@@ -1,0 +1,36 @@
+[package]
+name = "gateway"
+version = "0.2.18"
+edition = "2024"
+description = "LLM inference routing engine — fallback chains, circuit breaker, budget management"
+license = "MIT"
+
+[dependencies]
+# AWS Bedrock — heavy native deps (smithy runtime, hyper, etc.) but
+# brings SigV4, credential-provider chain, and Converse API for free.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "1"
+# Direct on aws-smithy-types so the Bedrock adapter can construct
+# Document values for tool input schemas and tool_use payloads
+# without going through a private re-export.
+aws-smithy-types = "1"
+async-trait = "0.1"
+# Used directly for naming reqwest's Bytes type in streaming
+# adapters' state machines (otherwise it leaks through `impl Stream`
+# and can't be stored in a struct).
+bytes = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+pin-project-lite = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"

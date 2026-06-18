@@ -1,0 +1,35 @@
+[package]
+name = "gateway-embedded"
+version = "0.2.18"
+edition = "2024"
+description = "In-process inference adapters and model registry for the sensei gateway"
+license = "MIT"
+
+[features]
+default = []
+# In-process inference engine adapters. Each pulls in heavyweight native deps
+# (C++ for llama-cpp, C++ for ort, both for fastembed) so they're opt-in.
+llama-cpp = ["dep:llama-cpp-2"]
+fastembed = ["dep:fastembed"]
+ort = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+
+[dependencies]
+gateway = { path = "../gateway" }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "rt", "sync"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+
+llama-cpp-2 = { version = "0.1.146", default-features = false, optional = true }
+fastembed = { version = "5", optional = true }
+ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"], optional = true }
+tokenizers = { version = "0.21", optional = true }
+ndarray = { version = "0.16", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

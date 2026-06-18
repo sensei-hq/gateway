@@ -1,0 +1,296 @@
+use std::pin::Pin;
+
+use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use futures::Stream;
+use reqwest::Client;
+use serde::Deserialize;
+
+use super::base::{build_client, resolve_api_key};
+use super::InferenceAdapter;
+use crate::types::capability::Capability;
+use crate::types::config::RouterConfig;
+use crate::types::error::GatewayError;
+use crate::types::request::{
+    ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk,
+};
+
+// ---------------------------------------------------------------------------
+// Wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct StabilityJsonResponse {
+    image: String,
+    #[allow(dead_code)]
+    seed: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const BASE_URL: &str = "https://api.stability.ai/v2beta";
+const DEFAULT_MODEL: &str = "sd3.5-large";
+
+fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
+    resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
+        adapter: "stability".into(),
+        message: "missing API key — set the env var specified in api_key_env".into(),
+    })
+}
+
+fn resolve_model(request: &InferenceRequest) -> String {
+    request
+        .model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
+fn base_url(config: &RouterConfig) -> &str {
+    let url = config.url.trim_end_matches('/');
+    if url.is_empty() {
+        BASE_URL
+    } else {
+        url
+    }
+}
+
+fn size_to_aspect_ratio(size: &Option<String>) -> &'static str {
+    match size.as_deref() {
+        Some("1792x1024") | Some("1024x576") => "16:9",
+        Some("1024x1792") | Some("576x1024") => "9:16",
+        Some("1024x1024") | None => "1:1",
+        _ => "1:1",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StabilityAdapter
+// ---------------------------------------------------------------------------
+
+/// Adapter for Stability AI (Stable Diffusion 3.x) image generation.
+///
+/// Uses Bearer-token authentication and multipart form uploads.
+pub struct StabilityAdapter {
+    client: Client,
+}
+
+impl StabilityAdapter {
+    pub fn new() -> Result<Self, GatewayError> {
+        Ok(Self {
+            client: Client::new(),
+        })
+    }
+
+    pub fn from_config(config: &RouterConfig) -> Result<Self, GatewayError> {
+        Ok(Self {
+            client: build_client(config)?,
+        })
+    }
+}
+
+#[async_trait]
+impl InferenceAdapter for StabilityAdapter {
+    fn id(&self) -> &str {
+        "stability"
+    }
+
+    fn supports(&self, capability: &Capability) -> bool {
+        matches!(capability, Capability::ImageGenerate)
+    }
+
+    async fn execute(
+        &self,
+        config: &RouterConfig,
+        request: &InferenceRequest,
+    ) -> Result<InferenceResponse, GatewayError> {
+        let Payload::ImageGenerate {
+            prompt, size, ..
+        } = &request.payload
+        else {
+            return Err(GatewayError::ProviderError {
+                adapter: "stability".into(),
+                message: "only ImageGenerate payload is supported".into(),
+                status: None,
+            });
+        };
+
+        let api_key = require_api_key(config)?;
+        let model = resolve_model(request);
+        let url_base = base_url(config);
+        let aspect_ratio = size_to_aspect_ratio(size);
+
+        let form = reqwest::multipart::Form::new()
+            .text("prompt", prompt.clone())
+            .text("model", model.clone())
+            .text("output_format", "png")
+            .text("aspect_ratio", aspect_ratio.to_string());
+
+        let url = format!("{url_base}/stable-image/generate/sd3");
+        let mut req = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .bearer_auth(&api_key);
+
+        for (k, v) in &config.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+
+        let response = req.send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(match status.as_u16() {
+                401 | 403 => GatewayError::Authentication {
+                    adapter: "stability".into(),
+                    message: body_text,
+                },
+                429 => GatewayError::RateLimit {
+                    adapter: "stability".into(),
+                    retry_after_ms: None,
+                },
+                _ => GatewayError::ProviderError {
+                    adapter: "stability".into(),
+                    message: body_text,
+                    status: Some(status.as_u16()),
+                },
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let b64 = if content_type.starts_with("application/json") {
+            let json_resp: StabilityJsonResponse =
+                response.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "stability".into(),
+                    message: format!("failed to parse stability response: {e}"),
+                    status: Some(status.as_u16()),
+                })?;
+            json_resp.image
+        } else {
+            // image/* — raw bytes
+            let bytes = response.bytes().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "stability".into(),
+                message: format!("failed to read image bytes: {e}"),
+                status: None,
+            })?;
+            STANDARD.encode(&bytes)
+        };
+
+        Ok(InferenceResponse {
+            success: true,
+            content: None,
+            embeddings: None,
+            transcription: None,
+            audio: None,
+            images: Some(vec![ImageResult {
+                b64_json: Some(b64),
+                url: None,
+                revised_prompt: None,
+            }]),
+            videos: None,
+            model: Some(model),
+            tool_calls: Vec::new(),
+            usage: None,
+            estimated_cost: None,
+            actual_cost: None,
+            attempts: vec![],
+        })
+    }
+
+    async fn stream(
+        &self,
+        _config: &RouterConfig,
+        _request: &InferenceRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
+        Err(GatewayError::ProviderError {
+            adapter: "stability".into(),
+            message: "streaming is not supported for image generation".into(),
+            status: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stability_id_and_supports() {
+        let adapter = StabilityAdapter::new().unwrap();
+        assert_eq!(adapter.id(), "stability");
+
+        assert!(adapter.supports(&Capability::ImageGenerate));
+        assert!(!adapter.supports(&Capability::TextChat));
+        assert!(!adapter.supports(&Capability::VideoGenerate));
+    }
+
+    #[test]
+    fn map_size_to_aspect_ratio() {
+        assert_eq!(size_to_aspect_ratio(&Some("1792x1024".to_string())), "16:9");
+        assert_eq!(size_to_aspect_ratio(&Some("1024x576".to_string())), "16:9");
+        assert_eq!(size_to_aspect_ratio(&Some("1024x1792".to_string())), "9:16");
+        assert_eq!(size_to_aspect_ratio(&Some("576x1024".to_string())), "9:16");
+        assert_eq!(size_to_aspect_ratio(&Some("1024x1024".to_string())), "1:1");
+        assert_eq!(size_to_aspect_ratio(&None), "1:1");
+        assert_eq!(size_to_aspect_ratio(&Some("512x512".to_string())), "1:1");
+    }
+
+    #[test]
+    fn parse_stability_json_response() {
+        let json = r#"{"image":"abc123","seed":42}"#;
+        let resp: StabilityJsonResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.image, "abc123");
+        assert_eq!(resp.seed, Some(42));
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_returns_auth_error() {
+        let adapter = StabilityAdapter::new().unwrap();
+        let config = RouterConfig {
+            url: "https://api.stability.ai/v2beta".to_string(),
+            api_key_env: Some("__NONEXISTENT_STABILITY_KEY_FOR_TEST__".to_string()),
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: std::collections::HashMap::new(),
+        };
+        let request = InferenceRequest {
+            capability: Capability::ImageGenerate,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::ImageGenerate {
+                prompt: "A cat".to_string(),
+                size: None,
+                quality: None,
+                style: None,
+                n: 1,
+            },
+            budget: None,
+        };
+
+        let result = adapter.execute(&config, &request).await;
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::Authentication { .. }),
+            "expected Authentication error, got: {err:?}",
+        );
+    }
+}
