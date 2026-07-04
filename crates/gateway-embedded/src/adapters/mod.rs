@@ -11,6 +11,12 @@ pub mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{LlamaCppAdapter, LlamaCppConfig, LlamaCppMode, shared_backend};
 
+#[cfg(feature = "llama-cpp")]
+pub mod embedded_llama;
+
+#[cfg(feature = "llama-cpp")]
+pub use embedded_llama::EmbeddedLlamaAdapter;
+
 #[cfg(feature = "fastembed")]
 pub mod fastembed;
 

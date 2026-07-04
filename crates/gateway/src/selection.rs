@@ -375,19 +375,31 @@ impl<'a> ModelSelectionService<'a> {
         }
     }
 
-    /// Tier 3: Find the first chain whose capability matches.
+    /// Tier 3: resolve by capability when the caller pinned neither a model
+    /// nor a chain.
+    ///
+    /// Several chains can share a capability (e.g. `classify`, `reasoning`,
+    /// `summarize` are all `TextChat`). `config.chains` is a `HashMap`, whose
+    /// iteration order is not stable across runs — picking "the first match"
+    /// would be non-deterministic (#80). Instead, pick the lowest chain id
+    /// among the matches: a stable, if arbitrary, default. Callers that need a
+    /// specific chain should pin it by name (tier 2) rather than rely on this.
     fn resolve_by_capability(&self, criteria: &SelectionCriteria) -> SelectionResult {
-        for chain in self.config.chains.values() {
-            if chain.capability == criteria.capability {
-                return self.resolve_chain(chain, criteria);
-            }
-        }
+        let chosen = self
+            .config
+            .chains
+            .values()
+            .filter(|c| c.capability == criteria.capability)
+            .min_by(|a, b| a.id.cmp(&b.id));
 
-        SelectionResult {
-            selected: None,
-            all_candidates: vec![],
-            skipped: vec![],
-            chain: None,
+        match chosen {
+            Some(chain) => self.resolve_chain(chain, criteria),
+            None => SelectionResult {
+                selected: None,
+                all_candidates: vec![],
+                skipped: vec![],
+                chain: None,
+            },
         }
     }
 }
@@ -608,6 +620,41 @@ mod tests {
         let selected = result.selected.unwrap();
         assert_eq!(selected.model, "all-minilm");
         assert_eq!(selected.router, "ollama");
+    }
+
+    #[test]
+    fn tier3_capability_is_deterministic_lowest_chain_id() {
+        // Two chains share TextChat; tier-3 must pick the lowest id ("aaa_chain")
+        // every time, not whatever the HashMap happens to yield first (#80).
+        let mut config = test_config();
+        config.chains.insert(
+            "aaa_chain".to_string(),
+            FallbackChainConfig {
+                id: "aaa_chain".to_string(),
+                capability: Capability::TextChat,
+                models: vec![ChainEntry {
+                    model: "claude-haiku".to_string(),
+                    router: None,
+                    api_model_id: None,
+                    priority: 1,
+                }],
+                fallback_triggers: vec![],
+            },
+        );
+        let cb = test_cb();
+        let svc = ModelSelectionService::new(&config, &cb);
+        // Run several times: a HashMap-order bug would flake; min_by is stable.
+        for _ in 0..10 {
+            let result = svc.select(&SelectionCriteria {
+                capability: Capability::TextChat,
+                model: None,
+                router: None,
+                chain: None,
+                budget: None,
+                input_tokens: None,
+            });
+            assert_eq!(result.chain.as_ref().unwrap().id, "aaa_chain");
+        }
     }
 
     #[test]
