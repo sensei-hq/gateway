@@ -1,6 +1,6 @@
 [package]
 name = "gateway"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2024"
 description = "LLM inference routing engine — fallback chains, circuit breaker, budget management"
 license = "MIT"
@@ -8,8 +8,24 @@ license = "MIT"
 [dependencies]
 # AWS Bedrock — heavy native deps (smithy runtime, hyper, etc.) but
 # brings SigV4, credential-provider chain, and Converse API for free.
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-bedrockruntime = "1"
+#
+# `default-features = false` intentionally drops the SDK's default `rustls`
+# feature. That feature enables `aws-smithy-runtime/tls-rustls`, which drags in
+# the legacy hyper-0.14 / rustls-0.21 connector (`legacy-rustls-ring`) and with
+# it the vulnerable `rustls-webpki 0.101.7` (RUSTSEC DoS-on-malformed-CRL). We
+# keep only `default-https-client`, which routes through the modern
+# `rustls-aws-lc` connector on rustls 0.23 / rustls-webpki 0.103. See issue #1.
+aws-config = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+    "behavior-version-latest",
+] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 # Direct on aws-smithy-types so the Bedrock adapter can construct
 # Document values for tool input schemas and tool_use payloads
 # without going through a private re-export.
