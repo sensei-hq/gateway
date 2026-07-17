@@ -11,6 +11,7 @@ use crate::adapters::async_job::{JobConfig, poll_until_complete};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
+use crate::types::io::{ImageRequest, ImageResponse};
 use crate::types::request::{
     ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk,
 };
@@ -262,6 +263,140 @@ impl InferenceAdapter for FluxAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model — see
+// docs/design/adapter-capability-traits.md). Additive alongside the legacy
+// `InferenceAdapter` impl above, which stays until the engine cuts over.
+// The capability traits are referenced by full path so their `Model::id`
+// method does not collide with `InferenceAdapter::id` in method resolution.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for FluxAdapter {
+    fn id(&self) -> &str {
+        "flux"
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::ImageModel for FluxAdapter {
+    async fn generate_image(
+        &self,
+        config: &RouterConfig,
+        req: &ImageRequest,
+    ) -> Result<ImageResponse, GatewayError> {
+        let api_key = require_api_key(config)?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let url_base = base_url(config);
+        let (width, height) = parse_size(&req.size);
+
+        let body = FluxImageRequest {
+            prompt: req.prompt.clone(),
+            width,
+            height,
+        };
+
+        // 1. Submit job
+        let submit_url = format!("{url_base}/{model}");
+        let resp = self
+            .client
+            .post(&submit_url)
+            .json(&body)
+            .header("x-key", &api_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(match status.as_u16() {
+                401 | 403 => GatewayError::Authentication {
+                    adapter: "flux".into(),
+                    message: body_text,
+                },
+                429 => GatewayError::RateLimit {
+                    adapter: "flux".into(),
+                    retry_after_ms: None,
+                },
+                _ => GatewayError::ProviderError {
+                    adapter: "flux".into(),
+                    message: body_text,
+                    status: Some(status.as_u16()),
+                },
+            });
+        }
+
+        let submit_resp: FluxSubmitResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "flux".into(),
+                message: format!("failed to parse submit response: {e}"),
+                status: Some(status.as_u16()),
+            })?;
+
+        // 2. Poll until ready
+        let task_id = submit_resp.id;
+        let poll_url = format!("{url_base}/get_result?id={task_id}");
+        let job_config = JobConfig::default();
+        let client = &self.client;
+        let api_key_ref = &api_key;
+
+        let final_result = poll_until_complete(&job_config, || async {
+            let resp = client
+                .get(&poll_url)
+                .header("x-key", api_key_ref)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::ProviderError {
+                    adapter: "flux".into(),
+                    message: body_text,
+                    status: None,
+                });
+            }
+
+            let poll_resp: FluxPollResponse =
+                resp.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "flux".into(),
+                    message: format!("failed to parse poll response: {e}"),
+                    status: None,
+                })?;
+
+            match poll_resp.status.as_str() {
+                "Ready" => Ok(Some(poll_resp)),
+                "Error" | "Failed" => Err(GatewayError::ProviderError {
+                    adapter: "flux".into(),
+                    message: "FLUX task failed".to_string(),
+                    status: None,
+                }),
+                _ => Ok(None), // Pending, Processing
+            }
+        })
+        .await?;
+
+        // 3. Extract sample URL
+        let sample_url = final_result.result.map(|r| r.sample);
+
+        Ok(ImageResponse {
+            images: vec![ImageResult {
+                url: sample_url,
+                b64_json: None,
+                revised_prompt: None,
+            }],
+        })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for FluxAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_image(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -277,6 +412,14 @@ mod tests {
         assert!(adapter.supports(&Capability::ImageGenerate));
         assert!(!adapter.supports(&Capability::TextChat));
         assert!(!adapter.supports(&Capability::VideoGenerate));
+    }
+
+    #[test]
+    fn flux_capability_model_id() {
+        let adapter = FluxAdapter::new().unwrap();
+        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // and the capability `Model` trait.
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "flux");
     }
 
     #[test]

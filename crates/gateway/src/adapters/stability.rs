@@ -7,11 +7,13 @@ use futures::Stream;
 use reqwest::Client;
 use serde::Deserialize;
 
-use super::InferenceAdapter;
 use super::base::{build_client, resolve_api_key};
+use super::capability::{ImageModel, Model};
+use super::{CapabilityRegistry, InferenceAdapter, RegisterInto};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
+use crate::types::io::{ImageRequest, ImageResponse};
 use crate::types::request::{
     ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk,
 };
@@ -217,6 +219,116 @@ impl InferenceAdapter for StabilityAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (segregated model — see
+// docs/design/adapter-capability-traits.md). Additive during the migration;
+// the legacy `impl InferenceAdapter` above is removed in Phase 4.
+// ---------------------------------------------------------------------------
+
+impl Model for StabilityAdapter {
+    fn id(&self) -> &str {
+        "stability"
+    }
+}
+
+#[async_trait]
+impl ImageModel for StabilityAdapter {
+    async fn generate_image(
+        &self,
+        config: &RouterConfig,
+        req: &ImageRequest,
+    ) -> Result<ImageResponse, GatewayError> {
+        let api_key = require_api_key(config)?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let url_base = base_url(config);
+        let aspect_ratio = size_to_aspect_ratio(&req.size);
+
+        let form = reqwest::multipart::Form::new()
+            .text("prompt", req.prompt.clone())
+            .text("model", model.clone())
+            .text("output_format", "png")
+            .text("aspect_ratio", aspect_ratio.to_string());
+
+        let url = format!("{url_base}/stable-image/generate/sd3");
+        let mut http_req = self.client.post(&url).multipart(form).bearer_auth(&api_key);
+
+        for (k, v) in &config.headers {
+            http_req = http_req.header(k.as_str(), v.as_str());
+        }
+
+        let response = http_req.send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(match status.as_u16() {
+                401 | 403 => GatewayError::Authentication {
+                    adapter: "stability".into(),
+                    message: body_text,
+                },
+                429 => GatewayError::RateLimit {
+                    adapter: "stability".into(),
+                    retry_after_ms: None,
+                },
+                _ => GatewayError::ProviderError {
+                    adapter: "stability".into(),
+                    message: body_text,
+                    status: Some(status.as_u16()),
+                },
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let b64 = if content_type.starts_with("application/json") {
+            let json_resp: StabilityJsonResponse =
+                response
+                    .json()
+                    .await
+                    .map_err(|e| GatewayError::ProviderError {
+                        adapter: "stability".into(),
+                        message: format!("failed to parse stability response: {e}"),
+                        status: Some(status.as_u16()),
+                    })?;
+            json_resp.image
+        } else {
+            // image/* — raw bytes
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| GatewayError::ProviderError {
+                    adapter: "stability".into(),
+                    message: format!("failed to read image bytes: {e}"),
+                    status: None,
+                })?;
+            STANDARD.encode(&bytes)
+        };
+
+        Ok(ImageResponse {
+            images: vec![ImageResult {
+                b64_json: Some(b64),
+                url: None,
+                revised_prompt: None,
+            }],
+        })
+    }
+}
+
+#[async_trait]
+impl RegisterInto for StabilityAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &CapabilityRegistry) {
+        reg.register_image(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -227,7 +339,7 @@ mod tests {
     #[test]
     fn stability_id_and_supports() {
         let adapter = StabilityAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "stability");
+        assert_eq!(InferenceAdapter::id(&adapter), "stability");
 
         assert!(adapter.supports(&Capability::ImageGenerate));
         assert!(!adapter.supports(&Capability::TextChat));
@@ -280,6 +392,36 @@ mod tests {
         };
 
         let result = adapter.execute(&config, &request).await;
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::Authentication { .. }),
+            "expected Authentication error, got: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_image_missing_api_key_returns_auth_error() {
+        let adapter = StabilityAdapter::new().unwrap();
+        let config = RouterConfig {
+            url: "https://api.stability.ai/v2beta".to_string(),
+            api_key_env: Some("__NONEXISTENT_STABILITY_KEY_FOR_TEST__".to_string()),
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: std::collections::HashMap::new(),
+        };
+        let request = ImageRequest {
+            model: None,
+            prompt: "A cat".to_string(),
+            size: None,
+            quality: None,
+            style: None,
+            n: 1,
+        };
+
+        let result = adapter.generate_image(&config, &request).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();
