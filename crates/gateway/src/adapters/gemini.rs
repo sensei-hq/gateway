@@ -33,6 +33,7 @@ use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
+use crate::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
 use crate::types::request::{
     InferenceRequest, InferenceResponse, MediaAttachment, MediaSource, Message, MessageContent,
     MessageRole, Payload, StreamChunk, ToolCall, ToolDefinition,
@@ -871,6 +872,206 @@ impl InferenceAdapter for GeminiAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model). Traits + RegisterInto referenced by full
+// path to avoid the id() clash with InferenceAdapter during the bridge. Gemini
+// wire structs are all `Gemini*`-prefixed, so the io types don't collide and
+// are imported by name.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for GeminiAdapter {
+    fn id(&self) -> &str {
+        ADAPTER_ID
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::ChatModel for GeminiAdapter {
+    async fn chat(
+        &self,
+        config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let api_key = resolve_api_key(config).ok_or_else(Self::missing_key_err)?;
+        let model = normalize_model_id(req.model.as_deref().unwrap_or(DEFAULT_MODEL)).to_string();
+        let url = format!(
+            "{}/models/{}:generateContent",
+            config.url.trim_end_matches('/'),
+            model
+        );
+
+        let generation_config =
+            (req.max_tokens.is_some() || req.temperature.is_some()).then(|| {
+                GeminiGenerationConfig {
+                    max_output_tokens: Some(req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+                    temperature: req.temperature,
+                }
+            });
+
+        let body = GeminiChatRequest {
+            contents: build_contents(&req.messages),
+            system_instruction: extract_system_instruction(&req.messages, &req.system),
+            generation_config,
+            tools: build_tools(&req.tools),
+        };
+
+        let resp: GeminiChatResponse =
+            gemini_post(&self.client, &url, &api_key, &body, &config.headers).await?;
+
+        let content = extract_text(&resp);
+        let tool_calls = extract_tool_calls(&resp);
+        let usage = usage_from_gemini(&resp.usage_metadata);
+
+        Ok(ChatResponse {
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls,
+            usage,
+            model: Some(model),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
+        let api_key = resolve_api_key(config).ok_or_else(Self::missing_key_err)?;
+        let model = normalize_model_id(req.model.as_deref().unwrap_or(DEFAULT_MODEL)).to_string();
+        let url = format!(
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            config.url.trim_end_matches('/'),
+            model
+        );
+
+        let generation_config =
+            (req.max_tokens.is_some() || req.temperature.is_some()).then(|| {
+                GeminiGenerationConfig {
+                    max_output_tokens: Some(req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+                    temperature: req.temperature,
+                }
+            });
+
+        let body = GeminiChatRequest {
+            contents: build_contents(&req.messages),
+            system_instruction: extract_system_instruction(&req.messages, &req.system),
+            generation_config,
+            tools: build_tools(&req.tools),
+        };
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &api_key)
+            .header("content-type", "application/json")
+            .json(&body);
+        for (k, v) in &config.headers {
+            request = request.header(k.as_str(), v.as_str());
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(match status.as_u16() {
+                401 | 403 => GatewayError::Authentication {
+                    adapter: ADAPTER_ID.into(),
+                    message: body_text,
+                },
+                429 => GatewayError::RateLimit {
+                    adapter: ADAPTER_ID.into(),
+                    retry_after_ms: None,
+                },
+                _ => GatewayError::ProviderError {
+                    adapter: ADAPTER_ID.into(),
+                    message: body_text,
+                    status: Some(status.as_u16()),
+                },
+            });
+        }
+
+        let byte_stream = response.bytes_stream();
+        let stream = byte_stream
+            .map(
+                |result| -> Result<Vec<Result<StreamChunk, GatewayError>>, GatewayError> {
+                    let bytes = result?;
+                    let text = String::from_utf8_lossy(&bytes);
+                    Ok(text.lines().filter_map(parse_stream_line).collect())
+                },
+            )
+            .map(|result| match result {
+                Ok(chunks) => futures::stream::iter(chunks),
+                Err(e) => futures::stream::iter(vec![Err(e)]),
+            })
+            .flatten();
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::EmbedModel for GeminiAdapter {
+    async fn embed(
+        &self,
+        config: &RouterConfig,
+        req: &EmbedRequest,
+    ) -> Result<EmbedResponse, GatewayError> {
+        let api_key = resolve_api_key(config).ok_or_else(Self::missing_key_err)?;
+        if req.texts.is_empty() {
+            return Ok(EmbedResponse {
+                embeddings: vec![],
+                usage: None,
+            });
+        }
+        let model =
+            normalize_model_id(req.model.as_deref().unwrap_or(DEFAULT_EMBED_MODEL)).to_string();
+        let url = format!(
+            "{}/models/{}:batchEmbedContents",
+            config.url.trim_end_matches('/'),
+            model
+        );
+        let qualified_model = format!("models/{model}");
+        let body = GeminiBatchEmbedRequest {
+            requests: req
+                .texts
+                .iter()
+                .map(|t| GeminiEmbedRequestItem {
+                    model: qualified_model.clone(),
+                    content: GeminiContent {
+                        role: "user",
+                        parts: vec![GeminiPart {
+                            text: Some(t.clone()),
+                            ..Default::default()
+                        }],
+                    },
+                })
+                .collect(),
+        };
+
+        let resp: GeminiBatchEmbedResponse =
+            gemini_post(&self.client, &url, &api_key, &body, &config.headers).await?;
+
+        let embeddings: Vec<Vec<f32>> = resp.embeddings.into_iter().map(|e| e.values).collect();
+
+        Ok(EmbedResponse {
+            embeddings,
+            usage: None,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for GeminiAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_chat(self.clone()).await;
+        reg.register_embed(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -898,6 +1099,14 @@ mod tests {
         assert!(a.supports(&Capability::TextEmbed));
         assert!(!a.supports(&Capability::ImageGenerate));
         assert!(!a.supports(&Capability::VideoGenerate));
+    }
+
+    #[test]
+    fn capability_model_id_matches_adapter_id() {
+        // The capability `Model::id` (fully qualified to avoid the
+        // InferenceAdapter::id clash) returns the same value.
+        let a = GeminiAdapter::new().unwrap();
+        assert_eq!(crate::adapters::capability::Model::id(&a), "gemini");
     }
 
     #[test]

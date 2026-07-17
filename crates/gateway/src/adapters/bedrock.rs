@@ -43,6 +43,7 @@ use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
+use crate::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
 use crate::types::request::{
     InferenceRequest, InferenceResponse, MediaAttachment, MediaSource, Message as GwMessage,
     MessageContent, MessageRole, Payload, StreamChunk, StreamingToolCall, ToolCall, ToolDefinition,
@@ -357,6 +358,172 @@ impl BedrockAdapter {
         // Cohere doesn't return per-request token counts on the embed
         // endpoint — usage is reported at the account level.
         Ok((parsed.embeddings, None))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capability traits (target model). Traits + RegisterInto referenced by full
+// path to avoid the id() clash with InferenceAdapter during the bridge.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for BedrockAdapter {
+    fn id(&self) -> &str {
+        ADAPTER_ID
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::ChatModel for BedrockAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        // Bedrock auth is SigV4 via the SDK's credential chain, so
+        // `cfg` (url/api_key) is ignored — same as the execute path.
+        let model_id = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let bedrock_messages = build_messages(&req.messages)?;
+        let system_blocks = build_system(&req.messages, &req.system);
+
+        let inference_cfg = InferenceConfiguration::builder()
+            .max_tokens(
+                req.max_tokens
+                    .map(|n| n as i32)
+                    .unwrap_or(DEFAULT_MAX_TOKENS),
+            )
+            .set_temperature(req.temperature)
+            .build();
+
+        let mut builder = self
+            .client
+            .converse()
+            .model_id(model_id.clone())
+            .inference_config(inference_cfg);
+        for m in bedrock_messages {
+            builder = builder.messages(m);
+        }
+        for s in system_blocks {
+            builder = builder.system(s);
+        }
+        if let Some(cfg) = build_tool_config(&req.tools) {
+            builder = builder.tool_config(cfg);
+        }
+
+        let response = builder.send().await.map_err(map_sdk_error)?;
+
+        let content = extract_text(&response);
+        let tool_calls = extract_tool_calls(&response);
+        let usage = response.usage.as_ref().map(|u| TokenUsage {
+            input_tokens: u.input_tokens.max(0) as u32,
+            output_tokens: u.output_tokens.max(0) as u32,
+            total_tokens: u.total_tokens.max(0) as u32,
+        });
+
+        Ok(ChatResponse {
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls,
+            usage,
+            model: Some(model_id),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
+        // Real Converse streaming — mirrors the InferenceAdapter::stream
+        // path, reading from the typed `req` instead of Payload::Chat.
+        let model_id = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let bedrock_messages = build_messages(&req.messages)?;
+        let system_blocks = build_system(&req.messages, &req.system);
+
+        let inference_cfg = InferenceConfiguration::builder()
+            .max_tokens(
+                req.max_tokens
+                    .map(|n| n as i32)
+                    .unwrap_or(DEFAULT_MAX_TOKENS),
+            )
+            .set_temperature(req.temperature)
+            .build();
+
+        let mut builder = self
+            .client
+            .converse_stream()
+            .model_id(model_id)
+            .inference_config(inference_cfg);
+        for m in bedrock_messages {
+            builder = builder.messages(m);
+        }
+        for s in system_blocks {
+            builder = builder.system(s);
+        }
+        if let Some(cfg) = build_tool_config(&req.tools) {
+            builder = builder.tool_config(cfg);
+        }
+
+        let output = builder.send().await.map_err(map_sdk_error)?;
+
+        Ok(Box::pin(into_stream_chunks(output)))
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::EmbedModel for BedrockAdapter {
+    async fn embed(
+        &self,
+        _cfg: &RouterConfig,
+        req: &EmbedRequest,
+    ) -> Result<EmbedResponse, GatewayError> {
+        let model_id = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
+        let family = embed_family(&model_id).ok_or_else(|| {
+            Self::err(
+                format!("model id '{model_id}' is not a recognised Bedrock embedding model"),
+                None,
+            )
+        })?;
+
+        if req.texts.is_empty() {
+            return Ok(EmbedResponse {
+                embeddings: Vec::new(),
+                usage: None,
+            });
+        }
+
+        let (embeddings, input_tokens) = match family {
+            EmbedFamily::Titan => self.invoke_titan_embed(&model_id, &req.texts).await?,
+            EmbedFamily::Cohere => self.invoke_cohere_embed(&model_id, &req.texts).await?,
+        };
+
+        let usage = input_tokens.map(|n| TokenUsage {
+            input_tokens: n,
+            output_tokens: 0,
+            total_tokens: n,
+        });
+
+        Ok(EmbedResponse { embeddings, usage })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for BedrockAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_chat(self.clone()).await;
+        reg.register_embed(self).await;
     }
 }
 
@@ -1480,6 +1647,18 @@ mod tests {
         // Reuse `embed_family` validation as a sanity check that the
         // adapter would now route an embed call past the dispatch.
         assert!(embed_family("amazon.titan-embed-text-v2:0").is_some());
+    }
+
+    #[tokio::test]
+    async fn bedrock_capability_model_id() {
+        // `with_region` is the documented test constructor: pinning the
+        // region skips region auto-discovery, and the AWS SDK resolves
+        // credentials lazily at request time — so building the client is
+        // offline-safe (no AWS creds or network needed here).
+        let adapter = BedrockAdapter::with_region("us-east-1").await.unwrap();
+        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // and the capability `Model` trait.
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "bedrock");
     }
 
     // -----------------------------------------------------------------
