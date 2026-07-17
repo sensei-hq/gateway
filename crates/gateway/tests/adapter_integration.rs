@@ -11,10 +11,10 @@ use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
 use gateway::types::request::{InferenceRequest, Message, MessageRole, Payload};
 
+use gateway::adapters::InferenceAdapter;
+use gateway::adapters::anthropic::AnthropicAdapter;
 use gateway::adapters::ollama::OllamaAdapter;
 use gateway::adapters::openai::OpenAIAdapter;
-use gateway::adapters::anthropic::AnthropicAdapter;
-use gateway::adapters::InferenceAdapter;
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -107,10 +107,7 @@ async fn ollama_chat_mock() {
 
     let response = adapter.execute(&config, &request).await.unwrap();
     assert!(response.success);
-    assert_eq!(
-        response.content.as_deref(),
-        Some("Hello from mock Ollama!"),
-    );
+    assert_eq!(response.content.as_deref(), Some("Hello from mock Ollama!"),);
     assert!(response.usage.is_some());
     let usage = response.usage.unwrap();
     assert_eq!(usage.input_tokens, 10);
@@ -171,7 +168,13 @@ async fn ollama_chat_error_500() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, GatewayError::ProviderError { status: Some(500), .. }),
+        matches!(
+            err,
+            GatewayError::ProviderError {
+                status: Some(500),
+                ..
+            }
+        ),
         "expected ProviderError with status 500, got: {err:?}",
     );
 }
@@ -186,7 +189,9 @@ async fn openai_chat_mock() {
 
     // Set env var for the test
     let env_key = "__TEST_OPENAI_KEY_MOCK__";
-    unsafe { std::env::set_var(env_key, "sk-test-mock-key"); }
+    unsafe {
+        std::env::set_var(env_key, "sk-test-mock-key");
+    }
 
     let canned = serde_json::json!({
         "choices": [{
@@ -213,16 +218,15 @@ async fn openai_chat_mock() {
 
     let response = adapter.execute(&config, &request).await.unwrap();
     assert!(response.success);
-    assert_eq!(
-        response.content.as_deref(),
-        Some("Hello from mock OpenAI!"),
-    );
+    assert_eq!(response.content.as_deref(), Some("Hello from mock OpenAI!"),);
     let usage = response.usage.unwrap();
     assert_eq!(usage.input_tokens, 12);
     assert_eq!(usage.output_tokens, 6);
 
     // Cleanup
-    unsafe { std::env::remove_var(env_key); }
+    unsafe {
+        std::env::remove_var(env_key);
+    }
 }
 
 #[tokio::test]
@@ -230,7 +234,9 @@ async fn openai_embed_mock() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_OPENAI_KEY_EMBED__";
-    unsafe { std::env::set_var(env_key, "sk-test-embed-key"); }
+    unsafe {
+        std::env::set_var(env_key, "sk-test-embed-key");
+    }
 
     let canned = serde_json::json!({
         "data": [
@@ -259,7 +265,9 @@ async fn openai_embed_mock() {
     assert_eq!(embeddings.len(), 1);
     assert_eq!(embeddings[0], vec![0.01, 0.02, 0.03]);
 
-    unsafe { std::env::remove_var(env_key); }
+    unsafe {
+        std::env::remove_var(env_key);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +279,9 @@ async fn anthropic_chat_mock() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_ANTHROPIC_KEY_MOCK__";
-    unsafe { std::env::set_var(env_key, "sk-ant-test-mock-key"); }
+    unsafe {
+        std::env::set_var(env_key, "sk-ant-test-mock-key");
+    }
 
     let canned = serde_json::json!({
         "content": [{"type": "text", "text": "Hello from mock Anthropic!"}],
@@ -302,7 +312,9 @@ async fn anthropic_chat_mock() {
     assert_eq!(usage.output_tokens, 7);
     assert_eq!(usage.total_tokens, 22);
 
-    unsafe { std::env::remove_var(env_key); }
+    unsafe {
+        std::env::remove_var(env_key);
+    }
 }
 
 #[tokio::test]
@@ -310,7 +322,9 @@ async fn anthropic_chat_401_auth_error() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_ANTHROPIC_KEY_401__";
-    unsafe { std::env::set_var(env_key, "bad-key"); }
+    unsafe {
+        std::env::set_var(env_key, "bad-key");
+    }
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -333,7 +347,9 @@ async fn anthropic_chat_401_auth_error() {
         "expected Authentication error, got: {err:?}",
     );
 
-    unsafe { std::env::remove_var(env_key); }
+    unsafe {
+        std::env::remove_var(env_key);
+    }
 }
 
 #[tokio::test]
@@ -341,7 +357,9 @@ async fn anthropic_chat_429_rate_limit() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_ANTHROPIC_KEY_429__";
-    unsafe { std::env::set_var(env_key, "rate-limited-key"); }
+    unsafe {
+        std::env::set_var(env_key, "rate-limited-key");
+    }
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -364,7 +382,9 @@ async fn anthropic_chat_429_rate_limit() {
         "expected RateLimit error, got: {err:?}",
     );
 
-    unsafe { std::env::remove_var(env_key); }
+    unsafe {
+        std::env::remove_var(env_key);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,5 +446,8 @@ async fn ollama_chat_streaming_integration() {
         collected.push_str(&chunk.content);
     }
 
-    assert!(!collected.is_empty(), "Expected non-empty streaming response");
+    assert!(
+        !collected.is_empty(),
+        "Expected non-empty streaming response"
+    );
 }

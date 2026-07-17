@@ -1,13 +1,13 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use futures::Stream;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
 use super::InferenceAdapter;
+use super::base::{build_client, resolve_api_key};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
@@ -35,7 +35,7 @@ struct ChatCompletionRequest {
 struct ChatMessage {
     role: String,
     content: String,
-    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
@@ -120,11 +120,7 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
 
 fn base_url(config: &RouterConfig) -> &str {
     let url = config.url.trim_end_matches('/');
-    if url.is_empty() {
-        BASE_URL
-    } else {
-        url
-    }
+    if url.is_empty() { BASE_URL } else { url }
 }
 
 fn role_to_string(role: &MessageRole) -> &'static str {
@@ -139,10 +135,16 @@ fn role_to_string(role: &MessageRole) -> &'static str {
 fn build_chat_messages(messages: &[Message], system: &Option<String>) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(sys) = system {
-        out.push(ChatMessage { role: "system".to_string(), content: sys.clone() });
+        out.push(ChatMessage {
+            role: "system".to_string(),
+            content: sys.clone(),
+        });
     }
     for m in messages {
-        out.push(ChatMessage { role: role_to_string(&m.role).to_string(), content: m.as_text().to_string() });
+        out.push(ChatMessage {
+            role: role_to_string(&m.role).to_string(),
+            content: m.as_text().to_string(),
+        });
     }
     out
 }
@@ -192,10 +194,7 @@ impl InferenceAdapter for TogetherAdapter {
     }
 
     fn supports(&self, capability: &Capability) -> bool {
-        matches!(
-            capability,
-            Capability::TextChat | Capability::ImageGenerate
-        )
+        matches!(capability, Capability::TextChat | Capability::ImageGenerate)
     }
 
     async fn execute(
@@ -228,11 +227,7 @@ impl InferenceAdapter for TogetherAdapter {
                 };
 
                 let url = format!("{url_base}/chat/completions");
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .json(&body)
-                    .bearer_auth(&api_key);
+                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
                 for (k, v) in &config.headers {
                     req = req.header(k.as_str(), v.as_str());
@@ -261,16 +256,16 @@ impl InferenceAdapter for TogetherAdapter {
                 }
 
                 let resp: ChatCompletionResponse =
-                    response.json().await.map_err(|e| GatewayError::ProviderError {
-                        adapter: "together".into(),
-                        message: format!("failed to parse chat response: {e}"),
-                        status: Some(status.as_u16()),
-                    })?;
+                    response
+                        .json()
+                        .await
+                        .map_err(|e| GatewayError::ProviderError {
+                            adapter: "together".into(),
+                            message: format!("failed to parse chat response: {e}"),
+                            status: Some(status.as_u16()),
+                        })?;
 
-                let content = resp
-                    .choices
-                    .first()
-                    .and_then(|c| c.message.content.clone());
+                let content = resp.choices.first().and_then(|c| c.message.content.clone());
                 let usage = usage_from_response(&resp.usage);
 
                 Ok(InferenceResponse {
@@ -290,10 +285,7 @@ impl InferenceAdapter for TogetherAdapter {
                 })
             }
             Payload::ImageGenerate {
-                prompt,
-                size,
-                n,
-                ..
+                prompt, size, n, ..
             } => {
                 let model = request
                     .model
@@ -308,11 +300,7 @@ impl InferenceAdapter for TogetherAdapter {
                 };
 
                 let url = format!("{url_base}/images/generations");
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .json(&body)
-                    .bearer_auth(&api_key);
+                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
                 for (k, v) in &config.headers {
                     req = req.header(k.as_str(), v.as_str());
@@ -341,11 +329,14 @@ impl InferenceAdapter for TogetherAdapter {
                 }
 
                 let image_resp: ImageGenerateResponse =
-                    response.json().await.map_err(|e| GatewayError::ProviderError {
-                        adapter: "together".into(),
-                        message: format!("failed to parse image response: {e}"),
-                        status: Some(status.as_u16()),
-                    })?;
+                    response
+                        .json()
+                        .await
+                        .map_err(|e| GatewayError::ProviderError {
+                            adapter: "together".into(),
+                            message: format!("failed to parse image response: {e}"),
+                            status: Some(status.as_u16()),
+                        })?;
 
                 let images: Vec<ImageResult> = image_resp
                     .data
@@ -476,14 +467,18 @@ impl InferenceAdapter for TogetherAdapter {
 
                 Ok(chunks)
             })
-            .map(|result| -> futures::stream::Iter<std::vec::IntoIter<Result<StreamChunk, GatewayError>>> {
-                match result {
-                    Ok(chunks) => {
-                        futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+            .map(
+                |result| -> futures::stream::Iter<
+                    std::vec::IntoIter<Result<StreamChunk, GatewayError>>,
+                > {
+                    match result {
+                        Ok(chunks) => {
+                            futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+                        }
+                        Err(e) => futures::stream::iter(vec![Err(e)]),
                     }
-                    Err(e) => futures::stream::iter(vec![Err(e)]),
-                }
-            })
+                },
+            )
             .flatten();
 
         Ok(Box::pin(stream))

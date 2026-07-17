@@ -192,7 +192,12 @@ mod tests {
                 "/home/u/.ollama/models/blobs/sha256-797b70c4edf85907fe0a49eb85811256f65fa0f7bf52166b147fd16be2be4662",
             ),
         };
-        assert!(ollama.path().to_string_lossy().ends_with("797b70c4edf85907fe0a49eb85811256f65fa0f7bf52166b147fd16be2be4662"));
+        assert!(
+            ollama
+                .path()
+                .to_string_lossy()
+                .ends_with("797b70c4edf85907fe0a49eb85811256f65fa0f7bf52166b147fd16be2be4662")
+        );
     }
 
     #[test]

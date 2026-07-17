@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use futures::Stream;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
 use super::InferenceAdapter;
+use super::base::{build_client, resolve_api_key};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
@@ -95,14 +95,9 @@ enum OutContentBlock {
 enum AnthropicImageSource {
     /// Inline image bytes. `media_type` is required on base64 sources
     /// — Anthropic uses it to pick the decoder.
-    Base64 {
-        media_type: String,
-        data: String,
-    },
+    Base64 { media_type: String, data: String },
     /// HTTPS URL fetched by Anthropic on the way in.
-    Url {
-        url: String,
-    },
+    Url { url: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,13 +493,12 @@ impl InferenceAdapter for AnthropicAdapter {
             });
         }
 
-        let anthropic_resp: AnthropicResponse = resp.json().await.map_err(|e| {
-            GatewayError::ProviderError {
+        let anthropic_resp: AnthropicResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
                 adapter: "anthropic".into(),
                 message: format!("failed to parse response: {}", e),
                 status: Some(status.as_u16()),
-            }
-        })?;
+            })?;
 
         let content = extract_text(&anthropic_resp.content);
         let tool_calls = extract_tool_calls(&anthropic_resp.content);
@@ -946,7 +940,8 @@ mod tests {
 
     #[test]
     fn parse_stream_content_delta() {
-        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#;
+        let json =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#;
 
         let event: StreamEvent = serde_json::from_str(json).unwrap();
 
@@ -1082,10 +1077,7 @@ mod tests {
     #[test]
     fn process_stream_bytes_reassembles_lines_split_across_byte_chunks() {
         let mut state = empty_anthropic_stream_state();
-        process_stream_bytes(
-            &mut state,
-            br#"data: {"type":"content_block_de"#,
-        );
+        process_stream_bytes(&mut state, br#"data: {"type":"content_block_de"#);
         assert!(state.pending.is_empty());
         process_stream_bytes(
             &mut state,
@@ -1173,14 +1165,12 @@ mod tests {
         // Anthropic requires media_type on base64 sources. We default
         // to image/jpeg when the gateway attachment doesn't specify
         // one — matches the most common case (camera roll uploads).
-        let msg = Message::text(MessageRole::User, "x").with_attachment(
-            MediaAttachment::Image {
-                source: MediaSource::Base64 {
-                    data: "AAAA".into(),
-                },
-                mime_type: None,
+        let msg = Message::text(MessageRole::User, "x").with_attachment(MediaAttachment::Image {
+            source: MediaSource::Base64 {
+                data: "AAAA".into(),
             },
-        );
+            mime_type: None,
+        });
         let json = serde_json::to_value(build_messages(&[msg])).unwrap();
         assert_eq!(json[0]["content"][1]["source"]["media_type"], "image/jpeg");
     }

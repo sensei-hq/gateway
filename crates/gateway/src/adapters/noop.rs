@@ -1,8 +1,8 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::stream;
 use futures::Stream;
+use futures::stream;
 
 use super::InferenceAdapter;
 use crate::types::capability::Capability;
@@ -139,14 +139,19 @@ mod tests {
     #[tokio::test]
     async fn noop_execute_returns_unsuccessful() {
         let adapter = NoopAdapter;
-        let response = adapter.execute(&test_config(), &test_request()).await.unwrap();
+        let response = adapter
+            .execute(&test_config(), &test_request())
+            .await
+            .unwrap();
 
         assert!(!response.success);
-        assert!(response
-            .content
-            .as_ref()
-            .unwrap()
-            .contains("No inference provider"));
+        assert!(
+            response
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("No inference provider")
+        );
         assert_eq!(response.attempts.len(), 1);
         assert_eq!(response.attempts[0].status, AttemptStatus::Failed);
     }
@@ -161,7 +166,10 @@ mod tests {
     #[tokio::test]
     async fn noop_stream_returns_single_chunk() {
         let adapter = NoopAdapter;
-        let mut stream = adapter.stream(&test_config(), &test_request()).await.unwrap();
+        let mut stream = adapter
+            .stream(&test_config(), &test_request())
+            .await
+            .unwrap();
 
         let first = stream.next().await;
         assert!(first.is_some());

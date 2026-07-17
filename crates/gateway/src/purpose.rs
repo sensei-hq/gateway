@@ -372,8 +372,8 @@ pub fn builtin_purposes() -> Vec<Purpose> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::noop::NoopAdapter;
     use crate::adapters::AdapterRegistry;
+    use crate::adapters::noop::NoopAdapter;
     use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
     use crate::types::config::{
         ChainEntry, FallbackChainConfig, FallbackTrigger, GatewayConfig, ModelConfig, RouterConfig,
@@ -456,9 +456,7 @@ mod tests {
 
         let gw = Gateway::new(config, adapters, cb);
         gw.adapters
-            .register(
-                Arc::new(NoopAdapter) as Arc<dyn crate::adapters::InferenceAdapter>,
-            )
+            .register(Arc::new(NoopAdapter) as Arc<dyn crate::adapters::InferenceAdapter>)
             .await;
         gw
     }
@@ -494,10 +492,7 @@ mod tests {
             deserialized.steps[0].system_prompt.as_deref(),
             Some("Be helpful"),
         );
-        assert_eq!(
-            deserialized.steps[0].model_hint,
-            Some(ModelHint::Balanced),
-        );
+        assert_eq!(deserialized.steps[0].model_hint, Some(ModelHint::Balanced),);
         assert_eq!(deserialized.steps[0].max_tokens, Some(100));
     }
 
@@ -579,10 +574,7 @@ mod tests {
             .build();
 
         assert_eq!(step.capability, Capability::TextChat);
-        assert_eq!(
-            step.system_prompt.as_deref(),
-            Some("You are a classifier."),
-        );
+        assert_eq!(step.system_prompt.as_deref(), Some("You are a classifier."),);
         assert_eq!(step.model_hint, Some(ModelHint::Fastest));
         assert_eq!(step.max_tokens, Some(50));
         assert!(matches!(step.input, StepInput::FromRequest));

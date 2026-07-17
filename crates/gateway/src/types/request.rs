@@ -9,8 +9,8 @@ use super::trace::Attempt;
 // ---------------------------------------------------------------------------
 
 mod base64_serde {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
@@ -24,8 +24,8 @@ mod base64_serde {
 }
 
 mod option_base64_serde {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(data: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
@@ -109,8 +109,13 @@ pub enum MessageRole {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageContent {
-    Text { text: String },
-    ToolResult { tool_call_id: String, content: String },
+    Text {
+        text: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+    },
 }
 
 impl MessageContent {
@@ -253,9 +258,7 @@ impl MediaAttachment {
     /// payload + MIME type.
     pub fn image_base64(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
         MediaAttachment::Image {
-            source: MediaSource::Base64 {
-                data: data.into(),
-            },
+            source: MediaSource::Base64 { data: data.into() },
             mime_type: Some(mime_type.into()),
         }
     }
@@ -584,7 +587,10 @@ mod tests {
         assert_eq!(m.role, MessageRole::User);
         assert_eq!(m.as_text(), "hello");
         assert!(m.tool_calls.is_empty());
-        assert!(m.attachments.is_empty(), "default attachments must be empty");
+        assert!(
+            m.attachments.is_empty(),
+            "default attachments must be empty"
+        );
         match m.content {
             MessageContent::Text { text } => assert_eq!(text, "hello"),
             _ => panic!("expected Text content"),
@@ -714,7 +720,10 @@ mod tests {
         assert_eq!(json["tool_calls"][0]["name"], "get_weather");
         let deserialized: Message = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.tool_calls.len(), 1);
-        assert_eq!(deserialized.tool_calls[0].arguments, "{\"city\":\"Berlin\"}");
+        assert_eq!(
+            deserialized.tool_calls[0].arguments,
+            "{\"city\":\"Berlin\"}"
+        );
     }
 
     #[test]
@@ -876,10 +885,7 @@ mod tests {
         assert!(json.contains(r#""transcription":"Hello world""#));
 
         let deserialized: InferenceResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            deserialized.transcription.as_deref(),
-            Some("Hello world"),
-        );
+        assert_eq!(deserialized.transcription.as_deref(), Some("Hello world"),);
         assert!(deserialized.audio.is_none());
     }
 
@@ -1014,7 +1020,14 @@ mod tests {
         let json = r#"{"type":"image_generate","prompt":"A cat"}"#;
         let payload: Payload = serde_json::from_str(json).unwrap();
 
-        if let Payload::ImageGenerate { prompt, n, size, quality, style } = &payload {
+        if let Payload::ImageGenerate {
+            prompt,
+            n,
+            size,
+            quality,
+            style,
+        } = &payload
+        {
             assert_eq!(prompt, "A cat");
             assert_eq!(*n, 1);
             assert!(size.is_none());
@@ -1171,8 +1184,8 @@ mod tests {
     #[test]
     fn stt_default_audio_format() {
         // When format is omitted in JSON, it should default to "wav"
-        use base64::engine::general_purpose::STANDARD;
         use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
         let audio_b64 = STANDARD.encode([0xFFu8, 0xFB]);
         let json = format!(r#"{{"type":"stt","audio":"{}"}}"#, audio_b64);
         let payload: Payload = serde_json::from_str(&json).unwrap();

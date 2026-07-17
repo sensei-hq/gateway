@@ -110,13 +110,7 @@ mod tests {
         let r = ExternalResolver::new();
         r.register(ext_entry("a", "/a.gguf")).await;
         r.register(ext_entry("b", "/b.gguf")).await;
-        let mut ids: Vec<_> = r
-            .list()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|e| e.id)
-            .collect();
+        let mut ids: Vec<_> = r.list().await.unwrap().into_iter().map(|e| e.id).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"]);
     }

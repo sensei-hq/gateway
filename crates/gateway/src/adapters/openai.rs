@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use futures::Stream;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, http_json, resolve_api_key};
 use super::InferenceAdapter;
+use super::base::{build_client, http_json, resolve_api_key};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
@@ -90,12 +90,8 @@ enum ChatContent {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentPart {
-    Text {
-        text: String,
-    },
-    ImageUrl {
-        image_url: ImageUrl,
-    },
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
 }
 
 #[derive(Debug, Serialize)]
@@ -626,7 +622,7 @@ impl InferenceAdapter for OpenAIAdapter {
                             adapter: "openai".into(),
                             message: format!("unsupported audio format: {other}"),
                             status: None,
-                        })
+                        });
                     }
                 };
 
@@ -651,11 +647,7 @@ impl InferenceAdapter for OpenAIAdapter {
                     "{}/v1/audio/transcriptions",
                     config.url.trim_end_matches('/')
                 );
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .multipart(form)
-                    .bearer_auth(&api_key);
+                let mut req = self.client.post(&url).multipart(form).bearer_auth(&api_key);
 
                 for (k, v) in &config.headers {
                     req = req.header(k.as_str(), v.as_str());
@@ -684,11 +676,14 @@ impl InferenceAdapter for OpenAIAdapter {
                 }
 
                 let whisper_resp: WhisperResponse =
-                    response.json().await.map_err(|e| GatewayError::ProviderError {
-                        adapter: "openai".into(),
-                        message: format!("failed to parse whisper response: {e}"),
-                        status: Some(status.as_u16()),
-                    })?;
+                    response
+                        .json()
+                        .await
+                        .map_err(|e| GatewayError::ProviderError {
+                            adapter: "openai".into(),
+                            message: format!("failed to parse whisper response: {e}"),
+                            status: Some(status.as_u16()),
+                        })?;
 
                 Ok(InferenceResponse {
                     success: true,
@@ -720,15 +715,8 @@ impl InferenceAdapter for OpenAIAdapter {
                     response_format: output_format.to_string(),
                 };
 
-                let url = format!(
-                    "{}/v1/audio/speech",
-                    config.url.trim_end_matches('/')
-                );
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .json(&body)
-                    .bearer_auth(&api_key);
+                let url = format!("{}/v1/audio/speech", config.url.trim_end_matches('/'));
+                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
                 for (k, v) in &config.headers {
                     req = req.header(k.as_str(), v.as_str());
@@ -756,13 +744,15 @@ impl InferenceAdapter for OpenAIAdapter {
                     });
                 }
 
-                let audio_bytes = response.bytes().await.map_err(|e| {
-                    GatewayError::ProviderError {
-                        adapter: "openai".into(),
-                        message: format!("failed to read TTS audio bytes: {e}"),
-                        status: None,
-                    }
-                })?;
+                let audio_bytes =
+                    response
+                        .bytes()
+                        .await
+                        .map_err(|e| GatewayError::ProviderError {
+                            adapter: "openai".into(),
+                            message: format!("failed to read TTS audio bytes: {e}"),
+                            status: None,
+                        })?;
 
                 Ok(InferenceResponse {
                     success: true,
@@ -801,15 +791,8 @@ impl InferenceAdapter for OpenAIAdapter {
                     n: *n,
                 };
 
-                let url = format!(
-                    "{}/v1/images/generations",
-                    config.url.trim_end_matches('/')
-                );
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .json(&body)
-                    .bearer_auth(&api_key);
+                let url = format!("{}/v1/images/generations", config.url.trim_end_matches('/'));
+                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
                 for (k, v) in &config.headers {
                     req = req.header(k.as_str(), v.as_str());
@@ -838,11 +821,14 @@ impl InferenceAdapter for OpenAIAdapter {
                 }
 
                 let image_resp: ImageGenerateResponse =
-                    response.json().await.map_err(|e| GatewayError::ProviderError {
-                        adapter: "openai".into(),
-                        message: format!("failed to parse image generation response: {e}"),
-                        status: Some(status.as_u16()),
-                    })?;
+                    response
+                        .json()
+                        .await
+                        .map_err(|e| GatewayError::ProviderError {
+                            adapter: "openai".into(),
+                            message: format!("failed to parse image generation response: {e}"),
+                            status: Some(status.as_u16()),
+                        })?;
 
                 let images: Vec<ImageResult> = image_resp
                     .data
@@ -911,10 +897,7 @@ impl InferenceAdapter for OpenAIAdapter {
             tools: build_tools(tools),
         };
 
-        let url = format!(
-            "{}/v1/chat/completions",
-            config.url.trim_end_matches('/')
-        );
+        let url = format!("{}/v1/chat/completions", config.url.trim_end_matches('/'));
         let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
         for (k, v) in &config.headers {
@@ -1141,8 +1124,7 @@ mod tests {
         let from_cfg = OpenAIAdapter::from_config(&cfg).unwrap();
         assert_eq!(from_cfg.id(), "openai");
 
-        let from_cfg_renamed =
-            OpenAIAdapter::from_config_with_id("vercel", &cfg).unwrap();
+        let from_cfg_renamed = OpenAIAdapter::from_config_with_id("vercel", &cfg).unwrap();
         assert_eq!(from_cfg_renamed.id(), "vercel");
     }
 
@@ -1192,7 +1174,10 @@ mod tests {
         assert_eq!(json["model"], "gpt-4o");
         assert_eq!(json["stream"], false);
         assert_eq!(json["max_tokens"], 1024);
-        assert!(json["temperature"].as_f64().unwrap() > 0.69 && json["temperature"].as_f64().unwrap() < 0.71);
+        assert!(
+            json["temperature"].as_f64().unwrap() > 0.69
+                && json["temperature"].as_f64().unwrap() < 0.71
+        );
 
         let msgs = json["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
@@ -1288,7 +1273,10 @@ mod tests {
         let msgs = vec![Message::text(MessageRole::User, "hello")];
         let json = serde_json::to_value(build_chat_messages(&msgs, &None)).unwrap();
         assert_eq!(json[0]["content"], "hello");
-        assert!(json[0]["content"].as_array().is_none(), "text-only must stay a string");
+        assert!(
+            json[0]["content"].as_array().is_none(),
+            "text-only must stay a string"
+        );
     }
 
     #[test]
@@ -1338,14 +1326,12 @@ mod tests {
         // OpenAI requires a media type in the data URL. We default to
         // image/jpeg, which matches OpenAI's own conservative default
         // for the legacy `image_url` shape.
-        let msg = Message::text(MessageRole::User, "x").with_attachment(
-            MediaAttachment::Image {
-                source: MediaSource::Base64 {
-                    data: "AAAA".into(),
-                },
-                mime_type: None,
+        let msg = Message::text(MessageRole::User, "x").with_attachment(MediaAttachment::Image {
+            source: MediaSource::Base64 {
+                data: "AAAA".into(),
             },
-        );
+            mime_type: None,
+        });
         let json = serde_json::to_value(build_chat_messages(&[msg], &None)).unwrap();
         let url = json[0]["content"][1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/jpeg;base64,"));
@@ -1585,16 +1571,10 @@ mod tests {
     fn process_stream_bytes_reassembles_lines_split_across_chunks() {
         let mut state = empty_stream_state();
         // First HTTP byte chunk: half of a data line, no newline.
-        process_stream_bytes(
-            &mut state,
-            br#"data: {"choices":[{"delta":{"conten"#,
-        );
+        process_stream_bytes(&mut state, br#"data: {"choices":[{"delta":{"conten"#);
         assert!(state.pending.is_empty(), "no complete line yet");
         // Second HTTP byte chunk: rest of the line + newline.
-        process_stream_bytes(
-            &mut state,
-            b"t\":\"Hi\"},\"finish_reason\":null}]}\n",
-        );
+        process_stream_bytes(&mut state, b"t\":\"Hi\"},\"finish_reason\":null}]}\n");
         assert_eq!(state.pending.len(), 1);
         let chunk = state.pending.pop_front().unwrap().unwrap();
         assert_eq!(chunk.content, "Hi");
@@ -1717,7 +1697,10 @@ mod tests {
             router: None,
             chain: None,
             payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Say hello in one sentence.".to_string())],
+                messages: vec![Message::text(
+                    MessageRole::User,
+                    "Say hello in one sentence.".to_string(),
+                )],
                 system: None,
                 max_tokens: Some(64),
                 temperature: Some(0.3),

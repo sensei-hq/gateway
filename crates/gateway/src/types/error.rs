@@ -121,96 +121,127 @@ mod tests {
             "budget exceeded: estimated 1.5000, remaining 0.5000"
         );
 
-        let err = GatewayError::AllAttemptsFailed { attempts: 3, errors: "x".into() };
+        let err = GatewayError::AllAttemptsFailed {
+            attempts: 3,
+            errors: "x".into(),
+        };
         assert_eq!(err.to_string(), "all 3 attempts failed: x");
     }
 
     #[test]
     fn is_retryable() {
-        assert!(GatewayError::RateLimit {
-            adapter: "a".into(),
-            retry_after_ms: None,
-        }
-        .is_retryable());
+        assert!(
+            GatewayError::RateLimit {
+                adapter: "a".into(),
+                retry_after_ms: None,
+            }
+            .is_retryable()
+        );
 
-        assert!(GatewayError::Timeout {
-            adapter: "a".into(),
-            model: "m".into(),
-            duration_ms: 1000,
-        }
-        .is_retryable());
+        assert!(
+            GatewayError::Timeout {
+                adapter: "a".into(),
+                model: "m".into(),
+                duration_ms: 1000,
+            }
+            .is_retryable()
+        );
 
-        assert!(GatewayError::ProviderError {
-            adapter: "a".into(),
-            message: "err".into(),
-            status: Some(500),
-        }
-        .is_retryable());
+        assert!(
+            GatewayError::ProviderError {
+                adapter: "a".into(),
+                message: "err".into(),
+                status: Some(500),
+            }
+            .is_retryable()
+        );
 
-        assert!(GatewayError::ModelUnavailable {
-            adapter: "a".into(),
-            model: "m".into(),
-        }
-        .is_retryable());
+        assert!(
+            GatewayError::ModelUnavailable {
+                adapter: "a".into(),
+                model: "m".into(),
+            }
+            .is_retryable()
+        );
 
         // Not retryable
-        assert!(!GatewayError::Authentication {
-            adapter: "a".into(),
-            message: "bad".into(),
-        }
-        .is_retryable());
+        assert!(
+            !GatewayError::Authentication {
+                adapter: "a".into(),
+                message: "bad".into(),
+            }
+            .is_retryable()
+        );
 
-        assert!(!GatewayError::BudgetExceeded {
-            estimated: 1.0,
-            remaining: 0.5,
-        }
-        .is_retryable());
+        assert!(
+            !GatewayError::BudgetExceeded {
+                estimated: 1.0,
+                remaining: 0.5,
+            }
+            .is_retryable()
+        );
 
-        assert!(!GatewayError::AllAttemptsFailed { attempts: 3, errors: String::new() }.is_retryable());
+        assert!(
+            !GatewayError::AllAttemptsFailed {
+                attempts: 3,
+                errors: String::new()
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
     fn should_trigger_fallback_matches_triggers() {
         let triggers = vec![FallbackTrigger::RateLimit, FallbackTrigger::Timeout];
 
-        assert!(GatewayError::RateLimit {
-            adapter: "a".into(),
-            retry_after_ms: None,
-        }
-        .should_trigger_fallback(&triggers));
+        assert!(
+            GatewayError::RateLimit {
+                adapter: "a".into(),
+                retry_after_ms: None,
+            }
+            .should_trigger_fallback(&triggers)
+        );
 
-        assert!(GatewayError::Timeout {
-            adapter: "a".into(),
-            model: "m".into(),
-            duration_ms: 1000,
-        }
-        .should_trigger_fallback(&triggers));
+        assert!(
+            GatewayError::Timeout {
+                adapter: "a".into(),
+                model: "m".into(),
+                duration_ms: 1000,
+            }
+            .should_trigger_fallback(&triggers)
+        );
 
         // ProviderError not in the trigger set
-        assert!(!GatewayError::ProviderError {
-            adapter: "a".into(),
-            message: "err".into(),
-            status: None,
-        }
-        .should_trigger_fallback(&triggers));
+        assert!(
+            !GatewayError::ProviderError {
+                adapter: "a".into(),
+                message: "err".into(),
+                status: None,
+            }
+            .should_trigger_fallback(&triggers)
+        );
     }
 
     #[test]
     fn should_trigger_fallback_empty_triggers() {
         let triggers: Vec<FallbackTrigger> = vec![];
 
-        assert!(!GatewayError::RateLimit {
-            adapter: "a".into(),
-            retry_after_ms: None,
-        }
-        .should_trigger_fallback(&triggers));
+        assert!(
+            !GatewayError::RateLimit {
+                adapter: "a".into(),
+                retry_after_ms: None,
+            }
+            .should_trigger_fallback(&triggers)
+        );
 
-        assert!(!GatewayError::Timeout {
-            adapter: "a".into(),
-            model: "m".into(),
-            duration_ms: 1000,
-        }
-        .should_trigger_fallback(&triggers));
+        assert!(
+            !GatewayError::Timeout {
+                adapter: "a".into(),
+                model: "m".into(),
+                duration_ms: 1000,
+            }
+            .should_trigger_fallback(&triggers)
+        );
     }
 
     #[test]
@@ -223,14 +254,21 @@ mod tests {
             FallbackTrigger::BudgetExceeded,
         ];
 
-        assert!(!GatewayError::Authentication {
-            adapter: "a".into(),
-            message: "bad key".into(),
-        }
-        .should_trigger_fallback(&all_triggers));
+        assert!(
+            !GatewayError::Authentication {
+                adapter: "a".into(),
+                message: "bad key".into(),
+            }
+            .should_trigger_fallback(&all_triggers)
+        );
 
-        assert!(!GatewayError::AllAttemptsFailed { attempts: 5, errors: String::new() }
-            .should_trigger_fallback(&all_triggers));
+        assert!(
+            !GatewayError::AllAttemptsFailed {
+                attempts: 5,
+                errors: String::new()
+            }
+            .should_trigger_fallback(&all_triggers)
+        );
     }
 
     #[test]
@@ -248,21 +286,25 @@ mod tests {
     #[test]
     fn model_unavailable_triggers_fallback() {
         let triggers = vec![FallbackTrigger::ModelUnavailable];
-        assert!(GatewayError::ModelUnavailable {
-            adapter: "a".into(),
-            model: "m".into(),
-        }
-        .should_trigger_fallback(&triggers));
+        assert!(
+            GatewayError::ModelUnavailable {
+                adapter: "a".into(),
+                model: "m".into(),
+            }
+            .should_trigger_fallback(&triggers)
+        );
     }
 
     #[test]
     fn budget_exceeded_triggers_fallback() {
         let triggers = vec![FallbackTrigger::BudgetExceeded];
-        assert!(GatewayError::BudgetExceeded {
-            estimated: 1.0,
-            remaining: 0.5,
-        }
-        .should_trigger_fallback(&triggers));
+        assert!(
+            GatewayError::BudgetExceeded {
+                estimated: 1.0,
+                remaining: 0.5,
+            }
+            .should_trigger_fallback(&triggers)
+        );
     }
 
     #[test]
@@ -278,9 +320,11 @@ mod tests {
 
         // We can't easily construct a reqwest::Error, so test the pattern
         // indirectly via the NoCandidates variant (also doesn't trigger fallback)
-        assert!(!GatewayError::NoCandidates {
-            capability: Capability::TextChat,
-        }
-        .should_trigger_fallback(&all_triggers));
+        assert!(
+            !GatewayError::NoCandidates {
+                capability: Capability::TextChat,
+            }
+            .should_trigger_fallback(&all_triggers)
+        );
     }
 }
