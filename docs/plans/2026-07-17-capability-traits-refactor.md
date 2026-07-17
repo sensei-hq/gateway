@@ -829,6 +829,33 @@ git commit -m "docs(features): sync capabilities page with shipped trait model"
 
 ---
 
+## Phase 5 — Security review & hardening (final gate)
+
+Run after Phase 4 is green. This is a full security checkup of the gateway crates; close any holes found before finishing the branch.
+
+### Task 5.1: Dependency & static analysis
+- [ ] `cargo audit` (install if absent) across the workspace — triage every RUSTSEC advisory; upgrade/patch or document why it's not exploitable. (The repo already has history here — rustls-webpki CVE work.)
+- [ ] Semgrep scan of `crates/**/*.rs` (Semgrep is available in this environment) — review findings, fix true positives.
+- [ ] `cargo clippy --workspace -- -D warnings` clean (already required, re-confirm).
+
+### Task 5.2: Credential-leakage review (highest priority for a key-handling gateway)
+- [ ] **`RouterConfig` derives `Debug` and holds `api_key: Option<String>`.** Audit every `{:?}`/`{:#?}`/`tracing::*` site that could print a `RouterConfig`, `GatewayConfig`, or a resolved key. Confirm no adapter, the engine, or the store logs the key. If any path can, implement a redacting `Debug` for `RouterConfig` (print `api_key: Some("***")`) or wrap the key in a `Secret`-style newtype (e.g. `secrecy`).
+- [ ] **Error messages.** Several adapters put the provider's raw response `body_text` into `GatewayError::{Authentication,ProviderError}`. Confirm those bodies can't echo the caller's key/secret, and that the request's own auth header/key is never formatted into an error.
+- [ ] **Attempt/trace surface.** Confirm `Attempt`/`StoredTrace`/`InferenceCall` never carry the api_key.
+
+### Task 5.3: Request-surface hardening
+- [ ] **SSRF note.** `RouterConfig.url` is caller-supplied and the gateway issues requests to it. Document the trust boundary (config is operator-supplied, not end-user-supplied). For the multi-tenant strategos consumer, flag that tenant-supplied base URLs would need SSRF filtering at that layer — out of scope for the library but must be recorded.
+- [ ] **Header injection.** `RouterConfig.headers` values are caller-supplied and set on outbound requests; confirm reqwest rejects CRLF (it does) and note it.
+- [ ] **Timeouts/DoS.** Confirm every adapter path has a bounded timeout (a wedged provider must not hang a worker forever — there's already a test for this on ollama).
+
+### Task 5.4: Report & close
+- [ ] Write findings + fixes to `docs/security/2026-07-17-gateway-security-review.md` (severity, file:line, fix or accepted-risk rationale).
+- [ ] Apply fixes; re-run the full gate (`cargo test` + `clippy` both crates, `cargo audit`, semgrep) green.
+
+> This security gate is a standing requirement — it must also run at the end of the AUTH track (OAuth tokens, refresh, credential storage), which is the most security-sensitive work in the roadmap.
+
+---
+
 ## Self-review notes (for the executor)
 
 - **Spec coverage:** every design-doc section maps to a task — traits (1.3), typed I/O 4b (1.2/1.4), registry (2.1), engine dispatch (4.1), migration across both crates (3.x), deletion of the fat trait (4.2), docs incl. features folder (Phase 0, 4.3).
