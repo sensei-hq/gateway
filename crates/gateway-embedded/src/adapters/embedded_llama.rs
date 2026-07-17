@@ -26,6 +26,7 @@ use gateway::adapters::InferenceAdapter;
 use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
+use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
 use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use std::collections::HashMap;
@@ -209,6 +210,104 @@ impl InferenceAdapter for EmbeddedLlamaAdapter {
             .worker_for_request(request, WorkerMode::Generation)
             .await?;
         worker.stream(config, request).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capability traits (target model). Traits + RegisterInto referenced by full
+// path to avoid the id() clash with InferenceAdapter during the bridge. The
+// non-streaming paths call each worker's trait-free `generate` / `embed`; the
+// stream path rebuilds the InferenceRequest envelope the worker's real
+// streaming loop expects (the per-model LlamaCppAdapter worker is not itself
+// migrated to the capability traits).
+// ---------------------------------------------------------------------------
+
+impl gateway::adapters::capability::Model for EmbeddedLlamaAdapter {
+    fn id(&self) -> &str {
+        &self.adapter_id
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::capability::ChatModel for EmbeddedLlamaAdapter {
+    async fn chat(
+        &self,
+        _config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let model_id = req.model.as_deref().ok_or_else(|| {
+            self.err("embedded-llama requires request.model (the model id to load)")
+        })?;
+        let worker = self.worker_for(model_id, WorkerMode::Generation).await?;
+        let content = worker.generate(
+            &req.messages,
+            req.system.as_deref(),
+            req.max_tokens,
+            req.temperature,
+        )?;
+        Ok(ChatResponse {
+            content: Some(content),
+            tool_calls: Vec::new(),
+            usage: None,
+            model: Some(model_id.to_string()),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
+        let model_id = req.model.as_deref().ok_or_else(|| {
+            self.err("embedded-llama requires request.model (the model id to load)")
+        })?;
+        let worker = self.worker_for(model_id, WorkerMode::Generation).await?;
+        // Rebuild the envelope the worker's InferenceAdapter::stream expects.
+        // request.model matches the worker's configured model_id (both derive
+        // from `model_id`), so the worker's model-mismatch guard passes.
+        let request = InferenceRequest {
+            capability: Capability::TextChat,
+            model: req.model.clone(),
+            router: None,
+            chain: None,
+            payload: Payload::Chat {
+                messages: req.messages.clone(),
+                system: req.system.clone(),
+                max_tokens: req.max_tokens,
+                temperature: req.temperature,
+                tools: req.tools.clone(),
+            },
+            budget: None,
+        };
+        worker.stream(config, &request).await
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::capability::EmbedModel for EmbeddedLlamaAdapter {
+    async fn embed(
+        &self,
+        _config: &RouterConfig,
+        req: &EmbedRequest,
+    ) -> Result<EmbedResponse, GatewayError> {
+        let model_id = req.model.as_deref().ok_or_else(|| {
+            self.err("embedded-llama requires request.model (the model id to load)")
+        })?;
+        let worker = self.worker_for(model_id, WorkerMode::Embedding).await?;
+        let embeddings = worker.embed(&req.texts)?;
+        Ok(EmbedResponse {
+            embeddings,
+            usage: None,
+        })
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::RegisterInto for EmbeddedLlamaAdapter {
+    async fn register_into(self: Arc<Self>, reg: &gateway::adapters::CapabilityRegistry) {
+        reg.register_chat(self.clone()).await;
+        reg.register_embed(self).await;
     }
 }
 

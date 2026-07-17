@@ -42,6 +42,7 @@ use gateway::adapters::InferenceAdapter;
 use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
+use gateway::types::io::{EmbedRequest, EmbedResponse};
 use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
 use std::path::Path;
 use std::pin::Pin;
@@ -363,6 +364,58 @@ impl InferenceAdapter for OrtAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Capability traits (target model — see the `gateway` crate's
+// docs/design/adapter-capability-traits.md). Additive alongside the existing
+// `InferenceAdapter` impl above, which is left intact during the bridge.
+// `Model` / `EmbedModel` / `RegisterInto` are referenced by full path so
+// `Model::id` doesn't clash with `InferenceAdapter::id`. ORT is embed-only.
+// ---------------------------------------------------------------------------
+
+impl gateway::adapters::capability::Model for OrtAdapter {
+    fn id(&self) -> &str {
+        &self.config.adapter_id
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::capability::EmbedModel for OrtAdapter {
+    async fn embed(
+        &self,
+        _config: &RouterConfig,
+        req: &EmbedRequest,
+    ) -> Result<EmbedResponse, GatewayError> {
+        // Model resolution mirrors the `Payload::Embed` arm of `execute`:
+        // an explicit, non-matching model name is rejected up front.
+        if let Some(requested) = &req.model
+            && requested != &self.config.model_id
+        {
+            return Err(GatewayError::ModelUnavailable {
+                adapter: self.config.adapter_id.clone(),
+                model: requested.clone(),
+            });
+        }
+
+        // Inherent `OrtAdapter::embed(&[String])` wins method resolution over
+        // this trait method, preserving the ONNX session + tokenizer path.
+        let embeddings = self.embed(&req.texts)?;
+        Ok(EmbedResponse {
+            embeddings,
+            usage: None,
+        })
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::RegisterInto for OrtAdapter {
+    async fn register_into(
+        self: std::sync::Arc<Self>,
+        reg: &gateway::adapters::CapabilityRegistry,
+    ) {
+        reg.register_embed(self).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +585,20 @@ mod tests {
                 "embedding[{i}]: expected ~unit length, got |v|={mag}",
             );
         }
+    }
+
+    /// The capability-trait `Model::id` must return the same id the legacy
+    /// `InferenceAdapter::id` does (the config's `adapter_id`). Constructing a
+    /// real `OrtAdapter` needs a live ONNX session, so this is gated on the
+    /// same `ORT_TEST_DIR` as the end-to-end embed test above; it still
+    /// compile-checks the full-path `Model::id` wiring on every build.
+    #[test]
+    #[ignore = "requires ORT_TEST_DIR env var pointing at an ONNX embedding model directory"]
+    fn capability_model_id_matches_config_adapter_id() {
+        let dir = std::env::var("ORT_TEST_DIR")
+            .expect("ORT_TEST_DIR must point at an ONNX embedding model directory");
+        let entry = external_entry(PathBuf::from(&dir).join("model.onnx"));
+        let adapter = OrtAdapter::load(&entry, OrtConfig::bert("test-ort")).expect("load");
+        assert_eq!(gateway::adapters::capability::Model::id(&adapter), "ort");
     }
 }
