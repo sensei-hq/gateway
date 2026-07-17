@@ -32,6 +32,7 @@ use gateway::adapters::InferenceAdapter;
 use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
+use gateway::types::io::{EmbedRequest, EmbedResponse};
 use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
 use std::path::Path;
 use std::pin::Pin;
@@ -218,6 +219,55 @@ impl InferenceAdapter for FastembedAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Capability traits (target model). Traits + RegisterInto referenced by full
+// path to avoid the id() clash with InferenceAdapter during the bridge.
+// Embed-only: fastembed serves the TextEmbed capability and nothing else.
+// ---------------------------------------------------------------------------
+
+impl gateway::adapters::capability::Model for FastembedAdapter {
+    fn id(&self) -> &str {
+        &self.config.adapter_id
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::capability::EmbedModel for FastembedAdapter {
+    async fn embed(
+        &self,
+        _cfg: &RouterConfig,
+        req: &EmbedRequest,
+    ) -> Result<EmbedResponse, GatewayError> {
+        // Preserve the legacy `execute` model resolution: reject a request
+        // pinned to a model this adapter does not serve.
+        if let Some(requested) = &req.model
+            && requested != &self.config.model_id
+        {
+            return Err(GatewayError::ModelUnavailable {
+                adapter: self.config.adapter_id.clone(),
+                model: requested.clone(),
+            });
+        }
+        // Inherent `FastembedAdapter::embed(&[String])` does the fastembed
+        // model loading/pooling; fastembed reports no token usage.
+        let embeddings = self.embed(&req.texts)?;
+        Ok(EmbedResponse {
+            embeddings,
+            usage: None,
+        })
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::RegisterInto for FastembedAdapter {
+    async fn register_into(
+        self: std::sync::Arc<Self>,
+        reg: &gateway::adapters::CapabilityRegistry,
+    ) {
+        reg.register_embed(self).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +366,25 @@ mod tests {
                 "embedding[{i}]: expected ~unit length, got |v|={mag}",
             );
         }
+    }
+
+    /// The capability-trait `Model::id` reports the same id as the legacy
+    /// `InferenceAdapter::id` (both read `config.adapter_id`). Constructing a
+    /// `FastembedAdapter` needs a real ONNX model, so this shares the
+    /// `FASTEMBED_TEST_DIR` guard of the e2e test above.
+    #[test]
+    #[ignore = "requires FASTEMBED_TEST_DIR env var pointing at a directory with the standard Qdrant ONNX layout"]
+    fn capability_model_id_matches_adapter_id() {
+        let dir = std::env::var("FASTEMBED_TEST_DIR")
+            .expect("FASTEMBED_TEST_DIR must point at an ONNX embedding model directory");
+        let entry = external_entry(PathBuf::from(&dir).join("model.onnx"));
+        let adapter =
+            FastembedAdapter::load(&entry, FastembedConfig::bert("test-fastembed")).expect("load");
+
+        // Full-path call avoids the InferenceAdapter::id() ambiguity.
+        assert_eq!(
+            gateway::adapters::capability::Model::id(&adapter),
+            "fastembed"
+        );
     }
 }
