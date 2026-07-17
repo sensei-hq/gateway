@@ -732,7 +732,7 @@ Same pattern, in `crates/gateway-embedded/src/adapters/`. These bodies are behin
 | Task | Adapter file | Traits | Feature |
 |---|---|---|---|
 | 3.17 | `llama_cpp.rs` | `ChatModel`, `EmbedModel` | `llama-cpp` |
-| 3.18 | `embedded_llama.rs` | `ChatModel`, `EmbedModel`, `SttModel`, `ImageModel` | `llama-cpp` |
+| 3.18 | `embedded_llama.rs` | `ChatModel`, `EmbedModel` | `llama-cpp` |
 | 3.19 | `fastembed.rs` | `EmbedModel` | `fastembed` |
 | 3.20 | `ort.rs` | `EmbedModel` | `ort` |
 
