@@ -13,6 +13,7 @@ use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
+use crate::types::io::{ChatRequest, ChatResponse};
 use crate::types::request::{
     InferenceRequest, InferenceResponse, MediaAttachment, MediaSource, Message, MessageContent,
     MessageRole, Payload, StreamChunk, StreamingToolCall, ToolCall, ToolDefinition,
@@ -771,6 +772,208 @@ fn process_sse_line(state: &mut AnthropicStreamState, line: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model). Traits + RegisterInto referenced by full
+// path to avoid the id() clash with InferenceAdapter during the bridge. The
+// SSE pipeline (process_stream_bytes / process_sse_line / AnthropicStreamState)
+// is shared verbatim with the legacy stream() method above.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for AnthropicAdapter {
+    fn id(&self) -> &str {
+        "anthropic"
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::ChatModel for AnthropicAdapter {
+    async fn chat(
+        &self,
+        config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let api_key = resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
+            adapter: "anthropic".into(),
+            message: "missing API key — set the env var specified in api_key_env".into(),
+        })?;
+
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let extracted_system = extract_system(&req.messages, &req.system);
+
+        let body = AnthropicRequest {
+            model: model.clone(),
+            messages: build_messages(&req.messages),
+            max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            system: extracted_system,
+            temperature: req.temperature,
+            stream: false,
+            tools: build_tools(&req.tools),
+        };
+
+        let url = format!("{}/v1/messages", config.url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(match status.as_u16() {
+                401 | 403 => GatewayError::Authentication {
+                    adapter: "anthropic".into(),
+                    message: body_text,
+                },
+                429 => GatewayError::RateLimit {
+                    adapter: "anthropic".into(),
+                    retry_after_ms: None,
+                },
+                _ => GatewayError::ProviderError {
+                    adapter: "anthropic".into(),
+                    message: body_text,
+                    status: Some(status.as_u16()),
+                },
+            });
+        }
+
+        let anthropic_resp: AnthropicResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "anthropic".into(),
+                message: format!("failed to parse response: {}", e),
+                status: Some(status.as_u16()),
+            })?;
+
+        let content = extract_text(&anthropic_resp.content);
+        let tool_calls = extract_tool_calls(&anthropic_resp.content);
+        let usage = usage_from_anthropic(&anthropic_resp.usage);
+
+        Ok(ChatResponse {
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls,
+            usage: Some(usage),
+            model: Some(model),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
+        let api_key = resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
+            adapter: "anthropic".into(),
+            message: "missing API key — set the env var specified in api_key_env".into(),
+        })?;
+
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let extracted_system = extract_system(&req.messages, &req.system);
+
+        let body = AnthropicRequest {
+            model,
+            messages: build_messages(&req.messages),
+            max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            system: extracted_system,
+            temperature: req.temperature,
+            stream: true,
+            // Streaming + tool calling is deferred — Anthropic emits
+            // `input_json_delta` events for tool arguments that need
+            // accumulation in the stream layer. v1 ships tools through
+            // execute() only.
+            tools: Vec::new(),
+        };
+
+        let url = format!("{}/v1/messages", config.url.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(&url)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(match status.as_u16() {
+                401 | 403 => GatewayError::Authentication {
+                    adapter: "anthropic".into(),
+                    message: body_text,
+                },
+                429 => GatewayError::RateLimit {
+                    adapter: "anthropic".into(),
+                    retry_after_ms: None,
+                },
+                _ => GatewayError::ProviderError {
+                    adapter: "anthropic".into(),
+                    message: body_text,
+                    status: Some(status.as_u16()),
+                },
+            });
+        }
+
+        let byte_stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(response.bytes_stream());
+        let initial = AnthropicStreamState {
+            byte_stream,
+            line_buf: String::new(),
+            tool_calls: BTreeMap::new(),
+            pending: VecDeque::new(),
+            eof: false,
+        };
+
+        let stream = futures::stream::unfold(initial, |mut state| async move {
+            loop {
+                if let Some(item) = state.pending.pop_front() {
+                    return Some((item, state));
+                }
+                if state.eof {
+                    return None;
+                }
+                match state.byte_stream.next().await {
+                    Some(Ok(bytes)) => process_stream_bytes(&mut state, &bytes),
+                    Some(Err(e)) => {
+                        state.pending.push_back(Err(GatewayError::ProviderError {
+                            adapter: "anthropic".into(),
+                            message: format!("anthropic stream error: {e}"),
+                            status: None,
+                        }));
+                        state.eof = true;
+                    }
+                    None => state.eof = true,
+                }
+            }
+        });
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for AnthropicAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_chat(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -790,6 +993,62 @@ mod tests {
         assert!(!adapter.supports(&Capability::AudioTranscribe));
         assert!(!adapter.supports(&Capability::AudioGenerate));
         assert!(!adapter.supports(&Capability::ImageGenerate));
+    }
+
+    #[test]
+    fn anthropic_capability_model_id() {
+        let adapter = AnthropicAdapter::new().unwrap();
+        // Full path avoids the id() ambiguity between InferenceAdapter and
+        // the capability Model trait.
+        assert_eq!(
+            crate::adapters::capability::Model::id(&adapter),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn chat_request_builds_expected_anthropic_body() {
+        // Mirrors build_anthropic_request_basic but drives the wire body from
+        // a capability-layer ChatRequest — exercising the same resolve-model /
+        // extract_system / build_messages / build_tools path chat() uses,
+        // without a network round-trip. Unlike chat_stream, the non-streaming
+        // chat path forwards tools.
+        let req = ChatRequest {
+            model: Some("claude-haiku-4-5-20250414".to_string()),
+            messages: vec![Message::text(MessageRole::User, "Hello")],
+            system: Some("Be terse.".to_string()),
+            max_tokens: Some(256),
+            temperature: Some(0.5),
+            tools: vec![ToolDefinition {
+                name: "get_weather".into(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        };
+
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let body = AnthropicRequest {
+            model: model.clone(),
+            messages: build_messages(&req.messages),
+            max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            system: extract_system(&req.messages, &req.system),
+            temperature: req.temperature,
+            stream: false,
+            tools: build_tools(&req.tools),
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["model"], "claude-haiku-4-5-20250414");
+        assert_eq!(json["max_tokens"], 256);
+        assert_eq!(json["system"], "Be terse.");
+        assert_eq!(json["stream"], false);
+        let blocks = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "Hello");
+        assert_eq!(json["tools"][0]["name"], "get_weather");
     }
 
     #[test]
