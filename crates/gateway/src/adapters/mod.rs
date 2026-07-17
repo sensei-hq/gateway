@@ -18,9 +18,7 @@ pub mod runway;
 pub mod stability;
 pub mod together;
 
-pub use capability::{
-    ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
-};
+pub use capability::{ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel};
 
 use std::collections::HashMap;
 use std::pin::Pin;
