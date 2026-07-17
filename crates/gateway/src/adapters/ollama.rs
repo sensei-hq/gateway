@@ -12,6 +12,7 @@ use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
+use crate::types::io::{ChatRequest, ChatResponse};
 use crate::types::request::{
     InferenceRequest, InferenceResponse, Message, MessageRole, Payload, StreamChunk,
 };
@@ -401,12 +402,227 @@ impl InferenceAdapter for OllamaAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model). Traits + RegisterInto referenced by full
+// path to avoid the id() clash with InferenceAdapter during the bridge.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for OllamaAdapter {
+    fn id(&self) -> &str {
+        "ollama"
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::ChatModel for OllamaAdapter {
+    async fn chat(
+        &self,
+        config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let api_key = resolve_api_key(config);
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let body = ChatCompletionRequest {
+            model: model.clone(),
+            messages: build_chat_messages(&req.messages, &req.system),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            stream: false,
+        };
+        let resp: ChatCompletionResponse = http_json(
+            &self.client,
+            &config.url,
+            "/v1/chat/completions",
+            &body,
+            api_key.as_deref(),
+            &config.headers,
+        )
+        .await?;
+        let content = resp.choices.first().and_then(|c| c.message.content.clone());
+        let usage = usage_from_response(&resp.usage);
+        Ok(ChatResponse {
+            content,
+            tool_calls: Vec::new(),
+            usage,
+            model: Some(model),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        config: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
+        let api_key = resolve_api_key(config);
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let body = ChatCompletionRequest {
+            model,
+            messages: build_chat_messages(&req.messages, &req.system),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            stream: true,
+        };
+
+        let url = format!("{}/v1/chat/completions", config.url.trim_end_matches('/'));
+        let mut request = self.client.post(&url).json(&body);
+
+        if let Some(key) = &api_key {
+            request = request.bearer_auth(key);
+        }
+        for (k, v) in &config.headers {
+            request = request.header(k.as_str(), v.as_str());
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "ollama".into(),
+                message: body_text,
+                status: Some(status.as_u16()),
+            });
+        }
+
+        let byte_stream = response.bytes_stream();
+
+        let stream = byte_stream
+            .map(|result| -> Result<Vec<StreamChunk>, GatewayError> {
+                let bytes = result?;
+                let text = String::from_utf8_lossy(&bytes);
+                let mut chunks = Vec::new();
+
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line == "data: [DONE]" {
+                        continue;
+                    }
+                    let json_str = line.strip_prefix("data: ").unwrap_or(line);
+                    if let Ok(parsed) = serde_json::from_str::<StreamChatResponse>(json_str)
+                        && let Some(choice) = parsed.choices.first()
+                    {
+                        let content = choice.delta.content.clone().unwrap_or_default();
+                        let usage = usage_from_response(&parsed.usage);
+                        chunks.push(StreamChunk {
+                            content,
+                            finish_reason: choice.finish_reason.clone(),
+                            usage,
+                            tool_calls: Vec::new(),
+                        });
+                    }
+                }
+
+                Ok(chunks)
+            })
+            .map(
+                |result| -> futures::stream::Iter<
+                    std::vec::IntoIter<Result<StreamChunk, GatewayError>>,
+                > {
+                    match result {
+                        Ok(chunks) => {
+                            futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+                        }
+                        Err(e) => futures::stream::iter(vec![Err(e)]),
+                    }
+                },
+            )
+            .flatten();
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::EmbedModel for OllamaAdapter {
+    async fn embed(
+        &self,
+        config: &RouterConfig,
+        req: &crate::types::io::EmbedRequest,
+    ) -> Result<crate::types::io::EmbedResponse, GatewayError> {
+        let api_key = resolve_api_key(config);
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let body = EmbedRequest {
+            model,
+            input: req.texts.clone(),
+        };
+        let resp: EmbedResponse = http_json(
+            &self.client,
+            &config.url,
+            "/v1/embeddings",
+            &body,
+            api_key.as_deref(),
+            &config.headers,
+        )
+        .await?;
+        let embeddings: Vec<Vec<f32>> = resp.data.into_iter().map(|d| d.embedding).collect();
+        let usage = usage_from_response(&resp.usage);
+        Ok(crate::types::io::EmbedResponse { embeddings, usage })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for OllamaAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_chat(self.clone()).await;
+        reg.register_embed(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn embed_capability_times_out_against_a_silent_server() {
+        use crate::adapters::capability::EmbedModel;
+        // Same silent-server setup as the execute-path timeout test, but
+        // driving the typed EmbedModel::embed method.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in listener.incoming().flatten() {
+                held.push(s);
+            }
+        });
+
+        let config = RouterConfig {
+            url: format!("http://{}", addr),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: Some(300),
+            headers: std::collections::HashMap::new(),
+        };
+        let adapter = OllamaAdapter::from_config(&config).unwrap();
+        let req = crate::types::io::EmbedRequest {
+            model: Some("all-minilm".to_string()),
+            texts: vec!["hello".to_string()],
+        };
+
+        let start = std::time::Instant::now();
+        let result = adapter.embed(&config, &req).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "silent server must error, not hang");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must time out promptly, took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn ollama_id_and_supports() {
