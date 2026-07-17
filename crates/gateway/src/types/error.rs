@@ -32,6 +32,11 @@ pub enum GatewayError {
     #[error("model '{model}' unavailable on adapter '{adapter}'")]
     ModelUnavailable { adapter: String, model: String },
 
+    /// The adapter exists for this capability but cannot perform the
+    /// requested sub-operation (e.g. a chat adapter that has no streaming).
+    #[error("adapter '{adapter}' does not support {what}")]
+    Unsupported { adapter: String, what: String },
+
     #[error("no candidates available for capability '{capability:?}'")]
     NoCandidates { capability: Capability },
 
@@ -77,8 +82,9 @@ impl GatewayError {
             GatewayError::BudgetExceeded { .. } => {
                 triggers.contains(&FallbackTrigger::BudgetExceeded)
             }
-            // Auth and AllAttemptsFailed never trigger fallback
+            // Auth, Unsupported, and AllAttemptsFailed never trigger fallback
             GatewayError::Authentication { .. }
+            | GatewayError::Unsupported { .. }
             | GatewayError::AllAttemptsFailed { .. }
             | GatewayError::NoCandidates { .. }
             | GatewayError::NotConfigured
@@ -269,6 +275,34 @@ mod tests {
             }
             .should_trigger_fallback(&all_triggers)
         );
+    }
+
+    #[test]
+    fn unsupported_error_displays_adapter_and_capability() {
+        let e = GatewayError::Unsupported {
+            adapter: "grok".into(),
+            what: "streaming".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("grok"));
+        assert!(s.contains("streaming"));
+    }
+
+    #[test]
+    fn unsupported_error_never_triggers_fallback_and_is_not_retryable() {
+        let all_triggers = vec![
+            FallbackTrigger::RateLimit,
+            FallbackTrigger::Timeout,
+            FallbackTrigger::ProviderError,
+            FallbackTrigger::ModelUnavailable,
+            FallbackTrigger::BudgetExceeded,
+        ];
+        let e = GatewayError::Unsupported {
+            adapter: "a".into(),
+            what: "streaming".into(),
+        };
+        assert!(!e.should_trigger_fallback(&all_triggers));
+        assert!(!e.is_retryable());
     }
 
     #[test]

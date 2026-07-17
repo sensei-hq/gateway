@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod async_job;
 pub mod base;
 pub mod bedrock;
+pub mod capability;
 pub mod fal;
 pub mod flux;
 pub mod gemini;
@@ -16,6 +17,10 @@ pub mod replicate;
 pub mod runway;
 pub mod stability;
 pub mod together;
+
+pub use capability::{
+    ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
+};
 
 use std::collections::HashMap;
 use std::pin::Pin;
