@@ -11,6 +11,7 @@ use crate::adapters::async_job::{JobConfig, poll_until_complete};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
+use crate::types::io::{VideoRequest, VideoResponse};
 use crate::types::request::{
     InferenceRequest, InferenceResponse, Payload, StreamChunk, VideoResult,
 };
@@ -237,6 +238,127 @@ impl InferenceAdapter for RunwayAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model — see
+// docs/design/adapter-capability-traits.md). Additive; the legacy
+// `InferenceAdapter` impl above is retired in a later phase.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for RunwayAdapter {
+    fn id(&self) -> &str {
+        "runway"
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::VideoModel for RunwayAdapter {
+    async fn generate_video(
+        &self,
+        cfg: &RouterConfig,
+        req: &VideoRequest,
+    ) -> Result<VideoResponse, GatewayError> {
+        let api_key = require_api_key(cfg)?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let url_base = base_url(cfg);
+
+        // 1. Submit task
+        let body = RunwayTaskRequest {
+            model: model.clone(),
+            task_type: "text-to-video".to_string(),
+            text_prompt: req.prompt.clone(),
+            duration: req.duration_secs,
+        };
+
+        let submit_url = format!("{url_base}/tasks");
+        let resp = self
+            .client
+            .post(&submit_url)
+            .json(&body)
+            .bearer_auth(&api_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "runway".into(),
+                message: body_text,
+                status: Some(status.as_u16()),
+            });
+        }
+
+        let task: RunwayTaskResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "runway".into(),
+                message: format!("failed to parse task response: {e}"),
+                status: Some(status.as_u16()),
+            })?;
+
+        // 2. Poll until complete
+        let task_id = task.id;
+        let poll_url = format!("{url_base}/tasks/{task_id}");
+        let job_config = JobConfig::default();
+        let client = &self.client;
+        let api_key_ref = &api_key;
+
+        let task_status = poll_until_complete(&job_config, || async {
+            let resp = client
+                .get(&poll_url)
+                .bearer_auth(api_key_ref)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::ProviderError {
+                    adapter: "runway".into(),
+                    message: body_text,
+                    status: None,
+                });
+            }
+
+            let status: RunwayTaskStatus =
+                resp.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "runway".into(),
+                    message: format!("failed to parse task status: {e}"),
+                    status: None,
+                })?;
+
+            match status.status.as_str() {
+                "SUCCEEDED" => Ok(Some(status)),
+                "FAILED" => Err(GatewayError::ProviderError {
+                    adapter: "runway".into(),
+                    message: status.failure.unwrap_or_else(|| "task failed".to_string()),
+                    status: None,
+                }),
+                _ => Ok(None), // PENDING, RUNNING
+            }
+        })
+        .await?;
+
+        // 3. Extract video URL
+        let video_url = task_status.output.and_then(|urls| urls.into_iter().next());
+
+        Ok(VideoResponse {
+            videos: vec![VideoResult {
+                url: video_url,
+                duration_secs: req.duration_secs.map(|d| d as f32),
+            }],
+        })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for RunwayAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_video(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -252,6 +374,14 @@ mod tests {
         assert!(adapter.supports(&Capability::VideoGenerate));
         assert!(!adapter.supports(&Capability::TextChat));
         assert!(!adapter.supports(&Capability::TextEmbed));
+    }
+
+    #[test]
+    fn runway_capability_model_id() {
+        let adapter = RunwayAdapter::new().unwrap();
+        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // and the capability `Model` trait.
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "runway");
     }
 
     #[test]
