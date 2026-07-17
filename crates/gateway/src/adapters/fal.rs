@@ -11,6 +11,7 @@ use crate::adapters::async_job::{JobConfig, poll_until_complete};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
+use crate::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
 use crate::types::request::{
     ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk, VideoResult,
 };
@@ -424,6 +425,281 @@ impl InferenceAdapter for FalAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model — see
+// docs/design/adapter-capability-traits.md). Additive alongside the legacy
+// `InferenceAdapter` impl above, which stays until the engine cuts over.
+// The capability traits are referenced by full path so their `Model::id`
+// method does not collide with `InferenceAdapter::id` in method resolution.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for FalAdapter {
+    fn id(&self) -> &str {
+        "fal"
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::ImageModel for FalAdapter {
+    async fn generate_image(
+        &self,
+        config: &RouterConfig,
+        req: &ImageRequest,
+    ) -> Result<ImageResponse, GatewayError> {
+        let api_key = require_api_key(config)?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| "fal-ai/flux-pro/v1.1".to_string());
+        let url_base = base_url(config);
+        let auth_header = format!("Key {api_key}");
+
+        let body = FalImageRequest {
+            prompt: req.prompt.clone(),
+        };
+
+        let submit_url = format!("{url_base}/{model}");
+        let resp = self
+            .client
+            .post(&submit_url)
+            .json(&body)
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: body_text,
+                status: Some(status.as_u16()),
+            });
+        }
+
+        let queue: FalQueueResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: format!("failed to parse queue response: {e}"),
+                status: Some(status.as_u16()),
+            })?;
+
+        let request_id = queue.request_id;
+        let status_url = format!("{url_base}/requests/{request_id}/status");
+        let job_config = JobConfig::default();
+        let client = &self.client;
+        let auth_ref = &auth_header;
+
+        poll_until_complete(&job_config, || async {
+            let resp = client
+                .get(&status_url)
+                .header("Authorization", auth_ref)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::ProviderError {
+                    adapter: "fal".into(),
+                    message: body_text,
+                    status: None,
+                });
+            }
+
+            let fal_status: FalStatusResponse =
+                resp.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "fal".into(),
+                    message: format!("failed to parse status response: {e}"),
+                    status: None,
+                })?;
+
+            match fal_status.status.as_str() {
+                "COMPLETED" => Ok(Some(())),
+                "FAILED" => Err(GatewayError::ProviderError {
+                    adapter: "fal".into(),
+                    message: "fal.ai request failed".to_string(),
+                    status: None,
+                }),
+                _ => Ok(None),
+            }
+        })
+        .await?;
+
+        let result_url = format!("{url_base}/requests/{request_id}");
+        let resp = self
+            .client
+            .get(&result_url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+
+        let resp_status = resp.status();
+        if !resp_status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: body_text,
+                status: Some(resp_status.as_u16()),
+            });
+        }
+
+        let result: FalImageResult =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: format!("failed to parse image result: {e}"),
+                status: None,
+            })?;
+
+        let images: Vec<ImageResult> = result
+            .images
+            .into_iter()
+            .map(|img| ImageResult {
+                url: Some(img.url),
+                b64_json: None,
+                revised_prompt: None,
+            })
+            .collect();
+
+        Ok(ImageResponse { images })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::VideoModel for FalAdapter {
+    async fn generate_video(
+        &self,
+        config: &RouterConfig,
+        req: &VideoRequest,
+    ) -> Result<VideoResponse, GatewayError> {
+        let api_key = require_api_key(config)?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let url_base = base_url(config);
+        let auth_header = format!("Key {api_key}");
+        let duration_secs = req.duration_secs;
+
+        // 1. Submit to queue
+        let body = FalVideoRequest {
+            prompt: req.prompt.clone(),
+            duration: duration_secs,
+            aspect_ratio: None,
+        };
+
+        let submit_url = format!("{url_base}/{model}");
+        let resp = self
+            .client
+            .post(&submit_url)
+            .json(&body)
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: body_text,
+                status: Some(status.as_u16()),
+            });
+        }
+
+        let queue: FalQueueResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: format!("failed to parse queue response: {e}"),
+                status: Some(status.as_u16()),
+            })?;
+
+        // 2. Poll status until COMPLETED
+        let request_id = queue.request_id;
+        let status_url = format!("{url_base}/requests/{request_id}/status");
+        let job_config = JobConfig::default();
+        let client = &self.client;
+        let auth_ref = &auth_header;
+
+        poll_until_complete(&job_config, || async {
+            let resp = client
+                .get(&status_url)
+                .header("Authorization", auth_ref)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::ProviderError {
+                    adapter: "fal".into(),
+                    message: body_text,
+                    status: None,
+                });
+            }
+
+            let fal_status: FalStatusResponse =
+                resp.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "fal".into(),
+                    message: format!("failed to parse status response: {e}"),
+                    status: None,
+                })?;
+
+            match fal_status.status.as_str() {
+                "COMPLETED" => Ok(Some(())),
+                "FAILED" => Err(GatewayError::ProviderError {
+                    adapter: "fal".into(),
+                    message: "fal.ai request failed".to_string(),
+                    status: None,
+                }),
+                _ => Ok(None), // IN_QUEUE, IN_PROGRESS
+            }
+        })
+        .await?;
+
+        // 3. Fetch result
+        let result_url = format!("{url_base}/requests/{request_id}");
+        let resp = self
+            .client
+            .get(&result_url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+
+        let resp_status = resp.status();
+        if !resp_status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: body_text,
+                status: Some(resp_status.as_u16()),
+            });
+        }
+
+        let result: FalResultResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "fal".into(),
+                message: format!("failed to parse result response: {e}"),
+                status: None,
+            })?;
+
+        let video_url = result.video.map(|v| v.url);
+
+        Ok(VideoResponse {
+            videos: vec![VideoResult {
+                url: video_url,
+                duration_secs: duration_secs.map(|d| d as f32),
+            }],
+        })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for FalAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_image(self.clone()).await;
+        reg.register_video(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -439,6 +715,14 @@ mod tests {
         assert!(adapter.supports(&Capability::VideoGenerate));
         assert!(!adapter.supports(&Capability::TextChat));
         assert!(!adapter.supports(&Capability::TextEmbed));
+    }
+
+    #[test]
+    fn fal_capability_model_id() {
+        let adapter = FalAdapter::new().unwrap();
+        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // and the capability `Model` trait.
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "fal");
     }
 
     #[test]

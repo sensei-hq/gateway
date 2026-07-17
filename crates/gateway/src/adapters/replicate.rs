@@ -11,6 +11,7 @@ use crate::adapters::async_job::{JobConfig, poll_until_complete};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
+use crate::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
 use crate::types::request::{
     ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk, VideoResult,
 };
@@ -367,6 +368,247 @@ impl InferenceAdapter for ReplicateAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model — see
+// docs/design/adapter-capability-traits.md). Additive alongside the legacy
+// `InferenceAdapter` impl above, which stays until the engine cuts over.
+// The capability traits are referenced by full path so their `Model::id`
+// method does not collide with `InferenceAdapter::id` in method resolution.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for ReplicateAdapter {
+    fn id(&self) -> &str {
+        "replicate"
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::ImageModel for ReplicateAdapter {
+    async fn generate_image(
+        &self,
+        config: &RouterConfig,
+        req: &ImageRequest,
+    ) -> Result<ImageResponse, GatewayError> {
+        let api_key = require_api_key(config)?;
+        let url_base = base_url(config);
+
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| "black-forest-labs/flux-schnell".to_string());
+
+        let input = serde_json::json!({ "prompt": req.prompt });
+        let body = ReplicatePredictionRequest {
+            model: model.clone(),
+            input,
+        };
+
+        let submit_url = format!("{url_base}/predictions");
+        let resp = self
+            .client
+            .post(&submit_url)
+            .json(&body)
+            .bearer_auth(&api_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "replicate".into(),
+                message: body_text,
+                status: Some(status.as_u16()),
+            });
+        }
+
+        let prediction: ReplicatePredictionResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "replicate".into(),
+                message: format!("failed to parse prediction response: {e}"),
+                status: Some(status.as_u16()),
+            })?;
+
+        let prediction_id = prediction.id;
+        let poll_url = format!("{url_base}/predictions/{prediction_id}");
+        let job_config = JobConfig::default();
+        let client = &self.client;
+        let api_key_ref = &api_key;
+
+        let final_prediction = poll_until_complete(&job_config, || async {
+            let resp = client
+                .get(&poll_url)
+                .bearer_auth(api_key_ref)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::ProviderError {
+                    adapter: "replicate".into(),
+                    message: body_text,
+                    status: None,
+                });
+            }
+
+            let pred: ReplicatePredictionResponse =
+                resp.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "replicate".into(),
+                    message: format!("failed to parse prediction status: {e}"),
+                    status: None,
+                })?;
+
+            match pred.status.as_str() {
+                "succeeded" => Ok(Some(pred)),
+                "failed" | "canceled" => Err(GatewayError::ProviderError {
+                    adapter: "replicate".into(),
+                    message: pred
+                        .error
+                        .unwrap_or_else(|| "prediction failed".to_string()),
+                    status: None,
+                }),
+                _ => Ok(None),
+            }
+        })
+        .await?;
+
+        // Output is array of URL strings
+        let images: Vec<ImageResult> = final_prediction
+            .output
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|url| ImageResult {
+                        url: Some(url.to_string()),
+                        b64_json: None,
+                        revised_prompt: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(ImageResponse { images })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::VideoModel for ReplicateAdapter {
+    async fn generate_video(
+        &self,
+        config: &RouterConfig,
+        req: &VideoRequest,
+    ) -> Result<VideoResponse, GatewayError> {
+        let api_key = require_api_key(config)?;
+        let url_base = base_url(config);
+
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+        // 1. Create prediction
+        let mut input = serde_json::json!({ "prompt": req.prompt });
+        if let Some(dur) = req.duration_secs {
+            input["duration"] = serde_json::json!(dur);
+        }
+
+        let body = ReplicatePredictionRequest {
+            model: model.clone(),
+            input,
+        };
+
+        let submit_url = format!("{url_base}/predictions");
+        let resp = self
+            .client
+            .post(&submit_url)
+            .json(&body)
+            .bearer_auth(&api_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "replicate".into(),
+                message: body_text,
+                status: Some(status.as_u16()),
+            });
+        }
+
+        let prediction: ReplicatePredictionResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "replicate".into(),
+                message: format!("failed to parse prediction response: {e}"),
+                status: Some(status.as_u16()),
+            })?;
+
+        // 2. Poll until complete
+        let prediction_id = prediction.id;
+        let poll_url = format!("{url_base}/predictions/{prediction_id}");
+        let job_config = JobConfig::default();
+        let client = &self.client;
+        let api_key_ref = &api_key;
+
+        let final_prediction = poll_until_complete(&job_config, || async {
+            let resp = client
+                .get(&poll_url)
+                .bearer_auth(api_key_ref)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::ProviderError {
+                    adapter: "replicate".into(),
+                    message: body_text,
+                    status: None,
+                });
+            }
+
+            let pred: ReplicatePredictionResponse =
+                resp.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "replicate".into(),
+                    message: format!("failed to parse prediction status: {e}"),
+                    status: None,
+                })?;
+
+            match pred.status.as_str() {
+                "succeeded" => Ok(Some(pred)),
+                "failed" | "canceled" => Err(GatewayError::ProviderError {
+                    adapter: "replicate".into(),
+                    message: pred
+                        .error
+                        .unwrap_or_else(|| "prediction failed".to_string()),
+                    status: None,
+                }),
+                _ => Ok(None), // starting, processing
+            }
+        })
+        .await?;
+
+        // 3. Extract video URL from output
+        let video_url = final_prediction.output.as_ref().and_then(extract_video_url);
+
+        Ok(VideoResponse {
+            videos: vec![VideoResult {
+                url: video_url,
+                duration_secs: req.duration_secs.map(|d| d as f32),
+            }],
+        })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for ReplicateAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_image(self.clone()).await;
+        reg.register_video(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -389,6 +631,17 @@ mod tests {
         let adapter = ReplicateAdapter::new().unwrap();
         assert!(adapter.supports(&Capability::ImageGenerate));
         assert!(adapter.supports(&Capability::VideoGenerate));
+    }
+
+    #[test]
+    fn replicate_capability_model_id() {
+        let adapter = ReplicateAdapter::new().unwrap();
+        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // and the capability `Model` trait.
+        assert_eq!(
+            crate::adapters::capability::Model::id(&adapter),
+            "replicate"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::adapters::async_job::{JobConfig, poll_until_complete};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
+use crate::types::io::{VideoRequest, VideoResponse};
 use crate::types::request::{
     InferenceRequest, InferenceResponse, Payload, StreamChunk, VideoResult,
 };
@@ -272,6 +273,145 @@ impl InferenceAdapter for KlingAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Capability traits (target model — see
+// docs/design/adapter-capability-traits.md). Additive alongside the legacy
+// `InferenceAdapter` impl above, which stays until the engine cuts over.
+// The capability traits are referenced by full path so their `Model::id`
+// method does not collide with `InferenceAdapter::id` in method resolution.
+// ---------------------------------------------------------------------------
+
+impl crate::adapters::capability::Model for KlingAdapter {
+    fn id(&self) -> &str {
+        "kling"
+    }
+}
+
+#[async_trait]
+impl crate::adapters::capability::VideoModel for KlingAdapter {
+    async fn generate_video(
+        &self,
+        config: &RouterConfig,
+        req: &VideoRequest,
+    ) -> Result<VideoResponse, GatewayError> {
+        let api_key = require_api_key(config)?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let url_base = base_url(config);
+
+        // Map resolution to aspect ratio if provided
+        let aspect_ratio = req.resolution.as_deref().map(|r| match r {
+            "1080p" | "720p" | "1920x1080" | "1280x720" => "16:9".to_string(),
+            "square" | "1:1" => "1:1".to_string(),
+            other => other.to_string(),
+        });
+
+        // 1. Submit task
+        let body = KlingVideoRequest {
+            prompt: req.prompt.clone(),
+            model_name: model,
+            duration: req.duration_secs.map(|d| d.to_string()),
+            aspect_ratio,
+        };
+
+        let submit_url = format!("{url_base}/videos/text2video");
+        let resp = self
+            .client
+            .post(&submit_url)
+            .json(&body)
+            .bearer_auth(&api_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ProviderError {
+                adapter: "kling".into(),
+                message: body_text,
+                status: Some(status.as_u16()),
+            });
+        }
+
+        let task: KlingTaskResponse =
+            resp.json().await.map_err(|e| GatewayError::ProviderError {
+                adapter: "kling".into(),
+                message: format!("failed to parse task response: {e}"),
+                status: Some(status.as_u16()),
+            })?;
+
+        // 2. Poll until complete
+        let task_id = task.data.task_id;
+        let poll_url = format!("{url_base}/videos/text2video/{task_id}");
+        let job_config = JobConfig::default();
+        let client = &self.client;
+        let api_key_ref = &api_key;
+
+        let task_status = poll_until_complete(&job_config, || async {
+            let resp = client
+                .get(&poll_url)
+                .bearer_auth(api_key_ref)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::ProviderError {
+                    adapter: "kling".into(),
+                    message: body_text,
+                    status: None,
+                });
+            }
+
+            let status: KlingTaskStatus =
+                resp.json().await.map_err(|e| GatewayError::ProviderError {
+                    adapter: "kling".into(),
+                    message: format!("failed to parse task status: {e}"),
+                    status: None,
+                })?;
+
+            match status.data.task_status.as_str() {
+                "succeed" => Ok(Some(status)),
+                "failed" => Err(GatewayError::ProviderError {
+                    adapter: "kling".into(),
+                    message: "video generation task failed".to_string(),
+                    status: None,
+                }),
+                _ => Ok(None), // submitted, processing
+            }
+        })
+        .await?;
+
+        // 3. Extract video URL and duration
+        let video = task_status
+            .data
+            .task_result
+            .and_then(|r| r.videos)
+            .and_then(|v| v.into_iter().next());
+
+        let (video_url, video_duration) = match video {
+            Some(v) => (Some(v.url), v.duration),
+            None => (None, None),
+        };
+
+        Ok(VideoResponse {
+            videos: vec![VideoResult {
+                url: video_url,
+                duration_secs: video_duration.or(req.duration_secs.map(|d| d as f32)),
+            }],
+        })
+    }
+}
+
+#[async_trait]
+impl crate::adapters::RegisterInto for KlingAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+        reg.register_video(self).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -287,6 +427,14 @@ mod tests {
         assert!(adapter.supports(&Capability::VideoGenerate));
         assert!(!adapter.supports(&Capability::TextChat));
         assert!(!adapter.supports(&Capability::TextEmbed));
+    }
+
+    #[test]
+    fn kling_capability_model_id() {
+        let adapter = KlingAdapter::new().unwrap();
+        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // and the capability `Model` trait.
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "kling");
     }
 
     #[test]
