@@ -79,11 +79,7 @@ struct GeminiPart {
     /// External file reference. `file_uri` is typically a `gs://`
     /// Cloud Storage URI; HTTPS URLs work only when the resource is
     /// publicly accessible to Gemini at request time.
-    #[serde(
-        default,
-        rename = "fileData",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "fileData", skip_serializing_if = "Option::is_none")]
     file_data: Option<GeminiFileData>,
 }
 
@@ -541,11 +537,13 @@ async fn gemini_post<Req: Serialize, Resp: serde::de::DeserializeOwned>(
             },
         });
     }
-    resp.json::<Resp>().await.map_err(|e| GatewayError::ProviderError {
-        adapter: ADAPTER_ID.into(),
-        message: format!("failed to parse response: {e}"),
-        status: Some(status.as_u16()),
-    })
+    resp.json::<Resp>()
+        .await
+        .map_err(|e| GatewayError::ProviderError {
+            adapter: ADAPTER_ID.into(),
+            message: format!("failed to parse response: {e}"),
+            status: Some(status.as_u16()),
+        })
 }
 
 /// Parse a single SSE `data: …` line emitted by
@@ -626,8 +624,9 @@ impl GeminiAdapter {
     fn missing_key_err() -> GatewayError {
         GatewayError::Authentication {
             adapter: ADAPTER_ID.into(),
-            message: "missing API key — set the env var specified in api_key_env (e.g. GEMINI_API_KEY)"
-                .into(),
+            message:
+                "missing API key — set the env var specified in api_key_env (e.g. GEMINI_API_KEY)"
+                    .into(),
         }
     }
 }
@@ -664,12 +663,13 @@ impl InferenceAdapter for GeminiAdapter {
                     model
                 );
 
-                let generation_config = (max_tokens.is_some() || temperature.is_some()).then(|| {
-                    GeminiGenerationConfig {
-                        max_output_tokens: Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
-                        temperature: *temperature,
-                    }
-                });
+                let generation_config =
+                    (max_tokens.is_some() || temperature.is_some()).then(|| {
+                        GeminiGenerationConfig {
+                            max_output_tokens: Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+                            temperature: *temperature,
+                        }
+                    });
 
                 let body = GeminiChatRequest {
                     contents: build_contents(messages),
@@ -687,7 +687,11 @@ impl InferenceAdapter for GeminiAdapter {
 
                 Ok(InferenceResponse {
                     success: true,
-                    content: if content.is_empty() { None } else { Some(content) },
+                    content: if content.is_empty() {
+                        None
+                    } else {
+                        Some(content)
+                    },
                     embeddings: None,
                     transcription: None,
                     audio: None,
@@ -803,12 +807,11 @@ impl InferenceAdapter for GeminiAdapter {
             model
         );
 
-        let generation_config = (max_tokens.is_some() || temperature.is_some()).then(|| {
-            GeminiGenerationConfig {
+        let generation_config =
+            (max_tokens.is_some() || temperature.is_some()).then(|| GeminiGenerationConfig {
                 max_output_tokens: Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
                 temperature: *temperature,
-            }
-        });
+            });
 
         let body = GeminiChatRequest {
             contents: build_contents(messages),
@@ -850,11 +853,13 @@ impl InferenceAdapter for GeminiAdapter {
 
         let byte_stream = response.bytes_stream();
         let stream = byte_stream
-            .map(|result| -> Result<Vec<Result<StreamChunk, GatewayError>>, GatewayError> {
-                let bytes = result?;
-                let text = String::from_utf8_lossy(&bytes);
-                Ok(text.lines().filter_map(parse_stream_line).collect())
-            })
+            .map(
+                |result| -> Result<Vec<Result<StreamChunk, GatewayError>>, GatewayError> {
+                    let bytes = result?;
+                    let text = String::from_utf8_lossy(&bytes);
+                    Ok(text.lines().filter_map(parse_stream_line).collect())
+                },
+            )
             .map(|result| match result {
                 Ok(chunks) => futures::stream::iter(chunks),
                 Err(e) => futures::stream::iter(vec![Err(e)]),
@@ -1247,14 +1252,12 @@ mod tests {
 
     #[test]
     fn build_parts_defaults_inline_mime_type_to_image_jpeg_when_unspecified() {
-        let msg = Message::text(MessageRole::User, "x").with_attachment(
-            MediaAttachment::Image {
-                source: MediaSource::Base64 {
-                    data: "AAAA".into(),
-                },
-                mime_type: None,
+        let msg = Message::text(MessageRole::User, "x").with_attachment(MediaAttachment::Image {
+            source: MediaSource::Base64 {
+                data: "AAAA".into(),
             },
-        );
+            mime_type: None,
+        });
         let parts = build_parts(&msg);
         assert_eq!(
             parts[1].inline_data.as_ref().unwrap().mime_type,

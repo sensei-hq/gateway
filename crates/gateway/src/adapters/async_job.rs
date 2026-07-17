@@ -50,8 +50,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[tokio::test]
     async fn poll_completes_immediately() {
@@ -99,9 +99,10 @@ mod tests {
             max_wait: Duration::from_millis(50),
         };
 
-        let result: Result<String, _> =
-            poll_until_complete(&config, || async { Ok::<Option<String>, GatewayError>(None) })
-                .await;
+        let result: Result<String, _> = poll_until_complete(&config, || async {
+            Ok::<Option<String>, GatewayError>(None)
+        })
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

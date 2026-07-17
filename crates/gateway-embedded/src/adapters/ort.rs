@@ -42,9 +42,7 @@ use gateway::adapters::InferenceAdapter;
 use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{
-    InferenceRequest, InferenceResponse, Payload, StreamChunk,
-};
+use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
 use std::path::Path;
 use std::pin::Pin;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
@@ -282,9 +280,8 @@ pub(crate) fn cls_pool(
 }
 
 fn load_tokenizer(path: &Path, config: &OrtConfig) -> Result<Tokenizer, GatewayError> {
-    Tokenizer::from_file(path).map_err(|e| {
-        OrtAdapter::err(config, format!("read tokenizer {}: {e}", path.display()))
-    })
+    Tokenizer::from_file(path)
+        .map_err(|e| OrtAdapter::err(config, format!("read tokenizer {}: {e}", path.display())))
 }
 
 fn configure_tokenizer(t: &mut Tokenizer, config: &OrtConfig) -> Result<(), GatewayError> {
@@ -349,9 +346,10 @@ impl InferenceAdapter for OrtAdapter {
                     attempts: vec![],
                 })
             }
-            _ => Err(self.adapter_err(
-                "OrtAdapter only supports Payload::Embed (TextEmbed capability)",
-            )),
+            _ => {
+                Err(self
+                    .adapter_err("OrtAdapter only supports Payload::Embed (TextEmbed capability)"))
+            }
         }
     }
 
@@ -359,10 +357,8 @@ impl InferenceAdapter for OrtAdapter {
         &self,
         _config: &RouterConfig,
         _request: &InferenceRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>,
-        GatewayError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
         Err(self.adapter_err("OrtAdapter does not support streaming"))
     }
 }

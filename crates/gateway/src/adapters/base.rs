@@ -80,13 +80,14 @@ pub async fn http_json<T: serde::de::DeserializeOwned>(
         });
     }
 
-    response.json::<T>().await.map_err(|e| {
-        GatewayError::ProviderError {
+    response
+        .json::<T>()
+        .await
+        .map_err(|e| GatewayError::ProviderError {
             adapter: "http".into(),
             message: format!("failed to parse response: {}", e),
             status: Some(status.as_u16()),
-        }
-    })
+        })
 }
 
 /// Extract error message from various provider JSON error formats.
@@ -159,19 +160,13 @@ mod tests {
     #[test]
     fn extract_error_message_openai_format() {
         let body = r#"{"error":{"message":"rate limit","type":"rate_limit_error"}}"#;
-        assert_eq!(
-            extract_error_message(body),
-            Some("rate limit".to_string()),
-        );
+        assert_eq!(extract_error_message(body), Some("rate limit".to_string()),);
     }
 
     #[test]
     fn extract_error_message_string_format() {
         let body = r#"{"error":"bad request"}"#;
-        assert_eq!(
-            extract_error_message(body),
-            Some("bad request".to_string()),
-        );
+        assert_eq!(extract_error_message(body), Some("bad request".to_string()),);
     }
 
     #[test]

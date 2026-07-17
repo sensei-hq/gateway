@@ -260,9 +260,12 @@ mod tests {
 
         let blobs_dir = dir.path().join("blobs");
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
-        tokio::fs::write(blobs_dir.join(format!("sha256-{digest}")), b"GGUF_FAKE_BYTES")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            blobs_dir.join(format!("sha256-{digest}")),
+            b"GGUF_FAKE_BYTES",
+        )
+        .await
+        .unwrap();
 
         dir
     }
@@ -286,14 +289,26 @@ mod tests {
 
     #[tokio::test]
     async fn library_default_tag_resolves_with_short_id() {
-        let dir = write_cache("registry.ollama.ai", "library", "all-minilm", "latest", "abc123", 100).await;
+        let dir = write_cache(
+            "registry.ollama.ai",
+            "library",
+            "all-minilm",
+            "latest",
+            "abc123",
+            100,
+        )
+        .await;
         let r = OllamaResolver::new(dir.path());
 
         let by_short = r.resolve("all-minilm").await.unwrap().expect("present");
         assert_eq!(by_short.id, "all-minilm");
         assert_eq!(by_short.format, ModelFormat::Gguf);
 
-        let by_full = r.resolve("all-minilm:latest").await.unwrap().expect("alias");
+        let by_full = r
+            .resolve("all-minilm:latest")
+            .await
+            .unwrap()
+            .expect("alias");
         assert_eq!(by_full.id, "all-minilm");
 
         match by_short.source {
@@ -319,7 +334,15 @@ mod tests {
 
     #[tokio::test]
     async fn non_default_namespace_keeps_namespace_in_id() {
-        let dir = write_cache("registry.ollama.ai", "myorg", "private", "latest", "feed", 0).await;
+        let dir = write_cache(
+            "registry.ollama.ai",
+            "myorg",
+            "private",
+            "latest",
+            "feed",
+            0,
+        )
+        .await;
         let r = OllamaResolver::new(dir.path());
         let got = r.resolve("myorg/private").await.unwrap().expect("present");
         assert_eq!(got.id, "myorg/private");
@@ -327,7 +350,15 @@ mod tests {
 
     #[tokio::test]
     async fn missing_blob_makes_manifest_invisible_not_an_error() {
-        let dir = write_cache("registry.ollama.ai", "library", "ghost", "latest", "deadbeef", 0).await;
+        let dir = write_cache(
+            "registry.ollama.ai",
+            "library",
+            "ghost",
+            "latest",
+            "deadbeef",
+            0,
+        )
+        .await;
         // Remove the blob to simulate post-GC state.
         tokio::fs::remove_file(dir.path().join("blobs").join("sha256-deadbeef"))
             .await
@@ -352,9 +383,12 @@ mod tests {
                 { "mediaType": "application/vnd.ollama.image.template", "digest": "sha256:0", "size": 1 }
             ]
         });
-        tokio::fs::write(manifest_dir.join("latest"), serde_json::to_vec(&manifest).unwrap())
-            .await
-            .unwrap();
+        tokio::fs::write(
+            manifest_dir.join("latest"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
         let r = OllamaResolver::new(dir.path());
         assert!(r.list().await.unwrap().is_empty());
     }
@@ -385,9 +419,7 @@ mod tests {
     async fn list_returns_all_models_across_namespaces() {
         let dir = TempDir::new().unwrap();
         // library/foo:latest
-        let m1 = dir
-            .path()
-            .join("manifests/registry.ollama.ai/library/foo");
+        let m1 = dir.path().join("manifests/registry.ollama.ai/library/foo");
         tokio::fs::create_dir_all(&m1).await.unwrap();
         tokio::fs::write(
             m1.join("latest"),
@@ -399,9 +431,7 @@ mod tests {
         .await
         .unwrap();
         // myorg/bar:v2
-        let m2 = dir
-            .path()
-            .join("manifests/registry.ollama.ai/myorg/bar");
+        let m2 = dir.path().join("manifests/registry.ollama.ai/myorg/bar");
         tokio::fs::create_dir_all(&m2).await.unwrap();
         tokio::fs::write(
             m2.join("v2"),
@@ -415,8 +445,12 @@ mod tests {
         // Both blobs exist
         let blobs = dir.path().join("blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
-        tokio::fs::write(blobs.join("sha256-aaa"), b"x").await.unwrap();
-        tokio::fs::write(blobs.join("sha256-bbb"), b"x").await.unwrap();
+        tokio::fs::write(blobs.join("sha256-aaa"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(blobs.join("sha256-bbb"), b"x")
+            .await
+            .unwrap();
 
         let r = OllamaResolver::new(dir.path());
         let mut ids: Vec<_> = r.list().await.unwrap().into_iter().map(|e| e.id).collect();

@@ -1,18 +1,20 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use futures::Stream;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, http_json, resolve_api_key};
 use super::InferenceAdapter;
+use super::base::{build_client, http_json, resolve_api_key};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
-use crate::types::request::{InferenceRequest, InferenceResponse, Message, MessageRole, Payload, StreamChunk};
+use crate::types::request::{
+    InferenceRequest, InferenceResponse, Message, MessageRole, Payload, StreamChunk,
+};
 
 // ---------------------------------------------------------------------------
 // Wire types — Grok chat request/response structs (OpenAI-compatible)
@@ -33,7 +35,7 @@ struct ChatCompletionRequest {
 struct ChatMessage {
     role: String,
     content: String,
-    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
@@ -112,19 +114,22 @@ fn role_to_string(role: &MessageRole) -> &'static str {
 }
 
 fn resolve_model(request: &InferenceRequest, default: &str) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| default.to_string())
+    request.model.clone().unwrap_or_else(|| default.to_string())
 }
 
 fn build_chat_messages(messages: &[Message], system: &Option<String>) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(sys) = system {
-        out.push(ChatMessage { role: "system".to_string(), content: sys.clone() });
+        out.push(ChatMessage {
+            role: "system".to_string(),
+            content: sys.clone(),
+        });
     }
     for m in messages {
-        out.push(ChatMessage { role: role_to_string(&m.role).to_string(), content: m.as_text().to_string() });
+        out.push(ChatMessage {
+            role: role_to_string(&m.role).to_string(),
+            content: m.as_text().to_string(),
+        });
     }
     out
 }
@@ -187,9 +192,7 @@ impl InferenceAdapter for GrokAdapter {
     fn supports(&self, capability: &Capability) -> bool {
         matches!(
             capability,
-            Capability::TextChat
-                | Capability::AudioTranscribe
-                | Capability::AudioGenerate
+            Capability::TextChat | Capability::AudioTranscribe | Capability::AudioGenerate
         )
     }
 
@@ -228,10 +231,7 @@ impl InferenceAdapter for GrokAdapter {
                 )
                 .await?;
 
-                let content = resp
-                    .choices
-                    .first()
-                    .and_then(|c| c.message.content.clone());
+                let content = resp.choices.first().and_then(|c| c.message.content.clone());
                 let usage = usage_from_response(&resp.usage);
 
                 Ok(InferenceResponse {
@@ -267,7 +267,7 @@ impl InferenceAdapter for GrokAdapter {
                             adapter: "grok".into(),
                             message: format!("unsupported audio format: {other}"),
                             status: None,
-                        })
+                        });
                     }
                 };
 
@@ -292,11 +292,7 @@ impl InferenceAdapter for GrokAdapter {
                     "{}/v1/audio/transcriptions",
                     config.url.trim_end_matches('/')
                 );
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .multipart(form)
-                    .bearer_auth(&api_key);
+                let mut req = self.client.post(&url).multipart(form).bearer_auth(&api_key);
 
                 for (k, v) in &config.headers {
                     req = req.header(k.as_str(), v.as_str());
@@ -325,11 +321,14 @@ impl InferenceAdapter for GrokAdapter {
                 }
 
                 let whisper_resp: WhisperResponse =
-                    response.json().await.map_err(|e| GatewayError::ProviderError {
-                        adapter: "grok".into(),
-                        message: format!("failed to parse whisper response: {e}"),
-                        status: Some(status.as_u16()),
-                    })?;
+                    response
+                        .json()
+                        .await
+                        .map_err(|e| GatewayError::ProviderError {
+                            adapter: "grok".into(),
+                            message: format!("failed to parse whisper response: {e}"),
+                            status: Some(status.as_u16()),
+                        })?;
 
                 Ok(InferenceResponse {
                     success: true,
@@ -362,15 +361,8 @@ impl InferenceAdapter for GrokAdapter {
                     response_format: output_format.to_string(),
                 };
 
-                let url = format!(
-                    "{}/v1/audio/speech",
-                    config.url.trim_end_matches('/')
-                );
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .json(&body)
-                    .bearer_auth(&api_key);
+                let url = format!("{}/v1/audio/speech", config.url.trim_end_matches('/'));
+                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
                 for (k, v) in &config.headers {
                     req = req.header(k.as_str(), v.as_str());
@@ -398,13 +390,15 @@ impl InferenceAdapter for GrokAdapter {
                     });
                 }
 
-                let audio_bytes = response.bytes().await.map_err(|e| {
-                    GatewayError::ProviderError {
-                        adapter: "grok".into(),
-                        message: format!("failed to read TTS audio bytes: {e}"),
-                        status: None,
-                    }
-                })?;
+                let audio_bytes =
+                    response
+                        .bytes()
+                        .await
+                        .map_err(|e| GatewayError::ProviderError {
+                            adapter: "grok".into(),
+                            message: format!("failed to read TTS audio bytes: {e}"),
+                            status: None,
+                        })?;
 
                 Ok(InferenceResponse {
                     success: true,
@@ -472,10 +466,7 @@ impl InferenceAdapter for GrokAdapter {
             stream: true,
         };
 
-        let url = format!(
-            "{}/v1/chat/completions",
-            config.url.trim_end_matches('/')
-        );
+        let url = format!("{}/v1/chat/completions", config.url.trim_end_matches('/'));
         let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
         for (k, v) in &config.headers {
@@ -534,14 +525,18 @@ impl InferenceAdapter for GrokAdapter {
 
                 Ok(chunks)
             })
-            .map(|result| -> futures::stream::Iter<std::vec::IntoIter<Result<StreamChunk, GatewayError>>> {
-                match result {
-                    Ok(chunks) => {
-                        futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+            .map(
+                |result| -> futures::stream::Iter<
+                    std::vec::IntoIter<Result<StreamChunk, GatewayError>>,
+                > {
+                    match result {
+                        Ok(chunks) => {
+                            futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+                        }
+                        Err(e) => futures::stream::iter(vec![Err(e)]),
                     }
-                    Err(e) => futures::stream::iter(vec![Err(e)]),
-                }
-            })
+                },
+            )
             .flatten();
 
         Ok(Box::pin(stream))
@@ -751,7 +746,10 @@ mod tests {
             router: None,
             chain: None,
             payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Say hello in one sentence.".to_string())],
+                messages: vec![Message::text(
+                    MessageRole::User,
+                    "Say hello in one sentence.".to_string(),
+                )],
                 system: None,
                 max_tokens: Some(64),
                 temperature: Some(0.3),

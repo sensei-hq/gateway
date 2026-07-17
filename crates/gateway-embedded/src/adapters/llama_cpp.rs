@@ -57,12 +57,12 @@ use gateway::types::request::{
 };
 use llama_cpp_2::{
     context::{
-        params::{LlamaContextParams, LlamaPoolingType},
         LlamaContext,
+        params::{LlamaContextParams, LlamaPoolingType},
     },
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaChatMessage, LlamaModel},
+    model::{AddBos, LlamaChatMessage, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
     token::LlamaToken,
 };
@@ -200,9 +200,9 @@ pub fn shared_backend() -> Result<Arc<LlamaBackend>, GatewayError> {
 /// model that no [`LlamaCppAdapter`] is holding gets dropped and the
 /// next [`cached_model`] call re-reads the file. Held in a
 /// `RwLock` so the common path (cache hit) only takes a read lock.
-fn model_cache()
--> &'static std::sync::RwLock<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<LlamaModel>>>
-{
+fn model_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<LlamaModel>>,
+> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
         std::sync::RwLock<
@@ -234,7 +234,9 @@ fn cached_model(
     // Cheap-path: a read lock + an upgrade. Returns immediately when
     // a live model is already cached.
     {
-        let cache = model_cache().read().map_err(|e| format!("model cache poisoned: {e}"))?;
+        let cache = model_cache()
+            .read()
+            .map_err(|e| format!("model cache poisoned: {e}"))?;
         if let Some(weak) = cache.get(path)
             && let Some(arc) = weak.upgrade()
         {
@@ -244,7 +246,9 @@ fn cached_model(
     // Slow path: take the write lock. Re-check inside the lock —
     // another thread may have populated the entry while we were
     // upgrading the lock.
-    let mut cache = model_cache().write().map_err(|e| format!("model cache poisoned: {e}"))?;
+    let mut cache = model_cache()
+        .write()
+        .map_err(|e| format!("model cache poisoned: {e}"))?;
     if let Some(weak) = cache.get(path)
         && let Some(arc) = weak.upgrade()
     {
@@ -484,9 +488,7 @@ impl LlamaCppAdapter {
                 seed,
             } => (default_max_tokens, default_temperature, seed),
             _ => {
-                return Err(
-                    self.err("adapter not configured for generation (mode != Generation)")
-                );
+                return Err(self.err("adapter not configured for generation (mode != Generation)"));
             }
         };
         let max_new = max_tokens.unwrap_or(default_max).max(1);
@@ -695,12 +697,8 @@ impl InferenceAdapter for LlamaCppAdapter {
                 temperature,
                 tools: _,
             } => {
-                let content = self.generate(
-                    messages,
-                    system.as_deref(),
-                    *max_tokens,
-                    *temperature,
-                )?;
+                let content =
+                    self.generate(messages, system.as_deref(), *max_tokens, *temperature)?;
                 Ok(response_with_content(&self.config.model_id, content))
             }
             _ => Err(self.err(
@@ -714,10 +712,8 @@ impl InferenceAdapter for LlamaCppAdapter {
         &self,
         _config: &RouterConfig,
         request: &InferenceRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>,
-        GatewayError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
         if let Some(requested) = &request.model
             && requested != &self.config.model_id
         {
@@ -735,9 +731,7 @@ impl InferenceAdapter for LlamaCppAdapter {
             tools: _,
         } = &request.payload
         else {
-            return Err(self.err(
-                "LlamaCppAdapter streaming only supports Payload::Chat",
-            ));
+            return Err(self.err("LlamaCppAdapter streaming only supports Payload::Chat"));
         };
 
         // Resolve generation settings (mode-checked).
@@ -748,9 +742,7 @@ impl InferenceAdapter for LlamaCppAdapter {
                 seed,
             } => (default_max_tokens, default_temperature, seed),
             _ => {
-                return Err(
-                    self.err("adapter not configured for streaming (mode != Generation)")
-                );
+                return Err(self.err("adapter not configured for streaming (mode != Generation)"));
             }
         };
         let max_new = max_tokens.unwrap_or(default_max).max(1);
@@ -1007,8 +999,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires LLAMA_TEST_GGUF env var pointing at a BERT-class embedding GGUF"]
     async fn cached_model_reuses_arc_across_load_calls() {
-        let path = std::env::var("LLAMA_TEST_GGUF")
-            .expect("LLAMA_TEST_GGUF must point at a GGUF file");
+        let path =
+            std::env::var("LLAMA_TEST_GGUF").expect("LLAMA_TEST_GGUF must point at a GGUF file");
         // Use the test-module helper, which already unwraps to an
         // Arc<LlamaBackend> (tests panic on init failure).
         let backend = shared_backend();
@@ -1048,7 +1040,9 @@ mod tests {
         assert_eq!(cfg.n_ctx, 512);
         assert_eq!(cfg.n_seq_max, 64);
         match cfg.mode {
-            LlamaCppMode::Embedding { pooling } => assert!(matches!(pooling, LlamaPoolingType::Mean)),
+            LlamaCppMode::Embedding { pooling } => {
+                assert!(matches!(pooling, LlamaPoolingType::Mean))
+            }
             _ => panic!("expected Embedding mode"),
         }
     }
@@ -1154,13 +1148,19 @@ mod tests {
         }
         let adapter = LlamaCppAdapter::load(backend, &entry, cfg).expect("load model");
 
-        let messages = vec![Message::text(MessageRole::User, "Reply with the single word: pong.".to_string())];
+        let messages = vec![Message::text(
+            MessageRole::User,
+            "Reply with the single word: pong.".to_string(),
+        )];
         let text = adapter
             .generate(&messages, None, Some(16), Some(0.0))
             .expect("generate");
 
         assert!(!text.is_empty(), "expected non-empty generation");
-        assert!(text.len() < 256, "expected short response under max_tokens cap, got {text:?}");
+        assert!(
+            text.len() < 256,
+            "expected short response under max_tokens cap, got {text:?}"
+        );
     }
 
     /// End-to-end streaming chat against a real generative GGUF.
@@ -1196,7 +1196,10 @@ mod tests {
             router: None,
             chain: None,
             payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Reply with the single word: pong.".to_string())],
+                messages: vec![Message::text(
+                    MessageRole::User,
+                    "Reply with the single word: pong.".to_string(),
+                )],
                 system: None,
                 max_tokens: Some(16),
                 temperature: Some(0.0),
@@ -1214,10 +1217,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
         };
 
-        let mut stream = adapter
-            .stream(&router_cfg, &request)
-            .await
-            .expect("stream");
+        let mut stream = adapter.stream(&router_cfg, &request).await.expect("stream");
 
         let mut accumulated = String::new();
         let mut content_chunks = 0usize;

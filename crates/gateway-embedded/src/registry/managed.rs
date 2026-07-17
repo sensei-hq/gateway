@@ -63,10 +63,12 @@ impl ManagedResolver {
 
     async fn load(&self) -> Result<Index, ResolveError> {
         match tokio::fs::read_to_string(self.index_path()).await {
-            Ok(contents) => serde_json::from_str(&contents).map_err(|e| ResolveError::InvalidManifest {
-                path: self.index_path(),
-                message: e.to_string(),
-            }),
+            Ok(contents) => {
+                serde_json::from_str(&contents).map_err(|e| ResolveError::InvalidManifest {
+                    path: self.index_path(),
+                    message: e.to_string(),
+                })
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
             Err(err) => Err(err.into()),
         }
@@ -201,13 +203,7 @@ mod tests {
             r.add(managed_entry(dir.path(), "b")).await.unwrap();
         }
         let r2 = ManagedResolver::new(dir.path());
-        let mut ids: Vec<_> = r2
-            .list()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|e| e.id)
-            .collect();
+        let mut ids: Vec<_> = r2.list().await.unwrap().into_iter().map(|e| e.id).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"]);
     }

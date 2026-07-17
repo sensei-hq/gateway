@@ -41,10 +41,7 @@ pub fn estimate_cost(
 }
 
 /// Partition models into affordable (estimated <= budget) and over_budget.
-pub fn filter_by_budget(
-    models: &[(String, CostEstimate)],
-    budget: f64,
-) -> BudgetFilterResult {
+pub fn filter_by_budget(models: &[(String, CostEstimate)], budget: f64) -> BudgetFilterResult {
     let mut affordable = Vec::new();
     let mut over_budget = Vec::new();
 

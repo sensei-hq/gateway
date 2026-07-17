@@ -446,7 +446,11 @@ mod tests {
                 id: "gemma3:27b".to_string(),
                 api_model_id: None,
                 provider: "ollama".to_string(),
-                capabilities: vec![Capability::TextChat, Capability::TextComplete, Capability::TextEmbed],
+                capabilities: vec![
+                    Capability::TextChat,
+                    Capability::TextComplete,
+                    Capability::TextEmbed,
+                ],
                 context_window: 128000,
                 max_output_tokens: 8192,
                 pricing: None,
@@ -515,10 +519,7 @@ mod tests {
                         priority: 2,
                     },
                 ],
-                fallback_triggers: vec![
-                    FallbackTrigger::Timeout,
-                    FallbackTrigger::ProviderError,
-                ],
+                fallback_triggers: vec![FallbackTrigger::Timeout, FallbackTrigger::ProviderError],
             },
         );
 
@@ -728,8 +729,12 @@ mod tests {
         assert!(result.selected.is_some());
         let selected = result.selected.unwrap();
         assert_eq!(selected.model, "claude-haiku");
-        assert!(result.skipped.iter().any(|s| s.model == "gemma3:27b"
-            && s.reason.contains("circuit breaker")));
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|s| s.model == "gemma3:27b" && s.reason.contains("circuit breaker"))
+        );
     }
 
     #[test]
@@ -750,11 +755,18 @@ mod tests {
         // gemma3:27b has no pricing -> passes budget (free)
         // claude-haiku has pricing -> estimate = 0.0008 + 0.004*8192/1000 = 0.0008 + 32.768 ≈ 33.5488
         // which is way over budget 0.001
-        assert!(result.all_candidates.iter().any(|c| c.model == "gemma3:27b"));
-        assert!(result
-            .skipped
-            .iter()
-            .any(|s| s.model == "claude-haiku" && s.reason.contains("over budget")));
+        assert!(
+            result
+                .all_candidates
+                .iter()
+                .any(|c| c.model == "gemma3:27b")
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|s| s.model == "claude-haiku" && s.reason.contains("over budget"))
+        );
     }
 
     #[test]
@@ -1034,8 +1046,12 @@ mod tests {
         });
 
         // gemma3:27b with nonexistent router should be skipped
-        assert!(result.skipped.iter().any(|s| s.model == "gemma3:27b"
-            && s.reason.contains("router not found")));
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|s| s.model == "gemma3:27b" && s.reason.contains("router not found"))
+        );
         // claude-haiku should still be available
         assert_eq!(result.all_candidates.len(), 1);
         assert_eq!(result.all_candidates[0].model, "claude-haiku");

@@ -1,14 +1,14 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use futures::Stream;
 use reqwest::Client;
 use serde::Deserialize;
 
-use super::base::{build_client, resolve_api_key};
 use super::InferenceAdapter;
+use super::base::{build_client, resolve_api_key};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
@@ -50,11 +50,7 @@ fn resolve_model(request: &InferenceRequest) -> String {
 
 fn base_url(config: &RouterConfig) -> &str {
     let url = config.url.trim_end_matches('/');
-    if url.is_empty() {
-        BASE_URL
-    } else {
-        url
-    }
+    if url.is_empty() { BASE_URL } else { url }
 }
 
 fn size_to_aspect_ratio(size: &Option<String>) -> &'static str {
@@ -106,10 +102,7 @@ impl InferenceAdapter for StabilityAdapter {
         config: &RouterConfig,
         request: &InferenceRequest,
     ) -> Result<InferenceResponse, GatewayError> {
-        let Payload::ImageGenerate {
-            prompt, size, ..
-        } = &request.payload
-        else {
+        let Payload::ImageGenerate { prompt, size, .. } = &request.payload else {
             return Err(GatewayError::ProviderError {
                 adapter: "stability".into(),
                 message: "only ImageGenerate payload is supported".into(),
@@ -129,11 +122,7 @@ impl InferenceAdapter for StabilityAdapter {
             .text("aspect_ratio", aspect_ratio.to_string());
 
         let url = format!("{url_base}/stable-image/generate/sd3");
-        let mut req = self
-            .client
-            .post(&url)
-            .multipart(form)
-            .bearer_auth(&api_key);
+        let mut req = self.client.post(&url).multipart(form).bearer_auth(&api_key);
 
         for (k, v) in &config.headers {
             req = req.header(k.as_str(), v.as_str());
@@ -170,19 +159,25 @@ impl InferenceAdapter for StabilityAdapter {
 
         let b64 = if content_type.starts_with("application/json") {
             let json_resp: StabilityJsonResponse =
-                response.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "stability".into(),
-                    message: format!("failed to parse stability response: {e}"),
-                    status: Some(status.as_u16()),
-                })?;
+                response
+                    .json()
+                    .await
+                    .map_err(|e| GatewayError::ProviderError {
+                        adapter: "stability".into(),
+                        message: format!("failed to parse stability response: {e}"),
+                        status: Some(status.as_u16()),
+                    })?;
             json_resp.image
         } else {
             // image/* — raw bytes
-            let bytes = response.bytes().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "stability".into(),
-                message: format!("failed to read image bytes: {e}"),
-                status: None,
-            })?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| GatewayError::ProviderError {
+                    adapter: "stability".into(),
+                    message: format!("failed to read image bytes: {e}"),
+                    status: None,
+                })?;
             STANDARD.encode(&bytes)
         };
 

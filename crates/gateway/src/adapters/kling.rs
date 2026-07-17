@@ -5,9 +5,9 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
 use super::InferenceAdapter;
-use crate::adapters::async_job::{poll_until_complete, JobConfig};
+use super::base::{build_client, resolve_api_key};
+use crate::adapters::async_job::{JobConfig, poll_until_complete};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
@@ -84,11 +84,7 @@ fn resolve_model(request: &InferenceRequest) -> String {
 
 fn base_url(config: &RouterConfig) -> &str {
     let url = config.url.trim_end_matches('/');
-    if url.is_empty() {
-        BASE_URL
-    } else {
-        url
-    }
+    if url.is_empty() { BASE_URL } else { url }
 }
 
 // ---------------------------------------------------------------------------

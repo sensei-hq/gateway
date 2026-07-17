@@ -177,7 +177,11 @@ impl Gateway {
         // 7. All candidates exhausted
         let errors = attempts
             .iter()
-            .filter_map(|a| a.error.as_ref().map(|e| format!("[{}:{}] {}", a.adapter, a.model, e)))
+            .filter_map(|a| {
+                a.error
+                    .as_ref()
+                    .map(|e| format!("[{}:{}] {}", a.adapter, a.model, e))
+            })
             .collect::<Vec<_>>()
             .join("; ");
         Err(GatewayError::AllAttemptsFailed {
@@ -447,7 +451,11 @@ mod tests {
             _request: &InferenceRequest,
         ) -> Result<
             std::pin::Pin<
-                Box<dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>> + Send>,
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<crate::types::request::StreamChunk, GatewayError>,
+                        > + Send,
+                >,
             >,
             GatewayError,
         > {
@@ -500,7 +508,11 @@ mod tests {
                 fallback_triggers: vec![],
             },
         );
-        let config = GatewayConfig { routers, models, chains };
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+        };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
@@ -546,11 +558,13 @@ mod tests {
         let response = gw.execute(&chat_request()).await.unwrap();
 
         assert!(!response.success);
-        assert!(response
-            .content
-            .as_ref()
-            .unwrap()
-            .contains("No inference provider"));
+        assert!(
+            response
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("No inference provider")
+        );
     }
 
     #[tokio::test]
@@ -634,10 +648,7 @@ mod tests {
         // Now execute should fail with NotConfigured (empty config)
         let result = gw.execute(&chat_request()).await;
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            GatewayError::NotConfigured
-        ));
+        assert!(matches!(result.unwrap_err(), GatewayError::NotConfigured));
     }
 
     // --- FailingAdapter for error/fallback path tests ---
@@ -1058,11 +1069,13 @@ mod tests {
         // Ghost adapter was skipped, noop should have handled it
         assert_eq!(response.model, Some("noop".to_string()));
         assert!(response.attempts.len() >= 2);
-        assert!(response.attempts[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("no adapter registered"));
+        assert!(
+            response.attempts[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("no adapter registered")
+        );
     }
 
     #[test]

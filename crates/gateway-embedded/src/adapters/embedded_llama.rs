@@ -18,7 +18,7 @@
 //!   (Managed → Ollama → External), so a model already pulled by Ollama is
 //!   reused in place and nothing has to be shipped with the binary.
 
-use crate::adapters::llama_cpp::{shared_backend, LlamaCppAdapter, LlamaCppConfig};
+use crate::adapters::llama_cpp::{LlamaCppAdapter, LlamaCppConfig, shared_backend};
 use crate::registry::ModelResolver;
 use async_trait::async_trait;
 use futures::Stream;
@@ -146,10 +146,11 @@ impl EmbeddedLlamaAdapter {
         let backend = self.backend.clone();
         let cfg = worker_config(model_id, mode);
         let adapter_id = self.adapter_id.clone();
-        let loaded = tokio::task::spawn_blocking(move || LlamaCppAdapter::load(backend, &entry, cfg))
-            .await
-            .map_err(|e| self.err(format!("worker load join: {e}")))?
-            .map_err(|e| self.err(format!("load '{model_id}': {e}")))?;
+        let loaded =
+            tokio::task::spawn_blocking(move || LlamaCppAdapter::load(backend, &entry, cfg))
+                .await
+                .map_err(|e| self.err(format!("worker load join: {e}")))?
+                .map_err(|e| self.err(format!("load '{model_id}': {e}")))?;
         let _ = adapter_id;
         let worker = Arc::new(loaded);
 
@@ -201,10 +202,8 @@ impl InferenceAdapter for EmbeddedLlamaAdapter {
         &self,
         config: &RouterConfig,
         request: &InferenceRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>,
-        GatewayError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
         // Streaming is generation-only; the worker enforces Payload::Chat.
         let worker = self
             .worker_for_request(request, WorkerMode::Generation)
@@ -270,9 +269,7 @@ mod tests {
             id: id.into(),
             name: id.into(),
             format: ModelFormat::Gguf,
-            source: ModelSource::External {
-                path: path.into(),
-            },
+            source: ModelSource::External { path: path.into() },
             sha256: None,
             size_bytes: None,
         }

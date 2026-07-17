@@ -32,9 +32,7 @@ use gateway::adapters::InferenceAdapter;
 use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{
-    InferenceRequest, InferenceResponse, Payload, StreamChunk,
-};
+use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Mutex;
@@ -108,10 +106,7 @@ impl FastembedAdapter {
         let tokenizer_files = TokenizerFiles {
             tokenizer_file: read_required(&dir.join("tokenizer.json"), &config)?,
             config_file: read_required(&dir.join("config.json"), &config)?,
-            special_tokens_map_file: read_required(
-                &dir.join("special_tokens_map.json"),
-                &config,
-            )?,
+            special_tokens_map_file: read_required(&dir.join("special_tokens_map.json"), &config)?,
             tokenizer_config_file: read_required(&dir.join("tokenizer_config.json"), &config)?,
         };
 
@@ -160,9 +155,8 @@ impl FastembedAdapter {
 }
 
 fn read_required(path: &Path, config: &FastembedConfig) -> Result<Vec<u8>, GatewayError> {
-    std::fs::read(path).map_err(|e| {
-        FastembedAdapter::err(config, format!("read {}: {e}", path.display()))
-    })
+    std::fs::read(path)
+        .map_err(|e| FastembedAdapter::err(config, format!("read {}: {e}", path.display())))
 }
 
 #[async_trait]
@@ -218,10 +212,8 @@ impl InferenceAdapter for FastembedAdapter {
         &self,
         _config: &RouterConfig,
         _request: &InferenceRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>,
-        GatewayError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
+    {
         Err(self.adapter_err("FastembedAdapter does not support streaming"))
     }
 }

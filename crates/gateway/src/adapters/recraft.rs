@@ -5,8 +5,8 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
 use super::InferenceAdapter;
+use super::base::{build_client, resolve_api_key};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
@@ -63,11 +63,7 @@ fn resolve_model(request: &InferenceRequest) -> String {
 
 fn base_url(config: &RouterConfig) -> &str {
     let url = config.url.trim_end_matches('/');
-    if url.is_empty() {
-        BASE_URL
-    } else {
-        url
-    }
+    if url.is_empty() { BASE_URL } else { url }
 }
 
 // ---------------------------------------------------------------------------
@@ -111,10 +107,7 @@ impl InferenceAdapter for RecraftAdapter {
         request: &InferenceRequest,
     ) -> Result<InferenceResponse, GatewayError> {
         let Payload::ImageGenerate {
-            prompt,
-            size,
-            n,
-            ..
+            prompt, size, n, ..
         } = &request.payload
         else {
             return Err(GatewayError::ProviderError {
@@ -137,11 +130,7 @@ impl InferenceAdapter for RecraftAdapter {
         };
 
         let url = format!("{url_base}/images/generations");
-        let mut req = self
-            .client
-            .post(&url)
-            .json(&body)
-            .bearer_auth(&api_key);
+        let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
 
         for (k, v) in &config.headers {
             req = req.header(k.as_str(), v.as_str());
@@ -170,11 +159,14 @@ impl InferenceAdapter for RecraftAdapter {
         }
 
         let recraft_resp: RecraftImageResponse =
-            response.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "recraft".into(),
-                message: format!("failed to parse recraft response: {e}"),
-                status: Some(status.as_u16()),
-            })?;
+            response
+                .json()
+                .await
+                .map_err(|e| GatewayError::ProviderError {
+                    adapter: "recraft".into(),
+                    message: format!("failed to parse recraft response: {e}"),
+                    status: Some(status.as_u16()),
+                })?;
 
         let images: Vec<ImageResult> = recraft_resp
             .data

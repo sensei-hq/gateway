@@ -1,13 +1,13 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use futures::Stream;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, http_json, resolve_api_key};
 use super::InferenceAdapter;
+use super::base::{build_client, http_json, resolve_api_key};
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
@@ -35,7 +35,7 @@ struct ChatCompletionRequest {
 struct ChatMessage {
     role: String,
     content: String,
-    }
+}
 
 #[derive(Debug, Serialize)]
 struct EmbedRequest {
@@ -118,16 +118,19 @@ fn resolve_model(request: &InferenceRequest) -> String {
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
-fn build_chat_messages(
-    messages: &[Message],
-    system: &Option<String>,
-) -> Vec<ChatMessage> {
+fn build_chat_messages(messages: &[Message], system: &Option<String>) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(sys) = system {
-        out.push(ChatMessage { role: "system".to_string(), content: sys.clone() });
+        out.push(ChatMessage {
+            role: "system".to_string(),
+            content: sys.clone(),
+        });
     }
     for m in messages {
-        out.push(ChatMessage { role: role_to_string(&m.role).to_string(), content: m.as_text().to_string() });
+        out.push(ChatMessage {
+            role: role_to_string(&m.role).to_string(),
+            content: m.as_text().to_string(),
+        });
     }
     out
 }
@@ -232,10 +235,7 @@ impl InferenceAdapter for OllamaAdapter {
                 )
                 .await?;
 
-                let content = resp
-                    .choices
-                    .first()
-                    .and_then(|c| c.message.content.clone());
+                let content = resp.choices.first().and_then(|c| c.message.content.clone());
                 let usage = usage_from_response(&resp.usage);
 
                 Ok(InferenceResponse {
@@ -330,10 +330,7 @@ impl InferenceAdapter for OllamaAdapter {
             stream: true,
         };
 
-        let url = format!(
-            "{}/v1/chat/completions",
-            config.url.trim_end_matches('/')
-        );
+        let url = format!("{}/v1/chat/completions", config.url.trim_end_matches('/'));
         let mut req = self.client.post(&url).json(&body);
 
         if let Some(key) = &api_key {
@@ -372,8 +369,7 @@ impl InferenceAdapter for OllamaAdapter {
                     if let Ok(parsed) = serde_json::from_str::<StreamChatResponse>(json_str)
                         && let Some(choice) = parsed.choices.first()
                     {
-                        let content =
-                            choice.delta.content.clone().unwrap_or_default();
+                        let content = choice.delta.content.clone().unwrap_or_default();
                         let usage = usage_from_response(&parsed.usage);
                         chunks.push(StreamChunk {
                             content,
@@ -386,14 +382,18 @@ impl InferenceAdapter for OllamaAdapter {
 
                 Ok(chunks)
             })
-            .map(|result| -> futures::stream::Iter<std::vec::IntoIter<Result<StreamChunk, GatewayError>>> {
-                match result {
-                    Ok(chunks) => {
-                        futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+            .map(
+                |result| -> futures::stream::Iter<
+                    std::vec::IntoIter<Result<StreamChunk, GatewayError>>,
+                > {
+                    match result {
+                        Ok(chunks) => {
+                            futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+                        }
+                        Err(e) => futures::stream::iter(vec![Err(e)]),
                     }
-                    Err(e) => futures::stream::iter(vec![Err(e)]),
-                }
-            })
+                },
+            )
             .flatten();
 
         Ok(Box::pin(stream))
@@ -425,9 +425,7 @@ mod tests {
 
     #[test]
     fn build_chat_request_body() {
-        let messages = vec![
-            Message::text(MessageRole::User, "Hello".to_string()),
-        ];
+        let messages = vec![Message::text(MessageRole::User, "Hello".to_string())];
         let system = Some("You are helpful.".to_string());
         let chat_messages = build_chat_messages(&messages, &system);
 
@@ -470,10 +468,7 @@ mod tests {
         let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
 
         assert_eq!(resp.choices.len(), 1);
-        assert_eq!(
-            resp.choices[0].message.content.as_deref(),
-            Some("Hello!"),
-        );
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"),);
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
 
         let usage = resp.usage.unwrap();
@@ -535,7 +530,10 @@ mod tests {
             router: None,
             chain: None,
             payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Say hello in one sentence.".to_string())],
+                messages: vec![Message::text(
+                    MessageRole::User,
+                    "Say hello in one sentence.".to_string(),
+                )],
                 system: None,
                 max_tokens: Some(64),
                 temperature: Some(0.3),
@@ -581,14 +579,19 @@ mod tests {
             model: Some("all-minilm".to_string()),
             router: None,
             chain: None,
-            payload: Payload::Embed { texts: vec!["hello".to_string()] },
+            payload: Payload::Embed {
+                texts: vec!["hello".to_string()],
+            },
             budget: None,
         };
 
         let start = std::time::Instant::now();
         let result = adapter.execute(&config, &request).await;
         let elapsed = start.elapsed();
-        assert!(result.is_err(), "a silent server must produce an error, not hang");
+        assert!(
+            result.is_err(),
+            "a silent server must produce an error, not hang"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "request must time out promptly, took {elapsed:?}"

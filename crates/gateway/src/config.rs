@@ -216,9 +216,11 @@ mod tests {
 
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|e| e.contains("unknown model") && e.contains("nonexistent")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("unknown model") && e.contains("nonexistent"))
+        );
     }
 
     #[test]
@@ -233,9 +235,7 @@ mod tests {
 
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|e| e.contains("no corresponding router")));
+        assert!(errors.iter().any(|e| e.contains("no corresponding router")));
     }
 
     #[test]
