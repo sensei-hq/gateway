@@ -12,6 +12,10 @@ default = []
 llama-cpp = ["dep:llama-cpp-2"]
 fastembed = ["dep:fastembed"]
 ort = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+# Hugging Face model download (HF-A). Opt-in like the engine adapters: pulls the
+# hf-hub async client, reqwest (for a byte-range size probe), and sysinfo (RAM +
+# disk pre-flight). The default build stays free of all three.
+hf-download = ["dep:hf-hub", "dep:reqwest", "dep:sysinfo"]
 
 [dependencies]
 gateway = { path = "../gateway" }
@@ -29,6 +33,14 @@ fastembed = { version = "5", optional = true }
 ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"], optional = true }
 tokenizers = { version = "0.21", optional = true }
 ndarray = { version = "0.16", optional = true }
+
+# hf-download feature deps (opt-in). hf-hub 0.4.x exposes the async `tokio`
+# client (`api::tokio::Api`); 1.0 replaced it with an unrelated `HFClient`
+# builder, so we pin the 0.4 line. rustls-tls keeps us off OpenSSL/native-tls.
+# reqwest is pinned to 0.4.x's own pin (0.12) to avoid a duplicate build.
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+sysinfo = { version = "0.39", default-features = false, features = ["disk", "system"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
