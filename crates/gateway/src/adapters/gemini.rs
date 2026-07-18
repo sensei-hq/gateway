@@ -27,16 +27,14 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::adapters::InferenceAdapter;
 use crate::adapters::base::{build_client, resolve_api_key};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
 use crate::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
 use crate::types::request::{
-    InferenceRequest, InferenceResponse, MediaAttachment, MediaSource, Message, MessageContent,
-    MessageRole, Payload, StreamChunk, ToolCall, ToolDefinition,
+    MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamChunk, ToolCall,
+    ToolDefinition,
 };
 
 const ADAPTER_ID: &str = "gemini";
@@ -467,16 +465,6 @@ fn normalize_model_id(model: &str) -> &str {
     model.strip_prefix("models/").unwrap_or(model)
 }
 
-fn resolve_chat_model(request: &InferenceRequest) -> String {
-    let raw = request.model.as_deref().unwrap_or(DEFAULT_MODEL);
-    normalize_model_id(raw).to_string()
-}
-
-fn resolve_embed_model(request: &InferenceRequest) -> String {
-    let raw = request.model.as_deref().unwrap_or(DEFAULT_EMBED_MODEL);
-    normalize_model_id(raw).to_string()
-}
-
 fn extract_text(resp: &GeminiChatResponse) -> String {
     resp.candidates
         .iter()
@@ -632,248 +620,8 @@ impl GeminiAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for GeminiAdapter {
-    fn id(&self) -> &str {
-        ADAPTER_ID
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::TextChat | Capability::TextEmbed)
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let api_key = resolve_api_key(config).ok_or_else(Self::missing_key_err)?;
-
-        match &request.payload {
-            Payload::Chat {
-                messages,
-                system,
-                max_tokens,
-                temperature,
-                tools,
-            } => {
-                let model = resolve_chat_model(request);
-                let url = format!(
-                    "{}/models/{}:generateContent",
-                    config.url.trim_end_matches('/'),
-                    model
-                );
-
-                let generation_config =
-                    (max_tokens.is_some() || temperature.is_some()).then(|| {
-                        GeminiGenerationConfig {
-                            max_output_tokens: Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
-                            temperature: *temperature,
-                        }
-                    });
-
-                let body = GeminiChatRequest {
-                    contents: build_contents(messages),
-                    system_instruction: extract_system_instruction(messages, system),
-                    generation_config,
-                    tools: build_tools(tools),
-                };
-
-                let resp: GeminiChatResponse =
-                    gemini_post(&self.client, &url, &api_key, &body, &config.headers).await?;
-
-                let content = extract_text(&resp);
-                let tool_calls = extract_tool_calls(&resp);
-                let usage = usage_from_gemini(&resp.usage_metadata);
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: if content.is_empty() {
-                        None
-                    } else {
-                        Some(content)
-                    },
-                    embeddings: None,
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage,
-                    tool_calls,
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-
-            Payload::Embed { texts } => {
-                if texts.is_empty() {
-                    return Ok(InferenceResponse {
-                        success: true,
-                        content: None,
-                        embeddings: Some(vec![]),
-                        transcription: None,
-                        audio: None,
-                        images: None,
-                        videos: None,
-                        model: request.model.clone(),
-                        tool_calls: Vec::new(),
-                        usage: None,
-                        estimated_cost: None,
-                        actual_cost: None,
-                        attempts: vec![],
-                    });
-                }
-                let model = resolve_embed_model(request);
-                let url = format!(
-                    "{}/models/{}:batchEmbedContents",
-                    config.url.trim_end_matches('/'),
-                    model
-                );
-                let qualified_model = format!("models/{model}");
-                let body = GeminiBatchEmbedRequest {
-                    requests: texts
-                        .iter()
-                        .map(|t| GeminiEmbedRequestItem {
-                            model: qualified_model.clone(),
-                            content: GeminiContent {
-                                role: "user",
-                                parts: vec![GeminiPart {
-                                    text: Some(t.clone()),
-                                    ..Default::default()
-                                }],
-                            },
-                        })
-                        .collect(),
-                };
-
-                let resp: GeminiBatchEmbedResponse =
-                    gemini_post(&self.client, &url, &api_key, &body, &config.headers).await?;
-
-                let embeddings: Vec<Vec<f32>> =
-                    resp.embeddings.into_iter().map(|e| e.values).collect();
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: Some(embeddings),
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-
-            _ => Err(GatewayError::ProviderError {
-                adapter: ADAPTER_ID.into(),
-                message: "Gemini supports Payload::Chat and Payload::Embed only".into(),
-                status: None,
-            }),
-        }
-    }
-
-    async fn stream(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: ADAPTER_ID.into(),
-                message: "Gemini streaming is only supported for Payload::Chat".into(),
-                status: None,
-            });
-        };
-
-        let api_key = resolve_api_key(config).ok_or_else(Self::missing_key_err)?;
-        let model = resolve_chat_model(request);
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse",
-            config.url.trim_end_matches('/'),
-            model
-        );
-
-        let generation_config =
-            (max_tokens.is_some() || temperature.is_some()).then(|| GeminiGenerationConfig {
-                max_output_tokens: Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
-                temperature: *temperature,
-            });
-
-        let body = GeminiChatRequest {
-            contents: build_contents(messages),
-            system_instruction: extract_system_instruction(messages, system),
-            generation_config,
-            tools: build_tools(tools),
-        };
-
-        let mut req = self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", &api_key)
-            .header("content-type", "application/json")
-            .json(&body);
-        for (k, v) in &config.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let response = req.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: ADAPTER_ID.into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: ADAPTER_ID.into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: ADAPTER_ID.into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let byte_stream = response.bytes_stream();
-        let stream = byte_stream
-            .map(
-                |result| -> Result<Vec<Result<StreamChunk, GatewayError>>, GatewayError> {
-                    let bytes = result?;
-                    let text = String::from_utf8_lossy(&bytes);
-                    Ok(text.lines().filter_map(parse_stream_line).collect())
-                },
-            )
-            .map(|result| match result {
-                Ok(chunks) => futures::stream::iter(chunks),
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            })
-            .flatten();
-
-        Ok(Box::pin(stream))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge. Gemini
+// Capability traits (target model). Traits + RegisterInto referenced by full path. Gemini
 // wire structs are all `Gemini*`-prefixed, so the io types don't collide and
 // are imported by name.
 // ---------------------------------------------------------------------------
@@ -1065,7 +813,7 @@ impl crate::adapters::capability::EmbedModel for GeminiAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for GeminiAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -1094,17 +842,13 @@ mod tests {
     #[test]
     fn id_and_supports_match_chat_and_embed() {
         let a = GeminiAdapter::new().unwrap();
-        assert_eq!(a.id(), "gemini");
-        assert!(a.supports(&Capability::TextChat));
-        assert!(a.supports(&Capability::TextEmbed));
-        assert!(!a.supports(&Capability::ImageGenerate));
-        assert!(!a.supports(&Capability::VideoGenerate));
+        assert_eq!(crate::adapters::capability::Model::id(&a), "gemini");
     }
 
     #[test]
     fn capability_model_id_matches_adapter_id() {
         // The capability `Model::id` (fully qualified to avoid the
-        // InferenceAdapter::id clash) returns the same value.
+        // via the capability `Model::id`) returns the same value.
         let a = GeminiAdapter::new().unwrap();
         assert_eq!(crate::adapters::capability::Model::id(&a), "gemini");
     }
@@ -1168,25 +912,6 @@ mod tests {
             normalize_model_id("text-embedding-004"),
             "text-embedding-004"
         );
-    }
-
-    #[test]
-    fn resolve_chat_model_uses_default_when_request_omits_model() {
-        let req = InferenceRequest {
-            capability: Capability::TextChat,
-            model: None,
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![user("hi")],
-                system: None,
-                max_tokens: None,
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
-        };
-        assert_eq!(resolve_chat_model(&req), DEFAULT_MODEL);
     }
 
     #[test]

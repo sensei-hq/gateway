@@ -27,15 +27,10 @@ use fastembed::{
     InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding, TokenizerFiles,
     UserDefinedEmbeddingModel,
 };
-use futures::Stream;
-use gateway::adapters::InferenceAdapter;
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
 use gateway::types::io::{EmbedRequest, EmbedResponse};
-use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Mutex;
 
 /// Construction-time configuration for [`FastembedAdapter`].
@@ -160,68 +155,8 @@ fn read_required(path: &Path, config: &FastembedConfig) -> Result<Vec<u8>, Gatew
         .map_err(|e| FastembedAdapter::err(config, format!("read {}: {e}", path.display())))
 }
 
-#[async_trait]
-impl InferenceAdapter for FastembedAdapter {
-    fn id(&self) -> &str {
-        &self.config.adapter_id
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::TextEmbed)
-    }
-
-    async fn execute(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        if let Some(requested) = &request.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
-
-        match &request.payload {
-            Payload::Embed { texts } => {
-                let embeddings = self.embed(texts)?;
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: Some(embeddings),
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(self.config.model_id.clone()),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            _ => Err(self.adapter_err(
-                "FastembedAdapter only supports Payload::Embed (TextEmbed capability)",
-            )),
-        }
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        _request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        Err(self.adapter_err("FastembedAdapter does not support streaming"))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge.
+// Capability traits (target model). Traits + RegisterInto referenced by full path.
 // Embed-only: fastembed serves the TextEmbed capability and nothing else.
 // ---------------------------------------------------------------------------
 
@@ -260,10 +195,7 @@ impl gateway::adapters::capability::EmbedModel for FastembedAdapter {
 
 #[async_trait]
 impl gateway::adapters::RegisterInto for FastembedAdapter {
-    async fn register_into(
-        self: std::sync::Arc<Self>,
-        reg: &gateway::adapters::CapabilityRegistry,
-    ) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
         reg.register_embed(self).await;
     }
 }
@@ -369,7 +301,7 @@ mod tests {
     }
 
     /// The capability-trait `Model::id` reports the same id as the legacy
-    /// `InferenceAdapter::id` (both read `config.adapter_id`). Constructing a
+    /// `Model::id` (reads `config.adapter_id`). Constructing a
     /// `FastembedAdapter` needs a real ONNX model, so this shares the
     /// `FASTEMBED_TEST_DIR` guard of the e2e test above.
     #[test]
@@ -381,7 +313,7 @@ mod tests {
         let adapter =
             FastembedAdapter::load(&entry, FastembedConfig::bert("test-fastembed")).expect("load");
 
-        // Full-path call avoids the InferenceAdapter::id() ambiguity.
+        // Full-path call to `Model::id`.
         assert_eq!(
             gateway::adapters::capability::Model::id(&adapter),
             "fastembed"

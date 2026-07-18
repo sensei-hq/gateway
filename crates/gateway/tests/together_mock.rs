@@ -1,16 +1,15 @@
 //! Integration tests for the Together AI adapter using wiremock.
 //!
 //! `TogetherAdapter` is an OpenAI-compatible provider with Bearer-token
-//! auth. `execute()` handles two payloads:
+//! auth implementing `ChatModel` + `ImageModel`:
 //!
-//! - `Payload::Chat` -> POST `{base}/chat/completions`, response parsed
-//!   from `choices[].message.content` + `usage`.
-//! - `Payload::ImageGenerate` -> POST `{base}/images/generations`,
-//!   response parsed from `data[].url` / `data[].b64_json`.
+//! - `chat()` -> POST `{base}/chat/completions`, response parsed from
+//!   `choices[].message.content` + `usage`.
+//! - `generate_image()` -> POST `{base}/images/generations`, response
+//!   parsed from `data[].url` / `data[].b64_json`.
 //!
-//! Any other payload returns `ProviderError { status: None, .. }` without
-//! an HTTP call. `stream()` opens a real SSE stream against
-//! `{base}/chat/completions` (chat only), yielding `data: ` chunks.
+//! `chat_stream()` opens a real SSE stream against `{base}/chat/completions`,
+//! yielding `data: ` chunks.
 //!
 //! Status mappings for both endpoints: 401/403 -> Authentication,
 //! 429 -> RateLimit, everything else -> ProviderError.
@@ -23,12 +22,12 @@ use std::collections::HashMap;
 
 use futures::StreamExt;
 
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{InferenceRequest, Message, MessageRole, Payload};
+use gateway::types::io::{ChatRequest, ImageRequest};
+use gateway::types::request::{Message, MessageRole};
 
-use gateway::adapters::InferenceAdapter;
+use gateway::adapters::capability::{ChatModel, ImageModel};
 use gateway::adapters::together::TogetherAdapter;
 
 use wiremock::matchers::{header, method, path};
@@ -49,50 +48,25 @@ fn router_config(url: &str) -> RouterConfig {
     }
 }
 
-fn chat_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextChat,
+fn chat_request() -> ChatRequest {
+    ChatRequest {
         model: Some("meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::Chat {
-            messages: vec![Message::text(MessageRole::User, "Hello, world!")],
-            system: Some("You are helpful.".to_string()),
-            max_tokens: Some(128),
-            temperature: Some(0.5),
-            tools: Vec::new(),
-        },
-        budget: None,
+        messages: vec![Message::text(MessageRole::User, "Hello, world!")],
+        system: Some("You are helpful.".to_string()),
+        max_tokens: Some(128),
+        temperature: Some(0.5),
+        tools: Vec::new(),
     }
 }
 
-fn image_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::ImageGenerate,
+fn image_request() -> ImageRequest {
+    ImageRequest {
         model: None,
-        router: None,
-        chain: None,
-        payload: Payload::ImageGenerate {
-            prompt: "a red fox in a snowy forest".to_string(),
-            size: Some("512x512".to_string()),
-            quality: None,
-            style: None,
-            n: 1,
-        },
-        budget: None,
-    }
-}
-
-fn embed_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextEmbed,
-        model: None,
-        router: None,
-        chain: None,
-        payload: Payload::Embed {
-            texts: vec!["hello world".to_string()],
-        },
-        budget: None,
+        prompt: "a red fox in a snowy forest".to_string(),
+        size: Some("512x512".to_string()),
+        quality: None,
+        style: None,
+        n: 1,
     }
 }
 
@@ -127,9 +101,8 @@ async fn together_chat_happy_path() {
     let config = router_config(&server.uri());
     let request = chat_request();
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.chat(&config, &request).await.unwrap();
 
-    assert!(response.success);
     assert_eq!(
         response.content.as_deref(),
         Some("Hello from mock Together!")
@@ -170,9 +143,8 @@ async fn together_chat_default_model_and_no_usage() {
     let mut request = chat_request();
     request.model = None; // exercise the DEFAULT_CHAT_MODEL branch
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.chat(&config, &request).await.unwrap();
 
-    assert!(response.success);
     assert_eq!(response.content.as_deref(), Some("defaulted"));
     assert_eq!(
         response.model.as_deref(),
@@ -198,7 +170,7 @@ async fn together_chat_401_maps_to_authentication() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let err = adapter.execute(&config, &chat_request()).await.unwrap_err();
+    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error, got: {err:?}",
@@ -218,7 +190,7 @@ async fn together_chat_403_maps_to_authentication() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let err = adapter.execute(&config, &chat_request()).await.unwrap_err();
+    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error, got: {err:?}",
@@ -238,7 +210,7 @@ async fn together_chat_429_maps_to_rate_limit() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let err = adapter.execute(&config, &chat_request()).await.unwrap_err();
+    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::RateLimit { .. }),
         "expected RateLimit error, got: {err:?}",
@@ -258,7 +230,7 @@ async fn together_chat_500_maps_to_provider_error() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let err = adapter.execute(&config, &chat_request()).await.unwrap_err();
+    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -286,7 +258,7 @@ async fn together_chat_bad_json_maps_to_provider_error() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let err = adapter.execute(&config, &chat_request()).await.unwrap_err();
+    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -323,16 +295,12 @@ async fn together_image_happy_path() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let response = adapter.execute(&config, &image_request()).await.unwrap();
+    let response = adapter
+        .generate_image(&config, &image_request())
+        .await
+        .unwrap();
 
-    assert!(response.success);
-    // model is None on the request -> falls back to DEFAULT_IMAGE_MODEL.
-    assert_eq!(
-        response.model.as_deref(),
-        Some("black-forest-labs/FLUX.1-schnell-Free"),
-    );
-
-    let images = response.images.expect("expected images in response");
+    let images = response.images;
     assert_eq!(images.len(), 1);
     assert_eq!(
         images[0].url.as_deref(),
@@ -361,9 +329,12 @@ async fn together_image_b64_json_variant() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let response = adapter.execute(&config, &image_request()).await.unwrap();
+    let response = adapter
+        .generate_image(&config, &image_request())
+        .await
+        .unwrap();
 
-    let images = response.images.expect("expected images in response");
+    let images = response.images;
     assert_eq!(images.len(), 1);
     assert!(images[0].url.is_none());
     assert_eq!(images[0].b64_json.as_deref(), Some("aGVsbG8="));
@@ -383,7 +354,7 @@ async fn together_image_401_maps_to_authentication() {
     let config = router_config(&server.uri());
 
     let err = adapter
-        .execute(&config, &image_request())
+        .generate_image(&config, &image_request())
         .await
         .unwrap_err();
     assert!(
@@ -406,7 +377,7 @@ async fn together_image_429_maps_to_rate_limit() {
     let config = router_config(&server.uri());
 
     let err = adapter
-        .execute(&config, &image_request())
+        .generate_image(&config, &image_request())
         .await
         .unwrap_err();
     assert!(
@@ -429,7 +400,7 @@ async fn together_image_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
 
     let err = adapter
-        .execute(&config, &image_request())
+        .generate_image(&config, &image_request())
         .await
         .unwrap_err();
     assert!(
@@ -460,7 +431,7 @@ async fn together_image_bad_json_maps_to_provider_error() {
     let config = router_config(&server.uri());
 
     let err = adapter
-        .execute(&config, &image_request())
+        .generate_image(&config, &image_request())
         .await
         .unwrap_err();
     assert!(
@@ -495,32 +466,10 @@ async fn together_missing_api_key_returns_authentication() {
 
     let adapter = TogetherAdapter::new().unwrap();
 
-    let err = adapter.execute(&config, &chat_request()).await.unwrap_err();
+    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error for missing key, got: {err:?}",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Unsupported payload -> ProviderError { status: None } (no HTTP call)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn together_unsupported_payload_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    // No mocks mounted: the adapter must reject before any HTTP call.
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter
-        .execute(&config, &embed_request())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError for unsupported payload, got: {err:?}",
     );
 }
 
@@ -545,7 +494,7 @@ async fn together_from_config_executes_chat() {
     let config = router_config(&server.uri());
     let adapter = TogetherAdapter::from_config(&config).unwrap();
 
-    let response = adapter.execute(&config, &chat_request()).await.unwrap();
+    let response = adapter.chat(&config, &chat_request()).await.unwrap();
     assert_eq!(response.content.as_deref(), Some("via from_config"));
 }
 
@@ -581,7 +530,7 @@ async fn together_stream_happy_path() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let mut stream = adapter.stream(&config, &chat_request()).await.unwrap();
+    let mut stream = adapter.chat_stream(&config, &chat_request()).await.unwrap();
 
     let mut collected = String::new();
     let mut saw_finish = false;
@@ -598,24 +547,6 @@ async fn together_stream_happy_path() {
 }
 
 #[tokio::test]
-async fn together_stream_wrong_payload_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    // stream() only supports chat payloads; image should be rejected
-    // before any HTTP call.
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let result = adapter.stream(&config, &image_request()).await;
-    assert!(result.is_err(), "stream() with image payload must error");
-    let err = result.err().unwrap();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError for non-chat stream, got: {err:?}",
-    );
-}
-
-#[tokio::test]
 async fn together_stream_401_maps_to_authentication() {
     let server = MockServer::start().await;
 
@@ -628,11 +559,11 @@ async fn together_stream_401_maps_to_authentication() {
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
-    let result = adapter.stream(&config, &chat_request()).await;
-    assert!(result.is_err(), "stream() must surface auth failure");
+    let result = adapter.chat_stream(&config, &chat_request()).await;
+    assert!(result.is_err(), "chat_stream() must surface auth failure");
     let err = result.err().unwrap();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error from stream(), got: {err:?}",
+        "expected Authentication error from chat_stream(), got: {err:?}",
     );
 }

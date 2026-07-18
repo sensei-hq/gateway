@@ -22,12 +22,10 @@ use crate::adapters::llama_cpp::{LlamaCppAdapter, LlamaCppConfig, shared_backend
 use crate::registry::ModelResolver;
 use async_trait::async_trait;
 use futures::Stream;
-use gateway::adapters::InferenceAdapter;
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
 use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
-use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
+use gateway::types::request::StreamChunk;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -39,25 +37,6 @@ use std::sync::Arc;
 pub(crate) enum WorkerMode {
     Embedding,
     Generation,
-}
-
-/// Map a payload to the worker mode it needs. `None` for payloads the embedded
-/// runtime doesn't serve (image/audio/etc.).
-pub(crate) fn mode_for_payload(payload: &Payload) -> Option<WorkerMode> {
-    match payload {
-        Payload::Embed { .. } => Some(WorkerMode::Embedding),
-        Payload::Chat { .. } => Some(WorkerMode::Generation),
-        _ => None,
-    }
-}
-
-/// Capabilities the embedded runtime can serve (given an appropriate model).
-/// Mirrors what the per-model [`LlamaCppAdapter`] supports across both modes.
-pub(crate) fn supports_capability(capability: &Capability) -> bool {
-    matches!(
-        capability,
-        Capability::TextChat | Capability::TextComplete | Capability::TextEmbed
-    )
 }
 
 /// Build the per-model worker config for a given mode. `n_ctx`/pooling/etc.
@@ -75,8 +54,8 @@ pub struct EmbeddedLlamaAdapter {
     backend: Arc<LlamaBackend>,
     resolver: Arc<dyn ModelResolver>,
     /// Lazily-built per-(model, mode) workers. An async mutex because lookups
-    /// happen inside `execute`/`stream`; never held across the blocking model
-    /// load (that runs on a `spawn_blocking` thread).
+    /// happen inside `chat`/`embed`/`chat_stream`; never held across the
+    /// blocking model load (that runs on a `spawn_blocking` thread).
     workers: tokio::sync::Mutex<HashMap<(String, WorkerMode), Arc<LlamaCppAdapter>>>,
 }
 
@@ -163,63 +142,12 @@ impl EmbeddedLlamaAdapter {
         workers.insert(key, worker.clone());
         Ok(worker)
     }
-
-    /// Resolve the worker a request targets (shared by execute + stream).
-    async fn worker_for_request(
-        &self,
-        request: &InferenceRequest,
-        mode: WorkerMode,
-    ) -> Result<Arc<LlamaCppAdapter>, GatewayError> {
-        let model_id = request.model.as_deref().ok_or_else(|| {
-            self.err("embedded-llama requires request.model (the model id to load)")
-        })?;
-        self.worker_for(model_id, mode).await
-    }
-}
-
-#[async_trait]
-impl InferenceAdapter for EmbeddedLlamaAdapter {
-    fn id(&self) -> &str {
-        &self.adapter_id
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        supports_capability(capability)
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let mode = mode_for_payload(&request.payload).ok_or_else(|| {
-            self.err("embedded-llama serves Payload::Chat and Payload::Embed only")
-        })?;
-        let worker = self.worker_for_request(request, mode).await?;
-        worker.execute(config, request).await
-    }
-
-    async fn stream(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        // Streaming is generation-only; the worker enforces Payload::Chat.
-        let worker = self
-            .worker_for_request(request, WorkerMode::Generation)
-            .await?;
-        worker.stream(config, request).await
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge. The
-// non-streaming paths call each worker's trait-free `generate` / `embed`; the
-// stream path rebuilds the InferenceRequest envelope the worker's real
-// streaming loop expects (the per-model LlamaCppAdapter worker is not itself
-// migrated to the capability traits).
+// Capability traits. The non-streaming paths call each worker's trait-free
+// `generate` / `embed`; the stream path delegates to the worker's own
+// `ChatModel::chat_stream`.
 // ---------------------------------------------------------------------------
 
 impl gateway::adapters::capability::Model for EmbeddedLlamaAdapter {
@@ -263,24 +191,10 @@ impl gateway::adapters::capability::ChatModel for EmbeddedLlamaAdapter {
             self.err("embedded-llama requires request.model (the model id to load)")
         })?;
         let worker = self.worker_for(model_id, WorkerMode::Generation).await?;
-        // Rebuild the envelope the worker's InferenceAdapter::stream expects.
-        // request.model matches the worker's configured model_id (both derive
-        // from `model_id`), so the worker's model-mismatch guard passes.
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
-            model: req.model.clone(),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: req.messages.clone(),
-                system: req.system.clone(),
-                max_tokens: req.max_tokens,
-                temperature: req.temperature,
-                tools: req.tools.clone(),
-            },
-            budget: None,
-        };
-        worker.stream(config, &request).await
+        // Delegate to the worker's typed chat_stream. `req.model` matches the
+        // worker's configured model_id (both derive from `model_id`), so the
+        // worker's model-mismatch guard passes.
+        worker.chat_stream(config, req).await
     }
 }
 
@@ -305,7 +219,7 @@ impl gateway::adapters::capability::EmbedModel for EmbeddedLlamaAdapter {
 
 #[async_trait]
 impl gateway::adapters::RegisterInto for EmbeddedLlamaAdapter {
-    async fn register_into(self: Arc<Self>, reg: &gateway::adapters::CapabilityRegistry) {
+    async fn register_into(self: Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -316,42 +230,6 @@ mod tests {
     use super::*;
     use crate::registry::{ExternalResolver, ModelEntry, ModelFormat, ModelSource};
     use gateway::types::request::{Message, MessageRole};
-
-    #[test]
-    fn mode_for_payload_maps_embed_and_chat_only() {
-        let embed = Payload::Embed {
-            texts: vec!["x".into()],
-        };
-        assert_eq!(mode_for_payload(&embed), Some(WorkerMode::Embedding));
-
-        let chat = Payload::Chat {
-            messages: vec![Message::text(MessageRole::User, "hi")],
-            system: None,
-            max_tokens: Some(8),
-            temperature: None,
-            tools: Vec::new(),
-        };
-        assert_eq!(mode_for_payload(&chat), Some(WorkerMode::Generation));
-
-        // A non-text payload (image generation) is not served by the runtime.
-        let img = Payload::ImageGenerate {
-            prompt: "a cat".into(),
-            size: None,
-            quality: None,
-            style: None,
-            n: 1,
-        };
-        assert_eq!(mode_for_payload(&img), None);
-    }
-
-    #[test]
-    fn supports_capability_is_the_text_union() {
-        assert!(supports_capability(&Capability::TextChat));
-        assert!(supports_capability(&Capability::TextComplete));
-        assert!(supports_capability(&Capability::TextEmbed));
-        assert!(!supports_capability(&Capability::ImageGenerate));
-        assert!(!supports_capability(&Capability::AudioTranscribe));
-    }
 
     #[test]
     fn worker_config_picks_mode_specific_defaults() {
@@ -377,7 +255,8 @@ mod tests {
     /// Unknown model id surfaces as `ModelUnavailable`, not a panic. Uses an
     /// empty resolver so no model file is needed.
     #[tokio::test]
-    async fn execute_unknown_model_is_model_unavailable() {
+    async fn chat_unknown_model_is_model_unavailable() {
+        use gateway::adapters::capability::ChatModel;
         let resolver = Arc::new(ExternalResolver::new());
         // No real backend needed: resolution fails before any load. We still
         // need a backend to construct, so this test is gated on llama init
@@ -386,19 +265,13 @@ mod tests {
         else {
             return;
         };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
+        let req = gateway::types::io::ChatRequest {
             model: Some("nope".into()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "hi")],
-                system: None,
-                max_tokens: Some(8),
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(MessageRole::User, "hi")],
+            system: None,
+            max_tokens: Some(8),
+            temperature: None,
+            tools: Vec::new(),
         };
         let cfg = RouterConfig {
             url: "embedded://embedded-llama".into(),
@@ -408,7 +281,7 @@ mod tests {
             timeout_ms: None,
             headers: std::collections::HashMap::new(),
         };
-        let err = adapter.execute(&cfg, &request).await.unwrap_err();
+        let err = adapter.chat(&cfg, &req).await.unwrap_err();
         match err {
             GatewayError::ModelUnavailable { ref model, .. } => assert_eq!(model, "nope"),
             other => panic!("expected ModelUnavailable, got {other:?}"),
@@ -423,6 +296,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires LLAMA_TEST_CHAT_GGUF + LLAMA_TEST_GGUF env vars"]
     async fn one_adapter_serves_chat_and_embed_by_model_id() {
+        use gateway::adapters::capability::{ChatModel, EmbedModel};
         let chat = std::env::var("LLAMA_TEST_CHAT_GGUF").expect("LLAMA_TEST_CHAT_GGUF");
         let embed = std::env::var("LLAMA_TEST_GGUF").expect("LLAMA_TEST_GGUF");
 
@@ -443,38 +317,24 @@ mod tests {
         };
 
         // Chat through the chat model.
-        let chat_req = InferenceRequest {
-            capability: Capability::TextChat,
+        let chat_req = gateway::types::io::ChatRequest {
             model: Some("chat-model".into()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Reply: pong")],
-                system: None,
-                max_tokens: Some(16),
-                temperature: Some(0.0),
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(MessageRole::User, "Reply: pong")],
+            system: None,
+            max_tokens: Some(16),
+            temperature: Some(0.0),
+            tools: Vec::new(),
         };
-        let chat_resp = adapter.execute(&cfg, &chat_req).await.expect("chat");
-        assert!(chat_resp.success);
+        let chat_resp = adapter.chat(&cfg, &chat_req).await.expect("chat");
         assert!(chat_resp.content.is_some());
 
         // Embed through the embed model — same adapter instance.
-        let embed_req = InferenceRequest {
-            capability: Capability::TextEmbed,
+        let embed_req = gateway::types::io::EmbedRequest {
             model: Some("embed-model".into()),
-            router: None,
-            chain: None,
-            payload: Payload::Embed {
-                texts: vec!["hello world".into()],
-            },
-            budget: None,
+            texts: vec!["hello world".into()],
         };
-        let embed_resp = adapter.execute(&cfg, &embed_req).await.expect("embed");
-        assert!(embed_resp.success);
-        let embs = embed_resp.embeddings.expect("embeddings");
+        let embed_resp = adapter.embed(&cfg, &embed_req).await.expect("embed");
+        let embs = embed_resp.embeddings;
         assert_eq!(embs.len(), 1);
         assert!(!embs[0].is_empty());
     }

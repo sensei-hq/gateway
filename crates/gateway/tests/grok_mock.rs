@@ -2,14 +2,12 @@
 //!
 //! Grok is an OpenAI-compatible chat provider that additionally exposes
 //! Whisper-style STT (`/v1/audio/transcriptions`) and TTS
-//! (`/v1/audio/speech`) endpoints. `execute()` dispatches on the payload
-//! variant:
-//!   - `Chat` -> POST `/v1/chat/completions` (via the shared `http_json`
-//!     helper), parses `choices[0].message.content` + `usage`.
-//!   - `Stt`  -> multipart POST `/v1/audio/transcriptions`, parses `{text}`.
-//!   - `Tts`  -> POST `/v1/audio/speech`, returns the raw audio bytes.
-//!   - `Embed` / `ImageGenerate` / `VideoGenerate` -> ProviderError
-//!     (xAI offers no such API), returned *before* any HTTP call.
+//! (`/v1/audio/speech`) endpoints via the capability traits:
+//!   - `chat()`       -> POST `/v1/chat/completions`, parses
+//!     `choices[0].message.content` + `usage`.
+//!   - `transcribe()` -> multipart POST `/v1/audio/transcriptions`,
+//!     parses `{text}`.
+//!   - `speak()`      -> POST `/v1/audio/speech`, returns the raw audio bytes.
 //!
 //! All auth uses a Bearer token; every endpoint maps 401/403 ->
 //! Authentication, 429 -> RateLimit, and any other non-success status ->
@@ -17,12 +15,12 @@
 
 use std::collections::HashMap;
 
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{AudioFormat, InferenceRequest, Message, MessageRole, Payload};
+use gateway::types::io::{ChatRequest, SttRequest, TtsRequest};
+use gateway::types::request::{AudioFormat, Message, MessageRole};
 
-use gateway::adapters::InferenceAdapter;
+use gateway::adapters::capability::{ChatModel, SttModel, TtsModel};
 use gateway::adapters::grok::GrokAdapter;
 
 use wiremock::matchers::{header, method, path};
@@ -33,7 +31,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 
 const DEFAULT_CHAT_MODEL: &str = "grok-4-fast";
-const DEFAULT_AUDIO_MODEL: &str = "grok-2-audio";
 
 fn router_config(url: &str) -> RouterConfig {
     RouterConfig {
@@ -46,64 +43,33 @@ fn router_config(url: &str) -> RouterConfig {
     }
 }
 
-fn chat_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextChat,
+fn chat_request() -> ChatRequest {
+    ChatRequest {
         model: None,
-        router: None,
-        chain: None,
-        payload: Payload::Chat {
-            messages: vec![Message::text(MessageRole::User, "Hello, world!")],
-            system: Some("You are a helpful assistant.".to_string()),
-            max_tokens: Some(128),
-            temperature: Some(0.5),
-            tools: Vec::new(),
-        },
-        budget: None,
+        messages: vec![Message::text(MessageRole::User, "Hello, world!")],
+        system: Some("You are a helpful assistant.".to_string()),
+        max_tokens: Some(128),
+        temperature: Some(0.5),
+        tools: Vec::new(),
     }
 }
 
-fn stt_request(format: &str) -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::AudioTranscribe,
+fn stt_request(format: &str) -> SttRequest {
+    SttRequest {
         model: None,
-        router: None,
-        chain: None,
-        payload: Payload::Stt {
-            audio: vec![0xFF, 0xFB, 0x90, 0x00],
-            language: Some("en".to_string()),
-            format: format.to_string(),
-        },
-        budget: None,
+        audio: vec![0xFF, 0xFB, 0x90, 0x00],
+        language: Some("en".to_string()),
+        format: format.to_string(),
     }
 }
 
-fn tts_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::AudioGenerate,
+fn tts_request() -> TtsRequest {
+    TtsRequest {
         model: None,
-        router: None,
-        chain: None,
-        payload: Payload::Tts {
-            text: "Hello world".to_string(),
-            voice: Some("Ara".to_string()),
-            speed: None,
-            output_format: AudioFormat::Mp3,
-        },
-        budget: None,
-    }
-}
-
-fn embed_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextEmbed,
-        model: None,
-        router: None,
-        chain: None,
-        payload: Payload::Embed {
-            texts: vec!["hello world".to_string()],
-        },
-        budget: None,
+        text: "Hello world".to_string(),
+        voice: Some("Ara".to_string()),
+        speed: None,
+        output_format: AudioFormat::Mp3,
     }
 }
 
@@ -138,9 +104,8 @@ async fn grok_chat_happy_path() {
     let config = router_config(&server.uri());
     let request = chat_request();
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.chat(&config, &request).await.unwrap();
 
-    assert!(response.success);
     assert_eq!(response.content.as_deref(), Some("Greetings, human!"));
     assert_eq!(response.model.as_deref(), Some(DEFAULT_CHAT_MODEL));
 
@@ -171,7 +136,7 @@ async fn grok_chat_401_maps_to_authentication() {
     let config = router_config(&server.uri());
     let request = chat_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.chat(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error, got: {err:?}",
@@ -192,7 +157,7 @@ async fn grok_chat_403_maps_to_authentication() {
     let config = router_config(&server.uri());
     let request = chat_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.chat(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error, got: {err:?}",
@@ -216,7 +181,7 @@ async fn grok_chat_429_maps_to_rate_limit() {
     let config = router_config(&server.uri());
     let request = chat_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.chat(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::RateLimit { .. }),
         "expected RateLimit error, got: {err:?}",
@@ -237,7 +202,7 @@ async fn grok_chat_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = chat_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.chat(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -251,7 +216,7 @@ async fn grok_chat_500_maps_to_provider_error() {
 }
 
 // ---------------------------------------------------------------------------
-// STT (AudioTranscribe) — happy path + error mappings
+// STT (transcribe) — happy path + error mappings
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -272,12 +237,9 @@ async fn grok_stt_happy_path() {
     let config = router_config(&server.uri());
     let request = stt_request("mp3");
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.transcribe(&config, &request).await.unwrap();
 
-    assert!(response.success);
-    assert_eq!(response.transcription.as_deref(), Some("hello from grok"));
-    assert_eq!(response.model.as_deref(), Some(DEFAULT_AUDIO_MODEL));
-    assert!(response.content.is_none());
+    assert_eq!(response.transcription, "hello from grok");
 }
 
 #[tokio::test]
@@ -289,7 +251,7 @@ async fn grok_stt_unsupported_format_returns_provider_error() {
     let config = router_config(&server.uri());
     let request = stt_request("ogg");
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.transcribe(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { status: None, .. }),
         "expected ProviderError with no status for unsupported audio format, got: {err:?}",
@@ -310,7 +272,7 @@ async fn grok_stt_401_maps_to_authentication() {
     let config = router_config(&server.uri());
     let request = stt_request("wav");
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.transcribe(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error, got: {err:?}",
@@ -331,7 +293,7 @@ async fn grok_stt_429_maps_to_rate_limit() {
     let config = router_config(&server.uri());
     let request = stt_request("webm");
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.transcribe(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::RateLimit { .. }),
         "expected RateLimit error, got: {err:?}",
@@ -352,7 +314,7 @@ async fn grok_stt_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = stt_request("m4a");
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.transcribe(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -366,7 +328,7 @@ async fn grok_stt_500_maps_to_provider_error() {
 }
 
 // ---------------------------------------------------------------------------
-// TTS (AudioGenerate) — happy path + error mappings
+// TTS (speak) — happy path + error mappings
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -386,12 +348,9 @@ async fn grok_tts_happy_path() {
     let config = router_config(&server.uri());
     let request = tts_request();
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.speak(&config, &request).await.unwrap();
 
-    assert!(response.success);
-    assert_eq!(response.audio.as_deref(), Some(audio_bytes.as_slice()));
-    assert_eq!(response.model.as_deref(), Some(DEFAULT_AUDIO_MODEL));
-    assert!(response.transcription.is_none());
+    assert_eq!(response.audio, audio_bytes);
 }
 
 #[tokio::test]
@@ -408,7 +367,7 @@ async fn grok_tts_403_maps_to_authentication() {
     let config = router_config(&server.uri());
     let request = tts_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.speak(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error, got: {err:?}",
@@ -429,7 +388,7 @@ async fn grok_tts_429_maps_to_rate_limit() {
     let config = router_config(&server.uri());
     let request = tts_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.speak(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::RateLimit { .. }),
         "expected RateLimit error, got: {err:?}",
@@ -450,7 +409,7 @@ async fn grok_tts_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = tts_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.speak(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -460,81 +419,6 @@ async fn grok_tts_500_maps_to_provider_error() {
             }
         ),
         "expected ProviderError with status 500, got: {err:?}",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Unsupported capabilities — return before any HTTP call
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn grok_embed_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    // No mocks mounted: xAI offers no embeddings API, so the adapter returns
-    // a ProviderError with no status before making any HTTP call.
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = embed_request();
-
-    let err = adapter.execute(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError with no status for embed, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn grok_image_generate_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = InferenceRequest {
-        capability: Capability::ImageGenerate,
-        model: None,
-        router: None,
-        chain: None,
-        payload: Payload::ImageGenerate {
-            prompt: "a red fox".to_string(),
-            size: None,
-            quality: None,
-            style: None,
-            n: 1,
-        },
-        budget: None,
-    };
-
-    let err = adapter.execute(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError with no status for image generation, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn grok_video_generate_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = InferenceRequest {
-        capability: Capability::VideoGenerate,
-        model: None,
-        router: None,
-        chain: None,
-        payload: Payload::VideoGenerate {
-            prompt: "a timelapse".to_string(),
-            duration_secs: None,
-            resolution: None,
-        },
-        budget: None,
-    };
-
-    let err = adapter.execute(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError with no status for video generation, got: {err:?}",
     );
 }
 
@@ -557,7 +441,7 @@ async fn grok_missing_api_key_returns_authentication() {
     };
     let request = chat_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.chat(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error for missing key, got: {err:?}",
@@ -565,7 +449,7 @@ async fn grok_missing_api_key_returns_authentication() {
 }
 
 // ---------------------------------------------------------------------------
-// stream() — SSE chat happy path + error mapping
+// chat_stream() — SSE chat happy path + error mapping
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -596,7 +480,7 @@ async fn grok_stream_chat_collects_content() {
     let config = router_config(&server.uri());
     let request = chat_request();
 
-    let mut stream = adapter.stream(&config, &request).await.unwrap();
+    let mut stream = adapter.chat_stream(&config, &request).await.unwrap();
     let mut collected = String::new();
     let mut finish_reasons = Vec::new();
 
@@ -610,29 +494,6 @@ async fn grok_stream_chat_collects_content() {
 
     assert_eq!(collected, "Hello world");
     assert_eq!(finish_reasons, vec!["stop".to_string()]);
-}
-
-#[tokio::test]
-async fn grok_stream_wrong_payload_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    // No mocks mounted: streaming only supports chat payloads, so the adapter
-    // returns before any HTTP call.
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = tts_request();
-
-    // `stream()`'s Ok variant (a boxed Stream) is not Debug, so unwrap_err()
-    // won't compile — extract the error via `.err()` instead.
-    let err = adapter
-        .stream(&config, &request)
-        .await
-        .err()
-        .expect("expected stream() to error");
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError for non-chat stream payload, got: {err:?}",
-    );
 }
 
 #[tokio::test]
@@ -650,10 +511,10 @@ async fn grok_stream_500_maps_to_provider_error() {
     let request = chat_request();
 
     let err = adapter
-        .stream(&config, &request)
+        .chat_stream(&config, &request)
         .await
         .err()
-        .expect("expected stream() to error");
+        .expect("expected chat_stream() to error");
     assert!(
         matches!(
             err,
@@ -662,6 +523,6 @@ async fn grok_stream_500_maps_to_provider_error() {
                 ..
             }
         ),
-        "expected ProviderError with status 500 from stream(), got: {err:?}",
+        "expected ProviderError with status 500 from chat_stream(), got: {err:?}",
     );
 }

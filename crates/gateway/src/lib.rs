@@ -2,9 +2,6 @@ pub mod adapters;
 pub mod budget;
 pub mod circuit_breaker;
 pub mod config;
-// Boundary conversions are consumed by the engine once it switches to
-// capability dispatch (Phase 4); allow dead_code during the bridge.
-#[allow(dead_code)]
 mod dispatch;
 pub mod engine;
 pub mod purpose;

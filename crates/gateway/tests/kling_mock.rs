@@ -1,8 +1,8 @@
 //! Integration tests for the Kling video-generation adapter using wiremock.
 //!
-//! Kling is an async job adapter: `execute()` first POSTs a submit request to
-//! `{base}/videos/text2video` authenticated with a bearer token, receiving
-//! `{"data":{"task_id":"..."}}`, then polls
+//! Kling is an async job adapter: `generate_video()` first POSTs a submit
+//! request to `{base}/videos/text2video` authenticated with a bearer token,
+//! receiving `{"data":{"task_id":"..."}}`, then polls
 //! `GET {base}/videos/text2video/{task_id}` until the returned
 //! `data.task_status` is `"succeed"`. Because `JobConfig::default()` uses a
 //! 3-second poll interval and `poll_until_complete` only sleeps when a poll
@@ -11,18 +11,17 @@
 //!
 //! NOTE: unlike the FLUX adapter (which routes submit errors through
 //! `http_json` and thus maps 401/403 -> Authentication and 429 -> RateLimit),
-//! Kling's `execute()` maps EVERY non-success submit status directly to
+//! Kling's `generate_video()` maps EVERY non-success submit status directly to
 //! `GatewayError::ProviderError { status: Some(code), .. }`. These tests assert
 //! that ACTUAL behavior.
 
 use std::collections::HashMap;
 
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{InferenceRequest, Message, MessageRole, Payload};
+use gateway::types::io::VideoRequest;
 
-use gateway::adapters::InferenceAdapter;
+use gateway::adapters::capability::VideoModel;
 use gateway::adapters::kling::KlingAdapter;
 
 use wiremock::matchers::{header, method, path};
@@ -33,7 +32,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 
 const SAMPLE_URL: &str = "https://cdn.klingai.com/output/generated-video.mp4";
-const DEFAULT_MODEL: &str = "kling-v2";
 const SUBMIT_PATH: &str = "/videos/text2video";
 
 fn router_config(url: &str) -> RouterConfig {
@@ -47,35 +45,12 @@ fn router_config(url: &str) -> RouterConfig {
     }
 }
 
-fn video_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::VideoGenerate,
+fn video_request() -> VideoRequest {
+    VideoRequest {
         model: None,
-        router: None,
-        chain: None,
-        payload: Payload::VideoGenerate {
-            prompt: "a timelapse of a blooming flower".to_string(),
-            duration_secs: Some(5),
-            resolution: Some("1080p".to_string()),
-        },
-        budget: None,
-    }
-}
-
-fn chat_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextChat,
-        model: Some("kling-v2".to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::Chat {
-            messages: vec![Message::text(MessageRole::User, "hello")],
-            system: None,
-            max_tokens: Some(64),
-            temperature: Some(0.5),
-            tools: Vec::new(),
-        },
-        budget: None,
+        prompt: "a timelapse of a blooming flower".to_string(),
+        duration_secs: Some(5),
+        resolution: Some("1080p".to_string()),
     }
 }
 
@@ -97,7 +72,7 @@ async fn mount_submit_ok(server: &MockServer, task_id: &str) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn kling_execute_happy_path() {
+async fn kling_generate_video_happy_path() {
     let server = MockServer::start().await;
 
     // 1. Submit task -> returns a task_id.
@@ -125,12 +100,9 @@ async fn kling_execute_happy_path() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.generate_video(&config, &request).await.unwrap();
 
-    assert!(response.success);
-    assert_eq!(response.model.as_deref(), Some(DEFAULT_MODEL));
-
-    let videos = response.videos.expect("expected videos in response");
+    let videos = response.videos;
     assert_eq!(videos.len(), 1);
     assert_eq!(videos[0].url.as_deref(), Some(SAMPLE_URL));
     assert!((videos[0].duration_secs.unwrap() - 5.0).abs() < f32::EPSILON);
@@ -139,7 +111,7 @@ async fn kling_execute_happy_path() {
 /// The `succeed` branch with an empty result must still succeed, falling back
 /// to the requested duration and a `None` URL.
 #[tokio::test]
-async fn kling_execute_succeed_without_video_falls_back() {
+async fn kling_generate_video_succeed_without_video_falls_back() {
     let server = MockServer::start().await;
 
     mount_submit_ok(&server, "task-no-video").await;
@@ -159,10 +131,9 @@ async fn kling_execute_succeed_without_video_falls_back() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.generate_video(&config, &request).await.unwrap();
 
-    assert!(response.success);
-    let videos = response.videos.expect("expected a videos vec");
+    let videos = response.videos;
     assert_eq!(videos.len(), 1);
     assert!(videos[0].url.is_none());
     // Falls back to the requested duration (5s -> 5.0).
@@ -172,7 +143,7 @@ async fn kling_execute_succeed_without_video_falls_back() {
 // ---------------------------------------------------------------------------
 // Submit error mappings
 //
-// Kling's execute() maps ALL non-success submit statuses directly to
+// Kling's generate_video() maps ALL non-success submit statuses directly to
 // ProviderError { status: Some(code) }. There is no Authentication/RateLimit
 // special-casing on this path.
 // ---------------------------------------------------------------------------
@@ -191,7 +162,7 @@ async fn kling_submit_401_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -218,7 +189,7 @@ async fn kling_submit_403_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -245,7 +216,7 @@ async fn kling_submit_429_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -272,7 +243,7 @@ async fn kling_submit_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -303,7 +274,7 @@ async fn kling_submit_unparseable_body_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { .. }),
         "expected ProviderError parsing submit response, got: {err:?}",
@@ -336,7 +307,7 @@ async fn kling_poll_failed_status_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { .. }),
         "expected ProviderError from failed poll, got: {err:?}",
@@ -360,7 +331,7 @@ async fn kling_poll_http_error_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { .. }),
         "expected ProviderError from poll HTTP error, got: {err:?}",
@@ -385,50 +356,9 @@ async fn kling_poll_unparseable_body_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { .. }),
         "expected ProviderError parsing poll status, got: {err:?}",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Wrong payload type -> early return
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn kling_wrong_payload_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    // No mocks mounted: the adapter must return before making any HTTP call.
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = chat_request();
-
-    let err = adapter.execute(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError for wrong payload, got: {err:?}",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// stream() is unsupported
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn kling_stream_returns_error() {
-    let server = MockServer::start().await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let result = adapter.stream(&config, &request).await;
-    assert!(result.is_err(), "kling stream() must return an error");
-    let err = result.err().unwrap();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from stream(), got: {err:?}",
     );
 }

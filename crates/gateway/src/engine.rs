@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use tokio::sync::RwLock;
 
-use crate::adapters::CapabilityRegistry;
+use crate::adapters::AdapterRegistry;
 use crate::circuit_breaker::CircuitBreakerManager;
 use crate::dispatch::{
     from_chat_response, from_embed_response, from_image_response, from_stt_response,
@@ -23,14 +23,14 @@ use crate::types::trace::{Attempt, AttemptStatus};
 /// chains, records attempts, and integrates the circuit breaker.
 pub struct Gateway {
     config: Arc<RwLock<GatewayConfig>>,
-    pub(crate) adapters: CapabilityRegistry,
+    pub(crate) adapters: AdapterRegistry,
     circuit_breaker: CircuitBreakerManager,
 }
 
 impl Gateway {
     pub fn new(
         config: GatewayConfig,
-        adapters: CapabilityRegistry,
+        adapters: AdapterRegistry,
         circuit_breaker: CircuitBreakerManager,
     ) -> Self {
         Self {
@@ -430,7 +430,7 @@ mod tests {
 
     fn test_gateway() -> Gateway {
         let config = test_config_with_noop();
-        let adapters = CapabilityRegistry::new();
+        let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
@@ -548,7 +548,7 @@ mod tests {
             timeout: Duration::from_secs(300),
             half_open_max_requests: 3,
         });
-        let gw = Gateway::new(config, CapabilityRegistry::new(), cb);
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
 
         let seen_model = Arc::new(std::sync::Mutex::new(None));
         gw.adapters
@@ -836,7 +836,7 @@ mod tests {
     /// Helper: gateway with a failing adapter registered.
     fn test_gateway_with_chain() -> Gateway {
         let config = test_config_with_failing_and_noop();
-        let adapters = CapabilityRegistry::new();
+        let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
@@ -958,7 +958,7 @@ mod tests {
             models,
             chains,
         };
-        let adapters = CapabilityRegistry::new();
+        let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
@@ -1067,7 +1067,7 @@ mod tests {
             models,
             chains,
         };
-        let adapters = CapabilityRegistry::new();
+        let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),

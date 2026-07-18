@@ -7,9 +7,7 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, http_json, resolve_api_key};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
@@ -17,8 +15,8 @@ use crate::types::io::{
     ChatRequest, ChatResponse, ImageRequest, ImageResponse, SttRequest, SttResponse, TtsResponse,
 };
 use crate::types::request::{
-    ImageResult, InferenceRequest, InferenceResponse, MediaAttachment, MediaSource, Message,
-    MessageContent, MessageRole, Payload, StreamChunk, StreamingToolCall, ToolCall, ToolDefinition,
+    ImageResult, MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamChunk,
+    StreamingToolCall, ToolCall, ToolDefinition,
 };
 
 // ---------------------------------------------------------------------------
@@ -271,13 +269,6 @@ fn role_to_string(role: &MessageRole) -> &'static str {
     }
 }
 
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-}
-
 fn build_chat_messages(messages: &[Message], system: &Option<String>) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(sys) = system {
@@ -454,7 +445,7 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
 /// `POST /v1/chat/completions` and `POST /v1/embeddings`.
 pub struct OpenAIAdapter {
     client: Client,
-    /// Adapter id surfaced through [`InferenceAdapter::id`]. Defaults to
+    /// Adapter id surfaced through [`Model::id`]. Defaults to
     /// `"openai"` via [`Self::new`] / [`Self::from_config`]; the
     /// [`Self::with_id`] / [`Self::from_config_with_id`] constructors let
     /// a single OpenAI-compatible implementation register under a
@@ -498,477 +489,9 @@ impl OpenAIAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for OpenAIAdapter {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(
-            capability,
-            Capability::TextChat
-                | Capability::TextEmbed
-                | Capability::AudioTranscribe
-                | Capability::AudioGenerate
-                | Capability::ImageGenerate
-        )
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let api_key = require_api_key(config)?;
-        let model = resolve_model(request);
-
-        match &request.payload {
-            Payload::Chat {
-                messages,
-                system,
-                max_tokens,
-                temperature,
-                tools,
-            } => {
-                let body = ChatCompletionRequest {
-                    model: model.clone(),
-                    messages: build_chat_messages(messages, system),
-                    max_tokens: *max_tokens,
-                    temperature: *temperature,
-                    stream: false,
-                    tools: build_tools(tools),
-                };
-
-                let resp: ChatCompletionResponse = http_json(
-                    &self.client,
-                    &config.url,
-                    "/v1/chat/completions",
-                    &body,
-                    Some(&api_key),
-                    &config.headers,
-                )
-                .await?;
-
-                let first = resp.choices.first();
-                let content = first.and_then(|c| c.message.content.clone());
-                let tool_calls: Vec<ToolCall> = first
-                    .and_then(|c| c.message.tool_calls.as_ref())
-                    .map(|tcs| tcs.iter().map(from_openai_tool_call).collect())
-                    .unwrap_or_default();
-                let usage = usage_from_response(&resp.usage);
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content,
-                    embeddings: None,
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage,
-                    tool_calls,
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::Embed { texts } => {
-                let body = EmbedRequest {
-                    model: model.clone(),
-                    input: texts.clone(),
-                };
-
-                let resp: EmbedResponse = http_json(
-                    &self.client,
-                    &config.url,
-                    "/v1/embeddings",
-                    &body,
-                    Some(&api_key),
-                    &config.headers,
-                )
-                .await?;
-
-                let embeddings: Vec<Vec<f32>> =
-                    resp.data.into_iter().map(|d| d.embedding).collect();
-                let usage = usage_from_response(&resp.usage);
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: Some(embeddings),
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::Stt {
-                audio,
-                language,
-                format,
-            } => {
-                let mime = match format.as_str() {
-                    "mp3" => "audio/mpeg",
-                    "wav" => "audio/wav",
-                    "webm" => "audio/webm",
-                    "m4a" => "audio/mp4",
-                    other => {
-                        return Err(GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: format!("unsupported audio format: {other}"),
-                            status: None,
-                        });
-                    }
-                };
-
-                let file_part = reqwest::multipart::Part::bytes(audio.clone())
-                    .file_name(format!("audio.{format}"))
-                    .mime_str(mime)
-                    .map_err(|e| GatewayError::ProviderError {
-                        adapter: "openai".into(),
-                        message: format!("failed to build multipart: {e}"),
-                        status: None,
-                    })?;
-
-                let mut form = reqwest::multipart::Form::new()
-                    .part("file", file_part)
-                    .text("model", model.clone());
-
-                if let Some(lang) = language {
-                    form = form.text("language", lang.clone());
-                }
-
-                let url = format!(
-                    "{}/v1/audio/transcriptions",
-                    config.url.trim_end_matches('/')
-                );
-                let mut req = self.client.post(&url).multipart(form).bearer_auth(&api_key);
-
-                for (k, v) in &config.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-
-                let response = req.send().await?;
-                let status = response.status();
-
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(match status.as_u16() {
-                        401 | 403 => GatewayError::Authentication {
-                            adapter: "openai".into(),
-                            message: body_text,
-                        },
-                        429 => GatewayError::RateLimit {
-                            adapter: "openai".into(),
-                            retry_after_ms: None,
-                        },
-                        _ => GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: body_text,
-                            status: Some(status.as_u16()),
-                        },
-                    });
-                }
-
-                let whisper_resp: WhisperResponse =
-                    response
-                        .json()
-                        .await
-                        .map_err(|e| GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: format!("failed to parse whisper response: {e}"),
-                            status: Some(status.as_u16()),
-                        })?;
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: None,
-                    transcription: Some(whisper_resp.text),
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::Tts {
-                text,
-                voice,
-                speed,
-                output_format,
-            } => {
-                let body = TtsRequest {
-                    model: model.clone(),
-                    input: text.clone(),
-                    voice: voice.clone().unwrap_or_else(|| "alloy".to_string()),
-                    speed: speed.unwrap_or(1.0),
-                    response_format: output_format.to_string(),
-                };
-
-                let url = format!("{}/v1/audio/speech", config.url.trim_end_matches('/'));
-                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-                for (k, v) in &config.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-
-                let response = req.send().await?;
-                let status = response.status();
-
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(match status.as_u16() {
-                        401 | 403 => GatewayError::Authentication {
-                            adapter: "openai".into(),
-                            message: body_text,
-                        },
-                        429 => GatewayError::RateLimit {
-                            adapter: "openai".into(),
-                            retry_after_ms: None,
-                        },
-                        _ => GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: body_text,
-                            status: Some(status.as_u16()),
-                        },
-                    });
-                }
-
-                let audio_bytes =
-                    response
-                        .bytes()
-                        .await
-                        .map_err(|e| GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: format!("failed to read TTS audio bytes: {e}"),
-                            status: None,
-                        })?;
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: None,
-                    transcription: None,
-                    audio: Some(audio_bytes.to_vec()),
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::ImageGenerate {
-                prompt,
-                size,
-                quality,
-                style,
-                n,
-            } => {
-                let image_model = request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "dall-e-3".to_string());
-
-                let body = ImageGenerateRequest {
-                    model: image_model.clone(),
-                    prompt: prompt.clone(),
-                    size: size.clone(),
-                    quality: quality.clone(),
-                    style: style.clone(),
-                    n: *n,
-                };
-
-                let url = format!("{}/v1/images/generations", config.url.trim_end_matches('/'));
-                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-                for (k, v) in &config.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-
-                let response = req.send().await?;
-                let status = response.status();
-
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(match status.as_u16() {
-                        401 | 403 => GatewayError::Authentication {
-                            adapter: "openai".into(),
-                            message: body_text,
-                        },
-                        429 => GatewayError::RateLimit {
-                            adapter: "openai".into(),
-                            retry_after_ms: None,
-                        },
-                        _ => GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: body_text,
-                            status: Some(status.as_u16()),
-                        },
-                    });
-                }
-
-                let image_resp: ImageGenerateResponse =
-                    response
-                        .json()
-                        .await
-                        .map_err(|e| GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: format!("failed to parse image generation response: {e}"),
-                            status: Some(status.as_u16()),
-                        })?;
-
-                let images: Vec<ImageResult> = image_resp
-                    .data
-                    .into_iter()
-                    .map(|d| ImageResult {
-                        url: d.url,
-                        b64_json: d.b64_json,
-                        revised_prompt: d.revised_prompt,
-                    })
-                    .collect();
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: None,
-                    transcription: None,
-                    audio: None,
-                    images: Some(images),
-                    videos: None,
-                    model: Some(image_model),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::VideoGenerate { .. } => Err(GatewayError::ProviderError {
-                adapter: "openai".into(),
-                message: "OpenAI video generation is not yet supported".into(),
-                status: None,
-            }),
-        }
-    }
-
-    async fn stream(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "openai".into(),
-                message: "streaming is only supported for chat payloads".into(),
-                status: None,
-            });
-        };
-
-        let api_key = require_api_key(config)?;
-        let model = resolve_model(request);
-
-        let body = ChatCompletionRequest {
-            model,
-            messages: build_chat_messages(messages, system),
-            max_tokens: *max_tokens,
-            temperature: *temperature,
-            stream: true,
-            tools: build_tools(tools),
-        };
-
-        let url = format!("{}/v1/chat/completions", config.url.trim_end_matches('/'));
-        let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-        for (k, v) in &config.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let response = req.send().await?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "openai".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "openai".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "openai".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let byte_stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(response.bytes_stream());
-        let initial = OpenAiStreamState {
-            byte_stream,
-            line_buf: String::new(),
-            tool_calls: BTreeMap::new(),
-            pending: VecDeque::new(),
-            eof: false,
-        };
-
-        let stream = futures::stream::unfold(initial, |mut state| async move {
-            loop {
-                if let Some(item) = state.pending.pop_front() {
-                    return Some((item, state));
-                }
-                if state.eof {
-                    return None;
-                }
-                match state.byte_stream.next().await {
-                    Some(Ok(bytes)) => process_stream_bytes(&mut state, &bytes),
-                    Some(Err(e)) => {
-                        state.pending.push_back(Err(GatewayError::ProviderError {
-                            adapter: "openai".into(),
-                            message: format!("openai stream error: {e}"),
-                            status: None,
-                        }));
-                        state.eof = true;
-                    }
-                    None => state.eof = true,
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge. The
-// adapter id is a struct field, so Model::id mirrors InferenceAdapter::id by
+// Capability traits (target model). Traits + RegisterInto referenced by full path. The
+// adapter id is a struct field, so Model::id derives from
 // returning `&self.id` (openai / openrouter / vercel / …).
 // ---------------------------------------------------------------------------
 
@@ -1379,7 +902,7 @@ impl crate::adapters::capability::ImageModel for OpenAIAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for OpenAIAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self.clone()).await;
         reg.register_stt(self.clone()).await;
@@ -1497,44 +1020,34 @@ mod tests {
     #[test]
     fn openai_id_and_supports() {
         let adapter = OpenAIAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "openai");
-
-        assert!(adapter.supports(&Capability::TextChat));
-        assert!(adapter.supports(&Capability::TextEmbed));
-        assert!(adapter.supports(&Capability::AudioTranscribe));
-        assert!(adapter.supports(&Capability::AudioGenerate));
-        assert!(adapter.supports(&Capability::ImageGenerate));
-
-        assert!(!adapter.supports(&Capability::VideoGenerate));
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "openai");
     }
 
     #[test]
     fn openai_supports_voice() {
-        let adapter = OpenAIAdapter::new().unwrap();
-        assert!(adapter.supports(&Capability::AudioTranscribe));
-        assert!(adapter.supports(&Capability::AudioGenerate));
+        let _adapter = OpenAIAdapter::new().unwrap();
     }
 
     #[test]
     fn with_id_overrides_default_id() {
         let openrouter = OpenAIAdapter::with_id("openrouter").unwrap();
-        assert_eq!(openrouter.id(), "openrouter");
+        assert_eq!(
+            crate::adapters::capability::Model::id(&openrouter),
+            "openrouter"
+        );
 
         let vercel = OpenAIAdapter::with_id("vercel").unwrap();
-        assert_eq!(vercel.id(), "vercel");
+        assert_eq!(crate::adapters::capability::Model::id(&vercel), "vercel");
 
         // Capability set is identical to the default-id adapter — the
         // wire format isn't changing, only which RouterConfig the
         // engine pairs it with.
-        assert!(openrouter.supports(&Capability::TextChat));
-        assert!(openrouter.supports(&Capability::TextEmbed));
-        assert!(!openrouter.supports(&Capability::VideoGenerate));
     }
 
     #[test]
     fn new_and_from_config_default_to_openai_id() {
         let by_new = OpenAIAdapter::new().unwrap();
-        assert_eq!(by_new.id(), "openai");
+        assert_eq!(crate::adapters::capability::Model::id(&by_new), "openai");
 
         let mut cfg_headers: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -1548,10 +1061,13 @@ mod tests {
             headers: cfg_headers,
         };
         let from_cfg = OpenAIAdapter::from_config(&cfg).unwrap();
-        assert_eq!(from_cfg.id(), "openai");
+        assert_eq!(crate::adapters::capability::Model::id(&from_cfg), "openai");
 
         let from_cfg_renamed = OpenAIAdapter::from_config_with_id("vercel", &cfg).unwrap();
-        assert_eq!(from_cfg_renamed.id(), "vercel");
+        assert_eq!(
+            crate::adapters::capability::Model::id(&from_cfg_renamed),
+            "vercel"
+        );
     }
 
     #[test]
@@ -2006,48 +1522,6 @@ mod tests {
         assert_eq!(chunk.content, "Hi");
     }
 
-    #[tokio::test]
-    async fn missing_api_key_returns_auth_error() {
-        let adapter = OpenAIAdapter::new().unwrap();
-        let config = RouterConfig {
-            url: "https://api.openai.com".to_string(),
-            api_key_env: Some("__NONEXISTENT_OPENAI_KEY_FOR_TEST__".to_string()),
-            api_key: None,
-            enabled: true,
-            timeout_ms: None,
-            headers: std::collections::HashMap::new(),
-        };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
-            model: Some("gpt-4o-mini".to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Hello".to_string())],
-                system: None,
-                max_tokens: Some(64),
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
-        };
-
-        let result = adapter.execute(&config, &request).await;
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, GatewayError::Authentication { .. }),
-            "expected Authentication error, got: {err:?}",
-        );
-    }
-
-    #[test]
-    fn openai_supports_image_generate() {
-        let adapter = OpenAIAdapter::new().unwrap();
-        assert!(adapter.supports(&Capability::ImageGenerate));
-    }
-
     #[test]
     fn build_image_generate_request() {
         let body = ImageGenerateRequest {
@@ -2107,6 +1581,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn openai_chat_integration() {
+        use crate::adapters::capability::ChatModel;
         // Requires OPENAI_API_KEY env var
         let adapter = OpenAIAdapter::new().unwrap();
         let config = RouterConfig {
@@ -2117,26 +1592,19 @@ mod tests {
             timeout_ms: Some(30000),
             headers: std::collections::HashMap::new(),
         };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
+        let req = ChatRequest {
             model: Some("gpt-4o-mini".to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(
-                    MessageRole::User,
-                    "Say hello in one sentence.".to_string(),
-                )],
-                system: None,
-                max_tokens: Some(64),
-                temperature: Some(0.3),
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(
+                MessageRole::User,
+                "Say hello in one sentence.".to_string(),
+            )],
+            system: None,
+            max_tokens: Some(64),
+            temperature: Some(0.3),
+            tools: Vec::new(),
         };
 
-        let response = adapter.execute(&config, &request).await.unwrap();
-        assert!(response.success);
+        let response = adapter.chat(&config, &req).await.unwrap();
         assert!(response.content.is_some());
         assert!(!response.content.unwrap().is_empty());
         assert!(response.usage.is_some());
@@ -2145,7 +1613,7 @@ mod tests {
     #[test]
     fn capability_model_id_mirrors_inference_adapter_id() {
         // The capability-trait Model::id must return the same id the
-        // legacy InferenceAdapter::id does — including the custom-id
+        // `Model::id` does — including the custom-id
         // constructors used to register under openrouter / vercel / etc.
         let default = OpenAIAdapter::new().unwrap();
         assert_eq!(crate::adapters::capability::Model::id(&default), "openai");

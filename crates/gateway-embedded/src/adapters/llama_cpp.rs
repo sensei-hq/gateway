@@ -4,27 +4,26 @@
 //! embedding queries spends 5–9x more time in protocol overhead than on
 //! the actual inference (measured in `rust-embedding-bench`). Loading the
 //! same GGUF in-process and calling [`llama_cpp_2`] directly recovers that
-//! latency. This adapter is the same idea behind the `InferenceAdapter`
-//! trait that the rest of the gateway already speaks.
+//! latency. This adapter speaks the gateway's capability traits
+//! (`ChatModel`/`EmbedModel`) like every other adapter.
 //!
 //! Design — one adapter holds one model and is configured at load time
 //! into one of two modes:
-//! - [`LlamaCppMode::Embedding`] supports [`Capability::TextEmbed`]
+//! - [`LlamaCppMode::Embedding`] supports `Capability::TextEmbed`
 //!   via a single-shot encode + per-sequence pooled vector read.
-//! - [`LlamaCppMode::Generation`] supports [`Capability::TextChat`] /
-//!   [`Capability::TextComplete`] via an autoregressive decode loop with
+//! - [`LlamaCppMode::Generation`] supports `Capability::TextChat` /
+//!   `Capability::TextComplete` via an autoregressive decode loop with
 //!   token sampling. Uses the model's bundled chat template to format
 //!   messages.
 //!
 //! The adapter is loaded with a specific [`ModelEntry`]; requests whose
 //! `model` field disagrees return [`GatewayError::ModelUnavailable`].
-//! Streaming is not yet implemented — `stream()` returns an error.
 //!
 //! Concurrency model:
 //! - The [`llama_cpp_2`] [`LlamaModel`] is read-only and shared.
 //! - The [`LlamaContext`] carries mutable state (kv cache, scratch
 //!   buffers) and is wired through a `std::sync::Mutex`. Concurrent
-//!   `execute()` calls serialise on the mutex; the work is fully blocking
+//!   `chat`/`embed` calls serialise on the mutex; the work is fully blocking
 //!   on llama.cpp's native side anyway.
 //!
 //! Lifetime gymnastics: a [`LlamaContext<'b>`] holds an `&'b LlamaModel`
@@ -48,14 +47,10 @@ use crate::math::l2_normalize_in_place;
 use crate::registry::{ModelEntry, ModelSource};
 use async_trait::async_trait;
 use futures::Stream;
-use gateway::adapters::InferenceAdapter;
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
 use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
-use gateway::types::request::{
-    InferenceRequest, InferenceResponse, Message, MessageRole, Payload, StreamChunk,
-};
+use gateway::types::request::{Message, MessageRole, StreamChunk};
 use llama_cpp_2::{
     context::{
         LlamaContext,
@@ -392,7 +387,7 @@ impl LlamaCppAdapter {
 
     /// Public, trait-free embedding entry point — easier to use from tests
     /// or from sensei-internal callers that already have a borrow on the
-    /// adapter and don't need the full [`InferenceRequest`] envelope.
+    /// adapter and don't need the full `InferenceRequest` envelope.
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, GatewayError> {
         if !matches!(self.config.mode, LlamaCppMode::Embedding { .. }) {
             return Err(self.err("adapter not configured for embedding (mode != Embedding)"));
@@ -621,190 +616,9 @@ fn chat_msg_err(detail: &str) -> GatewayError {
     }
 }
 
-fn response_with_embeddings(model_id: &str, embeddings: Vec<Vec<f32>>) -> InferenceResponse {
-    InferenceResponse {
-        success: true,
-        content: None,
-        embeddings: Some(embeddings),
-        transcription: None,
-        audio: None,
-        images: None,
-        videos: None,
-        model: Some(model_id.to_string()),
-        usage: None,
-        tool_calls: Vec::new(),
-        estimated_cost: None,
-        actual_cost: None,
-        attempts: vec![],
-    }
-}
-
-fn response_with_content(model_id: &str, content: String) -> InferenceResponse {
-    InferenceResponse {
-        success: true,
-        content: Some(content),
-        embeddings: None,
-        transcription: None,
-        audio: None,
-        images: None,
-        videos: None,
-        model: Some(model_id.to_string()),
-        usage: None,
-        tool_calls: Vec::new(),
-        estimated_cost: None,
-        actual_cost: None,
-        attempts: vec![],
-    }
-}
-
-#[async_trait]
-impl InferenceAdapter for LlamaCppAdapter {
-    fn id(&self) -> &str {
-        &self.config.adapter_id
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(
-            (&self.config.mode, capability),
-            (LlamaCppMode::Embedding { .. }, Capability::TextEmbed)
-                | (LlamaCppMode::Generation { .. }, Capability::TextChat)
-                | (LlamaCppMode::Generation { .. }, Capability::TextComplete)
-        )
-    }
-
-    async fn execute(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        if let Some(requested) = &request.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
-
-        match &request.payload {
-            Payload::Embed { texts } => {
-                let embeddings = self.embed(texts)?;
-                Ok(response_with_embeddings(&self.config.model_id, embeddings))
-            }
-            Payload::Chat {
-                messages,
-                system,
-                max_tokens,
-                temperature,
-                tools: _,
-            } => {
-                let content =
-                    self.generate(messages, system.as_deref(), *max_tokens, *temperature)?;
-                Ok(response_with_content(&self.config.model_id, content))
-            }
-            _ => Err(self.err(
-                "LlamaCppAdapter supports Payload::Embed (Embedding mode) \
-                 and Payload::Chat (Generation mode) only",
-            )),
-        }
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        if let Some(requested) = &request.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
-
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools: _,
-        } = &request.payload
-        else {
-            return Err(self.err("LlamaCppAdapter streaming only supports Payload::Chat"));
-        };
-
-        // Resolve generation settings (mode-checked).
-        let (default_max, default_temp, seed) = match self.config.mode {
-            LlamaCppMode::Generation {
-                default_max_tokens,
-                default_temperature,
-                seed,
-            } => (default_max_tokens, default_temperature, seed),
-            _ => {
-                return Err(self.err("adapter not configured for streaming (mode != Generation)"));
-            }
-        };
-        let max_new = max_tokens.unwrap_or(default_max).max(1);
-        let temperature = temperature.unwrap_or(default_temp);
-
-        // Build the prompt synchronously on the calling task — cheap.
-        // The heavy autoregressive loop runs inside spawn_blocking.
-        let chat = build_chat_messages(messages, system.as_deref())?;
-        let template = self
-            .inner
-            .model
-            .chat_template(None)
-            .map_err(|e| self.err(format!("chat template lookup: {e}")))?;
-        let prompt = self
-            .inner
-            .model
-            .apply_chat_template(&template, &chat, true)
-            .map_err(|e| self.err(format!("apply chat template: {e}")))?;
-        let prompt_tokens = self
-            .inner
-            .model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| self.err(format!("tokenize prompt: {e}")))?;
-        if (prompt_tokens.len() as u32).saturating_add(max_new) > self.config.n_ctx {
-            return Err(self.err(format!(
-                "prompt ({} tokens) + max_new ({}) exceeds n_ctx ({})",
-                prompt_tokens.len(),
-                max_new,
-                self.config.n_ctx
-            )));
-        }
-
-        // Channel sized so a fast producer can stay ahead of a slow
-        // consumer (e.g. SSE serialisation). 32 chunks ≈ 32 token-aligned
-        // text increments — small enough to keep memory bounded.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk, GatewayError>>(32);
-        let inner = Arc::clone(&self.inner);
-        let adapter_id = self.config.adapter_id.clone();
-
-        tokio::task::spawn_blocking(move || {
-            run_streaming_generation(
-                inner,
-                adapter_id,
-                prompt_tokens,
-                max_new,
-                temperature,
-                seed,
-                tx,
-            );
-        });
-
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability-segregated traits (target model — see
-// docs/design/adapter-capability-traits.md). Additive alongside the existing
-// `InferenceAdapter` impl during the migration. The traits and `RegisterInto`
-// are referenced by full path to avoid the `id()` clash with
-// `InferenceAdapter::id` during the bridge.
+// Capability-segregated traits (see docs/design/adapter-capability-traits.md).
+// The traits and `RegisterInto` are referenced by full path.
 //
 // One `LlamaCppAdapter` is loaded in exactly one mode (Embedding or
 // Generation), so it registers into both the chat and embed maps but only
@@ -958,10 +772,7 @@ impl gateway::adapters::capability::EmbedModel for LlamaCppAdapter {
 
 #[async_trait]
 impl gateway::adapters::RegisterInto for LlamaCppAdapter {
-    async fn register_into(
-        self: std::sync::Arc<Self>,
-        reg: &gateway::adapters::CapabilityRegistry,
-    ) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -1343,6 +1154,7 @@ mod tests {
     #[ignore = "requires LLAMA_TEST_CHAT_GGUF env var pointing at a generative GGUF with a chat template"]
     async fn stream_against_real_model_emits_chunks_with_finish_reason() {
         use futures::StreamExt;
+        use gateway::adapters::capability::ChatModel;
         use gateway::types::config::RouterConfig;
 
         let path = std::env::var("LLAMA_TEST_CHAT_GGUF")
@@ -1359,22 +1171,16 @@ mod tests {
         }
         let adapter = LlamaCppAdapter::load(backend, &entry, cfg).expect("load model");
 
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
+        let request = gateway::types::io::ChatRequest {
             model: Some("test-chat-model".into()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(
-                    MessageRole::User,
-                    "Reply with the single word: pong.".to_string(),
-                )],
-                system: None,
-                max_tokens: Some(16),
-                temperature: Some(0.0),
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(
+                MessageRole::User,
+                "Reply with the single word: pong.".to_string(),
+            )],
+            system: None,
+            max_tokens: Some(16),
+            temperature: Some(0.0),
+            tools: Vec::new(),
         };
 
         let router_cfg = RouterConfig {
@@ -1386,7 +1192,10 @@ mod tests {
             headers: std::collections::HashMap::new(),
         };
 
-        let mut stream = adapter.stream(&router_cfg, &request).await.expect("stream");
+        let mut stream = adapter
+            .chat_stream(&router_cfg, &request)
+            .await
+            .expect("stream");
 
         let mut accumulated = String::new();
         let mut content_chunks = 0usize;

@@ -373,7 +373,7 @@ pub fn builtin_purposes() -> Vec<Purpose> {
 mod tests {
     use super::*;
     use crate::adapters::noop::NoopAdapter;
-    use crate::adapters::{CapabilityRegistry, RegisterInto};
+    use crate::adapters::{AdapterRegistry, RegisterInto};
     use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
     use crate::types::config::{
         ChainEntry, FallbackChainConfig, FallbackTrigger, GatewayConfig, ModelConfig, RouterConfig,
@@ -447,7 +447,7 @@ mod tests {
 
     async fn noop_gateway() -> Gateway {
         let config = noop_gateway_config();
-        let adapters = CapabilityRegistry::new();
+        let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),

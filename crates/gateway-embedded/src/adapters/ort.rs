@@ -37,15 +37,10 @@ use ::ort::{
     value::Tensor,
 };
 use async_trait::async_trait;
-use futures::Stream;
-use gateway::adapters::InferenceAdapter;
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
 use gateway::types::io::{EmbedRequest, EmbedResponse};
-use gateway::types::request::{InferenceRequest, InferenceResponse, Payload, StreamChunk};
 use std::path::Path;
-use std::pin::Pin;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
 use crate::math::l2_normalize_in_place;
@@ -304,72 +299,10 @@ fn configure_tokenizer(t: &mut Tokenizer, config: &OrtConfig) -> Result<(), Gate
     Ok(())
 }
 
-#[async_trait]
-impl InferenceAdapter for OrtAdapter {
-    fn id(&self) -> &str {
-        &self.config.adapter_id
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::TextEmbed)
-    }
-
-    async fn execute(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        if let Some(requested) = &request.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
-
-        match &request.payload {
-            Payload::Embed { texts } => {
-                let embeddings = self.embed(texts)?;
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: Some(embeddings),
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(self.config.model_id.clone()),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            _ => {
-                Err(self
-                    .adapter_err("OrtAdapter only supports Payload::Embed (TextEmbed capability)"))
-            }
-        }
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        _request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        Err(self.adapter_err("OrtAdapter does not support streaming"))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model — see the `gateway` crate's
-// docs/design/adapter-capability-traits.md). Additive alongside the existing
-// `InferenceAdapter` impl above, which is left intact during the bridge.
-// `Model` / `EmbedModel` / `RegisterInto` are referenced by full path so
-// `Model::id` doesn't clash with `InferenceAdapter::id`. ORT is embed-only.
+// Capability traits (see docs/design/adapter-capability-traits.md).
+// `Model` / `EmbedModel` / `RegisterInto` are referenced by full path.
+// ORT is embed-only.
 // ---------------------------------------------------------------------------
 
 impl gateway::adapters::capability::Model for OrtAdapter {
@@ -408,10 +341,7 @@ impl gateway::adapters::capability::EmbedModel for OrtAdapter {
 
 #[async_trait]
 impl gateway::adapters::RegisterInto for OrtAdapter {
-    async fn register_into(
-        self: std::sync::Arc<Self>,
-        reg: &gateway::adapters::CapabilityRegistry,
-    ) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
         reg.register_embed(self).await;
     }
 }
@@ -588,7 +518,7 @@ mod tests {
     }
 
     /// The capability-trait `Model::id` must return the same id the legacy
-    /// `InferenceAdapter::id` does (the config's `adapter_id`). Constructing a
+    /// `Model::id` returns (the config's `adapter_id`). Constructing a
     /// real `OrtAdapter` needs a live ONNX session, so this is gated on the
     /// same `ORT_TEST_DIR` as the end-to-end embed test above; it still
     /// compile-checks the full-path `Model::id` wiring on every build.
