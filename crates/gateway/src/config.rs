@@ -1,6 +1,70 @@
 use std::collections::HashMap;
 
 use crate::types::config::{FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig};
+use crate::types::error::GatewayError;
+
+/// Collect all configuration errors for the given routers/models/chains.
+///
+/// Shared by [`GatewayBuilder::validate`] (which surfaces the raw strings) and
+/// [`validate_config`] (which wraps them in a [`GatewayError`]). Keeping the
+/// rules in one place means both entry points stay in lockstep.
+pub(crate) fn collect_validation_errors(
+    routers: &HashMap<String, RouterConfig>,
+    models: &HashMap<String, ModelConfig>,
+    chains: &HashMap<String, FallbackChainConfig>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Rule 1: At least one router
+    if routers.is_empty() {
+        errors.push("no routers configured".to_string());
+    }
+
+    // Rule 2: Each router must have non-empty url
+    for (id, router) in routers {
+        if router.url.is_empty() {
+            errors.push(format!("router '{}' has empty URL", id));
+        }
+    }
+
+    // Rule 3: Chain models must reference known models
+    for (chain_id, chain) in chains {
+        for entry in &chain.models {
+            if !models.contains_key(&entry.model) {
+                errors.push(format!(
+                    "chain '{}' references unknown model '{}'",
+                    chain_id, entry.model
+                ));
+            }
+        }
+    }
+
+    // Rule 4: Model provider must have corresponding router
+    for (model_id, model) in models {
+        if !routers.contains_key(&model.provider) {
+            errors.push(format!(
+                "model '{}' provider '{}' has no corresponding router",
+                model_id, model.provider
+            ));
+        }
+    }
+
+    errors
+}
+
+/// Validate an already-assembled [`GatewayConfig`], returning a single
+/// [`GatewayError::InvalidConfig`] carrying all discovered problems.
+///
+/// This is the checked counterpart to the unchecked `Gateway::new` /
+/// `update_config` paths, reusing the exact same rules as [`GatewayBuilder`].
+pub(crate) fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
+    let errors = collect_validation_errors(&config.routers, &config.models, &config.chains);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(GatewayError::InvalidConfig(errors.join("; ")))
+    }
+}
 
 /// Fluent builder for constructing and validating a [`GatewayConfig`].
 pub struct GatewayBuilder {
@@ -38,43 +102,7 @@ impl GatewayBuilder {
 
     /// Validate the current builder state, returning ALL errors found.
     pub fn validate(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        // Rule 1: At least one router
-        if self.routers.is_empty() {
-            errors.push("no routers configured".to_string());
-        }
-
-        // Rule 2: Each router must have non-empty url
-        for (id, router) in &self.routers {
-            if router.url.is_empty() {
-                errors.push(format!("router '{}' has empty URL", id));
-            }
-        }
-
-        // Rule 3: Chain models must reference known models
-        for (chain_id, chain) in &self.chains {
-            for entry in &chain.models {
-                if !self.models.contains_key(&entry.model) {
-                    errors.push(format!(
-                        "chain '{}' references unknown model '{}'",
-                        chain_id, entry.model
-                    ));
-                }
-            }
-        }
-
-        // Rule 4: Model provider must have corresponding router
-        for (model_id, model) in &self.models {
-            if !self.routers.contains_key(&model.provider) {
-                errors.push(format!(
-                    "model '{}' provider '{}' has no corresponding router",
-                    model_id, model.provider
-                ));
-            }
-        }
-
-        errors
+        collect_validation_errors(&self.routers, &self.models, &self.chains)
     }
 
     /// Validate and build the [`GatewayConfig`].
@@ -299,5 +327,57 @@ mod tests {
         let errors = builder.validate();
         // Should have at least "no routers configured"
         assert!(errors.iter().any(|e| e.contains("no routers")));
+    }
+
+    #[test]
+    fn validate_config_accepts_valid_and_rejects_invalid() {
+        // A valid config passes.
+        let valid = GatewayBuilder::new()
+            .add_router("ollama", ollama_router())
+            .add_model(gemma_model())
+            .add_chain(chat_chain())
+            .build()
+            .unwrap();
+        assert!(validate_config(&valid).is_ok());
+
+        // An empty config fails with a single joined InvalidConfig error.
+        match validate_config(&GatewayConfig::default()) {
+            Err(GatewayError::InvalidConfig(msg)) => {
+                assert!(msg.contains("no routers"), "unexpected message: {msg}");
+            }
+            other => panic!("Expected InvalidConfig, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_config_joins_all_errors() {
+        // Config with a chain that references an unknown model AND a model
+        // whose provider has no router — both problems surface in one message.
+        let mut config = GatewayBuilder::new()
+            .add_router("ollama", ollama_router())
+            .add_model(gemma_model())
+            .build()
+            .unwrap();
+        config.chains.insert(
+            "bad".to_string(),
+            FallbackChainConfig {
+                id: "bad".to_string(),
+                capability: Capability::TextChat,
+                models: vec![ChainEntry {
+                    model: "ghost".to_string(),
+                    router: None,
+                    api_model_id: None,
+                    priority: 1,
+                }],
+                fallback_triggers: vec![],
+            },
+        );
+
+        match validate_config(&config) {
+            Err(GatewayError::InvalidConfig(msg)) => {
+                assert!(msg.contains("unknown model") && msg.contains("ghost"));
+            }
+            other => panic!("Expected InvalidConfig, got: {other:?}"),
+        }
     }
 }
