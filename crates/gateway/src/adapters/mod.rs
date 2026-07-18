@@ -72,6 +72,15 @@ impl AdapterRegistry {
     capability_map_accessors!(image, register_image, image, ImageModel);
     capability_map_accessors!(video, register_video, video, VideoModel);
 
+    /// Register an adapter into every capability map it implements, in one call:
+    /// `registry.register(Arc::new(MyAdapter::new()?)).await`. This is the primary
+    /// registration entry point — it delegates to the adapter's [`RegisterInto`]
+    /// impl, so a chat+embed adapter lands in both maps. Use the per-capability
+    /// `register_chat` / `register_embed` / … only when you need finer control.
+    pub async fn register<A: RegisterInto + 'static>(&self, adapter: Arc<A>) {
+        adapter.register_into(self).await;
+    }
+
     /// Sorted, de-duplicated union of adapter ids across every capability map.
     /// An adapter registered under several capabilities appears once.
     pub async fn list(&self) -> Vec<String> {
@@ -86,10 +95,12 @@ impl AdapterRegistry {
     }
 }
 
-/// One-call registration: an adapter inserts itself into every capability map
-/// it implements. Consumers call
-/// `Arc::new(MyAdapter::new()?).register_into(&reg).await` instead of calling
-/// each `register_<cap>` by hand.
+/// Lets an adapter insert itself into every capability map it implements.
+/// **Custom adapters implement this**; callers usually don't invoke it directly
+/// — [`AdapterRegistry::register`] is the ergonomic entry point
+/// (`registry.register(Arc::new(MyAdapter::new()?)).await`) and delegates here.
+/// A built-in adapter's impl typically calls the `register_<cap>` method for each
+/// capability it supports.
 #[async_trait]
 pub trait RegisterInto: Send + Sync {
     async fn register_into(self: Arc<Self>, reg: &AdapterRegistry);
@@ -159,9 +170,10 @@ mod tests {
 
     #[tokio::test]
     async fn registry_registers_and_lists_by_capability() {
-        // NoopAdapter registers into every capability map via `RegisterInto`.
+        // `register` is the primary entry point; NoopAdapter lands in every
+        // capability map via its `RegisterInto` impl.
         let reg = AdapterRegistry::new();
-        Arc::new(NoopAdapter).register_into(&reg).await;
+        reg.register(Arc::new(NoopAdapter)).await;
 
         // Structural lookup: present under a capability, absent for unknown id.
         assert!(reg.chat("noop").await.is_some());

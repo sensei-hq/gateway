@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::types::config::{FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig};
+use crate::types::config::{
+    ConstraintsConfig, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
+};
 use crate::types::error::GatewayError;
 
 /// Collect all configuration errors for the given routers/models/chains.
@@ -71,6 +73,7 @@ pub struct GatewayBuilder {
     routers: HashMap<String, RouterConfig>,
     models: HashMap<String, ModelConfig>,
     chains: HashMap<String, FallbackChainConfig>,
+    constraints: ConstraintsConfig,
 }
 
 impl GatewayBuilder {
@@ -79,6 +82,7 @@ impl GatewayBuilder {
             routers: HashMap::new(),
             models: HashMap::new(),
             chains: HashMap::new(),
+            constraints: ConstraintsConfig::default(),
         }
     }
 
@@ -100,6 +104,13 @@ impl GatewayBuilder {
         self
     }
 
+    /// Set the subscription/quota constraints (AUTH). Optional — defaults to an
+    /// empty catalog (no enforcement).
+    pub fn constraints(mut self, constraints: ConstraintsConfig) -> Self {
+        self.constraints = constraints;
+        self
+    }
+
     /// Validate the current builder state, returning ALL errors found.
     pub fn validate(&self) -> Vec<String> {
         collect_validation_errors(&self.routers, &self.models, &self.chains)
@@ -118,7 +129,7 @@ impl GatewayBuilder {
             routers: self.routers,
             models: self.models,
             chains: self.chains,
-            constraints: Default::default(),
+            constraints: self.constraints,
         })
     }
 
@@ -128,6 +139,7 @@ impl GatewayBuilder {
             routers: config.routers,
             models: config.models,
             chains: config.chains,
+            constraints: config.constraints,
         }
     }
 }
@@ -168,6 +180,34 @@ mod tests {
             max_output_tokens: 8192,
             pricing: None,
         }
+    }
+
+    #[test]
+    fn builder_carries_constraints_into_config() {
+        use crate::types::config::{
+            ConstraintsConfig, MeterUnit, QuotaLimit, TierConstraints, Window,
+        };
+        let constraints = ConstraintsConfig {
+            tiers: HashMap::from([(
+                "free".to_string(),
+                TierConstraints {
+                    quota: vec![QuotaLimit {
+                        unit: MeterUnit::Requests,
+                        window: Window::Day,
+                        limit: 100,
+                    }],
+                    per_capability: HashMap::new(),
+                },
+            )]),
+            default: None,
+        };
+        let config = GatewayBuilder::new()
+            .add_router("ollama", ollama_router())
+            .add_model(gemma_model())
+            .constraints(constraints)
+            .build()
+            .expect("valid config");
+        assert_eq!(config.constraints.tiers["free"].quota[0].limit, 100);
     }
 
     fn chat_chain() -> FallbackChainConfig {
