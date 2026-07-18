@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::Utc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::adapters::AdapterRegistry;
 use crate::circuit_breaker::CircuitBreakerManager;
@@ -11,6 +13,7 @@ use crate::dispatch::{
     to_stt_request, to_tts_request, to_video_request,
 };
 use crate::selection::{ModelSelectionService, SelectionCriteria};
+use crate::store::{CallStatus, GatewayStore, InferenceCall};
 use crate::types::capability::Capability;
 use crate::types::config::GatewayConfig;
 use crate::types::cost::{Cost, TokenUsage};
@@ -26,6 +29,9 @@ pub struct Gateway {
     config: Arc<RwLock<GatewayConfig>>,
     pub(crate) adapters: AdapterRegistry,
     circuit_breaker: CircuitBreakerManager,
+    /// Optional persistence for recorded calls (burn-rate / quota). `None` ⇒
+    /// nothing is recorded and behaviour is exactly as before the AUTH track.
+    store: Option<Arc<dyn GatewayStore>>,
 }
 
 impl Gateway {
@@ -38,6 +44,25 @@ impl Gateway {
             config: Arc::new(RwLock::new(config)),
             adapters,
             circuit_breaker,
+            store: None,
+        }
+    }
+
+    /// Attach a [`GatewayStore`] so each terminal call is persisted (enabling
+    /// burn-rate/spend queries and, on the AUTH track, quota enforcement).
+    /// Builder-style; without it the gateway records nothing.
+    pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Best-effort persist a recorded call. Metering must never take down the
+    /// hot path, so a store error is logged and swallowed. No-op without a store.
+    async fn record_call(&self, call: InferenceCall) {
+        if let Some(store) = &self.store
+            && let Err(e) = store.insert_inference_call(&call).await
+        {
+            tracing::warn!(error = %e, "failed to record inference call (metering is best-effort)");
         }
     }
 
@@ -273,6 +298,32 @@ impl Gateway {
 
                     response.attempts = attempts;
                     response.model = Some(candidate.model.clone());
+
+                    // Best-effort record of the successful terminal call so
+                    // burn-rate/spend (and, on the AUTH track, quota) have data.
+                    let usage = response.usage.as_ref();
+                    self.record_call(InferenceCall {
+                        id: Uuid::new_v4(),
+                        session_id: None,
+                        project_id: None,
+                        capability: request.capability.clone(),
+                        chain_id: request.chain.clone(),
+                        adapter: candidate.router.clone(),
+                        model: candidate.model.clone(),
+                        api_model_id: Some(candidate.api_model_id.clone()),
+                        input_tokens: usage.map(|u| u.input_tokens),
+                        output_tokens: usage.map(|u| u.output_tokens),
+                        cost_usd: cost.unwrap_or(0.0),
+                        duration_ms,
+                        status: CallStatus::Success,
+                        error_type: None,
+                        fallback_sequence: sequence.saturating_sub(1),
+                        recorded_at: Utc::now(),
+                        subject_id: None,
+                        tier: None,
+                    })
+                    .await;
+
                     return Ok(response);
                 }
                 Err(err) => {
@@ -328,6 +379,33 @@ impl Gateway {
             errors = %errors,
             "all attempts failed"
         );
+
+        // Best-effort record of the failed terminal call (observability + request
+        // counting), attributed to the last attempted candidate.
+        if let Some(last) = attempts.last() {
+            self.record_call(InferenceCall {
+                id: Uuid::new_v4(),
+                session_id: None,
+                project_id: None,
+                capability: request.capability.clone(),
+                chain_id: request.chain.clone(),
+                adapter: last.adapter.clone(),
+                model: last.model.clone(),
+                api_model_id: Some(last.api_model_id.clone()),
+                input_tokens: last.tokens.as_ref().map(|u| u.input_tokens),
+                output_tokens: last.tokens.as_ref().map(|u| u.output_tokens),
+                cost_usd: last.cost.unwrap_or(0.0),
+                duration_ms: last.duration_ms,
+                status: CallStatus::Failed,
+                error_type: last.error.clone(),
+                fallback_sequence: last.sequence.saturating_sub(1),
+                recorded_at: Utc::now(),
+                subject_id: None,
+                tier: None,
+            })
+            .await;
+        }
+
         Err(GatewayError::AllAttemptsFailed {
             attempts: attempts.len(),
             errors,
@@ -427,6 +505,7 @@ impl Gateway {
             .unwrap_or_default();
         let adapters = self.adapters.clone();
         let circuit_breaker = self.circuit_breaker.clone();
+        let store = self.store.clone();
         let request = request.clone();
         let pinned_model = request.model.clone();
 
@@ -493,6 +572,7 @@ impl Gateway {
                 if let Some(mut inner) = got_stream {
                     // A candidate produced a stream: commit to it.
                     circuit_breaker.record_success(&endpoint);
+                    let stream_start = Instant::now();
                     tracing::debug!(adapter = %candidate.router, model = %candidate.model, "streaming candidate");
                     for ev in pending_switches.drain(..) {
                         yield ev;
@@ -532,11 +612,41 @@ impl Gateway {
                             Cost::from_usage(&tokens, p.input_per_1k, p.output_per_1k).total_cost
                         })
                         .unwrap_or(0.0);
+
+                    // Build the record before `tokens` moves into the event; insert
+                    // it after yielding `Done` so the terminal event isn't delayed
+                    // by the store write. Best-effort: a store error never surfaces.
+                    let call = store.as_ref().map(|_| InferenceCall {
+                        id: Uuid::new_v4(),
+                        session_id: None,
+                        project_id: None,
+                        capability: request.capability.clone(),
+                        chain_id: request.chain.clone(),
+                        adapter: candidate.router.clone(),
+                        model: candidate.model.clone(),
+                        api_model_id: Some(candidate.api_model_id.clone()),
+                        input_tokens: Some(tokens.input_tokens),
+                        output_tokens: Some(tokens.output_tokens),
+                        cost_usd: cost,
+                        duration_ms: stream_start.elapsed().as_millis() as u64,
+                        status: CallStatus::Success,
+                        error_type: None,
+                        fallback_sequence: idx as u8,
+                        recorded_at: Utc::now(),
+                        subject_id: None,
+                        tier: None,
+                    });
                     yield StreamEvent::Done {
                         model: candidate.model.clone(),
                         tokens,
                         cost,
                     };
+                    if let Some(store) = &store
+                        && let Some(call) = call
+                        && let Err(e) = store.insert_inference_call(&call).await
+                    {
+                        tracing::warn!(error = %e, "failed to record streaming call (metering is best-effort)");
+                    }
                     return;
                 }
 
@@ -1051,6 +1161,119 @@ mod tests {
         assert_eq!(cost.input_tokens, 1000);
         // The recorded attempt carries the same dollar cost.
         assert_eq!(response.attempts[0].cost, Some(cost.total_cost));
+    }
+
+    #[tokio::test]
+    async fn execute_records_successful_call_into_store() {
+        // With a store attached, a successful call is persisted so burn-rate
+        // (`get_spend_since`) has data — the deferred store-wiring, now live.
+        use crate::store::{GatewayStore, InMemoryStore};
+        use crate::types::config::ModelPricing;
+        use crate::types::cost::TokenUsage;
+
+        struct UsageAdapter;
+        impl crate::adapters::capability::Model for UsageAdapter {
+            fn id(&self) -> &str {
+                "priced"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::adapters::capability::ChatModel for UsageAdapter {
+            async fn chat(
+                &self,
+                _cfg: &RouterConfig,
+                _req: &crate::types::io::ChatRequest,
+            ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+                Ok(crate::types::io::ChatResponse {
+                    content: Some("ok".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(TokenUsage {
+                        input_tokens: 1000,
+                        output_tokens: 500,
+                        total_tokens: 1500,
+                    }),
+                    model: Some("priced".to_string()),
+                    degraded: false,
+                })
+            }
+        }
+
+        let mut routers = HashMap::new();
+        routers.insert(
+            "priced".to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "priced".to_string(),
+            ModelConfig {
+                id: "priced".to_string(),
+                api_model_id: None,
+                provider: "priced".to_string(),
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: Some(ModelPricing {
+                    input_per_1k: 0.0008,
+                    output_per_1k: 0.004,
+                    per_request: None,
+                }),
+            },
+        );
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains: HashMap::new(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let store = Arc::new(InMemoryStore::default());
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb).with_store(store.clone());
+        gw.adapters.register_chat(Arc::new(UsageAdapter)).await;
+
+        let request = InferenceRequest {
+            capability: Capability::TextChat,
+            model: Some("priced".to_string()),
+            router: Some("priced".to_string()),
+            chain: None,
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+        };
+        gw.execute(&request).await.unwrap();
+
+        // input 1000/1000*0.0008 + output 500/1000*0.004 = 0.0028; a row was
+        // persisted, so the windowed spend reflects it.
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let spend = store.get_spend_since(since).await.unwrap();
+        assert!(
+            (spend - 0.0028).abs() < 1e-9,
+            "recorded spend should match the call cost, got {spend}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_without_store_is_unchanged() {
+        // No store attached ⇒ recording is a no-op and execute behaves as before.
+        let gw = test_gateway();
+        register_noop(&gw).await;
+        let response = gw.execute(&chat_request()).await.unwrap();
+        assert!(!response.attempts.is_empty());
     }
 
     #[tokio::test]

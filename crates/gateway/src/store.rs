@@ -39,6 +39,13 @@ pub struct InferenceCall {
     pub error_type: Option<String>,
     pub fallback_sequence: u8,
     pub recorded_at: DateTime<Utc>,
+    /// Subject (team/tenant) the call is metered against — populated from the
+    /// request's `AuthContext` (AUTH track). `None` when unauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<Uuid>,
+    /// Subscription tier label at call time, for attribution/reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +193,8 @@ mod tests {
             error_type: None,
             fallback_sequence: 0,
             recorded_at,
+            subject_id: None,
+            tier: None,
         }
     }
 
