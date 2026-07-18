@@ -13,6 +13,7 @@ use crate::dispatch::{
 use crate::selection::{ModelSelectionService, SelectionCriteria};
 use crate::types::capability::Capability;
 use crate::types::config::GatewayConfig;
+use crate::types::cost::Cost;
 use crate::types::error::GatewayError;
 use crate::types::request::{InferenceRequest, InferenceResponse, Payload};
 use crate::types::trace::{Attempt, AttemptStatus};
@@ -183,6 +184,21 @@ impl Gateway {
                 Ok(mut response) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
                     self.circuit_breaker.record_success(&endpoint);
+
+                    // Fill cost: the pre-call estimate from selection, and the
+                    // actual dollar cost from the returned token usage × the
+                    // model's pricing (when both are known).
+                    response.estimated_cost = candidate.cost_estimate.clone();
+                    if let (Some(pricing), Some(usage)) = (
+                        candidate.model_config.pricing.as_ref(),
+                        response.usage.clone(),
+                    ) {
+                        response.actual_cost = Some(Cost::from_usage(
+                            &usage,
+                            pricing.input_per_1k,
+                            pricing.output_per_1k,
+                        ));
+                    }
 
                     attempts.push(Attempt {
                         sequence,
@@ -578,6 +594,109 @@ mod tests {
             Some("noop-v2".to_string()),
             "adapter should receive the chain-resolved api_model_id, not None or a default"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_fills_actual_cost_from_usage_and_pricing() {
+        use crate::types::config::ModelPricing;
+        use crate::types::cost::TokenUsage;
+
+        struct UsageAdapter;
+        impl crate::adapters::capability::Model for UsageAdapter {
+            fn id(&self) -> &str {
+                "priced"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::adapters::capability::ChatModel for UsageAdapter {
+            async fn chat(
+                &self,
+                _cfg: &RouterConfig,
+                _req: &crate::types::io::ChatRequest,
+            ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+                Ok(crate::types::io::ChatResponse {
+                    content: Some("ok".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(TokenUsage {
+                        input_tokens: 1000,
+                        output_tokens: 500,
+                        total_tokens: 1500,
+                    }),
+                    model: Some("priced".to_string()),
+                })
+            }
+        }
+
+        let mut routers = HashMap::new();
+        routers.insert(
+            "priced".to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "priced".to_string(),
+            ModelConfig {
+                id: "priced".to_string(),
+                api_model_id: None,
+                provider: "priced".to_string(),
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: Some(ModelPricing {
+                    input_per_1k: 0.0008,
+                    output_per_1k: 0.004,
+                    per_request: None,
+                }),
+            },
+        );
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains: HashMap::new(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        gw.adapters.register_chat(Arc::new(UsageAdapter)).await;
+
+        let request = InferenceRequest {
+            capability: Capability::TextChat,
+            model: Some("priced".to_string()),
+            router: Some("priced".to_string()),
+            chain: None,
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+        };
+        let response = gw.execute(&request).await.unwrap();
+
+        // input 1000/1000 * 0.0008 = 0.0008; output 500/1000 * 0.004 = 0.002; total 0.0028
+        let cost = response
+            .actual_cost
+            .expect("actual_cost should be computed from usage x pricing");
+        assert!(
+            (cost.total_cost - 0.0028).abs() < 1e-9,
+            "got {}",
+            cost.total_cost
+        );
+        assert_eq!(cost.input_tokens, 1000);
+        // The recorded attempt carries the same dollar cost.
+        assert_eq!(response.attempts[0].cost, Some(cost.total_cost));
     }
 
     #[tokio::test]
