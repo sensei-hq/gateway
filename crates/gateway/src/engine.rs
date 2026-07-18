@@ -41,9 +41,28 @@ impl Gateway {
         }
     }
 
+    /// Like [`Gateway::new`], but validates `config` first.
+    ///
+    /// Returns [`GatewayError::InvalidConfig`] if the config fails the same
+    /// rules enforced by [`GatewayBuilder`](crate::config::GatewayBuilder)
+    /// (at least one router, non-empty router URLs, chain model references
+    /// resolve, model providers have a router). `new` remains unchecked.
+    pub fn try_new(
+        config: GatewayConfig,
+        adapters: AdapterRegistry,
+        circuit_breaker: CircuitBreakerManager,
+    ) -> Result<Self, GatewayError> {
+        crate::config::validate_config(&config)?;
+        Ok(Self::new(config, adapters, circuit_breaker))
+    }
+
     /// Execute an inference request, walking the fallback chain on failure.
     ///
     /// Returns `GatewayError::NotConfigured` if no config has been set.
+    #[tracing::instrument(
+        skip(self, request),
+        fields(capability = ?request.capability, chain = ?request.chain)
+    )]
     pub async fn execute(
         &self,
         request: &InferenceRequest,
@@ -72,10 +91,16 @@ impl Gateway {
 
         // 4. No candidates?
         if result.all_candidates.is_empty() {
+            tracing::warn!("no candidates available for request");
             return Err(GatewayError::NoCandidates {
                 capability: request.capability.clone(),
             });
         }
+
+        tracing::debug!(
+            candidates = result.all_candidates.len(),
+            "selected candidates for request"
+        );
 
         // 5. Get fallback triggers from chain (or empty)
         let fallback_triggers = result
@@ -89,6 +114,13 @@ impl Gateway {
 
         for (sequence, candidate) in (1_u8..).zip(result.all_candidates.iter()) {
             let start = Instant::now();
+
+            tracing::debug!(
+                sequence,
+                adapter = %candidate.router,
+                model = %candidate.model,
+                "attempting candidate"
+            );
 
             // Resolve the model to send. Inject the selected candidate's resolved
             // `api_model_id` when the caller didn't pin one, so chain/registry
@@ -170,6 +202,13 @@ impl Gateway {
             let outcome = match outcome {
                 Some(o) => o,
                 None => {
+                    tracing::warn!(
+                        sequence,
+                        adapter = %candidate.router,
+                        model = %candidate.model,
+                        will_fall_back = true,
+                        "no adapter registered for router; trying next candidate"
+                    );
                     attempts.push(Attempt {
                         sequence,
                         adapter: candidate.router.clone(),
@@ -209,6 +248,16 @@ impl Gateway {
                         ));
                     }
 
+                    let cost = response.actual_cost.as_ref().map(|c| c.total_cost);
+                    tracing::info!(
+                        sequence,
+                        adapter = %candidate.router,
+                        model = %candidate.model,
+                        duration_ms,
+                        cost = ?cost,
+                        "inference succeeded"
+                    );
+
                     attempts.push(Attempt {
                         sequence,
                         adapter: candidate.router.clone(),
@@ -217,7 +266,7 @@ impl Gateway {
                         status: AttemptStatus::Success,
                         duration_ms,
                         tokens: response.usage.clone(),
-                        cost: response.actual_cost.as_ref().map(|c| c.total_cost),
+                        cost,
                         error: None,
                         fallback_triggered: false,
                     });
@@ -231,6 +280,16 @@ impl Gateway {
                     self.circuit_breaker.record_failure(&endpoint);
 
                     let should_fallback = err.should_trigger_fallback(fallback_triggers);
+
+                    tracing::warn!(
+                        sequence,
+                        adapter = %candidate.router,
+                        model = %candidate.model,
+                        duration_ms,
+                        error = %err,
+                        will_fall_back = should_fallback,
+                        "inference attempt failed"
+                    );
 
                     attempts.push(Attempt {
                         sequence,
@@ -264,9 +323,15 @@ impl Gateway {
             })
             .collect::<Vec<_>>()
             .join("; ");
+        tracing::warn!(
+            attempts = attempts.len(),
+            errors = %errors,
+            "all attempts failed"
+        );
         Err(GatewayError::AllAttemptsFailed {
             attempts: attempts.len(),
             errors,
+            attempts_detail: attempts,
         })
     }
 
@@ -274,6 +339,16 @@ impl Gateway {
     pub async fn update_config(&self, config: GatewayConfig) {
         let mut guard = self.config.write().await;
         *guard = config;
+    }
+
+    /// Like [`Gateway::update_config`], but validates `config` before swapping.
+    ///
+    /// Returns [`GatewayError::InvalidConfig`] (leaving the current config in
+    /// place) if validation fails. `update_config` remains unchecked.
+    pub async fn try_update_config(&self, config: GatewayConfig) -> Result<(), GatewayError> {
+        crate::config::validate_config(&config)?;
+        self.update_config(config).await;
+        Ok(())
     }
 
     /// Return a sorted list of all registered adapter ids.
@@ -1341,5 +1416,203 @@ mod tests {
         };
         let expected = ("A timelapse of a blooming flower".len() / 4) as u32;
         assert_eq!(estimate_input_tokens(&payload), expected);
+    }
+
+    #[tokio::test]
+    async fn execute_all_fail_populates_attempts_detail() {
+        // Chain: a failing provider (ProviderError, a fallback trigger) followed
+        // by a router with no registered adapter. Both fail, so the terminal
+        // AllAttemptsFailed must carry the full structured Attempt records.
+        let mut routers = HashMap::new();
+        for id in ["failing", "ghost"] {
+            routers.insert(
+                id.to_string(),
+                RouterConfig {
+                    url: "http://localhost".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    enabled: true,
+                    timeout_ms: None,
+                    headers: HashMap::new(),
+                },
+            );
+        }
+
+        let mut models = HashMap::new();
+        models.insert(
+            "fail-model".to_string(),
+            ModelConfig {
+                id: "fail-model".to_string(),
+                api_model_id: None,
+                provider: "failing".to_string(),
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: None,
+            },
+        );
+        models.insert(
+            "ghost-model".to_string(),
+            ModelConfig {
+                id: "ghost-model".to_string(),
+                api_model_id: None,
+                provider: "ghost".to_string(),
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: None,
+            },
+        );
+
+        let mut chains = HashMap::new();
+        chains.insert(
+            "chat_chain".to_string(),
+            FallbackChainConfig {
+                id: "chat_chain".to_string(),
+                capability: Capability::TextChat,
+                models: vec![
+                    ChainEntry {
+                        model: "fail-model".to_string(),
+                        router: Some("failing".to_string()),
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                    ChainEntry {
+                        model: "ghost-model".to_string(),
+                        router: Some("ghost".to_string()),
+                        api_model_id: None,
+                        priority: 2,
+                    },
+                ],
+                fallback_triggers: vec![FallbackTrigger::ProviderError],
+            },
+        );
+
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_failing(
+            &gw,
+            GatewayError::ProviderError {
+                adapter: "failing".into(),
+                message: "server error".into(),
+                status: Some(500),
+            },
+        )
+        .await;
+
+        match gw.execute(&chat_request()).await.unwrap_err() {
+            GatewayError::AllAttemptsFailed {
+                attempts,
+                attempts_detail,
+                ..
+            } => {
+                // Both the count and the structured detail agree.
+                assert_eq!(attempts, attempts_detail.len());
+                assert_eq!(attempts_detail.len(), 2);
+
+                // First attempt: the provider error, which triggered fallback.
+                let first = &attempts_detail[0];
+                assert_eq!(first.status, crate::types::trace::AttemptStatus::Failed);
+                assert_eq!(first.adapter, "failing");
+                assert!(first.fallback_triggered);
+                assert!(first.error.as_ref().unwrap().contains("server error"));
+
+                // Second attempt: no adapter registered for "ghost".
+                let second = &attempts_detail[1];
+                assert_eq!(second.status, crate::types::trace::AttemptStatus::Failed);
+                assert_eq!(second.adapter, "ghost");
+                assert!(
+                    second
+                        .error
+                        .as_ref()
+                        .unwrap()
+                        .contains("no adapter registered")
+                );
+            }
+            other => panic!("Expected AllAttemptsFailed, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn try_new_accepts_valid_config() {
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        // test_config_with_noop() is internally consistent (router/model/chain).
+        let result = Gateway::try_new(test_config_with_noop(), AdapterRegistry::new(), cb);
+        assert!(result.is_ok(), "valid config should pass validation");
+    }
+
+    #[test]
+    fn try_new_rejects_config_with_dangling_chain_model() {
+        // Chain references a model that isn't configured — obviously invalid.
+        let mut config = test_config_with_noop();
+        config.chains.get_mut("chat_chain").unwrap().models[0].model = "does-not-exist".to_string();
+
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        match Gateway::try_new(config, AdapterRegistry::new(), cb) {
+            Err(GatewayError::InvalidConfig(msg)) => {
+                assert!(
+                    msg.contains("unknown model") && msg.contains("does-not-exist"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Err(other) => panic!("Expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("Expected InvalidConfig, got Ok(Gateway)"),
+        }
+    }
+
+    #[test]
+    fn try_new_rejects_empty_config() {
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        match Gateway::try_new(GatewayConfig::default(), AdapterRegistry::new(), cb) {
+            Err(GatewayError::InvalidConfig(msg)) => {
+                assert!(msg.contains("no routers"), "unexpected message: {msg}");
+            }
+            Err(other) => panic!("Expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("Expected InvalidConfig, got Ok(Gateway)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_update_config_rejects_invalid_and_preserves_current() {
+        let gw = test_gateway();
+        register_noop(&gw).await;
+
+        // Invalid swap is rejected...
+        let err = gw
+            .try_update_config(GatewayConfig::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GatewayError::InvalidConfig(_)));
+
+        // ...and the original (valid) config is still in place.
+        assert!(gw.is_configured().await);
+        assert!(gw.execute(&chat_request()).await.is_ok());
+
+        // A valid swap succeeds.
+        gw.try_update_config(test_config_with_noop())
+            .await
+            .expect("valid config should be accepted");
+        assert!(gw.is_configured().await);
     }
 }

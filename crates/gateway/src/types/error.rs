@@ -44,7 +44,17 @@ pub enum GatewayError {
     NotConfigured,
 
     #[error("all {attempts} attempts failed: {errors}")]
-    AllAttemptsFailed { attempts: usize, errors: String },
+    AllAttemptsFailed {
+        attempts: usize,
+        errors: String,
+        /// Structured per-attempt diagnostics, preserved alongside the
+        /// flattened `errors` string so callers can inspect the full
+        /// [`Attempt`](crate::types::trace::Attempt) records on total failure.
+        attempts_detail: Vec<crate::types::trace::Attempt>,
+    },
+
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
 
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
@@ -88,6 +98,7 @@ impl GatewayError {
             | GatewayError::AllAttemptsFailed { .. }
             | GatewayError::NoCandidates { .. }
             | GatewayError::NotConfigured
+            | GatewayError::InvalidConfig(_)
             | GatewayError::Network(_)
             | GatewayError::Serialization(_) => false,
         }
@@ -130,8 +141,15 @@ mod tests {
         let err = GatewayError::AllAttemptsFailed {
             attempts: 3,
             errors: "x".into(),
+            attempts_detail: Vec::new(),
         };
         assert_eq!(err.to_string(), "all 3 attempts failed: x");
+
+        let err = GatewayError::InvalidConfig("no routers configured".into());
+        assert_eq!(
+            err.to_string(),
+            "invalid configuration: no routers configured"
+        );
     }
 
     #[test]
@@ -190,7 +208,8 @@ mod tests {
         assert!(
             !GatewayError::AllAttemptsFailed {
                 attempts: 3,
-                errors: String::new()
+                errors: String::new(),
+                attempts_detail: Vec::new(),
             }
             .is_retryable()
         );
@@ -271,7 +290,8 @@ mod tests {
         assert!(
             !GatewayError::AllAttemptsFailed {
                 attempts: 5,
-                errors: String::new()
+                errors: String::new(),
+                attempts_detail: Vec::new(),
             }
             .should_trigger_fallback(&all_triggers)
         );
