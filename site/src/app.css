@@ -142,3 +142,26 @@ section[id],
 pre {
 	font-variant-ligatures: none;
 }
+
+/* GitHub-style code-editor surface (mockup CodeWindow + usage tabs). Its own
+   palette — distinct from the page paper — flipping with the mode. */
+.code-surface {
+	--code-bg: #f6f8fa;
+	--code-bar: #eef1f4;
+	--code-border: #e3e6ea;
+	--code-text: #1f2328;
+	--code-idle: #8b91a0;
+	--code-copy-bg: rgba(0, 0, 0, 0.05);
+	--code-copy-text: #565c6b;
+	--code-shadow: 0 12px 40px -24px rgba(18, 20, 26, 0.28);
+}
+[data-mode='dark'] .code-surface {
+	--code-bg: #0d1117;
+	--code-bar: #161b22;
+	--code-border: #1c2230;
+	--code-text: #e6edf3;
+	--code-idle: #7d8698;
+	--code-copy-bg: rgba(255, 255, 255, 0.06);
+	--code-copy-text: #9aa4b2;
+	--code-shadow: 0 24px 60px -30px rgba(13, 17, 23, 0.5);
+}
