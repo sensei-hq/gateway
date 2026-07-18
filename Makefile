@@ -85,7 +85,8 @@ check: fmt-check clippy build test ## Pre-release gate: fmt + clippy + build + t
 #   make bump v=0.5.0    — explicit version
 #
 # Bumps BOTH crate versions in lockstep, commits, tags vX.Y.Z, and pushes the
-# commit + tag. Runs `make check` first so a broken build never gets tagged.
+# commit + tag. Runs `make check` first so a broken build never gets tagged, and
+# reclaims the local build cache (`cargo clean`) afterwards.
 # Safety: aborts on a pre-existing tag, a downgrade, or a no-op (same version).
 
 release: bump ## Alias for `bump` (a release here is just a tag push)
@@ -129,6 +130,10 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@git tag -a "v$(_v)" -m "gateway v$(_v)"
 	@git push origin HEAD
 	@git push origin "v$(_v)"
+	@# A release just built the whole workspace via `make check`, so reclaim the
+	@# local build cache (target/ fills disk) now that the tag is pushed.
+	@echo "Reclaiming local build cache (cargo clean)…"
+	@$(MAKE) clean
 	@echo "Pushed v$(_v). Re-pin the gateway / gateway-embedded git dep in sensei to tag v$(_v)."
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
