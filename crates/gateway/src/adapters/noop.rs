@@ -15,9 +15,14 @@ use crate::types::request::StreamChunk;
 
 /// Graceful-degradation adapter that never errors.
 ///
-/// Returns `Ok` with `success: false` for every request, explaining that no
-/// real inference provider is available. This is used as the last-resort
-/// fallback so the gateway always produces a response rather than an error.
+/// Implements every capability and returns an `Ok` "no inference provider
+/// available" placeholder for each, so the gateway always produces a response
+/// rather than an error. This is the last-resort fallback.
+///
+/// NOTE: the typed capability responses carry no `success` field, so the old
+/// `success: false` degraded signal is no longer expressed here — the engine's
+/// dispatch currently reports `success: true`. Reinstating a degraded/`success`
+/// signal is a tracked follow-up (see the gateway roadmap / observability pass).
 pub struct NoopAdapter;
 
 impl NoopAdapter {
