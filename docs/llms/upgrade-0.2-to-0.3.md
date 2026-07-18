@@ -11,7 +11,7 @@ subscription/quota metering.
 |---|---|---|
 | `Gateway::execute` | **Unchanged** signature + `InferenceResponse` fields | none |
 | JSON wire format | New fields are `serde(default)` | none — old ↔ new JSON round-trips |
-| Adapter registration | `register()` **removed** → `register_into()` | **required** |
+| Adapter registration | `registry.register(adapter)` **kept** (now generic) | none for concrete `Arc<Adapter>` |
 | Custom adapters | fat `InferenceAdapter` **removed** → capability traits | required *if you wrote any* |
 | `GatewayStore` impls | new required `get_usage_since` | required *if you implement the trait* |
 | `InferenceRequest {…}` literals | new `auth` field | add `auth: None` |
@@ -39,27 +39,23 @@ updates locally (3 RUSTSEC advisories fixed during 0.3):
 cargo update -p anyhow -p quinn-proto -p crossbeam-epoch
 ```
 
-## 2. Adapter registration: `register()` → `register_into()`
+## 2. Adapter registration: `register()` is preserved
 
-The single fat `InferenceAdapter` trait and `AdapterRegistry::register()` are gone.
-The registry now has **one map per capability** (`ChatModel`, `EmbedModel`,
-`SttModel`, `TtsModel`, `ImageModel`, `VideoModel`); an adapter registers itself
-into every map it implements via the `RegisterInto` trait.
+Under the hood the registry now has **one map per capability** (`ChatModel`,
+`EmbedModel`, `SttModel`, `TtsModel`, `ImageModel`, `VideoModel`) instead of one fat
+`InferenceAdapter` map. But `AdapterRegistry::register` is kept as the entry point —
+it's now generic and delegates to the adapter's `RegisterInto` impl — so the common
+call is **unchanged**:
 
 ```rust
-// 0.2.x
+// 0.2.x AND 0.3.0 — same line:
 registry.register(Arc::new(OpenAiAdapter::from_config(&cfg)?)).await;
-
-// 0.3.0
-use gateway::adapters::RegisterInto;                 // trait must be in scope
-Arc::new(OpenAiAdapter::from_config(&cfg)?)
-    .register_into(&registry)                        // lands in chat + embed maps
-    .await;
 ```
 
-A chat+embed adapter now shows up under both capabilities automatically — no need to
-register it twice. (If `register_into` reports "method not found", you forgot the
-`use gateway::adapters::RegisterInto;`.)
+A chat+embed adapter now lands in both capability maps automatically. The only thing
+that breaks here is if you stored an adapter as the **fat trait object**
+(`Arc<dyn InferenceAdapter>`) — that trait is gone; hold a concrete
+`Arc<SomeAdapter>` (or `Arc<dyn ChatModel>` etc.) instead.
 
 Need finer control? The per-capability methods are public too:
 `registry.register_chat(a.clone()).await; registry.register_embed(a).await;`.
