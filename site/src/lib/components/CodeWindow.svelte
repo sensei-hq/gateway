@@ -6,29 +6,37 @@
 		try {
 			await navigator.clipboard.writeText(code);
 			copied = true;
-			setTimeout(() => (copied = false), 1400);
+			setTimeout(() => (copied = false), 1500);
 		} catch {
 			/* clipboard unavailable — no-op */
 		}
 	}
 </script>
 
-<div class="overflow-hidden rounded-xl border border-paper-edge bg-paper-soft shadow-2xl">
-	<div class="flex items-center justify-between gap-3 border-b border-paper-edge px-4 py-2.5">
-		<div class="flex items-center gap-1.5">
-			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
-			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
-			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
-		</div>
-		<span class="font-mono text-xs text-ink-soft">{filename}</span>
+<div
+	class="code-surface overflow-hidden"
+	style="border-radius:14px; border:1px solid var(--code-border); box-shadow: var(--code-shadow)"
+>
+	<div
+		class="flex items-center gap-2"
+		style="background: var(--code-bar); padding:11px 14px; border-bottom:1px solid var(--code-border)"
+	>
+		<span style="width:11px;height:11px;border-radius:50%;background:#ff5f57"></span>
+		<span style="width:11px;height:11px;border-radius:50%;background:#febc2e"></span>
+		<span style="width:11px;height:11px;border-radius:50%;background:#28c840"></span>
+		<span class="font-mono" style="font-size:12.5px; color: var(--code-idle); margin-left:6px"
+			>{filename}</span
+		>
 		<button
 			onclick={copy}
-			class="font-mono text-xs text-ink-soft transition-colors hover:text-primary"
+			class="font-mono"
+			style="margin-left:auto; appearance:none; border:none; cursor:pointer; font-size:11.5px; color: var(--code-copy-text); background: var(--code-copy-bg); padding:4px 10px; border-radius:6px"
 			aria-label="Copy code to clipboard"
 		>
-			{copied ? 'copied ✓' : 'copy'}
+			{copied ? 'Copied' : 'Copy'}
 		</button>
 	</div>
 	<pre
-		class="overflow-x-auto px-5 py-4 font-mono text-[0.82rem] leading-relaxed text-ink">{code}</pre>
+		class="font-mono"
+		style="margin:0; background: var(--code-bg); color: var(--code-text); padding:20px; font-size:13.5px; line-height:1.8; overflow-x:auto">{code}</pre>
 </div>
