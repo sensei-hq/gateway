@@ -263,6 +263,7 @@ impl crate::adapters::capability::ChatModel for TogetherAdapter {
             tool_calls: Vec::new(),
             usage,
             model: Some(model),
+            degraded: false,
         })
     }
 
@@ -434,7 +435,10 @@ impl crate::adapters::capability::ImageModel for TogetherAdapter {
             })
             .collect();
 
-        Ok(ImageResponse { images })
+        Ok(ImageResponse {
+            images,
+            degraded: false,
+        })
     }
 }
 

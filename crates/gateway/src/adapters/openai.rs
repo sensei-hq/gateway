@@ -546,6 +546,7 @@ impl crate::adapters::capability::ChatModel for OpenAIAdapter {
             tool_calls,
             usage,
             model: Some(model),
+            degraded: false,
         })
     }
 
@@ -666,7 +667,11 @@ impl crate::adapters::capability::EmbedModel for OpenAIAdapter {
         let embeddings: Vec<Vec<f32>> = resp.data.into_iter().map(|d| d.embedding).collect();
         let usage = usage_from_response(&resp.usage);
 
-        Ok(crate::types::io::EmbedResponse { embeddings, usage })
+        Ok(crate::types::io::EmbedResponse {
+            embeddings,
+            usage,
+            degraded: false,
+        })
     }
 }
 
@@ -759,6 +764,7 @@ impl crate::adapters::capability::SttModel for OpenAIAdapter {
         Ok(SttResponse {
             transcription: whisper_resp.text,
             usage: None,
+            degraded: false,
         })
     }
 }
@@ -824,6 +830,7 @@ impl crate::adapters::capability::TtsModel for OpenAIAdapter {
 
         Ok(TtsResponse {
             audio: audio_bytes.to_vec(),
+            degraded: false,
         })
     }
 }
@@ -896,7 +903,10 @@ impl crate::adapters::capability::ImageModel for OpenAIAdapter {
             })
             .collect();
 
-        Ok(ImageResponse { images })
+        Ok(ImageResponse {
+            images,
+            degraded: false,
+        })
     }
 }
 

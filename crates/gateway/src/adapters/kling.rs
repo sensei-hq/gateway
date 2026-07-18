@@ -222,6 +222,7 @@ impl crate::adapters::capability::VideoModel for KlingAdapter {
                 url: video_url,
                 duration_secs: video_duration.or(req.duration_secs.map(|d| d as f32)),
             }],
+            degraded: false,
         })
     }
 }

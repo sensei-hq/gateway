@@ -666,6 +666,7 @@ impl crate::adapters::capability::ChatModel for AnthropicAdapter {
             tool_calls,
             usage: Some(usage),
             model: Some(model),
+            degraded: false,
         })
     }
 

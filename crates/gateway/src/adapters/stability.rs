@@ -174,6 +174,7 @@ impl ImageModel for StabilityAdapter {
                 url: None,
                 revised_prompt: None,
             }],
+            degraded: false,
         })
     }
 }

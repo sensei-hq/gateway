@@ -22,6 +22,8 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<TokenUsage>,
     pub model: Option<String>,
+    /// `true` = a placeholder/degraded reply (e.g. the no-provider fallback), not a real provider result.
+    pub degraded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,8 @@ pub struct EmbedRequest {
 pub struct EmbedResponse {
     pub embeddings: Vec<Vec<f32>>,
     pub usage: Option<TokenUsage>,
+    /// `true` = a placeholder/degraded reply (e.g. the no-provider fallback), not a real provider result.
+    pub degraded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +52,8 @@ pub struct SttRequest {
 pub struct SttResponse {
     pub transcription: String,
     pub usage: Option<TokenUsage>,
+    /// `true` = a placeholder/degraded reply (e.g. the no-provider fallback), not a real provider result.
+    pub degraded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +68,8 @@ pub struct TtsRequest {
 #[derive(Debug, Clone, Default)]
 pub struct TtsResponse {
     pub audio: Vec<u8>,
+    /// `true` = a placeholder/degraded reply (e.g. the no-provider fallback), not a real provider result.
+    pub degraded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +85,8 @@ pub struct ImageRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ImageResponse {
     pub images: Vec<ImageResult>,
+    /// `true` = a placeholder/degraded reply (e.g. the no-provider fallback), not a real provider result.
+    pub degraded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +100,8 @@ pub struct VideoRequest {
 #[derive(Debug, Clone, Default)]
 pub struct VideoResponse {
     pub videos: Vec<VideoResult>,
+    /// `true` = a placeholder/degraded reply (e.g. the no-provider fallback), not a real provider result.
+    pub degraded: bool,
 }
 
 #[cfg(test)]

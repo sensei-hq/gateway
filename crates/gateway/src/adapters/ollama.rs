@@ -223,6 +223,7 @@ impl crate::adapters::capability::ChatModel for OllamaAdapter {
             tool_calls: Vec::new(),
             usage,
             model: Some(model),
+            degraded: false,
         })
     }
 
@@ -342,7 +343,11 @@ impl crate::adapters::capability::EmbedModel for OllamaAdapter {
         .await?;
         let embeddings: Vec<Vec<f32>> = resp.data.into_iter().map(|d| d.embedding).collect();
         let usage = usage_from_response(&resp.usage);
-        Ok(crate::types::io::EmbedResponse { embeddings, usage })
+        Ok(crate::types::io::EmbedResponse {
+            embeddings,
+            usage,
+            degraded: false,
+        })
     }
 }
 

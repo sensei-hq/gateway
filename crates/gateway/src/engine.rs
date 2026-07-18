@@ -514,6 +514,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 model: req.model.clone(),
+                degraded: false,
             })
         }
     }
@@ -632,6 +633,7 @@ mod tests {
                         total_tokens: 1500,
                     }),
                     model: Some("priced".to_string()),
+                    degraded: false,
                 })
             }
         }
@@ -780,11 +782,11 @@ mod tests {
 
         let response = gw.execute(&chat_request()).await.unwrap();
 
-        // The typed capability path carries no `success` flag, so the noop's
-        // old `success: false` degraded signal is no longer propagated — the
-        // engine reports success for any Ok outcome (see NoopAdapter comment).
-        // The canned "No inference provider" content is still returned.
-        assert!(response.success);
+        // The noop marks its responses `degraded: true`, which the dispatch
+        // boundary propagates to `success: false` — the placeholder is not a
+        // real provider result. The canned "No inference provider" content is
+        // still returned.
+        assert!(!response.success);
         assert!(
             response
                 .content
@@ -792,6 +794,18 @@ mod tests {
                 .unwrap()
                 .contains("No inference provider")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_with_only_noop_reports_degraded_success_false() {
+        // With only the NoopAdapter registered, the response is a placeholder,
+        // so `success` must be false (degraded) even though the call is `Ok`.
+        let gw = test_gateway();
+        register_noop(&gw).await;
+
+        let response = gw.execute(&chat_request()).await.unwrap();
+
+        assert!(!response.success);
     }
 
     #[tokio::test]
