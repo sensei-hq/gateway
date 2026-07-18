@@ -8,7 +8,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24,6 +24,24 @@ pub struct RouterConfig {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+}
+
+/// Custom `Debug` that never prints the literal `api_key` — it renders as
+/// `Some("***")` when set, `None` when absent. `RouterConfig` (and, transitively,
+/// `GatewayConfig`) can otherwise leak the key into logs / error messages.
+/// Note: operator-supplied `headers` are shown as-is; do not place secrets in
+/// plain `headers` (use `api_key`/`api_key_env`).
+impl std::fmt::Debug for RouterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterConfig")
+            .field("url", &self.url)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("enabled", &self.enabled)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +106,27 @@ pub struct GatewayConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn router_config_debug_redacts_api_key() {
+        let cfg = RouterConfig {
+            url: "https://x".into(),
+            api_key_env: None,
+            api_key: Some("sk-super-secret".into()),
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("sk-super-secret"),
+            "api_key must not leak in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("***"),
+            "Debug should mark the key as set: {dbg}"
+        );
+    }
 
     #[test]
     fn router_config_serde_roundtrip() {
