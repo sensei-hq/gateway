@@ -228,6 +228,7 @@ impl crate::adapters::capability::ChatModel for GrokAdapter {
             tool_calls: Vec::new(),
             usage,
             model: Some(model),
+            degraded: false,
         })
     }
 
@@ -417,6 +418,7 @@ impl crate::adapters::capability::SttModel for GrokAdapter {
         Ok(SttResponse {
             transcription: whisper_resp.text,
             usage: None,
+            degraded: false,
         })
     }
 }
@@ -484,6 +486,7 @@ impl crate::adapters::capability::TtsModel for GrokAdapter {
 
         Ok(TtsResponse {
             audio: audio_bytes.to_vec(),
+            degraded: false,
         })
     }
 }

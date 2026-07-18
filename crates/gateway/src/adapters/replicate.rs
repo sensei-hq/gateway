@@ -200,7 +200,10 @@ impl crate::adapters::capability::ImageModel for ReplicateAdapter {
             })
             .unwrap_or_default();
 
-        Ok(ImageResponse { images })
+        Ok(ImageResponse {
+            images,
+            degraded: false,
+        })
     }
 }
 
@@ -308,6 +311,7 @@ impl crate::adapters::capability::VideoModel for ReplicateAdapter {
                 url: video_url,
                 duration_secs: req.duration_secs.map(|d| d as f32),
             }],
+            degraded: false,
         })
     }
 }

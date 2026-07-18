@@ -162,7 +162,10 @@ impl ImageModel for RecraftAdapter {
             })
             .collect();
 
-        Ok(ImageResponse { images })
+        Ok(ImageResponse {
+            images,
+            degraded: false,
+        })
     }
 }
 

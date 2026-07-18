@@ -662,6 +662,7 @@ impl gateway::adapters::capability::ChatModel for LlamaCppAdapter {
             tool_calls: Vec::new(),
             usage: None,
             model: Some(self.config.model_id.clone()),
+            degraded: false,
         })
     }
 
@@ -766,6 +767,7 @@ impl gateway::adapters::capability::EmbedModel for LlamaCppAdapter {
         Ok(EmbedResponse {
             embeddings,
             usage: None,
+            degraded: false,
         })
     }
 }

@@ -189,6 +189,7 @@ impl gateway::adapters::capability::EmbedModel for FastembedAdapter {
         Ok(EmbedResponse {
             embeddings,
             usage: None,
+            degraded: false,
         })
     }
 }

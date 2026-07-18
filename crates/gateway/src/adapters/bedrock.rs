@@ -254,6 +254,7 @@ impl crate::adapters::capability::ChatModel for BedrockAdapter {
             tool_calls,
             usage,
             model: Some(model_id),
+            degraded: false,
         })
     }
 
@@ -328,6 +329,7 @@ impl crate::adapters::capability::EmbedModel for BedrockAdapter {
             return Ok(EmbedResponse {
                 embeddings: Vec::new(),
                 usage: None,
+                degraded: false,
             });
         }
 
@@ -342,7 +344,11 @@ impl crate::adapters::capability::EmbedModel for BedrockAdapter {
             total_tokens: n,
         });
 
-        Ok(EmbedResponse { embeddings, usage })
+        Ok(EmbedResponse {
+            embeddings,
+            usage,
+            degraded: false,
+        })
     }
 }
 

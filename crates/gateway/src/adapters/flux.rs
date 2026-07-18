@@ -217,6 +217,7 @@ impl crate::adapters::capability::ImageModel for FluxAdapter {
                 b64_json: None,
                 revised_prompt: None,
             }],
+            degraded: false,
         })
     }
 }

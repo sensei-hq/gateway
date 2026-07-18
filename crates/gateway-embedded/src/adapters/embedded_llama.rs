@@ -178,6 +178,7 @@ impl gateway::adapters::capability::ChatModel for EmbeddedLlamaAdapter {
             tool_calls: Vec::new(),
             usage: None,
             model: Some(model_id.to_string()),
+            degraded: false,
         })
     }
 
@@ -213,6 +214,7 @@ impl gateway::adapters::capability::EmbedModel for EmbeddedLlamaAdapter {
         Ok(EmbedResponse {
             embeddings,
             usage: None,
+            degraded: false,
         })
     }
 }

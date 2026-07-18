@@ -188,6 +188,7 @@ impl crate::adapters::capability::VideoModel for RunwayAdapter {
                 url: video_url,
                 duration_secs: req.duration_secs.map(|d| d as f32),
             }],
+            degraded: false,
         })
     }
 }

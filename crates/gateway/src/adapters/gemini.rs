@@ -678,6 +678,7 @@ impl crate::adapters::capability::ChatModel for GeminiAdapter {
             tool_calls,
             usage,
             model: Some(model),
+            degraded: false,
         })
     }
 
@@ -772,6 +773,7 @@ impl crate::adapters::capability::EmbedModel for GeminiAdapter {
             return Ok(EmbedResponse {
                 embeddings: vec![],
                 usage: None,
+                degraded: false,
             });
         }
         let model =
@@ -807,6 +809,7 @@ impl crate::adapters::capability::EmbedModel for GeminiAdapter {
         Ok(EmbedResponse {
             embeddings,
             usage: None,
+            degraded: false,
         })
     }
 }

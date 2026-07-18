@@ -64,6 +64,7 @@ pub fn to_chat_request(
 
 pub fn from_chat_response(r: ChatResponse) -> InferenceResponse {
     InferenceResponse {
+        success: !r.degraded,
         content: r.content,
         tool_calls: r.tool_calls,
         usage: r.usage,
@@ -87,6 +88,7 @@ pub fn to_embed_request(
 
 pub fn from_embed_response(r: EmbedResponse) -> InferenceResponse {
     InferenceResponse {
+        success: !r.degraded,
         embeddings: Some(r.embeddings),
         usage: r.usage,
         ..empty_response()
@@ -115,6 +117,7 @@ pub fn to_stt_request(
 
 pub fn from_stt_response(r: SttResponse) -> InferenceResponse {
     InferenceResponse {
+        success: !r.degraded,
         transcription: Some(r.transcription),
         usage: r.usage,
         ..empty_response()
@@ -145,6 +148,7 @@ pub fn to_tts_request(
 
 pub fn from_tts_response(r: TtsResponse) -> InferenceResponse {
     InferenceResponse {
+        success: !r.degraded,
         audio: Some(r.audio),
         ..empty_response()
     }
@@ -176,6 +180,7 @@ pub fn to_image_request(
 
 pub fn from_image_response(r: ImageResponse) -> InferenceResponse {
     InferenceResponse {
+        success: !r.degraded,
         images: Some(r.images),
         ..empty_response()
     }
@@ -203,6 +208,7 @@ pub fn to_video_request(
 
 pub fn from_video_response(r: VideoResponse) -> InferenceResponse {
     InferenceResponse {
+        success: !r.degraded,
         videos: Some(r.videos),
         ..empty_response()
     }
@@ -293,8 +299,28 @@ mod tests {
         let ir = from_embed_response(EmbedResponse {
             embeddings: vec![vec![0.1, 0.2]],
             usage: None,
+            ..Default::default()
         });
         assert_eq!(ir.embeddings.as_ref().unwrap().len(), 1);
         assert!(ir.content.is_none());
+    }
+
+    #[test]
+    fn from_chat_response_degraded_flag_maps_to_success() {
+        // A degraded typed response yields `success == false`.
+        let degraded = from_chat_response(ChatResponse {
+            content: Some("placeholder".into()),
+            degraded: true,
+            ..Default::default()
+        });
+        assert!(!degraded.success);
+
+        // A normal typed response yields `success == true`.
+        let normal = from_chat_response(ChatResponse {
+            content: Some("real answer".into()),
+            degraded: false,
+            ..Default::default()
+        });
+        assert!(normal.success);
     }
 }

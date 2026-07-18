@@ -335,6 +335,7 @@ impl gateway::adapters::capability::EmbedModel for OrtAdapter {
         Ok(EmbedResponse {
             embeddings,
             usage: None,
+            degraded: false,
         })
     }
 }

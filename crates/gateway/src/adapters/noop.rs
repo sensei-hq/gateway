@@ -19,10 +19,9 @@ use crate::types::request::StreamChunk;
 /// available" placeholder for each, so the gateway always produces a response
 /// rather than an error. This is the last-resort fallback.
 ///
-/// NOTE: the typed capability responses carry no `success` field, so the old
-/// `success: false` degraded signal is no longer expressed here — the engine's
-/// dispatch currently reports `success: true`. Reinstating a degraded/`success`
-/// signal is a tracked follow-up (see the gateway roadmap / observability pass).
+/// Every response it returns is marked `degraded: true`, which the dispatch
+/// boundary propagates to `InferenceResponse { success: false, .. }` — so callers
+/// can distinguish this placeholder from a real provider result.
 pub struct NoopAdapter;
 
 impl NoopAdapter {
@@ -38,9 +37,8 @@ impl NoopAdapter {
 // ---------------------------------------------------------------------------
 // Capability traits (target model). noop is the catch-all: implements every
 // capability and returns the same "no provider" placeholder as the execute
-// path. NOTE: the typed responses have no `success` field, so the old
-// `success: false` degraded-signal cannot be carried here — the engine decides
-// success at the Phase 4 dispatch boundary. Traits referenced by full path.
+// path. Each response sets `degraded: true`, which the dispatch boundary turns
+// into `success: false` on the unified response. Traits referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for NoopAdapter {
@@ -61,6 +59,7 @@ impl crate::adapters::capability::ChatModel for NoopAdapter {
             tool_calls: Vec::new(),
             usage: None,
             model: None,
+            degraded: true,
         })
     }
 
@@ -87,7 +86,10 @@ impl crate::adapters::capability::EmbedModel for NoopAdapter {
         _config: &RouterConfig,
         _req: &EmbedRequest,
     ) -> Result<EmbedResponse, GatewayError> {
-        Ok(EmbedResponse::default())
+        Ok(EmbedResponse {
+            degraded: true,
+            ..Default::default()
+        })
     }
 }
 
@@ -101,6 +103,7 @@ impl crate::adapters::capability::SttModel for NoopAdapter {
         Ok(SttResponse {
             transcription: Self::unavailable_message(&Capability::AudioTranscribe),
             usage: None,
+            degraded: true,
         })
     }
 }
@@ -112,7 +115,10 @@ impl crate::adapters::capability::TtsModel for NoopAdapter {
         _config: &RouterConfig,
         _req: &TtsRequest,
     ) -> Result<TtsResponse, GatewayError> {
-        Ok(TtsResponse::default())
+        Ok(TtsResponse {
+            degraded: true,
+            ..Default::default()
+        })
     }
 }
 
@@ -123,7 +129,10 @@ impl crate::adapters::capability::ImageModel for NoopAdapter {
         _config: &RouterConfig,
         _req: &ImageRequest,
     ) -> Result<ImageResponse, GatewayError> {
-        Ok(ImageResponse::default())
+        Ok(ImageResponse {
+            degraded: true,
+            ..Default::default()
+        })
     }
 }
 
@@ -134,7 +143,10 @@ impl crate::adapters::capability::VideoModel for NoopAdapter {
         _config: &RouterConfig,
         _req: &VideoRequest,
     ) -> Result<VideoResponse, GatewayError> {
-        Ok(VideoResponse::default())
+        Ok(VideoResponse {
+            degraded: true,
+            ..Default::default()
+        })
     }
 }
 
