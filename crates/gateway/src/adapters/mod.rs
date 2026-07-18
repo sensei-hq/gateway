@@ -148,6 +148,19 @@ impl CapabilityRegistry {
     capability_map_accessors!(tts, register_tts, tts, TtsModel);
     capability_map_accessors!(image, register_image, image, ImageModel);
     capability_map_accessors!(video, register_video, video, VideoModel);
+
+    /// Sorted, de-duplicated union of adapter ids across every capability map.
+    /// An adapter registered under several capabilities appears once.
+    pub async fn list(&self) -> Vec<String> {
+        let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        ids.extend(self.chat.read().await.keys().cloned());
+        ids.extend(self.embed.read().await.keys().cloned());
+        ids.extend(self.stt.read().await.keys().cloned());
+        ids.extend(self.tts.read().await.keys().cloned());
+        ids.extend(self.image.read().await.keys().cloned());
+        ids.extend(self.video.read().await.keys().cloned());
+        ids.into_iter().collect()
+    }
 }
 
 /// One-call registration: an adapter inserts itself into every capability map
