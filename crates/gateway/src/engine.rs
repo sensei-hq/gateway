@@ -13,9 +13,9 @@ use crate::dispatch::{
 use crate::selection::{ModelSelectionService, SelectionCriteria};
 use crate::types::capability::Capability;
 use crate::types::config::GatewayConfig;
-use crate::types::cost::Cost;
+use crate::types::cost::{Cost, TokenUsage};
 use crate::types::error::GatewayError;
-use crate::types::request::{InferenceRequest, InferenceResponse, Payload};
+use crate::types::request::{InferenceRequest, InferenceResponse, Payload, StreamEvent};
 use crate::types::trace::{Attempt, AttemptStatus};
 
 /// Core gateway orchestrator.
@@ -335,6 +335,251 @@ impl Gateway {
         })
     }
 
+    /// Execute an inference request as a token stream.
+    ///
+    /// The streaming analogue of [`Gateway::execute`]. Reuses the same
+    /// selection + candidate-walk + circuit-breaker machinery, but forwards
+    /// the chosen adapter's [`ChatModel::chat_stream`](crate::adapters::ChatModel::chat_stream)
+    /// output as a sequence of [`StreamEvent`]s rather than assembling a
+    /// single [`InferenceResponse`].
+    ///
+    /// # Setup errors (returned before any stream)
+    /// - [`GatewayError::NotConfigured`] — the config is empty.
+    /// - [`GatewayError::Unsupported`] — the capability is not a chat
+    ///   capability. Only [`Capability::TextChat`] / [`Capability::TextComplete`]
+    ///   stream.
+    /// - [`GatewayError::NoCandidates`] — selection yielded nothing.
+    ///
+    /// # Fallback semantics
+    /// Fallback is **pre-first-byte only**. Candidates are walked in order; a
+    /// candidate whose `chat_stream` fails at setup (or whose router has no
+    /// registered adapter) is skipped to the next candidate when the chain's
+    /// `fallback_triggers` allow it, and a [`StreamEvent::ProviderSwitch`] is
+    /// emitted ahead of the next candidate's output so the consumer observes
+    /// the switch. Once a candidate begins streaming, an error mid-stream is
+    /// surfaced as a terminal [`StreamEvent::Error`] and the stream stops — no
+    /// mid-stream fallback, since bytes have already been sent.
+    ///
+    /// # Terminal events
+    /// A successful candidate ends with a [`StreamEvent::Done`] carrying the
+    /// resolved model, the accumulated [`TokenUsage`], and the dollar cost
+    /// (`usage × pricing`, or `0.0` when the model has no pricing). If **every**
+    /// candidate fails at setup, the stream emits any accrued `ProviderSwitch`
+    /// history followed by a terminal [`StreamEvent::Error`] describing the
+    /// exhaustion (rather than returning `Err`), so the caller still observes
+    /// the fallback trail.
+    #[tracing::instrument(
+        skip(self, request),
+        fields(capability = ?request.capability, chain = ?request.chain)
+    )]
+    pub async fn execute_stream(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>, GatewayError>
+    {
+        use futures::StreamExt;
+
+        // 1. Clone config from RwLock.
+        let config = self.config.read().await.clone();
+        if config.routers.is_empty() && config.models.is_empty() && config.chains.is_empty() {
+            return Err(GatewayError::NotConfigured);
+        }
+
+        // 2. Only chat capabilities stream.
+        if !matches!(
+            request.capability,
+            Capability::TextChat | Capability::TextComplete
+        ) {
+            return Err(GatewayError::Unsupported {
+                adapter: "gateway".to_string(),
+                what: "streaming (chat capabilities only)".to_string(),
+            });
+        }
+
+        // 3. Build SelectionCriteria from request (same as `execute`).
+        let input_tokens = estimate_input_tokens(&request.payload);
+        let criteria = SelectionCriteria {
+            capability: request.capability.clone(),
+            model: request.model.clone(),
+            router: request.router.clone(),
+            chain: request.chain.clone(),
+            budget: request.budget,
+            input_tokens: Some(input_tokens),
+        };
+
+        // 4. Select all candidates.
+        let svc = ModelSelectionService::new(&config, &self.circuit_breaker);
+        let result = svc.select_all(&criteria);
+
+        if result.all_candidates.is_empty() {
+            tracing::warn!("no candidates available for streaming request");
+            return Err(GatewayError::NoCandidates {
+                capability: request.capability.clone(),
+            });
+        }
+
+        // Owned state moved into the stream (it must be `'static`).
+        let candidates = result.all_candidates;
+        let fallback_triggers = result
+            .chain
+            .as_ref()
+            .map(|c| c.fallback_triggers.clone())
+            .unwrap_or_default();
+        let adapters = self.adapters.clone();
+        let circuit_breaker = self.circuit_breaker.clone();
+        let request = request.clone();
+        let pinned_model = request.model.clone();
+
+        let stream = async_stream::stream! {
+            // `ProviderSwitch` events accrued from pre-first-byte fallbacks,
+            // flushed ahead of the successful candidate's chunks (or ahead of
+            // a terminal `Error` when every candidate fails at setup).
+            let mut pending_switches: Vec<StreamEvent> = Vec::new();
+            let total = candidates.len();
+
+            for (idx, candidate) in candidates.iter().enumerate() {
+                let has_more = idx + 1 < total;
+                let endpoint = format!("{}:{}", candidate.router, candidate.model);
+
+                // Resolve the outbound model exactly like `execute`:
+                // caller-pinned wins, else the candidate's resolved api_model_id.
+                let model = if pinned_model.is_some() {
+                    pinned_model.clone()
+                } else {
+                    Some(candidate.api_model_id.clone())
+                };
+
+                // Attempt to obtain a stream for this candidate. Two pre-first-byte
+                // failure modes: no adapter registered (always skip to next), or a
+                // `chat_stream`/build error (skip only when triggers allow).
+                let mut got_stream = None;
+                let mut fail_code = String::new();
+                let mut fail_message = String::new();
+                let mut fail_should_fallback = false;
+                let mut fail_record_cb = false;
+
+                match adapters.chat(&candidate.router).await {
+                    None => {
+                        fail_code = "no_adapter".to_string();
+                        fail_message =
+                            format!("no adapter registered for router '{}'", candidate.router);
+                        // A missing adapter is not a provider fault; skip to the
+                        // next candidate unconditionally (mirrors `execute`).
+                        fail_should_fallback = true;
+                        fail_record_cb = false;
+                    }
+                    Some(m) => match crate::dispatch::to_chat_request(&request, model) {
+                        Err(e) => {
+                            fail_code = stream_error_code(&e);
+                            fail_message = e.to_string();
+                            fail_should_fallback = e.should_trigger_fallback(&fallback_triggers);
+                            fail_record_cb = true;
+                        }
+                        Ok(chat_req) => {
+                            match m.chat_stream(&candidate.router_config, &chat_req).await {
+                                Ok(s) => got_stream = Some(s),
+                                Err(e) => {
+                                    fail_code = stream_error_code(&e);
+                                    fail_message = e.to_string();
+                                    fail_should_fallback =
+                                        e.should_trigger_fallback(&fallback_triggers);
+                                    fail_record_cb = true;
+                                }
+                            }
+                        }
+                    },
+                }
+
+                if let Some(mut inner) = got_stream {
+                    // A candidate produced a stream: commit to it.
+                    circuit_breaker.record_success(&endpoint);
+                    tracing::debug!(adapter = %candidate.router, model = %candidate.model, "streaming candidate");
+                    for ev in pending_switches.drain(..) {
+                        yield ev;
+                    }
+
+                    // Forward chunks. Accumulate the latest usage (the terminal
+                    // chunk carries it) for the final `Done` event.
+                    let mut usage_acc: Option<TokenUsage> = None;
+                    while let Some(item) = inner.next().await {
+                        match item {
+                            Ok(chunk) => {
+                                if chunk.usage.is_some() {
+                                    usage_acc = chunk.usage;
+                                }
+                                if !chunk.content.is_empty() {
+                                    yield StreamEvent::Chunk { content: chunk.content };
+                                }
+                            }
+                            Err(e) => {
+                                // Mid-stream failure: bytes already sent, so no
+                                // fallback — surface and stop.
+                                yield StreamEvent::Error {
+                                    code: stream_error_code(&e),
+                                    message: e.to_string(),
+                                };
+                                return;
+                            }
+                        }
+                    }
+
+                    let tokens = usage_acc.unwrap_or_default();
+                    let cost = candidate
+                        .model_config
+                        .pricing
+                        .as_ref()
+                        .map(|p| {
+                            Cost::from_usage(&tokens, p.input_per_1k, p.output_per_1k).total_cost
+                        })
+                        .unwrap_or(0.0);
+                    yield StreamEvent::Done {
+                        model: candidate.model.clone(),
+                        tokens,
+                        cost,
+                    };
+                    return;
+                }
+
+                // Setup failure for this candidate.
+                if fail_record_cb {
+                    circuit_breaker.record_failure(&endpoint);
+                }
+                tracing::warn!(
+                    adapter = %candidate.router,
+                    model = %candidate.model,
+                    error = %fail_message,
+                    will_fall_back = has_more && fail_should_fallback,
+                    "streaming candidate failed before first byte"
+                );
+
+                if has_more && fail_should_fallback {
+                    let next = &candidates[idx + 1];
+                    pending_switches.push(StreamEvent::ProviderSwitch {
+                        from_adapter: candidate.router.clone(),
+                        from_model: candidate.model.clone(),
+                        to_adapter: next.router.clone(),
+                        to_model: next.model.clone(),
+                        reason: fail_message.clone(),
+                    });
+                    continue;
+                }
+
+                // No further candidates to try (or a non-fallback error):
+                // flush the switch history, then a terminal Error.
+                for ev in pending_switches.drain(..) {
+                    yield ev;
+                }
+                yield StreamEvent::Error {
+                    code: fail_code,
+                    message: fail_message,
+                };
+                return;
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+
     /// Replace the gateway configuration at runtime.
     pub async fn update_config(&self, config: GatewayConfig) {
         let mut guard = self.config.write().await;
@@ -429,6 +674,29 @@ impl Gateway {
         for (id, router) in config.routers.iter_mut() {
             router.api_key = resolver(id);
         }
+    }
+}
+
+/// Map a [`GatewayError`] to a short, stable `code` string for a
+/// [`StreamEvent::Error`]. `ProviderError` reports its HTTP status when
+/// present (most useful to a consumer), otherwise a variant discriminant.
+fn stream_error_code(err: &GatewayError) -> String {
+    match err {
+        GatewayError::Authentication { .. } => "authentication".to_string(),
+        GatewayError::RateLimit { .. } => "rate_limit".to_string(),
+        GatewayError::BudgetExceeded { .. } => "budget_exceeded".to_string(),
+        GatewayError::Timeout { .. } => "timeout".to_string(),
+        GatewayError::ProviderError { status, .. } => status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "provider_error".to_string()),
+        GatewayError::ModelUnavailable { .. } => "model_unavailable".to_string(),
+        GatewayError::Unsupported { .. } => "unsupported".to_string(),
+        GatewayError::NoCandidates { .. } => "no_candidates".to_string(),
+        GatewayError::NotConfigured => "not_configured".to_string(),
+        GatewayError::AllAttemptsFailed { .. } => "all_attempts_failed".to_string(),
+        GatewayError::InvalidConfig(_) => "invalid_config".to_string(),
+        GatewayError::Network(_) => "network".to_string(),
+        GatewayError::Serialization(_) => "serialization".to_string(),
     }
 }
 
@@ -1614,5 +1882,378 @@ mod tests {
             .await
             .expect("valid config should be accepted");
         assert!(gw.is_configured().await);
+    }
+
+    // --- Streaming (execute_stream) fakes + tests ---
+
+    /// Chat adapter whose `chat_stream` yields two content chunks then a
+    /// terminal (empty-content) chunk carrying `TokenUsage`.
+    struct FakeStreamer {
+        id: String,
+    }
+
+    impl crate::adapters::capability::Model for FakeStreamer {
+        fn id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::adapters::capability::ChatModel for FakeStreamer {
+        async fn chat(
+            &self,
+            _cfg: &RouterConfig,
+            _req: &crate::types::io::ChatRequest,
+        ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+            Ok(crate::types::io::ChatResponse::default())
+        }
+
+        async fn chat_stream(
+            &self,
+            _cfg: &RouterConfig,
+            _req: &crate::types::io::ChatRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<crate::types::request::StreamChunk, GatewayError>,
+                        > + Send,
+                >,
+            >,
+            GatewayError,
+        > {
+            use crate::types::cost::TokenUsage;
+            use crate::types::request::StreamChunk;
+            let chunks: Vec<Result<StreamChunk, GatewayError>> = vec![
+                Ok(StreamChunk {
+                    content: "Hello, ".to_string(),
+                    finish_reason: None,
+                    usage: None,
+                    tool_calls: Vec::new(),
+                }),
+                Ok(StreamChunk {
+                    content: "world!".to_string(),
+                    finish_reason: None,
+                    usage: None,
+                    tool_calls: Vec::new(),
+                }),
+                Ok(StreamChunk {
+                    content: String::new(),
+                    finish_reason: Some("stop".to_string()),
+                    usage: Some(TokenUsage {
+                        input_tokens: 1000,
+                        output_tokens: 500,
+                        total_tokens: 1500,
+                    }),
+                    tool_calls: Vec::new(),
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// Chat adapter whose `chat_stream` fails at setup (before any chunk)
+    /// with a `ProviderError` carrying the given HTTP status.
+    struct FakeStreamFailer {
+        id: String,
+        status: u16,
+    }
+
+    impl crate::adapters::capability::Model for FakeStreamFailer {
+        fn id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::adapters::capability::ChatModel for FakeStreamFailer {
+        async fn chat(
+            &self,
+            _cfg: &RouterConfig,
+            _req: &crate::types::io::ChatRequest,
+        ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+            Ok(crate::types::io::ChatResponse::default())
+        }
+
+        async fn chat_stream(
+            &self,
+            _cfg: &RouterConfig,
+            _req: &crate::types::io::ChatRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<crate::types::request::StreamChunk, GatewayError>,
+                        > + Send,
+                >,
+            >,
+            GatewayError,
+        > {
+            Err(GatewayError::ProviderError {
+                adapter: self.id.clone(),
+                message: "stream setup failed".to_string(),
+                status: Some(self.status),
+            })
+        }
+    }
+
+    async fn collect_stream(gw: &Gateway, request: &InferenceRequest) -> Vec<StreamEvent> {
+        use futures::StreamExt;
+        let mut stream = gw
+            .execute_stream(request)
+            .await
+            .expect("stream should start");
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            events.push(ev);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn execute_stream_yields_chunks_then_done_with_cost() {
+        use crate::types::config::ModelPricing;
+
+        let mut routers = HashMap::new();
+        routers.insert(
+            "priced".to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "priced".to_string(),
+            ModelConfig {
+                id: "priced".to_string(),
+                api_model_id: None,
+                provider: "priced".to_string(),
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: Some(ModelPricing {
+                    input_per_1k: 0.0008,
+                    output_per_1k: 0.004,
+                    per_request: None,
+                }),
+            },
+        );
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains: HashMap::new(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        gw.adapters
+            .register_chat(Arc::new(FakeStreamer {
+                id: "priced".to_string(),
+            }))
+            .await;
+
+        let request = InferenceRequest {
+            capability: Capability::TextChat,
+            model: Some("priced".to_string()),
+            router: Some("priced".to_string()),
+            chain: None,
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+        };
+
+        let events = collect_stream(&gw, &request).await;
+
+        assert_eq!(events.len(), 3, "two chunks + one done, got {events:?}");
+        match &events[0] {
+            StreamEvent::Chunk { content } => assert_eq!(content, "Hello, "),
+            other => panic!("expected first Chunk, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::Chunk { content } => assert_eq!(content, "world!"),
+            other => panic!("expected second Chunk, got {other:?}"),
+        }
+        match &events[2] {
+            StreamEvent::Done {
+                model,
+                tokens,
+                cost,
+            } => {
+                assert_eq!(model, "priced");
+                assert_eq!(tokens.input_tokens, 1000);
+                assert_eq!(tokens.output_tokens, 500);
+                // input 1000/1000*0.0008 = 0.0008; output 500/1000*0.004 = 0.002; total 0.0028
+                assert!((cost - 0.0028).abs() < 1e-9, "got {cost}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_falls_back_before_first_byte() {
+        // Chain: a failing streamer (ProviderError 500 at setup) then a
+        // healthy streamer. ProviderError is in the fallback triggers, so the
+        // stream must switch providers before the first byte.
+        let mut routers = HashMap::new();
+        for id in ["failing", "good"] {
+            routers.insert(
+                id.to_string(),
+                RouterConfig {
+                    url: "http://localhost".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    enabled: true,
+                    timeout_ms: None,
+                    headers: HashMap::new(),
+                },
+            );
+        }
+        let mut models = HashMap::new();
+        models.insert(
+            "fail-model".to_string(),
+            ModelConfig {
+                id: "fail-model".to_string(),
+                api_model_id: None,
+                provider: "failing".to_string(),
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: None,
+            },
+        );
+        models.insert(
+            "good".to_string(),
+            ModelConfig {
+                id: "good".to_string(),
+                api_model_id: None,
+                provider: "good".to_string(),
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: None,
+            },
+        );
+        let mut chains = HashMap::new();
+        chains.insert(
+            "chat_chain".to_string(),
+            FallbackChainConfig {
+                id: "chat_chain".to_string(),
+                capability: Capability::TextChat,
+                models: vec![
+                    ChainEntry {
+                        model: "fail-model".to_string(),
+                        router: Some("failing".to_string()),
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                    ChainEntry {
+                        model: "good".to_string(),
+                        router: Some("good".to_string()),
+                        api_model_id: None,
+                        priority: 2,
+                    },
+                ],
+                fallback_triggers: vec![FallbackTrigger::ProviderError],
+            },
+        );
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        gw.adapters
+            .register_chat(Arc::new(FakeStreamFailer {
+                id: "failing".to_string(),
+                status: 500,
+            }))
+            .await;
+        gw.adapters
+            .register_chat(Arc::new(FakeStreamer {
+                id: "good".to_string(),
+            }))
+            .await;
+
+        let events = collect_stream(&gw, &chat_request()).await;
+
+        // Sequence: ProviderSwitch (failing -> good), then good's two chunks,
+        // then Done. No Error, since fallback succeeded before any byte.
+        match &events[0] {
+            StreamEvent::ProviderSwitch {
+                from_adapter,
+                from_model,
+                to_adapter,
+                to_model,
+                ..
+            } => {
+                assert_eq!(from_adapter, "failing");
+                assert_eq!(from_model, "fail-model");
+                assert_eq!(to_adapter, "good");
+                assert_eq!(to_model, "good");
+            }
+            other => panic!("expected leading ProviderSwitch, got {other:?}"),
+        }
+        let chunks = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Chunk { .. }))
+            .count();
+        assert_eq!(chunks, 2, "expected the second adapter's two chunks");
+        assert!(
+            matches!(events.last().unwrap(), StreamEvent::Done { model, .. } if model == "good"),
+            "expected a terminal Done for the good model, got {:?}",
+            events.last()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error { .. })),
+            "successful fallback must not emit an Error event"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_non_chat_capability_errors_up_front() {
+        // Embedding is not a chat capability, so streaming is rejected before
+        // any stream is produced.
+        let gw = test_gateway();
+        register_noop(&gw).await;
+
+        let request = InferenceRequest {
+            capability: Capability::TextEmbed,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::Embed {
+                texts: vec!["hello".to_string()],
+            },
+            budget: None,
+        };
+
+        match gw.execute_stream(&request).await {
+            Err(GatewayError::Unsupported { adapter, what }) => {
+                assert_eq!(adapter, "gateway");
+                assert!(what.contains("streaming"), "unexpected `what`: {what}");
+            }
+            Err(other) => panic!("expected Unsupported, got: {other}"),
+            Ok(_) => panic!("expected Err(Unsupported), got a stream"),
+        }
     }
 }
