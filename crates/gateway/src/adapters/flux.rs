@@ -169,7 +169,7 @@ impl crate::adapters::capability::ImageModel for FluxAdapter {
         // 2. Poll until ready
         let task_id = submit_resp.id;
         let poll_url = format!("{url_base}/get_result?id={task_id}");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(config);
         let client = &self.client;
         let api_key_ref = &api_key;
 

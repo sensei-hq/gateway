@@ -166,7 +166,7 @@ impl crate::adapters::capability::VideoModel for KlingAdapter {
         // 2. Poll until complete
         let task_id = task.data.task_id;
         let poll_url = format!("{url_base}/videos/text2video/{task_id}");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(config);
         let client = &self.client;
         let api_key_ref = &api_key;
 

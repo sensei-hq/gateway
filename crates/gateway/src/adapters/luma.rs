@@ -149,7 +149,7 @@ impl crate::adapters::capability::VideoModel for LumaAdapter {
         // 2. Poll until complete
         let generation_id = generation.id;
         let poll_url = format!("{url_base}/generations/{generation_id}");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(config);
         let client = &self.client;
         let api_key_ref = &api_key;
 

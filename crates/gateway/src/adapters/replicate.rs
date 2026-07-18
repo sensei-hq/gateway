@@ -142,7 +142,7 @@ impl crate::adapters::capability::ImageModel for ReplicateAdapter {
 
         let prediction_id = prediction.id;
         let poll_url = format!("{url_base}/predictions/{prediction_id}");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(config);
         let client = &self.client;
         let api_key_ref = &api_key;
 
@@ -259,7 +259,7 @@ impl crate::adapters::capability::VideoModel for ReplicateAdapter {
         // 2. Poll until complete
         let prediction_id = prediction.id;
         let poll_url = format!("{url_base}/predictions/{prediction_id}");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(config);
         let client = &self.client;
         let api_key_ref = &api_key;
 

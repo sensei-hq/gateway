@@ -3,11 +3,21 @@
 //! Talks to the Bedrock Converse API via `aws-sdk-bedrockruntime`. Unlike
 //! the HTTP-based adapters in this crate, Bedrock auth is handled by the
 //! AWS SDK's credential-provider chain (env vars → shared credentials
-//! file → IAM role → IMDS), and request signing is SigV4 under the
-//! hood. As a result `RouterConfig.api_key` / `api_key_env` /
-//! `RouterConfig.url` aren't used for auth — the SDK ignores them. The
-//! adapter still uses `RouterConfig.headers` for any custom headers and
-//! honours per-request `model` / `max_tokens` / `temperature`.
+//! file → IAM role → IMDS), and request signing is SigV4 under the hood.
+//!
+//! What of `RouterConfig` is and isn't used:
+//! - `api_key` / `api_key_env` are **ignored** — the SDK resolves
+//!   credentials itself via the provider chain.
+//! - `url` is **ignored** — the SDK resolves the regional Bedrock
+//!   endpoint (from `AWS_REGION` / the credential chain), so there is no
+//!   operator-supplied base URL to honour.
+//! - `headers` **are** honoured: every entry is stamped onto the
+//!   outbound request through the SDK's `customize().mutate_request`
+//!   hook (see [`apply_config`]).
+//! - `timeout_ms` **is** honoured: it maps to a per-operation SDK
+//!   timeout via `config_override`.
+//! - Per-request `model` / `max_tokens` / `temperature` are honoured as
+//!   usual.
 //!
 //! Capability coverage: `TextChat` via the unified Converse API, which
 //! standardises the message shape across Anthropic, Meta, Mistral, and
@@ -103,6 +113,7 @@ impl BedrockAdapter {
         &self,
         model_id: &str,
         texts: &[String],
+        config: &RouterConfig,
     ) -> Result<(Vec<Vec<f32>>, Option<u32>), GatewayError> {
         let mut embeddings = Vec::with_capacity(texts.len());
         let mut total_tokens: u32 = 0;
@@ -110,13 +121,15 @@ impl BedrockAdapter {
         for text in texts {
             let body = serde_json::to_vec(&TitanEmbedRequest { input_text: text })
                 .map_err(|e| Self::err(format!("titan request encode: {e}"), None))?;
-            let resp = self
+            let op = self
                 .client
                 .invoke_model()
                 .model_id(model_id)
                 .content_type("application/json")
                 .accept("application/json")
                 .body(Blob::new(body))
+                .customize();
+            let resp = apply_config(op, config)
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
@@ -141,19 +154,22 @@ impl BedrockAdapter {
         &self,
         model_id: &str,
         texts: &[String],
+        config: &RouterConfig,
     ) -> Result<(Vec<Vec<f32>>, Option<u32>), GatewayError> {
         let body = serde_json::to_vec(&CohereEmbedRequest {
             texts,
             input_type: "search_document",
         })
         .map_err(|e| Self::err(format!("cohere request encode: {e}"), None))?;
-        let resp = self
+        let op = self
             .client
             .invoke_model()
             .model_id(model_id)
             .content_type("application/json")
             .accept("application/json")
             .body(Blob::new(body))
+            .customize();
+        let resp = apply_config(op, config)
             .send()
             .await
             .map_err(map_sdk_error)?;
@@ -179,11 +195,12 @@ impl crate::adapters::capability::Model for BedrockAdapter {
 impl crate::adapters::capability::ChatModel for BedrockAdapter {
     async fn chat(
         &self,
-        _cfg: &RouterConfig,
+        cfg: &RouterConfig,
         req: &ChatRequest,
     ) -> Result<ChatResponse, GatewayError> {
         // Bedrock auth is SigV4 via the SDK's credential chain, so
-        // `cfg` (url/api_key) is ignored — same as the execute path.
+        // `cfg.url` / `cfg.api_key` are ignored; `cfg.headers` and
+        // `cfg.timeout_ms` are applied to the operation via apply_config.
         let model_id = req
             .model
             .clone()
@@ -211,11 +228,14 @@ impl crate::adapters::capability::ChatModel for BedrockAdapter {
         for s in system_blocks {
             builder = builder.system(s);
         }
-        if let Some(cfg) = build_tool_config(&req.tools) {
-            builder = builder.tool_config(cfg);
+        if let Some(tool_cfg) = build_tool_config(&req.tools) {
+            builder = builder.tool_config(tool_cfg);
         }
 
-        let response = builder.send().await.map_err(map_sdk_error)?;
+        let response = apply_config(builder.customize(), cfg)
+            .send()
+            .await
+            .map_err(map_sdk_error)?;
 
         let content = extract_text(&response);
         let tool_calls = extract_tool_calls(&response);
@@ -239,12 +259,13 @@ impl crate::adapters::capability::ChatModel for BedrockAdapter {
 
     async fn chat_stream(
         &self,
-        _cfg: &RouterConfig,
+        cfg: &RouterConfig,
         req: &ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
     {
-        // Real Converse streaming — mirrors the non-streaming path
-        // path, reading from the typed `req` instead of Payload::Chat.
+        // Real Converse streaming — mirrors the non-streaming path,
+        // reading from the typed `req` instead of Payload::Chat.
+        // `cfg.headers` / `cfg.timeout_ms` are applied via apply_config.
         let model_id = req
             .model
             .clone()
@@ -272,11 +293,14 @@ impl crate::adapters::capability::ChatModel for BedrockAdapter {
         for s in system_blocks {
             builder = builder.system(s);
         }
-        if let Some(cfg) = build_tool_config(&req.tools) {
-            builder = builder.tool_config(cfg);
+        if let Some(tool_cfg) = build_tool_config(&req.tools) {
+            builder = builder.tool_config(tool_cfg);
         }
 
-        let output = builder.send().await.map_err(map_sdk_error)?;
+        let output = apply_config(builder.customize(), cfg)
+            .send()
+            .await
+            .map_err(map_sdk_error)?;
 
         Ok(Box::pin(into_stream_chunks(output)))
     }
@@ -286,7 +310,7 @@ impl crate::adapters::capability::ChatModel for BedrockAdapter {
 impl crate::adapters::capability::EmbedModel for BedrockAdapter {
     async fn embed(
         &self,
-        _cfg: &RouterConfig,
+        cfg: &RouterConfig,
         req: &EmbedRequest,
     ) -> Result<EmbedResponse, GatewayError> {
         let model_id = req
@@ -308,8 +332,8 @@ impl crate::adapters::capability::EmbedModel for BedrockAdapter {
         }
 
         let (embeddings, input_tokens) = match family {
-            EmbedFamily::Titan => self.invoke_titan_embed(&model_id, &req.texts).await?,
-            EmbedFamily::Cohere => self.invoke_cohere_embed(&model_id, &req.texts).await?,
+            EmbedFamily::Titan => self.invoke_titan_embed(&model_id, &req.texts, cfg).await?,
+            EmbedFamily::Cohere => self.invoke_cohere_embed(&model_id, &req.texts, cfg).await?,
         };
 
         let usage = input_tokens.map(|n| TokenUsage {
@@ -558,7 +582,7 @@ fn build_messages(messages: &[GwMessage]) -> Result<Vec<Message>, GatewayError> 
         let Some(role) = role_to_bedrock(&m.role) else {
             continue;
         };
-        let blocks = build_content_blocks(m);
+        let blocks = build_content_blocks(m)?;
         if blocks.is_empty() {
             continue;
         }
@@ -581,7 +605,11 @@ fn build_messages(messages: &[GwMessage]) -> Result<Vec<Message>, GatewayError> 
 /// and tool_result responses — into a single Vec of content blocks
 /// per message. The block order mirrors what we'd expect to see on
 /// the wire: text first, tool_use blocks last.
-fn build_content_blocks(m: &GwMessage) -> Vec<ContentBlock> {
+///
+/// Returns `Err` when an attachment can't be honoured as a hard failure
+/// (e.g. an image whose base64 fails to decode) — see
+/// [`attachment_to_block`].
+fn build_content_blocks(m: &GwMessage) -> Result<Vec<ContentBlock>, GatewayError> {
     let mut blocks: Vec<ContentBlock> = Vec::new();
     match &m.content {
         MessageContent::Text { text } => {
@@ -589,7 +617,7 @@ fn build_content_blocks(m: &GwMessage) -> Vec<ContentBlock> {
                 blocks.push(ContentBlock::Text(text.clone()));
             }
             for att in &m.attachments {
-                if let Some(block) = attachment_to_block(att) {
+                if let Some(block) = attachment_to_block(att)? {
                     blocks.push(block);
                 }
             }
@@ -636,7 +664,7 @@ fn build_content_blocks(m: &GwMessage) -> Vec<ContentBlock> {
             }
         }
     }
-    blocks
+    Ok(blocks)
 }
 
 /// Parse the gateway's JSON-string `arguments` payload into a JSON
@@ -663,39 +691,52 @@ fn parse_tool_input(args: &str) -> serde_json::Value {
 /// without round-tripping to fetch the bytes itself. Callers that
 /// need to attach a remote HTTPS image should download it client-side
 /// and pass it as `MediaAttachment::image_base64`.
-fn attachment_to_block(att: &MediaAttachment) -> Option<ContentBlock> {
+///
+/// Returns `Ok(None)` for attachments that are intentionally skipped
+/// (HTTPS URLs, structural SDK build failures) and `Err` for a payload
+/// the caller should fix — specifically an image whose base64 fails to
+/// decode. Dropping an undecodable image silently would ship the model a
+/// prompt that references an image it never received, so we surface it.
+fn attachment_to_block(att: &MediaAttachment) -> Result<Option<ContentBlock>, GatewayError> {
     let MediaAttachment::Image { source, mime_type } = att;
     let format = image_format_from_mime(mime_type.as_deref()).unwrap_or(ImageFormat::Jpeg);
     let image_source = match source {
         MediaSource::Base64 { data } => {
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(data.as_bytes())
-                .ok()?;
+                .map_err(|e| {
+                    BedrockAdapter::err(format!("invalid base64 image attachment: {e}"), None)
+                })?;
             ImageSource::Bytes(Blob::new(decoded))
         }
         MediaSource::Url { url } => {
-            if let Some(s3_uri) = url.strip_prefix("s3://") {
-                // Re-prefix and pass through — S3Location.uri wants the
-                // full `s3://bucket/key` URI back.
-                let _ = s3_uri; // silence unused-binding lint with the .uri call below
-                let loc = S3Location::builder().uri(url.clone()).build().ok()?;
-                ImageSource::S3Location(loc)
+            if url.starts_with("s3://") {
+                // S3Location.uri wants the full `s3://bucket/key` URI.
+                match S3Location::builder().uri(url.clone()).build() {
+                    Ok(loc) => ImageSource::S3Location(loc),
+                    // Structural build failure (uri is always set) — drop
+                    // rather than fail the whole request.
+                    Err(_) => return Ok(None),
+                }
             } else {
                 tracing::warn!(
                     adapter = ADAPTER_ID,
                     url = %url,
                     "dropping URL image attachment — Bedrock Converse only accepts inline bytes or s3:// references; pass base64 instead",
                 );
-                return None;
+                return Ok(None);
             }
         }
     };
-    let block = ImageBlock::builder()
+    match ImageBlock::builder()
         .format(format)
         .source(image_source)
         .build()
-        .ok()?;
-    Some(ContentBlock::Image(block))
+    {
+        Ok(block) => Ok(Some(ContentBlock::Image(block))),
+        // Structural build failure — format + source are both set above.
+        Err(_) => Ok(None),
+    }
 }
 
 /// Map a MIME type string to Bedrock's `ImageFormat` enum. Returns
@@ -891,6 +932,69 @@ fn map_sdk_error<E: std::error::Error + Send + Sync + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// RouterConfig → SDK request customization
+// ---------------------------------------------------------------------------
+
+/// Snapshot the operator-supplied `RouterConfig.headers` as an owned list
+/// so the SDK request-mutation closure can satisfy its
+/// `Fn(&mut HttpRequest) + Send + Sync + 'static` bound (the closure can't
+/// borrow the config).
+fn header_pairs(config: &RouterConfig) -> Vec<(String, String)> {
+    config
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Map `RouterConfig.timeout_ms` onto a per-operation SDK timeout via a
+/// config override. Returns `None` when no timeout is configured so the
+/// SDK's own defaults apply.
+fn timeout_override(config: &RouterConfig) -> Option<aws_sdk_bedrockruntime::config::Builder> {
+    let timeout_ms = config.timeout_ms?;
+    Some(
+        aws_sdk_bedrockruntime::config::Config::builder().timeout_config(
+            aws_smithy_types::timeout::TimeoutConfig::builder()
+                .operation_timeout(std::time::Duration::from_millis(timeout_ms))
+                .build(),
+        ),
+    )
+}
+
+/// Apply the operator `RouterConfig` to an outbound Bedrock operation.
+///
+/// This is how the SigV4-signed SDK path honours the same config surface
+/// the HTTP adapters read directly: every `config.headers` entry is
+/// stamped onto the request (invalid header names/values are logged and
+/// skipped rather than panicking, since `mutate_request` is infallible),
+/// and when `timeout_ms` is set the operation is bounded by an SDK
+/// timeout. The `HttpRequest` argument type is inferred from the SDK's
+/// `mutate_request` bound — it lives in a transitive crate that isn't
+/// nameable here, so it's deliberately never spelled out.
+fn apply_config<T, E, B>(
+    op: aws_sdk_bedrockruntime::client::customize::CustomizableOperation<T, E, B>,
+    config: &RouterConfig,
+) -> aws_sdk_bedrockruntime::client::customize::CustomizableOperation<T, E, B> {
+    let headers = header_pairs(config);
+    let op = op.mutate_request(move |req| {
+        for (k, v) in &headers {
+            if let Err(e) = req.headers_mut().try_insert(k.clone(), v.clone()) {
+                tracing::warn!(
+                    adapter = ADAPTER_ID,
+                    header = %k,
+                    error = %e,
+                    "skipping invalid custom header on Bedrock request",
+                );
+            }
+        }
+    });
+    match timeout_override(config) {
+        Some(over) => op.config_override(over),
+        None => op,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1060,7 +1164,7 @@ mod tests {
     #[test]
     fn build_content_blocks_for_tool_result_emits_tool_result_with_tool_use_id() {
         let m = GwMessage::tool_result("tu_01", "{\"temp\":72}");
-        let blocks = build_content_blocks(&m);
+        let blocks = build_content_blocks(&m).unwrap();
         assert_eq!(blocks.len(), 1);
         let ContentBlock::ToolResult(block) = &blocks[0] else {
             panic!("expected ToolResult content block");
@@ -1077,7 +1181,7 @@ mod tests {
     #[test]
     fn build_content_blocks_wraps_non_json_tool_result_in_text_inner_block() {
         let m = GwMessage::tool_result("tu_01", "all good");
-        let blocks = build_content_blocks(&m);
+        let blocks = build_content_blocks(&m).unwrap();
         let ContentBlock::ToolResult(block) = &blocks[0] else {
             panic!("expected ToolResult content block");
         };
@@ -1124,7 +1228,7 @@ mod tests {
         // base64("foo") = "Zm9v" → bytes [0x66, 0x6f, 0x6f]
         let msg = GwMessage::text(MessageRole::User, "what's in this?")
             .with_attachment(MediaAttachment::image_base64("Zm9v", "image/png"));
-        let blocks = build_content_blocks(&msg);
+        let blocks = build_content_blocks(&msg).unwrap();
         assert_eq!(blocks.len(), 2);
         let ContentBlock::Image(img) = &blocks[1] else {
             panic!("expected Image block, got {:?}", blocks[1]);
@@ -1145,7 +1249,7 @@ mod tests {
                 },
                 mime_type: Some("image/jpeg".into()),
             });
-        let blocks = build_content_blocks(&msg);
+        let blocks = build_content_blocks(&msg).unwrap();
         let ContentBlock::Image(img) = &blocks[1] else {
             panic!("expected Image block");
         };
@@ -1162,7 +1266,7 @@ mod tests {
         // understand. The text part still goes through.
         let msg = GwMessage::text(MessageRole::User, "see this")
             .with_attachment(MediaAttachment::image_url("https://ex.com/cat.jpg"));
-        let blocks = build_content_blocks(&msg);
+        let blocks = build_content_blocks(&msg).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             ContentBlock::Text(t) => assert_eq!(t, "see this"),
@@ -1178,11 +1282,30 @@ mod tests {
             },
             mime_type: None,
         });
-        let blocks = build_content_blocks(&msg);
+        let blocks = build_content_blocks(&msg).unwrap();
         let ContentBlock::Image(img) = &blocks[1] else {
             panic!("expected Image block");
         };
         assert!(matches!(img.format(), ImageFormat::Jpeg));
+    }
+
+    #[test]
+    fn build_content_blocks_errors_on_invalid_base64_image() {
+        // A base64 payload the decoder can't parse must surface an error
+        // rather than being silently dropped — otherwise the prompt would
+        // reference an image Bedrock never received.
+        let msg =
+            GwMessage::text(MessageRole::User, "look").with_attachment(MediaAttachment::Image {
+                source: MediaSource::Base64 {
+                    data: "!!!! not base64 !!!!".into(),
+                },
+                mime_type: Some("image/png".into()),
+            });
+        let err = build_content_blocks(&msg).unwrap_err();
+        assert!(
+            matches!(err, GatewayError::ProviderError { .. }),
+            "expected ProviderError, got: {err:?}",
+        );
     }
 
     #[test]
@@ -1199,7 +1322,7 @@ mod tests {
             }],
             attachments: vec![],
         };
-        let blocks = build_content_blocks(&msg);
+        let blocks = build_content_blocks(&msg).unwrap();
         // Text first, tool_use last.
         assert_eq!(blocks.len(), 2);
         let ContentBlock::Text(t) = &blocks[0] else {
@@ -1231,7 +1354,7 @@ mod tests {
             }],
             attachments: vec![],
         };
-        let blocks = build_content_blocks(&msg);
+        let blocks = build_content_blocks(&msg).unwrap();
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ContentBlock::ToolUse(_)));
     }
