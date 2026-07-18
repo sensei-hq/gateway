@@ -13,10 +13,14 @@
 pub mod external;
 pub mod managed;
 pub mod ollama;
+#[cfg(feature = "hf-download")]
+pub mod pull;
 
 pub use external::ExternalResolver;
 pub use managed::ManagedResolver;
 pub use ollama::OllamaResolver;
+#[cfg(feature = "hf-download")]
+pub use pull::{FitReport, HfHubPuller, ModelPuller, PullError, PullSpec, PullingResolver};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -106,6 +110,14 @@ pub enum ResolveError {
     /// A JSON parse failure (e.g. while reading an Ollama manifest).
     #[error("json: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// A model pull (download or resource pre-flight) failed while resolving
+    /// through a [`pull::PullingResolver`]. Carries the actionable message
+    /// (e.g. "won't fit on this machine") so the caller sees why the model is
+    /// absent rather than a silent miss.
+    #[cfg(feature = "hf-download")]
+    #[error("pull: {0}")]
+    Pull(String),
 }
 
 /// Looks up models by stable id from one storage backend.
