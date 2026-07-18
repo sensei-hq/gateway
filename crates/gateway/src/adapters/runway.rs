@@ -141,7 +141,7 @@ impl crate::adapters::capability::VideoModel for RunwayAdapter {
         // 2. Poll until complete
         let task_id = task.id;
         let poll_url = format!("{url_base}/tasks/{task_id}");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(cfg);
         let client = &self.client;
         let api_key_ref = &api_key;
 

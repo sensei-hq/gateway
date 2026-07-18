@@ -378,6 +378,46 @@ fn extract_text(content: &[ContentBlock]) -> String {
         .join("")
 }
 
+/// Header name for the Anthropic API version. Operators can override the
+/// default [`ANTHROPIC_VERSION`] by setting this key in
+/// `RouterConfig.headers` — so the version can be bumped via config
+/// without a rebuild.
+const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
+
+/// Apply the fixed Anthropic headers plus any operator-supplied
+/// `config.headers` to an outbound request builder.
+///
+/// `anthropic-version` defaults to [`ANTHROPIC_VERSION`] but an operator
+/// can override it via `config.headers`. The version is resolved once up
+/// front (caller value wins) and skipped during the `config.headers`
+/// pass, so exactly one `anthropic-version` header is emitted rather than
+/// a duplicate. Every other custom header is forwarded verbatim, matching
+/// the openai/gemini/grok adapters.
+fn apply_request_headers(
+    builder: reqwest::RequestBuilder,
+    api_key: &str,
+    config: &RouterConfig,
+) -> reqwest::RequestBuilder {
+    let anthropic_version = config
+        .headers
+        .get(ANTHROPIC_VERSION_HEADER)
+        .map(String::as_str)
+        .unwrap_or(ANTHROPIC_VERSION);
+    let mut builder = builder
+        .header("x-api-key", api_key)
+        .header(ANTHROPIC_VERSION_HEADER, anthropic_version)
+        .header("content-type", "application/json");
+    for (k, v) in &config.headers {
+        // anthropic-version is already applied above with the caller's
+        // value winning; skip it here so we don't emit a duplicate.
+        if k.eq_ignore_ascii_case(ANTHROPIC_VERSION_HEADER) {
+            continue;
+        }
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    builder
+}
+
 // ---------------------------------------------------------------------------
 // AnthropicAdapter
 // ---------------------------------------------------------------------------
@@ -580,12 +620,7 @@ impl crate::adapters::capability::ChatModel for AnthropicAdapter {
         };
 
         let url = format!("{}/v1/messages", config.url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
+        let resp = apply_request_headers(self.client.post(&url), &api_key, config)
             .json(&body)
             .send()
             .await?;
@@ -666,12 +701,7 @@ impl crate::adapters::capability::ChatModel for AnthropicAdapter {
         };
 
         let url = format!("{}/v1/messages", config.url.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
+        let response = apply_request_headers(self.client.post(&url), &api_key, config)
             .json(&body)
             .send()
             .await?;
@@ -755,6 +785,60 @@ mod tests {
             crate::adapters::capability::Model::id(&adapter),
             "anthropic"
         );
+    }
+
+    fn config_with_headers(headers: std::collections::HashMap<String, String>) -> RouterConfig {
+        RouterConfig {
+            url: "https://api.anthropic.com".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers,
+        }
+    }
+
+    #[test]
+    fn apply_request_headers_forwards_custom_headers_and_defaults_version() {
+        let headers =
+            std::collections::HashMap::from([("x-custom".to_string(), "abc".to_string())]);
+        let config = config_with_headers(headers);
+        let req = apply_request_headers(
+            Client::new().post("https://api.anthropic.com/v1/messages"),
+            "sk-test",
+            &config,
+        )
+        .build()
+        .unwrap();
+        let h = req.headers();
+        assert_eq!(h.get("x-api-key").unwrap(), "sk-test");
+        assert_eq!(h.get("content-type").unwrap(), "application/json");
+        // The custom header reaches the outbound request.
+        assert_eq!(h.get("x-custom").unwrap(), "abc");
+        // No override present → the const fallback is used.
+        assert_eq!(h.get("anthropic-version").unwrap(), ANTHROPIC_VERSION);
+    }
+
+    #[test]
+    fn apply_request_headers_lets_config_override_the_anthropic_version() {
+        let headers = std::collections::HashMap::from([
+            ("anthropic-version".to_string(), "2099-01-01".to_string()),
+            ("x-extra".to_string(), "1".to_string()),
+        ]);
+        let config = config_with_headers(headers);
+        let req = apply_request_headers(
+            Client::new().post("https://api.anthropic.com/v1/messages"),
+            "sk-test",
+            &config,
+        )
+        .build()
+        .unwrap();
+        let h = req.headers();
+        // The operator's version wins over the compiled-in default…
+        assert_eq!(h.get("anthropic-version").unwrap(), "2099-01-01");
+        // …and exactly one anthropic-version header is emitted (no dupe).
+        assert_eq!(h.get_all("anthropic-version").iter().count(), 1);
+        assert_eq!(h.get("x-extra").unwrap(), "1");
     }
 
     #[test]

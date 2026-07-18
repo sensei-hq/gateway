@@ -161,7 +161,7 @@ impl crate::adapters::capability::ImageModel for FalAdapter {
 
         let request_id = queue.request_id;
         let status_url = format!("{url_base}/requests/{request_id}/status");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(config);
         let client = &self.client;
         let auth_ref = &auth_header;
 
@@ -291,7 +291,7 @@ impl crate::adapters::capability::VideoModel for FalAdapter {
         // 2. Poll status until COMPLETED
         let request_id = queue.request_id;
         let status_url = format!("{url_base}/requests/{request_id}/status");
-        let job_config = JobConfig::default();
+        let job_config = JobConfig::from_config(config);
         let client = &self.client;
         let auth_ref = &auth_header;
 
