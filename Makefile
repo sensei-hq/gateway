@@ -69,12 +69,13 @@ cov-html: ## Generate + open an HTML coverage report for the gateway crate
 	cargo llvm-cov -p gateway --html --open
 
 # ── Release gate ──────────────────────────────────────────────────────────────
-# NOTE: `check` gates the release on build + test only. `fmt-check` and `clippy`
-# are available as standalone targets but are NOT in the gate yet: the existing
-# tree isn't rustfmt-formatted or clippy-clean, so gating on them would block
-# every release until a separate codebase-wide normalization lands.
+# The tree is rustfmt-formatted and clippy-clean (as of the capability-trait
+# refactor), so the gate now runs fmt-check + clippy alongside build + test.
+# NOTE: clippy/build here use default features; the feature-gated embedded
+# adapters (llama-cpp/ort/fastembed) need a C/C++ toolchain and are verified
+# separately (see the cov note).
 
-check: build test ## Pre-release gate: build + test must pass
+check: fmt-check clippy build test ## Pre-release gate: fmt + clippy + build + test
 
 # ── Version bump / release ────────────────────────────────────────────────────
 # Usage:

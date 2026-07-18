@@ -22,8 +22,8 @@ ort         # ONNX Runtime (CPU)
 Pin a tagged release via a git dependency:
 
 ```toml
-gateway          = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.18" }
-gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.18", features = ["fastembed"] }
+gateway          = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24" }
+gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24", features = ["fastembed"] }
 ```
 
 `Cargo.lock` in the consuming binary pins the exact commit, so there's no silent drift.
@@ -42,7 +42,7 @@ Edit locally, build the consumer against your changes, then push here, cut a new
 
 ## Versioning
 
-This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); both crates currently share version `0.2.18` (carried over from sensei).
+This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); both crates currently share version `0.2.24`.
 
 ## License
 
