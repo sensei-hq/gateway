@@ -1,5 +1,5 @@
-//! In-process inference adapters that implement
-//! [`gateway::adapters::InferenceAdapter`].
+//! In-process inference adapters that implement the gateway's capability
+//! traits (`Model` + `ChatModel`/`EmbedModel`).
 //!
 //! Each engine sits behind its own cargo feature so that callers only pay
 //! the build cost (C++ toolchain for `llama-cpp-2`, ORT runtime download

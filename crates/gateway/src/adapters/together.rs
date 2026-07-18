@@ -6,16 +6,12 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, resolve_api_key};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
 use crate::types::io::{ChatRequest, ChatResponse, ImageRequest, ImageResponse};
-use crate::types::request::{
-    ImageResult, InferenceRequest, InferenceResponse, Message, MessageRole, Payload, StreamChunk,
-};
+use crate::types::request::{ImageResult, Message, MessageRole, StreamChunk};
 
 // ---------------------------------------------------------------------------
 // Wire types — chat (OpenAI-compatible, defined independently)
@@ -188,308 +184,8 @@ impl TogetherAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for TogetherAdapter {
-    fn id(&self) -> &str {
-        "together"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::TextChat | Capability::ImageGenerate)
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let api_key = require_api_key(config)?;
-        let url_base = base_url(config);
-
-        match &request.payload {
-            Payload::Chat {
-                messages,
-                system,
-                max_tokens,
-                temperature,
-                tools: _,
-            } => {
-                let model = request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string());
-
-                let body = ChatCompletionRequest {
-                    model: model.clone(),
-                    messages: build_chat_messages(messages, system),
-                    max_tokens: *max_tokens,
-                    temperature: *temperature,
-                    stream: false,
-                };
-
-                let url = format!("{url_base}/chat/completions");
-                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-                for (k, v) in &config.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-
-                let response = req.send().await?;
-                let status = response.status();
-
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(match status.as_u16() {
-                        401 | 403 => GatewayError::Authentication {
-                            adapter: "together".into(),
-                            message: body_text,
-                        },
-                        429 => GatewayError::RateLimit {
-                            adapter: "together".into(),
-                            retry_after_ms: None,
-                        },
-                        _ => GatewayError::ProviderError {
-                            adapter: "together".into(),
-                            message: body_text,
-                            status: Some(status.as_u16()),
-                        },
-                    });
-                }
-
-                let resp: ChatCompletionResponse =
-                    response
-                        .json()
-                        .await
-                        .map_err(|e| GatewayError::ProviderError {
-                            adapter: "together".into(),
-                            message: format!("failed to parse chat response: {e}"),
-                            status: Some(status.as_u16()),
-                        })?;
-
-                let content = resp.choices.first().and_then(|c| c.message.content.clone());
-                let usage = usage_from_response(&resp.usage);
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content,
-                    embeddings: None,
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::ImageGenerate {
-                prompt, size, n, ..
-            } => {
-                let model = request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_IMAGE_MODEL.to_string());
-
-                let body = ImageGenerateRequest {
-                    model: model.clone(),
-                    prompt: prompt.clone(),
-                    n: *n,
-                    size: size.clone().or_else(|| Some("1024x1024".to_string())),
-                };
-
-                let url = format!("{url_base}/images/generations");
-                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-                for (k, v) in &config.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-
-                let response = req.send().await?;
-                let status = response.status();
-
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(match status.as_u16() {
-                        401 | 403 => GatewayError::Authentication {
-                            adapter: "together".into(),
-                            message: body_text,
-                        },
-                        429 => GatewayError::RateLimit {
-                            adapter: "together".into(),
-                            retry_after_ms: None,
-                        },
-                        _ => GatewayError::ProviderError {
-                            adapter: "together".into(),
-                            message: body_text,
-                            status: Some(status.as_u16()),
-                        },
-                    });
-                }
-
-                let image_resp: ImageGenerateResponse =
-                    response
-                        .json()
-                        .await
-                        .map_err(|e| GatewayError::ProviderError {
-                            adapter: "together".into(),
-                            message: format!("failed to parse image response: {e}"),
-                            status: Some(status.as_u16()),
-                        })?;
-
-                let images: Vec<ImageResult> = image_resp
-                    .data
-                    .into_iter()
-                    .map(|d| ImageResult {
-                        url: d.url,
-                        b64_json: d.b64_json,
-                        revised_prompt: None,
-                    })
-                    .collect();
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: None,
-                    transcription: None,
-                    audio: None,
-                    images: Some(images),
-                    videos: None,
-                    model: Some(model),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            _ => Err(GatewayError::ProviderError {
-                adapter: "together".into(),
-                message: "only Chat and ImageGenerate payloads are supported".into(),
-                status: None,
-            }),
-        }
-    }
-
-    async fn stream(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools: _,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "together".into(),
-                message: "streaming is only supported for chat payloads".into(),
-                status: None,
-            });
-        };
-
-        let api_key = require_api_key(config)?;
-        let url_base = base_url(config);
-        let model = request
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string());
-
-        let body = ChatCompletionRequest {
-            model,
-            messages: build_chat_messages(messages, system),
-            max_tokens: *max_tokens,
-            temperature: *temperature,
-            stream: true,
-        };
-
-        let url = format!("{url_base}/chat/completions");
-        let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-        for (k, v) in &config.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let response = req.send().await?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "together".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "together".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "together".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let byte_stream = response.bytes_stream();
-
-        let stream = byte_stream
-            .map(|result| -> Result<Vec<StreamChunk>, GatewayError> {
-                let bytes = result?;
-                let text = String::from_utf8_lossy(&bytes);
-                let mut chunks = Vec::new();
-
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line == "data: [DONE]" {
-                        continue;
-                    }
-                    let json_str = line.strip_prefix("data: ").unwrap_or(line);
-                    if let Ok(parsed) = serde_json::from_str::<StreamChatResponse>(json_str)
-                        && let Some(choice) = parsed.choices.first()
-                    {
-                        let content = choice.delta.content.clone().unwrap_or_default();
-                        let usage = usage_from_response(&parsed.usage);
-                        chunks.push(StreamChunk {
-                            content,
-                            finish_reason: choice.finish_reason.clone(),
-                            usage,
-                            tool_calls: Vec::new(),
-                        });
-                    }
-                }
-
-                Ok(chunks)
-            })
-            .map(
-                |result| -> futures::stream::Iter<
-                    std::vec::IntoIter<Result<StreamChunk, GatewayError>>,
-                > {
-                    match result {
-                        Ok(chunks) => {
-                            futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
-                        }
-                        Err(e) => futures::stream::iter(vec![Err(e)]),
-                    }
-                },
-            )
-            .flatten();
-
-        Ok(Box::pin(stream))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge; the
-// legacy `impl InferenceAdapter` above is removed in Phase 4.
+// Capability traits. Traits + RegisterInto referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for TogetherAdapter {
@@ -744,7 +440,7 @@ impl crate::adapters::capability::ImageModel for TogetherAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for TogetherAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_image(self).await;
     }
@@ -761,18 +457,13 @@ mod tests {
     #[test]
     fn together_id_and_supports() {
         let adapter = TogetherAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "together");
-
-        assert!(adapter.supports(&Capability::TextChat));
-        assert!(adapter.supports(&Capability::ImageGenerate));
-        assert!(!adapter.supports(&Capability::TextEmbed));
-        assert!(!adapter.supports(&Capability::VideoGenerate));
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "together");
     }
 
     #[test]
     fn together_capability_model_id() {
         // Typed-trait identity mirrors the legacy `id()` above via full path,
-        // sidestepping the InferenceAdapter::id / Model::id inherent clash.
+        // using the capability `Model::id`.
         let adapter = TogetherAdapter::new().unwrap();
         assert_eq!(crate::adapters::capability::Model::id(&adapter), "together");
     }
@@ -839,6 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_api_key_returns_auth_error() {
+        use crate::adapters::capability::ChatModel;
         let adapter = TogetherAdapter::new().unwrap();
         let config = RouterConfig {
             url: "https://api.together.xyz/v1".to_string(),
@@ -848,22 +540,16 @@ mod tests {
             timeout_ms: None,
             headers: std::collections::HashMap::new(),
         };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
+        let req = crate::types::io::ChatRequest {
             model: None,
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Hello".to_string())],
-                system: None,
-                max_tokens: Some(64),
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(MessageRole::User, "Hello".to_string())],
+            system: None,
+            max_tokens: Some(64),
+            temperature: None,
+            tools: Vec::new(),
         };
 
-        let result = adapter.execute(&config, &request).await;
+        let result = adapter.chat(&config, &req).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();

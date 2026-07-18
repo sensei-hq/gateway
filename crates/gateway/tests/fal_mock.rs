@@ -1,5 +1,5 @@
-//! Integration tests for the fal.ai adapter's `execute()` / `stream()`
-//! using wiremock.
+//! Integration tests for the fal.ai adapter's typed capability methods
+//! (`generate_video()` / `generate_image()`) using wiremock.
 //!
 //! These tests spin up an in-process HTTP mock server and verify that
 //! `FalAdapter` correctly serialises requests, drives the submit ->
@@ -18,12 +18,11 @@
 
 use std::collections::HashMap;
 
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{InferenceRequest, Message, MessageRole, Payload};
+use gateway::types::io::{ImageRequest, VideoRequest};
 
-use gateway::adapters::InferenceAdapter;
+use gateway::adapters::capability::{ImageModel, Model, VideoModel};
 use gateway::adapters::fal::FalAdapter;
 
 use wiremock::matchers::{header, method, path};
@@ -46,35 +45,23 @@ fn router_config(url: &str) -> RouterConfig {
     }
 }
 
-fn video_request(model: Option<&str>) -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::VideoGenerate,
+fn video_request(model: Option<&str>) -> VideoRequest {
+    VideoRequest {
         model: model.map(|m| m.to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::VideoGenerate {
-            prompt: "A cat playing piano".to_string(),
-            duration_secs: Some(5),
-            resolution: None,
-        },
-        budget: None,
+        prompt: "A cat playing piano".to_string(),
+        duration_secs: Some(5),
+        resolution: None,
     }
 }
 
-fn image_request(model: Option<&str>) -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::ImageGenerate,
+fn image_request(model: Option<&str>) -> ImageRequest {
+    ImageRequest {
         model: model.map(|m| m.to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::ImageGenerate {
-            prompt: "A sunset over mountains".to_string(),
-            size: None,
-            quality: None,
-            style: None,
-            n: 1,
-        },
-        budget: None,
+        prompt: "A sunset over mountains".to_string(),
+        size: None,
+        quality: None,
+        style: None,
+        n: 1,
     }
 }
 
@@ -83,7 +70,7 @@ fn image_request(model: Option<&str>) -> InferenceRequest {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fal_video_execute_happy_path() {
+async fn fal_video_generate_happy_path() {
     let server = MockServer::start().await;
 
     // 1. Submit -> queue response with request_id.
@@ -121,17 +108,14 @@ async fn fal_video_execute_happy_path() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    assert_eq!(response.model.as_deref(), Some("fal-ai/veo3"));
-    let videos = response.videos.expect("expected videos");
+    let response = adapter.generate_video(&config, &request).await.unwrap();
+    let videos = response.videos;
     assert_eq!(videos.len(), 1);
     assert_eq!(
         videos[0].url.as_deref(),
         Some("https://fal.media/video1.mp4"),
     );
     assert_eq!(videos[0].duration_secs, Some(5.0));
-    assert!(response.images.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +123,7 @@ async fn fal_video_execute_happy_path() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fal_image_execute_happy_path() {
+async fn fal_image_generate_happy_path() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -172,25 +156,22 @@ async fn fal_image_execute_happy_path() {
     let config = router_config(&server.uri());
     let request = image_request(None);
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    assert_eq!(response.model.as_deref(), Some("fal-ai/flux-pro/v1.1"));
-    let images = response.images.expect("expected images");
+    let response = adapter.generate_image(&config, &request).await.unwrap();
+    let images = response.images;
     assert_eq!(images.len(), 1);
     assert_eq!(
         images[0].url.as_deref(),
         Some("https://fal.media/image1.png"),
     );
     assert!(images[0].b64_json.is_none());
-    assert!(response.videos.is_none());
 }
 
 // ---------------------------------------------------------------------------
-// Image happy path — explicit model override
+// Image happy path — explicit model override (verified via the POST path).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fal_image_execute_custom_model() {
+async fn fal_image_generate_custom_model() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -222,9 +203,10 @@ async fn fal_image_execute_custom_model() {
     let config = router_config(&server.uri());
     let request = image_request(Some("fal-ai/recraft-v3"));
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    assert_eq!(response.model.as_deref(), Some("fal-ai/recraft-v3"));
+    // The mock only matches `/fal-ai/recraft-v3`; a wrong model URL would
+    // 404 and the call would error — so success proves the override is used.
+    let response = adapter.generate_image(&config, &request).await.unwrap();
+    assert_eq!(response.images.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +228,7 @@ async fn fal_missing_api_key_authentication_error() {
     let adapter = FalAdapter::from_config(&config).unwrap();
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::Authentication { .. }),
         "expected Authentication error, got: {err:?}",
@@ -276,7 +258,7 @@ async fn fal_submit_401_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -305,7 +287,7 @@ async fn fal_submit_403_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -334,7 +316,7 @@ async fn fal_submit_429_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -364,7 +346,7 @@ async fn fal_submit_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -393,7 +375,7 @@ async fn fal_image_submit_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = image_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_image(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -427,7 +409,7 @@ async fn fal_submit_bad_queue_body_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     match err {
         GatewayError::ProviderError { message, .. } => {
             assert!(
@@ -469,7 +451,7 @@ async fn fal_poll_failed_status_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     match err {
         GatewayError::ProviderError { message, .. } => {
             assert_eq!(message, "fal.ai request failed");
@@ -507,7 +489,7 @@ async fn fal_poll_http_error_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { status: None, .. }),
         "expected ProviderError with status None, got: {err:?}",
@@ -551,7 +533,7 @@ async fn fal_result_http_error_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -565,8 +547,8 @@ async fn fal_result_http_error_maps_to_provider_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Result phase — result body has no `video` field -> success with a
-// VideoResult whose url is None.
+// Result phase — result body has no `video` field -> a VideoResult whose
+// url is None.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -600,88 +582,18 @@ async fn fal_video_result_missing_video_yields_none_url() {
     let config = router_config(&server.uri());
     let request = video_request(None);
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    let videos = response.videos.expect("expected videos");
+    let response = adapter.generate_video(&config, &request).await.unwrap();
+    let videos = response.videos;
     assert_eq!(videos.len(), 1);
     assert!(videos[0].url.is_none());
 }
 
 // ---------------------------------------------------------------------------
-// Wrong payload (Chat) -> early ProviderError.
+// Identity check through the capability-trait surface.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fal_wrong_payload_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
-    let config = router_config(&server.uri());
-    let request = InferenceRequest {
-        capability: Capability::TextChat,
-        model: None,
-        router: None,
-        chain: None,
-        payload: Payload::Chat {
-            messages: vec![Message::text(MessageRole::User, "Hi")],
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            tools: Vec::new(),
-        },
-        budget: None,
-    };
-
-    let err = adapter.execute(&config, &request).await.unwrap_err();
-    match err {
-        GatewayError::ProviderError {
-            message, status, ..
-        } => {
-            assert_eq!(
-                message,
-                "only VideoGenerate and ImageGenerate payloads are supported",
-            );
-            assert!(status.is_none());
-        }
-        other => panic!("expected ProviderError, got: {other:?}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// stream() is an unsupported-error stub -> ProviderError.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn fal_stream_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(None);
-
-    let err = adapter.stream(&config, &request).await.err();
-    let err = err.expect("stream should return an error");
-    match err {
-        GatewayError::ProviderError { message, .. } => {
-            assert!(
-                message.contains("streaming is not supported"),
-                "unexpected message: {message}",
-            );
-        }
-        other => panic!("expected ProviderError, got: {other:?}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// id() / supports() sanity checks through the adapter surface.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn fal_id_and_supports() {
+#[test]
+fn fal_id() {
     let adapter = FalAdapter::new().unwrap();
-    assert_eq!(adapter.id(), "fal");
-    assert!(adapter.supports(&Capability::VideoGenerate));
-    assert!(adapter.supports(&Capability::ImageGenerate));
-    assert!(!adapter.supports(&Capability::TextChat));
-    assert!(!adapter.supports(&Capability::TextEmbed));
+    assert_eq!(Model::id(&adapter), "fal");
 }

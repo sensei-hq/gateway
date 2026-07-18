@@ -1,22 +1,16 @@
-use std::pin::Pin;
-
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use futures::Stream;
 use reqwest::Client;
 use serde::Deserialize;
 
 use super::base::{build_client, resolve_api_key};
 use super::capability::{ImageModel, Model};
-use super::{CapabilityRegistry, InferenceAdapter, RegisterInto};
-use crate::types::capability::Capability;
+use super::{AdapterRegistry, RegisterInto};
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
 use crate::types::io::{ImageRequest, ImageResponse};
-use crate::types::request::{
-    ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk,
-};
+use crate::types::request::ImageResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -41,13 +35,6 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
         adapter: "stability".into(),
         message: "missing API key — set the env var specified in api_key_env".into(),
     })
-}
-
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
 fn base_url(config: &RouterConfig) -> &str {
@@ -89,139 +76,9 @@ impl StabilityAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for StabilityAdapter {
-    fn id(&self) -> &str {
-        "stability"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::ImageGenerate)
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let Payload::ImageGenerate { prompt, size, .. } = &request.payload else {
-            return Err(GatewayError::ProviderError {
-                adapter: "stability".into(),
-                message: "only ImageGenerate payload is supported".into(),
-                status: None,
-            });
-        };
-
-        let api_key = require_api_key(config)?;
-        let model = resolve_model(request);
-        let url_base = base_url(config);
-        let aspect_ratio = size_to_aspect_ratio(size);
-
-        let form = reqwest::multipart::Form::new()
-            .text("prompt", prompt.clone())
-            .text("model", model.clone())
-            .text("output_format", "png")
-            .text("aspect_ratio", aspect_ratio.to_string());
-
-        let url = format!("{url_base}/stable-image/generate/sd3");
-        let mut req = self.client.post(&url).multipart(form).bearer_auth(&api_key);
-
-        for (k, v) in &config.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let response = req.send().await?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "stability".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "stability".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "stability".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let b64 = if content_type.starts_with("application/json") {
-            let json_resp: StabilityJsonResponse =
-                response
-                    .json()
-                    .await
-                    .map_err(|e| GatewayError::ProviderError {
-                        adapter: "stability".into(),
-                        message: format!("failed to parse stability response: {e}"),
-                        status: Some(status.as_u16()),
-                    })?;
-            json_resp.image
-        } else {
-            // image/* — raw bytes
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| GatewayError::ProviderError {
-                    adapter: "stability".into(),
-                    message: format!("failed to read image bytes: {e}"),
-                    status: None,
-                })?;
-            STANDARD.encode(&bytes)
-        };
-
-        Ok(InferenceResponse {
-            success: true,
-            content: None,
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: Some(vec![ImageResult {
-                b64_json: Some(b64),
-                url: None,
-                revised_prompt: None,
-            }]),
-            videos: None,
-            model: Some(model),
-            tool_calls: Vec::new(),
-            usage: None,
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        _request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        Err(GatewayError::ProviderError {
-            adapter: "stability".into(),
-            message: "streaming is not supported for image generation".into(),
-            status: None,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (segregated model — see
-// docs/design/adapter-capability-traits.md). Additive during the migration;
-// the legacy `impl InferenceAdapter` above is removed in Phase 4.
+// Capability traits (see docs/design/adapter-capability-traits.md).
+// Referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl Model for StabilityAdapter {
@@ -323,7 +180,7 @@ impl ImageModel for StabilityAdapter {
 
 #[async_trait]
 impl RegisterInto for StabilityAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &AdapterRegistry) {
         reg.register_image(self).await;
     }
 }
@@ -339,11 +196,10 @@ mod tests {
     #[test]
     fn stability_id_and_supports() {
         let adapter = StabilityAdapter::new().unwrap();
-        assert_eq!(InferenceAdapter::id(&adapter), "stability");
-
-        assert!(adapter.supports(&Capability::ImageGenerate));
-        assert!(!adapter.supports(&Capability::TextChat));
-        assert!(!adapter.supports(&Capability::VideoGenerate));
+        assert_eq!(
+            crate::adapters::capability::Model::id(&adapter),
+            "stability"
+        );
     }
 
     #[test]
@@ -363,42 +219,6 @@ mod tests {
         let resp: StabilityJsonResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.image, "abc123");
         assert_eq!(resp.seed, Some(42));
-    }
-
-    #[tokio::test]
-    async fn missing_api_key_returns_auth_error() {
-        let adapter = StabilityAdapter::new().unwrap();
-        let config = RouterConfig {
-            url: "https://api.stability.ai/v2beta".to_string(),
-            api_key_env: Some("__NONEXISTENT_STABILITY_KEY_FOR_TEST__".to_string()),
-            api_key: None,
-            enabled: true,
-            timeout_ms: None,
-            headers: std::collections::HashMap::new(),
-        };
-        let request = InferenceRequest {
-            capability: Capability::ImageGenerate,
-            model: None,
-            router: None,
-            chain: None,
-            payload: Payload::ImageGenerate {
-                prompt: "A cat".to_string(),
-                size: None,
-                quality: None,
-                style: None,
-                n: 1,
-            },
-            budget: None,
-        };
-
-        let result = adapter.execute(&config, &request).await;
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, GatewayError::Authentication { .. }),
-            "expected Authentication error, got: {err:?}",
-        );
     }
 
     #[tokio::test]

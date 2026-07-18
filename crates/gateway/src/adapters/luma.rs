@@ -1,20 +1,13 @@
-use std::pin::Pin;
-
 use async_trait::async_trait;
-use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, resolve_api_key};
 use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
 use crate::types::io::{VideoRequest, VideoResponse};
-use crate::types::request::{
-    InferenceRequest, InferenceResponse, Payload, StreamChunk, VideoResult,
-};
+use crate::types::request::VideoResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -66,13 +59,6 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
     })
 }
 
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-}
-
 fn base_url(config: &RouterConfig) -> &str {
     let url = config.url.trim_end_matches('/');
     if url.is_empty() { BASE_URL } else { url }
@@ -101,159 +87,9 @@ impl LumaAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for LumaAdapter {
-    fn id(&self) -> &str {
-        "luma"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::VideoGenerate)
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let Payload::VideoGenerate {
-            prompt,
-            duration_secs,
-            resolution,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "luma".into(),
-                message: "only VideoGenerate payload is supported".into(),
-                status: None,
-            });
-        };
-
-        let api_key = require_api_key(config)?;
-        let model = resolve_model(request);
-        let url_base = base_url(config);
-
-        // 1. Submit generation
-        let body = LumaGenerationRequest {
-            prompt: prompt.clone(),
-            model: Some(model.clone()),
-            resolution: resolution.clone(),
-            duration: duration_secs.map(|d| format!("{d}s")),
-        };
-
-        let submit_url = format!("{url_base}/generations");
-        let resp = self
-            .client
-            .post(&submit_url)
-            .json(&body)
-            .bearer_auth(&api_key)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::ProviderError {
-                adapter: "luma".into(),
-                message: body_text,
-                status: Some(status.as_u16()),
-            });
-        }
-
-        let generation: LumaGenerationResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "luma".into(),
-                message: format!("failed to parse generation response: {e}"),
-                status: Some(status.as_u16()),
-            })?;
-
-        // 2. Poll until complete
-        let generation_id = generation.id;
-        let poll_url = format!("{url_base}/generations/{generation_id}");
-        let job_config = JobConfig::default();
-        let client = &self.client;
-        let api_key_ref = &api_key;
-
-        let gen_status = poll_until_complete(&job_config, || async {
-            let resp = client
-                .get(&poll_url)
-                .bearer_auth(api_key_ref)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "luma".into(),
-                    message: body_text,
-                    status: None,
-                });
-            }
-
-            let status: LumaGenerationStatus =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "luma".into(),
-                    message: format!("failed to parse generation status: {e}"),
-                    status: None,
-                })?;
-
-            match status.state.as_str() {
-                "completed" => Ok(Some(status)),
-                "failed" => Err(GatewayError::ProviderError {
-                    adapter: "luma".into(),
-                    message: status
-                        .failure_reason
-                        .unwrap_or_else(|| "generation failed".to_string()),
-                    status: None,
-                }),
-                _ => Ok(None), // queued, dreaming
-            }
-        })
-        .await?;
-
-        // 3. Extract video URL
-        let video_url = gen_status.assets.and_then(|a| a.video);
-
-        Ok(InferenceResponse {
-            success: true,
-            content: None,
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: None,
-            videos: Some(vec![VideoResult {
-                url: video_url,
-                duration_secs: duration_secs.map(|d| d as f32),
-            }]),
-            model: Some(model),
-            tool_calls: Vec::new(),
-            usage: None,
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        _request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        Err(GatewayError::ProviderError {
-            adapter: "luma".into(),
-            message: "streaming is not supported for video generation".into(),
-            status: None,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model — see
-// docs/design/adapter-capability-traits.md). Additive alongside the legacy
-// `InferenceAdapter` impl above, which stays until the engine cuts over.
-// The capability traits are referenced by full path so their `Model::id`
-// method does not collide with `InferenceAdapter::id` in method resolution.
+// Capability traits (see docs/design/adapter-capability-traits.md). Traits +
+// RegisterInto are referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for LumaAdapter {
@@ -368,7 +204,7 @@ impl crate::adapters::capability::VideoModel for LumaAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for LumaAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_video(self).await;
     }
 }
@@ -384,17 +220,13 @@ mod tests {
     #[test]
     fn luma_id_and_supports() {
         let adapter = LumaAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "luma");
-
-        assert!(adapter.supports(&Capability::VideoGenerate));
-        assert!(!adapter.supports(&Capability::TextChat));
-        assert!(!adapter.supports(&Capability::TextEmbed));
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "luma");
     }
 
     #[test]
     fn luma_capability_model_id() {
         let adapter = LumaAdapter::new().unwrap();
-        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // Reference `Model::id` by full path
         // and the capability `Model` trait.
         assert_eq!(crate::adapters::capability::Model::id(&adapter), "luma");
     }

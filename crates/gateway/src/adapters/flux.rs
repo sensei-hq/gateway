@@ -1,20 +1,13 @@
-use std::pin::Pin;
-
 use async_trait::async_trait;
-use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, resolve_api_key};
 use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
 use crate::types::io::{ImageRequest, ImageResponse};
-use crate::types::request::{
-    ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk,
-};
+use crate::types::request::ImageResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -55,13 +48,6 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
         adapter: "flux".into(),
         message: "missing API key — set the env var specified in api_key_env".into(),
     })
-}
-
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
 fn base_url(config: &RouterConfig) -> &str {
@@ -111,163 +97,9 @@ impl FluxAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for FluxAdapter {
-    fn id(&self) -> &str {
-        "flux"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::ImageGenerate)
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let Payload::ImageGenerate { prompt, size, .. } = &request.payload else {
-            return Err(GatewayError::ProviderError {
-                adapter: "flux".into(),
-                message: "only ImageGenerate payload is supported".into(),
-                status: None,
-            });
-        };
-
-        let api_key = require_api_key(config)?;
-        let model = resolve_model(request);
-        let url_base = base_url(config);
-        let (width, height) = parse_size(size);
-
-        let body = FluxImageRequest {
-            prompt: prompt.clone(),
-            width,
-            height,
-        };
-
-        // 1. Submit job
-        let submit_url = format!("{url_base}/{model}");
-        let resp = self
-            .client
-            .post(&submit_url)
-            .json(&body)
-            .header("x-key", &api_key)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "flux".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "flux".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "flux".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let submit_resp: FluxSubmitResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "flux".into(),
-                message: format!("failed to parse submit response: {e}"),
-                status: Some(status.as_u16()),
-            })?;
-
-        // 2. Poll until ready
-        let task_id = submit_resp.id;
-        let poll_url = format!("{url_base}/get_result?id={task_id}");
-        let job_config = JobConfig::default();
-        let client = &self.client;
-        let api_key_ref = &api_key;
-
-        let final_result = poll_until_complete(&job_config, || async {
-            let resp = client
-                .get(&poll_url)
-                .header("x-key", api_key_ref)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "flux".into(),
-                    message: body_text,
-                    status: None,
-                });
-            }
-
-            let poll_resp: FluxPollResponse =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "flux".into(),
-                    message: format!("failed to parse poll response: {e}"),
-                    status: None,
-                })?;
-
-            match poll_resp.status.as_str() {
-                "Ready" => Ok(Some(poll_resp)),
-                "Error" | "Failed" => Err(GatewayError::ProviderError {
-                    adapter: "flux".into(),
-                    message: "FLUX task failed".to_string(),
-                    status: None,
-                }),
-                _ => Ok(None), // Pending, Processing
-            }
-        })
-        .await?;
-
-        // 3. Extract sample URL
-        let sample_url = final_result.result.map(|r| r.sample);
-
-        Ok(InferenceResponse {
-            success: true,
-            content: None,
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: Some(vec![ImageResult {
-                url: sample_url,
-                b64_json: None,
-                revised_prompt: None,
-            }]),
-            videos: None,
-            model: Some(model),
-            tool_calls: Vec::new(),
-            usage: None,
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        _request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        Err(GatewayError::ProviderError {
-            adapter: "flux".into(),
-            message: "streaming is not supported for image generation".into(),
-            status: None,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model — see
-// docs/design/adapter-capability-traits.md). Additive alongside the legacy
-// `InferenceAdapter` impl above, which stays until the engine cuts over.
-// The capability traits are referenced by full path so their `Model::id`
-// method does not collide with `InferenceAdapter::id` in method resolution.
+// Capability traits (see docs/design/adapter-capability-traits.md). Traits +
+// RegisterInto are referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for FluxAdapter {
@@ -391,7 +223,7 @@ impl crate::adapters::capability::ImageModel for FluxAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for FluxAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_image(self).await;
     }
 }
@@ -407,17 +239,13 @@ mod tests {
     #[test]
     fn flux_id_and_supports() {
         let adapter = FluxAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "flux");
-
-        assert!(adapter.supports(&Capability::ImageGenerate));
-        assert!(!adapter.supports(&Capability::TextChat));
-        assert!(!adapter.supports(&Capability::VideoGenerate));
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "flux");
     }
 
     #[test]
     fn flux_capability_model_id() {
         let adapter = FluxAdapter::new().unwrap();
-        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // Reference `Model::id` by full path
         // and the capability `Model` trait.
         assert_eq!(crate::adapters::capability::Model::id(&adapter), "flux");
     }

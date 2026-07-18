@@ -1,8 +1,8 @@
 //! Integration tests for the Luma AI Dream Machine video-generation adapter
 //! using wiremock.
 //!
-//! Luma is an async job adapter: `execute()` first POSTs a submit request to
-//! `{base}/generations` (default model `ray-2`) authenticated with a bearer
+//! Luma is an async job adapter: `generate_video()` first POSTs a submit request
+//! to `{base}/generations` (default model `ray-2`) authenticated with a bearer
 //! `Authorization: Bearer <key>` header, then polls
 //! `GET {base}/generations/{id}` until the returned `state` is `"completed"`.
 //! Because `JobConfig::default()` uses a 3-second poll interval and
@@ -19,12 +19,11 @@
 
 use std::collections::HashMap;
 
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{InferenceRequest, Message, MessageRole, Payload};
+use gateway::types::io::VideoRequest;
 
-use gateway::adapters::InferenceAdapter;
+use gateway::adapters::capability::VideoModel;
 use gateway::adapters::luma::LumaAdapter;
 
 use wiremock::matchers::{header, method, path};
@@ -35,7 +34,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 
 const SAMPLE_URL: &str = "https://storage.lumalabs.ai/dream-machine/video1.mp4";
-const DEFAULT_MODEL: &str = "ray-2";
 
 fn router_config(url: &str) -> RouterConfig {
     RouterConfig {
@@ -48,35 +46,12 @@ fn router_config(url: &str) -> RouterConfig {
     }
 }
 
-fn video_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::VideoGenerate,
+fn video_request() -> VideoRequest {
+    VideoRequest {
         model: None,
-        router: None,
-        chain: None,
-        payload: Payload::VideoGenerate {
-            prompt: "A timelapse of a city skyline at dusk".to_string(),
-            duration_secs: Some(5),
-            resolution: Some("1080p".to_string()),
-        },
-        budget: None,
-    }
-}
-
-fn chat_request() -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextChat,
-        model: Some("ray-2".to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::Chat {
-            messages: vec![Message::text(MessageRole::User, "hello")],
-            system: None,
-            max_tokens: Some(64),
-            temperature: Some(0.5),
-            tools: Vec::new(),
-        },
-        budget: None,
+        prompt: "A timelapse of a city skyline at dusk".to_string(),
+        duration_secs: Some(5),
+        resolution: Some("1080p".to_string()),
     }
 }
 
@@ -85,7 +60,7 @@ fn chat_request() -> InferenceRequest {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn luma_execute_happy_path() {
+async fn luma_generate_video_happy_path() {
     let server = MockServer::start().await;
 
     // 1. Submit generation -> returns an id + a non-terminal state.
@@ -117,12 +92,9 @@ async fn luma_execute_happy_path() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let response = adapter.execute(&config, &request).await.unwrap();
+    let response = adapter.generate_video(&config, &request).await.unwrap();
 
-    assert!(response.success);
-    assert_eq!(response.model.as_deref(), Some(DEFAULT_MODEL));
-
-    let videos = response.videos.expect("expected videos in response");
+    let videos = response.videos;
     assert_eq!(videos.len(), 1);
     assert_eq!(videos[0].url.as_deref(), Some(SAMPLE_URL));
     // duration_secs on the request was 5 -> surfaced as 5.0 on the result.
@@ -151,7 +123,7 @@ async fn luma_submit_401_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -178,7 +150,7 @@ async fn luma_submit_403_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -205,7 +177,7 @@ async fn luma_submit_429_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -232,7 +204,7 @@ async fn luma_submit_500_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -264,7 +236,7 @@ async fn luma_submit_unparseable_body_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { .. }),
         "expected ProviderError from unparseable submit body, got: {err:?}",
@@ -305,7 +277,7 @@ async fn luma_poll_failed_state_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { .. }),
         "expected ProviderError from failed poll, got: {err:?}",
@@ -341,7 +313,7 @@ async fn luma_poll_http_error_maps_to_provider_error() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let err = adapter.execute(&config, &request).await.unwrap_err();
+    let err = adapter.generate_video(&config, &request).await.unwrap_err();
     assert!(
         matches!(err, GatewayError::ProviderError { .. }),
         "expected ProviderError from failed poll HTTP status, got: {err:?}",
@@ -349,11 +321,11 @@ async fn luma_poll_http_error_maps_to_provider_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Completed but no video asset -> success with a None url
+// Completed but no video asset -> a result with a None url
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn luma_execute_completed_without_assets_returns_none_url() {
+async fn luma_generate_video_completed_without_assets_returns_none_url() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -380,54 +352,12 @@ async fn luma_execute_completed_without_assets_returns_none_url() {
     let config = router_config(&server.uri());
     let request = video_request();
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    let videos = response.videos.expect("expected a videos vec");
+    let response = adapter.generate_video(&config, &request).await.unwrap();
+    let videos = response.videos;
     assert_eq!(videos.len(), 1);
     assert!(
         videos[0].url.is_none(),
         "expected no url when assets are absent, got: {:?}",
         videos[0].url,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Wrong payload type -> early return before any HTTP call
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn luma_wrong_payload_returns_provider_error() {
-    let server = MockServer::start().await;
-
-    // No mocks mounted: the adapter must return before making any HTTP call.
-    let adapter = LumaAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = chat_request();
-
-    let err = adapter.execute(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError for wrong payload, got: {err:?}",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// stream() is unsupported
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn luma_stream_returns_error() {
-    let server = MockServer::start().await;
-
-    let adapter = LumaAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let result = adapter.stream(&config, &request).await;
-    assert!(result.is_err(), "luma stream() must return an error");
-    let err = result.err().unwrap();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from stream(), got: {err:?}",
     );
 }

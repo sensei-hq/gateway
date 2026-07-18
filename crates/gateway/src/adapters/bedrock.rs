@@ -38,15 +38,13 @@ use aws_smithy_types::{Blob, Document, Number};
 use base64::Engine;
 use futures::Stream;
 
-use crate::adapters::InferenceAdapter;
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
 use crate::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
 use crate::types::request::{
-    InferenceRequest, InferenceResponse, MediaAttachment, MediaSource, Message as GwMessage,
-    MessageContent, MessageRole, Payload, StreamChunk, StreamingToolCall, ToolCall, ToolDefinition,
+    MediaAttachment, MediaSource, Message as GwMessage, MessageContent, MessageRole, StreamChunk,
+    StreamingToolCall, ToolCall, ToolDefinition,
 };
 
 const ADAPTER_ID: &str = "bedrock";
@@ -97,201 +95,7 @@ impl BedrockAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for BedrockAdapter {
-    fn id(&self) -> &str {
-        ADAPTER_ID
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::TextChat | Capability::TextEmbed)
-    }
-
-    async fn execute(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        match &request.payload {
-            Payload::Chat { .. } => self.execute_chat(request).await,
-            Payload::Embed { texts } => self.execute_embed(request, texts).await,
-            _ => Err(Self::err(
-                "BedrockAdapter only supports Payload::Chat and Payload::Embed",
-                None,
-            )),
-        }
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools,
-        } = &request.payload
-        else {
-            return Err(Self::err(
-                "Bedrock streaming is only supported for Payload::Chat",
-                None,
-            ));
-        };
-
-        let model_id = resolve_model(request);
-        let bedrock_messages = build_messages(messages)?;
-        let system_blocks = build_system(messages, system);
-
-        let inference_cfg = InferenceConfiguration::builder()
-            .max_tokens(max_tokens.map(|n| n as i32).unwrap_or(DEFAULT_MAX_TOKENS))
-            .set_temperature(*temperature)
-            .build();
-
-        let mut builder = self
-            .client
-            .converse_stream()
-            .model_id(model_id)
-            .inference_config(inference_cfg);
-        for m in bedrock_messages {
-            builder = builder.messages(m);
-        }
-        for s in system_blocks {
-            builder = builder.system(s);
-        }
-        if let Some(cfg) = build_tool_config(tools) {
-            builder = builder.tool_config(cfg);
-        }
-
-        let output = builder.send().await.map_err(map_sdk_error)?;
-
-        Ok(Box::pin(into_stream_chunks(output)))
-    }
-}
-
 impl BedrockAdapter {
-    async fn execute_chat(
-        &self,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools,
-        } = &request.payload
-        else {
-            unreachable!("execute_chat called with non-Chat payload");
-        };
-
-        let model_id = resolve_model(request);
-        let bedrock_messages = build_messages(messages)?;
-        let system_blocks = build_system(messages, system);
-
-        let inference_cfg = InferenceConfiguration::builder()
-            .max_tokens(max_tokens.map(|n| n as i32).unwrap_or(DEFAULT_MAX_TOKENS))
-            .set_temperature(*temperature)
-            .build();
-
-        let mut builder = self
-            .client
-            .converse()
-            .model_id(model_id.clone())
-            .inference_config(inference_cfg);
-        for m in bedrock_messages {
-            builder = builder.messages(m);
-        }
-        for s in system_blocks {
-            builder = builder.system(s);
-        }
-        if let Some(cfg) = build_tool_config(tools) {
-            builder = builder.tool_config(cfg);
-        }
-
-        let response = builder.send().await.map_err(map_sdk_error)?;
-
-        let content = extract_text(&response);
-        let tool_calls = extract_tool_calls(&response);
-        let usage = response.usage.as_ref().map(|u| TokenUsage {
-            input_tokens: u.input_tokens.max(0) as u32,
-            output_tokens: u.output_tokens.max(0) as u32,
-            total_tokens: u.total_tokens.max(0) as u32,
-        });
-
-        Ok(InferenceResponse {
-            success: true,
-            content: if content.is_empty() {
-                None
-            } else {
-                Some(content)
-            },
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: None,
-            videos: None,
-            model: Some(model_id),
-            usage,
-            tool_calls,
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
-    /// Dispatch a [`Payload::Embed`] request to the right per-family
-    /// wire format. Bedrock embedding models don't share a request
-    /// shape — Titan accepts one string per call (so we loop) and
-    /// Cohere accepts a batch.
-    async fn execute_embed(
-        &self,
-        request: &InferenceRequest,
-        texts: &[String],
-    ) -> Result<InferenceResponse, GatewayError> {
-        let model_id = resolve_embed_model(request);
-        let family = embed_family(&model_id).ok_or_else(|| {
-            Self::err(
-                format!("model id '{model_id}' is not a recognised Bedrock embedding model"),
-                None,
-            )
-        })?;
-
-        if texts.is_empty() {
-            return Ok(empty_embed_response(model_id));
-        }
-
-        let (embeddings, input_tokens) = match family {
-            EmbedFamily::Titan => self.invoke_titan_embed(&model_id, texts).await?,
-            EmbedFamily::Cohere => self.invoke_cohere_embed(&model_id, texts).await?,
-        };
-
-        let usage = input_tokens.map(|n| TokenUsage {
-            input_tokens: n,
-            output_tokens: 0,
-            total_tokens: n,
-        });
-
-        Ok(InferenceResponse {
-            success: true,
-            content: None,
-            embeddings: Some(embeddings),
-            transcription: None,
-            audio: None,
-            images: None,
-            videos: None,
-            model: Some(model_id),
-            usage,
-            tool_calls: Vec::new(),
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
     /// Invoke a Titan text-embedding model. Titan accepts a single
     /// `inputText` per call; we loop over the input slice and
     /// accumulate the per-call token counts.
@@ -362,8 +166,7 @@ impl BedrockAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge.
+// Capability traits (target model). Traits + RegisterInto referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for BedrockAdapter {
@@ -440,7 +243,7 @@ impl crate::adapters::capability::ChatModel for BedrockAdapter {
         req: &ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
     {
-        // Real Converse streaming — mirrors the InferenceAdapter::stream
+        // Real Converse streaming — mirrors the non-streaming path
         // path, reading from the typed `req` instead of Payload::Chat.
         let model_id = req
             .model
@@ -521,7 +324,7 @@ impl crate::adapters::capability::EmbedModel for BedrockAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for BedrockAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -677,20 +480,6 @@ fn chunk_from_event(
 // Pure helpers (unit-testable without an SDK client)
 // ---------------------------------------------------------------------------
 
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-}
-
-fn resolve_embed_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string())
-}
-
 /// Embedding-model families on Bedrock with materially different
 /// request/response wire shapes. Anything else is rejected up front in
 /// [`BedrockAdapter::execute_embed`].
@@ -713,27 +502,6 @@ fn embed_family(model_id: &str) -> Option<EmbedFamily> {
         Some(EmbedFamily::Cohere)
     } else {
         None
-    }
-}
-
-/// Build the [`InferenceResponse`] for an embedding request whose
-/// input slice was empty. Mirrors what other embed adapters do —
-/// no SDK call, just an empty vector and zero usage.
-fn empty_embed_response(model_id: String) -> InferenceResponse {
-    InferenceResponse {
-        success: true,
-        content: None,
-        embeddings: Some(Vec::new()),
-        transcription: None,
-        audio: None,
-        images: None,
-        videos: None,
-        model: Some(model_id),
-        usage: None,
-        tool_calls: Vec::new(),
-        estimated_cost: None,
-        actual_cost: None,
-        attempts: vec![],
     }
 }
 
@@ -1142,34 +910,6 @@ mod tests {
         GwMessage::text(MessageRole::System, content)
     }
 
-    fn empty_request(model: Option<&str>) -> InferenceRequest {
-        InferenceRequest {
-            capability: Capability::TextChat,
-            model: model.map(|s| s.to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![user("hi")],
-                system: None,
-                max_tokens: None,
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
-        }
-    }
-
-    #[test]
-    fn resolve_model_falls_back_to_default_when_absent() {
-        assert_eq!(resolve_model(&empty_request(None)), DEFAULT_MODEL);
-    }
-
-    #[test]
-    fn resolve_model_respects_request_override() {
-        let req = empty_request(Some("meta.llama3-1-70b-instruct-v1:0"));
-        assert_eq!(resolve_model(&req), "meta.llama3-1-70b-instruct-v1:0");
-    }
-
     #[test]
     fn role_to_bedrock_maps_user_and_assistant_and_drops_system() {
         assert!(matches!(
@@ -1557,32 +1297,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_embed_model_falls_back_to_default_when_absent() {
-        let req = InferenceRequest {
-            capability: Capability::TextEmbed,
-            model: None,
-            router: None,
-            chain: None,
-            payload: Payload::Embed { texts: vec![] },
-            budget: None,
-        };
-        assert_eq!(resolve_embed_model(&req), DEFAULT_EMBED_MODEL);
-    }
-
-    #[test]
-    fn resolve_embed_model_respects_request_override() {
-        let req = InferenceRequest {
-            capability: Capability::TextEmbed,
-            model: Some("cohere.embed-english-v3".into()),
-            router: None,
-            chain: None,
-            payload: Payload::Embed { texts: vec![] },
-            budget: None,
-        };
-        assert_eq!(resolve_embed_model(&req), "cohere.embed-english-v3");
-    }
-
-    #[test]
     fn titan_request_serialises_with_camel_case_input_text() {
         let body = TitanEmbedRequest {
             input_text: "hello world",
@@ -1630,16 +1344,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_embed_response_returns_empty_vec_with_zero_usage() {
-        let resp = empty_embed_response("amazon.titan-embed-text-v2:0".into());
-        assert!(resp.success);
-        assert_eq!(resp.embeddings, Some(Vec::new()));
-        assert_eq!(resp.model.as_deref(), Some("amazon.titan-embed-text-v2:0"));
-        assert!(resp.usage.is_none());
-        assert!(resp.tool_calls.is_empty());
-    }
-
-    #[test]
     fn bedrock_supports_text_chat_and_embed() {
         // We don't construct the SDK client (would require AWS creds);
         // call `supports` directly via a manually-built adapter.
@@ -1656,7 +1360,7 @@ mod tests {
         // credentials lazily at request time — so building the client is
         // offline-safe (no AWS creds or network needed here).
         let adapter = BedrockAdapter::with_region("us-east-1").await.unwrap();
-        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // Reference `Model::id` by full path
         // and the capability `Model` trait.
         assert_eq!(crate::adapters::capability::Model::id(&adapter), "bedrock");
     }

@@ -6,16 +6,12 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, http_json, resolve_api_key};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
 use crate::types::io::{ChatRequest, ChatResponse, SttRequest, SttResponse, TtsResponse};
-use crate::types::request::{
-    InferenceRequest, InferenceResponse, Message, MessageRole, Payload, StreamChunk,
-};
+use crate::types::request::{Message, MessageRole, StreamChunk};
 
 // ---------------------------------------------------------------------------
 // Wire types — Grok chat request/response structs (OpenAI-compatible)
@@ -114,10 +110,6 @@ fn role_to_string(role: &MessageRole) -> &'static str {
     }
 }
 
-fn resolve_model(request: &InferenceRequest, default: &str) -> String {
-    request.model.clone().unwrap_or_else(|| default.to_string())
-}
-
 fn build_chat_messages(messages: &[Message], system: &Option<String>) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(sys) = system {
@@ -184,369 +176,8 @@ impl GrokAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for GrokAdapter {
-    fn id(&self) -> &str {
-        "grok"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(
-            capability,
-            Capability::TextChat | Capability::AudioTranscribe | Capability::AudioGenerate
-        )
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let api_key = require_api_key(config)?;
-
-        match &request.payload {
-            Payload::Chat {
-                messages,
-                system,
-                max_tokens,
-                temperature,
-                tools: _,
-            } => {
-                let model = resolve_model(request, DEFAULT_CHAT_MODEL);
-
-                let body = ChatCompletionRequest {
-                    model: model.clone(),
-                    messages: build_chat_messages(messages, system),
-                    max_tokens: *max_tokens,
-                    temperature: *temperature,
-                    stream: false,
-                };
-
-                let resp: ChatCompletionResponse = http_json(
-                    &self.client,
-                    &config.url,
-                    "/v1/chat/completions",
-                    &body,
-                    Some(&api_key),
-                    &config.headers,
-                )
-                .await?;
-
-                let content = resp.choices.first().and_then(|c| c.message.content.clone());
-                let usage = usage_from_response(&resp.usage);
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content,
-                    embeddings: None,
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::Stt {
-                audio,
-                language,
-                format,
-            } => {
-                let model = resolve_model(request, DEFAULT_AUDIO_MODEL);
-
-                let mime = match format.as_str() {
-                    "mp3" => "audio/mpeg",
-                    "wav" => "audio/wav",
-                    "webm" => "audio/webm",
-                    "m4a" => "audio/mp4",
-                    other => {
-                        return Err(GatewayError::ProviderError {
-                            adapter: "grok".into(),
-                            message: format!("unsupported audio format: {other}"),
-                            status: None,
-                        });
-                    }
-                };
-
-                let file_part = reqwest::multipart::Part::bytes(audio.clone())
-                    .file_name(format!("audio.{format}"))
-                    .mime_str(mime)
-                    .map_err(|e| GatewayError::ProviderError {
-                        adapter: "grok".into(),
-                        message: format!("failed to build multipart: {e}"),
-                        status: None,
-                    })?;
-
-                let mut form = reqwest::multipart::Form::new()
-                    .part("file", file_part)
-                    .text("model", model.clone());
-
-                if let Some(lang) = language {
-                    form = form.text("language", lang.clone());
-                }
-
-                let url = format!(
-                    "{}/v1/audio/transcriptions",
-                    config.url.trim_end_matches('/')
-                );
-                let mut req = self.client.post(&url).multipart(form).bearer_auth(&api_key);
-
-                for (k, v) in &config.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-
-                let response = req.send().await?;
-                let status = response.status();
-
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(match status.as_u16() {
-                        401 | 403 => GatewayError::Authentication {
-                            adapter: "grok".into(),
-                            message: body_text,
-                        },
-                        429 => GatewayError::RateLimit {
-                            adapter: "grok".into(),
-                            retry_after_ms: None,
-                        },
-                        _ => GatewayError::ProviderError {
-                            adapter: "grok".into(),
-                            message: body_text,
-                            status: Some(status.as_u16()),
-                        },
-                    });
-                }
-
-                let whisper_resp: WhisperResponse =
-                    response
-                        .json()
-                        .await
-                        .map_err(|e| GatewayError::ProviderError {
-                            adapter: "grok".into(),
-                            message: format!("failed to parse whisper response: {e}"),
-                            status: Some(status.as_u16()),
-                        })?;
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: None,
-                    transcription: Some(whisper_resp.text),
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::Tts {
-                text,
-                voice,
-                output_format,
-                ..
-            } => {
-                let model = resolve_model(request, DEFAULT_AUDIO_MODEL);
-
-                let body = TtsRequest {
-                    model: model.clone(),
-                    input: text.clone(),
-                    voice: voice.clone().unwrap_or_else(|| DEFAULT_VOICE.to_string()),
-                    response_format: output_format.to_string(),
-                };
-
-                let url = format!("{}/v1/audio/speech", config.url.trim_end_matches('/'));
-                let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-                for (k, v) in &config.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-
-                let response = req.send().await?;
-                let status = response.status();
-
-                if !status.is_success() {
-                    let body_text = response.text().await.unwrap_or_default();
-                    return Err(match status.as_u16() {
-                        401 | 403 => GatewayError::Authentication {
-                            adapter: "grok".into(),
-                            message: body_text,
-                        },
-                        429 => GatewayError::RateLimit {
-                            adapter: "grok".into(),
-                            retry_after_ms: None,
-                        },
-                        _ => GatewayError::ProviderError {
-                            adapter: "grok".into(),
-                            message: body_text,
-                            status: Some(status.as_u16()),
-                        },
-                    });
-                }
-
-                let audio_bytes =
-                    response
-                        .bytes()
-                        .await
-                        .map_err(|e| GatewayError::ProviderError {
-                            adapter: "grok".into(),
-                            message: format!("failed to read TTS audio bytes: {e}"),
-                            status: None,
-                        })?;
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: None,
-                    transcription: None,
-                    audio: Some(audio_bytes.to_vec()),
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage: None,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::Embed { .. } => Err(GatewayError::ProviderError {
-                adapter: "grok".into(),
-                message: "xAI does not offer an embeddings API".into(),
-                status: None,
-            }),
-            Payload::ImageGenerate { .. } => Err(GatewayError::ProviderError {
-                adapter: "grok".into(),
-                message: "xAI does not offer an image generation API".into(),
-                status: None,
-            }),
-            Payload::VideoGenerate { .. } => Err(GatewayError::ProviderError {
-                adapter: "grok".into(),
-                message: "xAI does not offer a video generation API".into(),
-                status: None,
-            }),
-        }
-    }
-
-    async fn stream(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools: _,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "grok".into(),
-                message: "streaming is only supported for chat payloads".into(),
-                status: None,
-            });
-        };
-
-        let api_key = require_api_key(config)?;
-        let model = resolve_model(request, DEFAULT_CHAT_MODEL);
-
-        let body = ChatCompletionRequest {
-            model,
-            messages: build_chat_messages(messages, system),
-            max_tokens: *max_tokens,
-            temperature: *temperature,
-            stream: true,
-        };
-
-        let url = format!("{}/v1/chat/completions", config.url.trim_end_matches('/'));
-        let mut req = self.client.post(&url).json(&body).bearer_auth(&api_key);
-
-        for (k, v) in &config.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let response = req.send().await?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "grok".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "grok".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "grok".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let byte_stream = response.bytes_stream();
-
-        let stream = byte_stream
-            .map(|result| -> Result<Vec<StreamChunk>, GatewayError> {
-                let bytes = result?;
-                let text = String::from_utf8_lossy(&bytes);
-                let mut chunks = Vec::new();
-
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line == "data: [DONE]" {
-                        continue;
-                    }
-                    let json_str = line.strip_prefix("data: ").unwrap_or(line);
-                    if let Ok(parsed) = serde_json::from_str::<StreamChatResponse>(json_str)
-                        && let Some(choice) = parsed.choices.first()
-                    {
-                        let content = choice.delta.content.clone().unwrap_or_default();
-                        let usage = usage_from_response(&parsed.usage);
-                        chunks.push(StreamChunk {
-                            content,
-                            finish_reason: choice.finish_reason.clone(),
-                            usage,
-                            tool_calls: Vec::new(),
-                        });
-                    }
-                }
-
-                Ok(chunks)
-            })
-            .map(
-                |result| -> futures::stream::Iter<
-                    std::vec::IntoIter<Result<StreamChunk, GatewayError>>,
-                > {
-                    match result {
-                        Ok(chunks) => {
-                            futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
-                        }
-                        Err(e) => futures::stream::iter(vec![Err(e)]),
-                    }
-                },
-            )
-            .flatten();
-
-        Ok(Box::pin(stream))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge. The io
+// Capability traits (target model). Traits + RegisterInto referenced by full path. The io
 // `TtsRequest` is full-pathed in `speak` too — it collides with the local Grok
 // TTS wire struct of the same name, so the unqualified `TtsRequest` in the body
 // keeps resolving to the wire struct.
@@ -859,7 +490,7 @@ impl crate::adapters::capability::TtsModel for GrokAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for GrokAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_stt(self.clone()).await;
         reg.register_tts(self).await;
@@ -877,18 +508,11 @@ mod tests {
     #[test]
     fn grok_id_and_supports() {
         let adapter = GrokAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "grok");
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "grok");
 
         // Supported capabilities
-        assert!(adapter.supports(&Capability::TextChat));
-        assert!(adapter.supports(&Capability::AudioTranscribe));
-        assert!(adapter.supports(&Capability::AudioGenerate));
 
         // NOT supported
-        assert!(!adapter.supports(&Capability::TextEmbed));
-        assert!(!adapter.supports(&Capability::ImageGenerate));
-        assert!(!adapter.supports(&Capability::VideoGenerate));
-        assert!(!adapter.supports(&Capability::TextComplete));
     }
 
     #[test]
@@ -1015,44 +639,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_api_key_returns_auth_error() {
-        let adapter = GrokAdapter::new().unwrap();
-        let config = RouterConfig {
-            url: "https://api.x.ai".to_string(),
-            api_key_env: Some("__NONEXISTENT_XAI_KEY_FOR_TEST__".to_string()),
-            api_key: None,
-            enabled: true,
-            timeout_ms: None,
-            headers: std::collections::HashMap::new(),
-        };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
-            model: Some("grok-4-fast".to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "Hello".to_string())],
-                system: None,
-                max_tokens: Some(64),
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
-        };
-
-        let result = adapter.execute(&config, &request).await;
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, GatewayError::Authentication { .. }),
-            "expected Authentication error, got: {err:?}",
-        );
-    }
-
-    #[tokio::test]
     #[ignore]
     async fn grok_chat_integration() {
+        use crate::adapters::capability::ChatModel;
         // Requires XAI_API_KEY env var
         let adapter = GrokAdapter::new().unwrap();
         let config = RouterConfig {
@@ -1063,26 +652,19 @@ mod tests {
             timeout_ms: Some(30000),
             headers: std::collections::HashMap::new(),
         };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
+        let req = crate::types::io::ChatRequest {
             model: Some("grok-4-fast".to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(
-                    MessageRole::User,
-                    "Say hello in one sentence.".to_string(),
-                )],
-                system: None,
-                max_tokens: Some(64),
-                temperature: Some(0.3),
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(
+                MessageRole::User,
+                "Say hello in one sentence.".to_string(),
+            )],
+            system: None,
+            max_tokens: Some(64),
+            temperature: Some(0.3),
+            tools: Vec::new(),
         };
 
-        let response = adapter.execute(&config, &request).await.unwrap();
-        assert!(response.success);
+        let response = adapter.chat(&config, &req).await.unwrap();
         assert!(response.content.is_some());
         assert!(!response.content.unwrap().is_empty());
         assert!(response.usage.is_some());

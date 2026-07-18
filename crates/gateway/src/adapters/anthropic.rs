@@ -7,16 +7,14 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, resolve_api_key};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
 use crate::types::io::{ChatRequest, ChatResponse};
 use crate::types::request::{
-    InferenceRequest, InferenceResponse, MediaAttachment, MediaSource, Message, MessageContent,
-    MessageRole, Payload, StreamChunk, StreamingToolCall, ToolCall, ToolDefinition,
+    MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamChunk,
+    StreamingToolCall, ToolCall, ToolDefinition,
 };
 
 // ---------------------------------------------------------------------------
@@ -193,13 +191,6 @@ struct StreamDelta {
 const DEFAULT_MODEL: &str = "claude-haiku-4-5-20250414";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 1024;
-
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-}
 
 /// Extract system prompt from:
 /// 1. The explicit `system` field on the Chat payload
@@ -414,229 +405,6 @@ impl AnthropicAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for AnthropicAdapter {
-    fn id(&self) -> &str {
-        "anthropic"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(capability, Capability::TextChat)
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "anthropic".into(),
-                message: "Anthropic only supports chat payloads".into(),
-                status: None,
-            });
-        };
-
-        let api_key = resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
-            adapter: "anthropic".into(),
-            message: "missing API key — set the env var specified in api_key_env".into(),
-        })?;
-
-        let model = resolve_model(request);
-        let extracted_system = extract_system(messages, system);
-
-        let body = AnthropicRequest {
-            model: model.clone(),
-            messages: build_messages(messages),
-            max_tokens: max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            system: extracted_system,
-            temperature: *temperature,
-            stream: false,
-            tools: build_tools(tools),
-        };
-
-        let url = format!("{}/v1/messages", config.url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "anthropic".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let anthropic_resp: AnthropicResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "anthropic".into(),
-                message: format!("failed to parse response: {}", e),
-                status: Some(status.as_u16()),
-            })?;
-
-        let content = extract_text(&anthropic_resp.content);
-        let tool_calls = extract_tool_calls(&anthropic_resp.content);
-        let usage = usage_from_anthropic(&anthropic_resp.usage);
-
-        Ok(InferenceResponse {
-            success: true,
-            content: if content.is_empty() {
-                None
-            } else {
-                Some(content)
-            },
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: None,
-            videos: None,
-            model: Some(model),
-            tool_calls,
-            usage: Some(usage),
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
-    async fn stream(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools: _,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "anthropic".into(),
-                message: "streaming is only supported for chat payloads".into(),
-                status: None,
-            });
-        };
-
-        let api_key = resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
-            adapter: "anthropic".into(),
-            message: "missing API key — set the env var specified in api_key_env".into(),
-        })?;
-
-        let model = resolve_model(request);
-        let extracted_system = extract_system(messages, system);
-
-        let body = AnthropicRequest {
-            model,
-            messages: build_messages(messages),
-            max_tokens: max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            system: extracted_system,
-            temperature: *temperature,
-            stream: true,
-            // Streaming + tool calling is deferred — Anthropic emits
-            // `input_json_delta` events for tool arguments that need
-            // accumulation in the stream layer. v1 ships tools through
-            // execute() only.
-            tools: Vec::new(),
-        };
-
-        let url = format!("{}/v1/messages", config.url.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = response.status();
-
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "anthropic".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
-        }
-
-        let byte_stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(response.bytes_stream());
-        let initial = AnthropicStreamState {
-            byte_stream,
-            line_buf: String::new(),
-            tool_calls: BTreeMap::new(),
-            pending: VecDeque::new(),
-            eof: false,
-        };
-
-        let stream = futures::stream::unfold(initial, |mut state| async move {
-            loop {
-                if let Some(item) = state.pending.pop_front() {
-                    return Some((item, state));
-                }
-                if state.eof {
-                    return None;
-                }
-                match state.byte_stream.next().await {
-                    Some(Ok(bytes)) => process_stream_bytes(&mut state, &bytes),
-                    Some(Err(e)) => {
-                        state.pending.push_back(Err(GatewayError::ProviderError {
-                            adapter: "anthropic".into(),
-                            message: format!("anthropic stream error: {e}"),
-                            status: None,
-                        }));
-                        state.eof = true;
-                    }
-                    None => state.eof = true,
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
-    }
-}
-
 /// Persistent state for the Anthropic SSE stream pipeline. Lives
 /// across HTTP byte chunks so that:
 ///
@@ -772,8 +540,7 @@ fn process_sse_line(state: &mut AnthropicStreamState, line: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge. The
+// Capability traits (target model). Traits + RegisterInto referenced by full path. The
 // SSE pipeline (process_stream_bytes / process_sse_line / AnthropicStreamState)
 // is shared verbatim with the legacy stream() method above.
 // ---------------------------------------------------------------------------
@@ -968,7 +735,7 @@ impl crate::adapters::capability::ChatModel for AnthropicAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for AnthropicAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self).await;
     }
 }
@@ -984,21 +751,16 @@ mod tests {
     #[test]
     fn anthropic_id_and_supports() {
         let adapter = AnthropicAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "anthropic");
-
-        assert!(adapter.supports(&Capability::TextChat));
-
-        assert!(!adapter.supports(&Capability::TextEmbed));
-        assert!(!adapter.supports(&Capability::TextComplete));
-        assert!(!adapter.supports(&Capability::AudioTranscribe));
-        assert!(!adapter.supports(&Capability::AudioGenerate));
-        assert!(!adapter.supports(&Capability::ImageGenerate));
+        assert_eq!(
+            crate::adapters::capability::Model::id(&adapter),
+            "anthropic"
+        );
     }
 
     #[test]
     fn anthropic_capability_model_id() {
         let adapter = AnthropicAdapter::new().unwrap();
-        // Full path avoids the id() ambiguity between InferenceAdapter and
+        // Reference `Model::id` by full path
         // the capability Model trait.
         assert_eq!(
             crate::adapters::capability::Model::id(&adapter),
@@ -1573,6 +1335,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn anthropic_chat_integration() {
+        use crate::adapters::capability::ChatModel;
         // Requires ANTHROPIC_API_KEY env var
         let adapter = AnthropicAdapter::new().unwrap();
         let config = RouterConfig {
@@ -1583,26 +1346,19 @@ mod tests {
             timeout_ms: Some(30000),
             headers: std::collections::HashMap::new(),
         };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
+        let req = crate::types::io::ChatRequest {
             model: Some("claude-haiku-4-5-20250414".to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(
-                    MessageRole::User,
-                    "Say hello in one sentence.",
-                )],
-                system: None,
-                max_tokens: Some(64),
-                temperature: Some(0.3),
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(
+                MessageRole::User,
+                "Say hello in one sentence.",
+            )],
+            system: None,
+            max_tokens: Some(64),
+            temperature: Some(0.3),
+            tools: Vec::new(),
         };
 
-        let response = adapter.execute(&config, &request).await.unwrap();
-        assert!(response.success);
+        let response = adapter.chat(&config, &req).await.unwrap();
         assert!(response.content.is_some());
         assert!(!response.content.unwrap().is_empty());
         assert!(response.usage.is_some());

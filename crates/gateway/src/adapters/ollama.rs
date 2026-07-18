@@ -6,16 +6,12 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, http_json, resolve_api_key};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::cost::TokenUsage;
 use crate::types::error::GatewayError;
 use crate::types::io::{ChatRequest, ChatResponse};
-use crate::types::request::{
-    InferenceRequest, InferenceResponse, Message, MessageRole, Payload, StreamChunk,
-};
+use crate::types::request::{Message, MessageRole, StreamChunk};
 
 // ---------------------------------------------------------------------------
 // Wire types — OpenAI-compatible request/response structs
@@ -112,13 +108,6 @@ fn role_to_string(role: &MessageRole) -> &'static str {
     }
 }
 
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-}
-
 fn build_chat_messages(messages: &[Message], system: &Option<String>) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(sys) = system {
@@ -189,221 +178,8 @@ impl OllamaAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for OllamaAdapter {
-    fn id(&self) -> &str {
-        "ollama"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(
-            capability,
-            Capability::TextChat | Capability::TextComplete | Capability::TextEmbed
-        )
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let api_key = resolve_api_key(config);
-        let model = resolve_model(request);
-
-        match &request.payload {
-            Payload::Chat {
-                messages,
-                system,
-                max_tokens,
-                temperature,
-                tools: _,
-            } => {
-                let body = ChatCompletionRequest {
-                    model: model.clone(),
-                    messages: build_chat_messages(messages, system),
-                    max_tokens: *max_tokens,
-                    temperature: *temperature,
-                    stream: false,
-                };
-
-                let resp: ChatCompletionResponse = http_json(
-                    &self.client,
-                    &config.url,
-                    "/v1/chat/completions",
-                    &body,
-                    api_key.as_deref(),
-                    &config.headers,
-                )
-                .await?;
-
-                let content = resp.choices.first().and_then(|c| c.message.content.clone());
-                let usage = usage_from_response(&resp.usage);
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content,
-                    embeddings: None,
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            Payload::Embed { texts } => {
-                let body = EmbedRequest {
-                    model: model.clone(),
-                    input: texts.clone(),
-                };
-
-                let resp: EmbedResponse = http_json(
-                    &self.client,
-                    &config.url,
-                    "/v1/embeddings",
-                    &body,
-                    api_key.as_deref(),
-                    &config.headers,
-                )
-                .await?;
-
-                let embeddings: Vec<Vec<f32>> =
-                    resp.data.into_iter().map(|d| d.embedding).collect();
-                let usage = usage_from_response(&resp.usage);
-
-                Ok(InferenceResponse {
-                    success: true,
-                    content: None,
-                    embeddings: Some(embeddings),
-                    transcription: None,
-                    audio: None,
-                    images: None,
-                    videos: None,
-                    model: Some(model),
-                    usage,
-                    tool_calls: Vec::new(),
-                    estimated_cost: None,
-                    actual_cost: None,
-                    attempts: vec![],
-                })
-            }
-            _ => Err(GatewayError::ProviderError {
-                adapter: "ollama".into(),
-                message: "Ollama only supports chat and embed payloads".into(),
-                status: None,
-            }),
-        }
-    }
-
-    async fn stream(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let Payload::Chat {
-            messages,
-            system,
-            max_tokens,
-            temperature,
-            tools: _,
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "ollama".into(),
-                message: "streaming is only supported for chat payloads".into(),
-                status: None,
-            });
-        };
-
-        let api_key = resolve_api_key(config);
-        let model = resolve_model(request);
-
-        let body = ChatCompletionRequest {
-            model,
-            messages: build_chat_messages(messages, system),
-            max_tokens: *max_tokens,
-            temperature: *temperature,
-            stream: true,
-        };
-
-        let url = format!("{}/v1/chat/completions", config.url.trim_end_matches('/'));
-        let mut req = self.client.post(&url).json(&body);
-
-        if let Some(key) = &api_key {
-            req = req.bearer_auth(key);
-        }
-        for (k, v) in &config.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let response = req.send().await?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(GatewayError::ProviderError {
-                adapter: "ollama".into(),
-                message: body_text,
-                status: Some(status.as_u16()),
-            });
-        }
-
-        let byte_stream = response.bytes_stream();
-
-        let stream = byte_stream
-            .map(|result| -> Result<Vec<StreamChunk>, GatewayError> {
-                let bytes = result?;
-                let text = String::from_utf8_lossy(&bytes);
-                let mut chunks = Vec::new();
-
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line == "data: [DONE]" {
-                        continue;
-                    }
-                    let json_str = line.strip_prefix("data: ").unwrap_or(line);
-                    if let Ok(parsed) = serde_json::from_str::<StreamChatResponse>(json_str)
-                        && let Some(choice) = parsed.choices.first()
-                    {
-                        let content = choice.delta.content.clone().unwrap_or_default();
-                        let usage = usage_from_response(&parsed.usage);
-                        chunks.push(StreamChunk {
-                            content,
-                            finish_reason: choice.finish_reason.clone(),
-                            usage,
-                            tool_calls: Vec::new(),
-                        });
-                    }
-                }
-
-                Ok(chunks)
-            })
-            .map(
-                |result| -> futures::stream::Iter<
-                    std::vec::IntoIter<Result<StreamChunk, GatewayError>>,
-                > {
-                    match result {
-                        Ok(chunks) => {
-                            futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
-                        }
-                        Err(e) => futures::stream::iter(vec![Err(e)]),
-                    }
-                },
-            )
-            .flatten();
-
-        Ok(Box::pin(stream))
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model). Traits + RegisterInto referenced by full
-// path to avoid the id() clash with InferenceAdapter during the bridge.
+// Capability traits (target model). Traits + RegisterInto referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for OllamaAdapter {
@@ -572,7 +348,7 @@ impl crate::adapters::capability::EmbedModel for OllamaAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for OllamaAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -627,16 +403,7 @@ mod tests {
     #[test]
     fn ollama_id_and_supports() {
         let adapter = OllamaAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "ollama");
-
-        assert!(adapter.supports(&Capability::TextChat));
-        assert!(adapter.supports(&Capability::TextComplete));
-        assert!(adapter.supports(&Capability::TextEmbed));
-
-        assert!(!adapter.supports(&Capability::AudioTranscribe));
-        assert!(!adapter.supports(&Capability::AudioGenerate));
-        assert!(!adapter.supports(&Capability::ImageGenerate));
-        assert!(!adapter.supports(&Capability::VideoGenerate));
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "ollama");
     }
 
     #[test]
@@ -731,6 +498,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn ollama_chat_integration() {
+        use crate::adapters::capability::ChatModel;
         let adapter = OllamaAdapter::new().unwrap();
         let config = RouterConfig {
             url: "http://localhost:11434".to_string(),
@@ -740,32 +508,26 @@ mod tests {
             timeout_ms: Some(60000),
             headers: std::collections::HashMap::new(),
         };
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
+        let req = crate::types::io::ChatRequest {
             model: Some("llama3.2:latest".to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(
-                    MessageRole::User,
-                    "Say hello in one sentence.".to_string(),
-                )],
-                system: None,
-                max_tokens: Some(64),
-                temperature: Some(0.3),
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(
+                MessageRole::User,
+                "Say hello in one sentence.".to_string(),
+            )],
+            system: None,
+            max_tokens: Some(64),
+            temperature: Some(0.3),
+            tools: Vec::new(),
         };
 
-        let response = adapter.execute(&config, &request).await.unwrap();
-        assert!(response.success);
+        let response = adapter.chat(&config, &req).await.unwrap();
         assert!(response.content.is_some());
         assert!(!response.content.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn execute_times_out_against_a_silent_server() {
+    async fn embed_times_out_against_a_silent_server() {
+        use crate::adapters::capability::EmbedModel;
         // A server that accepts the connection but never sends a response. A
         // no-timeout client (the old Client::new()) would hang here forever and
         // wedge the worker; with a per-request timeout the call must return an
@@ -790,19 +552,13 @@ mod tests {
             headers: std::collections::HashMap::new(),
         };
         let adapter = OllamaAdapter::from_config(&config).unwrap();
-        let request = InferenceRequest {
-            capability: Capability::TextEmbed,
+        let req = crate::types::io::EmbedRequest {
             model: Some("all-minilm".to_string()),
-            router: None,
-            chain: None,
-            payload: Payload::Embed {
-                texts: vec!["hello".to_string()],
-            },
-            budget: None,
+            texts: vec!["hello".to_string()],
         };
 
         let start = std::time::Instant::now();
-        let result = adapter.execute(&config, &request).await;
+        let result = adapter.embed(&config, &req).await;
         let elapsed = start.elapsed();
         assert!(
             result.is_err(),

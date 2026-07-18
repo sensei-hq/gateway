@@ -1,20 +1,13 @@
-use std::pin::Pin;
-
 use async_trait::async_trait;
-use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, resolve_api_key};
 use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
 use crate::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
-use crate::types::request::{
-    ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk, VideoResult,
-};
+use crate::types::request::{ImageResult, VideoResult};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -80,13 +73,6 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
     })
 }
 
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-}
-
 fn base_url(config: &RouterConfig) -> &str {
     let url = config.url.trim_end_matches('/');
     if url.is_empty() { BASE_URL } else { url }
@@ -117,319 +103,9 @@ impl FalAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for FalAdapter {
-    fn id(&self) -> &str {
-        "fal"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(
-            capability,
-            Capability::VideoGenerate | Capability::ImageGenerate
-        )
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let api_key = require_api_key(config)?;
-
-        // --- ImageGenerate branch ---
-        if let Payload::ImageGenerate { prompt, .. } = &request.payload {
-            let model = request
-                .model
-                .clone()
-                .unwrap_or_else(|| "fal-ai/flux-pro/v1.1".to_string());
-            let url_base = base_url(config);
-            let auth_header = format!("Key {api_key}");
-
-            let body = FalImageRequest {
-                prompt: prompt.clone(),
-            };
-
-            let submit_url = format!("{url_base}/{model}");
-            let resp = self
-                .client
-                .post(&submit_url)
-                .json(&body)
-                .header("Authorization", &auth_header)
-                .send()
-                .await?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "fal".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                });
-            }
-
-            let queue: FalQueueResponse =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "fal".into(),
-                    message: format!("failed to parse queue response: {e}"),
-                    status: Some(status.as_u16()),
-                })?;
-
-            let request_id = queue.request_id;
-            let status_url = format!("{url_base}/requests/{request_id}/status");
-            let job_config = JobConfig::default();
-            let client = &self.client;
-            let auth_ref = &auth_header;
-
-            poll_until_complete(&job_config, || async {
-                let resp = client
-                    .get(&status_url)
-                    .header("Authorization", auth_ref)
-                    .send()
-                    .await?;
-
-                if !resp.status().is_success() {
-                    let body_text = resp.text().await.unwrap_or_default();
-                    return Err(GatewayError::ProviderError {
-                        adapter: "fal".into(),
-                        message: body_text,
-                        status: None,
-                    });
-                }
-
-                let fal_status: FalStatusResponse =
-                    resp.json().await.map_err(|e| GatewayError::ProviderError {
-                        adapter: "fal".into(),
-                        message: format!("failed to parse status response: {e}"),
-                        status: None,
-                    })?;
-
-                match fal_status.status.as_str() {
-                    "COMPLETED" => Ok(Some(())),
-                    "FAILED" => Err(GatewayError::ProviderError {
-                        adapter: "fal".into(),
-                        message: "fal.ai request failed".to_string(),
-                        status: None,
-                    }),
-                    _ => Ok(None),
-                }
-            })
-            .await?;
-
-            let result_url = format!("{url_base}/requests/{request_id}");
-            let resp = self
-                .client
-                .get(&result_url)
-                .header("Authorization", &auth_header)
-                .send()
-                .await?;
-
-            let resp_status = resp.status();
-            if !resp_status.is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "fal".into(),
-                    message: body_text,
-                    status: Some(resp_status.as_u16()),
-                });
-            }
-
-            let result: FalImageResult =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "fal".into(),
-                    message: format!("failed to parse image result: {e}"),
-                    status: None,
-                })?;
-
-            let images: Vec<ImageResult> = result
-                .images
-                .into_iter()
-                .map(|img| ImageResult {
-                    url: Some(img.url),
-                    b64_json: None,
-                    revised_prompt: None,
-                })
-                .collect();
-
-            return Ok(InferenceResponse {
-                success: true,
-                content: None,
-                embeddings: None,
-                transcription: None,
-                audio: None,
-                images: Some(images),
-                videos: None,
-                model: Some(model),
-                tool_calls: Vec::new(),
-                usage: None,
-                estimated_cost: None,
-                actual_cost: None,
-                attempts: vec![],
-            });
-        }
-
-        // --- VideoGenerate branch ---
-        let Payload::VideoGenerate {
-            prompt,
-            duration_secs,
-            ..
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "fal".into(),
-                message: "only VideoGenerate and ImageGenerate payloads are supported".into(),
-                status: None,
-            });
-        };
-
-        let model = resolve_model(request);
-        let url_base = base_url(config);
-        let auth_header = format!("Key {api_key}");
-
-        // 1. Submit to queue
-        let body = FalVideoRequest {
-            prompt: prompt.clone(),
-            duration: *duration_secs,
-            aspect_ratio: None,
-        };
-
-        let submit_url = format!("{url_base}/{model}");
-        let resp = self
-            .client
-            .post(&submit_url)
-            .json(&body)
-            .header("Authorization", &auth_header)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::ProviderError {
-                adapter: "fal".into(),
-                message: body_text,
-                status: Some(status.as_u16()),
-            });
-        }
-
-        let queue: FalQueueResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "fal".into(),
-                message: format!("failed to parse queue response: {e}"),
-                status: Some(status.as_u16()),
-            })?;
-
-        // 2. Poll status until COMPLETED
-        let request_id = queue.request_id;
-        let status_url = format!("{url_base}/requests/{request_id}/status");
-        let job_config = JobConfig::default();
-        let client = &self.client;
-        let auth_ref = &auth_header;
-
-        poll_until_complete(&job_config, || async {
-            let resp = client
-                .get(&status_url)
-                .header("Authorization", auth_ref)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "fal".into(),
-                    message: body_text,
-                    status: None,
-                });
-            }
-
-            let fal_status: FalStatusResponse =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "fal".into(),
-                    message: format!("failed to parse status response: {e}"),
-                    status: None,
-                })?;
-
-            match fal_status.status.as_str() {
-                "COMPLETED" => Ok(Some(())),
-                "FAILED" => Err(GatewayError::ProviderError {
-                    adapter: "fal".into(),
-                    message: "fal.ai request failed".to_string(),
-                    status: None,
-                }),
-                _ => Ok(None), // IN_QUEUE, IN_PROGRESS
-            }
-        })
-        .await?;
-
-        // 3. Fetch result
-        let result_url = format!("{url_base}/requests/{request_id}");
-        let resp = self
-            .client
-            .get(&result_url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await?;
-
-        let resp_status = resp.status();
-        if !resp_status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::ProviderError {
-                adapter: "fal".into(),
-                message: body_text,
-                status: Some(resp_status.as_u16()),
-            });
-        }
-
-        let result: FalResultResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "fal".into(),
-                message: format!("failed to parse result response: {e}"),
-                status: None,
-            })?;
-
-        let video_url = result.video.map(|v| v.url);
-
-        Ok(InferenceResponse {
-            success: true,
-            content: None,
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: None,
-            videos: Some(vec![VideoResult {
-                url: video_url,
-                duration_secs: duration_secs.map(|d| d as f32),
-            }]),
-            model: Some(model),
-            usage: None,
-            tool_calls: Vec::new(),
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        _request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        Err(GatewayError::ProviderError {
-            adapter: "fal".into(),
-            message: "streaming is not supported for image/video generation".into(),
-            status: None,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model — see
-// docs/design/adapter-capability-traits.md). Additive alongside the legacy
-// `InferenceAdapter` impl above, which stays until the engine cuts over.
-// The capability traits are referenced by full path so their `Model::id`
-// method does not collide with `InferenceAdapter::id` in method resolution.
+// Capability traits (see docs/design/adapter-capability-traits.md). Traits +
+// RegisterInto are referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for FalAdapter {
@@ -693,7 +369,7 @@ impl crate::adapters::capability::VideoModel for FalAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for FalAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_image(self.clone()).await;
         reg.register_video(self).await;
     }
@@ -710,17 +386,13 @@ mod tests {
     #[test]
     fn fal_id_and_supports() {
         let adapter = FalAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "fal");
-
-        assert!(adapter.supports(&Capability::VideoGenerate));
-        assert!(!adapter.supports(&Capability::TextChat));
-        assert!(!adapter.supports(&Capability::TextEmbed));
+        assert_eq!(crate::adapters::capability::Model::id(&adapter), "fal");
     }
 
     #[test]
     fn fal_capability_model_id() {
         let adapter = FalAdapter::new().unwrap();
-        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // Reference `Model::id` by full path
         // and the capability `Model` trait.
         assert_eq!(crate::adapters::capability::Model::id(&adapter), "fal");
     }
@@ -749,9 +421,7 @@ mod tests {
 
     #[test]
     fn fal_supports_image_generate() {
-        let adapter = FalAdapter::new().unwrap();
-        assert!(adapter.supports(&Capability::ImageGenerate));
-        assert!(adapter.supports(&Capability::VideoGenerate));
+        let _adapter = FalAdapter::new().unwrap();
     }
 
     #[test]

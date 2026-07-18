@@ -1,20 +1,13 @@
-use std::pin::Pin;
-
 use async_trait::async_trait;
-use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::InferenceAdapter;
 use super::base::{build_client, resolve_api_key};
 use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
 use crate::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
-use crate::types::request::{
-    ImageResult, InferenceRequest, InferenceResponse, Payload, StreamChunk, VideoResult,
-};
+use crate::types::request::{ImageResult, VideoResult};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -46,13 +39,6 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
         adapter: "replicate".into(),
         message: "missing API key — set the env var specified in api_key_env".into(),
     })
-}
-
-fn resolve_model(request: &InferenceRequest) -> String {
-    request
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
 fn base_url(config: &RouterConfig) -> &str {
@@ -96,283 +82,9 @@ impl ReplicateAdapter {
     }
 }
 
-#[async_trait]
-impl InferenceAdapter for ReplicateAdapter {
-    fn id(&self) -> &str {
-        "replicate"
-    }
-
-    fn supports(&self, capability: &Capability) -> bool {
-        matches!(
-            capability,
-            Capability::VideoGenerate | Capability::ImageGenerate
-        )
-    }
-
-    async fn execute(
-        &self,
-        config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        let api_key = require_api_key(config)?;
-        let url_base = base_url(config);
-
-        // --- ImageGenerate branch ---
-        if let Payload::ImageGenerate { prompt, .. } = &request.payload {
-            let model = request
-                .model
-                .clone()
-                .unwrap_or_else(|| "black-forest-labs/flux-schnell".to_string());
-
-            let input = serde_json::json!({ "prompt": prompt });
-            let body = ReplicatePredictionRequest {
-                model: model.clone(),
-                input,
-            };
-
-            let submit_url = format!("{url_base}/predictions");
-            let resp = self
-                .client
-                .post(&submit_url)
-                .json(&body)
-                .bearer_auth(&api_key)
-                .send()
-                .await?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "replicate".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                });
-            }
-
-            let prediction: ReplicatePredictionResponse =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "replicate".into(),
-                    message: format!("failed to parse prediction response: {e}"),
-                    status: Some(status.as_u16()),
-                })?;
-
-            let prediction_id = prediction.id;
-            let poll_url = format!("{url_base}/predictions/{prediction_id}");
-            let job_config = JobConfig::default();
-            let client = &self.client;
-            let api_key_ref = &api_key;
-
-            let final_prediction = poll_until_complete(&job_config, || async {
-                let resp = client
-                    .get(&poll_url)
-                    .bearer_auth(api_key_ref)
-                    .send()
-                    .await?;
-
-                if !resp.status().is_success() {
-                    let body_text = resp.text().await.unwrap_or_default();
-                    return Err(GatewayError::ProviderError {
-                        adapter: "replicate".into(),
-                        message: body_text,
-                        status: None,
-                    });
-                }
-
-                let pred: ReplicatePredictionResponse =
-                    resp.json().await.map_err(|e| GatewayError::ProviderError {
-                        adapter: "replicate".into(),
-                        message: format!("failed to parse prediction status: {e}"),
-                        status: None,
-                    })?;
-
-                match pred.status.as_str() {
-                    "succeeded" => Ok(Some(pred)),
-                    "failed" | "canceled" => Err(GatewayError::ProviderError {
-                        adapter: "replicate".into(),
-                        message: pred
-                            .error
-                            .unwrap_or_else(|| "prediction failed".to_string()),
-                        status: None,
-                    }),
-                    _ => Ok(None),
-                }
-            })
-            .await?;
-
-            // Output is array of URL strings
-            let images: Vec<ImageResult> = final_prediction
-                .output
-                .as_ref()
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|url| ImageResult {
-                            url: Some(url.to_string()),
-                            b64_json: None,
-                            revised_prompt: None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            return Ok(InferenceResponse {
-                success: true,
-                content: None,
-                embeddings: None,
-                transcription: None,
-                audio: None,
-                images: Some(images),
-                videos: None,
-                model: Some(model),
-                tool_calls: Vec::new(),
-                usage: None,
-                estimated_cost: None,
-                actual_cost: None,
-                attempts: vec![],
-            });
-        }
-
-        // --- VideoGenerate branch ---
-        let Payload::VideoGenerate {
-            prompt,
-            duration_secs,
-            ..
-        } = &request.payload
-        else {
-            return Err(GatewayError::ProviderError {
-                adapter: "replicate".into(),
-                message: "only VideoGenerate and ImageGenerate payloads are supported".into(),
-                status: None,
-            });
-        };
-
-        let model = resolve_model(request);
-
-        // 1. Create prediction
-        let mut input = serde_json::json!({ "prompt": prompt });
-        if let Some(dur) = duration_secs {
-            input["duration"] = serde_json::json!(dur);
-        }
-
-        let body = ReplicatePredictionRequest {
-            model: model.clone(),
-            input,
-        };
-
-        let submit_url = format!("{url_base}/predictions");
-        let resp = self
-            .client
-            .post(&submit_url)
-            .json(&body)
-            .bearer_auth(&api_key)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::ProviderError {
-                adapter: "replicate".into(),
-                message: body_text,
-                status: Some(status.as_u16()),
-            });
-        }
-
-        let prediction: ReplicatePredictionResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "replicate".into(),
-                message: format!("failed to parse prediction response: {e}"),
-                status: Some(status.as_u16()),
-            })?;
-
-        // 2. Poll until complete
-        let prediction_id = prediction.id;
-        let poll_url = format!("{url_base}/predictions/{prediction_id}");
-        let job_config = JobConfig::default();
-        let client = &self.client;
-        let api_key_ref = &api_key;
-
-        let final_prediction = poll_until_complete(&job_config, || async {
-            let resp = client
-                .get(&poll_url)
-                .bearer_auth(api_key_ref)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "replicate".into(),
-                    message: body_text,
-                    status: None,
-                });
-            }
-
-            let pred: ReplicatePredictionResponse =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "replicate".into(),
-                    message: format!("failed to parse prediction status: {e}"),
-                    status: None,
-                })?;
-
-            match pred.status.as_str() {
-                "succeeded" => Ok(Some(pred)),
-                "failed" | "canceled" => Err(GatewayError::ProviderError {
-                    adapter: "replicate".into(),
-                    message: pred
-                        .error
-                        .unwrap_or_else(|| "prediction failed".to_string()),
-                    status: None,
-                }),
-                _ => Ok(None), // starting, processing
-            }
-        })
-        .await?;
-
-        // 3. Extract video URL from output
-        let video_url = final_prediction.output.as_ref().and_then(extract_video_url);
-
-        Ok(InferenceResponse {
-            success: true,
-            content: None,
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: None,
-            videos: Some(vec![VideoResult {
-                url: video_url,
-                duration_secs: duration_secs.map(|d| d as f32),
-            }]),
-            model: Some(model),
-            usage: None,
-            tool_calls: Vec::new(),
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![],
-        })
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        _request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        Err(GatewayError::ProviderError {
-            adapter: "replicate".into(),
-            message: "streaming is not supported for image/video generation".into(),
-            status: None,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Capability traits (target model — see
-// docs/design/adapter-capability-traits.md). Additive alongside the legacy
-// `InferenceAdapter` impl above, which stays until the engine cuts over.
-// The capability traits are referenced by full path so their `Model::id`
-// method does not collide with `InferenceAdapter::id` in method resolution.
+// Capability traits (see docs/design/adapter-capability-traits.md). Traits +
+// RegisterInto are referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for ReplicateAdapter {
@@ -602,7 +314,7 @@ impl crate::adapters::capability::VideoModel for ReplicateAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for ReplicateAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_image(self.clone()).await;
         reg.register_video(self).await;
     }
@@ -619,24 +331,21 @@ mod tests {
     #[test]
     fn replicate_id_and_supports() {
         let adapter = ReplicateAdapter::new().unwrap();
-        assert_eq!(adapter.id(), "replicate");
-
-        assert!(adapter.supports(&Capability::VideoGenerate));
-        assert!(!adapter.supports(&Capability::TextChat));
-        assert!(!adapter.supports(&Capability::TextEmbed));
+        assert_eq!(
+            crate::adapters::capability::Model::id(&adapter),
+            "replicate"
+        );
     }
 
     #[test]
     fn replicate_supports_image_generate() {
-        let adapter = ReplicateAdapter::new().unwrap();
-        assert!(adapter.supports(&Capability::ImageGenerate));
-        assert!(adapter.supports(&Capability::VideoGenerate));
+        let _adapter = ReplicateAdapter::new().unwrap();
     }
 
     #[test]
     fn replicate_capability_model_id() {
         let adapter = ReplicateAdapter::new().unwrap();
-        // Full path avoids the `id()` ambiguity between `InferenceAdapter`
+        // Reference `Model::id` by full path
         // and the capability `Model` trait.
         assert_eq!(
             crate::adapters::capability::Model::id(&adapter),

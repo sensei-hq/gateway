@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use futures::Stream;
 use futures::stream;
 
-use super::InferenceAdapter;
 use crate::types::capability::Capability;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
@@ -12,8 +11,7 @@ use crate::types::io::{
     ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, ImageRequest, ImageResponse,
     SttRequest, SttResponse, TtsRequest, TtsResponse, VideoRequest, VideoResponse,
 };
-use crate::types::request::{InferenceRequest, InferenceResponse, StreamChunk};
-use crate::types::trace::{Attempt, AttemptStatus};
+use crate::types::request::StreamChunk;
 
 /// Graceful-degradation adapter that never errors.
 ///
@@ -30,69 +28,6 @@ impl NoopAdapter {
             capability,
         )
     }
-
-    fn failed_attempt(capability: &Capability) -> Attempt {
-        Attempt {
-            sequence: 1,
-            adapter: "noop".to_string(),
-            model: "none".to_string(),
-            api_model_id: "none".to_string(),
-            status: AttemptStatus::Failed,
-            duration_ms: 0,
-            tokens: None,
-            cost: None,
-            error: Some(Self::unavailable_message(capability)),
-            fallback_triggered: false,
-        }
-    }
-}
-
-#[async_trait]
-impl InferenceAdapter for NoopAdapter {
-    fn id(&self) -> &str {
-        "noop"
-    }
-
-    fn supports(&self, _capability: &Capability) -> bool {
-        true
-    }
-
-    async fn execute(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<InferenceResponse, GatewayError> {
-        Ok(InferenceResponse {
-            success: false,
-            content: Some(Self::unavailable_message(&request.capability)),
-            embeddings: None,
-            transcription: None,
-            audio: None,
-            images: None,
-            videos: None,
-            model: None,
-            tool_calls: Vec::new(),
-            usage: None,
-            estimated_cost: None,
-            actual_cost: None,
-            attempts: vec![Self::failed_attempt(&request.capability)],
-        })
-    }
-
-    async fn stream(
-        &self,
-        _config: &RouterConfig,
-        request: &InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
-    {
-        let chunk = StreamChunk {
-            content: Self::unavailable_message(&request.capability),
-            finish_reason: Some("no_provider".to_string()),
-            usage: None,
-            tool_calls: Vec::new(),
-        };
-        Ok(Box::pin(stream::once(async move { Ok(chunk) })))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,8 +35,7 @@ impl InferenceAdapter for NoopAdapter {
 // capability and returns the same "no provider" placeholder as the execute
 // path. NOTE: the typed responses have no `success` field, so the old
 // `success: false` degraded-signal cannot be carried here — the engine decides
-// success at the Phase 4 dispatch boundary. Traits referenced by full path to
-// avoid the id() clash with InferenceAdapter during the bridge.
+// success at the Phase 4 dispatch boundary. Traits referenced by full path.
 // ---------------------------------------------------------------------------
 
 impl crate::adapters::capability::Model for NoopAdapter {
@@ -201,7 +135,7 @@ impl crate::adapters::capability::VideoModel for NoopAdapter {
 
 #[async_trait]
 impl crate::adapters::RegisterInto for NoopAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::CapabilityRegistry) {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self.clone()).await;
         reg.register_stt(self.clone()).await;
@@ -216,7 +150,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::types::request::{Message, MessageRole, Payload};
+    use crate::adapters::capability::{ChatModel, Model};
+    use crate::types::io::ChatRequest;
+    use crate::types::request::{Message, MessageRole};
     use futures::StreamExt;
 
     fn test_config() -> RouterConfig {
@@ -230,81 +166,33 @@ mod tests {
         }
     }
 
-    fn test_request() -> InferenceRequest {
-        InferenceRequest {
-            capability: Capability::TextChat,
+    fn test_chat_request() -> ChatRequest {
+        ChatRequest {
             model: None,
-            router: None,
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "hello".to_string())],
-                system: None,
-                max_tokens: None,
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
+            messages: vec![Message::text(MessageRole::User, "hello".to_string())],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
         }
     }
 
     #[tokio::test]
     async fn noop_chatmodel_returns_canned_content() {
-        use crate::adapters::capability::{ChatModel, Model};
         let adapter = NoopAdapter;
         assert_eq!(Model::id(&adapter), "noop");
-        let req = crate::types::io::ChatRequest {
-            model: None,
-            messages: vec![Message::text(MessageRole::User, "hi".to_string())],
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            tools: Vec::new(),
-        };
-        let resp = adapter.chat(&test_config(), &req).await.unwrap();
+        let resp = adapter
+            .chat(&test_config(), &test_chat_request())
+            .await
+            .unwrap();
         assert!(resp.content.unwrap().contains("No inference provider"));
     }
 
-    #[test]
-    fn noop_supports_all_capabilities() {
-        let adapter = NoopAdapter;
-        assert!(adapter.supports(&Capability::TextChat));
-        assert!(adapter.supports(&Capability::TextEmbed));
-        assert!(adapter.supports(&Capability::TextRerank));
-        assert!(adapter.supports(&Capability::AudioTranscribe));
-    }
-
     #[tokio::test]
-    async fn noop_execute_returns_unsuccessful() {
-        let adapter = NoopAdapter;
-        let response = adapter
-            .execute(&test_config(), &test_request())
-            .await
-            .unwrap();
-
-        assert!(!response.success);
-        assert!(
-            response
-                .content
-                .as_ref()
-                .unwrap()
-                .contains("No inference provider")
-        );
-        assert_eq!(response.attempts.len(), 1);
-        assert_eq!(response.attempts[0].status, AttemptStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn noop_execute_never_errors() {
-        let adapter = NoopAdapter;
-        let result = adapter.execute(&test_config(), &test_request()).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn noop_stream_returns_single_chunk() {
+    async fn noop_chat_stream_returns_single_chunk() {
         let adapter = NoopAdapter;
         let mut stream = adapter
-            .stream(&test_config(), &test_request())
+            .chat_stream(&test_config(), &test_chat_request())
             .await
             .unwrap();
 

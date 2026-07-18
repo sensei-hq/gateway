@@ -1,4 +1,4 @@
-//! Integration tests for adapter execute() methods using wiremock.
+//! Integration tests for adapter capability methods using wiremock.
 //!
 //! These tests spin up an in-process HTTP mock server and verify that
 //! adapters correctly serialize requests, parse responses, and handle
@@ -6,13 +6,13 @@
 
 use std::collections::HashMap;
 
-use gateway::types::capability::Capability;
 use gateway::types::config::RouterConfig;
 use gateway::types::error::GatewayError;
-use gateway::types::request::{InferenceRequest, Message, MessageRole, Payload};
+use gateway::types::io::{ChatRequest, EmbedRequest};
+use gateway::types::request::{Message, MessageRole};
 
-use gateway::adapters::InferenceAdapter;
 use gateway::adapters::anthropic::AnthropicAdapter;
+use gateway::adapters::capability::{ChatModel, EmbedModel};
 use gateway::adapters::ollama::OllamaAdapter;
 use gateway::adapters::openai::OpenAIAdapter;
 
@@ -45,33 +45,21 @@ fn router_config_with_key(url: &str, env_var: &str) -> RouterConfig {
     }
 }
 
-fn chat_request(model: &str) -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextChat,
+fn chat_request(model: &str) -> ChatRequest {
+    ChatRequest {
         model: Some(model.to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::Chat {
-            messages: vec![Message::text(MessageRole::User, "Hello, world!")],
-            system: None,
-            max_tokens: Some(128),
-            temperature: Some(0.5),
-            tools: Vec::new(),
-        },
-        budget: None,
+        messages: vec![Message::text(MessageRole::User, "Hello, world!")],
+        system: None,
+        max_tokens: Some(128),
+        temperature: Some(0.5),
+        tools: Vec::new(),
     }
 }
 
-fn embed_request(model: &str) -> InferenceRequest {
-    InferenceRequest {
-        capability: Capability::TextEmbed,
+fn embed_request(model: &str) -> EmbedRequest {
+    EmbedRequest {
         model: Some(model.to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::Embed {
-            texts: vec!["hello world".to_string()],
-        },
-        budget: None,
+        texts: vec!["hello world".to_string()],
     }
 }
 
@@ -105,8 +93,7 @@ async fn ollama_chat_mock() {
     let config = router_config(&server.uri());
     let request = chat_request("gemma3:27b");
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
+    let response = adapter.chat(&config, &request).await.unwrap();
     assert_eq!(response.content.as_deref(), Some("Hello from mock Ollama!"),);
     assert!(response.usage.is_some());
     let usage = response.usage.unwrap();
@@ -139,10 +126,8 @@ async fn ollama_embed_mock() {
     let config = router_config(&server.uri());
     let request = embed_request("all-minilm");
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    assert!(response.embeddings.is_some());
-    let embeddings = response.embeddings.unwrap();
+    let response = adapter.embed(&config, &request).await.unwrap();
+    let embeddings = response.embeddings;
     assert_eq!(embeddings.len(), 1);
     assert_eq!(embeddings[0], vec![0.1, 0.2, 0.3, 0.4, 0.5]);
 }
@@ -164,7 +149,7 @@ async fn ollama_chat_error_500() {
     let config = router_config(&server.uri());
     let request = chat_request("gemma3:27b");
 
-    let result = adapter.execute(&config, &request).await;
+    let result = adapter.chat(&config, &request).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -216,8 +201,7 @@ async fn openai_chat_mock() {
     let config = router_config_with_key(&server.uri(), env_key);
     let request = chat_request("gpt-4o-mini");
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
+    let response = adapter.chat(&config, &request).await.unwrap();
     assert_eq!(response.content.as_deref(), Some("Hello from mock OpenAI!"),);
     let usage = response.usage.unwrap();
     assert_eq!(usage.input_tokens, 12);
@@ -259,9 +243,8 @@ async fn openai_embed_mock() {
     let config = router_config_with_key(&server.uri(), env_key);
     let request = embed_request("text-embedding-3-small");
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    let embeddings = response.embeddings.unwrap();
+    let response = adapter.embed(&config, &request).await.unwrap();
+    let embeddings = response.embeddings;
     assert_eq!(embeddings.len(), 1);
     assert_eq!(embeddings[0], vec![0.01, 0.02, 0.03]);
 
@@ -301,8 +284,7 @@ async fn anthropic_chat_mock() {
     let config = router_config_with_key(&server.uri(), env_key);
     let request = chat_request("claude-haiku-4-5-20250414");
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
+    let response = adapter.chat(&config, &request).await.unwrap();
     assert_eq!(
         response.content.as_deref(),
         Some("Hello from mock Anthropic!"),
@@ -339,7 +321,7 @@ async fn anthropic_chat_401_auth_error() {
     let config = router_config_with_key(&server.uri(), env_key);
     let request = chat_request("claude-haiku-4-5-20250414");
 
-    let result = adapter.execute(&config, &request).await;
+    let result = adapter.chat(&config, &request).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -374,7 +356,7 @@ async fn anthropic_chat_429_rate_limit() {
     let config = router_config_with_key(&server.uri(), env_key);
     let request = chat_request("claude-haiku-4-5-20250414");
 
-    let result = adapter.execute(&config, &request).await;
+    let result = adapter.chat(&config, &request).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -403,20 +385,13 @@ async fn ollama_embed_integration() {
         timeout_ms: Some(30000),
         headers: HashMap::new(),
     };
-    let request = InferenceRequest {
-        capability: Capability::TextEmbed,
+    let request = EmbedRequest {
         model: Some("all-minilm".to_string()),
-        router: None,
-        chain: None,
-        payload: Payload::Embed {
-            texts: vec!["hello world".to_string(), "test embedding".to_string()],
-        },
-        budget: None,
+        texts: vec!["hello world".to_string(), "test embedding".to_string()],
     };
 
-    let response = adapter.execute(&config, &request).await.unwrap();
-    assert!(response.success);
-    let embeddings = response.embeddings.unwrap();
+    let response = adapter.embed(&config, &request).await.unwrap();
+    let embeddings = response.embeddings;
     assert_eq!(embeddings.len(), 2);
     assert!(!embeddings[0].is_empty());
     assert!(!embeddings[1].is_empty());
@@ -438,7 +413,7 @@ async fn ollama_chat_streaming_integration() {
     };
     let request = chat_request("llama3.2:latest");
 
-    let mut stream = adapter.stream(&config, &request).await.unwrap();
+    let mut stream = adapter.chat_stream(&config, &request).await.unwrap();
     let mut collected = String::new();
 
     while let Some(result) = stream.next().await {
