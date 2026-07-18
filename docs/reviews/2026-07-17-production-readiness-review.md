@@ -43,7 +43,7 @@ verified in context; this doc tracks each to a fix.
 | 9 | `AllAttemptsFailed` flattens `Vec<Attempt>` to a string | Added `attempts_detail: Vec<Attempt>` on the terminal error | ✅ `1a22cb4` |
 | 10 | `Gateway::new`/`update_config` bypass `GatewayBuilder::validate` | Added validating `try_new`/`try_update_config` + `InvalidConfig` | ✅ `1a22cb4` |
 | 11 | ~no `tracing` in the hot path | `#[instrument]` on execute + select/attempt/fallback events | ✅ `1a22cb4` |
-| 12 | Streaming unreachable via public API; `StreamEvent` dead | `Gateway::execute_stream` emitting `StreamEvent` (v1) | ⬜ pending (last item) |
+| 12 | Streaming unreachable via public API; `StreamEvent` dead | `Gateway::execute_stream` emitting `StreamEvent` (Chunk/ProviderSwitch/Done/Error) | ✅ `b8afc0e` |
 | 13 | Burn rate / `GatewayStore` unwired | Optional store on `Gateway`; persist calls | ⬜ **AUTH track** |
 | 14 | Security: deps, static analysis, secret-leak surface | 2 RUSTSEC vulns patched (consumers update locks); semgrep clean; redacting `Debug(RouterConfig)` | ✅ `f8f0d79` |
 | 15 | `ExecutionTrace` / `skipped` diagnostics unused | Build+surface `ExecutionTrace` incl. `skipped` | ⬜ pending (with 9/12) |
