@@ -3,9 +3,15 @@ use std::time::Instant;
 
 use tokio::sync::RwLock;
 
-use crate::adapters::AdapterRegistry;
+use crate::adapters::CapabilityRegistry;
 use crate::circuit_breaker::CircuitBreakerManager;
+use crate::dispatch::{
+    from_chat_response, from_embed_response, from_image_response, from_stt_response,
+    from_tts_response, from_video_response, to_chat_request, to_embed_request, to_image_request,
+    to_stt_request, to_tts_request, to_video_request,
+};
 use crate::selection::{ModelSelectionService, SelectionCriteria};
+use crate::types::capability::Capability;
 use crate::types::config::GatewayConfig;
 use crate::types::error::GatewayError;
 use crate::types::request::{InferenceRequest, InferenceResponse, Payload};
@@ -17,14 +23,14 @@ use crate::types::trace::{Attempt, AttemptStatus};
 /// chains, records attempts, and integrates the circuit breaker.
 pub struct Gateway {
     config: Arc<RwLock<GatewayConfig>>,
-    pub(crate) adapters: AdapterRegistry,
+    pub(crate) adapters: CapabilityRegistry,
     circuit_breaker: CircuitBreakerManager,
 }
 
 impl Gateway {
     pub fn new(
         config: GatewayConfig,
-        adapters: AdapterRegistry,
+        adapters: CapabilityRegistry,
         circuit_breaker: CircuitBreakerManager,
     ) -> Self {
         Self {
@@ -83,9 +89,76 @@ impl Gateway {
         for (sequence, candidate) in (1_u8..).zip(result.all_candidates.iter()) {
             let start = Instant::now();
 
-            // Get adapter from registry
-            let adapter = match self.adapters.get(&candidate.router).await {
-                Some(a) => a,
+            // Resolve the model to send. Inject the selected candidate's resolved
+            // `api_model_id` when the caller didn't pin one, so chain/registry
+            // selection actually drives the provider model — otherwise the adapter
+            // falls back to its own built-in default. A caller-pinned
+            // `request.model` takes precedence.
+            let model = if request.model.is_some() {
+                request.model.clone()
+            } else {
+                Some(candidate.api_model_id.clone())
+            };
+            let endpoint = format!("{}:{}", candidate.router, candidate.model);
+            let cfg = &candidate.router_config;
+
+            // Dispatch by capability to the matching registry map + typed method,
+            // translating at the boundary via `crate::dispatch`. `None` means no
+            // adapter is registered for this router+capability (or the capability
+            // has no dispatch route) — handled the same as the legacy
+            // no-adapter-registered path below.
+            let outcome: Option<Result<InferenceResponse, GatewayError>> = match request.capability
+            {
+                Capability::TextChat | Capability::TextComplete => {
+                    match self.adapters.chat(&candidate.router).await {
+                        Some(m) => Some(match to_chat_request(request, model) {
+                            Ok(r) => m.chat(cfg, &r).await.map(from_chat_response),
+                            Err(e) => Err(e),
+                        }),
+                        None => None,
+                    }
+                }
+                Capability::TextEmbed => match self.adapters.embed(&candidate.router).await {
+                    Some(m) => Some(match to_embed_request(request, model) {
+                        Ok(r) => m.embed(cfg, &r).await.map(from_embed_response),
+                        Err(e) => Err(e),
+                    }),
+                    None => None,
+                },
+                Capability::AudioTranscribe => match self.adapters.stt(&candidate.router).await {
+                    Some(m) => Some(match to_stt_request(request, model) {
+                        Ok(r) => m.transcribe(cfg, &r).await.map(from_stt_response),
+                        Err(e) => Err(e),
+                    }),
+                    None => None,
+                },
+                Capability::AudioGenerate => match self.adapters.tts(&candidate.router).await {
+                    Some(m) => Some(match to_tts_request(request, model) {
+                        Ok(r) => m.speak(cfg, &r).await.map(from_tts_response),
+                        Err(e) => Err(e),
+                    }),
+                    None => None,
+                },
+                Capability::ImageGenerate => match self.adapters.image(&candidate.router).await {
+                    Some(m) => Some(match to_image_request(request, model) {
+                        Ok(r) => m.generate_image(cfg, &r).await.map(from_image_response),
+                        Err(e) => Err(e),
+                    }),
+                    None => None,
+                },
+                Capability::VideoGenerate => match self.adapters.video(&candidate.router).await {
+                    Some(m) => Some(match to_video_request(request, model) {
+                        Ok(r) => m.generate_video(cfg, &r).await.map(from_video_response),
+                        Err(e) => Err(e),
+                    }),
+                    None => None,
+                },
+                // Any other capability has no dispatch route — treat as no adapter.
+                _ => None,
+            };
+
+            let outcome = match outcome {
+                Some(o) => o,
                 None => {
                     attempts.push(Attempt {
                         sequence,
@@ -106,25 +179,7 @@ impl Gateway {
                 }
             };
 
-            // Execute via adapter. Inject the selected candidate's resolved model
-            // when the caller didn't pin one, so chain/registry selection actually
-            // drives the provider model — otherwise the adapter falls back to its
-            // own built-in default. A caller-pinned `request.model` takes precedence.
-            let endpoint = format!("{}:{}", candidate.router, candidate.model);
-            let owned_request;
-            let req_for_adapter: &InferenceRequest = if request.model.is_some() {
-                request
-            } else {
-                owned_request = InferenceRequest {
-                    model: Some(candidate.api_model_id.clone()),
-                    ..request.clone()
-                };
-                &owned_request
-            };
-            match adapter
-                .execute(&candidate.router_config, req_for_adapter)
-                .await
-            {
+            match outcome {
                 Ok(mut response) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
                     self.circuit_breaker.record_success(&endpoint);
@@ -375,7 +430,7 @@ mod tests {
 
     fn test_gateway() -> Gateway {
         let config = test_config_with_noop();
-        let adapters = AdapterRegistry::new();
+        let adapters = CapabilityRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
@@ -386,9 +441,10 @@ mod tests {
     }
 
     async fn register_noop(gw: &Gateway) {
-        gw.adapters
-            .register(Arc::new(NoopAdapter) as Arc<dyn crate::adapters::InferenceAdapter>)
-            .await;
+        use crate::adapters::RegisterInto;
+        // NoopAdapter implements every capability trait + RegisterInto, so this
+        // lands it in all six capability maps in one call.
+        Arc::new(NoopAdapter).register_into(&gw.adapters).await;
     }
 
     fn chat_request() -> InferenceRequest {
@@ -408,58 +464,32 @@ mod tests {
         }
     }
 
-    // Adapter that records the request.model it receives, so we can assert the
-    // engine injects the chain-selected model rather than passing model=None.
+    // Adapter that records the model it receives via `chat`, so we can assert the
+    // engine injects the chain-selected api_model_id rather than passing None.
     struct RecordingAdapter {
         seen_model: Arc<std::sync::Mutex<Option<String>>>,
     }
 
-    #[async_trait::async_trait]
-    impl crate::adapters::InferenceAdapter for RecordingAdapter {
+    impl crate::adapters::capability::Model for RecordingAdapter {
         fn id(&self) -> &str {
             "noop"
         }
-        fn supports(&self, _capability: &Capability) -> bool {
-            true
-        }
-        async fn execute(
-            &self,
-            _config: &RouterConfig,
-            request: &InferenceRequest,
-        ) -> Result<InferenceResponse, GatewayError> {
-            *self.seen_model.lock().unwrap() = request.model.clone();
-            Ok(InferenceResponse {
-                success: true,
-                content: Some("ok".to_string()),
-                embeddings: None,
-                transcription: None,
-                audio: None,
-                images: None,
-                videos: None,
-                model: request.model.clone(),
-                usage: None,
-                tool_calls: Vec::new(),
-                estimated_cost: None,
-                actual_cost: None,
-                attempts: vec![],
-            })
-        }
+    }
 
-        async fn stream(
+    #[async_trait::async_trait]
+    impl crate::adapters::capability::ChatModel for RecordingAdapter {
+        async fn chat(
             &self,
-            _config: &RouterConfig,
-            _request: &InferenceRequest,
-        ) -> Result<
-            std::pin::Pin<
-                Box<
-                    dyn futures::Stream<
-                            Item = Result<crate::types::request::StreamChunk, GatewayError>,
-                        > + Send,
-                >,
-            >,
-            GatewayError,
-        > {
-            Err(GatewayError::NotConfigured)
+            _cfg: &RouterConfig,
+            req: &crate::types::io::ChatRequest,
+        ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+            *self.seen_model.lock().unwrap() = req.model.clone();
+            Ok(crate::types::io::ChatResponse {
+                content: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                model: req.model.clone(),
+            })
         }
     }
 
@@ -518,13 +548,13 @@ mod tests {
             timeout: Duration::from_secs(300),
             half_open_max_requests: 3,
         });
-        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        let gw = Gateway::new(config, CapabilityRegistry::new(), cb);
 
         let seen_model = Arc::new(std::sync::Mutex::new(None));
         gw.adapters
-            .register(Arc::new(RecordingAdapter {
+            .register_chat(Arc::new(RecordingAdapter {
                 seen_model: seen_model.clone(),
-            }) as Arc<dyn crate::adapters::InferenceAdapter>)
+            }))
             .await;
 
         let request = InferenceRequest {
@@ -557,7 +587,11 @@ mod tests {
 
         let response = gw.execute(&chat_request()).await.unwrap();
 
-        assert!(!response.success);
+        // The typed capability path carries no `success` flag, so the noop's
+        // old `success: false` degraded signal is no longer propagated — the
+        // engine reports success for any Ok outcome (see NoopAdapter comment).
+        // The canned "No inference provider" content is still returned.
+        assert!(response.success);
         assert!(
             response
                 .content
@@ -653,31 +687,24 @@ mod tests {
 
     // --- FailingAdapter for error/fallback path tests ---
 
-    use crate::adapters::InferenceAdapter;
-    use crate::types::request::StreamChunk;
-    use futures::Stream;
-    use std::pin::Pin;
-
     struct FailingAdapter {
         error: GatewayError,
     }
 
-    #[async_trait::async_trait]
-    impl InferenceAdapter for FailingAdapter {
+    impl crate::adapters::capability::Model for FailingAdapter {
         fn id(&self) -> &str {
             "failing"
         }
+    }
 
-        fn supports(&self, _capability: &Capability) -> bool {
-            true
-        }
-
-        async fn execute(
+    #[async_trait::async_trait]
+    impl crate::adapters::capability::ChatModel for FailingAdapter {
+        async fn chat(
             &self,
-            _config: &crate::types::config::RouterConfig,
-            _request: &crate::types::request::InferenceRequest,
-        ) -> Result<InferenceResponse, GatewayError> {
-            // Clone the error to return each time
+            _cfg: &RouterConfig,
+            _req: &crate::types::io::ChatRequest,
+        ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+            // Clone the configured error to return each time.
             match &self.error {
                 GatewayError::ProviderError {
                     adapter,
@@ -716,21 +743,6 @@ mod tests {
                     status: None,
                 }),
             }
-        }
-
-        async fn stream(
-            &self,
-            _config: &crate::types::config::RouterConfig,
-            _request: &crate::types::request::InferenceRequest,
-        ) -> Result<
-            Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>,
-            GatewayError,
-        > {
-            Err(GatewayError::ProviderError {
-                adapter: "failing".into(),
-                message: "not supported".into(),
-                status: None,
-            })
         }
     }
 
@@ -824,7 +836,7 @@ mod tests {
     /// Helper: gateway with a failing adapter registered.
     fn test_gateway_with_chain() -> Gateway {
         let config = test_config_with_failing_and_noop();
-        let adapters = AdapterRegistry::new();
+        let adapters = CapabilityRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
@@ -835,7 +847,7 @@ mod tests {
 
     async fn register_failing(gw: &Gateway, error: GatewayError) {
         gw.adapters
-            .register(Arc::new(FailingAdapter { error }) as Arc<dyn InferenceAdapter>)
+            .register_chat(Arc::new(FailingAdapter { error }))
             .await;
     }
 
@@ -946,7 +958,7 @@ mod tests {
             models,
             chains,
         };
-        let adapters = AdapterRegistry::new();
+        let adapters = CapabilityRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
@@ -1055,7 +1067,7 @@ mod tests {
             models,
             chains,
         };
-        let adapters = AdapterRegistry::new();
+        let adapters = CapabilityRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
             timeout: Duration::from_secs(300),
