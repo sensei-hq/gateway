@@ -154,8 +154,17 @@ impl Gateway {
                     }),
                     None => None,
                 },
-                // Any other capability has no dispatch route — treat as no adapter.
-                _ => None,
+                // Reserved capabilities have no payload / trait / dispatch route
+                // yet — surface an honest "not yet supported" rather than the
+                // misleading "no adapter registered". Exhaustive (no `_`) so a new
+                // `Capability` variant forces a routing decision here at compile time.
+                Capability::TextRerank
+                | Capability::TextModerate
+                | Capability::ImageEdit
+                | Capability::ImageAnalyze => Some(Err(GatewayError::Unsupported {
+                    adapter: candidate.router.clone(),
+                    what: "capability not yet supported (reserved)".to_string(),
+                })),
             };
 
             let outcome = match outcome {
@@ -697,6 +706,71 @@ mod tests {
         assert_eq!(cost.input_tokens, 1000);
         // The recorded attempt carries the same dollar cost.
         assert_eq!(response.attempts[0].cost, Some(cost.total_cost));
+    }
+
+    #[tokio::test]
+    async fn reserved_capability_returns_unsupported_not_no_adapter() {
+        // A model may declare a reserved capability (e.g. ImageEdit); a request
+        // for it must surface an honest "not yet supported" error rather than the
+        // misleading "no adapter registered".
+        let mut routers = HashMap::new();
+        routers.insert(
+            "r".to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "m".to_string(),
+            ModelConfig {
+                id: "m".to_string(),
+                api_model_id: None,
+                provider: "r".to_string(),
+                capabilities: vec![Capability::ImageEdit],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: None,
+            },
+        );
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains: HashMap::new(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+
+        let request = InferenceRequest {
+            capability: Capability::ImageEdit,
+            model: Some("m".to_string()),
+            router: Some("r".to_string()),
+            chain: None,
+            // No ImageEdit payload exists; any constructible payload works — the
+            // reserved arm errors before the payload is inspected.
+            payload: Payload::ImageGenerate {
+                prompt: "x".to_string(),
+                size: None,
+                quality: None,
+                style: None,
+                n: 1,
+            },
+            budget: None,
+        };
+        let msg = gw.execute(&request).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("not yet supported") || msg.contains("reserved"),
+            "expected an honest reserved-capability error, got: {msg}"
+        );
     }
 
     #[tokio::test]
