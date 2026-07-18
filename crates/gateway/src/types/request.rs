@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::capability::Capability;
 use super::cost::{Cost, CostEstimate, TokenUsage};
@@ -350,6 +351,18 @@ pub struct VideoResult {
     pub duration_secs: Option<f32>,
 }
 
+/// Resolved caller identity for metering/quota (AUTH). The consumer authenticates
+/// the caller (OAuth/Kavach), resolves their team + tier, and attaches this —
+/// opaque ids only, never tokens. See docs/design/subscription-quota-auth.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthContext {
+    /// Subject (team/tenant) the call is metered + quota-checked against.
+    pub subject_id: Uuid,
+    /// Subscription tier label; selects the configured `TierConstraints`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub capability: Capability,
@@ -362,6 +375,10 @@ pub struct InferenceRequest {
     pub payload: Payload,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<f64>,
+    /// Caller identity for metering/quota. `None` ⇒ unauthenticated (recorded
+    /// without a subject; no quota enforced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,6 +523,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: Some(1.0),
+            auth: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -537,6 +555,7 @@ mod tests {
                 texts: vec!["hello world".to_string()],
             },
             budget: None,
+            auth: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -788,6 +807,7 @@ mod tests {
                 format: "wav".to_string(),
             },
             budget: None,
+            auth: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -822,6 +842,7 @@ mod tests {
                 output_format: AudioFormat::Mp3,
             },
             budget: None,
+            auth: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -932,6 +953,7 @@ mod tests {
                 n: 2,
             },
             budget: None,
+            auth: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1051,6 +1073,7 @@ mod tests {
                 resolution: Some("1080p".to_string()),
             },
             budget: None,
+            auth: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1363,5 +1386,44 @@ mod tests {
             arguments_buffer: String::new(),
         };
         assert!(acc.finalize().is_none());
+    }
+
+    #[test]
+    fn auth_context_roundtrip_and_optional_tier() {
+        let id = Uuid::new_v4();
+        let ctx = AuthContext {
+            subject_id: id,
+            tier: Some("pro".into()),
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: AuthContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subject_id, id);
+        assert_eq!(back.tier.as_deref(), Some("pro"));
+
+        // tier omitted ⇒ None.
+        let back2: AuthContext =
+            serde_json::from_str(&format!("{{\"subject_id\":\"{id}\"}}")).unwrap();
+        assert!(back2.tier.is_none());
+    }
+
+    #[test]
+    fn inference_request_omits_auth_when_none() {
+        // `auth` is skipped when absent, so authenticated and unauthenticated
+        // requests share one wire shape and old payloads still deserialize.
+        let req = InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::Embed {
+                texts: vec!["x".into()],
+            },
+            budget: None,
+            auth: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"auth\""));
+        let back: InferenceRequest = serde_json::from_str(&json).unwrap();
+        assert!(back.auth.is_none());
     }
 }

@@ -1,5 +1,5 @@
 use super::capability::Capability;
-use super::config::FallbackTrigger;
+use super::config::{FallbackTrigger, MeterUnit, Window};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
@@ -14,6 +14,16 @@ pub enum GatewayError {
 
     #[error("budget exceeded: estimated {estimated:.4}, remaining {remaining:.4}")]
     BudgetExceeded { estimated: f64, remaining: f64 },
+
+    /// A subject's subscription quota is exhausted for this unit/window. A hard
+    /// stop (per-subject, not per-provider), so it does not trigger fallback.
+    #[error("quota exceeded: {used} of {limit} {unit:?} used in this {window:?}")]
+    QuotaExceeded {
+        unit: MeterUnit,
+        window: Window,
+        limit: u64,
+        used: u64,
+    },
 
     #[error("timeout after {duration_ms}ms for model '{model}' on adapter '{adapter}'")]
     Timeout {
@@ -92,11 +102,13 @@ impl GatewayError {
             GatewayError::BudgetExceeded { .. } => {
                 triggers.contains(&FallbackTrigger::BudgetExceeded)
             }
-            // Auth, Unsupported, and AllAttemptsFailed never trigger fallback
+            // Auth, Unsupported, AllAttemptsFailed, and Quota (a per-subject hard
+            // stop, not a provider fault) never trigger fallback.
             GatewayError::Authentication { .. }
             | GatewayError::Unsupported { .. }
             | GatewayError::AllAttemptsFailed { .. }
             | GatewayError::NoCandidates { .. }
+            | GatewayError::QuotaExceeded { .. }
             | GatewayError::NotConfigured
             | GatewayError::InvalidConfig(_)
             | GatewayError::Network(_)

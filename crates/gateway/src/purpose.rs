@@ -284,6 +284,7 @@ fn build_step_request(step: &PurposeStep, input_text: &str) -> InferenceRequest 
         chain: None,
         payload,
         budget: None,
+        auth: None,
     }
 }
 
@@ -442,6 +443,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         }
     }
 

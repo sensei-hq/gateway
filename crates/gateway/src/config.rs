@@ -118,6 +118,7 @@ impl GatewayBuilder {
             routers: self.routers,
             models: self.models,
             chains: self.chains,
+            constraints: Default::default(),
         })
     }
 

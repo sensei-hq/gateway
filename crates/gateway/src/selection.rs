@@ -527,6 +527,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         }
     }
 

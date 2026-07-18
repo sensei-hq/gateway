@@ -795,6 +795,7 @@ fn stream_error_code(err: &GatewayError) -> String {
         GatewayError::Authentication { .. } => "authentication".to_string(),
         GatewayError::RateLimit { .. } => "rate_limit".to_string(),
         GatewayError::BudgetExceeded { .. } => "budget_exceeded".to_string(),
+        GatewayError::QuotaExceeded { .. } => "quota_exceeded".to_string(),
         GatewayError::Timeout { .. } => "timeout".to_string(),
         GatewayError::ProviderError { status, .. } => status
             .map(|s| s.to_string())
@@ -903,6 +904,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         }
     }
 
@@ -939,6 +941,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         }
     }
 
@@ -1021,6 +1024,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1049,6 +1053,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         };
         gw.execute(&request).await.unwrap();
 
@@ -1124,6 +1129,7 @@ mod tests {
             routers,
             models,
             chains: HashMap::new(),
+            constraints: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1146,6 +1152,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         };
         let response = gw.execute(&request).await.unwrap();
 
@@ -1231,6 +1238,7 @@ mod tests {
             routers,
             models,
             chains: HashMap::new(),
+            constraints: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1254,6 +1262,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         };
         gw.execute(&request).await.unwrap();
 
@@ -1310,6 +1319,7 @@ mod tests {
             routers,
             models,
             chains: HashMap::new(),
+            constraints: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1333,6 +1343,7 @@ mod tests {
                 n: 1,
             },
             budget: None,
+            auth: None,
         };
         let msg = gw.execute(&request).await.unwrap_err().to_string();
         assert!(
@@ -1393,6 +1404,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         };
 
         let result = gw.execute(&request).await;
@@ -1423,6 +1435,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         };
 
         let response = gw.execute(&request).await.unwrap();
@@ -1603,6 +1616,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         }
     }
 
@@ -1730,6 +1744,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         };
         let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
@@ -1839,6 +1854,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         };
         let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
@@ -1983,6 +1999,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -2270,6 +2287,7 @@ mod tests {
             routers,
             models,
             chains: HashMap::new(),
+            constraints: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -2296,6 +2314,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         };
 
         let events = collect_stream(&gw, &request).await;
@@ -2396,6 +2415,7 @@ mod tests {
             routers,
             models,
             chains,
+            constraints: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -2468,6 +2488,7 @@ mod tests {
                 texts: vec!["hello".to_string()],
             },
             budget: None,
+            auth: None,
         };
 
         match gw.execute_stream(&request).await {
