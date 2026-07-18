@@ -1,15 +1,15 @@
 # Capabilities & Adapters
 
-> **Target-model note.** This page describes the capability-trait model introduced
-> by the **adapter-capability-traits** refactor; until that lands, adapters still
-> use the single `InferenceAdapter` trait — see the design doc
+> This page describes the capability-trait model shipped by the
+> **adapter-capability-traits** refactor (now landed — the old single
+> `InferenceAdapter` trait has been removed). See the design doc
 > ([`docs/design/adapter-capability-traits.md`](../design/adapter-capability-traits.md)).
 
 The gateway routes an `InferenceRequest` to whichever provider can serve its
-`Capability`. The target architecture replaces the one fat `InferenceAdapter`
+`Capability`. The architecture replaces the former fat `InferenceAdapter`
 trait — where `execute` matched on the payload and returned a runtime error for
 unsupported kinds — with **one trait per capability**. An adapter implements only
-the traits it supports, so a capability mismatch on the dispatch path becomes a
+the traits it supports, so a capability mismatch on the dispatch path is a
 compile-time impossibility rather than a runtime `ProviderError`.
 
 ---
