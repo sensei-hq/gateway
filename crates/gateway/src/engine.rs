@@ -1,7 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -13,9 +14,9 @@ use crate::dispatch::{
     to_stt_request, to_tts_request, to_video_request,
 };
 use crate::selection::{ModelSelectionService, SelectionCriteria};
-use crate::store::{CallStatus, GatewayStore, InferenceCall};
+use crate::store::{CallStatus, GatewayStore, InferenceCall, UsageTotals};
 use crate::types::capability::Capability;
-use crate::types::config::GatewayConfig;
+use crate::types::config::{GatewayConfig, MeterUnit, QuotaLimit, Window};
 use crate::types::cost::{Cost, TokenUsage};
 use crate::types::error::GatewayError;
 use crate::types::request::{InferenceRequest, InferenceResponse, Payload, StreamEvent};
@@ -64,6 +65,74 @@ impl Gateway {
         {
             tracing::warn!(error = %e, "failed to record inference call (metering is best-effort)");
         }
+    }
+
+    /// Pre-flight subscription-quota check (AUTH). Refuses the call with
+    /// [`GatewayError::QuotaExceeded`] before any provider is contacted when the
+    /// request's subject has exhausted an applicable configured limit.
+    ///
+    /// No-op (`Ok`) when there is no store, no `request.auth`, or no matching
+    /// tier constraints — so unauthenticated callers and unconfigured tiers
+    /// behave exactly as before. Soft/advisory under concurrency (D3): usage is
+    /// read then checked, so concurrent calls can overshoot by ~the in-flight
+    /// count. `OutputTokens`/`CostUsdMillis` have no pre-call estimate, so those
+    /// caps engage once the recorded usage already crosses the line.
+    async fn check_quota(
+        &self,
+        config: &GatewayConfig,
+        request: &InferenceRequest,
+        input_tokens: u32,
+    ) -> Result<(), GatewayError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let Some(auth) = &request.auth else {
+            return Ok(());
+        };
+
+        // Resolve the tier's constraints: the named tier, else the default.
+        let constraints = auth
+            .tier
+            .as_deref()
+            .and_then(|t| config.constraints.tiers.get(t))
+            .or(config.constraints.default.as_ref());
+        let Some(constraints) = constraints else {
+            return Ok(());
+        };
+
+        // Effective limits = tier-wide quota + this capability's overrides.
+        let mut limits: Vec<&QuotaLimit> = constraints.quota.iter().collect();
+        if let Some(extra) = constraints.per_capability.get(&request.capability) {
+            limits.extend(extra.iter());
+        }
+        if limits.is_empty() {
+            return Ok(());
+        }
+
+        // One usage read per distinct window, reused across its limits.
+        let now = Utc::now();
+        let windows: HashSet<Window> = limits.iter().map(|l| l.window).collect();
+        let mut usage_by_window: HashMap<Window, UsageTotals> = HashMap::new();
+        for w in windows {
+            let usage = store
+                .get_usage_since(auth.subject_id, window_start(now, w))
+                .await?;
+            usage_by_window.insert(w, usage);
+        }
+
+        for limit in &limits {
+            let used = usage_value(&usage_by_window[&limit.window], limit.unit);
+            let this_call = call_estimate(limit.unit, input_tokens);
+            if used.saturating_add(this_call) > limit.limit {
+                return Err(GatewayError::QuotaExceeded {
+                    unit: limit.unit,
+                    window: limit.window,
+                    limit: limit.limit,
+                    used,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Like [`Gateway::new`], but validates `config` first.
@@ -126,6 +195,10 @@ impl Gateway {
             candidates = result.all_candidates.len(),
             "selected candidates for request"
         );
+
+        // Quota pre-flight (AUTH): refuse an over-quota subject before any
+        // provider call. No-op without a store / auth / matching constraints.
+        self.check_quota(&config, request, input_tokens).await?;
 
         // 5. Get fallback triggers from chain (or empty)
         let fallback_triggers = result
@@ -319,8 +392,8 @@ impl Gateway {
                         error_type: None,
                         fallback_sequence: sequence.saturating_sub(1),
                         recorded_at: Utc::now(),
-                        subject_id: None,
-                        tier: None,
+                        subject_id: request.auth.as_ref().map(|a| a.subject_id),
+                        tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
                     })
                     .await;
 
@@ -400,8 +473,8 @@ impl Gateway {
                 error_type: last.error.clone(),
                 fallback_sequence: last.sequence.saturating_sub(1),
                 recorded_at: Utc::now(),
-                subject_id: None,
-                tier: None,
+                subject_id: request.auth.as_ref().map(|a| a.subject_id),
+                tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
             })
             .await;
         }
@@ -495,6 +568,9 @@ impl Gateway {
                 capability: request.capability.clone(),
             });
         }
+
+        // Quota pre-flight (AUTH) — a setup error returned before any stream.
+        self.check_quota(&config, request, input_tokens).await?;
 
         // Owned state moved into the stream (it must be `'static`).
         let candidates = result.all_candidates;
@@ -633,8 +709,8 @@ impl Gateway {
                         error_type: None,
                         fallback_sequence: idx as u8,
                         recorded_at: Utc::now(),
-                        subject_id: None,
-                        tier: None,
+                        subject_id: request.auth.as_ref().map(|a| a.subject_id),
+                        tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
                     });
                     yield StreamEvent::Done {
                         model: candidate.model.clone(),
@@ -811,6 +887,40 @@ fn stream_error_code(err: &GatewayError) -> String {
     }
 }
 
+/// Rolling-window start for a [`Window`]: `now − period`. Week = 7 days,
+/// Month ≈ 30 days (rolling, not calendar-aligned — see the AUTH design D2).
+fn window_start(now: DateTime<Utc>, w: Window) -> DateTime<Utc> {
+    let period = match w {
+        Window::Day => chrono::Duration::days(1),
+        Window::Week => chrono::Duration::days(7),
+        Window::Month => chrono::Duration::days(30),
+    };
+    now - period
+}
+
+/// Read a subject's aggregated usage for a given meter unit.
+fn usage_value(u: &UsageTotals, unit: MeterUnit) -> u64 {
+    match unit {
+        MeterUnit::Requests => u.requests,
+        MeterUnit::InputTokens => u.input_tokens,
+        MeterUnit::OutputTokens => u.output_tokens,
+        MeterUnit::TotalTokens => u.total_tokens,
+        MeterUnit::CostUsdMillis => u.cost_usd_millis,
+    }
+}
+
+/// This call's contribution to a meter unit, known pre-flight. Requests count 1;
+/// input/total tokens use the request estimate; output tokens and dollars are
+/// unknown before the call (0), so those caps are enforced against usage already
+/// on record (a deliberate soft guard — see the AUTH design D3).
+fn call_estimate(unit: MeterUnit, input_tokens: u32) -> u64 {
+    match unit {
+        MeterUnit::Requests => 1,
+        MeterUnit::InputTokens | MeterUnit::TotalTokens => input_tokens as u64,
+        MeterUnit::OutputTokens | MeterUnit::CostUsdMillis => 0,
+    }
+}
+
 /// Estimate input token count from the request payload.
 ///
 /// Rough heuristic: 1 token ~ 4 characters.
@@ -843,11 +953,13 @@ mod tests {
     use super::*;
     use crate::adapters::noop::NoopAdapter;
     use crate::circuit_breaker::CircuitBreakerConfig;
+    use crate::store::InMemoryStore;
     use crate::types::capability::Capability;
     use crate::types::config::{
-        ChainEntry, FallbackChainConfig, FallbackTrigger, GatewayConfig, ModelConfig, RouterConfig,
+        ChainEntry, ConstraintsConfig, FallbackChainConfig, FallbackTrigger, GatewayConfig,
+        MeterUnit, ModelConfig, QuotaLimit, RouterConfig, TierConstraints, Window,
     };
-    use crate::types::request::{Message, MessageRole, Payload};
+    use crate::types::request::{AuthContext, Message, MessageRole, Payload};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1283,6 +1395,150 @@ mod tests {
         register_noop(&gw).await;
         let response = gw.execute(&chat_request()).await.unwrap();
         assert!(!response.attempts.is_empty());
+    }
+
+    // --- AUTH quota enforcement ---
+
+    /// A noop gateway with a store and the given constraints attached.
+    fn constrained_gateway(constraints: ConstraintsConfig, store: Arc<InMemoryStore>) -> Gateway {
+        let mut config = test_config_with_noop();
+        config.constraints = constraints;
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        Gateway::new(config, AdapterRegistry::new(), cb).with_store(store)
+    }
+
+    fn authed(subject: Uuid, tier: Option<&str>) -> InferenceRequest {
+        let mut r = chat_request();
+        r.auth = Some(AuthContext {
+            subject_id: subject,
+            tier: tier.map(Into::into),
+        });
+        r
+    }
+
+    fn requests_per_day(limit: u64) -> Vec<QuotaLimit> {
+        vec![QuotaLimit {
+            unit: MeterUnit::Requests,
+            window: Window::Day,
+            limit,
+        }]
+    }
+
+    #[tokio::test]
+    async fn execute_enforces_request_quota_as_hard_stop() {
+        // Tier "free": 1 request/day. First authed call records one request;
+        // the second is refused pre-flight with QuotaExceeded.
+        let store = Arc::new(InMemoryStore::default());
+        let constraints = ConstraintsConfig {
+            tiers: HashMap::from([(
+                "free".to_string(),
+                TierConstraints {
+                    quota: requests_per_day(1),
+                    per_capability: HashMap::new(),
+                },
+            )]),
+            default: None,
+        };
+        let gw = constrained_gateway(constraints, store.clone());
+        register_noop(&gw).await;
+
+        let subject = Uuid::new_v4();
+        let req = authed(subject, Some("free"));
+
+        gw.execute(&req).await.unwrap(); // within quota, records 1
+        let err = gw.execute(&req).await.unwrap_err(); // exceeds
+        assert!(
+            matches!(
+                err,
+                GatewayError::QuotaExceeded {
+                    unit: MeterUnit::Requests,
+                    window: Window::Day,
+                    limit: 1,
+                    used: 1,
+                }
+            ),
+            "expected QuotaExceeded, got {err:?}"
+        );
+        // The blocked call contacted no provider, so only the first recorded.
+        let usage = store
+            .get_usage_since(subject, Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(usage.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_without_auth_bypasses_quota() {
+        // A default tier exists, but an unauthenticated request is never
+        // quota-checked — recorded without a subject, always allowed.
+        let store = Arc::new(InMemoryStore::default());
+        let constraints = ConstraintsConfig {
+            tiers: HashMap::new(),
+            default: Some(TierConstraints {
+                quota: requests_per_day(1),
+                per_capability: HashMap::new(),
+            }),
+        };
+        let gw = constrained_gateway(constraints, store);
+        register_noop(&gw).await;
+        for _ in 0..3 {
+            gw.execute(&chat_request()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_uses_default_tier_when_tier_absent() {
+        // The request's tier isn't in the catalog, so the default applies.
+        let store = Arc::new(InMemoryStore::default());
+        let constraints = ConstraintsConfig {
+            tiers: HashMap::new(),
+            default: Some(TierConstraints {
+                quota: requests_per_day(1),
+                per_capability: HashMap::new(),
+            }),
+        };
+        let gw = constrained_gateway(constraints, store);
+        register_noop(&gw).await;
+
+        let subject = Uuid::new_v4();
+        let req = authed(subject, Some("no-such-tier"));
+        gw.execute(&req).await.unwrap();
+        let err = gw.execute(&req).await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::QuotaExceeded { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_enforces_per_capability_override() {
+        // No tier-wide quota, but a per-capability cap on TextChat of 1/day.
+        let store = Arc::new(InMemoryStore::default());
+        let constraints = ConstraintsConfig {
+            tiers: HashMap::from([(
+                "free".to_string(),
+                TierConstraints {
+                    quota: Vec::new(),
+                    per_capability: HashMap::from([(Capability::TextChat, requests_per_day(1))]),
+                },
+            )]),
+            default: None,
+        };
+        let gw = constrained_gateway(constraints, store);
+        register_noop(&gw).await;
+
+        let subject = Uuid::new_v4();
+        let req = authed(subject, Some("free"));
+        gw.execute(&req).await.unwrap();
+        let err = gw.execute(&req).await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::QuotaExceeded { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
