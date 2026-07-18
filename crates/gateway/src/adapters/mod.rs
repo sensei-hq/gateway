@@ -12,6 +12,7 @@ pub mod luma;
 pub mod noop;
 pub mod ollama;
 pub mod openai;
+pub mod openai_compat;
 pub mod recraft;
 pub mod replicate;
 pub mod runway;
