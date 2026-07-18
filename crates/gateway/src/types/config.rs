@@ -93,6 +93,64 @@ pub struct FallbackChainConfig {
     pub fallback_triggers: Vec<FallbackTrigger>,
 }
 
+// ---------------------------------------------------------------------------
+// Subscription/quota constraints (AUTH). Operator-configured, provided at
+// gateway init alongside routers/models/chains. Empty ⇒ no enforcement.
+// See docs/design/subscription-quota-auth.md.
+// ---------------------------------------------------------------------------
+
+/// The unit a [`QuotaLimit`] is counted in. Dollars are integer milli-USD
+/// (`cost_usd × 1000`) so quota counters stay integer; the f64 `Cost` USD path
+/// is unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeterUnit {
+    Requests,
+    InputTokens,
+    OutputTokens,
+    TotalTokens,
+    CostUsdMillis,
+}
+
+/// Rolling window a [`QuotaLimit`] applies over (start = `now − period`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Window {
+    Day,
+    Week,
+    Month,
+}
+
+/// A single "at most `limit` of `unit` per `window`" cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaLimit {
+    pub unit: MeterUnit,
+    pub window: Window,
+    pub limit: u64,
+}
+
+/// The constraints for one subscription tier: limits that apply across all
+/// modalities, plus optional per-capability (modality) additions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TierConstraints {
+    #[serde(default)]
+    pub quota: Vec<QuotaLimit>,
+    #[serde(default)]
+    pub per_capability: HashMap<Capability, Vec<QuotaLimit>>,
+}
+
+/// Operator-configured constraint catalog. Empty ⇒ nothing is enforced
+/// (today's behaviour). A request's `AuthContext.tier` selects a `TierConstraints`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConstraintsConfig {
+    /// Per-tier constraint sets, keyed by tier label.
+    #[serde(default)]
+    pub tiers: HashMap<String, TierConstraints>,
+    /// Applied when a request carries no tier, or a tier absent from `tiers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<TierConstraints>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default)]
@@ -101,6 +159,9 @@ pub struct GatewayConfig {
     pub models: HashMap<String, ModelConfig>,
     #[serde(default)]
     pub chains: HashMap<String, FallbackChainConfig>,
+    /// Subscription/quota constraints (AUTH). Default empty ⇒ no enforcement.
+    #[serde(default)]
+    pub constraints: ConstraintsConfig,
 }
 
 #[cfg(test)]
@@ -268,5 +329,64 @@ mod tests {
         // "api_key_env" would contain "api_key" as a substring, so check the
         // exact JSON key form instead.
         assert!(!json.contains("\"api_key\":"));
+    }
+
+    #[test]
+    fn constraints_default_when_absent() {
+        // A config without a `constraints` key deserializes to an empty catalog
+        // (⇒ no enforcement), so existing configs keep working unchanged.
+        let json = r#"{"routers":{},"models":{},"chains":{}}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.constraints.tiers.is_empty());
+        assert!(cfg.constraints.default.is_none());
+    }
+
+    #[test]
+    fn constraints_config_roundtrip_with_per_capability() {
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "pro".to_string(),
+            TierConstraints {
+                quota: vec![
+                    QuotaLimit {
+                        unit: MeterUnit::Requests,
+                        window: Window::Day,
+                        limit: 1000,
+                    },
+                    QuotaLimit {
+                        unit: MeterUnit::TotalTokens,
+                        window: Window::Week,
+                        limit: 1_000_000,
+                    },
+                ],
+                per_capability: HashMap::from([(
+                    Capability::ImageGenerate,
+                    vec![QuotaLimit {
+                        unit: MeterUnit::Requests,
+                        window: Window::Day,
+                        limit: 50,
+                    }],
+                )]),
+            },
+        );
+        let cfg = GatewayConfig {
+            constraints: ConstraintsConfig {
+                tiers,
+                default: None,
+            },
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        // Enum units/windows and the Capability map key serialize snake_case.
+        assert!(json.contains("\"requests\"") && json.contains("\"day\""));
+        assert!(json.contains("image_generate"));
+
+        let back: GatewayConfig = serde_json::from_str(&json).unwrap();
+        let pro = back.constraints.tiers.get("pro").expect("pro tier");
+        assert_eq!(pro.quota.len(), 2);
+        assert_eq!(pro.quota[0].unit, MeterUnit::Requests);
+        assert_eq!(pro.quota[1].window, Window::Week);
+        assert_eq!(pro.per_capability[&Capability::ImageGenerate][0].limit, 50);
     }
 }

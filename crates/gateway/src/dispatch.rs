@@ -235,6 +235,7 @@ mod tests {
                 tools: Vec::new(),
             },
             budget: None,
+            auth: None,
         }
     }
 
@@ -277,6 +278,7 @@ mod tests {
                 texts: vec!["x".into()],
             },
             budget: None,
+            auth: None,
         };
         assert!(to_chat_request(&ir, None).is_err());
     }
