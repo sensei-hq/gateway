@@ -83,6 +83,47 @@ Notes:
 4. Gate: default build unaffected; `cargo build/test -p gateway-embedded --features hf-download`
    green; clippy `-D warnings` clean.
 
+## 4a. Phase 2 — resource pre-flight + pull-on-missing (requested 2026-07-18)
+
+Two additions on top of the base puller:
+
+### Resource pre-flight (`check_fit`) — fail before a doomed download
+A model must not be downloaded/loaded if it can't run on the machine (e.g. a ~30 GB
+model on 8 GB RAM, or insufficient disk).
+- **Model size** is obtained from HF **without downloading** — hf-hub repo info /
+  siblings sizes, or a `HEAD` on the resolve URL (`Content-Length`). Sum across `files`.
+- **Machine resources** via the `sysinfo` crate (behind `hf-download`): total + available
+  RAM, and free disk on the filesystem holding the managed root.
+- **Fit rule (heuristic, documented as approximate):**
+  - `need_disk = size * 1.05`; error `WontFit` if `> available_disk`.
+  - `need_ram ≈ size * 1.2` (GGUF loads ≈ file size resident + KV/context margin); error
+    `WontFit` if `> total_ram`. RAM need truly depends on quant + context length, so this
+    is a *gross* guard that catches the "won't remotely fit" cases, not a precise budget.
+- API: `pub struct FitReport { model_bytes, disk_available, ram_total, ram_available, fits, reason: Option<String> }`
+  and `async fn check_fit(&self, spec: &PullSpec) -> Result<FitReport, PullError>`.
+  **The guard lives INSIDE `pull` (mandatory, not an optional caller step):** `pull` calls
+  `check_fit` FIRST and returns `PullError::WontFit(String)` **before any network I/O / any
+  download** (no point fetching a 30 GB file that can't run), with a clear message, e.g. *"model 'X' is ~18.0 GB and needs ~21.6 GB RAM; this
+  machine has 8.0 GB — not usable"* or *"insufficient disk for 'X': need 18.9 GB, 5.2 GB free
+  at <managed root>"*. `check_fit` is public so a UI can pre-check before offering a pull.
+- New `PullError::WontFit(String)` variant.
+
+### Pull-on-missing (`PullingResolver`) — config-driven fetch on first use
+A `ModelResolver` that wraps `(inner: ManagedResolver, puller: HfHubPuller, specs:
+HashMap<String /*id*/, PullSpec>)`:
+- `resolve(id)`: if `inner` already has it → return it; else if a `PullSpec` is registered
+  for `id` → run `check_fit` then `pull` (which registers it into the managed store) and
+  return the entry; else `Ok(None)`.
+- `WontFit`/download errors surface as `ResolveError` (add a `ResolveError` variant, or map
+  to the existing error type) so the caller gets the actionable "won't run on this machine"
+  message rather than a silent miss.
+- The `specs` map IS the "config": the consumer/daemon populates it from the operator's
+  model config (each local model that has an HF source), so a configured-but-absent model
+  is fetched — and resource-checked — the first time an embedded engine asks for it.
+
+Build order: land the base puller (Phase 1) → add `sysinfo` + `check_fit` + `WontFit` →
+add `PullingResolver`. All under `#[cfg(feature = "hf-download")]`.
+
 ## 5. Non-goals
 - No safetensors, no auto-quant-selection, no GGUF→ONNX conversion. No UI (consumer drives
   `PullSpec`). No quota/subscription (AUTH).
