@@ -1,6 +1,8 @@
 node_modules
 /build
 /.svelte-kit
+# docs content is synced from ../docs/llms at build (single source of truth)
+/src/lib/content
 /package
 .env
 .env.*

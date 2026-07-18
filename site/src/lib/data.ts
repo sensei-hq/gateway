@@ -16,7 +16,7 @@ export const nav = {
 		{ label: 'Crates', href: '/#crates' },
 		{ label: 'Usage', href: '/#usage' },
 		{ label: 'Architecture', href: '/#architecture' },
-		{ label: 'Versioning', href: '/#versioning' },
+		{ label: 'Docs', href: '/docs' },
 		{ label: 'GitHub', href: REPO }
 	],
 	cta: { label: 'Get started', href: '/#start' }
@@ -30,7 +30,7 @@ export const hero = {
 	badge: ['Rust', 'LLM inference routing'],
 	title: 'One routing engine for every model provider.',
 	lede: 'Fallback chains, circuit breakers and budget management across ~16 cloud providers — plus in-process local models — behind one trait-based routing config.',
-	primaryCta: { label: 'Get started guide', href: REPO },
+	primaryCta: { label: 'Get started guide', href: '/docs/quickstart' },
 	secondaryCta: { label: 'View on GitHub', href: REPO },
 	code: { filename: 'Cargo.toml', source: INSTALL }
 };
@@ -165,7 +165,7 @@ export const versioning = {
 export const start = {
 	title: 'Start routing through gateway.',
 	lede: 'Add the git dependency, name a fallback chain, and let the engine handle the rest.',
-	primaryCta: { label: 'Get started guide', href: REPO },
+	primaryCta: { label: 'Get started guide', href: '/docs/quickstart' },
 	secondaryCta: { label: 'Star on GitHub', href: REPO }
 };
 
@@ -182,9 +182,10 @@ export const footer = {
 		{
 			title: 'Resources',
 			links: [
+				{ label: 'Docs', href: '/docs' },
+				{ label: 'llms.txt', href: '/llms.txt' },
 				{ label: 'GitHub', href: REPO },
-				{ label: 'Releases', href: `${REPO}/releases` },
-				{ label: 'MIT License', href: REPO }
+				{ label: 'Releases', href: `${REPO}/releases` }
 			]
 		}
 	],
