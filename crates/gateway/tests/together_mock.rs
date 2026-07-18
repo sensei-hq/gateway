@@ -91,7 +91,7 @@ async fn together_chat_happy_path() {
     });
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .and(header("authorization", "Bearer test-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&canned))
         .mount(&server)
@@ -132,7 +132,7 @@ async fn together_chat_default_model_and_no_usage() {
     });
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&canned))
         .mount(&server)
         .await;
@@ -162,7 +162,7 @@ async fn together_chat_401_maps_to_authentication() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
         .mount(&server)
         .await;
@@ -182,7 +182,7 @@ async fn together_chat_403_maps_to_authentication() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
         .mount(&server)
         .await;
@@ -202,7 +202,7 @@ async fn together_chat_429_maps_to_rate_limit() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
         .mount(&server)
         .await;
@@ -222,7 +222,7 @@ async fn together_chat_500_maps_to_provider_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
         .mount(&server)
         .await;
@@ -250,7 +250,7 @@ async fn together_chat_bad_json_maps_to_provider_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
         .mount(&server)
         .await;
@@ -286,7 +286,7 @@ async fn together_image_happy_path() {
     });
 
     Mock::given(method("POST"))
-        .and(path("/images/generations"))
+        .and(path("/v1/images/generations"))
         .and(header("authorization", "Bearer test-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&canned))
         .mount(&server)
@@ -321,7 +321,7 @@ async fn together_image_b64_json_variant() {
     });
 
     Mock::given(method("POST"))
-        .and(path("/images/generations"))
+        .and(path("/v1/images/generations"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&canned))
         .mount(&server)
         .await;
@@ -345,7 +345,7 @@ async fn together_image_401_maps_to_authentication() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/images/generations"))
+        .and(path("/v1/images/generations"))
         .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
         .mount(&server)
         .await;
@@ -368,7 +368,7 @@ async fn together_image_429_maps_to_rate_limit() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/images/generations"))
+        .and(path("/v1/images/generations"))
         .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
         .mount(&server)
         .await;
@@ -391,7 +391,7 @@ async fn together_image_500_maps_to_provider_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/images/generations"))
+        .and(path("/v1/images/generations"))
         .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
         .mount(&server)
         .await;
@@ -422,7 +422,7 @@ async fn together_image_bad_json_maps_to_provider_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/images/generations"))
+        .and(path("/v1/images/generations"))
         .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
         .mount(&server)
         .await;
@@ -486,7 +486,7 @@ async fn together_from_config_executes_chat() {
     });
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&canned))
         .mount(&server)
         .await;
@@ -517,7 +517,7 @@ async fn together_stream_happy_path() {
     );
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .and(header("authorization", "Bearer test-key"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -551,7 +551,7 @@ async fn together_stream_401_maps_to_authentication() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
         .mount(&server)
         .await;
