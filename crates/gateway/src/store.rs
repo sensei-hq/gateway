@@ -56,6 +56,18 @@ pub struct StoredTrace {
     pub created_at: DateTime<Utc>,
 }
 
+/// A subject's aggregated usage over a window, in the units the AUTH quota
+/// enforcer checks. Dollars are integer milli-USD (`cost_usd × 1000`, rounded)
+/// so quota counters stay integer while the f64 `Cost` USD path is untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_millis: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -72,6 +84,15 @@ pub trait GatewayStore: Send + Sync {
         &self,
         since: DateTime<Utc>,
     ) -> Result<Vec<(String, f64)>, GatewayError>;
+
+    /// Aggregate a subject's usage since `since` (a rolling-window start), for
+    /// AUTH quota enforcement. Counts only calls attributed to `subject_id`
+    /// (`InferenceCall::subject_id`); an unknown subject yields zeroes.
+    async fn get_usage_since(
+        &self,
+        subject_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<UsageTotals, GatewayError>;
 
     async fn insert_execution_trace(&self, trace: &StoredTrace) -> Result<Uuid, GatewayError>;
     async fn get_execution_trace(&self, id: Uuid) -> Result<Option<StoredTrace>, GatewayError>;
@@ -132,6 +153,28 @@ impl GatewayStore for InMemoryStore {
         let mut result: Vec<(String, f64)> = map.into_iter().collect();
         result.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(result)
+    }
+
+    async fn get_usage_since(
+        &self,
+        subject_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<UsageTotals, GatewayError> {
+        let calls = self.calls.lock().unwrap();
+        let mut totals = UsageTotals::default();
+        for c in calls
+            .iter()
+            .filter(|c| c.subject_id == Some(subject_id) && c.recorded_at >= since)
+        {
+            let input = c.input_tokens.unwrap_or(0) as u64;
+            let output = c.output_tokens.unwrap_or(0) as u64;
+            totals.requests += 1;
+            totals.input_tokens += input;
+            totals.output_tokens += output;
+            totals.total_tokens += input + output;
+            totals.cost_usd_millis += (c.cost_usd.max(0.0) * 1000.0).round() as u64;
+        }
+        Ok(totals)
     }
 
     async fn insert_execution_trace(&self, trace: &StoredTrace) -> Result<Uuid, GatewayError> {
@@ -380,6 +423,51 @@ mod tests {
 
         assert!((sonnet.1 - 0.03).abs() < f64::EPSILON);
         assert!((gpt.1 - 0.05).abs() < f64::EPSILON);
+    }
+
+    // 7b. Usage aggregation is scoped to the subject and the window.
+    #[tokio::test]
+    async fn in_memory_usage_since_filters_by_subject_and_window() {
+        let store = InMemoryStore::default();
+        let subject = Uuid::new_v4();
+        let now = Utc::now();
+
+        // make_call records 100 input + 50 output tokens each.
+        let mut c1 = make_call(None, "m", 0.01, now);
+        c1.subject_id = Some(subject);
+        let mut c2 = make_call(None, "m", 0.02, now);
+        c2.subject_id = Some(subject);
+        // Different subject — excluded.
+        let mut c3 = make_call(None, "m", 0.05, now);
+        c3.subject_id = Some(Uuid::new_v4());
+        // Same subject but before the window — excluded.
+        let mut c4 = make_call(None, "m", 0.04, now - Duration::hours(2));
+        c4.subject_id = Some(subject);
+
+        for c in [&c1, &c2, &c3, &c4] {
+            store.insert_inference_call(c).await.unwrap();
+        }
+
+        let usage = store
+            .get_usage_since(subject, now - Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(usage.requests, 2);
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.total_tokens, 300);
+        assert_eq!(usage.cost_usd_millis, 30); // round(0.01*1000)+round(0.02*1000)
+    }
+
+    // 7c. Unknown subject aggregates to zero.
+    #[tokio::test]
+    async fn in_memory_usage_since_unknown_subject_is_zero() {
+        let store = InMemoryStore::default();
+        let usage = store
+            .get_usage_since(Uuid::new_v4(), Utc::now() - Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(usage, UsageTotals::default());
     }
 
     // 8. Insert and get trace
