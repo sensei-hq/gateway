@@ -34,10 +34,9 @@
 <a id="top"></a>
 
 <!-- HERO -->
-<section class="relative overflow-hidden">
-	<div class="pointer-events-none absolute inset-0 bg-grid mask-fade-b opacity-50"></div>
+<section>
 	<div
-		class="relative mx-auto flex max-w-content flex-col items-center gap-6 px-6 pb-16 pt-20 text-center lg:pt-28"
+		class="mx-auto flex max-w-content flex-col items-center gap-6 px-6 pb-16 pt-20 text-center lg:pt-28"
 	>
 		<div
 			class="inline-flex items-center gap-2 rounded-full border border-accent-line bg-accent-soft px-3 py-1 text-sm font-semibold text-primary"
@@ -78,7 +77,7 @@
 </div>
 
 <!-- FEATURES -->
-<section id="features" class="grid-section">
+<section id="features">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={features.eyebrow} title={features.title} lede={features.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -90,7 +89,7 @@
 </section>
 
 <!-- CRATES -->
-<section id="crates" class="grid-section border-y border-paper-edge bg-paper-soft">
+<section id="crates" class="border-y border-paper-edge bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={crates.eyebrow} title={crates.title} />
 		<div class="mt-12 grid gap-6 md:grid-cols-2">
@@ -102,7 +101,7 @@
 </section>
 
 <!-- USAGE -->
-<section id="usage" class="grid-section">
+<section id="usage">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={usage.eyebrow} title={usage.title} lede={usage.lede} />
 		<div class="mt-10">
@@ -113,7 +112,7 @@
 </section>
 
 <!-- ARCHITECTURE -->
-<section id="architecture" class="grid-section border-y border-paper-edge bg-paper-soft">
+<section id="architecture" class="border-y border-paper-edge bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={architecture.eyebrow} title={architecture.title} />
 		<div class="mt-12">
@@ -124,7 +123,7 @@
 </section>
 
 <!-- CONSUMERS -->
-<section id="consumers" class="grid-section">
+<section id="consumers">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={consumers.eyebrow} title={consumers.title} lede={consumers.lede} />
 		<div class="mt-12 grid gap-6 sm:grid-cols-2">
@@ -177,7 +176,7 @@
 </section>
 
 <!-- CTA -->
-<section id="start" class="grid-section">
+<section id="start">
 	<div
 		class="mx-auto flex max-w-content flex-col items-center gap-5 px-6 py-section text-center"
 	>
