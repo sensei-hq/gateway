@@ -39,14 +39,26 @@ verified in context; this doc tracks each to a fix.
 | 5 | bedrock ignores all `RouterConfig` + false module doc | Fix doc; wire headers+timeout via SDK `customize()` | ✅ `3623517` |
 | 6 | bedrock silently drops invalid-base64 image | Return `GatewayError` on decode failure | ✅ `3623517` |
 | 7 | `JobConfig` 5-min ceiling hardcoded (async media) | `JobConfig::from_config`; all 8 call sites | ✅ `3623517` |
-| 8 | noop `success:false` degraded signal dropped by refactor | Typed `degraded: bool` → `InferenceResponse.success` | ⏳ in progress |
-| 9 | `AllAttemptsFailed` flattens `Vec<Attempt>` to a string | Carry structured attempts on the terminal error | ⬜ pending |
-| 10 | `Gateway::new`/`update_config` bypass `GatewayBuilder::validate` | Validate on construct/update | ⬜ pending |
-| 11 | ~no `tracing` in the hot path | Instrument execute/select/fallback | ⬜ pending |
-| 12 | Streaming unreachable via public API; `StreamEvent` dead | `Gateway::execute_stream` emitting `StreamEvent` (v1) | ⬜ pending |
+| 8 | noop `success:false` degraded signal dropped by refactor | Typed `degraded: bool` → `InferenceResponse.success` | ✅ `093012c` |
+| 9 | `AllAttemptsFailed` flattens `Vec<Attempt>` to a string | Added `attempts_detail: Vec<Attempt>` on the terminal error | ✅ `1a22cb4` |
+| 10 | `Gateway::new`/`update_config` bypass `GatewayBuilder::validate` | Added validating `try_new`/`try_update_config` + `InvalidConfig` | ✅ `1a22cb4` |
+| 11 | ~no `tracing` in the hot path | `#[instrument]` on execute + select/attempt/fallback events | ✅ `1a22cb4` |
+| 12 | Streaming unreachable via public API; `StreamEvent` dead | `Gateway::execute_stream` emitting `StreamEvent` (v1) | ⬜ pending (last item) |
 | 13 | Burn rate / `GatewayStore` unwired | Optional store on `Gateway`; persist calls | ⬜ **AUTH track** |
-| 14 | Security: deps, static analysis, secret-leak surface | `cargo audit` + semgrep + redacting `Debug(RouterConfig)` | ⬜ pending |
+| 14 | Security: deps, static analysis, secret-leak surface | 2 RUSTSEC vulns patched (consumers update locks); semgrep clean; redacting `Debug(RouterConfig)` | ✅ `f8f0d79` |
 | 15 | `ExecutionTrace` / `skipped` diagnostics unused | Build+surface `ExecutionTrace` incl. `skipped` | ⬜ pending (with 9/12) |
+
+## Security pass (`f8f0d79`)
+
+- `cargo audit`: 2 vulnerabilities found, both transitive and now fixed by bumping the
+  lock — **quinn-proto → 0.11.16** (RUSTSEC-2026-0185, HIGH remote memory exhaustion)
+  and **crossbeam-epoch → 0.9.20** (RUSTSEC-2026-0204). `Cargo.lock` is gitignored
+  (library convention), so **consumers (sensei/strategos) must run
+  `cargo update -p quinn-proto -p crossbeam-epoch`** in their own repos to ship the fix.
+- Accepted (informational, transitive): `number_prefix`/`paste` unmaintained,
+  `anyhow` unsound `downcast_mut` (RUSTSEC-2025-0119 / 2024-0436 / 2026-0190).
+- `semgrep --config auto`: clean (0 findings).
+- Secret-leak surface: `RouterConfig`'s `api_key` now redacted in `Debug`.
 
 ## Notes
 
