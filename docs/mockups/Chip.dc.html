@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</helmet>
+<sc-if value="{{ isAccent }}">
+  <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent,#2f7ff2);background:var(--accent-wash,#eef3fe);border:1px solid var(--accent-line,#dbe7fe);padding:3px 10px;border-radius:100px;white-space:nowrap">{{ label }}</span>
+</sc-if>
+<sc-if value="{{ isGray }}" hint-placeholder-val="{{ true }}">
+  <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ink-muted,#565c6b);background:var(--chip,#eef0f4);padding:4px 10px;border-radius:6px;white-space:nowrap">{{ label }}</span>
+</sc-if>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:120,&quot;height&quot;:28},&quot;label&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;tokio&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;tone&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;gray&quot;,&quot;options&quot;:[&quot;gray&quot;,&quot;accent&quot;],&quot;tsType&quot;:&quot;string&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    const p = this.props || {};
+    const accent = (p.tone || 'gray') === 'accent';
+    return { label: p.label || '', isAccent: accent, isGray: !accent };
+  }
+}
+</script>
+</body>
+</html>

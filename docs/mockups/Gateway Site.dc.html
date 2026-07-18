@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  :root{
+    --paper:#fbfbfd;--card:#ffffff;--panel:#fbfbfd;--stripe:#f4f5f8;
+    --ink:#12141a;--ink-muted:#565c6b;--ink-faint:#8b91a0;
+    --line:rgba(18,20,26,.09);--line-strong:rgba(18,20,26,.14);--hairline:rgba(18,20,26,.07);
+    --accent:#2f7ff2;--accent-strong:#1c66e0;
+    --accent-wash:#eef3fe;--accent-line:#dbe7fe;--chip:#eef0f4;
+    --nav:rgba(251,251,253,.82);
+  }
+  [data-theme="dark"]{
+    --paper:#0b0d11;--card:#12151b;--panel:#0f1319;--stripe:rgba(255,255,255,.045);
+    --ink:#eef1f5;--ink-muted:#9aa4b2;--ink-faint:#6b7280;
+    --line:rgba(255,255,255,.10);--line-strong:rgba(255,255,255,.18);--hairline:rgba(255,255,255,.08);
+    --accent-wash:rgba(47,127,242,.15);--accent-line:rgba(47,127,242,.35);--chip:rgba(255,255,255,.06);
+    --nav:rgba(11,13,17,.85);
+  }
+  [data-theme="light"]{
+    --paper:#fbfbfd;--card:#ffffff;--panel:#fbfbfd;--stripe:#f4f5f8;
+    --ink:#12141a;--ink-muted:#565c6b;--ink-faint:#8b91a0;
+    --line:rgba(18,20,26,.09);--line-strong:rgba(18,20,26,.14);--hairline:rgba(18,20,26,.07);
+    --accent-wash:#eef3fe;--accent-line:#dbe7fe;--chip:#eef0f4;
+    --nav:rgba(251,251,253,.82);
+  }
+:root{
+    --fs-xs:12px;--fs-sm:13px;--fs-base:14px;--fs-md:15px;--fs-lg:16px;--fs-xl:18px;--fs-2xl:20px;--fs-3xl:24px;--fs-4xl:38px;--fs-5xl:48px;--fs-6xl:64px;
+    --fw-medium:500;--fw-semibold:600;--fw-bold:700;
+    --r-sm:8px;--r-md:12px;--r-lg:16px;--r-pill:100px;
+    --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;--sp-7:28px;--sp-8:32px;--sp-9:40px;--sp-10:48px;--sp-11:56px;--sp-12:64px;--sp-section:92px;
+  }
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{color:var(--accent-strong)}
+  ::selection{background:#cfe0ff}
+  h1,h2,h3{font-family:"Space Grotesk",system-ui,sans-serif;letter-spacing:-.02em;margin:0;color:var(--ink)}
+  .mono{font-family:"JetBrains Mono",ui-monospace,monospace}
+  @keyframes archflow{to{stroke-dashoffset:-30}}
+  #arch-diagram svg{width:100%;height:auto;overflow:visible}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+</helmet>
+
+<div data-theme="{{ theme }}" style="min-height:100vh;background:var(--paper);transition:background .2s ease,color .2s ease">
+
+  <!-- NAV -->
+  <header style="position:sticky;top:0;z-index:20;background:var(--nav);backdrop-filter:saturate(140%) blur(12px);border-bottom:1px solid var(--hairline)">
+    <div style="max-width:1140px;margin:0 auto;padding:var(--sp-4) var(--sp-8);display:flex;align-items:center;justify-content:space-between;gap:var(--sp-6)">
+      <a href="#top" style="display:flex;align-items:center;gap:var(--sp-3);color:var(--ink)">
+        <span style="width:28px;height:28px;border-radius:var(--r-sm);background:#2f7ff2;display:flex;align-items:center;justify-content:center;color:#fff;font-family:'JetBrains Mono',monospace;font-weight:var(--fw-semibold);font-size:var(--fs-lg);box-shadow:0 2px 8px rgba(47,127,242,.35)">g</span>
+        <span style="font-family:'Space Grotesk',sans-serif;font-weight:var(--fw-semibold);font-size:var(--fs-xl);letter-spacing:-.01em">gateway</span>
+      </a>
+      <nav style="display:flex;align-items:center;gap:var(--sp-7);font-size:var(--fs-base);font-weight:var(--fw-medium)">
+        <a href="#features" style="color:var(--ink-muted)">Features</a>
+        <a href="#crates" style="color:var(--ink-muted)">Crates</a>
+        <a href="#usage" style="color:var(--ink-muted)">Usage</a>
+        <a href="#versioning" style="color:var(--ink-muted)">Versioning</a>
+        <a href="https://github.com/sensei-hq/gateway" style="color:var(--ink-muted)">GitHub</a>
+        <button onClick="{{ toggleTheme }}" title="Toggle theme" aria-label="Toggle theme" style="{{ iconBtnStyle }}" style-hover="{{ iconBtnHover }}">{{ themeIcon }}</button>
+        <dc-import name="Button" href="#start" label="Get started" variant="primary" size="sm" arrow="{{ true }}" hint-size="140px,38px"></dc-import>
+      </nav>
+    </div>
+  </header>
+
+  <a id="top"></a>
+
+  <!-- HERO -->
+  <section style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8) var(--sp-12);text-align:center;display:flex;flex-direction:column;align-items:center">
+    <div style="display:inline-flex;align-items:center;gap:var(--sp-2);font-size:var(--fs-sm);font-weight:var(--fw-semibold);color:var(--accent);background:var(--accent-wash);border:1px solid var(--accent-line);padding:var(--sp-1) var(--sp-3);border-radius:var(--r-pill)">
+      <span class="mono">Rust</span><span style="color:#a9bce6">·</span>LLM inference routing
+    </div>
+    <h1 style="font-size:var(--fs-6xl);line-height:1.02;font-weight:var(--fw-semibold);margin:var(--sp-6) 0 0;max-width:16ch">One routing engine for every model provider.</h1>
+    <p style="font-size:var(--fs-xl);line-height:1.55;color:var(--ink-muted);margin:var(--sp-6) 0 0;max-width:56ch">Fallback chains, circuit breakers and budget management across ~15 cloud providers — plus in-process local models — behind one trait-based routing config.</p>
+    <div style="display:flex;gap:var(--sp-3);margin-top:var(--sp-8);flex-wrap:wrap;justify-content:center">
+      <dc-import name="Button" href="#start" label="Get started guide" variant="primary" size="md" arrow="{{ true }}" hint-size="210px,48px"></dc-import>
+      <dc-import name="Button" href="https://github.com/sensei-hq/gateway" label="View on GitHub" variant="secondary" size="md" hint-size="180px,48px"></dc-import>
+    </div>
+    <div style="width:100%;max-width:720px;margin-top:var(--sp-10);text-align:left">
+      <dc-import name="CodeWindow" filename="Cargo.toml" code="{{ installCode }}" dark="{{ codeDark }}" copyable="{{ true }}" hint-size="100%,220px"></dc-import>
+    </div>
+  </section>
+
+  <!-- PROOF STRIP -->
+  <div style="border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline);background:var(--card)">
+    <div class="mono" style="max-width:1140px;margin:0 auto;padding:var(--sp-4) var(--sp-8);display:flex;align-items:center;gap:var(--sp-6);flex-wrap:wrap;font-size:var(--fs-sm);color:var(--ink-faint)">
+      <span style="color:var(--ink-muted);font-weight:var(--fw-medium)">Provider-agnostic:</span>
+      <span>openai</span><span>anthropic</span><span>google</span><span>mistral</span><span>cohere</span><span>groq</span><span>bedrock</span><span>+ local · llama.cpp · onnx</span>
+    </div>
+  </div>
+
+  <!-- FEATURES -->
+  <section id="features" style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8)">
+    <div style="max-width:60ch">
+      <dc-import name="Eyebrow" label="The routing engine" hint-size="180px,18px"></dc-import>
+      <h2 style="font-size:var(--fs-4xl);font-weight:var(--fw-semibold);margin:var(--sp-4) 0 0;line-height:1.1">Everything a request needs to reach a healthy model.</h2>
+      <p style="font-size:var(--fs-lg);color:var(--ink-muted);margin:var(--sp-4) 0 0;line-height:1.55">No database of its own, no lock-in. HTTP via <span class="mono" style="font-size:var(--fs-md)">reqwest</span>/<span class="mono" style="font-size:var(--fs-md)">rustls</span>, async via <span class="mono" style="font-size:var(--fs-md)">tokio</span>.</p>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:var(--sp-5);margin-top:var(--sp-10)">
+      <sc-for list="{{ features }}" as="f" hint-placeholder-count="6">
+        <div style="background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp-7) var(--sp-6)" style-hover="border-color:rgba(47,127,242,.4);box-shadow:0 8px 30px -16px rgba(47,127,242,.4)">
+          <div class="mono" style="font-size:var(--fs-xs);color:var(--accent);font-weight:var(--fw-semibold)">{{ f.tag }}</div>
+          <h3 style="font-size:var(--fs-xl);font-weight:var(--fw-semibold);margin:var(--sp-3) 0 var(--sp-2)">{{ f.title }}</h3>
+          <p style="font-size:var(--fs-base);line-height:1.6;color:var(--ink-muted);margin:0">{{ f.body }}</p>
+        </div>
+      </sc-for>
+    </div>
+  </section>
+
+  <!-- CRATES -->
+  <section id="crates" style="background:var(--card);border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline)">
+    <div style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8)">
+      <dc-import name="Eyebrow" label="Two crates" hint-size="120px,18px"></dc-import>
+      <h2 style="font-size:var(--fs-4xl);font-weight:var(--fw-semibold);margin:var(--sp-4) 0 0;line-height:1.1">Cloud and local, one config.</h2>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-6);margin-top:var(--sp-10)">
+        <div style="border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp-8);background:var(--panel)">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3)">
+            <span class="mono" style="font-size:var(--fs-xl);font-weight:var(--fw-semibold);color:var(--ink)">gateway</span>
+            <dc-import name="Chip" label="v0.2.18" tone="accent" hint-size="72px,24px"></dc-import>
+          </div>
+          <p style="font-size:var(--fs-md);line-height:1.6;color:var(--ink-muted);margin:var(--sp-4) 0 var(--sp-5)">Provider-agnostic routing engine. Trait-based adapters, named fallback chains, per-endpoint circuit breaker, budget filtering and request tracing — with a store trait for persistence.</p>
+          <div style="display:flex;flex-wrap:wrap;gap:var(--sp-2)">
+            <dc-import name="Chip" label="reqwest" hint-size="74px,26px"></dc-import>
+            <dc-import name="Chip" label="rustls" hint-size="66px,26px"></dc-import>
+            <dc-import name="Chip" label="tokio" hint-size="60px,26px"></dc-import>
+          </div>
+        </div>
+        <div style="border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp-8);background:var(--panel)">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3)">
+            <span class="mono" style="font-size:var(--fs-xl);font-weight:var(--fw-semibold);color:var(--ink)">gateway-embedded</span>
+            <dc-import name="Chip" label="v0.2.18" tone="accent" hint-size="72px,24px"></dc-import>
+          </div>
+          <p style="font-size:var(--fs-md);line-height:1.6;color:var(--ink-muted);margin:var(--sp-4) 0 var(--sp-5)">In-process inference adapters and an on-disk model registry. The same <span class="mono" style="font-size:var(--fs-sm)">InferenceAdapter</span> trait as the cloud adapters, so local and cloud models compose in one routing config.</p>
+          <div style="display:flex;flex-wrap:wrap;gap:var(--sp-2);align-items:center">
+            <dc-import name="Chip" label="llama-cpp" hint-size="86px,26px"></dc-import>
+            <dc-import name="Chip" label="fastembed" hint-size="86px,26px"></dc-import>
+            <dc-import name="Chip" label="ort" hint-size="52px,26px"></dc-import>
+            <span class="mono" style="font-size:var(--fs-xs);color:var(--ink-faint);padding:4px 6px">feature-gated</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- USAGE -->
+  <section id="usage" style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8)">
+    <div style="max-width:64ch">
+      <dc-import name="Eyebrow" label="Consuming it" hint-size="140px,18px"></dc-import>
+      <h2 style="font-size:var(--fs-4xl);font-weight:var(--fw-semibold);margin:var(--sp-4) 0 0;line-height:1.12">Pin a tag. Lock the commit.</h2>
+      <p style="font-size:var(--fs-lg);line-height:1.6;color:var(--ink-muted);margin:var(--sp-4) 0 0">Add it as a git dependency on a tagged release. <span class="mono" style="font-size:var(--fs-base)">Cargo.lock</span> in your binary pins the exact commit, so there's no silent drift between builds. Developing in-place? Clone next to your consumer and add a dev-only <span class="mono" style="font-size:var(--fs-base)">[patch]</span> at the workspace root.</p>
+    </div>
+    <div style="margin-top:var(--sp-9)">
+      <div style="{{ codeShellStyle }}">
+        <div style="{{ codeBarStyle }}">
+          <sc-for list="{{ tabs }}" as="tab" hint-placeholder-count="3">
+            <button onClick="{{ tab.onSelect }}" class="mono" style="{{ tab.btnStyle }}">{{ tab.label }}</button>
+          </sc-for>
+        </div>
+        <pre class="mono" style="{{ codePreStyle }}">{{ currentCode }}</pre>
+      </div>
+      <p class="mono" style="font-size:var(--fs-sm);color:var(--ink-faint);margin:var(--sp-4) 2px 0">// after editing locally: push, cut a new tag, bump the pinned tag in each consumer</p>
+    </div>
+  </section>
+
+  <!-- ARCHITECTURE -->
+  <section style="background:var(--card);border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline)">
+    <div style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8)">
+      <dc-import name="Eyebrow" label="Architecture" hint-size="130px,18px"></dc-import>
+      <h2 style="font-size:var(--fs-4xl);font-weight:var(--fw-semibold);margin:var(--sp-4) 0 var(--sp-6);line-height:1.1">One trait, many backends.</h2>
+      <div id="arch-diagram" style="width:100%;min-height:300px;margin-top:6px"></div>
+      <div class="mono" style="font-size:var(--fs-xs);color:var(--ink-faint);margin-top:var(--sp-4);text-align:center">one InferenceAdapter trait — cloud and local backends compose in a single routing config</div>
+    </div>
+  </section>
+
+  <!-- WHO USES IT -->
+  <section style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8)">
+    <dc-import name="Eyebrow" label="Shipped in production" hint-size="200px,18px"></dc-import>
+    <h2 style="font-size:var(--fs-4xl);font-weight:var(--fw-semibold);margin:var(--sp-4) 0 0;line-height:1.1">Consumed by sibling projects.</h2>
+    <p style="font-size:var(--fs-lg);color:var(--ink-muted);margin:var(--sp-4) 0 var(--sp-9);max-width:56ch">gateway is the shared inference layer under two projects in the <span class="mono" style="font-size:var(--fs-base)">sensei-hq</span> org.</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-6)">
+      <a href="https://github.com/sensei-hq/sensei" style="border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp-7);display:flex;align-items:center;gap:var(--sp-4);color:var(--ink);background:var(--card)" style-hover="border-color:rgba(47,127,242,.4)">
+        <span style="width:44px;height:44px;border-radius:var(--r-md);background:var(--accent-wash);border:1px solid var(--accent-line);display:flex;align-items:center;justify-content:center;font-family:'JetBrains Mono',monospace;font-weight:var(--fw-semibold);color:var(--accent);font-size:var(--fs-2xl)">s</span>
+        <div>
+          <div style="font-family:'Space Grotesk',sans-serif;font-weight:var(--fw-semibold);font-size:var(--fs-xl)">sensei</div>
+          <div class="mono" style="font-size:var(--fs-sm);color:var(--ink-faint);margin-top:3px">github.com/sensei-hq/sensei</div>
+        </div>
+      </a>
+      <a href="https://github.com/sensei-hq/strategos" style="border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp-7);display:flex;align-items:center;gap:var(--sp-4);color:var(--ink);background:var(--card)" style-hover="border-color:rgba(47,127,242,.4)">
+        <span style="width:44px;height:44px;border-radius:var(--r-md);background:var(--accent-wash);border:1px solid var(--accent-line);display:flex;align-items:center;justify-content:center;font-family:'JetBrains Mono',monospace;font-weight:var(--fw-semibold);color:var(--accent);font-size:var(--fs-2xl)">σ</span>
+        <div>
+          <div style="font-family:'Space Grotesk',sans-serif;font-weight:var(--fw-semibold);font-size:var(--fs-xl)">strategos</div>
+          <div class="mono" style="font-size:var(--fs-sm);color:var(--ink-faint);margin-top:3px">github.com/sensei-hq/strategos</div>
+        </div>
+      </a>
+    </div>
+  </section>
+
+  <!-- VERSIONING (inverted panel: flips opposite the page theme) -->
+  <section id="versioning" data-theme="{{ invTheme }}" style="background:var(--paper)">
+    <div style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8);display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-10);align-items:center">
+      <div>
+        <dc-import name="Eyebrow" label="Versioning" dark="{{ invDark }}" hint-size="120px,18px"></dc-import>
+        <h2 style="font-size:var(--fs-4xl);font-weight:var(--fw-semibold);margin:var(--sp-4) 0 0;line-height:1.12;color:var(--ink)">Independent, semver, reproducible.</h2>
+        <p style="font-size:var(--fs-lg);line-height:1.6;color:var(--ink-muted);margin:var(--sp-4) 0 0">This repo versions independently of its consumers. Releases are semver tags — both crates currently share <span class="mono" style="color:var(--ink);font-size:var(--fs-base)">v0.2.18</span>, carried over from sensei.</p>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:var(--sp-3)">
+        <sc-for list="{{ steps }}" as="s" hint-placeholder-count="3">
+          <div style="display:flex;gap:var(--sp-3);align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:var(--r-md);padding:var(--sp-4) var(--sp-5)">
+            <span class="mono" style="color:var(--accent);font-size:var(--fs-sm);margin-top:1px">{{ s.n }}</span>
+            <div><div style="color:var(--ink);font-weight:var(--fw-semibold);font-size:var(--fs-md);font-family:'Space Grotesk',sans-serif">{{ s.title }}</div><div class="mono" style="color:var(--ink-faint);font-size:var(--fs-sm);margin-top:4px">{{ s.note }}</div></div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section id="start" style="max-width:1140px;margin:0 auto;padding:var(--sp-section) var(--sp-8);text-align:center;display:flex;flex-direction:column;align-items:center">
+    <h2 style="font-size:var(--fs-5xl);font-weight:var(--fw-semibold);line-height:1.06;max-width:18ch">Start routing through gateway.</h2>
+    <p style="font-size:var(--fs-xl);color:var(--ink-muted);margin:var(--sp-5) 0 0;max-width:48ch">Add the git dependency, name a fallback chain, and let the engine handle the rest.</p>
+    <div style="display:flex;gap:var(--sp-3);margin-top:var(--sp-8);flex-wrap:wrap;justify-content:center">
+      <dc-import name="Button" href="https://github.com/sensei-hq/gateway" label="Get started guide" variant="primary" size="lg" arrow="{{ true }}" hint-size="220px,50px"></dc-import>
+      <dc-import name="Button" href="https://github.com/sensei-hq/gateway" label="Star on GitHub" variant="secondary" size="lg" hint-size="180px,50px"></dc-import>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer style="background:var(--card);border-top:1px solid var(--hairline)">
+    <div style="max-width:1140px;margin:0 auto;padding:var(--sp-11) var(--sp-8) var(--sp-9);display:grid;grid-template-columns:1.5fr 1fr 1fr;gap:40px">
+      <div>
+        <div style="display:flex;align-items:center;gap:var(--sp-3)">
+          <span style="width:26px;height:26px;border-radius:var(--r-sm);background:#2f7ff2;display:flex;align-items:center;justify-content:center;color:#fff;font-family:'JetBrains Mono',monospace;font-weight:var(--fw-semibold);font-size:var(--fs-md)">g</span>
+          <span style="font-family:'Space Grotesk',sans-serif;font-weight:var(--fw-semibold);font-size:var(--fs-lg)">gateway</span>
+        </div>
+        <p style="font-size:var(--fs-base);color:var(--ink-faint);margin:var(--sp-4) 0 0;max-width:38ch;line-height:1.6">Shared LLM inference routing engine for Rust. Fallback chains, circuit breaker, budget management — cloud and local.</p>
+      </div>
+      <div>
+        <div class="mono" style="font-size:var(--fs-xs);color:var(--ink-faint);text-transform:uppercase;letter-spacing:.05em;margin-bottom:14px">Crates</div>
+        <div style="display:flex;flex-direction:column;gap:var(--sp-3);font-size:var(--fs-base)">
+          <a href="https://github.com/sensei-hq/gateway" style="color:var(--ink-muted)">gateway</a>
+          <a href="https://github.com/sensei-hq/gateway" style="color:var(--ink-muted)">gateway-embedded</a>
+        </div>
+      </div>
+      <div>
+        <div class="mono" style="font-size:var(--fs-xs);color:var(--ink-faint);text-transform:uppercase;letter-spacing:.05em;margin-bottom:14px">Resources</div>
+        <div style="display:flex;flex-direction:column;gap:var(--sp-3);font-size:var(--fs-base)">
+          <a href="https://github.com/sensei-hq/gateway" style="color:var(--ink-muted)">GitHub</a>
+          <a href="https://github.com/sensei-hq/gateway/releases" style="color:var(--ink-muted)">Releases</a>
+          <a href="https://github.com/sensei-hq/gateway" style="color:var(--ink-muted)">MIT License</a>
+        </div>
+      </div>
+    </div>
+    <div style="border-top:1px solid var(--hairline)">
+      <div class="mono" style="max-width:1140px;margin:0 auto;padding:var(--sp-4) var(--sp-8);display:flex;justify-content:space-between;flex-wrap:wrap;gap:var(--sp-3);font-size:var(--fs-sm);color:var(--ink-faint)">
+        <span>MIT licensed · sensei-hq</span>
+        <span>v0.2.18</span>
+      </div>
+    </div>
+  </footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;light&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;}}">
+class Component extends DCLogic {
+  state = { activeTab: 'add', theme: null };
+
+  tabsData() {
+    return [
+      { id: 'add', label: 'Cargo.toml', code:
+`[dependencies]
+gateway          = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.18" }
+gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.18", features = ["fastembed"] }` },
+      { id: 'patch', label: 'Local dev', code:
+`# consumer workspace root — keep dev-only
+[patch."https://github.com/sensei-hq/gateway"]
+gateway          = { path = "../gateway/crates/gateway" }
+gateway-embedded = { path = "../gateway/crates/gateway-embedded" }` },
+      { id: 'features', label: 'Embedded engines', code:
+`# gateway-embedded features (all off by default)
+llama-cpp   # GGUF generation/embedding via llama.cpp
+fastembed   # lightweight embeddings
+ort         # ONNX Runtime (CPU)` },
+    ];
+  }
+
+  componentDidMount() {
+    try { const t = localStorage.getItem('gw-theme'); if (t) this.setState({ theme: t }); } catch (e) {}
+    this.drawDiagram();
+  }
+
+  drawDiagram() {
+    const d3 = window.d3;
+    const el = document.getElementById('arch-diagram');
+    if (!el) return;
+    if (!d3) { clearTimeout(this._d3t); this._d3t = setTimeout(this.drawDiagram.bind(this), 120); return; }
+    const SG = "'Space Grotesk',sans-serif";
+    const MONO = "'JetBrains Mono',monospace";
+    d3.select(el).selectAll('*').remove();
+    const svg = d3.select(el).append('svg')
+      .attr('viewBox', '0 0 1080 440')
+      .attr('preserveAspectRatio', 'xMidYMid meet');
+
+    const defs = svg.append('defs');
+    const mk = defs.append('marker').attr('id', 'arw').attr('viewBox', '0 0 8 8')
+      .attr('refX', 6.4).attr('refY', 4).attr('markerWidth', 6).attr('markerHeight', 6).attr('orient', 'auto-start-reverse');
+    mk.append('path').attr('d', 'M0.5,0.5 L7.5,4 L0.5,7.5 Z').style('fill', 'var(--ink-faint)');
+
+    const linkG = svg.append('g');
+    const path = (x1, y1, x2, y2) => { const mx = (x1 + x2) / 2; return 'M' + x1 + ',' + y1 + ' C' + mx + ',' + y1 + ' ' + mx + ',' + y2 + ' ' + x2 + ',' + y2; };
+    [[172, 220, 246, 220], [582, 220, 636, 220], [772, 212, 826, 146], [772, 228, 826, 309]].forEach(l => {
+      const d = path(l[0], l[1], l[2], l[3]);
+      linkG.append('path').attr('d', d).style('fill', 'none').style('stroke', 'var(--line-strong)').style('stroke-width', 1.75).style('stroke-linecap', 'round').attr('marker-end', 'url(#arw)');
+      linkG.append('path').attr('d', d).style('fill', 'none').style('stroke', 'var(--accent)').style('stroke-width', 2)
+        .style('stroke-linecap', 'round').style('stroke-dasharray', '0.5 13').style('opacity', 0.5).style('animation', 'archflow 1.5s linear infinite');
+    });
+
+    const cardRect = (g, x, y, w, h, accent) => {
+      g.append('rect').attr('x', x).attr('y', y).attr('width', w).attr('height', h).attr('rx', 16)
+        .style('fill', accent ? 'var(--accent-wash)' : 'var(--card)')
+        .style('stroke', accent ? 'var(--accent-line)' : 'var(--line)').style('stroke-width', 1);
+    };
+    const txt = (g, x, y, str, o) => {
+      o = o || {};
+      g.append('text').attr('x', x).attr('y', y).text(str)
+        .style('font-family', o.mono ? MONO : SG).style('font-size', (o.size || 14) + 'px')
+        .style('font-weight', o.weight || 600).style('fill', o.fill || 'var(--ink)')
+        .style('text-anchor', o.anchor || 'start').style('letter-spacing', o.mono ? '0' : '-.01em');
+    };
+    const pills = (g, labels, x0, y0, maxX) => {
+      let x = x0, y = y0; const h = 24, pad = 9, gap = 7;
+      labels.forEach(l => {
+        const w = Math.round(l.length * 6.7) + pad * 2;
+        if (x + w > maxX) { x = x0; y += h + 7; }
+        g.append('rect').attr('x', x).attr('y', y).attr('width', w).attr('height', h).attr('rx', 7).style('fill', 'var(--chip)');
+        g.append('text').attr('x', x + pad).attr('y', y + 16).text(l).style('font-family', MONO).style('font-size', '11.5px').style('fill', 'var(--ink-muted)');
+        x += w + gap;
+      });
+    };
+
+    const app = svg.append('g');
+    cardRect(app, 20, 170, 150, 100, false);
+    txt(app, 95, 212, 'Your app', { size: 17, anchor: 'middle' });
+    txt(app, 95, 236, 'route(model)', { mono: true, size: 12, weight: 500, fill: 'var(--ink-faint)', anchor: 'middle' });
+
+    const gw = svg.append('g');
+    cardRect(gw, 250, 66, 330, 308, true);
+    gw.append('circle').attr('cx', 300).attr('cy', 103).attr('r', 5).style('fill', 'var(--accent)');
+    txt(gw, 315, 110, 'gateway', { size: 23 });
+    txt(gw, 315, 132, 'routing engine', { mono: true, size: 12, weight: 500, fill: 'var(--accent)' });
+    gw.append('line').attr('x1', 274).attr('y1', 152).attr('x2', 556).attr('y2', 152).style('stroke', 'var(--accent-line)').style('stroke-width', 1);
+    const capW = 262, capX = 284, capH = 27, capGap = 8, capY0 = 166;
+    ['fallback', 'circuit breaker', 'budget', 'tracing'].forEach((c, i) => {
+      const y = capY0 + i * (capH + capGap);
+      gw.append('rect').attr('x', capX).attr('y', y).attr('width', capW).attr('height', capH).attr('rx', 9).style('fill', 'var(--card)').style('stroke', 'var(--line)');
+      gw.append('circle').attr('cx', capX + 16).attr('cy', y + capH / 2).attr('r', 3.5).style('fill', 'var(--accent)');
+      txt(gw, capX + 30, y + capH / 2 + 4, c, { mono: true, size: 12, weight: 500, fill: 'var(--ink-muted)' });
+    });
+    gw.append('line').attr('x1', 274).attr('y1', 313).attr('x2', 556).attr('y2', 313).style('stroke', 'var(--accent-line)').style('stroke-width', 1);
+    txt(gw, 415, 334, 'no DB · GatewayStore trait', { mono: true, size: 11, weight: 400, fill: 'var(--ink-faint)', anchor: 'middle' });
+    txt(gw, 415, 353, 'reqwest · rustls · tokio', { mono: true, size: 11, weight: 400, fill: 'var(--ink-faint)', anchor: 'middle' });
+
+    const ad = svg.append('g');
+    cardRect(ad, 640, 160, 130, 120, false);
+    txt(ad, 705, 205, 'Inference', { size: 15, anchor: 'middle' });
+    txt(ad, 705, 225, 'Adapter', { size: 15, anchor: 'middle' });
+    txt(ad, 705, 248, 'one trait', { mono: true, size: 11.5, weight: 500, fill: 'var(--accent)', anchor: 'middle' });
+
+    const cl = svg.append('g');
+    cardRect(cl, 830, 70, 230, 150, false);
+    txt(cl, 852, 104, 'Cloud providers', { size: 15 });
+    txt(cl, 852, 124, '~15 adapters', { mono: true, size: 11.5, weight: 500, fill: 'var(--accent)' });
+    pills(cl, ['openai', 'anthropic', 'google', 'mistral', 'groq'], 852, 140, 1044);
+
+    const lo = svg.append('g');
+    cardRect(lo, 830, 250, 230, 120, false);
+    txt(lo, 852, 284, 'Local engines', { size: 15 });
+    txt(lo, 852, 304, 'in-process', { mono: true, size: 11.5, weight: 500, fill: 'var(--accent)' });
+    pills(lo, ['llama.cpp', 'onnx', 'fastembed'], 852, 320, 1044);
+  }
+
+  renderVals() {
+    const p = this.props || {};
+    const theme = this.state.theme || p.theme || 'light';
+    const codeDark = theme === 'dark';
+    const isDark = theme === 'dark';
+    const isLight = !isDark;
+    const invTheme = isDark ? 'light' : 'dark';
+    const invDark = !isDark;
+    const iconBtnStyle = 'appearance:none;cursor:pointer;width:38px;height:38px;display:inline-flex;align-items:center;justify-content:center;border-radius:var(--r-sm);border:1px solid var(--line-strong);background:transparent;color:var(--ink-muted);padding:0;transition:color .15s ease,border-color .15s ease';
+    const iconBtnHover = { color: 'var(--ink)' };
+    const R = React.createElement;
+    const themeIcon = isDark
+      ? R('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'currentColor' },
+          R('path', { d: 'M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z' }))
+      : R('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round' },
+          R('circle', { key: 'c', cx: 12, cy: 12, r: 4 }),
+          R('line', { key: 'a', x1: 12, y1: 2.5, x2: 12, y2: 4.5 }),
+          R('line', { key: 'b', x1: 12, y1: 19.5, x2: 12, y2: 21.5 }),
+          R('line', { key: 'd', x1: 2.5, y1: 12, x2: 4.5, y2: 12 }),
+          R('line', { key: 'e', x1: 19.5, y1: 12, x2: 21.5, y2: 12 }),
+          R('line', { key: 'f', x1: 5.2, y1: 5.2, x2: 6.6, y2: 6.6 }),
+          R('line', { key: 'g', x1: 17.4, y1: 17.4, x2: 18.8, y2: 18.8 }),
+          R('line', { key: 'h', x1: 5.2, y1: 18.8, x2: 6.6, y2: 17.4 }),
+          R('line', { key: 'i', x1: 17.4, y1: 6.6, x2: 18.8, y2: 5.2 }));
+    const toggleTheme = () => {
+      const next = (this.state.theme || p.theme || 'light') === 'dark' ? 'light' : 'dark';
+      try { localStorage.setItem('gw-theme', next); } catch (e) {}
+      this.setState({ theme: next });
+    };
+    const active = this.state.activeTab || 'add';
+    const data = this.tabsData();
+    const ct = codeDark
+      ? { bg: '#0d1117', bar: '#161b22', border: '#1c2230', text: '#e6edf3', idle: '#7d8698', shadow: '0 24px 60px -30px rgba(13,17,23,.5)' }
+      : { bg: '#f6f8fa', bar: '#eef1f4', border: '#e3e6ea', text: '#1f2328', idle: '#8b91a0', shadow: '0 12px 40px -24px rgba(18,20,26,.28)' };
+    const base = 'appearance:none;border:none;cursor:pointer;font-size:var(--fs-sm);font-weight:var(--fw-medium);padding:9px 14px;border-radius:var(--r-sm) var(--r-sm) 0 0;background:transparent;';
+    const tabs = data.map(t => ({
+      id: t.id,
+      label: t.label,
+      onSelect: () => this.setState({ activeTab: t.id }),
+      btnStyle: base + (t.id === active ? ('color:' + ct.text + ';background:' + ct.bg + ';') : ('color:' + ct.idle + ';')),
+    }));
+    const codeShellStyle = 'border-radius:var(--r-lg);overflow:hidden;border:1px solid ' + ct.border + ';box-shadow:' + ct.shadow;
+    const codeBarStyle = 'background:' + ct.bar + ';display:flex;align-items:center;gap:2px;padding:8px 10px 0;border-bottom:1px solid ' + ct.border;
+    const codePreStyle = 'margin:0;background:' + ct.bg + ';color:' + ct.text + ';padding:22px 20px;font-size:var(--fs-sm);line-height:1.85;overflow-x:auto;min-height:150px';
+    const current = data.find(t => t.id === active) || data[0];
+
+    return {
+      theme,
+      invTheme,
+      invDark,
+      toggleTheme,
+      iconBtnStyle,
+      iconBtnHover,
+      themeIcon,
+      codeDark,
+      installCode:
+`[dependencies]
+gateway          = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.18" }
+gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.18", features = ["fastembed"] }`,
+      features: [
+        { tag: 'fallback', title: 'Named fallback chains', body: "Chain endpoints by name. When one fails or blows its budget, the next takes over — automatically, per request." },
+        { tag: 'circuit', title: 'Per-endpoint circuit breaker', body: "Trips on repeated failures and backs off, so a flaky provider can't drag the whole chain down with it." },
+        { tag: 'budget', title: 'Budget filtering', body: 'Filter candidates by cost before a request goes out. Routes stay inside their spend limits by design.' },
+        { tag: 'adapters', title: '~15 cloud adapters', body: 'Trait-based adapters for around fifteen providers. Add your own by implementing a single trait.' },
+        { tag: 'tracing', title: 'Request tracing', body: 'Every request carries structured trace context through the pipeline — you see exactly which endpoint served it.' },
+        { tag: 'store', title: 'Bring your own store', body: 'A GatewayStore trait handles persistence. Wire in whatever you already run — gateway ships no DB.' },
+      ],
+      steps: [
+        { n: '01', title: 'Tag with semver', note: 'vMAJOR.MINOR.PATCH' },
+        { n: '02', title: 'Consumer pins the tag', note: 'git dependency, tag = "v0.2.18"' },
+        { n: '03', title: 'Cargo.lock pins the commit', note: 'exact commit · no silent drift' },
+      ],
+      tabs,
+      codeShellStyle,
+      codeBarStyle,
+      codePreStyle,
+      currentCode: current.code,
+    };
+  }
+}
+</script>
+</body>
+</html>

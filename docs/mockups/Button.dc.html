@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</helmet>
+<a href="{{ href }}" style="{{ style }}" style-hover="{{ hoverStyle }}">{{ label }}<sc-if value="{{ arrow }}"><span style="opacity:.65;font-family:'JetBrains Mono',monospace">&#8594;</span></sc-if></a>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:220,&quot;height&quot;:52},&quot;label&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;Get started&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;href&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;#&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;variant&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;primary&quot;,&quot;options&quot;:[&quot;primary&quot;,&quot;secondary&quot;,&quot;ghost&quot;],&quot;tsType&quot;:&quot;string&quot;},&quot;size&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;md&quot;,&quot;options&quot;:[&quot;sm&quot;,&quot;md&quot;,&quot;lg&quot;],&quot;tsType&quot;:&quot;string&quot;},&quot;arrow&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    const p = this.props || {};
+    const variant = p.variant || 'primary';
+    const size = p.size || 'md';
+    const sizes = {
+      sm: { padding: '8px 15px', fontSize: '14px', radius: '8px' },
+      md: { padding: '13px 22px', fontSize: '15px', radius: '10px' },
+      lg: { padding: '14px 26px', fontSize: '15.5px', radius: '11px' },
+    };
+    const sz = sizes[size] || sizes.md;
+    const common = {
+      display: 'inline-flex', alignItems: 'center', gap: '8px',
+      fontFamily: '"IBM Plex Sans",system-ui,sans-serif', fontWeight: 600,
+      padding: sz.padding, fontSize: sz.fontSize, borderRadius: sz.radius,
+      textDecoration: 'none', lineHeight: 1, cursor: 'pointer',
+      transition: 'background .15s ease,border-color .15s ease,color .15s ease', whiteSpace: 'nowrap',
+    };
+    let style, hoverStyle;
+    if (variant === 'primary') {
+      style = { ...common, background: '#2f7ff2', color: '#fff', border: '1px solid transparent', boxShadow: '0 4px 16px rgba(47,127,242,.3)' };
+      hoverStyle = { background: '#1c66e0' };
+    } else if (variant === 'secondary') {
+      style = { ...common, background: 'var(--card,#fff)', color: 'var(--ink,#12141a)', border: '1px solid var(--line-strong,rgba(18,20,26,.14))' };
+      hoverStyle = { borderColor: 'var(--ink-faint,#8b91a0)' };
+    } else {
+      style = { ...common, background: 'transparent', color: '#565c6b', border: '1px solid transparent' };
+      hoverStyle = { color: '#12141a' };
+    }
+    return { href: p.href || '#', label: p.label || 'Button', arrow: !!p.arrow, style, hoverStyle };
+  }
+}
+</script>
+</body>
+</html>
