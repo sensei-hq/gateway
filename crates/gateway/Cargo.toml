@@ -30,6 +30,10 @@ aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
 # Document values for tool input schemas and tool_use payloads
 # without going through a private re-export.
 aws-smithy-types = "1"
+# Ergonomic `stream! { ... yield ev; ... }` macro used by
+# `Gateway::execute_stream` to build the public StreamEvent stream
+# imperatively (await candidates, yield ProviderSwitch/Chunk/Done/Error).
+async-stream = "0.3"
 async-trait = "0.1"
 # Used directly for naming reqwest's Bytes type in streaming
 # adapters' state machines (otherwise it leaks through `impl Stream`
