@@ -7,6 +7,7 @@ pub mod fal;
 pub mod flux;
 pub mod gemini;
 pub mod grok;
+pub mod huggingface;
 pub mod kling;
 pub mod luma;
 pub mod noop;
