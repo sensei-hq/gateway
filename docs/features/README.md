@@ -18,6 +18,7 @@ claims to source and carries a **Notes** section flagging existing quirks.
 | [fallback-chains](fallback-chains.md) | `FallbackChainConfig`/`ChainEntry`, `FallbackTrigger` variants, the candidate walk (continue vs. break) |
 | [circuit-breaker](circuit-breaker.md) | Per-endpoint breaker states, config, and how it skips candidates |
 | [budget-and-cost](budget-and-cost.md) | Token metering today (`ModelPricing`, `estimate_cost`, budget filtering); future quota/tiered metering |
+| [subscription-quota](subscription-quota.md) | Config-at-init tier quotas (`ConstraintsConfig`/`QuotaLimit`), `AuthContext`, the `check_quota` pre-flight guard, usage recording |
 | [capabilities-and-adapters](capabilities-and-adapters.md) | **Target** capability-trait model (`ChatModel`/`EmbedModel`/…), per-capability registry, how to add an adapter |
 | [providers](providers.md) | Reference for the 16 cloud adapters: id, base URL, auth style, capabilities, quirks |
 | [embedded-inference](embedded-inference.md) | `gateway-embedded`: llama.cpp / ONNX / FastEmbed engines, cargo features |
