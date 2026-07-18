@@ -36,7 +36,7 @@
 <!-- HERO -->
 <section>
 	<div
-		class="mx-auto flex max-w-content flex-col items-center gap-6 px-6 pb-16 pt-20 text-center lg:pt-28"
+		class="mx-auto flex max-w-content flex-col items-center gap-6 px-6 pb-16 pt-20 text-center md:pt-28"
 	>
 		<div
 			class="inline-flex items-center gap-2 rounded-full border border-accent-line bg-accent-soft px-3 py-1 text-sm font-semibold text-primary"
@@ -80,7 +80,7 @@
 <section id="features">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={features.eyebrow} title={features.title} lede={features.lede} />
-		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+		<div class="mt-12 grid gap-4 sm:grid-cols-2 md:grid-cols-3">
 			{#each features.items as f (f.tag)}
 				<FeatureCard tag={f.tag} title={f.title} body={f.body} />
 			{/each}
@@ -152,7 +152,7 @@
 <!-- VERSIONING (inverted panel) -->
 <section id="versioning" data-mode={invMode} class="border-y border-paper-edge bg-paper">
 	<div
-		class="mx-auto grid max-w-content items-center gap-10 px-6 py-section lg:grid-cols-2 lg:gap-14"
+		class="mx-auto grid max-w-content items-center gap-10 px-6 py-section md:grid-cols-2 md:gap-14"
 	>
 		<div class="flex flex-col gap-4">
 			<Eyebrow>{versioning.eyebrow}</Eyebrow>

@@ -16,9 +16,9 @@
 	type="article"
 />
 
-<div class="mx-auto grid max-w-content gap-12 px-6 py-section lg:grid-cols-[16rem_1fr]">
+<div class="mx-auto grid max-w-content gap-12 px-6 py-section md:grid-cols-[16rem_1fr]">
 	<!-- Sidebar -->
-	<aside class="lg:sticky lg:top-24 lg:self-start">
+	<aside class="md:sticky md:top-24 md:self-start">
 		<a href="/docs" class="font-mono text-label uppercase text-ink-soft hover:text-ink">Docs</a>
 		<nav class="mt-4 flex flex-col gap-1">
 			{#each pages as p (p.slug)}

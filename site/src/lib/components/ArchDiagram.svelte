@@ -7,7 +7,7 @@
 {#snippet arrow()}
 	<div class="flex shrink-0 items-center justify-center text-ink-soft">
 		<svg
-			class="h-4 w-4 rotate-90 lg:rotate-0"
+			class="h-4 w-4 rotate-90 md:rotate-0"
 			viewBox="0 0 16 16"
 			fill="none"
 			stroke="currentColor"
@@ -19,10 +19,10 @@
 	</div>
 {/snippet}
 
-<div class="flex flex-col items-stretch gap-3 lg:flex-row lg:items-center">
+<div class="flex flex-col items-stretch gap-3 md:flex-row md:items-center">
 	<!-- Your app -->
 	<div
-		class="flex shrink-0 flex-col gap-1 rounded-xl border border-paper-edge bg-paper p-5 text-center lg:w-36"
+		class="flex shrink-0 flex-col gap-1 rounded-xl border border-paper-edge bg-paper p-5 text-center md:w-36"
 	>
 		<span class="font-display font-semibold text-ink">Your app</span>
 		<span class="font-mono text-xs text-ink-soft">route(model)</span>
@@ -56,7 +56,7 @@
 
 	<!-- Inference adapter -->
 	<div
-		class="flex shrink-0 flex-col gap-1 rounded-xl border border-paper-edge bg-paper p-5 text-center lg:w-36"
+		class="flex shrink-0 flex-col gap-1 rounded-xl border border-paper-edge bg-paper p-5 text-center md:w-36"
 	>
 		<span class="font-display font-semibold leading-tight text-ink">Inference adapter</span>
 		<span class="font-mono text-xs text-primary">capability traits</span>
@@ -65,7 +65,7 @@
 	{@render arrow()}
 
 	<!-- backends -->
-	<div class="flex shrink-0 flex-col gap-3 lg:w-56">
+	<div class="flex shrink-0 flex-col gap-3 md:w-56">
 		<div class="rounded-xl border border-paper-edge bg-paper p-4">
 			<div class="font-display font-semibold text-sm text-ink">Cloud providers</div>
 			<div class="font-mono text-xs text-primary">~16 adapters</div>
