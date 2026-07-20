@@ -1,8 +1,8 @@
 # gateway — LLM usage guides
 
-Task-oriented, copy-pasteable guides for using the `gateway` crate (and its
-companion `gateway-embedded`). For deep reference see `docs/features/`; this
-folder is the fast path for an agent that needs to *use* the crate.
+Task-oriented, copy-pasteable guides for using the `gateway` crate (and its local
+companions `local-providers` + `local-engine`). For deep reference see
+`docs/features/`; this folder is the fast path for an agent that needs to *use* the crate.
 
 ## What it is
 

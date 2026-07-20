@@ -1,9 +1,10 @@
-# Upgrade guide: gateway 0.2.x → 0.3.0
+# Upgrade guide: gateway 0.2.x → 0.3.x
 
-For consumers (sensei / strategos) re-pinning the `gateway` / `gateway-embedded`
-git dependency from a `v0.2.x` tag to **`v0.3.0`**. 0.3.0 bundles the capability-trait
-refactor, the Hugging Face adapter + model download, per-call cost + streaming, and
-subscription/quota metering.
+For consumers (sensei / strategos) re-pinning the gateway git dependency from a
+`v0.2.x` tag to the latest **`v0.3.x`**. 0.3.0 bundles the capability-trait refactor,
+the Hugging Face adapter + model download, per-call cost + streaming, and
+subscription/quota metering; **0.3.1** splits the old `gateway-embedded` crate into
+`local-providers` (in-process adapters) + `local-engine` (model resolvers + HF pull).
 
 ## TL;DR
 
@@ -16,6 +17,7 @@ subscription/quota metering.
 | `GatewayStore` impls | new required `get_usage_since` | required *if you implement the trait* |
 | `InferenceRequest {…}` literals | new `auth` field | add `auth: None` |
 | `GatewayConfig {…}` literals | new `constraints` field | add `constraints: Default::default()` |
+| Local inference crate | `gateway-embedded` **split** → `local-providers` + `local-engine` (v0.3.1) | rename the dep *if you use local models* |
 | Transitive CVEs | Cargo.lock is gitignored | `cargo update` (below) |
 
 Everything else is **additive/opt-in** (see the last section). The main call path —
@@ -28,8 +30,10 @@ and behaves exactly as before once the items above are addressed.
 
 ```toml
 # Cargo.toml
-gateway          = { git = "https://github.com/sensei-hq/gateway", tag = "v0.3.0" }
-gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.3.0" }
+gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
+# Local inference (only if you use it) — the v0.3.0 `gateway-embedded` crate split in two:
+local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
+local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
 ```
 
 Then, because `Cargo.lock` is gitignored in the gateway repo, apply the security
@@ -150,7 +154,7 @@ let cfg = GatewayConfig { routers, models, chains, constraints: Default::default
 - **Streaming:** `gateway.execute_stream(&req).await` → a stream of `StreamEvent`.
 - **Hugging Face Inference adapter** (`huggingface`) — OpenAI-compatible router, bearer
   HF token; base URL overridable for Inference Endpoints.
-- **HF model download** (`gateway-embedded`, opt-in `hf-download` feature) — pull GGUF/
+- **HF model download** (`local-engine`, opt-in `hf-download` feature) — pull GGUF/
   ONNX from the HF Hub into the managed store, with an in-`pull` RAM/disk fit guard.
 - **Subscription / quota metering** — operator-configured tier limits in
   `GatewayConfig.constraints` + `AuthContext` on `request.auth`; enforced pre-flight

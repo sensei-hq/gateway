@@ -23,8 +23,9 @@ export const nav = {
 };
 
 const INSTALL = `[dependencies]
-gateway          = { git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
-gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1", features = ["fastembed"] }`;
+gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
+local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1", features = ["fastembed"] }
+local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }`;
 
 export const hero = {
 	badge: ['Rust', 'LLM inference routing'],
@@ -83,7 +84,7 @@ export const features = {
 export type Crate = { name: string; version: string; body: string; chips: string[]; note?: string };
 
 export const crates = {
-	eyebrow: 'Two crates',
+	eyebrow: 'Three crates',
 	title: 'Cloud and local, one config.',
 	items: [
 		{
@@ -93,10 +94,17 @@ export const crates = {
 			chips: ['reqwest', 'rustls', 'tokio']
 		},
 		{
-			name: 'gateway-embedded',
+			name: 'local-providers',
 			version: 'v0.3.1',
-			body: 'In-process inference adapters and an on-disk model registry. The same capability traits as the cloud adapters, so local and cloud models compose in one routing config.',
+			body: 'In-process inference adapters (llama.cpp, fastembed, ONNX Runtime). The same capability traits as the cloud adapters, so local and cloud models compose in one routing config.',
 			chips: ['llama-cpp', 'fastembed', 'ort'],
+			note: 'feature-gated'
+		},
+		{
+			name: 'local-engine',
+			version: 'v0.3.1',
+			body: 'The local model engine: resolvers that map a model id to on-disk bytes (managed / Ollama / external) plus optional Hugging Face model pull.',
+			chips: ['hf-download'],
 			note: 'feature-gated'
 		}
 	] as Crate[]
@@ -116,16 +124,18 @@ export const usage = {
 			label: 'Local dev',
 			code: `# consumer workspace root — keep dev-only
 [patch."https://github.com/sensei-hq/gateway"]
-gateway          = { path = "../gateway/crates/gateway" }
-gateway-embedded = { path = "../gateway/crates/gateway-embedded" }`
+sensei-gateway         = { path = "../gateway/crates/gateway" }
+sensei-local-providers = { path = "../gateway/crates/local-providers" }
+sensei-local-engine    = { path = "../gateway/crates/local-engine" }`
 		},
 		{
 			id: 'features',
 			label: 'Embedded engines',
-			code: `# gateway-embedded features (all off by default)
+			code: `# local-providers features (all off by default)
 llama-cpp     # GGUF generation/embedding via llama.cpp
 fastembed     # lightweight embeddings
 ort           # ONNX Runtime (CPU)
+# local-engine feature:
 hf-download   # pull GGUF/ONNX models from the Hugging Face Hub`
 		}
 	] as UsageTab[]
@@ -154,7 +164,7 @@ export type Step = { n: string; title: string; note: string };
 export const versioning = {
 	eyebrow: 'Versioning',
 	title: 'Independent, semver, reproducible.',
-	lede: 'This repo versions independently of its consumers. Releases are semver tags — both crates currently share v0.3.1.',
+	lede: 'This repo versions independently of its consumers. Releases are semver tags — all five crates currently share v0.3.1.',
 	steps: [
 		{ n: '01', title: 'Tag with semver', note: 'vMAJOR.MINOR.PATCH' },
 		{ n: '02', title: 'Consumer pins the tag', note: 'git dependency, tag = "v0.3.1"' },
@@ -176,7 +186,8 @@ export const footer = {
 			title: 'Crates',
 			links: [
 				{ label: 'gateway', href: REPO },
-				{ label: 'gateway-embedded', href: REPO }
+				{ label: 'local-providers', href: REPO },
+				{ label: 'local-engine', href: REPO }
 			]
 		},
 		{

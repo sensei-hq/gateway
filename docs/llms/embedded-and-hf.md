@@ -1,13 +1,16 @@
 # Embedded inference + Hugging Face download
 
-`gateway-embedded` runs models **in-process** (no network) and implements the *same*
+`local-providers` runs models **in-process** (no network) and implements the *same*
 capability traits as the cloud adapters — so a local model registers and executes
 exactly like a cloud one. Engines are behind cargo features (each pulls heavy native
-deps), so you compile only what you use.
+deps), so you compile only what you use. Model resolution and Hugging Face pull live
+in the companion `local-engine` crate.
 
 ```toml
-gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.3.0",
-                     features = ["llama-cpp"] }   # or: fastembed, ort, hf-download
+local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway",
+                    tag = "v0.3.1", features = ["llama-cpp"] }   # or: fastembed, ort
+local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway",
+                    tag = "v0.3.1", features = ["hf-download"] } # resolvers + HF pull
 ```
 
 | Feature | Engine | Capabilities | Format |
@@ -17,7 +20,8 @@ gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.3.0
 | `ort` | `OrtAdapter` | embed | ONNX |
 | `hf-download` | — (registry) | pull models from the HF Hub | GGUF / ONNX |
 
-Default build compiles none of them.
+Default build compiles none of them. The `llama-cpp` / `fastembed` / `ort` engine
+features live on `local-providers`; `hf-download` lives on `local-engine`.
 
 ## The local-inference flow
 
@@ -26,9 +30,9 @@ Three steps: resolve → load → register.
 
 ```rust
 use std::sync::Arc;
-use gateway_embedded::registry::{ModelResolver, ManagedResolver};
-use gateway_embedded::adapters::llama_cpp::{LlamaCppAdapter, LlamaCppConfig};
-use gateway_embedded::adapters::llama_cpp::LlamaBackend; // process-wide backend
+use local_engine::registry::{ModelResolver, ManagedResolver};
+use local_providers::adapters::llama_cpp::{LlamaCppAdapter, LlamaCppConfig};
+use local_providers::adapters::llama_cpp::LlamaBackend; // process-wide backend
 
 // 1. Resolve a model from the managed store (an index of on-disk models).
 let registry = ManagedResolver::new("/path/to/models");
@@ -65,8 +69,8 @@ model that can't run on the machine (`PullError::WontFit`) — no 30 GB download
 8 GB box.
 
 ```rust
-use gateway_embedded::registry::{ManagedResolver, ModelFormat};
-use gateway_embedded::registry::pull::{HfHubPuller, ModelPuller, PullSpec};
+use local_engine::registry::{ManagedResolver, ModelFormat};
+use local_engine::registry::pull::{HfHubPuller, ModelPuller, PullSpec};
 
 let managed = ManagedResolver::new("/path/to/models");
 let puller  = HfHubPuller::new(managed, std::env::var("HF_TOKEN").ok()); // token: gated/private repos

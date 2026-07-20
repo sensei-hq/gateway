@@ -1,7 +1,7 @@
 # Design: Hugging Face model download (HF-A)
 
 - **Status:** Approved (2026-07-18)
-- **Crate:** `gateway-embedded`
+- **Crate:** `local-engine` (was `gateway-embedded` pre-0.3.1 split)
 - **Depends on:** the model registry (`ModelResolver`/`ManagedResolver`).
 - **Next in sequence:** AUTH.
 
@@ -27,7 +27,7 @@ pull; expressed as a registry-layer trait, not bolted onto the inference-adapter
   `OllamaResolver` read-through already serves operators who prefer Ollama's cache — just
   documented.
 
-## 3. Design (`gateway-embedded/src/registry/pull.rs`, feature `hf-download`)
+## 3. Design (`local-engine/src/registry/pull.rs`, feature `hf-download`)
 
 ```rust
 /// A model file (+ any siblings) to fetch and register.
@@ -75,12 +75,12 @@ Notes:
   with the right size.
 
 ## 4. Build sequence
-1. Add `hf-hub` dep + `hf-download` feature to `gateway-embedded/Cargo.toml`.
+1. Add `hf-hub` dep + `hf-download` feature to `local-engine/Cargo.toml`.
 2. `registry/pull.rs`: `PullSpec`/`PullError`/`ModelPuller`/`HfHubPuller` (all under
    `#[cfg(feature = "hf-download")]`). Re-export from `registry/mod.rs` under the same gate.
 3. Tests: unit-test the managed-path + `ModelEntry` construction + `EmptySpec` with fixtures
    (no network); a real end-to-end pull of a tiny public GGUF is `#[ignore]`.
-4. Gate: default build unaffected; `cargo build/test -p gateway-embedded --features hf-download`
+4. Gate: default build unaffected; `cargo build/test -p sensei-local-engine --features hf-download`
    green; clippy `-D warnings` clean.
 
 ## 4a. Phase 2 — resource pre-flight + pull-on-missing (requested 2026-07-18)
