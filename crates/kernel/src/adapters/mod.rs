@@ -77,7 +77,10 @@ impl AdapterRegistry {
 
 /// Lets an adapter insert itself into every capability map it implements.
 /// **Custom adapters implement this**; callers usually don't invoke it directly
-/// — [`AdapterRegistry::register`] is the ergonomic entry point and delegates here.
+/// — [`AdapterRegistry::register`] is the ergonomic entry point
+/// (`registry.register(Arc::new(MyAdapter::new()?)).await`) and delegates here.
+/// A built-in adapter's impl typically calls the `register_<cap>` method for each
+/// capability it supports.
 #[async_trait]
 pub trait RegisterInto: Send + Sync {
     async fn register_into(self: Arc<Self>, reg: &AdapterRegistry);
