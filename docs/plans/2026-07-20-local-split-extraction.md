@@ -22,6 +22,39 @@
 
 ---
 
+## Amendment A (2026-07-20, during execution) — resolves the `embedded_llama` test coupling
+
+`adapters/embedded_llama.rs`'s `#[cfg(test)]` module uses the concrete `ExternalResolver`,
+which moves to `local-engine` (not `kernel`). The plan's mechanical `crate::registry::` →
+`kernel::registry::` rewrite (Task 2, Step 5) would produce `kernel::registry::ExternalResolver`,
+which does not exist. (This test only compiles under `--features llama-cpp`, so the plan's original
+Task-2 verification — which never runs `cargo test` with an engine feature — would not have caught it.)
+
+**Decisions (approved by the human):**
+
+1. **`local-providers` gains a dev-dependency on `local-engine`** so the test keeps using
+   `ExternalResolver`. This introduces a **dev-only** `local-providers → local-engine` edge
+   (acyclic: `local-engine` never depends on `local-providers`). Runtime deps of both crates
+   remain `kernel`-only.
+2. **Execution order is reordered to `Task 3 → Task 2 → Task 4`.** Cargo loads every member
+   manifest up front, so a `dev-dependencies` path to `../local-engine` must exist before *any*
+   `local-providers` cargo command works. Therefore `local-engine` must be created first.
+   - The `gateway-embedded` removal from `[workspace] members` (originally Task 2, Step 1) moves
+     into the now-first task (Task 3, Step 1), so `--workspace` stays valid from the first move.
+3. **In moved `embedded_llama.rs` test:** split the import into
+   `use kernel::registry::{ModelEntry, ModelFormat, ModelSource};` +
+   `use local_engine::registry::ExternalResolver;` (the sed rewrite over-broadly sends
+   `ExternalResolver` to `kernel`; correct it).
+4. **Task 2 verification gains** `cargo test -p sensei-local-providers --features llama-cpp,fastembed,ort`
+   so the fixed test is actually exercised.
+5. **Task 3, Step 5 clarification:** the kept `ChainedResolver` tests use `Path`/`PathBuf`, so after
+   the vocab (and its `use std::path::{Path, PathBuf};`) is removed, move that import *into* the
+   `#[cfg(test)] mod tests` block — leaving it at module scope would trip clippy `unused_imports`
+   under `-D warnings`. Keep `use std::collections::HashSet;` + `use std::sync::Arc;` at module
+   scope (both used by `ChainedResolver` non-test code).
+
+---
+
 ## Task 1: Lift the model-registry vocabulary into `kernel`
 
 **Files:** create `crates/kernel/src/registry.rs`; modify `crates/kernel/src/lib.rs`.
