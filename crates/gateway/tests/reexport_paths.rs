@@ -8,9 +8,11 @@ use gateway::adapters::capability::{
 };
 use gateway::adapters::{AdapterRegistry, RegisterInto};
 use gateway::types::config::RouterConfig;
+use gateway::types::cost::{Cost, CostEstimate, TokenUsage};
 use gateway::types::error::GatewayError;
 use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
 use gateway::types::request::{Message, MessageRole, StreamChunk};
+use gateway::types::trace::Attempt;
 use gateway::{Capability, InferenceRequest, InferenceResponse};
 
 #[test]
