@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/kernel", "crates/cloud-providers", "crates/gateway", "crates/local-engine"]
+members = ["crates/kernel", "crates/cloud-providers", "crates/gateway", "crates/local-engine", "crates/local-providers"]
 resolver = "2"
 
 [profile.release]

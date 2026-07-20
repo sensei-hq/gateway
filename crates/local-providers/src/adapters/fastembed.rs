@@ -21,7 +21,7 @@
 //! not ONNX. Loading an Ollama-sourced entry through this adapter will
 //! fail at fastembed's ONNX parse step with a clear error.
 
-use crate::registry::ModelEntry;
+use kernel::registry::ModelEntry;
 use async_trait::async_trait;
 use fastembed::{
     InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding, TokenizerFiles,
@@ -204,7 +204,7 @@ impl kernel::adapters::RegisterInto for FastembedAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{ModelFormat, ModelSource};
+    use kernel::registry::{ModelFormat, ModelSource};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
