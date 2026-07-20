@@ -39,7 +39,7 @@ test: ## Run the full test suite (workspace, default features)
 	cargo test --workspace
 
 test-fast: ## Run only the gateway crate's lib unit tests (no wiremock integration)
-	cargo test -p gateway --lib
+	cargo test -p sensei-gateway --lib
 
 # ── Lint / format ─────────────────────────────────────────────────────────────
 
@@ -61,13 +61,13 @@ lint: fmt-check clippy ## fmt-check + clippy
 # routing engine and provider adapters that carry the testable logic.
 
 cov: ## Print a per-file coverage summary for the gateway crate
-	cargo llvm-cov -p gateway --summary-only
+	cargo llvm-cov -p sensei-gateway --summary-only
 
 cov-check: ## Fail if gateway line coverage drops below 80% (the CI gate)
-	cargo llvm-cov -p gateway --summary-only --fail-under-lines 80
+	cargo llvm-cov -p sensei-gateway --summary-only --fail-under-lines 80
 
 cov-html: ## Generate + open an HTML coverage report for the gateway crate
-	cargo llvm-cov -p gateway --html --open
+	cargo llvm-cov -p sensei-gateway --html --open
 
 # ── Release gate ──────────────────────────────────────────────────────────────
 # The tree is rustfmt-formatted and clippy-clean (as of the capability-trait
