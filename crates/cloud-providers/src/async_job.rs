@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
 
 /// Default poll interval (seconds) when the operator doesn't override it.
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 3;

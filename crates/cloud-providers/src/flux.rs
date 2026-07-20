@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ImageRequest, ImageResponse};
-use crate::types::request::ImageResult;
+use crate::base::{build_client, resolve_api_key};
+use crate::async_job::{JobConfig, poll_until_complete};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ImageRequest, ImageResponse};
+use kernel::types::request::ImageResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -102,14 +102,14 @@ impl FluxAdapter {
 // RegisterInto are referenced by full path.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for FluxAdapter {
+impl kernel::adapters::capability::Model for FluxAdapter {
     fn id(&self) -> &str {
         "flux"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ImageModel for FluxAdapter {
+impl kernel::adapters::capability::ImageModel for FluxAdapter {
     async fn generate_image(
         &self,
         config: &RouterConfig,
@@ -223,8 +223,8 @@ impl crate::adapters::capability::ImageModel for FluxAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for FluxAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for FluxAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_image(self).await;
     }
 }
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn flux_id_and_supports() {
         let adapter = FluxAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "flux");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "flux");
     }
 
     #[test]
@@ -248,7 +248,7 @@ mod tests {
         let adapter = FluxAdapter::new().unwrap();
         // Reference `Model::id` by full path
         // and the capability `Model` trait.
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "flux");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "flux");
     }
 
     #[test]

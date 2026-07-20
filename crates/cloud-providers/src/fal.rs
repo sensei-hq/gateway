@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
-use crate::types::request::{ImageResult, VideoResult};
+use crate::base::{build_client, resolve_api_key};
+use crate::async_job::{JobConfig, poll_until_complete};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
+use kernel::types::request::{ImageResult, VideoResult};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -108,14 +108,14 @@ impl FalAdapter {
 // RegisterInto are referenced by full path.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for FalAdapter {
+impl kernel::adapters::capability::Model for FalAdapter {
     fn id(&self) -> &str {
         "fal"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ImageModel for FalAdapter {
+impl kernel::adapters::capability::ImageModel for FalAdapter {
     async fn generate_image(
         &self,
         config: &RouterConfig,
@@ -243,7 +243,7 @@ impl crate::adapters::capability::ImageModel for FalAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::VideoModel for FalAdapter {
+impl kernel::adapters::capability::VideoModel for FalAdapter {
     async fn generate_video(
         &self,
         config: &RouterConfig,
@@ -372,8 +372,8 @@ impl crate::adapters::capability::VideoModel for FalAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for FalAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for FalAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_image(self.clone()).await;
         reg.register_video(self).await;
     }
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn fal_id_and_supports() {
         let adapter = FalAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "fal");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "fal");
     }
 
     #[test]
@@ -398,7 +398,7 @@ mod tests {
         let adapter = FalAdapter::new().unwrap();
         // Reference `Model::id` by full path
         // and the capability `Model` trait.
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "fal");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "fal");
     }
 
     #[test]
