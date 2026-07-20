@@ -3,8 +3,13 @@
 //! registry. This crate depends on nothing else in the workspace; every other
 //! gateway crate depends on it.
 
+pub mod adapters;
 pub mod types;
 
+pub use adapters::capability::{
+    ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
+};
+pub use adapters::{AdapterRegistry, RegisterInto};
 pub use types::capability::Capability;
 pub use types::error::GatewayError;
 pub use types::request::{InferenceRequest, InferenceResponse};
