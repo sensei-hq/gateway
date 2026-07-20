@@ -127,7 +127,8 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/gateway/Cargo.toml
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/gateway-embedded/Cargo.toml
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/kernel/Cargo.toml
-	@git add crates/gateway/Cargo.toml crates/gateway-embedded/Cargo.toml crates/kernel/Cargo.toml
+	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/cloud-providers/Cargo.toml
+	@git add crates/gateway/Cargo.toml crates/gateway-embedded/Cargo.toml crates/kernel/Cargo.toml crates/cloud-providers/Cargo.toml
 	@git commit -m "chore: bump to v$(_v)"
 	@git tag -a "v$(_v)" -m "gateway v$(_v)"
 	@git push origin HEAD
