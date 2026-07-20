@@ -15,6 +15,12 @@ use gateway::types::request::{Message, MessageRole, StreamChunk};
 use gateway::types::trace::Attempt;
 use gateway::{Capability, InferenceRequest, InferenceResponse};
 
+#[cfg(feature = "cloud")]
+#[allow(unused_imports)]
+use gateway::adapters::{
+    anthropic::AnthropicAdapter, bedrock::BedrockAdapter, openai::OpenAIAdapter,
+};
+
 #[test]
 fn reexport_paths_resolve() {
     // The `use` block above proves the paths resolve; nothing to assert at runtime.
