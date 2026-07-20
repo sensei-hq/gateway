@@ -7,7 +7,7 @@ pub mod engine;
 pub mod purpose;
 pub mod selection;
 pub mod store;
-pub mod types;
+pub use kernel::types;
 
 pub use config::GatewayBuilder;
 pub use engine::Gateway;
