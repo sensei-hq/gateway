@@ -15,13 +15,13 @@
 
 use std::collections::HashMap;
 
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{ChatRequest, SttRequest, TtsRequest};
-use gateway::types::request::{AudioFormat, Message, MessageRole};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, SttRequest, TtsRequest};
+use kernel::types::request::{AudioFormat, Message, MessageRole};
 
-use gateway::adapters::capability::{ChatModel, SttModel, TtsModel};
-use gateway::adapters::grok::GrokAdapter;
+use kernel::adapters::capability::{ChatModel, SttModel, TtsModel};
+use cloud_providers::grok::GrokAdapter;
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
