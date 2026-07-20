@@ -1,7 +1,7 @@
 # Design: subscription/quota auth + metering (AUTH)
 
 - **Status:** Approved (2026-07-18)
-- **Crate:** `gateway` (cloud). No `gateway-embedded` changes.
+- **Crate:** `gateway` (cloud). No `local-providers`/`local-engine` changes.
 - **Depends on:** the existing metering surface (`types/cost.rs`, `budget.rs`,
   `store.rs`) and the capability-trait engine (`engine.rs`).
 - **Sequence:** last of FOUNDATION → HF-B → HF-A → **AUTH**.
@@ -266,5 +266,5 @@ Each step is green + committed on its own; the facade stays stable throughout.
 - No calendar-aligned windows, no per-user sub-quotas, no hard/atomic reservation
   (deferred, §6).
 - No change to dollar metering, model selection, or the circuit breaker.
-- No `gateway-embedded` changes.
+- No `local-providers`/`local-engine` changes.
 ```

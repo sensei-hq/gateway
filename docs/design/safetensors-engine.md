@@ -1,7 +1,7 @@
 # Sketch: safetensors "HF as a separate engine" (Metal / candle)
 
 - **Status:** Sketch — future track, not scheduled
-- **Crate:** `gateway-embedded`
+- **Crate:** `local-providers` (was `gateway-embedded` pre-0.3.1 split)
 - **Builds on:** the model registry (`ModelFormat::Safetensors` already exists) and
   the HF-A puller (`docs/design/hf-model-download.md`). Deferred from HF-A, which
   shipped GGUF + ONNX.
@@ -18,7 +18,7 @@ a model published only as safetensors is usable on a Mac.
 
 | Option | Fit | Notes |
 |---|---|---|
-| **candle** (HF's Rust ML framework) | **Best** | Native Rust, Metal backend (`Device::new_metal`), loads safetensors directly, ships per-architecture model code (llama/mistral/qwen/gemma/…), and BERT-family for embeddings. Cleanest fit for a Rust `gateway-embedded` engine. |
+| **candle** (HF's Rust ML framework) | **Best** | Native Rust, Metal backend (`Device::new_metal`), loads safetensors directly, ships per-architecture model code (llama/mistral/qwen/gemma/…), and BERT-family for embeddings. Cleanest fit for a Rust `local-providers` engine. |
 | **mistral.rs** | Good | Built on candle; more batteries (paged attention, quant, many models, an OpenAI-ish server) but heavier and more opinionated. Consider if we want broad model coverage without hand-wiring architectures. |
 | **MLX** (Apple) | Poor (for Rust) | Fast on Apple Silicon, but Python/C++/Swift-first; Rust bindings immature. Not a fit for a Rust crate today. |
 
@@ -28,7 +28,7 @@ becomes the bottleneck.
 
 ## 3. Integration shape
 
-- New engine module in `gateway-embedded` behind a **`candle`** (or `safetensors`)
+- New engine module in `local-providers` behind a **`candle`** (or `safetensors`)
   cargo feature — opt-in like `llama-cpp`/`ort`/`fastembed`, since it drags in a GPU
   stack.
 - Implements the same capability traits — `ChatModel` (generate) and `EmbedModel`

@@ -119,9 +119,9 @@ local engine meet only through the kernel's `ReadinessProbe` port (§5).
 - **Provider deps are opt-in per wing.** `--features cloud` pulls in
   `cloud-providers` (AWS SDK + reqwest); `--features local` pulls in
   `local-engine` → `local-providers` (engines). A **pure-local** build sheds the
-  AWS SDK; a **pure-cloud** build sheds the engines. Today `gateway-embedded`
-  transitively compiles the entire Bedrock SDK just to reach the traits — the
-  kernel split ends that.
+  AWS SDK; a **pure-cloud** build sheds the engines. Before the split,
+  `gateway-embedded` transitively compiled the entire Bedrock SDK just to reach
+  the traits — the kernel split ended that.
 - **Symmetry.** `cloud-providers ∥ local-providers`; the routing engine
   (`gateway`) ∥ the local engine (`local-engine`); both speak `kernel`.
 
@@ -372,7 +372,8 @@ existing machinery plus the readiness signal.
 
 Each PR is standalone and independently reviewable. Steps 1–3 are pure
 relocations (no behavior change, guarded by re-export shims); step 4 is the
-feature.
+feature. **Status: steps 1–3 are complete — `kernel`, `cloud-providers`, and the
+`local-providers`/`local-engine` split all shipped by v0.3.1; step 4 is next.**
 
 1. **Extract `kernel`.** Move `types/*`, `adapters/capability.rs`, and
    `adapters/mod.rs` (`AdapterRegistry`/`RegisterInto`) into `kernel`. `gateway`
@@ -430,6 +431,6 @@ The library changes ship as new crate tags and, for the public OSS release,
 publish to crates.io under the `sensei-` package names (§2); the git-tag path
 remains available for pre-release pins. Downstream (senseid) bumps its
 dependencies and wires the facade builder; once `gateway` re-exports the local
-engine, senseid can collapse from `gateway` + `gateway-embedded` pins down to
+engine, senseid can collapse from `gateway` + `local-providers` + `local-engine` pins down to
 just `sensei-gateway` (with the `cloud`/`local` features it needs). Tracked as
 separate senseid issues.

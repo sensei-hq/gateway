@@ -2,7 +2,7 @@
 
 - **Status:** Draft (awaiting review)
 - **Date:** 2026-07-17
-- **Crates affected:** `gateway`, `gateway-embedded`
+- **Crates affected:** `gateway`, `local-providers` (then `gateway-embedded`)
 - **Supersedes:** the single `InferenceAdapter` trait
 - **Enables (downstream):** OpenAI-compatible adapter consolidation → Hugging Face Inference adapter (HF-B); later HF model download (HF-A) and subscription/quota auth (AUTH)
 
@@ -223,7 +223,7 @@ and budget filtering are **unchanged** — they already key off `Capability`.
    `ollama`, `fal`, `flux`, `kling`, `luma`, `recraft`, `replicate`, `runway`,
    `stability`. (`base` and `async_job` are shared helpers, not adapters — they
    need no trait impl, but `async_job`'s callers may shift to typed responses.)
-3. **Migrate `gateway-embedded` adapters**: `llama_cpp`, `embedded_llama`,
+3. **Migrate `local-providers` adapters**: `llama_cpp`, `embedded_llama`,
    `fastembed`, `ort`.
 4. **Switch the engine** to capability-map dispatch; **delete** the fat
    `InferenceAdapter` trait, `supports()`, and the bridge.
