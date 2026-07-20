@@ -296,7 +296,7 @@ mod tests {
     /// End-to-end: one adapter serves a chat model AND an embed model,
     /// selecting by `request.model`. Ignored by default; run with both GGUFs:
     ///   LLAMA_TEST_CHAT_GGUF=… LLAMA_TEST_GGUF=… \
-    ///     cargo test -p gateway-embedded --features llama-cpp \
+    ///     cargo test -p sensei-local-providers --features llama-cpp \
     ///     one_adapter_serves_chat_and_embed -- --ignored
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires LLAMA_TEST_CHAT_GGUF + LLAMA_TEST_GGUF env vars"]

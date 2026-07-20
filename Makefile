@@ -2,17 +2,20 @@
 ##
 ## Cargo workspace:
 ##   crates/kernel           — shared types, capability traits, adapter registry (sensei-kernel)
+##   crates/cloud-providers  — cloud provider adapters (sensei-cloud-providers)
 ##   crates/gateway          — routing engine (fallback chains, circuit breaker, budgets)
-##   crates/gateway-embedded — in-process inference adapters (opt-in native deps)
+##   crates/local-providers  — in-process inference adapters, opt-in native deps (sensei-local-providers)
+##   crates/local-engine     — model resolvers + Hugging Face pull (sensei-local-engine)
 ##
 ## Consumed by sensei (sensei-hq/sensei) as a git dependency (`gateway` /
-## `gateway-embedded`) pinned by tag. A release here is just a tag: `make bump`
-## bumps all four crate versions in lockstep, commits, tags, and pushes — then
+## `local-providers` / `local-engine`) pinned by tag. A release here is just a
+## tag: `make bump` bumps all five crate versions in lockstep, commits, tags,
+## and pushes — then
 ## sensei re-pins the git dep to the new tag. There are no binaries to publish
 ## (this is a library), so the tag push has no release artifacts to build.
 ##
 ## Versioning:
-##   The four crates share one version (kept in lockstep). The current version is
+##   The five crates share one version (kept in lockstep). The current version is
 ##   read from crates/gateway/Cargo.toml — that is the single source of truth.
 
 .PHONY: help build test test-fast fmt fmt-check clippy lint cov cov-html \
@@ -56,7 +59,7 @@ lint: fmt-check clippy ## fmt-check + clippy
 
 # ── Coverage ──────────────────────────────────────────────────────────────────
 # Requires cargo-llvm-cov: cargo install cargo-llvm-cov
-# gateway-embedded's native adapters (llama-cpp/ort/fastembed) are behind feature
+# local-providers' native adapters (llama-cpp/ort/fastembed) are behind feature
 # flags and need a C/C++ toolchain, so coverage targets the gateway crate — the
 # routing engine and provider adapters that carry the testable logic.
 
@@ -122,13 +125,13 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@echo "Running pre-release gate (fmt + clippy + tests)..."
 	@$(MAKE) check
 	@echo "Bumping $(VERSION) → $(_v)"
-	@# All four crates share one version — update them in lockstep. The anchored
+	@# All five crates share one version — update them in lockstep. The anchored
 	@# pattern matches only the [package] version line, never inline dep versions.
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/gateway/Cargo.toml
-	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/gateway-embedded/Cargo.toml
+	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/local-providers/Cargo.toml crates/local-engine/Cargo.toml
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/kernel/Cargo.toml
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/cloud-providers/Cargo.toml
-	@git add crates/gateway/Cargo.toml crates/gateway-embedded/Cargo.toml crates/kernel/Cargo.toml crates/cloud-providers/Cargo.toml
+	@git add crates/gateway/Cargo.toml crates/local-providers/Cargo.toml crates/local-engine/Cargo.toml crates/kernel/Cargo.toml crates/cloud-providers/Cargo.toml
 	@git commit -m "chore: bump to v$(_v)"
 	@git tag -a "v$(_v)" -m "gateway v$(_v)"
 	@git push origin HEAD
@@ -137,7 +140,7 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@# local build cache (target/ fills disk) now that the tag is pushed.
 	@echo "Reclaiming local build cache (cargo clean)…"
 	@$(MAKE) clean
-	@echo "Pushed v$(_v). Re-pin the gateway / gateway-embedded git dep in sensei to tag v$(_v)."
+	@echo "Pushed v$(_v). Re-pin the gateway / local-providers / local-engine git dep in sensei to tag v$(_v)."
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

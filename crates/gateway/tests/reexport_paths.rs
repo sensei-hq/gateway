@@ -1,5 +1,5 @@
-//! Compile-time guard: every `gateway::…` path that downstream consumers (and
-//! `gateway-embedded`) depend on must keep resolving after the kernel split.
+//! Compile-time guard: every `gateway::…` path that downstream consumers
+//! depend on must keep resolving after the kernel split.
 //! Compiling this file IS the assertion.
 #![allow(unused_imports)]
 

@@ -490,7 +490,7 @@ mod tests {
     /// has exactly this layout. Run with:
     ///
     ///     ORT_TEST_DIR=$HOME/.../models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/<id> \
-    ///       cargo test -p gateway-embedded --features ort -- --ignored
+    ///       cargo test -p sensei-local-providers --features ort -- --ignored
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires ORT_TEST_DIR env var pointing at an ONNX embedding model directory"]
     async fn embed_against_real_onnx_returns_unit_length_vectors() {

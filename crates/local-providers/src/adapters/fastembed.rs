@@ -270,7 +270,7 @@ mod tests {
     /// `models/all-MiniLM-L6-v2-qdrant/`. Run with:
     ///
     ///     FASTEMBED_TEST_DIR=$HOME/...rust-embedding-bench/models/all-MiniLM-L6-v2-qdrant \
-    ///       cargo test -p gateway-embedded --features fastembed -- --ignored
+    ///       cargo test -p sensei-local-providers --features fastembed -- --ignored
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires FASTEMBED_TEST_DIR env var pointing at a directory with the standard Qdrant ONNX layout"]
     async fn embed_against_real_qdrant_layout_returns_dense_vectors() {

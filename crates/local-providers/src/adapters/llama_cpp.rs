@@ -1078,7 +1078,7 @@ mod tests {
     /// disk. Run with:
     ///
     ///     LLAMA_TEST_GGUF=$HOME/.ollama/models/blobs/sha256-... \
-    ///       cargo test -p gateway-embedded --features llama-cpp -- --ignored
+    ///       cargo test -p sensei-local-providers --features llama-cpp -- --ignored
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires LLAMA_TEST_GGUF env var pointing at a BERT-class embedding GGUF"]
     async fn embed_against_real_model_returns_unit_length_vectors() {
@@ -1111,7 +1111,7 @@ mod tests {
     /// qwen2.5, etc.). Ignored by default. Run with:
     ///
     ///     LLAMA_TEST_CHAT_GGUF=$HOME/.ollama/models/blobs/sha256-... \
-    ///       cargo test -p gateway-embedded --features llama-cpp -- --ignored
+    ///       cargo test -p sensei-local-providers --features llama-cpp -- --ignored
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires LLAMA_TEST_CHAT_GGUF env var pointing at a generative GGUF with a chat template"]
     async fn generate_against_real_model_returns_non_empty_text() {
