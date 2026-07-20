@@ -7,7 +7,7 @@
 //! full-featured variant once (tools + multimodal + streaming-with-tools)
 //! and exposes three `pub(crate)` entry points — [`chat`], [`chat_stream`],
 //! and [`embed`] — that speak the gateway's typed
-//! [`io`](crate::types::io) request/response structs and encapsulate the
+//! [`io`](kernel::types::io) request/response structs and encapsulate the
 //! HTTP.
 //!
 //! Adapters keep their own `struct`, `Model::id`, base-url / default-model
@@ -23,12 +23,12 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{http_json, resolve_api_key};
-use crate::types::config::RouterConfig;
-use crate::types::cost::TokenUsage;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse};
-use crate::types::request::{
+use crate::base::{http_json, resolve_api_key};
+use kernel::types::config::RouterConfig;
+use kernel::types::cost::TokenUsage;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse};
+use kernel::types::request::{
     MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamChunk,
     StreamingToolCall, ToolCall, ToolDefinition,
 };
@@ -565,8 +565,8 @@ pub(crate) async fn embed(
     base_url: &str,
     default_model: &str,
     cfg: &RouterConfig,
-    req: &crate::types::io::EmbedRequest,
-) -> Result<crate::types::io::EmbedResponse, GatewayError> {
+    req: &kernel::types::io::EmbedRequest,
+) -> Result<kernel::types::io::EmbedResponse, GatewayError> {
     let api_key = resolve_api_key(cfg);
     let model = req
         .model
@@ -591,7 +591,7 @@ pub(crate) async fn embed(
     let embeddings: Vec<Vec<f32>> = resp.data.into_iter().map(|d| d.embedding).collect();
     let usage = usage_from_response(&resp.usage);
 
-    Ok(crate::types::io::EmbedResponse {
+    Ok(kernel::types::io::EmbedResponse {
         embeddings,
         usage,
         degraded: false,
