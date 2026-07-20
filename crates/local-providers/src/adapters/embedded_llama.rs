@@ -19,7 +19,7 @@
 //!   reused in place and nothing has to be shipped with the binary.
 
 use crate::adapters::llama_cpp::{LlamaCppAdapter, LlamaCppConfig, shared_backend};
-use crate::registry::ModelResolver;
+use kernel::registry::ModelResolver;
 use async_trait::async_trait;
 use futures::Stream;
 use kernel::types::config::RouterConfig;
@@ -230,8 +230,11 @@ impl kernel::adapters::RegisterInto for EmbeddedLlamaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{ExternalResolver, ModelEntry, ModelFormat, ModelSource};
+    use kernel::registry::{ModelEntry, ModelFormat, ModelSource};
     use kernel::types::request::{Message, MessageRole};
+    // ExternalResolver is a concrete resolver from the local engine; see the
+    // local-engine dev-dependency in Cargo.toml (Amendment A of the split plan).
+    use local_engine::registry::ExternalResolver;
 
     #[test]
     fn worker_config_picks_mode_specific_defaults() {

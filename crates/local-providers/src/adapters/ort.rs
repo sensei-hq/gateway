@@ -44,7 +44,7 @@ use std::path::Path;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
 use crate::math::l2_normalize_in_place;
-use crate::registry::ModelEntry;
+use kernel::registry::ModelEntry;
 
 /// Pooling strategy applied to the model's per-token hidden states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,7 +350,7 @@ impl kernel::adapters::RegisterInto for OrtAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{ModelFormat, ModelSource};
+    use kernel::registry::{ModelFormat, ModelSource};
     use std::path::PathBuf;
     use tempfile::TempDir;
 

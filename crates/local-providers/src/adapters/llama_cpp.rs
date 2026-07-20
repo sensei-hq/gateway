@@ -44,7 +44,7 @@
 //!    for that reason.
 
 use crate::math::l2_normalize_in_place;
-use crate::registry::{ModelEntry, ModelSource};
+use kernel::registry::{ModelEntry, ModelSource};
 use async_trait::async_trait;
 use futures::Stream;
 use kernel::types::config::RouterConfig;
@@ -933,7 +933,7 @@ fn run_streaming_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{ModelFormat, ModelSource};
+    use kernel::registry::{ModelFormat, ModelSource};
     use std::path::PathBuf;
 
     /// Test-only wrapper around the public [`super::shared_backend`].
