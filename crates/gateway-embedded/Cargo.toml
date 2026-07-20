@@ -18,7 +18,7 @@ ort = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 hf-download = ["dep:hf-hub", "dep:reqwest", "dep:sysinfo"]
 
 [dependencies]
-gateway = { path = "../gateway" }
+kernel = { package = "sensei-kernel", path = "../kernel" }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

@@ -22,10 +22,10 @@ use crate::adapters::llama_cpp::{LlamaCppAdapter, LlamaCppConfig, shared_backend
 use crate::registry::ModelResolver;
 use async_trait::async_trait;
 use futures::Stream;
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
-use gateway::types::request::StreamChunk;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use kernel::types::request::StreamChunk;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -150,14 +150,14 @@ impl EmbeddedLlamaAdapter {
 // `ChatModel::chat_stream`.
 // ---------------------------------------------------------------------------
 
-impl gateway::adapters::capability::Model for EmbeddedLlamaAdapter {
+impl kernel::adapters::capability::Model for EmbeddedLlamaAdapter {
     fn id(&self) -> &str {
         &self.adapter_id
     }
 }
 
 #[async_trait]
-impl gateway::adapters::capability::ChatModel for EmbeddedLlamaAdapter {
+impl kernel::adapters::capability::ChatModel for EmbeddedLlamaAdapter {
     async fn chat(
         &self,
         _config: &RouterConfig,
@@ -200,7 +200,7 @@ impl gateway::adapters::capability::ChatModel for EmbeddedLlamaAdapter {
 }
 
 #[async_trait]
-impl gateway::adapters::capability::EmbedModel for EmbeddedLlamaAdapter {
+impl kernel::adapters::capability::EmbedModel for EmbeddedLlamaAdapter {
     async fn embed(
         &self,
         _config: &RouterConfig,
@@ -220,8 +220,8 @@ impl gateway::adapters::capability::EmbedModel for EmbeddedLlamaAdapter {
 }
 
 #[async_trait]
-impl gateway::adapters::RegisterInto for EmbeddedLlamaAdapter {
-    async fn register_into(self: Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for EmbeddedLlamaAdapter {
+    async fn register_into(self: Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -231,7 +231,7 @@ impl gateway::adapters::RegisterInto for EmbeddedLlamaAdapter {
 mod tests {
     use super::*;
     use crate::registry::{ExternalResolver, ModelEntry, ModelFormat, ModelSource};
-    use gateway::types::request::{Message, MessageRole};
+    use kernel::types::request::{Message, MessageRole};
 
     #[test]
     fn worker_config_picks_mode_specific_defaults() {
@@ -258,7 +258,7 @@ mod tests {
     /// empty resolver so no model file is needed.
     #[tokio::test]
     async fn chat_unknown_model_is_model_unavailable() {
-        use gateway::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         let resolver = Arc::new(ExternalResolver::new());
         // No real backend needed: resolution fails before any load. We still
         // need a backend to construct, so this test is gated on llama init
@@ -267,7 +267,7 @@ mod tests {
         else {
             return;
         };
-        let req = gateway::types::io::ChatRequest {
+        let req = kernel::types::io::ChatRequest {
             model: Some("nope".into()),
             messages: vec![Message::text(MessageRole::User, "hi")],
             system: None,
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires LLAMA_TEST_CHAT_GGUF + LLAMA_TEST_GGUF env vars"]
     async fn one_adapter_serves_chat_and_embed_by_model_id() {
-        use gateway::adapters::capability::{ChatModel, EmbedModel};
+        use kernel::adapters::capability::{ChatModel, EmbedModel};
         let chat = std::env::var("LLAMA_TEST_CHAT_GGUF").expect("LLAMA_TEST_CHAT_GGUF");
         let embed = std::env::var("LLAMA_TEST_GGUF").expect("LLAMA_TEST_GGUF");
 
@@ -319,7 +319,7 @@ mod tests {
         };
 
         // Chat through the chat model.
-        let chat_req = gateway::types::io::ChatRequest {
+        let chat_req = kernel::types::io::ChatRequest {
             model: Some("chat-model".into()),
             messages: vec![Message::text(MessageRole::User, "Reply: pong")],
             system: None,
@@ -331,7 +331,7 @@ mod tests {
         assert!(chat_resp.content.is_some());
 
         // Embed through the embed model — same adapter instance.
-        let embed_req = gateway::types::io::EmbedRequest {
+        let embed_req = kernel::types::io::EmbedRequest {
             model: Some("embed-model".into()),
             texts: vec!["hello world".into()],
         };

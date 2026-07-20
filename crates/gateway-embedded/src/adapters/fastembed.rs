@@ -27,9 +27,9 @@ use fastembed::{
     InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding, TokenizerFiles,
     UserDefinedEmbeddingModel,
 };
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{EmbedRequest, EmbedResponse};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{EmbedRequest, EmbedResponse};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -160,14 +160,14 @@ fn read_required(path: &Path, config: &FastembedConfig) -> Result<Vec<u8>, Gatew
 // Embed-only: fastembed serves the TextEmbed capability and nothing else.
 // ---------------------------------------------------------------------------
 
-impl gateway::adapters::capability::Model for FastembedAdapter {
+impl kernel::adapters::capability::Model for FastembedAdapter {
     fn id(&self) -> &str {
         &self.config.adapter_id
     }
 }
 
 #[async_trait]
-impl gateway::adapters::capability::EmbedModel for FastembedAdapter {
+impl kernel::adapters::capability::EmbedModel for FastembedAdapter {
     async fn embed(
         &self,
         _cfg: &RouterConfig,
@@ -195,8 +195,8 @@ impl gateway::adapters::capability::EmbedModel for FastembedAdapter {
 }
 
 #[async_trait]
-impl gateway::adapters::RegisterInto for FastembedAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for FastembedAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_embed(self).await;
     }
 }
@@ -316,7 +316,7 @@ mod tests {
 
         // Full-path call to `Model::id`.
         assert_eq!(
-            gateway::adapters::capability::Model::id(&adapter),
+            kernel::adapters::capability::Model::id(&adapter),
             "fastembed"
         );
     }
