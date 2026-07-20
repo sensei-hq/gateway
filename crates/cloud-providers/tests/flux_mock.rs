@@ -10,12 +10,12 @@
 
 use std::collections::HashMap;
 
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::ImageRequest;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::ImageRequest;
 
-use gateway::adapters::capability::ImageModel;
-use gateway::adapters::flux::FluxAdapter;
+use kernel::adapters::capability::ImageModel;
+use cloud_providers::flux::FluxAdapter;
 
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};

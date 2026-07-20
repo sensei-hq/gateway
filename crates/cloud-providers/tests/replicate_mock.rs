@@ -14,12 +14,12 @@
 
 use std::collections::HashMap;
 
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{ImageRequest, VideoRequest};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ImageRequest, VideoRequest};
 
-use gateway::adapters::capability::{ImageModel, VideoModel};
-use gateway::adapters::replicate::ReplicateAdapter;
+use kernel::adapters::capability::{ImageModel, VideoModel};
+use cloud_providers::replicate::ReplicateAdapter;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
