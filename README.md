@@ -44,7 +44,7 @@ Edit locally, build the consumer against your changes, then push here, cut a new
 
 ## Versioning
 
-This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); all three crates currently share version `0.2.24`.
+This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); all four crates currently share version `0.3.1`.
 
 ## License
 
