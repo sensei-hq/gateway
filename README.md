@@ -7,7 +7,7 @@ Shared **LLM inference routing engine** — fallback chains, circuit breaker, bu
 | Crate | What it is |
 |---|---|
 | [`kernel`](crates/kernel) (`sensei-kernel`) | Shared types, capability traits, and the `AdapterRegistry` underpinning both crates below. No I/O of its own — the foundation `gateway` and `gateway-embedded` build adapters against. |
-| [`gateway`](crates/gateway) | Provider-agnostic routing engine. Trait-based adapters (~15 cloud providers), named fallback chains, per-endpoint circuit breaker, budget filtering, request tracing, and a `GatewayStore` trait for persistence. No DB of its own; HTTP via `reqwest`/`rustls`, async via `tokio`. |
+| [`gateway`](crates/gateway) (`sensei-gateway`) | Provider-agnostic routing engine. Trait-based adapters (~15 cloud providers), named fallback chains, per-endpoint circuit breaker, budget filtering, request tracing, and a `GatewayStore` trait for persistence. No DB of its own; HTTP via `reqwest`/`rustls`, async via `tokio`. |
 | [`gateway-embedded`](crates/gateway-embedded) | In-process inference adapters (`llama.cpp`, ONNX Runtime, FastEmbed) and an on-disk model registry. Same `InferenceAdapter` trait as the cloud adapters, so local and cloud models compose in one routing config. Engines are feature-gated. |
 
 `gateway-embedded` features (all off by default — each pulls heavyweight native deps):
@@ -23,7 +23,7 @@ ort         # ONNX Runtime (CPU)
 Pin a tagged release via a git dependency:
 
 ```toml
-gateway          = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24" }
+gateway          = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24" }
 gateway-embedded = { git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24", features = ["fastembed"] }
 ```
 
@@ -35,7 +35,7 @@ Clone this repo next to the consumer and add a `[patch]` (keep it dev-only) at t
 
 ```toml
 [patch."https://github.com/sensei-hq/gateway"]
-gateway          = { path = "../gateway/crates/gateway" }
+sensei-gateway   = { path = "../gateway/crates/gateway" }
 gateway-embedded = { path = "../gateway/crates/gateway-embedded" }
 ```
 
