@@ -7,6 +7,7 @@ Shared **LLM inference routing engine** — fallback chains, circuit breaker, bu
 | Crate | What it is |
 |---|---|
 | [`kernel`](crates/kernel) (`sensei-kernel`) | Shared types, capability traits, and the `AdapterRegistry` underpinning both crates below. No I/O of its own — the foundation `gateway` and `gateway-embedded` build adapters against. |
+| [`cloud-providers`](crates/cloud-providers) (`sensei-cloud-providers`) | Cloud provider adapters (~15 providers incl. Anthropic, Bedrock, OpenAI). Gated behind `gateway`'s default `cloud` feature and re-exported at `gateway::adapters::<provider>`; build `gateway` with `--no-default-features` for a lean routing core with no AWS SDK. |
 | [`gateway`](crates/gateway) (`sensei-gateway`) | Provider-agnostic routing engine. Trait-based adapters (~15 cloud providers), named fallback chains, per-endpoint circuit breaker, budget filtering, request tracing, and a `GatewayStore` trait for persistence. No DB of its own; HTTP via `reqwest`/`rustls`, async via `tokio`. |
 | [`gateway-embedded`](crates/gateway-embedded) | In-process inference adapters (`llama.cpp`, ONNX Runtime, FastEmbed) and an on-disk model registry. Same `InferenceAdapter` trait as the cloud adapters, so local and cloud models compose in one routing config. Engines are feature-gated. |
 
@@ -43,7 +44,7 @@ Edit locally, build the consumer against your changes, then push here, cut a new
 
 ## Versioning
 
-This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); all three crates currently share version `0.2.24`.
+This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); all four crates currently share version `0.3.1`.
 
 ## License
 

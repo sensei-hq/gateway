@@ -22,13 +22,13 @@ use std::collections::HashMap;
 
 use futures::StreamExt;
 
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{ChatRequest, ImageRequest};
-use gateway::types::request::{Message, MessageRole};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ImageRequest};
+use kernel::types::request::{Message, MessageRole};
 
-use gateway::adapters::capability::{ChatModel, ImageModel};
-use gateway::adapters::together::TogetherAdapter;
+use kernel::adapters::capability::{ChatModel, ImageModel};
+use cloud_providers::together::TogetherAdapter;
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

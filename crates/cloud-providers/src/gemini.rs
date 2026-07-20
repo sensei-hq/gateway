@@ -27,12 +27,12 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::adapters::base::{build_client, resolve_api_key};
-use crate::types::config::RouterConfig;
-use crate::types::cost::TokenUsage;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
-use crate::types::request::{
+use crate::base::{build_client, resolve_api_key};
+use kernel::types::config::RouterConfig;
+use kernel::types::cost::TokenUsage;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use kernel::types::request::{
     MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamChunk, ToolCall,
     ToolDefinition,
 };
@@ -626,14 +626,14 @@ impl GeminiAdapter {
 // are imported by name.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for GeminiAdapter {
+impl kernel::adapters::capability::Model for GeminiAdapter {
     fn id(&self) -> &str {
         ADAPTER_ID
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for GeminiAdapter {
+impl kernel::adapters::capability::ChatModel for GeminiAdapter {
     async fn chat(
         &self,
         config: &RouterConfig,
@@ -762,7 +762,7 @@ impl crate::adapters::capability::ChatModel for GeminiAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::EmbedModel for GeminiAdapter {
+impl kernel::adapters::capability::EmbedModel for GeminiAdapter {
     async fn embed(
         &self,
         config: &RouterConfig,
@@ -815,8 +815,8 @@ impl crate::adapters::capability::EmbedModel for GeminiAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for GeminiAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for GeminiAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn id_and_supports_match_chat_and_embed() {
         let a = GeminiAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&a), "gemini");
+        assert_eq!(kernel::adapters::capability::Model::id(&a), "gemini");
     }
 
     #[test]
@@ -853,7 +853,7 @@ mod tests {
         // The capability `Model::id` (fully qualified to avoid the
         // via the capability `Model::id`) returns the same value.
         let a = GeminiAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&a), "gemini");
+        assert_eq!(kernel::adapters::capability::Model::id(&a), "gemini");
     }
 
     #[test]

@@ -8,46 +8,21 @@ license = "MIT"
 [lib]
 name = "gateway"
 
+[features]
+default = ["cloud"]
+cloud = ["dep:cloud-providers"]
+
 [dependencies]
-# AWS Bedrock — heavy native deps (smithy runtime, hyper, etc.) but
-# brings SigV4, credential-provider chain, and Converse API for free.
-#
-# `default-features = false` intentionally drops the SDK's default `rustls`
-# feature. That feature enables `aws-smithy-runtime/tls-rustls`, which drags in
-# the legacy hyper-0.14 / rustls-0.21 connector (`legacy-rustls-ring`) and with
-# it the vulnerable `rustls-webpki 0.101.7` (RUSTSEC DoS-on-malformed-CRL). We
-# keep only `default-https-client`, which routes through the modern
-# `rustls-aws-lc` connector on rustls 0.23 / rustls-webpki 0.103. See issue #1.
-aws-config = { version = "1", default-features = false, features = [
-    "default-https-client",
-    "rt-tokio",
-    "credentials-process",
-    "sso",
-    "behavior-version-latest",
-] }
-aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
-    "default-https-client",
-    "rt-tokio",
-] }
-# Direct on aws-smithy-types so the Bedrock adapter can construct
-# Document values for tool input schemas and tool_use payloads
-# without going through a private re-export.
-aws-smithy-types = "1"
 # Ergonomic `stream! { ... yield ev; ... }` macro used by
 # `Gateway::execute_stream` to build the public StreamEvent stream
 # imperatively (await candidates, yield ProviderSwitch/Chunk/Done/Error).
 async-stream = "0.3"
 async-trait = "0.1"
-# Used directly for naming reqwest's Bytes type in streaming
-# adapters' state machines (otherwise it leaks through `impl Stream`
-# and can't be stored in a struct).
-bytes = "1"
-base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+cloud-providers = { package = "sensei-cloud-providers", path = "../cloud-providers", optional = true }
 futures = "0.3"
 kernel = { package = "sensei-kernel", path = "../kernel" }
 pin-project-lite = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

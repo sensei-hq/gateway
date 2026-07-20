@@ -7,12 +7,12 @@
 ##
 ## Consumed by sensei (sensei-hq/sensei) as a git dependency (`gateway` /
 ## `gateway-embedded`) pinned by tag. A release here is just a tag: `make bump`
-## bumps all three crate versions in lockstep, commits, tags, and pushes — then
+## bumps all four crate versions in lockstep, commits, tags, and pushes — then
 ## sensei re-pins the git dep to the new tag. There are no binaries to publish
 ## (this is a library), so the tag push has no release artifacts to build.
 ##
 ## Versioning:
-##   The three crates share one version (kept in lockstep). The current version is
+##   The four crates share one version (kept in lockstep). The current version is
 ##   read from crates/gateway/Cargo.toml — that is the single source of truth.
 
 .PHONY: help build test test-fast fmt fmt-check clippy lint cov cov-html \
@@ -122,12 +122,13 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@echo "Running pre-release gate (fmt + clippy + tests)..."
 	@$(MAKE) check
 	@echo "Bumping $(VERSION) → $(_v)"
-	@# All three crates share one version — update them in lockstep. The anchored
+	@# All four crates share one version — update them in lockstep. The anchored
 	@# pattern matches only the [package] version line, never inline dep versions.
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/gateway/Cargo.toml
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/gateway-embedded/Cargo.toml
 	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/kernel/Cargo.toml
-	@git add crates/gateway/Cargo.toml crates/gateway-embedded/Cargo.toml crates/kernel/Cargo.toml
+	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/cloud-providers/Cargo.toml
+	@git add crates/gateway/Cargo.toml crates/gateway-embedded/Cargo.toml crates/kernel/Cargo.toml crates/cloud-providers/Cargo.toml
 	@git commit -m "chore: bump to v$(_v)"
 	@git tag -a "v$(_v)" -m "gateway v$(_v)"
 	@git push origin HEAD

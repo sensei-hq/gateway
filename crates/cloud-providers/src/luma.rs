@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{VideoRequest, VideoResponse};
-use crate::types::request::VideoResult;
+use crate::base::{build_client, resolve_api_key};
+use crate::async_job::{JobConfig, poll_until_complete};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{VideoRequest, VideoResponse};
+use kernel::types::request::VideoResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -92,14 +92,14 @@ impl LumaAdapter {
 // RegisterInto are referenced by full path.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for LumaAdapter {
+impl kernel::adapters::capability::Model for LumaAdapter {
     fn id(&self) -> &str {
         "luma"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::VideoModel for LumaAdapter {
+impl kernel::adapters::capability::VideoModel for LumaAdapter {
     async fn generate_video(
         &self,
         config: &RouterConfig,
@@ -204,8 +204,8 @@ impl crate::adapters::capability::VideoModel for LumaAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for LumaAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for LumaAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_video(self).await;
     }
 }
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn luma_id_and_supports() {
         let adapter = LumaAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "luma");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "luma");
     }
 
     #[test]
@@ -229,7 +229,7 @@ mod tests {
         let adapter = LumaAdapter::new().unwrap();
         // Reference `Model::id` by full path
         // and the capability `Model` trait.
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "luma");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "luma");
     }
 
     #[test]

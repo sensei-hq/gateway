@@ -2,13 +2,13 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use super::capability::{ImageModel, Model};
-use super::{AdapterRegistry, RegisterInto};
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ImageRequest, ImageResponse};
-use crate::types::request::ImageResult;
+use crate::base::{build_client, resolve_api_key};
+use kernel::adapters::capability::{ImageModel, Model};
+use kernel::adapters::{AdapterRegistry, RegisterInto};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ImageRequest, ImageResponse};
+use kernel::types::request::ImageResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -189,7 +189,7 @@ mod tests {
         let adapter = RecraftAdapter::new().unwrap();
         // `id` comes from the `Model`
         // trait, so the call must be disambiguated.
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "recraft");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "recraft");
         assert_eq!(Model::id(&adapter), "recraft");
     }
 

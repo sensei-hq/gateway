@@ -48,11 +48,11 @@ use aws_smithy_types::{Blob, Document, Number};
 use base64::Engine;
 use futures::Stream;
 
-use crate::types::config::RouterConfig;
-use crate::types::cost::TokenUsage;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
-use crate::types::request::{
+use kernel::types::config::RouterConfig;
+use kernel::types::cost::TokenUsage;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use kernel::types::request::{
     MediaAttachment, MediaSource, Message as GwMessage, MessageContent, MessageRole, StreamChunk,
     StreamingToolCall, ToolCall, ToolDefinition,
 };
@@ -185,14 +185,14 @@ impl BedrockAdapter {
 // Capability traits (target model). Traits + RegisterInto referenced by full path.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for BedrockAdapter {
+impl kernel::adapters::capability::Model for BedrockAdapter {
     fn id(&self) -> &str {
         ADAPTER_ID
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for BedrockAdapter {
+impl kernel::adapters::capability::ChatModel for BedrockAdapter {
     async fn chat(
         &self,
         cfg: &RouterConfig,
@@ -308,7 +308,7 @@ impl crate::adapters::capability::ChatModel for BedrockAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::EmbedModel for BedrockAdapter {
+impl kernel::adapters::capability::EmbedModel for BedrockAdapter {
     async fn embed(
         &self,
         cfg: &RouterConfig,
@@ -353,8 +353,8 @@ impl crate::adapters::capability::EmbedModel for BedrockAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for BedrockAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for BedrockAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -1491,7 +1491,7 @@ mod tests {
         let adapter = BedrockAdapter::with_region("us-east-1").await.unwrap();
         // Reference `Model::id` by full path
         // and the capability `Model` trait.
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "bedrock");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "bedrock");
     }
 
     // -----------------------------------------------------------------

@@ -6,15 +6,15 @@
 
 use std::collections::HashMap;
 
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{ChatRequest, EmbedRequest};
-use gateway::types::request::{Message, MessageRole};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, EmbedRequest};
+use kernel::types::request::{Message, MessageRole};
 
-use gateway::adapters::anthropic::AnthropicAdapter;
-use gateway::adapters::capability::{ChatModel, EmbedModel};
-use gateway::adapters::ollama::OllamaAdapter;
-use gateway::adapters::openai::OpenAIAdapter;
+use cloud_providers::anthropic::AnthropicAdapter;
+use kernel::adapters::capability::{ChatModel, EmbedModel};
+use cloud_providers::ollama::OllamaAdapter;
+use cloud_providers::openai::OpenAIAdapter;
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

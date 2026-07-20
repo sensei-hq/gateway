@@ -4,13 +4,13 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::Client;
 use serde::Deserialize;
 
-use super::base::{build_client, resolve_api_key};
-use super::capability::{ImageModel, Model};
-use super::{AdapterRegistry, RegisterInto};
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ImageRequest, ImageResponse};
-use crate::types::request::ImageResult;
+use crate::base::{build_client, resolve_api_key};
+use kernel::adapters::capability::{ImageModel, Model};
+use kernel::adapters::{AdapterRegistry, RegisterInto};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ImageRequest, ImageResponse};
+use kernel::types::request::ImageResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -198,7 +198,7 @@ mod tests {
     fn stability_id_and_supports() {
         let adapter = StabilityAdapter::new().unwrap();
         assert_eq!(
-            crate::adapters::capability::Model::id(&adapter),
+            kernel::adapters::capability::Model::id(&adapter),
             "stability"
         );
     }
