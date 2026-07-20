@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use futures::Stream;
 use reqwest::Client;
 
-use super::base::build_client;
-use super::openai_compat;
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse};
-use crate::types::request::StreamChunk;
+use crate::base::build_client;
+use crate::openai_compat;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse};
+use kernel::types::request::StreamChunk;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -66,14 +66,14 @@ impl OllamaAdapter {
 // Capability traits (target model). Traits + RegisterInto referenced by full path.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for OllamaAdapter {
+impl kernel::adapters::capability::Model for OllamaAdapter {
     fn id(&self) -> &str {
         "ollama"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for OllamaAdapter {
+impl kernel::adapters::capability::ChatModel for OllamaAdapter {
     async fn chat(
         &self,
         config: &RouterConfig,
@@ -96,19 +96,19 @@ impl crate::adapters::capability::ChatModel for OllamaAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::EmbedModel for OllamaAdapter {
+impl kernel::adapters::capability::EmbedModel for OllamaAdapter {
     async fn embed(
         &self,
         config: &RouterConfig,
-        req: &crate::types::io::EmbedRequest,
-    ) -> Result<crate::types::io::EmbedResponse, GatewayError> {
+        req: &kernel::types::io::EmbedRequest,
+    ) -> Result<kernel::types::io::EmbedResponse, GatewayError> {
         openai_compat::embed(&self.client, &config.url, DEFAULT_MODEL, config, req).await
     }
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for OllamaAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for OllamaAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -121,11 +121,11 @@ impl crate::adapters::RegisterInto for OllamaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::request::{Message, MessageRole};
+    use kernel::types::request::{Message, MessageRole};
 
     #[tokio::test]
     async fn embed_capability_times_out_against_a_silent_server() {
-        use crate::adapters::capability::EmbedModel;
+        use kernel::adapters::capability::EmbedModel;
         // Same silent-server setup as the execute-path timeout test, but
         // driving the typed EmbedModel::embed method.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -146,7 +146,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
         };
         let adapter = OllamaAdapter::from_config(&config).unwrap();
-        let req = crate::types::io::EmbedRequest {
+        let req = kernel::types::io::EmbedRequest {
             model: Some("all-minilm".to_string()),
             texts: vec!["hello".to_string()],
         };
@@ -164,13 +164,13 @@ mod tests {
     #[test]
     fn ollama_id_and_supports() {
         let adapter = OllamaAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "ollama");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "ollama");
     }
 
     #[tokio::test]
     #[ignore]
     async fn ollama_chat_integration() {
-        use crate::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         let adapter = OllamaAdapter::new().unwrap();
         let config = RouterConfig {
             url: "http://localhost:11434".to_string(),
@@ -180,7 +180,7 @@ mod tests {
             timeout_ms: Some(60000),
             headers: std::collections::HashMap::new(),
         };
-        let req = crate::types::io::ChatRequest {
+        let req = kernel::types::io::ChatRequest {
             model: Some("llama3.2:latest".to_string()),
             messages: vec![Message::text(
                 MessageRole::User,
@@ -199,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn embed_times_out_against_a_silent_server() {
-        use crate::adapters::capability::EmbedModel;
+        use kernel::adapters::capability::EmbedModel;
         // A server that accepts the connection but never sends a response. A
         // no-timeout client (the old Client::new()) would hang here forever and
         // wedge the worker; with a per-request timeout the call must return an
@@ -224,7 +224,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
         };
         let adapter = OllamaAdapter::from_config(&config).unwrap();
-        let req = crate::types::io::EmbedRequest {
+        let req = kernel::types::io::EmbedRequest {
             model: Some("all-minilm".to_string()),
             texts: vec!["hello".to_string()],
         };

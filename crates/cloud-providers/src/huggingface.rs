@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use futures::Stream;
 use reqwest::Client;
 
-use super::base::{build_client, resolve_api_key};
-use super::openai_compat;
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
-use crate::types::request::StreamChunk;
+use crate::base::{build_client, resolve_api_key};
+use crate::openai_compat;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use kernel::types::request::StreamChunk;
 
 /// Default base URL — Hugging Face's OpenAI-compatible Inference **router**
 /// (multi-provider, serverless, pay-as-you-go). Override via `RouterConfig.url`
@@ -63,14 +63,14 @@ fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
     })
 }
 
-impl crate::adapters::capability::Model for HuggingFaceAdapter {
+impl kernel::adapters::capability::Model for HuggingFaceAdapter {
     fn id(&self) -> &str {
         "huggingface"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for HuggingFaceAdapter {
+impl kernel::adapters::capability::ChatModel for HuggingFaceAdapter {
     async fn chat(
         &self,
         config: &RouterConfig,
@@ -92,7 +92,7 @@ impl crate::adapters::capability::ChatModel for HuggingFaceAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::EmbedModel for HuggingFaceAdapter {
+impl kernel::adapters::capability::EmbedModel for HuggingFaceAdapter {
     async fn embed(
         &self,
         config: &RouterConfig,
@@ -104,8 +104,8 @@ impl crate::adapters::capability::EmbedModel for HuggingFaceAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for HuggingFaceAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for HuggingFaceAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn huggingface_id() {
         let a = HuggingFaceAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&a), "huggingface");
+        assert_eq!(kernel::adapters::capability::Model::id(&a), "huggingface");
     }
 
     #[test]
@@ -144,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_missing_api_key_returns_auth_error() {
-        use crate::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         let a = HuggingFaceAdapter::new().unwrap();
         let req = ChatRequest {
             model: Some("meta-llama/Llama-3.3-70B-Instruct".into()),
@@ -163,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn embed_missing_api_key_returns_auth_error() {
-        use crate::adapters::capability::EmbedModel;
+        use kernel::adapters::capability::EmbedModel;
         let a = HuggingFaceAdapter::new().unwrap();
         let req = EmbedRequest {
             model: Some("BAAI/bge-small-en-v1.5".into()),

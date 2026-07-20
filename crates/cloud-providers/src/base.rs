@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use reqwest::Client;
 
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
 
 /// Build a reqwest Client for a router config with optional timeout.
 pub fn build_client(config: &RouterConfig) -> Result<Client, GatewayError> {
@@ -115,7 +115,7 @@ fn extract_error_message(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::config::RouterConfig;
+    use kernel::types::config::RouterConfig;
     use std::collections::HashMap;
     use std::sync::Mutex;
 

@@ -5,12 +5,12 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use super::openai_compat;
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse, SttRequest, SttResponse, TtsResponse};
-use crate::types::request::StreamChunk;
+use crate::base::{build_client, resolve_api_key};
+use crate::openai_compat;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse, SttRequest, SttResponse, TtsResponse};
+use kernel::types::request::StreamChunk;
 
 // ---------------------------------------------------------------------------
 // Wire types — Grok audio (STT + TTS) request/response structs.
@@ -87,14 +87,14 @@ impl GrokAdapter {
 // keeps resolving to the wire struct.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for GrokAdapter {
+impl kernel::adapters::capability::Model for GrokAdapter {
     fn id(&self) -> &str {
         "grok"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for GrokAdapter {
+impl kernel::adapters::capability::ChatModel for GrokAdapter {
     async fn chat(
         &self,
         config: &RouterConfig,
@@ -120,7 +120,7 @@ impl crate::adapters::capability::ChatModel for GrokAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::SttModel for GrokAdapter {
+impl kernel::adapters::capability::SttModel for GrokAdapter {
     async fn transcribe(
         &self,
         config: &RouterConfig,
@@ -214,11 +214,11 @@ impl crate::adapters::capability::SttModel for GrokAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::TtsModel for GrokAdapter {
+impl kernel::adapters::capability::TtsModel for GrokAdapter {
     async fn speak(
         &self,
         config: &RouterConfig,
-        req: &crate::types::io::TtsRequest,
+        req: &kernel::types::io::TtsRequest,
     ) -> Result<TtsResponse, GatewayError> {
         let api_key = require_api_key(config)?;
         let model = req
@@ -282,8 +282,8 @@ impl crate::adapters::capability::TtsModel for GrokAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for GrokAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for GrokAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_stt(self.clone()).await;
         reg.register_tts(self).await;
@@ -297,12 +297,12 @@ impl crate::adapters::RegisterInto for GrokAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::request::{Message, MessageRole};
+    use kernel::types::request::{Message, MessageRole};
 
     #[test]
     fn grok_id_and_supports() {
         let adapter = GrokAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "grok");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "grok");
 
         // Supported capabilities
 
@@ -336,7 +336,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn grok_chat_integration() {
-        use crate::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         // Requires XAI_API_KEY env var
         let adapter = GrokAdapter::new().unwrap();
         let config = RouterConfig {
@@ -347,7 +347,7 @@ mod tests {
             timeout_ms: Some(30000),
             headers: std::collections::HashMap::new(),
         };
-        let req = crate::types::io::ChatRequest {
+        let req = kernel::types::io::ChatRequest {
             model: Some("grok-4-fast".to_string()),
             messages: vec![Message::text(
                 MessageRole::User,
@@ -367,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn grok_chatmodel_id_and_missing_key() {
-        use crate::adapters::capability::{ChatModel, Model};
+        use kernel::adapters::capability::{ChatModel, Model};
 
         let adapter = GrokAdapter::new().unwrap();
         assert_eq!(Model::id(&adapter), "grok");
@@ -380,7 +380,7 @@ mod tests {
             timeout_ms: None,
             headers: std::collections::HashMap::new(),
         };
-        let req = crate::types::io::ChatRequest {
+        let req = kernel::types::io::ChatRequest {
             model: Some("grok-4-fast".to_string()),
             messages: vec![Message::text(MessageRole::User, "Hello".to_string())],
             system: None,

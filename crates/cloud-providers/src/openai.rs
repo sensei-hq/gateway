@@ -5,14 +5,14 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use super::openai_compat;
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{
+use crate::base::{build_client, resolve_api_key};
+use crate::openai_compat;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{
     ChatRequest, ChatResponse, ImageRequest, ImageResponse, SttRequest, SttResponse, TtsResponse,
 };
-use crate::types::request::{ImageResult, StreamChunk};
+use kernel::types::request::{ImageResult, StreamChunk};
 
 // ---------------------------------------------------------------------------
 // Wire types — OpenAI image / audio (STT + TTS) request/response structs.
@@ -140,14 +140,14 @@ impl OpenAIAdapter {
 // returning `&self.id` (openai / openrouter / vercel / …).
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for OpenAIAdapter {
+impl kernel::adapters::capability::Model for OpenAIAdapter {
     fn id(&self) -> &str {
         &self.id
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for OpenAIAdapter {
+impl kernel::adapters::capability::ChatModel for OpenAIAdapter {
     async fn chat(
         &self,
         config: &RouterConfig,
@@ -173,19 +173,19 @@ impl crate::adapters::capability::ChatModel for OpenAIAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::EmbedModel for OpenAIAdapter {
+impl kernel::adapters::capability::EmbedModel for OpenAIAdapter {
     async fn embed(
         &self,
         config: &RouterConfig,
-        req: &crate::types::io::EmbedRequest,
-    ) -> Result<crate::types::io::EmbedResponse, GatewayError> {
+        req: &kernel::types::io::EmbedRequest,
+    ) -> Result<kernel::types::io::EmbedResponse, GatewayError> {
         require_api_key(config)?;
         openai_compat::embed(&self.client, &config.url, DEFAULT_MODEL, config, req).await
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::SttModel for OpenAIAdapter {
+impl kernel::adapters::capability::SttModel for OpenAIAdapter {
     async fn transcribe(
         &self,
         config: &RouterConfig,
@@ -279,11 +279,11 @@ impl crate::adapters::capability::SttModel for OpenAIAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::TtsModel for OpenAIAdapter {
+impl kernel::adapters::capability::TtsModel for OpenAIAdapter {
     async fn speak(
         &self,
         config: &RouterConfig,
-        req: &crate::types::io::TtsRequest,
+        req: &kernel::types::io::TtsRequest,
     ) -> Result<TtsResponse, GatewayError> {
         let api_key = require_api_key(config)?;
         let model = req
@@ -345,7 +345,7 @@ impl crate::adapters::capability::TtsModel for OpenAIAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::ImageModel for OpenAIAdapter {
+impl kernel::adapters::capability::ImageModel for OpenAIAdapter {
     async fn generate_image(
         &self,
         config: &RouterConfig,
@@ -420,8 +420,8 @@ impl crate::adapters::capability::ImageModel for OpenAIAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for OpenAIAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for OpenAIAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self.clone()).await;
         reg.register_stt(self.clone()).await;
@@ -437,12 +437,12 @@ impl crate::adapters::RegisterInto for OpenAIAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::request::{Message, MessageRole};
+    use kernel::types::request::{Message, MessageRole};
 
     #[test]
     fn openai_id_and_supports() {
         let adapter = OpenAIAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "openai");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "openai");
     }
 
     #[test]
@@ -454,12 +454,12 @@ mod tests {
     fn with_id_overrides_default_id() {
         let openrouter = OpenAIAdapter::with_id("openrouter").unwrap();
         assert_eq!(
-            crate::adapters::capability::Model::id(&openrouter),
+            kernel::adapters::capability::Model::id(&openrouter),
             "openrouter"
         );
 
         let vercel = OpenAIAdapter::with_id("vercel").unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&vercel), "vercel");
+        assert_eq!(kernel::adapters::capability::Model::id(&vercel), "vercel");
 
         // Capability set is identical to the default-id adapter — the
         // wire format isn't changing, only which RouterConfig the
@@ -469,12 +469,12 @@ mod tests {
     #[test]
     fn new_and_from_config_default_to_openai_id() {
         let by_new = OpenAIAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&by_new), "openai");
+        assert_eq!(kernel::adapters::capability::Model::id(&by_new), "openai");
 
         let mut cfg_headers: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         cfg_headers.insert("X-Test".into(), "true".into());
-        let cfg = crate::types::config::RouterConfig {
+        let cfg = kernel::types::config::RouterConfig {
             url: "https://example.com".into(),
             api_key_env: None,
             api_key: None,
@@ -483,11 +483,11 @@ mod tests {
             headers: cfg_headers,
         };
         let from_cfg = OpenAIAdapter::from_config(&cfg).unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&from_cfg), "openai");
+        assert_eq!(kernel::adapters::capability::Model::id(&from_cfg), "openai");
 
         let from_cfg_renamed = OpenAIAdapter::from_config_with_id("vercel", &cfg).unwrap();
         assert_eq!(
-            crate::adapters::capability::Model::id(&from_cfg_renamed),
+            kernel::adapters::capability::Model::id(&from_cfg_renamed),
             "vercel"
         );
     }
@@ -577,7 +577,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn openai_chat_integration() {
-        use crate::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         // Requires OPENAI_API_KEY env var
         let adapter = OpenAIAdapter::new().unwrap();
         let config = RouterConfig {
@@ -612,18 +612,18 @@ mod tests {
         // `Model::id` does — including the custom-id
         // constructors used to register under openrouter / vercel / etc.
         let default = OpenAIAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&default), "openai");
+        assert_eq!(kernel::adapters::capability::Model::id(&default), "openai");
 
         let openrouter = OpenAIAdapter::with_id("openrouter").unwrap();
         assert_eq!(
-            crate::adapters::capability::Model::id(&openrouter),
+            kernel::adapters::capability::Model::id(&openrouter),
             "openrouter"
         );
     }
 
     #[tokio::test]
     async fn chat_capability_missing_api_key_returns_auth_error() {
-        use crate::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         // Mirror of `missing_api_key_returns_auth_error`, but driving the
         // typed ChatModel::chat path instead of execute(). No network is
         // touched — the missing key short-circuits before any request.

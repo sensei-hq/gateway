@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use crate::adapters::async_job::{JobConfig, poll_until_complete};
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{VideoRequest, VideoResponse};
-use crate::types::request::VideoResult;
+use crate::base::{build_client, resolve_api_key};
+use crate::async_job::{JobConfig, poll_until_complete};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{VideoRequest, VideoResponse};
+use kernel::types::request::VideoResult;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -84,14 +84,14 @@ impl RunwayAdapter {
 //
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for RunwayAdapter {
+impl kernel::adapters::capability::Model for RunwayAdapter {
     fn id(&self) -> &str {
         "runway"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::VideoModel for RunwayAdapter {
+impl kernel::adapters::capability::VideoModel for RunwayAdapter {
     async fn generate_video(
         &self,
         cfg: &RouterConfig,
@@ -194,8 +194,8 @@ impl crate::adapters::capability::VideoModel for RunwayAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for RunwayAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for RunwayAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_video(self).await;
     }
 }
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn runway_id_and_supports() {
         let adapter = RunwayAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "runway");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "runway");
     }
 
     #[test]
@@ -219,7 +219,7 @@ mod tests {
         let adapter = RunwayAdapter::new().unwrap();
         // Reference `Model::id` by full path
         // and the capability `Model` trait.
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "runway");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "runway");
     }
 
     #[test]

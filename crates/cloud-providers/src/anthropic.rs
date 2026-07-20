@@ -7,12 +7,12 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use crate::types::config::RouterConfig;
-use crate::types::cost::TokenUsage;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse};
-use crate::types::request::{
+use crate::base::{build_client, resolve_api_key};
+use kernel::types::config::RouterConfig;
+use kernel::types::cost::TokenUsage;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse};
+use kernel::types::request::{
     MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamChunk,
     StreamingToolCall, ToolCall, ToolDefinition,
 };
@@ -585,14 +585,14 @@ fn process_sse_line(state: &mut AnthropicStreamState, line: &str) {
 // is shared verbatim with the legacy stream() method above.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for AnthropicAdapter {
+impl kernel::adapters::capability::Model for AnthropicAdapter {
     fn id(&self) -> &str {
         "anthropic"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for AnthropicAdapter {
+impl kernel::adapters::capability::ChatModel for AnthropicAdapter {
     async fn chat(
         &self,
         config: &RouterConfig,
@@ -765,8 +765,8 @@ impl crate::adapters::capability::ChatModel for AnthropicAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for AnthropicAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for AnthropicAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self).await;
     }
 }
@@ -783,7 +783,7 @@ mod tests {
     fn anthropic_id_and_supports() {
         let adapter = AnthropicAdapter::new().unwrap();
         assert_eq!(
-            crate::adapters::capability::Model::id(&adapter),
+            kernel::adapters::capability::Model::id(&adapter),
             "anthropic"
         );
     }
@@ -848,7 +848,7 @@ mod tests {
         // Reference `Model::id` by full path
         // the capability Model trait.
         assert_eq!(
-            crate::adapters::capability::Model::id(&adapter),
+            kernel::adapters::capability::Model::id(&adapter),
             "anthropic"
         );
     }
@@ -1420,7 +1420,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn anthropic_chat_integration() {
-        use crate::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         // Requires ANTHROPIC_API_KEY env var
         let adapter = AnthropicAdapter::new().unwrap();
         let config = RouterConfig {
@@ -1431,7 +1431,7 @@ mod tests {
             timeout_ms: Some(30000),
             headers: std::collections::HashMap::new(),
         };
-        let req = crate::types::io::ChatRequest {
+        let req = kernel::types::io::ChatRequest {
             model: Some("claude-haiku-4-5-20250414".to_string()),
             messages: vec![Message::text(
                 MessageRole::User,

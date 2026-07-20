@@ -5,12 +5,12 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::base::{build_client, resolve_api_key};
-use super::openai_compat;
-use crate::types::config::RouterConfig;
-use crate::types::error::GatewayError;
-use crate::types::io::{ChatRequest, ChatResponse, ImageRequest, ImageResponse};
-use crate::types::request::{ImageResult, StreamChunk};
+use crate::base::{build_client, resolve_api_key};
+use crate::openai_compat;
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse, ImageRequest, ImageResponse};
+use kernel::types::request::{ImageResult, StreamChunk};
 
 // ---------------------------------------------------------------------------
 // Wire types — image generation (OpenAI-compatible)
@@ -89,14 +89,14 @@ impl TogetherAdapter {
 // Capability traits. Traits + RegisterInto referenced by full path.
 // ---------------------------------------------------------------------------
 
-impl crate::adapters::capability::Model for TogetherAdapter {
+impl kernel::adapters::capability::Model for TogetherAdapter {
     fn id(&self) -> &str {
         "together"
     }
 }
 
 #[async_trait]
-impl crate::adapters::capability::ChatModel for TogetherAdapter {
+impl kernel::adapters::capability::ChatModel for TogetherAdapter {
     async fn chat(
         &self,
         config: &RouterConfig,
@@ -136,7 +136,7 @@ impl crate::adapters::capability::ChatModel for TogetherAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::capability::ImageModel for TogetherAdapter {
+impl kernel::adapters::capability::ImageModel for TogetherAdapter {
     async fn generate_image(
         &self,
         config: &RouterConfig,
@@ -213,8 +213,8 @@ impl crate::adapters::capability::ImageModel for TogetherAdapter {
 }
 
 #[async_trait]
-impl crate::adapters::RegisterInto for TogetherAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for TogetherAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_image(self).await;
     }
@@ -227,12 +227,12 @@ impl crate::adapters::RegisterInto for TogetherAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::request::{Message, MessageRole};
+    use kernel::types::request::{Message, MessageRole};
 
     #[test]
     fn together_id_and_supports() {
         let adapter = TogetherAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "together");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "together");
     }
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
         // Typed-trait identity mirrors the legacy `id()` above via full path,
         // using the capability `Model::id`.
         let adapter = TogetherAdapter::new().unwrap();
-        assert_eq!(crate::adapters::capability::Model::id(&adapter), "together");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "together");
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_api_key_returns_auth_error() {
-        use crate::adapters::capability::ChatModel;
+        use kernel::adapters::capability::ChatModel;
         let adapter = TogetherAdapter::new().unwrap();
         let config = RouterConfig {
             url: "https://api.together.xyz/v1".to_string(),
@@ -289,7 +289,7 @@ mod tests {
             timeout_ms: None,
             headers: std::collections::HashMap::new(),
         };
-        let req = crate::types::io::ChatRequest {
+        let req = kernel::types::io::ChatRequest {
             model: None,
             messages: vec![Message::text(MessageRole::User, "Hello".to_string())],
             system: None,
