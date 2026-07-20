@@ -37,9 +37,9 @@ use ::ort::{
     value::Tensor,
 };
 use async_trait::async_trait;
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{EmbedRequest, EmbedResponse};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{EmbedRequest, EmbedResponse};
 use std::path::Path;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
@@ -305,14 +305,14 @@ fn configure_tokenizer(t: &mut Tokenizer, config: &OrtConfig) -> Result<(), Gate
 // ORT is embed-only.
 // ---------------------------------------------------------------------------
 
-impl gateway::adapters::capability::Model for OrtAdapter {
+impl kernel::adapters::capability::Model for OrtAdapter {
     fn id(&self) -> &str {
         &self.config.adapter_id
     }
 }
 
 #[async_trait]
-impl gateway::adapters::capability::EmbedModel for OrtAdapter {
+impl kernel::adapters::capability::EmbedModel for OrtAdapter {
     async fn embed(
         &self,
         _config: &RouterConfig,
@@ -341,8 +341,8 @@ impl gateway::adapters::capability::EmbedModel for OrtAdapter {
 }
 
 #[async_trait]
-impl gateway::adapters::RegisterInto for OrtAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for OrtAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_embed(self).await;
     }
 }
@@ -530,6 +530,6 @@ mod tests {
             .expect("ORT_TEST_DIR must point at an ONNX embedding model directory");
         let entry = external_entry(PathBuf::from(&dir).join("model.onnx"));
         let adapter = OrtAdapter::load(&entry, OrtConfig::bert("test-ort")).expect("load");
-        assert_eq!(gateway::adapters::capability::Model::id(&adapter), "ort");
+        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "ort");
     }
 }

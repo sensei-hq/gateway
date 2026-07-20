@@ -1,9 +1,12 @@
 [package]
-name = "gateway"
+name = "sensei-gateway"
 version = "0.3.1"
 edition = "2024"
 description = "LLM inference routing engine — fallback chains, circuit breaker, budget management"
 license = "MIT"
+
+[lib]
+name = "gateway"
 
 [dependencies]
 # AWS Bedrock — heavy native deps (smithy runtime, hyper, etc.) but
@@ -42,6 +45,7 @@ bytes = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+kernel = { package = "sensei-kernel", path = "../kernel" }
 pin-project-lite = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

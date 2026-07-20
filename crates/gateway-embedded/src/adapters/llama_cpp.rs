@@ -47,10 +47,10 @@ use crate::math::l2_normalize_in_place;
 use crate::registry::{ModelEntry, ModelSource};
 use async_trait::async_trait;
 use futures::Stream;
-use gateway::types::config::RouterConfig;
-use gateway::types::error::GatewayError;
-use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
-use gateway::types::request::{Message, MessageRole, StreamChunk};
+use kernel::types::config::RouterConfig;
+use kernel::types::error::GatewayError;
+use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use kernel::types::request::{Message, MessageRole, StreamChunk};
 use llama_cpp_2::{
     context::{
         LlamaContext,
@@ -626,14 +626,14 @@ fn chat_msg_err(detail: &str) -> GatewayError {
 // `ProviderError` the trait-free `generate`/`embed` helpers already raise.
 // ---------------------------------------------------------------------------
 
-impl gateway::adapters::capability::Model for LlamaCppAdapter {
+impl kernel::adapters::capability::Model for LlamaCppAdapter {
     fn id(&self) -> &str {
         &self.config.adapter_id
     }
 }
 
 #[async_trait]
-impl gateway::adapters::capability::ChatModel for LlamaCppAdapter {
+impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
     async fn chat(
         &self,
         _cfg: &RouterConfig,
@@ -746,7 +746,7 @@ impl gateway::adapters::capability::ChatModel for LlamaCppAdapter {
 }
 
 #[async_trait]
-impl gateway::adapters::capability::EmbedModel for LlamaCppAdapter {
+impl kernel::adapters::capability::EmbedModel for LlamaCppAdapter {
     async fn embed(
         &self,
         _cfg: &RouterConfig,
@@ -773,8 +773,8 @@ impl gateway::adapters::capability::EmbedModel for LlamaCppAdapter {
 }
 
 #[async_trait]
-impl gateway::adapters::RegisterInto for LlamaCppAdapter {
-    async fn register_into(self: std::sync::Arc<Self>, reg: &gateway::adapters::AdapterRegistry) {
+impl kernel::adapters::RegisterInto for LlamaCppAdapter {
+    async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
@@ -1156,8 +1156,8 @@ mod tests {
     #[ignore = "requires LLAMA_TEST_CHAT_GGUF env var pointing at a generative GGUF with a chat template"]
     async fn stream_against_real_model_emits_chunks_with_finish_reason() {
         use futures::StreamExt;
-        use gateway::adapters::capability::ChatModel;
-        use gateway::types::config::RouterConfig;
+        use kernel::adapters::capability::ChatModel;
+        use kernel::types::config::RouterConfig;
 
         let path = std::env::var("LLAMA_TEST_CHAT_GGUF")
             .expect("LLAMA_TEST_CHAT_GGUF must point at a generative GGUF");
@@ -1173,7 +1173,7 @@ mod tests {
         }
         let adapter = LlamaCppAdapter::load(backend, &entry, cfg).expect("load model");
 
-        let request = gateway::types::io::ChatRequest {
+        let request = kernel::types::io::ChatRequest {
             model: Some("test-chat-model".into()),
             messages: vec![Message::text(
                 MessageRole::User,
