@@ -1,15 +1,15 @@
 # Embedded Inference
 
-In-process (local) inference adapters for the gateway. `gateway-embedded` loads
+In-process (local) inference adapters for the gateway. `local-providers` loads
 models into the host process and runs generation/embedding directly — no HTTP,
 no daemon, no separate provider account — while presenting the exact same
 adapter surface the cloud providers use.
 
-Source: `crates/gateway-embedded/src/lib.rs`,
-`crates/gateway-embedded/src/adapters/*.rs`,
-`crates/gateway-embedded/Cargo.toml`.
+Source: `crates/local-providers/src/lib.rs`,
+`crates/local-providers/src/adapters/*.rs`,
+`crates/local-providers/Cargo.toml`.
 
-## What `gateway-embedded` is
+## What `local-providers` is
 
 Every embedded engine is wrapped in an adapter that implements the **same
 `gateway::adapters::InferenceAdapter` trait** as the ~15 cloud adapters in the
@@ -198,6 +198,6 @@ embedder as the fallback.
   (`tokenizer.json`, `config.json`, `special_tokens_map.json`,
   `tokenizer_config.json`). A directory that loads under `ort` may not load
   under `fastembed`.
-- **Version drift in the README.** The root `README.md` says both crates
-  "currently share version `0.2.18`," but `gateway-embedded/Cargo.toml` is at
-  `0.2.24`. The README examples also pin tag `v0.2.18`.
+- **Crate split (v0.3.1).** The in-process adapters moved to `local-providers`
+  and the model resolvers + HF pull to `local-engine`; the old `gateway-embedded`
+  crate was retired. All five crates share one version.
