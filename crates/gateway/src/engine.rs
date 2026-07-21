@@ -34,6 +34,11 @@ pub struct Gateway {
     /// Optional persistence for recorded calls (burn-rate / quota). `None` ⇒
     /// nothing is recorded and behaviour is exactly as before the AUTH track.
     store: Option<Arc<dyn GatewayStore>>,
+    /// Optional readiness probe (the local engine's provisioning supervisor).
+    /// Consulted only at chain exhaustion to degrade a still-provisioning model
+    /// to [`GatewayError::ModelNotReady`]. `None` ⇒ behaviour is byte-identical
+    /// to before this seam.
+    probe: Option<Arc<dyn kernel::ReadinessProbe>>,
 }
 
 impl Gateway {
@@ -47,6 +52,7 @@ impl Gateway {
             adapters,
             circuit_breaker,
             store: None,
+            probe: None,
         }
     }
 
@@ -55,6 +61,16 @@ impl Gateway {
     /// Builder-style; without it the gateway records nothing.
     pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Attach a readiness probe (the local engine's provisioning supervisor).
+    /// Builder-style, mirroring [`Self::with_store`]. When set, chain exhaustion
+    /// consults the probe and degrades a still-provisioning candidate to a
+    /// terminal [`GatewayError::ModelNotReady`] instead of the generic
+    /// `AllAttemptsFailed`; the selection algorithm is otherwise untouched.
+    pub fn with_readiness(mut self, probe: Arc<dyn kernel::ReadinessProbe>) -> Self {
+        self.probe = Some(probe);
         self
     }
 
@@ -453,7 +469,24 @@ impl Gateway {
             }
         }
 
-        // 7. All candidates exhausted
+        // 7. All candidates exhausted. If a readiness probe is attached, a chain
+        // can fail purely because its model(s) are still provisioning: consult the
+        // probe for the attempted candidates in priority order and degrade the
+        // first still-in-flight one to a terminal `ModelNotReady` (which never
+        // triggers fallback) instead of the generic `AllAttemptsFailed`. With no
+        // probe attached this block is skipped and behaviour is byte-identical.
+        if let Some(probe) = &self.probe {
+            for attempt in &attempts {
+                let phase = probe.phase(&attempt.model).await;
+                if phase.is_in_flight() {
+                    return Err(GatewayError::ModelNotReady {
+                        model: attempt.model.clone(),
+                        phase,
+                    });
+                }
+            }
+        }
+
         let errors = attempts
             .iter()
             .filter_map(|a| {
@@ -897,6 +930,7 @@ fn stream_error_code(err: &GatewayError) -> String {
         GatewayError::NoCandidates { .. } => "no_candidates".to_string(),
         GatewayError::NotConfigured => "not_configured".to_string(),
         GatewayError::AllAttemptsFailed { .. } => "all_attempts_failed".to_string(),
+        GatewayError::ModelNotReady { .. } => "model_not_ready".to_string(),
         GatewayError::InvalidConfig(_) => "invalid_config".to_string(),
         GatewayError::Network(_) => "network".to_string(),
         GatewayError::Serialization(_) => "serialization".to_string(),
@@ -1908,6 +1942,96 @@ mod tests {
         gw.adapters
             .register_chat(Arc::new(FailingAdapter { error }))
             .await;
+    }
+
+    /// Readiness probe returning canned phases per model (Absent for unknown ids).
+    struct FakeProbe {
+        phases: HashMap<String, kernel::ProvisionPhase>,
+    }
+
+    #[async_trait::async_trait]
+    impl kernel::ReadinessProbe for FakeProbe {
+        async fn phase(&self, model: &str) -> kernel::ProvisionPhase {
+            self.phases
+                .get(model)
+                .cloned()
+                .unwrap_or(kernel::ProvisionPhase::Absent)
+        }
+        async fn status_all(&self) -> Vec<(String, kernel::ProvisionPhase)> {
+            self.phases
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn exhaustion_with_in_flight_candidate_degrades_to_model_not_ready() {
+        // Single-candidate chain, no adapter registered → the candidate fails
+        // (no adapter) and the chain exhausts. With a probe reporting the model
+        // still downloading, exhaustion degrades to a terminal ModelNotReady
+        // rather than the generic AllAttemptsFailed.
+        let mut phases = HashMap::new();
+        phases.insert(
+            "noop".to_string(),
+            kernel::ProvisionPhase::Downloading {
+                done: 3,
+                total: Some(10),
+            },
+        );
+        let gw = test_gateway().with_readiness(Arc::new(FakeProbe { phases }));
+
+        match gw.execute(&chat_request()).await.unwrap_err() {
+            GatewayError::ModelNotReady { model, phase } => {
+                assert_eq!(model, "noop");
+                assert_eq!(
+                    phase,
+                    kernel::ProvisionPhase::Downloading {
+                        done: 3,
+                        total: Some(10)
+                    }
+                );
+            }
+            other => panic!("expected ModelNotReady, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_fallback_succeeds_even_with_probe_attached() {
+        // Primary candidate ("failing" router) has no adapter registered — still
+        // provisioning — so the walk falls through to the registered noop. The
+        // request succeeds before exhaustion, so the probe is never consulted and
+        // no ModelNotReady is produced.
+        let gw = test_gateway_with_chain();
+        register_noop(&gw).await; // registers "noop"; "failing" is left unregistered
+        let mut phases = HashMap::new();
+        phases.insert(
+            "fail-model".to_string(),
+            kernel::ProvisionPhase::Downloading {
+                done: 1,
+                total: Some(4),
+            },
+        );
+        phases.insert("noop".to_string(), kernel::ProvisionPhase::Ready);
+        let gw = gw.with_readiness(Arc::new(FakeProbe { phases }));
+
+        let response = gw.execute(&chat_request()).await.unwrap();
+        assert_eq!(response.model, Some("noop".to_string()));
+        assert!(
+            response.attempts.len() >= 2,
+            "primary was attempted, then fell back to the ready candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_without_probe_still_returns_all_attempts_failed() {
+        // No probe attached → byte-identical to before this seam: chain
+        // exhaustion with no adapter yields AllAttemptsFailed, not ModelNotReady.
+        let gw = test_gateway();
+        match gw.execute(&chat_request()).await.unwrap_err() {
+            GatewayError::AllAttemptsFailed { .. } => {}
+            other => panic!("expected AllAttemptsFailed, got: {other}"),
+        }
     }
 
     #[tokio::test]

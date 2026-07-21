@@ -63,6 +63,16 @@ pub enum GatewayError {
         attempts_detail: Vec<crate::types::trace::Attempt>,
     },
 
+    /// A model in the resolved chain is still provisioning (pulling / loading)
+    /// and no ready fallback candidate exists. Terminal for this request — the
+    /// caller retries once the supervisor reports the model ready. Never
+    /// triggers fallback (a provisioning model is not a provider fault).
+    #[error("model '{model}' not ready: {phase:?}")]
+    ModelNotReady {
+        model: String,
+        phase: crate::readiness::ProvisionPhase,
+    },
+
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
@@ -102,13 +112,15 @@ impl GatewayError {
             GatewayError::BudgetExceeded { .. } => {
                 triggers.contains(&FallbackTrigger::BudgetExceeded)
             }
-            // Auth, Unsupported, AllAttemptsFailed, and Quota (a per-subject hard
-            // stop, not a provider fault) never trigger fallback.
+            // Auth, Unsupported, AllAttemptsFailed, Quota (a per-subject hard
+            // stop, not a provider fault), and ModelNotReady (a still-provisioning
+            // model, not a provider fault) never trigger fallback.
             GatewayError::Authentication { .. }
             | GatewayError::Unsupported { .. }
             | GatewayError::AllAttemptsFailed { .. }
             | GatewayError::NoCandidates { .. }
             | GatewayError::QuotaExceeded { .. }
+            | GatewayError::ModelNotReady { .. }
             | GatewayError::NotConfigured
             | GatewayError::InvalidConfig(_)
             | GatewayError::Network(_)
@@ -307,6 +319,27 @@ mod tests {
             }
             .should_trigger_fallback(&all_triggers)
         );
+    }
+
+    #[test]
+    fn model_not_ready_never_triggers_fallback_and_is_not_retryable() {
+        let all_triggers = vec![
+            FallbackTrigger::RateLimit,
+            FallbackTrigger::Timeout,
+            FallbackTrigger::ProviderError,
+            FallbackTrigger::ModelUnavailable,
+            FallbackTrigger::BudgetExceeded,
+        ];
+        let e = GatewayError::ModelNotReady {
+            model: "gemma".into(),
+            phase: crate::readiness::ProvisionPhase::Downloading {
+                done: 1,
+                total: Some(10),
+            },
+        };
+        assert!(!e.should_trigger_fallback(&all_triggers));
+        assert!(!e.is_retryable());
+        assert!(e.to_string().contains("gemma"));
     }
 
     #[test]
