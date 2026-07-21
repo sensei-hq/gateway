@@ -31,7 +31,14 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "rt", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
-hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
+# 1.0 is the first Xet-capable release: it bundles the mandatory `hf-xet`
+# transfer engine, so downloads complete after HF's platform-wide Xet migration
+# (0.x stalls on the Xet-bridge response for every current GGUF repo). The async
+# client is the crate default in 1.0 — no `tokio` feature to select.
+# 1.0 pulls reqwest 0.13 (vs 0.12 in kernel/cloud-providers/our size probe); the
+# tree resolves rustls-only, no native-tls/openssl (verified via
+# `cargo tree -i native-tls`). Duplicate-major cleanup is tracked separately.
+hf-hub = { version = "1.0", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 sysinfo = { version = "0.39", default-features = false, features = ["disk", "system"], optional = true }
 # Coldboot target: the supervisor loads a local-providers adapter and registers
