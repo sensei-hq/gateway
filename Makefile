@@ -9,17 +9,18 @@
 ##
 ## Consumed by sensei (sensei-hq/sensei) as a git dependency (`gateway` /
 ## `local-providers` / `local-engine`) pinned by tag. A release here is just a
-## tag: `make bump` bumps all five crate versions in lockstep, commits, tags,
-## and pushes — then
+## tag: `make bump` bumps every crate version + the site package in lockstep,
+## commits, tags, and pushes — then
 ## sensei re-pins the git dep to the new tag. There are no binaries to publish
 ## (this is a library), so the tag push has no release artifacts to build.
 ##
 ## Versioning:
-##   The five crates share one version (kept in lockstep). The current version is
-##   read from crates/gateway/Cargo.toml — that is the single source of truth.
+##   Every crate + the site package (site/package.json) share one version (kept
+##   in lockstep). The current version is read from crates/gateway/Cargo.toml —
+##   that is the single source of truth.
 
 .PHONY: help build test test-fast fmt fmt-check clippy lint cov cov-html \
-        check bump release clean
+        check bump release clean hooks
 
 # Single source of truth: the [package] version of the gateway crate.
 VERSION := $(shell grep -m1 '^version = ' crates/gateway/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
@@ -57,6 +58,16 @@ clippy: ## Lint with clippy, warnings-as-errors
 
 lint: fmt-check clippy ## fmt-check + clippy
 
+# ── Git hooks ───────────────────────────────────────────────────────────────
+# The tracked hook in .githooks/ runs `make lint` (fmt-check + clippy) before
+# every commit, so formatting/lint never drifts in. Opt in per clone with
+# `make hooks` (sets core.hooksPath); bypass a single commit with
+# `git commit --no-verify`.
+
+hooks: ## Install the tracked git pre-commit hook (fmt-check + clippy)
+	git config core.hooksPath .githooks
+	@echo "Installed: git pre-commit runs 'make lint' (core.hooksPath=.githooks)."
+
 # ── Coverage ──────────────────────────────────────────────────────────────────
 # Requires cargo-llvm-cov: cargo install cargo-llvm-cov
 # local-providers' native adapters (llama-cpp/ort/fastembed) are behind feature
@@ -88,7 +99,7 @@ check: fmt-check clippy build test ## Pre-release gate: fmt + clippy + build + t
 #   make bump v=major    — 0.2.24 → 1.0.0
 #   make bump v=0.5.0    — explicit version
 #
-# Bumps BOTH crate versions in lockstep, commits, tags vX.Y.Z, and pushes the
+# Bumps every crate + the site version in lockstep, commits, tags vX.Y.Z, and pushes the
 # commit + tag. Runs `make check` first so a broken build never gets tagged, and
 # reclaims the local build cache (`cargo clean`) afterwards.
 # Safety: aborts on a pre-existing tag, a downgrade, or a no-op (same version).
@@ -125,13 +136,17 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@echo "Running pre-release gate (fmt + clippy + tests)..."
 	@$(MAKE) check
 	@echo "Bumping $(VERSION) → $(_v)"
-	@# All five crates share one version — update them in lockstep. The anchored
-	@# pattern matches only the [package] version line, never inline dep versions.
-	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/gateway/Cargo.toml
-	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/local-providers/Cargo.toml crates/local-engine/Cargo.toml
-	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/kernel/Cargo.toml
-	@sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" crates/cloud-providers/Cargo.toml
-	@git add crates/gateway/Cargo.toml crates/local-providers/Cargo.toml crates/local-engine/Cargo.toml crates/kernel/Cargo.toml crates/cloud-providers/Cargo.toml
+	@# Every crate + the site package share one version — bump them in lockstep.
+	@# The crates/*/Cargo.toml glob auto-includes any new crate; the anchored
+	@# `^version = ` pattern matches only the [package] version line, never inline
+	@# dep versions.
+	@for f in crates/*/Cargo.toml; do \
+	  sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$(_v)\"/" "$$f"; \
+	done
+	@# The SvelteKit site (site/package.json) tracks the same version. Anchored to
+	@# the indented top-level "version" key so nested dep versions are untouched.
+	@sed -i '' -E "s/^([[:space:]]*\"version\"): \"[^\"]*\"/\1: \"$(_v)\"/" site/package.json
+	@git add crates/*/Cargo.toml site/package.json
 	@git commit -m "chore: bump to v$(_v)"
 	@git tag -a "v$(_v)" -m "gateway v$(_v)"
 	@git push origin HEAD
