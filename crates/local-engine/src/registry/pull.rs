@@ -19,8 +19,7 @@
 
 use super::{ManagedResolver, ModelEntry, ModelFormat, ModelResolver, ModelSource, ResolveError};
 use async_trait::async_trait;
-use hf_hub::api::tokio::ApiBuilder;
-use hf_hub::{Repo, RepoType};
+use hf_hub::{HFClient, split_id};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use sysinfo::{Disks, System};
@@ -134,10 +133,10 @@ impl HfHubPuller {
 
     /// Like [`ModelPuller::pull`], but emits coarse download progress: an opening
     /// `0 / total` tick, then the cumulative byte count after each file lands.
-    /// `total` is the size [`Self::check_fit`] already ranged-probed. `hf-hub`'s
-    /// `repo.get` is monolithic (no sub-file callback), so granularity is
-    /// per-file — fine for a progress display, where fast transitions coalesce
-    /// anyway. The supervisor bridges `on_progress` to
+    /// `total` is the size [`Self::check_fit`] already ranged-probed. Progress is
+    /// tracked per-file (we don't wire hf-hub's byte-level `Progress` handler) —
+    /// fine for a display, where fast transitions coalesce anyway. The supervisor
+    /// bridges `on_progress` to
     /// [`ProvisionPhase::Downloading { done, total }`](kernel::ProvisionPhase).
     pub async fn pull_with_progress(
         &self,
@@ -173,23 +172,27 @@ impl HfHubPuller {
         let mut reporter = ProgressReporter::new(Some(fit.model_bytes), on_progress);
         reporter.start();
 
-        let revision = spec.revision.as_deref().unwrap_or("main").to_string();
-        let api = ApiBuilder::new()
-            .with_token(self.token.clone())
-            .build()
-            .map_err(|e| PullError::Hub(e.to_string()))?;
-        let repo = api.repo(Repo::with_revision(
-            spec.repo.clone(),
-            RepoType::Model,
-            revision,
-        ));
+        // hf-hub 1.0 reads `HF_ENDPOINT` itself (the same override `check_fit`'s
+        // size probe honours) and drives the Xet transfer path transparently, so
+        // Xet-migrated repos download to completion. Revision defaults to `main`
+        // when the spec pins none.
+        let mut builder = HFClient::builder();
+        if let Some(token) = &self.token {
+            builder = builder.token(token.clone());
+        }
+        let client = builder.build().map_err(|e| PullError::Hub(e.to_string()))?;
+        let (owner, name) = split_id(&spec.repo);
+        let repo = client.model(owner, name);
 
         tokio::fs::create_dir_all(&dest_dir).await?;
 
         let mut staged = Vec::with_capacity(spec.files.len());
         for (file, dest) in spec.files.iter().zip(dests) {
             let cached = repo
-                .get(file)
+                .download_file()
+                .filename(file.as_str())
+                .maybe_revision(spec.revision.clone())
+                .send()
                 .await
                 .map_err(|e| PullError::Hub(format!("download of '{file}' failed: {e}")))?;
             if let Some(parent) = dest.parent() {
