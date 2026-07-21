@@ -265,69 +265,12 @@ impl Gateway {
             let endpoint = format!("{}:{}", candidate.router, candidate.model);
             let cfg = &candidate.router_config;
 
-            // Dispatch by capability to the matching registry map + typed method,
-            // translating at the boundary via `crate::dispatch`. `None` means no
-            // adapter is registered for this router+capability (or the capability
-            // has no dispatch route) — handled the same as the legacy
-            // no-adapter-registered path below.
-            let outcome: Option<Result<InferenceResponse, GatewayError>> = match request.capability
-            {
-                Capability::TextChat | Capability::TextComplete => {
-                    match self.adapters.chat(&candidate.router).await {
-                        Some(m) => Some(match to_chat_request(request, model) {
-                            Ok(r) => m.chat(cfg, &r).await.map(from_chat_response),
-                            Err(e) => Err(e),
-                        }),
-                        None => None,
-                    }
-                }
-                Capability::TextEmbed => match self.adapters.embed(&candidate.router).await {
-                    Some(m) => Some(match to_embed_request(request, model) {
-                        Ok(r) => m.embed(cfg, &r).await.map(from_embed_response),
-                        Err(e) => Err(e),
-                    }),
-                    None => None,
-                },
-                Capability::AudioTranscribe => match self.adapters.stt(&candidate.router).await {
-                    Some(m) => Some(match to_stt_request(request, model) {
-                        Ok(r) => m.transcribe(cfg, &r).await.map(from_stt_response),
-                        Err(e) => Err(e),
-                    }),
-                    None => None,
-                },
-                Capability::AudioGenerate => match self.adapters.tts(&candidate.router).await {
-                    Some(m) => Some(match to_tts_request(request, model) {
-                        Ok(r) => m.speak(cfg, &r).await.map(from_tts_response),
-                        Err(e) => Err(e),
-                    }),
-                    None => None,
-                },
-                Capability::ImageGenerate => match self.adapters.image(&candidate.router).await {
-                    Some(m) => Some(match to_image_request(request, model) {
-                        Ok(r) => m.generate_image(cfg, &r).await.map(from_image_response),
-                        Err(e) => Err(e),
-                    }),
-                    None => None,
-                },
-                Capability::VideoGenerate => match self.adapters.video(&candidate.router).await {
-                    Some(m) => Some(match to_video_request(request, model) {
-                        Ok(r) => m.generate_video(cfg, &r).await.map(from_video_response),
-                        Err(e) => Err(e),
-                    }),
-                    None => None,
-                },
-                // Reserved capabilities have no payload / trait / dispatch route
-                // yet — surface an honest "not yet supported" rather than the
-                // misleading "no adapter registered". Exhaustive (no `_`) so a new
-                // `Capability` variant forces a routing decision here at compile time.
-                Capability::TextRerank
-                | Capability::TextModerate
-                | Capability::ImageEdit
-                | Capability::ImageAnalyze => Some(Err(GatewayError::Unsupported {
-                    adapter: candidate.router.clone(),
-                    what: "capability not yet supported (reserved)".to_string(),
-                })),
-            };
+            // Dispatch by capability to the matching registry map + typed method.
+            // `None` means no adapter is registered for this router+capability —
+            // handled the same as the legacy no-adapter-registered path below.
+            let outcome = self
+                .dispatch_capability(request, &candidate.router, model, cfg)
+                .await;
 
             let outcome = match outcome {
                 Some(o) => o,
@@ -719,6 +662,79 @@ impl Gateway {
             judgment_output,
             total_cost,
         })
+    }
+
+    /// Dispatch one attempt to the adapter registered for `router` + the
+    /// request's capability, translating at the [`crate::dispatch`] boundary.
+    ///
+    /// `None` means no adapter is registered for this router+capability (or the
+    /// capability has no dispatch route) — the caller treats it as a no-adapter
+    /// miss and falls through to the next candidate. Reserved capabilities
+    /// return `Some(Err(Unsupported))`. Exhaustive (no `_`) so a new
+    /// `Capability` variant forces a routing decision here at compile time.
+    async fn dispatch_capability(
+        &self,
+        request: &InferenceRequest,
+        router: &str,
+        model: Option<String>,
+        cfg: &kernel::types::config::RouterConfig,
+    ) -> Option<Result<InferenceResponse, GatewayError>> {
+        match request.capability {
+            Capability::TextChat | Capability::TextComplete => {
+                match self.adapters.chat(router).await {
+                    Some(m) => Some(match to_chat_request(request, model) {
+                        Ok(r) => m.chat(cfg, &r).await.map(from_chat_response),
+                        Err(e) => Err(e),
+                    }),
+                    None => None,
+                }
+            }
+            Capability::TextEmbed => match self.adapters.embed(router).await {
+                Some(m) => Some(match to_embed_request(request, model) {
+                    Ok(r) => m.embed(cfg, &r).await.map(from_embed_response),
+                    Err(e) => Err(e),
+                }),
+                None => None,
+            },
+            Capability::AudioTranscribe => match self.adapters.stt(router).await {
+                Some(m) => Some(match to_stt_request(request, model) {
+                    Ok(r) => m.transcribe(cfg, &r).await.map(from_stt_response),
+                    Err(e) => Err(e),
+                }),
+                None => None,
+            },
+            Capability::AudioGenerate => match self.adapters.tts(router).await {
+                Some(m) => Some(match to_tts_request(request, model) {
+                    Ok(r) => m.speak(cfg, &r).await.map(from_tts_response),
+                    Err(e) => Err(e),
+                }),
+                None => None,
+            },
+            Capability::ImageGenerate => match self.adapters.image(router).await {
+                Some(m) => Some(match to_image_request(request, model) {
+                    Ok(r) => m.generate_image(cfg, &r).await.map(from_image_response),
+                    Err(e) => Err(e),
+                }),
+                None => None,
+            },
+            Capability::VideoGenerate => match self.adapters.video(router).await {
+                Some(m) => Some(match to_video_request(request, model) {
+                    Ok(r) => m.generate_video(cfg, &r).await.map(from_video_response),
+                    Err(e) => Err(e),
+                }),
+                None => None,
+            },
+            // Reserved capabilities have no payload / trait / dispatch route
+            // yet — surface an honest "not yet supported" rather than the
+            // misleading "no adapter registered".
+            Capability::TextRerank
+            | Capability::TextModerate
+            | Capability::ImageEdit
+            | Capability::ImageAnalyze => Some(Err(GatewayError::Unsupported {
+                adapter: router.to_string(),
+                what: "capability not yet supported (reserved)".to_string(),
+            })),
+        }
     }
 
     /// Execute an inference request as a token stream.
