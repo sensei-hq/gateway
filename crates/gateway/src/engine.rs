@@ -13,6 +13,7 @@ use crate::dispatch::{
     from_tts_response, from_video_response, to_chat_request, to_embed_request, to_image_request,
     to_stt_request, to_tts_request, to_video_request,
 };
+use crate::pruning::{Availability, ChainWarning};
 use crate::selection::{ModelSelectionService, SelectionCriteria};
 use crate::store::{CallStatus, GatewayStore, InferenceCall, UsageTotals};
 use crate::types::capability::Capability;
@@ -55,6 +56,21 @@ impl Gateway {
     pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
         self.store = Some(store);
         self
+    }
+
+    /// Prune permanently-unavailable candidates from the live config's chains
+    /// and return the dropped-and-why report. Write-locks the config, applies
+    /// [`crate::pruning::prune_unavailable`], and returns the warnings. The
+    /// `judge` encodes availability the library can't see from config alone
+    /// (e.g. "cloud router has no API key"); disabled/unknown routers and
+    /// unknown models are dropped without it. Provisioning (`Pending`)
+    /// candidates are kept.
+    pub async fn prune_unavailable(
+        &self,
+        judge: impl Fn(&str, &str) -> Availability,
+    ) -> Vec<ChainWarning> {
+        let mut cfg = self.config.write().await;
+        crate::pruning::prune_unavailable(&mut cfg, judge)
     }
 
     /// Best-effort persist a recorded call. Metering must never take down the
