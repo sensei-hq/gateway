@@ -5,7 +5,7 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{build_client, resolve_api_key};
+use crate::base::{build_client, error_from_response, resolve_api_key};
 use crate::openai_compat;
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
@@ -167,22 +167,7 @@ impl kernel::adapters::capability::ImageModel for TogetherAdapter {
         let status = response.status();
 
         if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "together".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "together".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "together".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
+            return Err(error_from_response("together", response).await);
         }
 
         let image_resp: ImageGenerateResponse =

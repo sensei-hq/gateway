@@ -90,6 +90,42 @@ pub async fn http_json<T: serde::de::DeserializeOwned>(
         })
 }
 
+/// Map a **non-success** provider HTTP response to a [`GatewayError`], tagged
+/// with `adapter`, consuming the response to use its body as the error message.
+///
+/// Shared form of the status-mapping the adapters' streaming and multipart paths
+/// repeat: `401`/`403` → [`GatewayError::Authentication`], `429` →
+/// [`GatewayError::RateLimit`], anything else → [`GatewayError::ProviderError`]
+/// carrying the status code. Uses the raw body as the message (callers wanting
+/// the JSON `error.message` extracted use [`http_json`]). Call only after
+/// checking `!status.is_success()`.
+pub async fn error_from_response(adapter: &str, response: reqwest::Response) -> GatewayError {
+    let status = response.status().as_u16();
+    let body_text = response.text().await.unwrap_or_default();
+    map_status_error(adapter, status, body_text)
+}
+
+/// Pure mapping of a non-success HTTP status code + response body to a
+/// [`GatewayError`]. Split from [`error_from_response`] so the mapping is
+/// unit-testable without constructing a live [`reqwest::Response`].
+fn map_status_error(adapter: &str, status: u16, body_text: String) -> GatewayError {
+    match status {
+        401 | 403 => GatewayError::Authentication {
+            adapter: adapter.into(),
+            message: body_text,
+        },
+        429 => GatewayError::RateLimit {
+            adapter: adapter.into(),
+            retry_after_ms: None,
+        },
+        code => GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: body_text,
+            status: Some(code),
+        },
+    }
+}
+
 /// Extract error message from various provider JSON error formats.
 fn extract_error_message(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -173,5 +209,48 @@ mod tests {
     fn extract_error_message_invalid_json() {
         let body = "not json";
         assert_eq!(extract_error_message(body), None);
+    }
+
+    #[test]
+    fn map_status_error_maps_401_403_to_authentication() {
+        for code in [401u16, 403] {
+            match map_status_error("acme", code, "bad key".into()) {
+                GatewayError::Authentication { adapter, message } => {
+                    assert_eq!(adapter, "acme");
+                    assert_eq!(message, "bad key");
+                }
+                other => panic!("expected Authentication for {code}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_status_error_maps_429_to_rate_limit() {
+        match map_status_error("acme", 429, "slow down".into()) {
+            GatewayError::RateLimit {
+                adapter,
+                retry_after_ms,
+            } => {
+                assert_eq!(adapter, "acme");
+                assert_eq!(retry_after_ms, None);
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_status_error_maps_other_codes_to_provider_error() {
+        match map_status_error("acme", 500, "boom".into()) {
+            GatewayError::ProviderError {
+                adapter,
+                message,
+                status,
+            } => {
+                assert_eq!(adapter, "acme");
+                assert_eq!(message, "boom");
+                assert_eq!(status, Some(500));
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
     }
 }
