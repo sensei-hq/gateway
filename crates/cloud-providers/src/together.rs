@@ -232,7 +232,10 @@ mod tests {
     #[test]
     fn together_id_and_supports() {
         let adapter = TogetherAdapter::new().unwrap();
-        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "together");
+        assert_eq!(
+            kernel::adapters::capability::Model::id(&adapter),
+            "together"
+        );
     }
 
     #[test]
@@ -240,7 +243,10 @@ mod tests {
         // Typed-trait identity mirrors the legacy `id()` above via full path,
         // using the capability `Model::id`.
         let adapter = TogetherAdapter::new().unwrap();
-        assert_eq!(kernel::adapters::capability::Model::id(&adapter), "together");
+        assert_eq!(
+            kernel::adapters::capability::Model::id(&adapter),
+            "together"
+        );
     }
 
     #[test]

@@ -12,9 +12,9 @@ use kernel::types::io::{ChatRequest, EmbedRequest};
 use kernel::types::request::{Message, MessageRole};
 
 use cloud_providers::anthropic::AnthropicAdapter;
-use kernel::adapters::capability::{ChatModel, EmbedModel};
 use cloud_providers::ollama::OllamaAdapter;
 use cloud_providers::openai::OpenAIAdapter;
+use kernel::adapters::capability::{ChatModel, EmbedModel};
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

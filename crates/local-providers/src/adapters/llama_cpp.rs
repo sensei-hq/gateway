@@ -44,9 +44,9 @@
 //!    for that reason.
 
 use crate::math::l2_normalize_in_place;
-use kernel::registry::{ModelEntry, ModelSource};
 use async_trait::async_trait;
 use futures::Stream;
+use kernel::registry::{ModelEntry, ModelSource};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};

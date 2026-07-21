@@ -110,7 +110,10 @@ impl FacadeBuilder {
                 self.max_concurrent_provisioning,
             ));
             let gateway = gateway.with_readiness(supervisor.clone());
-            Facade { gateway, supervisor }
+            Facade {
+                gateway,
+                supervisor,
+            }
         }
         #[cfg(not(feature = "local"))]
         {
@@ -143,23 +146,49 @@ async fn register_cloud_from_config(
     let mut failures = Vec::new();
     for (id, router) in &config.routers {
         let outcome: Option<Result<(), GatewayError>> = match id.as_str() {
-            "anthropic" => Some(reg(registry, cp::anthropic::AnthropicAdapter::from_config(router)).await),
+            "anthropic" => Some(
+                reg(
+                    registry,
+                    cp::anthropic::AnthropicAdapter::from_config(router),
+                )
+                .await,
+            ),
             "openai" => Some(reg(registry, cp::openai::OpenAIAdapter::from_config(router)).await),
             "gemini" => Some(reg(registry, cp::gemini::GeminiAdapter::from_config(router)).await),
             "grok" => Some(reg(registry, cp::grok::GrokAdapter::from_config(router)).await),
             "ollama" => Some(reg(registry, cp::ollama::OllamaAdapter::from_config(router)).await),
-            "huggingface" => {
-                Some(reg(registry, cp::huggingface::HuggingFaceAdapter::from_config(router)).await)
+            "huggingface" => Some(
+                reg(
+                    registry,
+                    cp::huggingface::HuggingFaceAdapter::from_config(router),
+                )
+                .await,
+            ),
+            "together" => {
+                Some(reg(registry, cp::together::TogetherAdapter::from_config(router)).await)
             }
-            "together" => Some(reg(registry, cp::together::TogetherAdapter::from_config(router)).await),
             "fal" => Some(reg(registry, cp::fal::FalAdapter::from_config(router)).await),
             "flux" => Some(reg(registry, cp::flux::FluxAdapter::from_config(router)).await),
             "kling" => Some(reg(registry, cp::kling::KlingAdapter::from_config(router)).await),
             "luma" => Some(reg(registry, cp::luma::LumaAdapter::from_config(router)).await),
             "runway" => Some(reg(registry, cp::runway::RunwayAdapter::from_config(router)).await),
-            "stability" => Some(reg(registry, cp::stability::StabilityAdapter::from_config(router)).await),
-            "recraft" => Some(reg(registry, cp::recraft::RecraftAdapter::from_config(router)).await),
-            "replicate" => Some(reg(registry, cp::replicate::ReplicateAdapter::from_config(router)).await),
+            "stability" => Some(
+                reg(
+                    registry,
+                    cp::stability::StabilityAdapter::from_config(router),
+                )
+                .await,
+            ),
+            "recraft" => {
+                Some(reg(registry, cp::recraft::RecraftAdapter::from_config(router)).await)
+            }
+            "replicate" => Some(
+                reg(
+                    registry,
+                    cp::replicate::ReplicateAdapter::from_config(router),
+                )
+                .await,
+            ),
             _ => None,
         };
         if let Some(Err(e)) = outcome {
@@ -174,9 +203,7 @@ mod tests {
     use super::*;
     use crate::pruning::Availability;
     use crate::types::capability::Capability;
-    use crate::types::config::{
-        ChainEntry, FallbackChainConfig, ModelConfig, RouterConfig,
-    };
+    use crate::types::config::{ChainEntry, FallbackChainConfig, ModelConfig, RouterConfig};
     use crate::types::error::GatewayError;
     use crate::types::request::{InferenceRequest, Message, MessageRole, Payload};
     use local_engine::{EnsureOpts, ScriptedPlan};

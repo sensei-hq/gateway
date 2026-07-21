@@ -19,9 +19,9 @@
 //!   reused in place and nothing has to be shipped with the binary.
 
 use crate::adapters::llama_cpp::{LlamaCppAdapter, LlamaCppConfig, shared_backend};
-use kernel::registry::ModelResolver;
 use async_trait::async_trait;
 use futures::Stream;
+use kernel::registry::ModelResolver;
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};

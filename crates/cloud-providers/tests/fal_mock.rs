@@ -22,8 +22,8 @@ use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ImageRequest, VideoRequest};
 
-use kernel::adapters::capability::{ImageModel, Model, VideoModel};
 use cloud_providers::fal::FalAdapter;
+use kernel::adapters::capability::{ImageModel, Model, VideoModel};
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
