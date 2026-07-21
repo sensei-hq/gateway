@@ -4,6 +4,7 @@
 //! gateway crate depends on it.
 
 pub mod adapters;
+pub mod readiness;
 pub mod registry;
 pub mod types;
 
@@ -11,6 +12,7 @@ pub use adapters::capability::{
     ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
 };
 pub use adapters::{AdapterRegistry, RegisterInto};
+pub use readiness::{ProvisionEvent, ProvisionPhase, ReadinessProbe};
 pub use registry::{ModelEntry, ModelFormat, ModelResolver, ModelSource, ResolveError};
 pub use types::capability::Capability;
 pub use types::error::GatewayError;
