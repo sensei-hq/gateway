@@ -21,6 +21,25 @@ use gateway::adapters::{
     anthropic::AnthropicAdapter, bedrock::BedrockAdapter, openai::OpenAIAdapter,
 };
 
+// Model-registry vocabulary via the facade (no direct `kernel` dependency needed).
+use gateway::registry::{ModelEntry, ModelFormat, ModelResolver, ModelSource, ResolveError};
+
+// The local-engine surface, proving a consumer can reach it through `sensei-gateway`
+// alone (feature `local` + the `local-*` engine pass-throughs).
+#[cfg(feature = "local")]
+use gateway::local::{
+    ChainedResolver, EnsureOpts, ExternalResolver, ManagedResolver, OllamaResolver,
+    ProvisionHandle, ProvisionPlan, ProvisioningSupervisor, ScriptedPlan,
+};
+#[cfg(feature = "local-llama-cpp")]
+use gateway::local::{EmbeddedLlamaAdapter, LlamaCppAdapter, LlamaCppConfig, LlamaCppMode};
+#[cfg(feature = "local-fastembed")]
+use gateway::local::{FastembedAdapter, FastembedConfig};
+#[cfg(feature = "local-hf-download")]
+use gateway::local::{FitReport, HfHubPuller, ModelPuller, PullError, PullSpec, PullingResolver};
+#[cfg(feature = "local-ort")]
+use gateway::local::{OrtAdapter, OrtConfig, OrtPoolingStrategy};
+
 #[test]
 fn reexport_paths_resolve() {
     // The `use` block above proves the paths resolve; nothing to assert at runtime.
