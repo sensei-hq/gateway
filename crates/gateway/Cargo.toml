@@ -12,6 +12,13 @@ name = "gateway"
 default = ["cloud"]
 cloud = ["dep:cloud-providers"]
 local = ["dep:local-engine"]
+# Engine pass-throughs: forward to local-engine (which forwards to local-providers),
+# so a consumer can depend on ONLY `sensei-gateway` and still opt into the in-process
+# engines + HF pull. Each implies `local`.
+local-hf-download = ["local", "local-engine/hf-download"]
+local-llama-cpp = ["local", "local-engine/llama-cpp"]
+local-fastembed = ["local", "local-engine/fastembed"]
+local-ort = ["local", "local-engine/ort"]
 
 [dependencies]
 # Ergonomic `stream! { ... yield ev; ... }` macro used by
