@@ -3,8 +3,10 @@
 For consumers (sensei / strategos) re-pinning the gateway git dependency from a
 `v0.2.x` tag to the latest **`v0.3.x`**. 0.3.0 bundles the capability-trait refactor,
 the Hugging Face adapter + model download, per-call cost + streaming, and
-subscription/quota metering; **0.3.1** splits the old `gateway-embedded` crate into
-`local-providers` (in-process adapters) + `local-engine` (model resolvers + HF pull).
+subscription/quota metering. Local inference still ships as the single
+`gateway-embedded` crate throughout 0.3.x — the split into `local-providers` +
+`local-engine` (and the extraction of shared types into `kernel`) landed in
+**v0.4.0**. If you're going past 0.3.x, follow `upgrade-0.3-to-0.4.md` for that.
 
 ## TL;DR
 
@@ -17,7 +19,7 @@ subscription/quota metering; **0.3.1** splits the old `gateway-embedded` crate i
 | `GatewayStore` impls | new required `get_usage_since` | required *if you implement the trait* |
 | `InferenceRequest {…}` literals | new `auth` field | add `auth: None` |
 | `GatewayConfig {…}` literals | new `constraints` field | add `constraints: Default::default()` |
-| Local inference crate | `gateway-embedded` **split** → `local-providers` + `local-engine` (v0.3.1) | rename the dep *if you use local models* |
+| Local inference crate | still one `gateway-embedded` crate in 0.3.x (splits in v0.4.0) | none in 0.3.x |
 | Transitive CVEs | Cargo.lock is gitignored | `cargo update` (below) |
 
 Everything else is **additive/opt-in** (see the last section). The main call path —
@@ -30,10 +32,9 @@ and behaves exactly as before once the items above are addressed.
 
 ```toml
 # Cargo.toml
-gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
-# Local inference (only if you use it) — the v0.3.0 `gateway-embedded` crate split in two:
-local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
-local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
+gateway          = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
+# Local inference (only if you use it) — still one crate in 0.3.x:
+gateway-embedded = { package = "gateway-embedded", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
 ```
 
 Then, because `Cargo.lock` is gitignored in the gateway repo, apply the security

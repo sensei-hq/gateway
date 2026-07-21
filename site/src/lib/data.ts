@@ -30,9 +30,8 @@ export const nav = {
 };
 
 const INSTALL = `[dependencies]
-gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "${TAG}" }
-local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "${TAG}", features = ["fastembed"] }
-local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "${TAG}" }`;
+# One dependency. Cloud is on by default; opt into local models with features.
+gateway = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "${TAG}", features = ["local", "local-fastembed"] }`;
 
 export const hero = {
 	badge: ['Rust', 'LLM inference routing'],
@@ -129,21 +128,21 @@ export const usage = {
 		{
 			id: 'patch',
 			label: 'Local dev',
-			code: `# consumer workspace root — keep dev-only
+			code: `# consumer workspace root — keep dev-only. Patching the one crate is enough;
+# its sibling crates resolve as path deps of the local checkout.
 [patch."https://github.com/sensei-hq/gateway"]
-sensei-gateway         = { path = "../gateway/crates/gateway" }
-sensei-local-providers = { path = "../gateway/crates/local-providers" }
-sensei-local-engine    = { path = "../gateway/crates/local-engine" }`
+sensei-gateway = { path = "../gateway/crates/gateway" }`
 		},
 		{
 			id: 'features',
-			label: 'Embedded engines',
-			code: `# local-providers features (all off by default)
-llama-cpp     # GGUF generation/embedding via llama.cpp
-fastembed     # lightweight embeddings
-ort           # ONNX Runtime (CPU)
-# local-engine feature:
-hf-download   # pull GGUF/ONNX models from the Hugging Face Hub`
+			label: 'Features',
+			code: `# sensei-gateway features
+cloud              # cloud provider adapters (default)
+local              # local engine: resolvers + provisioning supervisor
+local-hf-download  # pull GGUF/ONNX models from the Hugging Face Hub
+local-llama-cpp    # GGUF generation/embedding via llama.cpp
+local-fastembed    # lightweight ONNX embeddings
+local-ort          # ONNX Runtime (CPU)`
 		}
 	] as UsageTab[]
 };
