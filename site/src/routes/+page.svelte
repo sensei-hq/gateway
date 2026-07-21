@@ -31,12 +31,13 @@
 
 <Seo title="gateway — LLM inference routing engine for Rust" {description} />
 
-<a id="top"></a>
+<span id="top"></span>
 
 <!-- HERO -->
-<section>
+<section class="relative overflow-hidden">
+	<div class="pointer-events-none absolute inset-0 bg-grid mask-fade-b opacity-60"></div>
 	<div
-		class="mx-auto flex max-w-content flex-col items-center gap-6 px-6 pb-16 pt-20 text-center md:pt-28"
+		class="anim-rise relative mx-auto flex max-w-content flex-col items-center gap-6 px-6 pb-16 pt-20 text-center md:pt-28"
 	>
 		<div
 			class="inline-flex items-center gap-2 rounded-full border border-accent-line bg-accent-soft px-3 py-1 text-sm font-semibold text-primary"
@@ -77,7 +78,7 @@
 </div>
 
 <!-- FEATURES -->
-<section id="features">
+<section id="features" class="grid-section">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={features.eyebrow} title={features.title} lede={features.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 md:grid-cols-3">
@@ -89,7 +90,7 @@
 </section>
 
 <!-- CRATES -->
-<section id="crates" class="border-y border-paper-edge bg-paper-soft">
+<section id="crates" class="grid-section border-y border-paper-edge bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={crates.eyebrow} title={crates.title} />
 		<div class="mt-12 grid gap-6 md:grid-cols-2">
@@ -101,7 +102,7 @@
 </section>
 
 <!-- USAGE -->
-<section id="usage">
+<section id="usage" class="grid-section">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={usage.eyebrow} title={usage.title} lede={usage.lede} />
 		<div class="mt-10">
@@ -112,7 +113,7 @@
 </section>
 
 <!-- ARCHITECTURE -->
-<section id="architecture" class="border-y border-paper-edge bg-paper-soft">
+<section id="architecture" class="grid-section border-y border-paper-edge bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={architecture.eyebrow} title={architecture.title} />
 		<div class="mt-12">
@@ -123,7 +124,7 @@
 </section>
 
 <!-- CONSUMERS -->
-<section id="consumers">
+<section id="consumers" class="grid-section">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={consumers.eyebrow} title={consumers.title} lede={consumers.lede} />
 		<div class="mt-12 grid gap-6 sm:grid-cols-2">
@@ -150,7 +151,7 @@
 </section>
 
 <!-- VERSIONING (inverted panel) -->
-<section id="versioning" data-mode={invMode} class="border-y border-paper-edge bg-paper">
+<section id="versioning" data-mode={invMode} class="grid-section border-y border-paper-edge bg-paper">
 	<div
 		class="mx-auto grid max-w-content items-center gap-10 px-6 py-section md:grid-cols-2 md:gap-14"
 	>
@@ -176,7 +177,7 @@
 </section>
 
 <!-- CTA -->
-<section id="start">
+<section id="start" class="grid-section">
 	<div
 		class="mx-auto flex max-w-content flex-col items-center gap-5 px-6 py-section text-center"
 	>
