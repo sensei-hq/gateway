@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::async_job::{JobConfig, poll_until_complete};
-use crate::base::{build_client, resolve_api_key};
+use crate::base::{build_client, get_json_bearer, post_json_bearer, resolve_api_key};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{VideoRequest, VideoResponse};
@@ -121,30 +121,8 @@ impl kernel::adapters::capability::VideoModel for LumaAdapter {
         };
 
         let submit_url = format!("{url_base}/generations");
-        let resp = self
-            .client
-            .post(&submit_url)
-            .json(&body)
-            .bearer_auth(&api_key)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::ProviderError {
-                adapter: "luma".into(),
-                message: body_text,
-                status: Some(status.as_u16()),
-            });
-        }
-
         let generation: LumaGenerationResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "luma".into(),
-                message: format!("failed to parse generation response: {e}"),
-                status: Some(status.as_u16()),
-            })?;
+            post_json_bearer(&self.client, &submit_url, &api_key, "luma", &body).await?;
 
         // 2. Poll until complete
         let generation_id = generation.id;
@@ -154,27 +132,8 @@ impl kernel::adapters::capability::VideoModel for LumaAdapter {
         let api_key_ref = &api_key;
 
         let gen_status = poll_until_complete(&job_config, || async {
-            let resp = client
-                .get(&poll_url)
-                .bearer_auth(api_key_ref)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "luma".into(),
-                    message: body_text,
-                    status: None,
-                });
-            }
-
             let status: LumaGenerationStatus =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "luma".into(),
-                    message: format!("failed to parse generation status: {e}"),
-                    status: None,
-                })?;
+                get_json_bearer(client, &poll_url, api_key_ref, "luma").await?;
 
             match status.state.as_str() {
                 "completed" => Ok(Some(status)),
