@@ -23,8 +23,8 @@ use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::VideoRequest;
 
-use kernel::adapters::capability::VideoModel;
 use cloud_providers::luma::LumaAdapter;
+use kernel::adapters::capability::VideoModel;
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

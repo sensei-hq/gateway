@@ -27,8 +27,8 @@ use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ImageRequest};
 use kernel::types::request::{Message, MessageRole};
 
-use kernel::adapters::capability::{ChatModel, ImageModel};
 use cloud_providers::together::TogetherAdapter;
+use kernel::adapters::capability::{ChatModel, ImageModel};
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

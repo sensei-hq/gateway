@@ -101,13 +101,21 @@ mod tests {
     }
     #[async_trait]
     impl ChatModel for Dual {
-        async fn chat(&self, _c: &RouterConfig, _r: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+        async fn chat(
+            &self,
+            _c: &RouterConfig,
+            _r: &ChatRequest,
+        ) -> Result<ChatResponse, GatewayError> {
             Ok(ChatResponse::default())
         }
     }
     #[async_trait]
     impl EmbedModel for Dual {
-        async fn embed(&self, _c: &RouterConfig, _r: &EmbedRequest) -> Result<EmbedResponse, GatewayError> {
+        async fn embed(
+            &self,
+            _c: &RouterConfig,
+            _r: &EmbedRequest,
+        ) -> Result<EmbedResponse, GatewayError> {
             Ok(EmbedResponse::default())
         }
     }

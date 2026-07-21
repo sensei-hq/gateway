@@ -13,9 +13,8 @@ pub use kernel::adapters::{AdapterRegistry, RegisterInto};
 // `gateway::adapters::<provider>::…` paths so cloud consumers are unaffected.
 #[cfg(feature = "cloud")]
 pub use cloud_providers::{
-    anthropic, async_job, base, bedrock, fal, flux, gemini, grok, huggingface,
-    kling, luma, ollama, openai, openai_compat, recraft, replicate, runway,
-    stability, together,
+    anthropic, async_job, base, bedrock, fal, flux, gemini, grok, huggingface, kling, luma, ollama,
+    openai, openai_compat, recraft, replicate, runway, stability, together,
 };
 
 #[cfg(test)]

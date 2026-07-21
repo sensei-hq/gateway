@@ -14,8 +14,8 @@ use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::ImageRequest;
 
-use kernel::adapters::capability::ImageModel;
 use cloud_providers::flux::FluxAdapter;
+use kernel::adapters::capability::ImageModel;
 
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};

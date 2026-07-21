@@ -50,7 +50,13 @@ mod tests {
     #[test]
     fn is_in_flight_is_true_for_queued_download_verify_load_only() {
         assert!(ProvisionPhase::Queued.is_in_flight());
-        assert!(ProvisionPhase::Downloading { done: 1, total: Some(10) }.is_in_flight());
+        assert!(
+            ProvisionPhase::Downloading {
+                done: 1,
+                total: Some(10)
+            }
+            .is_in_flight()
+        );
         assert!(ProvisionPhase::Verifying.is_in_flight());
         assert!(ProvisionPhase::Loading.is_in_flight());
         assert!(!ProvisionPhase::Absent.is_in_flight());
@@ -60,7 +66,10 @@ mod tests {
 
     #[test]
     fn phase_roundtrips_through_json() {
-        let p = ProvisionPhase::Downloading { done: 5, total: Some(100) };
+        let p = ProvisionPhase::Downloading {
+            done: 5,
+            total: Some(100),
+        };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(serde_json::from_str::<ProvisionPhase>(&json).unwrap(), p);
     }

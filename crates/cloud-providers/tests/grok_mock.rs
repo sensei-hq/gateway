@@ -20,8 +20,8 @@ use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, SttRequest, TtsRequest};
 use kernel::types::request::{AudioFormat, Message, MessageRole};
 
-use kernel::adapters::capability::{ChatModel, SttModel, TtsModel};
 use cloud_providers::grok::GrokAdapter;
+use kernel::adapters::capability::{ChatModel, SttModel, TtsModel};
 
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

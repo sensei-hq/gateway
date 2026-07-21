@@ -21,12 +21,12 @@
 //! not ONNX. Loading an Ollama-sourced entry through this adapter will
 //! fail at fastembed's ONNX parse step with a clear error.
 
-use kernel::registry::ModelEntry;
 use async_trait::async_trait;
 use fastembed::{
     InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding, TokenizerFiles,
     UserDefinedEmbeddingModel,
 };
+use kernel::registry::ModelEntry;
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{EmbedRequest, EmbedResponse};

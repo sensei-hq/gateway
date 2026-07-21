@@ -113,9 +113,7 @@ pub fn prune_unavailable(
 mod tests {
     use super::*;
     use crate::types::capability::Capability;
-    use crate::types::config::{
-        ChainEntry, FallbackChainConfig, ModelConfig, RouterConfig,
-    };
+    use crate::types::config::{ChainEntry, FallbackChainConfig, ModelConfig, RouterConfig};
     use std::collections::HashMap;
 
     fn router(enabled: bool) -> RouterConfig {
@@ -156,7 +154,10 @@ mod tests {
         chain_entries: Vec<ChainEntry>,
     ) -> GatewayConfig {
         GatewayConfig {
-            routers: routers.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            routers: routers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
             models: models.into_iter().map(|m| (m.id.clone(), m)).collect(),
             chains: HashMap::from([(
                 "c".to_string(),
@@ -172,7 +173,11 @@ mod tests {
     }
 
     fn models_left(cfg: &GatewayConfig) -> Vec<String> {
-        cfg.chains["c"].models.iter().map(|e| e.model.clone()).collect()
+        cfg.chains["c"]
+            .models
+            .iter()
+            .map(|e| e.model.clone())
+            .collect()
     }
 
     #[test]
@@ -231,7 +236,9 @@ mod tests {
         );
         let w = prune_unavailable(&mut cfg, |r, _| {
             if r == "anthropic" {
-                Availability::Unavailable { reason: "no api key".into() }
+                Availability::Unavailable {
+                    reason: "no api key".into(),
+                }
             } else {
                 Availability::Available
             }
@@ -304,7 +311,9 @@ mod tests {
         );
         let w = prune_unavailable(&mut cfg, |r, _| {
             if r == "anthropic" {
-                Availability::Unavailable { reason: "no api key".into() }
+                Availability::Unavailable {
+                    reason: "no api key".into(),
+                }
             } else {
                 Availability::Available
             }

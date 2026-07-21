@@ -483,7 +483,13 @@ mod coldboot {
             return;
         };
 
-        emit(tx, ProvisionPhase::Downloading { done: 0, total: None });
+        emit(
+            tx,
+            ProvisionPhase::Downloading {
+                done: 0,
+                total: None,
+            },
+        );
         let mut on_progress = {
             let tx = tx.clone();
             move |done, total| {
@@ -491,7 +497,12 @@ mod coldboot {
             }
         };
         if let Err(e) = puller.pull_with_progress(&spec, &mut on_progress).await {
-            emit(tx, ProvisionPhase::Failed { error: e.to_string() });
+            emit(
+                tx,
+                ProvisionPhase::Failed {
+                    error: e.to_string(),
+                },
+            );
             return;
         }
 
@@ -558,11 +569,21 @@ mod coldboot {
         let adapter = match loaded {
             Ok(Ok(adapter)) => adapter,
             Ok(Err(e)) => {
-                emit(tx, ProvisionPhase::Failed { error: e.to_string() });
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: e.to_string(),
+                    },
+                );
                 return;
             }
             Err(e) => {
-                emit(tx, ProvisionPhase::Failed { error: format!("load task failed: {e}") });
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: format!("load task failed: {e}"),
+                    },
+                );
                 return;
             }
         };
@@ -595,11 +616,21 @@ mod coldboot {
         let adapter = match loaded {
             Ok(Ok(adapter)) => adapter,
             Ok(Err(e)) => {
-                emit(tx, ProvisionPhase::Failed { error: e.to_string() });
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: e.to_string(),
+                    },
+                );
                 return;
             }
             Err(e) => {
-                emit(tx, ProvisionPhase::Failed { error: format!("load task failed: {e}") });
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: format!("load task failed: {e}"),
+                    },
+                );
                 return;
             }
         };
@@ -787,7 +818,12 @@ mod tests {
             .unwrap_err();
         let ProvisionError::Failed(msg) = err;
         assert!(msg.contains("disk full"), "got: {msg}");
-        assert_eq!(sup.status("m").await, ProvisionPhase::Failed { error: "disk full".to_string() });
+        assert_eq!(
+            sup.status("m").await,
+            ProvisionPhase::Failed {
+                error: "disk full".to_string()
+            }
+        );
     }
 
     #[tokio::test]

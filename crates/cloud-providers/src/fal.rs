@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{build_client, resolve_api_key};
 use crate::async_job::{JobConfig, poll_until_complete};
+use crate::base::{build_client, resolve_api_key};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
