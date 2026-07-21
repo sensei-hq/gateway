@@ -11,6 +11,15 @@ name = "local_engine"
 [features]
 default = []
 hf-download = ["dep:hf-hub", "dep:reqwest", "dep:sysinfo"]
+# Internal umbrella: on whenever an in-process engine wing is enabled. Gates the
+# supervisor's coldboot code paths (adapter load + registration) and the
+# registry/resolver context they need, so the default build carries none of it.
+coldboot = []
+# Engine wings: forward to local-providers, which the supervisor coldboots into
+# an adapter and registers. Each pulls in its heavy backend only when enabled.
+llama-cpp = ["dep:local-providers", "local-providers/llama-cpp", "coldboot"]
+fastembed = ["dep:local-providers", "local-providers/fastembed", "coldboot"]
+ort = ["dep:local-providers", "local-providers/ort", "coldboot"]
 
 [dependencies]
 kernel = { package = "sensei-kernel", path = "../kernel" }
@@ -20,10 +29,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "rt", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 sysinfo = { version = "0.39", default-features = false, features = ["disk", "system"], optional = true }
+# Coldboot target: the supervisor loads a local-providers adapter and registers
+# it. Optional + feature-gated (the engine wings above). local-providers carries
+# a dev-dep back on local-engine (embedded_llama tests) — that reverse edge is
+# dev-only, so this normal edge does not form a build cycle.
+local-providers = { package = "sensei-local-providers", path = "../local-providers", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -131,11 +131,19 @@ impl HfHubPuller {
         self.managed.add(entry.clone()).await?;
         Ok(entry)
     }
-}
 
-#[async_trait]
-impl ModelPuller for HfHubPuller {
-    async fn pull(&self, spec: &PullSpec) -> Result<ModelEntry, PullError> {
+    /// Like [`ModelPuller::pull`], but emits coarse download progress: an opening
+    /// `0 / total` tick, then the cumulative byte count after each file lands.
+    /// `total` is the size [`Self::check_fit`] already ranged-probed. `hf-hub`'s
+    /// `repo.get` is monolithic (no sub-file callback), so granularity is
+    /// per-file — fine for a progress display, where fast transitions coalesce
+    /// anyway. The supervisor bridges `on_progress` to
+    /// [`ProvisionPhase::Downloading { done, total }`](kernel::ProvisionPhase).
+    pub async fn pull_with_progress(
+        &self,
+        spec: &PullSpec,
+        on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<ModelEntry, PullError> {
         if spec.files.is_empty() {
             return Err(PullError::EmptySpec);
         }
@@ -153,6 +161,7 @@ impl ModelPuller for HfHubPuller {
         // Resource guard FIRST — never fetch file bytes for a model that can't
         // run here. `check_fit` only reads sizes (one-byte ranged probes), not
         // bodies; if it says the model won't fit we bail before any download.
+        // It also hands us the `total` the progress ticks are measured against.
         let fit = self.check_fit(spec).await?;
         if !fit.fits {
             let reason = fit
@@ -160,6 +169,9 @@ impl ModelPuller for HfHubPuller {
                 .unwrap_or_else(|| "does not fit on this machine".to_string());
             return Err(PullError::WontFit(format!("model '{}' {reason}", spec.id)));
         }
+
+        let mut reporter = ProgressReporter::new(Some(fit.model_bytes), on_progress);
+        reporter.start();
 
         let revision = spec.revision.as_deref().unwrap_or("main").to_string();
         let api = ApiBuilder::new()
@@ -184,11 +196,54 @@ impl ModelPuller for HfHubPuller {
                 tokio::fs::create_dir_all(parent).await?;
             }
             stage_file(&cached, &dest).await?;
+            // Cumulative progress from the on-disk size we just staged.
+            let bytes = tokio::fs::metadata(&dest).await?.len();
+            reporter.file_done(bytes);
             staged.push(dest);
         }
 
         self.register_local(&spec.id, spec.name.clone(), spec.format, &staged)
             .await
+    }
+}
+
+/// Accumulates download progress across a spec's files and forwards each tick
+/// to the caller's `FnMut(u64, Option<u64>)` sink (the supervisor maps it to
+/// `ProvisionPhase::Downloading { done, total }`). Split out so the accounting
+/// is unit-testable without a network — the real byte counts come from each
+/// staged file's on-disk size.
+struct ProgressReporter<'a> {
+    done: u64,
+    total: Option<u64>,
+    on_progress: &'a mut (dyn FnMut(u64, Option<u64>) + Send),
+}
+
+impl<'a> ProgressReporter<'a> {
+    fn new(total: Option<u64>, on_progress: &'a mut (dyn FnMut(u64, Option<u64>) + Send)) -> Self {
+        Self {
+            done: 0,
+            total,
+            on_progress,
+        }
+    }
+
+    /// Emit the opening `0 / total` tick as the download begins.
+    fn start(&mut self) {
+        (self.on_progress)(self.done, self.total);
+    }
+
+    /// Record that a file of `bytes` finished; emit the new cumulative `done`.
+    fn file_done(&mut self, bytes: u64) {
+        self.done = self.done.saturating_add(bytes);
+        (self.on_progress)(self.done, self.total);
+    }
+}
+
+#[async_trait]
+impl ModelPuller for HfHubPuller {
+    async fn pull(&self, spec: &PullSpec) -> Result<ModelEntry, PullError> {
+        // A progress-free pull is the progress pull with a sink that drops ticks.
+        self.pull_with_progress(spec, &mut |_done, _total| {}).await
     }
 
     async fn check_fit(&self, spec: &PullSpec) -> Result<FitReport, PullError> {
@@ -517,6 +572,35 @@ mod tests {
     fn fmt_bytes_uses_gb_then_mb() {
         assert_eq!(fmt_bytes(18 * GB), "18.0 GB");
         assert_eq!(fmt_bytes(512 * MB), "512.0 MB");
+    }
+
+    #[test]
+    fn progress_reporter_emits_monotonic_done_culminating_in_total() {
+        // The accounting the supervisor bridges to `Downloading { done, total }`:
+        // start at 0, add each file's bytes as it lands, end exactly at total.
+        let total = Some(300u64);
+        let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
+        {
+            let mut cb = |done, total| seen.push((done, total));
+            let mut rep = ProgressReporter::new(total, &mut cb);
+            rep.start();
+            rep.file_done(100);
+            rep.file_done(50);
+            rep.file_done(150);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (0, Some(300)),
+                (100, Some(300)),
+                (150, Some(300)),
+                (300, Some(300)),
+            ]
+        );
+        // Monotonic non-decreasing `done`.
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
+        // Total is carried unchanged on every tick.
+        assert!(seen.iter().all(|(_, t)| *t == Some(300)));
     }
 
     #[test]

@@ -3,3 +3,9 @@
 //! `ChainedResolver`) plus Hugging Face pull (`hf-download`). Model vocabulary
 //! (`ModelEntry`/`ModelResolver`/…) lives in `kernel::registry`.
 pub mod registry;
+pub mod supervisor;
+
+pub use supervisor::{
+    EnsureOpts, ProvisionError, ProvisionHandle, ProvisionPlan, ProvisioningSupervisor,
+    ScriptedPlan,
+};
