@@ -1,6 +1,6 @@
 [package]
 name = "sensei-local-providers"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "In-process inference adapters (llama.cpp, fastembed, ONNX Runtime) for the sensei gateway"
 license = "MIT"
