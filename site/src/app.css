@@ -126,6 +126,16 @@ section[id],
 	mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
 }
 
+/* Outline buttons are transparent by default, so over the fixed grid backdrop the
+   lattice shows through them. Fill them with the page colour to occlude the grid
+   while keeping the 1px border + muted label. Selector mirrors Rokkit's own
+   (`zen-sumi` outline/default) specificity and, loaded after the theme @import,
+   wins the cascade. */
+[data-style='zen-sumi'] [data-button][data-style='outline'][data-variant='default'],
+[data-style='zen-sumi'] [data-button][data-style='outline']:not([data-variant]) {
+	background-color: var(--paper);
+}
+
 /* ---- Entrance animation ---- */
 .anim-rise {
 	animation: rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both;
