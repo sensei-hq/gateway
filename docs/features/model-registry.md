@@ -4,10 +4,11 @@ Resolves a stable model **id** to an on-disk path to the model bytes, drawing
 from three storage sources looked up in a fixed precedence order. Each source is
 a separate resolver; they compose into one registry via `ChainedResolver`.
 
-Source: `crates/gateway-embedded/src/registry/mod.rs`,
-`crates/gateway-embedded/src/registry/managed.rs`,
-`crates/gateway-embedded/src/registry/ollama.rs`,
-`crates/gateway-embedded/src/registry/external.rs`.
+Source: `crates/local-engine/src/registry/mod.rs`,
+`crates/local-engine/src/registry/managed.rs`,
+`crates/local-engine/src/registry/ollama.rs`,
+`crates/local-engine/src/registry/external.rs`;
+the `ModelEntry`/`ModelResolver` vocabulary lives in `crates/kernel/src/registry.rs`.
 
 ## Purpose
 

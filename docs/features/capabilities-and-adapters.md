@@ -214,8 +214,8 @@ and budget filtering are **unchanged** — they already key off `Capability`.
 
 ## Capability × provider matrix
 
-Rows are the 16 cloud adapters (`crates/gateway/src/adapters/`) plus the 4 embedded
-adapters (`crates/gateway-embedded/src/adapters/`). A ✓ means the adapter will
+Rows are the 16 cloud adapters (`crates/cloud-providers/src/`) plus the 4 embedded
+adapters (`crates/local-providers/src/adapters/`). A ✓ means the adapter will
 implement that capability trait and be registered into that map.
 
 | Adapter | Chat | Embed | STT | TTS | Image | Video |

@@ -3,9 +3,10 @@
 The `gateway` crate is a provider-agnostic **LLM inference routing engine**:
 connect provider credentials once, then route requests through named fallback
 chains with a per-endpoint circuit breaker, budget filtering, and request
-tracing. The companion `gateway-embedded` crate adds in-process (local)
+tracing. The companion `local-providers` crate adds in-process (local)
 inference — llama.cpp, ONNX Runtime, FastEmbed — behind the same adapter
-abstraction, so local and cloud models compose in one routing config.
+abstraction (with `local-engine` for model resolution + Hugging Face pull), so
+local and cloud models compose in one routing config.
 
 This folder documents the library feature-by-feature. Every page traces its
 claims to source and carries a **Notes** section flagging existing quirks.
@@ -21,7 +22,7 @@ claims to source and carries a **Notes** section flagging existing quirks.
 | [subscription-quota](subscription-quota.md) | Config-at-init tier quotas (`ConstraintsConfig`/`QuotaLimit`), `AuthContext`, the `check_quota` pre-flight guard, usage recording |
 | [capabilities-and-adapters](capabilities-and-adapters.md) | **Target** capability-trait model (`ChatModel`/`EmbedModel`/…), per-capability registry, how to add an adapter |
 | [providers](providers.md) | Reference for the 16 cloud adapters: id, base URL, auth style, capabilities, quirks |
-| [embedded-inference](embedded-inference.md) | `gateway-embedded`: llama.cpp / ONNX / FastEmbed engines, cargo features |
+| [embedded-inference](embedded-inference.md) | `local-providers`: llama.cpp / ONNX / FastEmbed engines, cargo features |
 | [model-registry](model-registry.md) | `ModelResolver`, `ChainedResolver`, Managed / Ollama-read-through / External sources |
 | [streaming](streaming.md) | `stream()`, `StreamChunk`, `StreamingToolCall` accumulation, SSE parsing |
 | [tool-calling](tool-calling.md) | `ToolDefinition`/`ToolCall`, per-provider wire differences, streamed assembly |
