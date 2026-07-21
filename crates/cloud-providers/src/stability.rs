@@ -4,7 +4,7 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::base::{build_client, resolve_api_key};
+use crate::base::{build_client, error_from_response, resolve_api_key};
 use kernel::adapters::capability::{ImageModel, Model};
 use kernel::adapters::{AdapterRegistry, RegisterInto};
 use kernel::types::config::RouterConfig;
@@ -119,22 +119,7 @@ impl ImageModel for StabilityAdapter {
         let status = response.status();
 
         if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "stability".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "stability".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "stability".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
+            return Err(error_from_response("stability", response).await);
         }
 
         let content_type = response
