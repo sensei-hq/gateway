@@ -1,7 +1,14 @@
-/* gateway website — content data, ported from the design mockup (Gateway Site.dc.html),
-   with facts updated to the current release (v0.3.x, capability-trait adapters). */
+/* gateway website — content data, ported from the design mockup (Gateway Site.dc.html).
+   The release version is sourced from package.json (single source of truth), so the
+   site follows `make bump` automatically and never drifts on a version change. */
+import { version } from '../../package.json';
 
 const REPO = 'https://github.com/sensei-hq/gateway';
+
+/** Current release, from package.json — e.g. "0.4.0". */
+export const VERSION = version;
+/** Git-tag form consumers pin — e.g. "v0.4.0". */
+export const TAG = `v${version}`;
 
 export const brand = {
 	name: 'gateway',
@@ -23,9 +30,9 @@ export const nav = {
 };
 
 const INSTALL = `[dependencies]
-gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }
-local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1", features = ["fastembed"] }
-local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "v0.3.1" }`;
+gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "${TAG}" }
+local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "${TAG}", features = ["fastembed"] }
+local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "${TAG}" }`;
 
 export const hero = {
 	badge: ['Rust', 'LLM inference routing'],
@@ -89,20 +96,20 @@ export const crates = {
 	items: [
 		{
 			name: 'gateway',
-			version: 'v0.3.1',
+			version: TAG,
 			body: 'Provider-agnostic routing engine. Capability-trait adapters, named fallback chains, per-endpoint circuit breaker, budget filtering and request tracing — with a store trait for persistence and quotas.',
 			chips: ['reqwest', 'rustls', 'tokio']
 		},
 		{
 			name: 'local-providers',
-			version: 'v0.3.1',
+			version: TAG,
 			body: 'In-process inference adapters (llama.cpp, fastembed, ONNX Runtime). The same capability traits as the cloud adapters, so local and cloud models compose in one routing config.',
 			chips: ['llama-cpp', 'fastembed', 'ort'],
 			note: 'feature-gated'
 		},
 		{
 			name: 'local-engine',
-			version: 'v0.3.1',
+			version: TAG,
 			body: 'The local model engine: resolvers that map a model id to on-disk bytes (managed / Ollama / external) plus optional Hugging Face model pull.',
 			chips: ['hf-download'],
 			note: 'feature-gated'
@@ -164,10 +171,10 @@ export type Step = { n: string; title: string; note: string };
 export const versioning = {
 	eyebrow: 'Versioning',
 	title: 'Independent, semver, reproducible.',
-	lede: 'This repo versions independently of its consumers. Releases are semver tags — all five crates currently share v0.3.1.',
+	lede: `This repo versions independently of its consumers. Releases are semver tags — all five crates currently share ${TAG}.`,
 	steps: [
 		{ n: '01', title: 'Tag with semver', note: 'vMAJOR.MINOR.PATCH' },
-		{ n: '02', title: 'Consumer pins the tag', note: 'git dependency, tag = "v0.3.1"' },
+		{ n: '02', title: 'Consumer pins the tag', note: `git dependency, tag = "${TAG}"` },
 		{ n: '03', title: 'Cargo.lock pins the commit', note: 'exact commit · no silent drift' }
 	] as Step[]
 };

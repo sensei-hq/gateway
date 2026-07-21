@@ -87,7 +87,12 @@ section[id],
 	max-width: var(--content);
 }
 
-/* ---- Grid backdrop (hero + alternating sections) ---- */
+/* ---- Grid backdrop (hero + alternating sections) ----
+   `background-attachment: fixed` anchors the grid to the viewport instead of each
+   element, so every section (and the hero) reads from ONE shared 64px lattice —
+   the pattern stays continuous across section boundaries rather than restarting at
+   each section's top. (On iOS Safari, which ignores fixed attachment, it degrades
+   to a per-section origin — same as before, no worse.) */
 .grid-section {
 	position: relative;
 	isolation: isolate;
@@ -102,6 +107,7 @@ section[id],
 		linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
 		linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
 	background-size: 64px 64px;
+	background-attachment: fixed;
 	opacity: 0.85;
 }
 .grid-section > * {
@@ -113,6 +119,7 @@ section[id],
 		linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
 		linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
 	background-size: 64px 64px;
+	background-attachment: fixed;
 }
 .mask-fade-b {
 	-webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
