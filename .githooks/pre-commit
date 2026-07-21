@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit gate — keep every commit formatting- and lint-clean.
+#
+# Mirrors `make lint`: `cargo fmt --all --check` (rejects unformatted code) then
+# `cargo clippy --workspace --all-targets -- -D warnings`. It CHECKS formatting
+# rather than rewriting files, so it never surprise-edits your staged changes —
+# run `make fmt` to fix formatting, then re-commit.
+#
+# Enable per clone with `make hooks` (sets core.hooksPath=.githooks).
+# Bypass a single commit with `git commit --no-verify`.
+set -e
+echo "pre-commit: make lint (fmt-check + clippy)…"
+exec make lint
