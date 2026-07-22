@@ -132,6 +132,7 @@ mod tests {
             id: id.into(),
             api_model_id: None,
             provider: provider.into(),
+            family: None,
             capabilities: vec![Capability::TextChat],
             context_window: 8192,
             max_output_tokens: 1024,

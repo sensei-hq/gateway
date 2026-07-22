@@ -224,6 +224,7 @@ mod tests {
             id: id.to_string(),
             api_model_id: None,
             provider: provider.to_string(),
+            family: None,
             capabilities: vec![Capability::TextChat],
             context_window: 4096,
             max_output_tokens: 1024,
