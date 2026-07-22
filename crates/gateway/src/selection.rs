@@ -446,6 +446,7 @@ mod tests {
                 id: "gemma3:27b".to_string(),
                 api_model_id: None,
                 provider: "ollama".to_string(),
+                family: None,
                 capabilities: vec![
                     Capability::TextChat,
                     Capability::TextComplete,
@@ -462,6 +463,7 @@ mod tests {
                 id: "all-minilm".to_string(),
                 api_model_id: None,
                 provider: "ollama".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextEmbed],
                 context_window: 512,
                 max_output_tokens: 0,
@@ -474,6 +476,7 @@ mod tests {
                 id: "claude-haiku".to_string(),
                 api_model_id: Some("claude-haiku-4-5-20251001".to_string()),
                 provider: "anthropic".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 200000,
                 max_output_tokens: 8192,

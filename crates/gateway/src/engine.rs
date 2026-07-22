@@ -535,6 +535,98 @@ impl Gateway {
         })
     }
 
+    /// Fan out one request across a [`PanelConfig`](crate::types::config::PanelConfig)'s
+    /// slots (each an existing chain), concurrently, returning every slot's result.
+    ///
+    /// The panel is **formed** first — each slot's primary model + family is
+    /// resolved and the `distinct_by` policy enforced — so a distinctness
+    /// violation (or unknown chain/model) fails fast with
+    /// [`GatewayError::InvalidConfig`] before any model is called. Each slot then
+    /// runs its own [`execute`](Self::execute) scoped to the slot's chain, so it
+    /// keeps its fallback legs; one slot failing yields `Err` for **that slot
+    /// only** and never sinks the panel. Non-streaming (a panel is aggregate).
+    pub async fn execute_panel(
+        &self,
+        request: &InferenceRequest,
+        panel: &crate::types::config::PanelConfig,
+    ) -> Result<crate::panel::PanelResponse, GatewayError> {
+        if request.capability != panel.capability {
+            return Err(GatewayError::InvalidConfig(format!(
+                "panel '{}' is {:?} but the request is {:?}",
+                panel.id, panel.capability, request.capability
+            )));
+        }
+
+        let config = self.config.read().await.clone();
+        let formed = crate::panel::form_panel(&config, panel)?;
+
+        // Fan out: one execute() per slot, scoped to the slot's chain.
+        let calls = formed.slots.iter().map(|slot| {
+            let mut req = request.clone();
+            req.chain = Some(slot.chain.clone());
+            req.model = None;
+            req.router = None;
+            async move { self.execute(&req).await }
+        });
+        let results = futures::future::join_all(calls).await;
+
+        // Assemble per-slot results; resolve the family that actually answered
+        // and flag runtime family collisions between successful slots.
+        let mut slots = Vec::with_capacity(formed.slots.len());
+        let mut total_cost = Cost::zero();
+        let mut used_families: HashMap<String, String> = HashMap::new();
+        let mut collisions = Vec::new();
+
+        for (slot, result) in formed.slots.iter().zip(results) {
+            let family = match &result {
+                Ok(resp) => resp
+                    .model
+                    .as_ref()
+                    .and_then(|m| config.models.get(m))
+                    .and_then(|m| m.family.clone())
+                    .or_else(|| Some(slot.family.clone())),
+                Err(_) => Some(slot.family.clone()),
+            };
+
+            if let Ok(resp) = &result
+                && let Some(c) = &resp.actual_cost
+            {
+                total_cost.input_tokens += c.input_tokens;
+                total_cost.output_tokens += c.output_tokens;
+                total_cost.total_tokens += c.total_tokens;
+                total_cost.input_cost += c.input_cost;
+                total_cost.output_cost += c.output_cost;
+                total_cost.total_cost += c.total_cost;
+            }
+
+            let label = slot.label.clone().unwrap_or_else(|| slot.chain.clone());
+            if result.is_ok()
+                && let Some(fam) = &family
+            {
+                if let Some(prev) = used_families.get(fam) {
+                    collisions.push(format!(
+                        "slots '{prev}' and '{label}' both answered with family '{fam}'"
+                    ));
+                } else {
+                    used_families.insert(fam.clone(), label);
+                }
+            }
+
+            slots.push(crate::panel::PanelSlotResult {
+                label: slot.label.clone(),
+                chain: slot.chain.clone(),
+                family,
+                result,
+            });
+        }
+
+        Ok(crate::panel::PanelResponse {
+            slots,
+            total_cost,
+            collisions,
+        })
+    }
+
     /// Execute an inference request as a token stream.
     ///
     /// The streaming analogue of [`Gateway::execute`]. Reuses the same
@@ -1035,6 +1127,7 @@ mod tests {
                 id: "noop".to_string(),
                 api_model_id: None,
                 provider: "noop".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat, Capability::TextEmbed],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -1161,6 +1254,7 @@ mod tests {
                 id: "noop".to_string(),
                 api_model_id: Some("noop-v2".to_string()),
                 provider: "noop".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -1277,6 +1371,7 @@ mod tests {
                 id: "priced".to_string(),
                 api_model_id: None,
                 provider: "priced".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -1386,6 +1481,7 @@ mod tests {
                 id: "priced".to_string(),
                 api_model_id: None,
                 provider: "priced".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -1615,6 +1711,7 @@ mod tests {
                 id: "m".to_string(),
                 api_model_id: None,
                 provider: "r".to_string(),
+                family: None,
                 capabilities: vec![Capability::ImageEdit],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -1871,6 +1968,7 @@ mod tests {
                 id: "fail-model".to_string(),
                 api_model_id: None,
                 provider: "failing".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -1883,6 +1981,7 @@ mod tests {
                 id: "noop".to_string(),
                 api_model_id: None,
                 provider: "noop".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2113,6 +2212,7 @@ mod tests {
                 id: "fail-model".to_string(),
                 api_model_id: None,
                 provider: "failing".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2203,6 +2303,7 @@ mod tests {
                 id: "ghost-model".to_string(),
                 api_model_id: None,
                 provider: "ghost".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2215,6 +2316,7 @@ mod tests {
                 id: "noop".to_string(),
                 api_model_id: None,
                 provider: "noop".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2348,6 +2450,7 @@ mod tests {
                 id: "fail-model".to_string(),
                 api_model_id: None,
                 provider: "failing".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2360,6 +2463,7 @@ mod tests {
                 id: "ghost-model".to_string(),
                 api_model_id: None,
                 provider: "ghost".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2669,6 +2773,7 @@ mod tests {
                 id: "priced".to_string(),
                 api_model_id: None,
                 provider: "priced".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2766,6 +2871,7 @@ mod tests {
                 id: "fail-model".to_string(),
                 api_model_id: None,
                 provider: "failing".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2778,6 +2884,7 @@ mod tests {
                 id: "good".to_string(),
                 api_model_id: None,
                 provider: "good".to_string(),
+                family: None,
                 capabilities: vec![Capability::TextChat],
                 context_window: 4096,
                 max_output_tokens: 1024,
@@ -2895,5 +3002,185 @@ mod tests {
             Err(other) => panic!("expected Unsupported, got: {other}"),
             Ok(_) => panic!("expected Err(Unsupported), got a stream"),
         }
+    }
+
+    // --- Panel fan-out (execute_panel) ---
+
+    fn router(enabled: bool) -> RouterConfig {
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn chat_model(id: &str, provider: &str, family: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            api_model_id: None,
+            provider: provider.to_string(),
+            family: Some(family.to_string()),
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: None,
+        }
+    }
+
+    fn one_model_chain(id: &str, model: &str, router: &str) -> FallbackChainConfig {
+        FallbackChainConfig {
+            id: id.to_string(),
+            capability: Capability::TextChat,
+            models: vec![ChainEntry {
+                model: model.to_string(),
+                router: Some(router.to_string()),
+                api_model_id: None,
+                priority: 1,
+            }],
+            fallback_triggers: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_panel_fans_out_and_isolates_slot_failures() {
+        use crate::types::config::{DistinctBy, PanelConfig, PanelSlot};
+
+        // gemma + qwen are served by the registered noop adapter; the "wildcard"
+        // slot routes to "ghost" (no adapter) so it fails alone.
+        let routers = HashMap::from([
+            ("noop".to_string(), router(true)),
+            ("ghost".to_string(), router(true)),
+        ]);
+        let models = HashMap::from([
+            (
+                "m-gemma".to_string(),
+                chat_model("m-gemma", "noop", "gemma"),
+            ),
+            ("m-qwen".to_string(), chat_model("m-qwen", "noop", "qwen")),
+            ("m-ghost".to_string(), chat_model("m-ghost", "ghost", "phi")),
+        ]);
+        let chains = HashMap::from([
+            (
+                "c-gemma".to_string(),
+                one_model_chain("c-gemma", "m-gemma", "noop"),
+            ),
+            (
+                "c-qwen".to_string(),
+                one_model_chain("c-qwen", "m-qwen", "noop"),
+            ),
+            (
+                "c-ghost".to_string(),
+                one_model_chain("c-ghost", "m-ghost", "ghost"),
+            ),
+        ]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_noop(&gw).await; // "noop" only; "ghost" has no adapter
+
+        let panel = PanelConfig {
+            id: "consensus".to_string(),
+            capability: Capability::TextChat,
+            distinct_by: DistinctBy::Family,
+            slots: vec![
+                PanelSlot {
+                    chain: "c-gemma".to_string(),
+                    label: Some("proposer".to_string()),
+                },
+                PanelSlot {
+                    chain: "c-qwen".to_string(),
+                    label: Some("challenger".to_string()),
+                },
+                PanelSlot {
+                    chain: "c-ghost".to_string(),
+                    label: Some("wildcard".to_string()),
+                },
+            ],
+        };
+
+        let resp = gw.execute_panel(&chat_request(), &panel).await.unwrap();
+        assert_eq!(resp.slots.len(), 3);
+
+        let slot = |label: &str| {
+            resp.slots
+                .iter()
+                .find(|s| s.label.as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("missing slot {label}"))
+        };
+        assert!(slot("proposer").result.is_ok());
+        assert!(slot("challenger").result.is_ok());
+        // The ghost slot has no adapter → its execute() fails, but in isolation.
+        assert!(slot("wildcard").result.is_err());
+        assert_eq!(slot("proposer").family.as_deref(), Some("gemma"));
+        assert_eq!(slot("challenger").family.as_deref(), Some("qwen"));
+        assert!(
+            resp.collisions.is_empty(),
+            "distinct families should not collide, got {:?}",
+            resp.collisions
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_panel_rejects_same_family_at_formation() {
+        use crate::types::config::{DistinctBy, PanelConfig, PanelSlot};
+
+        // Both slots resolve to a gemma-family primary → formation must reject
+        // before any inference under distinct_by = family.
+        let routers = HashMap::from([("noop".to_string(), router(true))]);
+        let models = HashMap::from([
+            ("m1".to_string(), chat_model("m1", "noop", "gemma")),
+            ("m2".to_string(), chat_model("m2", "noop", "gemma")),
+        ]);
+        let chains = HashMap::from([
+            ("c1".to_string(), one_model_chain("c1", "m1", "noop")),
+            ("c2".to_string(), one_model_chain("c2", "m2", "noop")),
+        ]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_noop(&gw).await;
+
+        let panel = PanelConfig {
+            id: "bad".to_string(),
+            capability: Capability::TextChat,
+            distinct_by: DistinctBy::Family,
+            slots: vec![
+                PanelSlot {
+                    chain: "c1".to_string(),
+                    label: None,
+                },
+                PanelSlot {
+                    chain: "c2".to_string(),
+                    label: None,
+                },
+            ],
+        };
+
+        let err = gw.execute_panel(&chat_request(), &panel).await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::InvalidConfig(_)),
+            "same-family panel must fail formation, got {err:?}"
+        );
     }
 }
