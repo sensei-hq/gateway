@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod budget;
 pub mod circuit_breaker;
 pub mod config;
+pub mod consensus;
 mod dispatch;
 pub mod engine;
 pub mod facade;
@@ -17,13 +18,14 @@ pub use kernel::types;
 pub use kernel::registry;
 
 pub use config::GatewayBuilder;
+pub use consensus::ConsensusResult;
 pub use engine::Gateway;
 pub use facade::{Facade, FacadeBuilder};
 pub use panel::{PanelResponse, PanelSlotResult};
 pub use pruning::{Availability, ChainWarning, prune_unavailable};
 pub use purpose::{ModelHint, Purpose, PurposeBuilder, PurposeResult, StepBuilder, StepInput};
 pub use types::capability::Capability;
-pub use types::config::{DistinctBy, PanelConfig, PanelSlot};
+pub use types::config::{ConsensusConfig, DistinctBy, PanelConfig, PanelSlot, RoleSpec};
 pub use types::error::GatewayError;
 pub use types::request::{InferenceRequest, InferenceResponse};
 
