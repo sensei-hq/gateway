@@ -18,16 +18,27 @@ local-engine    = { package = "sensei-local-engine", git = "https://github.com/s
 | `llama-cpp` | `LlamaCppAdapter` | chat + embed | GGUF |
 | `fastembed` _(deferred, gh#7)_ | `FastembedAdapter` | embed | ONNX (+ tokenizer files) |
 | `ort` | `OrtAdapter` | embed | ONNX |
+| `kokoro` | `KokoroAdapter` | tts | ONNX (model + voices + lexicon) |
 | `hf-download` | — (registry) | pull models from the HF Hub | GGUF / ONNX |
 
-Default build compiles none of them. The `llama-cpp` / `fastembed` / `ort` engine
-features live on `local-providers`; `hf-download` lives on `local-engine`.
+Default build compiles none of them. The `llama-cpp` / `fastembed` / `ort` /
+`kokoro` engine features live on `local-providers`; `hf-download` lives on
+`local-engine`.
 
 > **`fastembed` is deferred (gh#7).** Its 5.x line pins `hf-hub 0.5`, which would
 > duplicate the `hf-hub 1.0` used for HF download, so the dependency is disabled and
 > the feature is an inert placeholder — it won't build until fastembed ships on
 > `hf-hub 1.0`. For ONNX embeddings use `ort`; Ollama embeddings remain the primary
 > path and are unaffected.
+
+> **`kokoro` = local text-to-speech (Kokoro-82M, gh#23).** A `TtsModel` backed by
+> the Apache-2.0 Kokoro ONNX model via the `sensei-kokoro` engine — the first
+> *local* TTS provider. Enable `local-kokoro` on the gateway (or `kokoro` on
+> `local-providers`). Provision with an `HfKokoro` plan: it pulls the model + a
+> voice from `onnx-community/Kokoro-82M-v1.0-ONNX`. The misaki `us_gold.json`
+> lexicon is GitHub-only (not on the model repo), so supply it as a sibling —
+> `KokoroConfig::hf_layout("af_heart")` sets the right relative paths for the
+> pulled layout. English (US/UK) today; emits 24 kHz WAV.
 
 ## The local-inference flow
 

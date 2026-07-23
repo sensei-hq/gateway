@@ -36,6 +36,7 @@ The crate has three modules:
 | llama.cpp (GGUF) | `LlamaCppAdapter`, `EmbeddedLlamaAdapter` | `llama-cpp` | `llama-cpp-2` (C++) | generation + embedding |
 | ONNX Runtime | `OrtAdapter` | `ort` | `ort` (C++), `tokenizers`, `ndarray` | embedding only |
 | FastEmbed _(deferred, gh#7)_ | `FastembedAdapter` | `fastembed` | `fastembed` (wraps ORT) | embedding only |
+| Kokoro-82M (TTS) | `KokoroAdapter` | `kokoro` | `sensei-kokoro` + `ort` (C++) | text-to-speech |
 
 > **The `fastembed` feature is deferred (gh#7).** fastembed 5.x pins `hf-hub 0.5`,
 > which would duplicate the `hf-hub 1.0` used for HF download, so the `fastembed`
@@ -43,6 +44,23 @@ The crate has three modules:
 > `FastembedAdapter` code below remains for reference but won't build until fastembed
 > ships on `hf-hub 1.0`. Use `ort` for ONNX embeddings, or Ollama (the primary
 > embedding path) in the meantime.
+
+### Kokoro TTS — `kokoro`
+
+The first *local* text-to-speech engine (gh#23): a `TtsModel` wrapping the
+Apache-2.0 **Kokoro-82M** StyleTTS2 model, run as ONNX through the standalone
+`sensei-kokoro` crate. Pipeline: `text → G2P → phoneme tokens → ONNX → 24 kHz
+WAV`, with the per-language grapheme-to-phoneme frontend behind a `G2p` trait
+(the phoneme vocab is shared across languages; English today).
+
+- **Enable**: `local-kokoro` on `sensei-gateway` (or `kokoro` on `local-providers`).
+- **Provision** (`HfKokoro` plan): pulls `onnx/model_q8f16.onnx` + a `voices/*.bin`
+  from `onnx-community/Kokoro-82M-v1.0-ONNX`. The misaki `us_gold.json` lexicon is
+  **GitHub-only** (not on the model repo), so it's supplied as an operator sibling;
+  `KokoroConfig::hf_layout("af_heart")` sets the relative paths for the pulled
+  `onnx/` + `voices/` layout.
+- **Follow-ups**: bundled/auto-fetched lexicon, output-format transcode (emits WAV
+  today), multi-voice packs, and an OOV letter-to-sound fallback.
 
 ### llama.cpp — `llama_cpp` and `embedded_llama`
 
