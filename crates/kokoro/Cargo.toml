@@ -1,0 +1,12 @@
+[package]
+name = "sensei-kokoro"
+version = "0.4.3"
+edition = "2024"
+description = "Local Kokoro-82M text-to-speech engine — phoneme tokenizer, voice packs, and audio — for the sensei gateway"
+license = "MIT"
+
+[lib]
+name = "kokoro"
+
+[dependencies]
+thiserror = "2"
