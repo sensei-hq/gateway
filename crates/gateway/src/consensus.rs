@@ -74,6 +74,8 @@ pub(crate) fn build_chat_request(
         },
         budget: None,
         auth: None,
+        panel: None,
+        consensus: None,
     }
 }
 

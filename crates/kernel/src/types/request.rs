@@ -379,6 +379,16 @@ pub struct InferenceRequest {
     /// without a subject; no quota enforced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthContext>,
+    /// Address a named fan-out panel from `GatewayConfig::panels` (gh#19).
+    /// Consumed by `Gateway::execute_panel_addressed`; the single-response
+    /// `execute` ignores it. `None` ⇒ not a panel request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<String>,
+    /// Address a named consensus workflow from `GatewayConfig::consensus`
+    /// (gh#19). Consumed by `Gateway::execute_consensus_addressed`. `None` ⇒
+    /// not a consensus request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consensus: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -524,6 +534,8 @@ mod tests {
             },
             budget: Some(1.0),
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -556,6 +568,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -808,6 +822,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -843,6 +859,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -954,6 +972,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1074,6 +1094,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1420,6 +1442,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"auth\""));

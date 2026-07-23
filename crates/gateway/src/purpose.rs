@@ -285,6 +285,8 @@ fn build_step_request(step: &PurposeStep, input_text: &str) -> InferenceRequest 
         payload,
         budget: None,
         auth: None,
+        panel: None,
+        consensus: None,
     }
 }
 
@@ -445,6 +447,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         }
     }
 
