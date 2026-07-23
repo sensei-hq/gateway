@@ -2,14 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 # Cancel in-progress runs for the same ref when a new commit is pushed.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+# Least-privilege GITHUB_TOKEN for every job: they only read the repo (checkout
+# + build/test/coverage). The coverage upload authenticates to Qlty with
+# QLTY_COVERAGE_TOKEN, not GITHUB_TOKEN, so no write scopes are needed.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,5 +67,17 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@9458fed45835344deb5e69e06e831be047c96abf # cargo-llvm-cov
 
-      - name: Coverage (fail under 80% lines)
-        run: cargo llvm-cov -p gateway --summary-only --fail-under-lines 80
+      - name: Coverage (lcov + fail under 80% lines)
+        # Writes the lcov report *before* evaluating the threshold, so the file
+        # exists for the upload step even when the gate trips.
+        run: cargo llvm-cov -p sensei-gateway --lcov --output-path target/lcov.info --fail-under-lines 80
+
+      - name: Upload coverage to Qlty
+        # `if: always()` so the coverage number still reports to Qlty even when
+        # the 80%-line gate above fails. Pinned to the v2 commit SHA per the
+        # supply-chain policy noted above.
+        if: always()
+        uses: qltysh/qlty-action/coverage@08a0a862c159eae9b9003081da6663d96efef637 # v2
+        with:
+          token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
+          files: target/lcov.info
