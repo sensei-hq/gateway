@@ -19,5 +19,7 @@ pub use local_providers::adapters::{
 };
 #[cfg(feature = "fastembed")]
 pub use local_providers::adapters::{FastembedAdapter, FastembedConfig};
+#[cfg(feature = "kokoro")]
+pub use local_providers::adapters::{KokoroAdapter, KokoroConfig, KokoroLang};
 #[cfg(feature = "ort")]
 pub use local_providers::adapters::{OrtAdapter, OrtConfig, OrtPoolingStrategy};
