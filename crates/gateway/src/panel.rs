@@ -274,6 +274,7 @@ mod tests {
             id: "p".into(),
             capability: Capability::TextChat,
             distinct_by,
+            strict: false,
             slots: slots
                 .iter()
                 .map(|c| PanelSlot {

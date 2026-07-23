@@ -545,15 +545,30 @@ impl Gateway {
             }
 
             let label = slot.label.clone().unwrap_or_else(|| slot.chain.clone());
+
+            // Runtime distinctness (gh#21): a successful slot whose family a
+            // prior slot already produced collides. Non-strict records it and
+            // keeps both; strict drops this slot (result → error) so no two
+            // returned slots share a family. `distinct_by: None` is exempt.
+            let mut result = result;
             if result.is_ok()
-                && let Some(fam) = &family
+                && let Some(fam) = family.clone()
             {
-                if let Some(prev) = used_families.get(fam) {
-                    collisions.push(format!(
-                        "slots '{prev}' and '{label}' both answered with family '{fam}'"
-                    ));
+                if let Some(prev) = used_families.get(&fam).cloned() {
+                    if panel.strict && panel.distinct_by != crate::types::config::DistinctBy::None {
+                        collisions.push(format!(
+                            "slot '{label}' dropped under strict distinctness: family '{fam}' already answered by '{prev}'"
+                        ));
+                        result = Err(GatewayError::InvalidConfig(format!(
+                            "dropped under strict distinctness: family '{fam}' already answered by slot '{prev}'"
+                        )));
+                    } else {
+                        collisions.push(format!(
+                            "slots '{prev}' and '{label}' both answered with family '{fam}'"
+                        ));
+                    }
                 } else {
-                    used_families.insert(fam.clone(), label);
+                    used_families.insert(fam, label);
                 }
             }
 
@@ -3365,6 +3380,7 @@ mod tests {
             id: "consensus".to_string(),
             capability: Capability::TextChat,
             distinct_by: DistinctBy::Family,
+            strict: false,
             slots: vec![
                 PanelSlot {
                     chain: "c-gemma".to_string(),
@@ -3441,6 +3457,7 @@ mod tests {
             id: "bad".to_string(),
             capability: Capability::TextChat,
             distinct_by: DistinctBy::Family,
+            strict: false,
             slots: vec![
                 PanelSlot {
                     chain: "c1".to_string(),
@@ -3536,6 +3553,7 @@ mod tests {
             id: "p".to_string(),
             capability: Capability::TextChat,
             distinct_by: DistinctBy::Family,
+            strict: false,
             slots: vec![
                 PanelSlot {
                     chain: "c-gemma".to_string(),
@@ -3627,6 +3645,7 @@ mod tests {
                 id: "debate".to_string(),
                 capability: Capability::TextChat,
                 distinct_by: DistinctBy::Family,
+                strict: false,
                 slots: vec![
                     PanelSlot {
                         chain: "c-gemma".to_string(),
@@ -3724,6 +3743,7 @@ mod tests {
                 id: "debate".to_string(),
                 capability: Capability::TextChat,
                 distinct_by: DistinctBy::Family,
+                strict: false,
                 slots: vec![
                     PanelSlot {
                         chain: "c-gemma".to_string(),
@@ -3785,6 +3805,7 @@ mod tests {
                 id: "board".to_string(),
                 capability: Capability::TextChat,
                 distinct_by: DistinctBy::Family,
+                strict: false,
                 slots: vec![
                     PanelSlot {
                         chain: "c-gemma".to_string(),
@@ -3875,6 +3896,7 @@ mod tests {
                     id: "debate-panel".to_string(),
                     capability: Capability::TextChat,
                     distinct_by: DistinctBy::Family,
+                    strict: false,
                     slots: vec![
                         PanelSlot {
                             chain: "c-gemma".to_string(),
@@ -3984,6 +4006,7 @@ mod tests {
             id: "jury".to_string(),
             capability: Capability::TextChat,
             distinct_by: DistinctBy::Family,
+            strict: false,
             slots: slots
                 .iter()
                 .map(|c| PanelSlot {
@@ -4001,6 +4024,7 @@ mod tests {
             id: "debate".to_string(),
             capability: Capability::TextChat,
             distinct_by: DistinctBy::Family,
+            strict: false,
             slots: vec![
                 PanelSlot {
                     chain: "c-gemma".to_string(),
@@ -4111,6 +4135,129 @@ mod tests {
         assert!(
             matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("not both")),
             "both judge and quorum must be rejected, got {err:?}"
+        );
+    }
+
+    // --- Strict runtime distinctness (gh#21) ---
+
+    #[tokio::test]
+    async fn execute_panel_strict_drops_runtime_family_convergence() {
+        use crate::types::config::{
+            ChainEntry, DistinctBy, FallbackChainConfig, PanelConfig, PanelSlot,
+        };
+
+        // Slot A's primary is phi on router "ghost" (no adapter → skipped), so it
+        // falls back to a gemma model; slot B is gemma. Formation passes (phi vs
+        // gemma *primaries*), but at runtime both answer with gemma — the
+        // convergence strict mode must prevent.
+        let routers = HashMap::from([
+            ("noop".to_string(), router(true)),
+            ("ghost".to_string(), router(true)),
+        ]);
+        let models = HashMap::from([
+            ("m-a1".to_string(), chat_model("m-a1", "ghost", "phi")),
+            ("m-a2".to_string(), chat_model("m-a2", "noop", "gemma")),
+            ("m-b1".to_string(), chat_model("m-b1", "noop", "gemma")),
+        ]);
+        let c_a = FallbackChainConfig {
+            id: "c-a".to_string(),
+            capability: Capability::TextChat,
+            models: vec![
+                ChainEntry {
+                    model: "m-a1".to_string(),
+                    router: Some("ghost".to_string()),
+                    api_model_id: None,
+                    priority: 1,
+                },
+                ChainEntry {
+                    model: "m-a2".to_string(),
+                    router: Some("noop".to_string()),
+                    api_model_id: None,
+                    priority: 2,
+                },
+            ],
+            fallback_triggers: vec![],
+        };
+        let chains = HashMap::from([
+            ("c-a".to_string(), c_a),
+            ("c-b".to_string(), one_model_chain("c-b", "m-b1", "noop")),
+        ]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_noop(&gw).await;
+
+        let make_panel = |strict: bool| PanelConfig {
+            id: "p".to_string(),
+            capability: Capability::TextChat,
+            distinct_by: DistinctBy::Family,
+            strict,
+            slots: vec![
+                PanelSlot {
+                    chain: "c-a".to_string(),
+                    label: Some("A".to_string()),
+                    system_prompt: None,
+                },
+                PanelSlot {
+                    chain: "c-b".to_string(),
+                    label: Some("B".to_string()),
+                    system_prompt: None,
+                },
+            ],
+        };
+
+        // Non-strict: both slots succeed on gemma; the convergence is only flagged.
+        let lax = gw
+            .execute_panel(&chat_request(), &make_panel(false))
+            .await
+            .unwrap();
+        assert!(lax.slots.iter().all(|s| s.result.is_ok()));
+        assert!(
+            !lax.collisions.is_empty(),
+            "non-strict must flag the runtime collision"
+        );
+
+        // Strict: slot A (first) keeps gemma; slot B is dropped to an error, so no
+        // two *returned* slots share a family.
+        let strict = gw
+            .execute_panel(&chat_request(), &make_panel(true))
+            .await
+            .unwrap();
+        let a = strict
+            .slots
+            .iter()
+            .find(|s| s.label.as_deref() == Some("A"))
+            .unwrap();
+        let b = strict
+            .slots
+            .iter()
+            .find(|s| s.label.as_deref() == Some("B"))
+            .unwrap();
+        assert!(a.result.is_ok(), "the first slot keeps its family");
+        assert!(
+            b.result.is_err(),
+            "the converging slot must be dropped under strict"
+        );
+        assert_eq!(
+            strict.slots.iter().filter(|s| s.result.is_ok()).count(),
+            1,
+            "strict leaves exactly one successful slot per family"
+        );
+        assert!(
+            strict.collisions.iter().any(|c| c.contains("dropped")),
+            "strict records the drop, got {:?}",
+            strict.collisions
         );
     }
 }
