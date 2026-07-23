@@ -87,6 +87,12 @@ pub enum ProvisionPlan {
     Ort {
         config: local_providers::adapters::OrtConfig,
     },
+
+    /// Load Kokoro-82M for TTS via ONNX Runtime and register it (gh#23).
+    #[cfg(feature = "kokoro")]
+    Kokoro {
+        config: local_providers::adapters::KokoroConfig,
+    },
 }
 
 /// A [`ProvisionPlan`] that emits a predetermined phase sequence — no engine, no
@@ -411,6 +417,8 @@ async fn run_job(
         }
         #[cfg(feature = "ort")]
         ProvisionPlan::Ort { config } => coldboot::run_ort(model, config, &tx, &ctx).await,
+        #[cfg(feature = "kokoro")]
+        ProvisionPlan::Kokoro { config } => coldboot::run_kokoro(model, config, &tx, &ctx).await,
     }
 }
 
@@ -611,6 +619,55 @@ mod coldboot {
         emit(tx, ProvisionPhase::Loading);
         let loaded = tokio::task::spawn_blocking(move || {
             local_providers::adapters::OrtAdapter::load(&entry, config)
+        })
+        .await;
+        let adapter = match loaded {
+            Ok(Ok(adapter)) => adapter,
+            Ok(Err(e)) => {
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: e.to_string(),
+                    },
+                );
+                return;
+            }
+            Err(e) => {
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: format!("load task failed: {e}"),
+                    },
+                );
+                return;
+            }
+        };
+        ctx.registry.register(Arc::new(adapter)).await;
+        emit(tx, ProvisionPhase::Ready);
+    }
+
+    /// Load Kokoro-82M for TTS and register it as a `TtsModel` (gh#23). Mirrors
+    /// [`run_ort`]: resolve the model dir, load the adapter off the async worker
+    /// threads (native ORT), and register.
+    #[cfg(feature = "kokoro")]
+    pub(super) async fn run_kokoro(
+        model: String,
+        config: local_providers::adapters::KokoroConfig,
+        tx: &watch::Sender<ProvisionPhase>,
+        ctx: &ColdbootCtx,
+    ) {
+        emit(tx, ProvisionPhase::Verifying);
+        let entry = match resolve_entry(&model, ctx).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                emit(tx, ProvisionPhase::Failed { error: e });
+                return;
+            }
+        };
+
+        emit(tx, ProvisionPhase::Loading);
+        let loaded = tokio::task::spawn_blocking(move || {
+            local_providers::adapters::KokoroAdapter::load(&entry, config)
         })
         .await;
         let adapter = match loaded {
