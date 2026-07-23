@@ -9,4 +9,5 @@ license = "MIT"
 name = "kokoro"
 
 [dependencies]
+serde_json = "1"
 thiserror = "2"

@@ -10,13 +10,15 @@
 //! - [`vocab`] — the **shared** IPA phoneme → token-id table (one set for all
 //!   languages; it is baked into the model's embedding).
 //! - [`tokenizer`] — a phoneme string → padded `input_ids` (shared).
-//! - [`g2p`] — the [`G2p`] **strategy trait**; one implementation per language
-//!   (`g2p::en`, … — landing in follow-up work). *This* is where languages differ.
+//! - [`g2p`] — the [`G2p`] **strategy trait** + implementations per language
+//!   ([`g2p::en`] today; `ja` / `zh` / … later). *This* is where languages differ.
 //! - [`voices`] — voice-pack parsing + style-vector selection by phoneme count.
 //! - [`audio`] — 24 kHz `f32` PCM → WAV bytes (shared).
 //!
-//! ONNX inference (`input_ids` + `style` + `speed` → audio, behind an `onnx`
-//! feature) and the misaki-en G2P port land in follow-up PRs; see gh#23.
+//! The English G2P ([`EnglishG2p`]) is lexicon-driven — load misaki's Apache-2.0
+//! dictionary with [`Lexicon::from_misaki_json`]. ONNX inference (`input_ids` +
+//! `style` + `speed` → audio, behind an `onnx` feature) lands in a follow-up PR;
+//! see gh#23.
 //!
 //! # Pipeline
 //! ```text
@@ -35,6 +37,7 @@ pub mod voices;
 
 pub use error::KokoroError;
 pub use g2p::G2p;
+pub use g2p::en::{EnglishG2p, Lexicon};
 pub use lang::Lang;
 pub use tokenizer::{Tokenized, tokenize};
 pub use voices::Voices;
