@@ -8,7 +8,7 @@ in the companion `local-engine` crate.
 
 ```toml
 local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway",
-                    tag = "v0.3.1", features = ["llama-cpp"] }   # or: fastembed, ort
+                    tag = "v0.3.1", features = ["llama-cpp"] }   # or: ort  (fastembed deferred, see note)
 local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway",
                     tag = "v0.3.1", features = ["hf-download"] } # resolvers + HF pull
 ```
@@ -16,12 +16,18 @@ local-engine    = { package = "sensei-local-engine", git = "https://github.com/s
 | Feature | Engine | Capabilities | Format |
 |---|---|---|---|
 | `llama-cpp` | `LlamaCppAdapter` | chat + embed | GGUF |
-| `fastembed` | `FastembedAdapter` | embed | ONNX (+ tokenizer files) |
+| `fastembed` _(deferred, gh#7)_ | `FastembedAdapter` | embed | ONNX (+ tokenizer files) |
 | `ort` | `OrtAdapter` | embed | ONNX |
 | `hf-download` | — (registry) | pull models from the HF Hub | GGUF / ONNX |
 
 Default build compiles none of them. The `llama-cpp` / `fastembed` / `ort` engine
 features live on `local-providers`; `hf-download` lives on `local-engine`.
+
+> **`fastembed` is deferred (gh#7).** Its 5.x line pins `hf-hub 0.5`, which would
+> duplicate the `hf-hub 1.0` used for HF download, so the dependency is disabled and
+> the feature is an inert placeholder — it won't build until fastembed ships on
+> `hf-hub 1.0`. For ONNX embeddings use `ort`; Ollama embeddings remain the primary
+> path and are unaffected.
 
 ## The local-inference flow
 
