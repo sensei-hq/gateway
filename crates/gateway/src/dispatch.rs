@@ -218,8 +218,8 @@ pub fn from_video_response(r: VideoResponse) -> InferenceResponse {
 mod tests {
     use super::*;
     use crate::types::capability::Capability;
-    use crate::types::io::ChatResponse;
-    use crate::types::request::{Message, MessageRole, Payload};
+    use crate::types::io::{ChatResponse, ImageResponse, SttResponse, TtsResponse, VideoResponse};
+    use crate::types::request::{AudioFormat, Message, MessageRole, Payload};
 
     fn chat_req(model: Option<&str>) -> InferenceRequest {
         InferenceRequest {
@@ -234,6 +234,22 @@ mod tests {
                 temperature: Some(0.5),
                 tools: Vec::new(),
             },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+        }
+    }
+
+    /// A request carrying an arbitrary payload (capability is not inspected by
+    /// the `to_*` converters — they match on the payload).
+    fn req_with(payload: Payload) -> InferenceRequest {
+        InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: None,
+            payload,
             budget: None,
             auth: None,
             panel: None,
@@ -328,5 +344,119 @@ mod tests {
             ..Default::default()
         });
         assert!(normal.success);
+    }
+
+    // --- Embed / STT / TTS / Image / Video converters ---
+
+    #[test]
+    fn to_embed_request_maps_texts_and_prefers_injected_model() {
+        let r = req_with(Payload::Embed {
+            texts: vec!["a".into(), "b".into()],
+        });
+        let er = to_embed_request(&r, Some("m".into())).unwrap();
+        assert_eq!(er.model.as_deref(), Some("m"));
+        assert_eq!(er.texts, vec!["a".to_string(), "b".to_string()]);
+        assert!(to_embed_request(&chat_req(None), None).is_err());
+    }
+
+    #[test]
+    fn to_stt_request_maps_audio_language_and_format() {
+        let r = req_with(Payload::Stt {
+            audio: vec![1, 2, 3],
+            language: Some("en".into()),
+            format: "wav".into(),
+        });
+        let sr = to_stt_request(&r, None).unwrap();
+        assert_eq!(sr.audio, vec![1u8, 2, 3]);
+        assert_eq!(sr.language.as_deref(), Some("en"));
+        assert_eq!(sr.format, "wav");
+        assert!(to_stt_request(&chat_req(None), None).is_err());
+    }
+
+    #[test]
+    fn from_stt_response_sets_transcription_and_success() {
+        let ir = from_stt_response(SttResponse {
+            transcription: "hello".into(),
+            usage: None,
+            degraded: false,
+        });
+        assert_eq!(ir.transcription.as_deref(), Some("hello"));
+        assert!(ir.success);
+    }
+
+    #[test]
+    fn to_tts_request_maps_text_voice_and_speed() {
+        let r = req_with(Payload::Tts {
+            text: "hi".into(),
+            voice: Some("v".into()),
+            speed: Some(1.5),
+            output_format: AudioFormat::Wav,
+        });
+        let tr = to_tts_request(&r, Some("m".into())).unwrap();
+        assert_eq!(tr.model.as_deref(), Some("m"));
+        assert_eq!(tr.text, "hi");
+        assert_eq!(tr.voice.as_deref(), Some("v"));
+        assert_eq!(tr.speed, Some(1.5));
+        assert!(to_tts_request(&chat_req(None), None).is_err());
+    }
+
+    #[test]
+    fn from_tts_response_sets_audio_and_degraded_maps_to_success() {
+        let ir = from_tts_response(TtsResponse {
+            audio: vec![9u8],
+            degraded: true,
+        });
+        assert_eq!(ir.audio, Some(vec![9u8]));
+        assert!(!ir.success);
+    }
+
+    #[test]
+    fn to_image_request_maps_prompt_size_and_count() {
+        let r = req_with(Payload::ImageGenerate {
+            prompt: "a cat".into(),
+            size: Some("1024x1024".into()),
+            quality: None,
+            style: None,
+            n: 2,
+        });
+        let img = to_image_request(&r, None).unwrap();
+        assert_eq!(img.prompt, "a cat");
+        assert_eq!(img.size.as_deref(), Some("1024x1024"));
+        assert_eq!(img.n, 2);
+        assert!(to_image_request(&chat_req(None), None).is_err());
+    }
+
+    #[test]
+    fn from_image_response_sets_images() {
+        let ir = from_image_response(ImageResponse {
+            images: Vec::new(),
+            degraded: false,
+        });
+        assert!(ir.images.is_some());
+        assert!(ir.success);
+    }
+
+    #[test]
+    fn to_video_request_maps_prompt_and_duration() {
+        let r = req_with(Payload::VideoGenerate {
+            prompt: "sunset".into(),
+            duration_secs: Some(10),
+            resolution: Some("1080p".into()),
+        });
+        let vr = to_video_request(&r, None).unwrap();
+        assert_eq!(vr.prompt, "sunset");
+        assert_eq!(vr.duration_secs, Some(10));
+        assert_eq!(vr.resolution.as_deref(), Some("1080p"));
+        assert!(to_video_request(&chat_req(None), None).is_err());
+    }
+
+    #[test]
+    fn from_video_response_sets_videos() {
+        let ir = from_video_response(VideoResponse {
+            videos: Vec::new(),
+            degraded: false,
+        });
+        assert!(ir.videos.is_some());
+        assert!(ir.success);
     }
 }

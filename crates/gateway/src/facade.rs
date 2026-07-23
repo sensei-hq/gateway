@@ -345,3 +345,72 @@ mod tests {
         );
     }
 }
+
+// Cloud-path tests run under the default (`cloud`) feature set — the one the
+// coverage job measures — exercising `register_cloud_from_config` + the
+// non-`local` `build` branch.
+#[cfg(all(test, feature = "cloud"))]
+mod cloud_tests {
+    use super::*;
+    use crate::types::config::RouterConfig;
+    use std::collections::HashMap;
+
+    fn router() -> RouterConfig {
+        RouterConfig {
+            url: "https://example.test".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_registers_known_cloud_routers_and_skips_unknown() {
+        // `openai` / `anthropic` are recognised (their `from_config` builds a
+        // client without needing a key); an unrecognised router is skipped, not
+        // treated as a failure.
+        let routers = HashMap::from([
+            ("openai".to_string(), router()),
+            ("anthropic".to_string(), router()),
+            ("totally-unknown-router".to_string(), router()),
+        ]);
+        let config = GatewayConfig {
+            routers,
+            ..Default::default()
+        };
+
+        let facade = FacadeBuilder::new(config).build().await;
+        let adapters = facade.gateway.list_adapters().await;
+
+        assert!(
+            adapters.iter().any(|a| a == "openai"),
+            "openai should register, got {adapters:?}"
+        );
+        assert!(
+            adapters.iter().any(|a| a == "anthropic"),
+            "anthropic should register, got {adapters:?}"
+        );
+        assert!(
+            !adapters.iter().any(|a| a == "totally-unknown-router"),
+            "unknown router must be skipped, got {adapters:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_with_no_routers_yields_a_gateway_with_no_adapters() {
+        let facade = FacadeBuilder::new(GatewayConfig::default()).build().await;
+        assert!(facade.gateway.list_adapters().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_override_is_accepted() {
+        // Exercises the builder override + the non-local `build` branch.
+        let facade = FacadeBuilder::new(GatewayConfig::default())
+            .circuit_breaker(CircuitBreakerConfig::default())
+            .build()
+            .await;
+        assert!(!facade.gateway.is_configured().await);
+    }
+}

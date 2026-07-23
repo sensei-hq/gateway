@@ -2,7 +2,7 @@
 Cargo.lock
 **/*.rs.bk
 .DS_Store
-# Local tooling dirs — Claude Code state/transcripts (can contain secrets) and
-# qlty's local config/cache. Never commit these.
+# Claude Code state/transcripts — can contain secrets. Never commit.
 .claude/
-.qlty/
+# qlty: the project config (`.qlty/qlty.toml` + configs) IS committed so the
+# scan is repo-controlled; `.qlty/.gitignore` already ignores the cache/output.
