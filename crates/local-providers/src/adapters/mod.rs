@@ -28,3 +28,9 @@ pub mod ort;
 
 #[cfg(feature = "ort")]
 pub use self::ort::{OrtAdapter, OrtConfig, OrtPoolingStrategy};
+
+#[cfg(feature = "kokoro")]
+pub mod kokoro;
+
+#[cfg(feature = "kokoro")]
+pub use kokoro::{KokoroAdapter, KokoroConfig, KokoroLang};

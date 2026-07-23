@@ -19,6 +19,10 @@ llama-cpp = ["dep:llama-cpp-2"]
 # Re-enable: put back `["dep:fastembed"]` here + uncomment the dep below.
 fastembed = []
 ort = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+# Kokoro-82M local TTS (gh#23). Pulls the `sensei-kokoro` engine with its `onnx`
+# feature (ORT inference); the adapter loads the model + voices + lexicon from a
+# resolved `ModelEntry`.
+kokoro = ["dep:sensei-kokoro"]
 
 [dependencies]
 kernel = { package = "sensei-kernel", path = "../kernel" }
@@ -35,6 +39,9 @@ llama-cpp-2 = { version = "0.1.146", default-features = false, optional = true }
 ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"], optional = true }
 tokenizers = { version = "0.21", optional = true }
 ndarray = { version = "0.16", optional = true }
+# Local Kokoro TTS engine; the `onnx` feature is always on when this is pulled
+# (the adapter needs inference). Shares the workspace's `ort` (rc.12).
+sensei-kokoro = { path = "../kokoro", features = ["onnx"], optional = true }
 
 [dev-dependencies]
 # The embedded_llama adapter's tests exercise the concrete ExternalResolver,
