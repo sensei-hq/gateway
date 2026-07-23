@@ -1,6 +1,6 @@
 [package]
 name = "sensei-cloud-providers"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 description = "Cloud LLM provider adapters (OpenAI, Anthropic, Bedrock, Gemini, …) for the sensei gateway"
 license = "MIT"
