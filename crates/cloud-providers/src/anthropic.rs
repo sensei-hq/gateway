@@ -7,7 +7,7 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{build_client, resolve_api_key};
+use crate::base::{build_client, error_from_response, resolve_api_key};
 use kernel::types::config::RouterConfig;
 use kernel::types::cost::TokenUsage;
 use kernel::types::error::GatewayError;
@@ -628,22 +628,7 @@ impl kernel::adapters::capability::ChatModel for AnthropicAdapter {
         let status = resp.status();
 
         if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "anthropic".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
+            return Err(error_from_response("anthropic", resp).await);
         }
 
         let anthropic_resp: AnthropicResponse =
@@ -710,22 +695,7 @@ impl kernel::adapters::capability::ChatModel for AnthropicAdapter {
         let status = response.status();
 
         if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => GatewayError::Authentication {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                },
-                429 => GatewayError::RateLimit {
-                    adapter: "anthropic".into(),
-                    retry_after_ms: None,
-                },
-                _ => GatewayError::ProviderError {
-                    adapter: "anthropic".into(),
-                    message: body_text,
-                    status: Some(status.as_u16()),
-                },
-            });
+            return Err(error_from_response("anthropic", response).await);
         }
 
         let byte_stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(response.bytes_stream());
