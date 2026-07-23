@@ -604,6 +604,29 @@ impl Gateway {
             }
         }
 
+        // Judge quorum (gh#20): mutually exclusive with a single judge, and
+        // every quorum member must likewise be independent of every debater.
+        if spec.judge.is_some() && spec.judge_quorum.is_some() {
+            return Err(GatewayError::InvalidConfig(format!(
+                "consensus '{}': set either `judge` or `judge_quorum`, not both",
+                spec.id
+            )));
+        }
+        if let Some(quorum) = &spec.judge_quorum {
+            for jslot in &quorum.slots {
+                let judge_family = crate::panel::chain_primary_family(&cfg, &jslot.chain)?;
+                for slot in &spec.panel.slots {
+                    let debater_family = crate::panel::chain_primary_family(&cfg, &slot.chain)?;
+                    if debater_family == judge_family {
+                        return Err(GatewayError::InvalidConfig(format!(
+                            "consensus '{}': judge-quorum chain '{}' shares family '{}' with debater chain '{}'; every quorum member must be independent",
+                            spec.id, jslot.chain, judge_family, slot.chain
+                        )));
+                    }
+                }
+            }
+        }
+
         // 1. Debate — fan out the panel (this also forms + enforces distinctness).
         let debate_req = crate::consensus::build_chat_request(spec.capability.clone(), input, None);
         let panel = self.execute_panel(&debate_req, &spec.panel).await?;
@@ -626,10 +649,10 @@ impl Gateway {
         let synthesis = self.execute(&synth_req).await?;
         let synthesis_output = crate::consensus::text_of(&synthesis);
 
-        // 3. Judge (optional) — evaluate the synthesis.
-        let (judgment, judgment_output) = if let Some(judge) = &spec.judge {
-            let judge_input =
-                format!("Debate:\n{debate_block}\n\nProposed synthesis:\n{synthesis_output}");
+        // 3. Judge (optional) — a single independent judge, or a quorum panel.
+        let judge_input =
+            format!("Debate:\n{debate_block}\n\nProposed synthesis:\n{synthesis_output}");
+        let (judgment, judgment_output, judge_quorum) = if let Some(judge) = &spec.judge {
             let mut judge_req = crate::consensus::build_chat_request(
                 spec.capability.clone(),
                 &judge_input,
@@ -638,12 +661,20 @@ impl Gateway {
             judge_req.chain = Some(judge.chain.clone());
             let j = self.execute(&judge_req).await?;
             let jo = crate::consensus::text_of(&j);
-            (Some(j), Some(jo))
+            (Some(j), Some(jo), None)
+        } else if let Some(quorum) = &spec.judge_quorum {
+            // Fan the synthesis out to the judge quorum; each member's persona
+            // (system prompt) comes from its own slot (gh#18), and formation
+            // enforces the quorum's own family-distinctness.
+            let quorum_req =
+                crate::consensus::build_chat_request(spec.capability.clone(), &judge_input, None);
+            let panel = self.execute_panel(&quorum_req, quorum).await?;
+            (None, None, Some(panel))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
-        // 4. Aggregate cost across debate + synthesis + judgment.
+        // 4. Aggregate cost across debate + synthesis + judgment (single or quorum).
         let mut total_cost = panel.total_cost.clone();
         for resp in [Some(&synthesis), judgment.as_ref()].into_iter().flatten() {
             if let Some(c) = &resp.actual_cost {
@@ -655,6 +686,14 @@ impl Gateway {
                 total_cost.total_cost += c.total_cost;
             }
         }
+        if let Some(q) = &judge_quorum {
+            total_cost.input_tokens += q.total_cost.input_tokens;
+            total_cost.output_tokens += q.total_cost.output_tokens;
+            total_cost.total_tokens += q.total_cost.total_tokens;
+            total_cost.input_cost += q.total_cost.input_cost;
+            total_cost.output_cost += q.total_cost.output_cost;
+            total_cost.total_cost += q.total_cost.total_cost;
+        }
 
         Ok(crate::consensus::ConsensusResult {
             debate: panel.slots,
@@ -662,6 +701,7 @@ impl Gateway {
             synthesis_output,
             judgment,
             judgment_output,
+            judge_quorum,
             total_cost,
         })
     }
@@ -3608,6 +3648,7 @@ mod tests {
                 chain: "c-judge".to_string(),
                 system_prompt: Some("Score the synthesis.".to_string()),
             }),
+            judge_quorum: None,
         };
 
         let result = gw.execute_consensus(&spec, "What is 2 + 2?").await.unwrap();
@@ -3704,6 +3745,7 @@ mod tests {
                 chain: "c-gemma2".to_string(),
                 system_prompt: None,
             }),
+            judge_quorum: None,
         };
 
         let err = gw.execute_consensus(&spec, "q").await.unwrap_err();
@@ -3851,6 +3893,7 @@ mod tests {
                     system_prompt: Some("Merge.".to_string()),
                 },
                 judge: None,
+                judge_quorum: None,
             },
         )]);
         let config = GatewayConfig {
@@ -3887,6 +3930,187 @@ mod tests {
         assert!(
             matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("unknown consensus")),
             "unknown consensus id must fail fast, got {err:?}"
+        );
+    }
+
+    // --- Judge quorum (gh#20) ---
+
+    /// Config for the quorum tests: gemma/qwen debaters, a mixtral synthesizer,
+    /// and judge chains whose families are given by `judges` (id, family).
+    fn quorum_config(judges: &[(&str, &str)]) -> GatewayConfig {
+        let mut models = HashMap::from([
+            (
+                "m-gemma".to_string(),
+                chat_model("m-gemma", "noop", "gemma"),
+            ),
+            ("m-qwen".to_string(), chat_model("m-qwen", "noop", "qwen")),
+            (
+                "m-synth".to_string(),
+                chat_model("m-synth", "noop", "mixtral"),
+            ),
+        ]);
+        let mut chains = HashMap::from([
+            (
+                "c-gemma".to_string(),
+                one_model_chain("c-gemma", "m-gemma", "noop"),
+            ),
+            (
+                "c-qwen".to_string(),
+                one_model_chain("c-qwen", "m-qwen", "noop"),
+            ),
+            (
+                "c-synth".to_string(),
+                one_model_chain("c-synth", "m-synth", "noop"),
+            ),
+        ]);
+        for (chain, family) in judges {
+            let model = format!("m-{chain}");
+            models.insert(model.clone(), chat_model(&model, "noop", family));
+            chains.insert((*chain).to_string(), one_model_chain(chain, &model, "noop"));
+        }
+        GatewayConfig {
+            routers: HashMap::from([("noop".to_string(), router(true))]),
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        }
+    }
+
+    fn quorum_panel(slots: &[&str]) -> crate::types::config::PanelConfig {
+        use crate::types::config::{DistinctBy, PanelConfig, PanelSlot};
+        PanelConfig {
+            id: "jury".to_string(),
+            capability: Capability::TextChat,
+            distinct_by: DistinctBy::Family,
+            slots: slots
+                .iter()
+                .map(|c| PanelSlot {
+                    chain: (*c).to_string(),
+                    label: Some((*c).to_string()),
+                    system_prompt: Some("Score 1-10.".to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    fn debate_panel() -> crate::types::config::PanelConfig {
+        use crate::types::config::{DistinctBy, PanelConfig, PanelSlot};
+        PanelConfig {
+            id: "debate".to_string(),
+            capability: Capability::TextChat,
+            distinct_by: DistinctBy::Family,
+            slots: vec![
+                PanelSlot {
+                    chain: "c-gemma".to_string(),
+                    label: Some("proposer".to_string()),
+                    system_prompt: None,
+                },
+                PanelSlot {
+                    chain: "c-qwen".to_string(),
+                    label: Some("challenger".to_string()),
+                    system_prompt: None,
+                },
+            ],
+        }
+    }
+
+    fn gw_from(config: GatewayConfig) -> Gateway {
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        Gateway::new(config, AdapterRegistry::new(), cb)
+    }
+
+    #[tokio::test]
+    async fn execute_consensus_judge_quorum_fans_out() {
+        use crate::types::config::{ConsensusConfig, RoleSpec};
+
+        // Two family-distinct judges (phi, llama), both independent of the
+        // gemma/qwen debaters and the mixtral synthesizer.
+        let gw = gw_from(quorum_config(&[("c-phi", "phi"), ("c-llama", "llama")]));
+        register_noop(&gw).await;
+
+        let spec = ConsensusConfig {
+            id: "consensus".to_string(),
+            capability: Capability::TextChat,
+            panel: debate_panel(),
+            synthesizer: RoleSpec {
+                chain: "c-synth".to_string(),
+                system_prompt: Some("Merge.".to_string()),
+            },
+            judge: None,
+            judge_quorum: Some(quorum_panel(&["c-phi", "c-llama"])),
+        };
+
+        let result = gw.execute_consensus(&spec, "What is 2 + 2?").await.unwrap();
+        assert_eq!(result.debate.len(), 2);
+        assert!(!result.synthesis_output.is_empty());
+        // The single-judge fields stay empty; the quorum panel carries the votes.
+        assert!(result.judgment.is_none());
+        let jury = result.judge_quorum.expect("quorum results present");
+        assert_eq!(jury.slots.len(), 2);
+        assert!(jury.slots.iter().all(|s| s.result.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn execute_consensus_rejects_non_independent_quorum_member() {
+        use crate::types::config::{ConsensusConfig, RoleSpec};
+
+        // One quorum judge (c-gemma2) shares the proposer's gemma family →
+        // rejected before any inference.
+        let gw = gw_from(quorum_config(&[("c-phi", "phi"), ("c-gemma2", "gemma")]));
+        register_noop(&gw).await;
+
+        let spec = ConsensusConfig {
+            id: "bad".to_string(),
+            capability: Capability::TextChat,
+            panel: debate_panel(),
+            synthesizer: RoleSpec {
+                chain: "c-synth".to_string(),
+                system_prompt: None,
+            },
+            judge: None,
+            judge_quorum: Some(quorum_panel(&["c-phi", "c-gemma2"])),
+        };
+
+        let err = gw.execute_consensus(&spec, "q").await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("quorum") && m.contains("independent")),
+            "non-independent quorum member must be rejected, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_consensus_rejects_both_judge_and_quorum() {
+        use crate::types::config::{ConsensusConfig, RoleSpec};
+
+        // Setting both a single judge and a quorum is a config error.
+        let gw = gw_from(quorum_config(&[("c-phi", "phi")]));
+        register_noop(&gw).await;
+
+        let spec = ConsensusConfig {
+            id: "bad".to_string(),
+            capability: Capability::TextChat,
+            panel: debate_panel(),
+            synthesizer: RoleSpec {
+                chain: "c-synth".to_string(),
+                system_prompt: None,
+            },
+            judge: Some(RoleSpec {
+                chain: "c-phi".to_string(),
+                system_prompt: None,
+            }),
+            judge_quorum: Some(quorum_panel(&["c-phi"])),
+        };
+
+        let err = gw.execute_consensus(&spec, "q").await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("not both")),
+            "both judge and quorum must be rejected, got {err:?}"
         );
     }
 }
