@@ -245,6 +245,15 @@ pub struct GatewayConfig {
     /// Subscription/quota constraints (AUTH). Default empty ⇒ no enforcement.
     #[serde(default)]
     pub constraints: ConstraintsConfig,
+    /// Named fan-out panels, addressable by id via [`crate::types::request::InferenceRequest::panel`]
+    /// and `Gateway::execute_panel_addressed`. Default empty (gh#19).
+    #[serde(default)]
+    pub panels: HashMap<String, PanelConfig>,
+    /// Named consensus workflows, addressable by id via
+    /// [`crate::types::request::InferenceRequest::consensus`] and
+    /// `Gateway::execute_consensus_addressed`. Default empty (gh#19).
+    #[serde(default)]
+    pub consensus: HashMap<String, ConsensusConfig>,
 }
 
 #[cfg(test)]
@@ -423,6 +432,79 @@ mod tests {
         let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.constraints.tiers.is_empty());
         assert!(cfg.constraints.default.is_none());
+    }
+
+    #[test]
+    fn panels_and_consensus_default_when_absent() {
+        // A config without `panels`/`consensus` keys deserializes to empty maps,
+        // so existing configs keep working unchanged (gh#19).
+        let json = r#"{"routers":{},"models":{},"chains":{}}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.panels.is_empty());
+        assert!(cfg.consensus.is_empty());
+    }
+
+    #[test]
+    fn panels_and_consensus_roundtrip() {
+        let mut cfg = GatewayConfig::default();
+        cfg.panels.insert(
+            "board".to_string(),
+            PanelConfig {
+                id: "board".to_string(),
+                capability: Capability::TextChat,
+                slots: vec![
+                    PanelSlot {
+                        chain: "a".to_string(),
+                        label: Some("proposer".to_string()),
+                        system_prompt: Some("argue for".to_string()),
+                    },
+                    PanelSlot {
+                        chain: "b".to_string(),
+                        label: None,
+                        system_prompt: None,
+                    },
+                ],
+                distinct_by: DistinctBy::Family,
+            },
+        );
+        cfg.consensus.insert(
+            "debate".to_string(),
+            ConsensusConfig {
+                id: "debate".to_string(),
+                capability: Capability::TextChat,
+                panel: PanelConfig {
+                    id: "debate-panel".to_string(),
+                    capability: Capability::TextChat,
+                    slots: vec![PanelSlot {
+                        chain: "a".to_string(),
+                        label: None,
+                        system_prompt: None,
+                    }],
+                    distinct_by: DistinctBy::Family,
+                },
+                synthesizer: RoleSpec {
+                    chain: "s".to_string(),
+                    system_prompt: Some("merge".to_string()),
+                },
+                judge: Some(RoleSpec {
+                    chain: "j".to_string(),
+                    system_prompt: None,
+                }),
+            },
+        );
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: GatewayConfig = serde_json::from_str(&json).unwrap();
+
+        let board = back.panels.get("board").expect("board panel");
+        assert_eq!(board.slots.len(), 2);
+        assert_eq!(board.distinct_by, DistinctBy::Family);
+        assert_eq!(board.slots[0].system_prompt.as_deref(), Some("argue for"));
+
+        let debate = back.consensus.get("debate").expect("debate consensus");
+        assert_eq!(debate.panel.slots.len(), 1);
+        assert_eq!(debate.synthesizer.system_prompt.as_deref(), Some("merge"));
+        assert!(debate.judge.is_some());
     }
 
     #[test]
