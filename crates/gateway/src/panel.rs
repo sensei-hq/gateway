@@ -64,6 +64,33 @@ fn model_family(model: &ModelConfig) -> String {
     model.family.clone().unwrap_or_else(|| model.id.clone())
 }
 
+/// Resolve the family of a chain's *primary* (lowest-priority) model. Used by
+/// the consensus workflow to enforce judge independence. Errors mirror
+/// [`form_panel`] (unknown chain / empty chain / unknown model).
+pub(crate) fn chain_primary_family(
+    config: &GatewayConfig,
+    chain_name: &str,
+) -> Result<String, GatewayError> {
+    let chain = config
+        .chains
+        .get(chain_name)
+        .ok_or_else(|| GatewayError::InvalidConfig(format!("unknown chain '{chain_name}'")))?;
+    let primary = chain
+        .models
+        .iter()
+        .min_by_key(|e| e.priority)
+        .ok_or_else(|| {
+            GatewayError::InvalidConfig(format!("chain '{chain_name}' has no models"))
+        })?;
+    let model = config.models.get(&primary.model).ok_or_else(|| {
+        GatewayError::InvalidConfig(format!(
+            "chain '{chain_name}' primary references unknown model '{}'",
+            primary.model
+        ))
+    })?;
+    Ok(model_family(model))
+}
+
 /// Resolve every slot's primary model + family and enforce `distinct_by`.
 ///
 /// Fails fast — before any inference — with [`GatewayError::InvalidConfig`] on
