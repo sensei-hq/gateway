@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::async_job::{JobConfig, poll_until_complete};
-use crate::base::{build_client, resolve_api_key};
+use crate::base::{build_client, get_json_bearer, post_json_bearer, resolve_api_key};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{VideoRequest, VideoResponse};
@@ -113,30 +113,8 @@ impl kernel::adapters::capability::VideoModel for RunwayAdapter {
         };
 
         let submit_url = format!("{url_base}/tasks");
-        let resp = self
-            .client
-            .post(&submit_url)
-            .json(&body)
-            .bearer_auth(&api_key)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::ProviderError {
-                adapter: "runway".into(),
-                message: body_text,
-                status: Some(status.as_u16()),
-            });
-        }
-
         let task: RunwayTaskResponse =
-            resp.json().await.map_err(|e| GatewayError::ProviderError {
-                adapter: "runway".into(),
-                message: format!("failed to parse task response: {e}"),
-                status: Some(status.as_u16()),
-            })?;
+            post_json_bearer(&self.client, &submit_url, &api_key, "runway", &body).await?;
 
         // 2. Poll until complete
         let task_id = task.id;
@@ -146,27 +124,8 @@ impl kernel::adapters::capability::VideoModel for RunwayAdapter {
         let api_key_ref = &api_key;
 
         let task_status = poll_until_complete(&job_config, || async {
-            let resp = client
-                .get(&poll_url)
-                .bearer_auth(api_key_ref)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let body_text = resp.text().await.unwrap_or_default();
-                return Err(GatewayError::ProviderError {
-                    adapter: "runway".into(),
-                    message: body_text,
-                    status: None,
-                });
-            }
-
             let status: RunwayTaskStatus =
-                resp.json().await.map_err(|e| GatewayError::ProviderError {
-                    adapter: "runway".into(),
-                    message: format!("failed to parse task status: {e}"),
-                    status: None,
-                })?;
+                get_json_bearer(client, &poll_url, api_key_ref, "runway").await?;
 
             match status.status.as_str() {
                 "SUCCEEDED" => Ok(Some(status)),
