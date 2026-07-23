@@ -126,6 +126,80 @@ fn map_status_error(adapter: &str, status: u16, body_text: String) -> GatewayErr
     }
 }
 
+/// POST `body` as JSON with bearer auth and parse the response as `R`.
+///
+/// A non-success status maps to [`GatewayError::ProviderError`] tagged with
+/// `adapter`, carrying the raw response body and the HTTP status; a JSON parse
+/// failure maps the same way. This is the shared "submit" half of the async-job
+/// (video) adapters — see [`get_json_bearer`] for the poll half.
+pub async fn post_json_bearer<B, R>(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    adapter: &str,
+    body: &B,
+) -> Result<R, GatewayError>
+where
+    B: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+{
+    let resp = client
+        .post(url)
+        .json(body)
+        .bearer_auth(api_key)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: body_text,
+            status: Some(status.as_u16()),
+        });
+    }
+    resp.json::<R>()
+        .await
+        .map_err(|e| GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: format!("failed to parse response: {e}"),
+            status: Some(status.as_u16()),
+        })
+}
+
+/// GET with bearer auth and parse the response as `R`.
+///
+/// A non-success status maps to [`GatewayError::ProviderError`] tagged with
+/// `adapter` (raw body as the message, no HTTP status attached — matching the
+/// poll-loop convention); a JSON parse failure maps the same way. This is the
+/// shared "poll" half of the async-job adapters — see [`post_json_bearer`].
+pub async fn get_json_bearer<R>(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    adapter: &str,
+) -> Result<R, GatewayError>
+where
+    R: serde::de::DeserializeOwned,
+{
+    let resp = client.get(url).bearer_auth(api_key).send().await?;
+    if !resp.status().is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: body_text,
+            status: None,
+        });
+    }
+    resp.json::<R>()
+        .await
+        .map_err(|e| GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: format!("failed to parse response: {e}"),
+            status: None,
+        })
+}
+
 /// Extract error message from various provider JSON error formats.
 fn extract_error_message(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
