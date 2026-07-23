@@ -54,6 +54,21 @@ impl Default for KokoroConfig {
     }
 }
 
+impl KokoroConfig {
+    /// Config for the directory layout the HF pull (`HfKokoro` plan) produces —
+    /// the model under `onnx/`, voices under `voices/`. Since `voices_file` /
+    /// `lexicon_file` resolve relative to the model's parent (`onnx/`), both use
+    /// `../` paths. `voice` is a voice id such as `"af_heart"`; the lexicon
+    /// (`us_gold.json`) is the operator-supplied sibling at the dir root.
+    pub fn hf_layout(voice: &str) -> Self {
+        Self {
+            voices_file: format!("../voices/{voice}.bin"),
+            lexicon_file: "../us_gold.json".into(),
+            ..Self::default()
+        }
+    }
+}
+
 /// In-process TTS adapter backed by Kokoro-82M via ONNX Runtime.
 pub struct KokoroAdapter {
     config: KokoroConfig,
@@ -182,6 +197,14 @@ mod tests {
         assert_eq!(cfg.lang, KokoroLang::American);
         assert_eq!(cfg.voices_file, "voices.bin");
         assert_eq!(cfg.lexicon_file, "us_gold.json");
+    }
+
+    #[test]
+    fn hf_layout_uses_relative_sibling_paths() {
+        let cfg = KokoroConfig::hf_layout("af_heart");
+        assert_eq!(cfg.voices_file, "../voices/af_heart.bin");
+        assert_eq!(cfg.lexicon_file, "../us_gold.json");
+        assert_eq!(cfg.lang, KokoroLang::American);
     }
 
     #[test]
