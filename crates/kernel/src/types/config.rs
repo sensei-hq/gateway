@@ -141,6 +141,34 @@ pub struct PanelConfig {
     pub distinct_by: DistinctBy,
 }
 
+/// One non-fan-out role in a consensus workflow (synthesizer or judge): the
+/// chain that runs it plus an optional system prompt shaping the role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleSpec {
+    /// Name of a chain in [`GatewayConfig::chains`] to run this role.
+    pub chain: String,
+    /// System prompt prepended for this role (e.g. "Merge the proposals…").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+}
+
+/// A consensus workflow: a fan-out debate ([`PanelConfig`]) whose outputs are
+/// merged by a `synthesizer` and optionally evaluated by an independent
+/// `judge`. See `Gateway::execute_consensus`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusConfig {
+    pub id: String,
+    pub capability: Capability,
+    /// The debating members (fan-out), family-distinct via the panel's `distinct_by`.
+    pub panel: PanelConfig,
+    /// Merges the debaters' outputs into one answer.
+    pub synthesizer: RoleSpec,
+    /// Optional final evaluator; must be family-independent of every debater
+    /// (enforced before any inference).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<RoleSpec>,
+}
+
 // ---------------------------------------------------------------------------
 // Subscription/quota constraints (AUTH). Operator-configured, provided at
 // gateway init alongside routers/models/chains. Empty ⇒ no enforcement.

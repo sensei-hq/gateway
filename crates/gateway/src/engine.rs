@@ -627,6 +627,100 @@ impl Gateway {
         })
     }
 
+    /// Run a consensus workflow: fan out a debate
+    /// ([`execute_panel`](Self::execute_panel)), merge the debaters' answers with
+    /// a synthesizer chain, then optionally have an **independent** judge chain
+    /// evaluate the synthesis.
+    ///
+    /// Validated up front (no inference): the judge's primary family must differ
+    /// from every debater's — a judge sharing a debater's family inherits its
+    /// bias — on top of the panel's own `distinct_by` enforcement. Returns
+    /// [`GatewayError::InvalidConfig`] on an independence/config violation, and a
+    /// [`GatewayError::ProviderError`] only if *every* debater fails (nothing to
+    /// synthesize). Non-streaming — a consensus is aggregate.
+    pub async fn execute_consensus(
+        &self,
+        spec: &crate::types::config::ConsensusConfig,
+        input: &str,
+    ) -> Result<crate::consensus::ConsensusResult, GatewayError> {
+        let cfg = self.config.read().await.clone();
+
+        // Judge independence: the judge's family must differ from every debater's.
+        if let Some(judge) = &spec.judge {
+            let judge_family = crate::panel::chain_primary_family(&cfg, &judge.chain)?;
+            for slot in &spec.panel.slots {
+                let debater_family = crate::panel::chain_primary_family(&cfg, &slot.chain)?;
+                if debater_family == judge_family {
+                    return Err(GatewayError::InvalidConfig(format!(
+                        "consensus '{}': judge chain '{}' shares family '{}' with debater chain '{}'; the judge must be independent",
+                        spec.id, judge.chain, judge_family, slot.chain
+                    )));
+                }
+            }
+        }
+
+        // 1. Debate — fan out the panel (this also forms + enforces distinctness).
+        let debate_req = crate::consensus::build_chat_request(spec.capability.clone(), input, None);
+        let panel = self.execute_panel(&debate_req, &spec.panel).await?;
+        if panel.slots.iter().all(|s| s.result.is_err()) {
+            return Err(GatewayError::ProviderError {
+                adapter: spec.id.clone(),
+                message: "consensus: every debater failed".to_string(),
+                status: None,
+            });
+        }
+
+        // 2. Synthesize — one chain merges the debaters' answers.
+        let debate_block = crate::consensus::render_debate(&panel);
+        let mut synth_req = crate::consensus::build_chat_request(
+            spec.capability.clone(),
+            &debate_block,
+            spec.synthesizer.system_prompt.clone(),
+        );
+        synth_req.chain = Some(spec.synthesizer.chain.clone());
+        let synthesis = self.execute(&synth_req).await?;
+        let synthesis_output = crate::consensus::text_of(&synthesis);
+
+        // 3. Judge (optional) — evaluate the synthesis.
+        let (judgment, judgment_output) = if let Some(judge) = &spec.judge {
+            let judge_input =
+                format!("Debate:\n{debate_block}\n\nProposed synthesis:\n{synthesis_output}");
+            let mut judge_req = crate::consensus::build_chat_request(
+                spec.capability.clone(),
+                &judge_input,
+                judge.system_prompt.clone(),
+            );
+            judge_req.chain = Some(judge.chain.clone());
+            let j = self.execute(&judge_req).await?;
+            let jo = crate::consensus::text_of(&j);
+            (Some(j), Some(jo))
+        } else {
+            (None, None)
+        };
+
+        // 4. Aggregate cost across debate + synthesis + judgment.
+        let mut total_cost = panel.total_cost.clone();
+        for resp in [Some(&synthesis), judgment.as_ref()].into_iter().flatten() {
+            if let Some(c) = &resp.actual_cost {
+                total_cost.input_tokens += c.input_tokens;
+                total_cost.output_tokens += c.output_tokens;
+                total_cost.total_tokens += c.total_tokens;
+                total_cost.input_cost += c.input_cost;
+                total_cost.output_cost += c.output_cost;
+                total_cost.total_cost += c.total_cost;
+            }
+        }
+
+        Ok(crate::consensus::ConsensusResult {
+            debate: panel.slots,
+            synthesis,
+            synthesis_output,
+            judgment,
+            judgment_output,
+            total_cost,
+        })
+    }
+
     /// Execute an inference request as a token stream.
     ///
     /// The streaming analogue of [`Gateway::execute`]. Reuses the same
@@ -3181,6 +3275,184 @@ mod tests {
         assert!(
             matches!(err, GatewayError::InvalidConfig(_)),
             "same-family panel must fail formation, got {err:?}"
+        );
+    }
+
+    // --- Consensus workflow (execute_consensus) ---
+
+    #[tokio::test]
+    async fn execute_consensus_debate_synthesize_judge() {
+        use crate::types::config::{ConsensusConfig, DistinctBy, PanelConfig, PanelSlot, RoleSpec};
+
+        let routers = HashMap::from([("noop".to_string(), router(true))]);
+        let models = HashMap::from([
+            (
+                "m-gemma".to_string(),
+                chat_model("m-gemma", "noop", "gemma"),
+            ),
+            ("m-qwen".to_string(), chat_model("m-qwen", "noop", "qwen")),
+            (
+                "m-synth".to_string(),
+                chat_model("m-synth", "noop", "mixtral"),
+            ),
+            ("m-judge".to_string(), chat_model("m-judge", "noop", "phi")),
+        ]);
+        let chains = HashMap::from([
+            (
+                "c-gemma".to_string(),
+                one_model_chain("c-gemma", "m-gemma", "noop"),
+            ),
+            (
+                "c-qwen".to_string(),
+                one_model_chain("c-qwen", "m-qwen", "noop"),
+            ),
+            (
+                "c-synth".to_string(),
+                one_model_chain("c-synth", "m-synth", "noop"),
+            ),
+            (
+                "c-judge".to_string(),
+                one_model_chain("c-judge", "m-judge", "noop"),
+            ),
+        ]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_noop(&gw).await;
+
+        let spec = ConsensusConfig {
+            id: "consensus".to_string(),
+            capability: Capability::TextChat,
+            panel: PanelConfig {
+                id: "debate".to_string(),
+                capability: Capability::TextChat,
+                distinct_by: DistinctBy::Family,
+                slots: vec![
+                    PanelSlot {
+                        chain: "c-gemma".to_string(),
+                        label: Some("proposer".to_string()),
+                    },
+                    PanelSlot {
+                        chain: "c-qwen".to_string(),
+                        label: Some("challenger".to_string()),
+                    },
+                ],
+            },
+            synthesizer: RoleSpec {
+                chain: "c-synth".to_string(),
+                system_prompt: Some("Merge the proposals.".to_string()),
+            },
+            judge: Some(RoleSpec {
+                chain: "c-judge".to_string(),
+                system_prompt: Some("Score the synthesis.".to_string()),
+            }),
+        };
+
+        let result = gw.execute_consensus(&spec, "What is 2 + 2?").await.unwrap();
+
+        assert_eq!(result.debate.len(), 2);
+        assert!(result.debate.iter().all(|s| s.result.is_ok()));
+        // noop returns canned content, but every phase produced output.
+        assert!(!result.synthesis_output.is_empty());
+        assert!(result.judgment.is_some());
+        assert!(!result.judgment_output.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_consensus_rejects_non_independent_judge() {
+        use crate::types::config::{ConsensusConfig, DistinctBy, PanelConfig, PanelSlot, RoleSpec};
+
+        // The judge chain's primary is gemma-family — the same as the proposer —
+        // so it must be rejected before any inference.
+        let routers = HashMap::from([("noop".to_string(), router(true))]);
+        let models = HashMap::from([
+            (
+                "m-gemma".to_string(),
+                chat_model("m-gemma", "noop", "gemma"),
+            ),
+            ("m-qwen".to_string(), chat_model("m-qwen", "noop", "qwen")),
+            (
+                "m-synth".to_string(),
+                chat_model("m-synth", "noop", "mixtral"),
+            ),
+            (
+                "m-gemma2".to_string(),
+                chat_model("m-gemma2", "noop", "gemma"),
+            ),
+        ]);
+        let chains = HashMap::from([
+            (
+                "c-gemma".to_string(),
+                one_model_chain("c-gemma", "m-gemma", "noop"),
+            ),
+            (
+                "c-qwen".to_string(),
+                one_model_chain("c-qwen", "m-qwen", "noop"),
+            ),
+            (
+                "c-synth".to_string(),
+                one_model_chain("c-synth", "m-synth", "noop"),
+            ),
+            (
+                "c-gemma2".to_string(),
+                one_model_chain("c-gemma2", "m-gemma2", "noop"),
+            ),
+        ]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_noop(&gw).await;
+
+        let spec = ConsensusConfig {
+            id: "bad".to_string(),
+            capability: Capability::TextChat,
+            panel: PanelConfig {
+                id: "debate".to_string(),
+                capability: Capability::TextChat,
+                distinct_by: DistinctBy::Family,
+                slots: vec![
+                    PanelSlot {
+                        chain: "c-gemma".to_string(),
+                        label: None,
+                    },
+                    PanelSlot {
+                        chain: "c-qwen".to_string(),
+                        label: None,
+                    },
+                ],
+            },
+            synthesizer: RoleSpec {
+                chain: "c-synth".to_string(),
+                system_prompt: None,
+            },
+            judge: Some(RoleSpec {
+                chain: "c-gemma2".to_string(),
+                system_prompt: None,
+            }),
+        };
+
+        let err = gw.execute_consensus(&spec, "q").await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("independent")),
+            "non-independent judge must be rejected, got {err:?}"
         );
     }
 }
