@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crate::types::config::{DistinctBy, GatewayConfig, ModelConfig, PanelConfig};
 use crate::types::cost::Cost;
 use crate::types::error::GatewayError;
-use crate::types::request::InferenceResponse;
+use crate::types::request::{InferenceRequest, InferenceResponse, Payload};
 
 /// One slot's outcome in a [`PanelResponse`].
 #[derive(Debug)]
@@ -50,6 +50,9 @@ pub(crate) struct FormedSlot {
     pub chain: String,
     pub primary_model: String,
     pub family: String,
+    /// Per-slot system prompt (gh#18), carried from the [`crate::types::config::PanelSlot`]
+    /// and layered onto this slot's request at fan-out time.
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -150,6 +153,7 @@ pub(crate) fn form_panel(
             chain: slot.chain.clone(),
             primary_model: model.id.clone(),
             family: model_family(model),
+            system_prompt: slot.system_prompt.clone(),
         });
     }
 
@@ -184,6 +188,21 @@ fn enforce_distinct(panel: &PanelConfig, formed: &[FormedSlot]) -> Result<(), Ga
         seen.insert(key, slot.chain.clone());
     }
     Ok(())
+}
+
+/// Layer a slot's system prompt onto a chat request in place (gh#18): appended
+/// after any base system prompt (base instructions first, then the slot's
+/// persona), so each panel debater can be steered independently. A no-op when
+/// the slot declares no prompt, or when the payload isn't a chat (system
+/// prompts only apply to chat).
+pub(crate) fn apply_slot_system_prompt(req: &mut InferenceRequest, slot_system: Option<&str>) {
+    let Some(sp) = slot_system else { return };
+    if let Payload::Chat { system, .. } = &mut req.payload {
+        *system = Some(match system.take() {
+            Some(base) if !base.trim().is_empty() => format!("{base}\n\n{sp}"),
+            _ => sp.to_string(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +277,7 @@ mod tests {
                 .map(|c| PanelSlot {
                     chain: (*c).into(),
                     label: None,
+                    system_prompt: None,
                 })
                 .collect(),
         }
@@ -306,5 +326,59 @@ mod tests {
     fn empty_panel_errors() {
         let err = form_panel(&cfg(), &panel(DistinctBy::Family, &[])).unwrap_err();
         assert!(matches!(err, GatewayError::InvalidConfig(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn slot_system_prompt_layers_onto_chat() {
+        use crate::types::request::{Message, MessageRole};
+
+        fn chat_req(system: Option<&str>) -> InferenceRequest {
+            InferenceRequest {
+                capability: Capability::TextChat,
+                model: None,
+                router: None,
+                chain: None,
+                payload: Payload::Chat {
+                    messages: vec![Message::text(MessageRole::User, "hi")],
+                    system: system.map(Into::into),
+                    max_tokens: None,
+                    temperature: None,
+                    tools: Vec::new(),
+                },
+                budget: None,
+                auth: None,
+            }
+        }
+        fn system_of(req: &InferenceRequest) -> Option<String> {
+            match &req.payload {
+                Payload::Chat { system, .. } => system.clone(),
+                _ => None,
+            }
+        }
+
+        // No slot prompt → request is unchanged.
+        let mut req = chat_req(None);
+        apply_slot_system_prompt(&mut req, None);
+        assert_eq!(system_of(&req), None);
+
+        // Set on an empty base.
+        let mut req = chat_req(None);
+        apply_slot_system_prompt(&mut req, Some("Argue in favour"));
+        assert_eq!(system_of(&req).as_deref(), Some("Argue in favour"));
+
+        // Layered *after* an existing base prompt.
+        let mut req = chat_req(Some("Be concise"));
+        apply_slot_system_prompt(&mut req, Some("Red-team it"));
+        assert_eq!(
+            system_of(&req).as_deref(),
+            Some("Be concise\n\nRed-team it")
+        );
+
+        // Two different slot prompts → distinct outgoing requests.
+        let mut a = chat_req(None);
+        let mut b = chat_req(None);
+        apply_slot_system_prompt(&mut a, Some("proposer persona"));
+        apply_slot_system_prompt(&mut b, Some("challenger persona"));
+        assert_ne!(system_of(&a), system_of(&b));
     }
 }
