@@ -35,7 +35,14 @@ The crate has three modules:
 | --- | --- | --- | --- | --- |
 | llama.cpp (GGUF) | `LlamaCppAdapter`, `EmbeddedLlamaAdapter` | `llama-cpp` | `llama-cpp-2` (C++) | generation + embedding |
 | ONNX Runtime | `OrtAdapter` | `ort` | `ort` (C++), `tokenizers`, `ndarray` | embedding only |
-| FastEmbed | `FastembedAdapter` | `fastembed` | `fastembed` (wraps ORT) | embedding only |
+| FastEmbed _(deferred, gh#7)_ | `FastembedAdapter` | `fastembed` | `fastembed` (wraps ORT) | embedding only |
+
+> **The `fastembed` feature is deferred (gh#7).** fastembed 5.x pins `hf-hub 0.5`,
+> which would duplicate the `hf-hub 1.0` used for HF download, so the `fastembed`
+> optional dependency is disabled and the feature is an inert placeholder — the
+> `FastembedAdapter` code below remains for reference but won't build until fastembed
+> ships on `hf-hub 1.0`. Use `ort` for ONNX embeddings, or Ollama (the primary
+> embedding path) in the meantime.
 
 ### llama.cpp — `llama_cpp` and `embedded_llama`
 

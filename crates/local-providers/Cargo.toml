@@ -11,7 +11,13 @@ name = "local_providers"
 [features]
 default = []
 llama-cpp = ["dep:llama-cpp-2"]
-fastembed = ["dep:fastembed"]
+# Deferred (gh#7): fastembed 5.x pins hf-hub 0.5, duplicating our hf-hub 1.0, so
+# the `fastembed` optional dep below is disabled. This feature is kept as an
+# inert placeholder — so the cfg-gated adapter stays a *known* feature (no
+# unexpected-cfg warnings) — but enabling it won't build until the dep is
+# restored. Ollama embeddings are primary; fastembed was optional.
+# Re-enable: put back `["dep:fastembed"]` here + uncomment the dep below.
+fastembed = []
 ort = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 [dependencies]
@@ -25,7 +31,7 @@ tokio = { version = "1", features = ["fs", "rt", "sync"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 llama-cpp-2 = { version = "0.1.146", default-features = false, optional = true }
-fastembed = { version = "5", optional = true }
+# fastembed = { version = "5", optional = true }  # deferred (gh#7): pins hf-hub 0.5
 ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"], optional = true }
 tokenizers = { version = "0.21", optional = true }
 ndarray = { version = "0.16", optional = true }
