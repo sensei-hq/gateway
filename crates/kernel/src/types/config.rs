@@ -126,6 +126,13 @@ pub struct PanelSlot {
     /// Human role label (e.g. `"proposer"`, `"challenger"`, `"reviewer"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// System prompt applied to **this slot only**, layered after any base
+    /// request system prompt — so each debater can take a distinct persona
+    /// (e.g. `"argue in favour"` vs `"red-team the proposal"`) instead of every
+    /// slot receiving the identical request. Mirrors [`RoleSpec::system_prompt`]
+    /// for the synthesizer/judge. No effect on non-chat capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 /// A fan-out "panel": N slots (each a chain) run concurrently for one request,

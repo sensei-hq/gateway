@@ -509,6 +509,8 @@ impl Gateway {
             req.chain = Some(slot.chain.clone());
             req.model = None;
             req.router = None;
+            // Layer this slot's persona (gh#18) onto its request only.
+            crate::panel::apply_slot_system_prompt(&mut req, slot.system_prompt.as_deref());
             async move { self.execute(&req).await }
         });
         let results = futures::future::join_all(calls).await;
@@ -3208,14 +3210,17 @@ mod tests {
                 PanelSlot {
                     chain: "c-gemma".to_string(),
                     label: Some("proposer".to_string()),
+                    system_prompt: None,
                 },
                 PanelSlot {
                     chain: "c-qwen".to_string(),
                     label: Some("challenger".to_string()),
+                    system_prompt: None,
                 },
                 PanelSlot {
                     chain: "c-ghost".to_string(),
                     label: Some("wildcard".to_string()),
+                    system_prompt: None,
                 },
             ],
         };
@@ -3279,10 +3284,12 @@ mod tests {
                 PanelSlot {
                     chain: "c1".to_string(),
                     label: None,
+                    system_prompt: None,
                 },
                 PanelSlot {
                     chain: "c2".to_string(),
                     label: None,
+                    system_prompt: None,
                 },
             ],
         };
@@ -3291,6 +3298,109 @@ mod tests {
         assert!(
             matches!(err, GatewayError::InvalidConfig(_)),
             "same-family panel must fail formation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_panel_applies_per_slot_system_prompt() {
+        use crate::types::config::{DistinctBy, PanelConfig, PanelSlot};
+
+        // A chat adapter that records the system prompt of every request it
+        // serves, so we can prove each slot's persona reached *its own* outgoing
+        // request (gh#18) rather than every slot getting the identical request.
+        struct SystemRecorder {
+            seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        }
+        impl crate::adapters::capability::Model for SystemRecorder {
+            fn id(&self) -> &str {
+                "noop"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::adapters::capability::ChatModel for SystemRecorder {
+            async fn chat(
+                &self,
+                _cfg: &RouterConfig,
+                req: &crate::types::io::ChatRequest,
+            ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+                self.seen.lock().unwrap().push(req.system.clone());
+                Ok(crate::types::io::ChatResponse {
+                    content: Some("ok".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    model: req.model.clone(),
+                    degraded: false,
+                })
+            }
+        }
+
+        let routers = HashMap::from([("noop".to_string(), router(true))]);
+        let models = HashMap::from([
+            (
+                "m-gemma".to_string(),
+                chat_model("m-gemma", "noop", "gemma"),
+            ),
+            ("m-qwen".to_string(), chat_model("m-qwen", "noop", "qwen")),
+        ]);
+        let chains = HashMap::from([
+            (
+                "c-gemma".to_string(),
+                one_model_chain("c-gemma", "m-gemma", "noop"),
+            ),
+            (
+                "c-qwen".to_string(),
+                one_model_chain("c-qwen", "m-qwen", "noop"),
+            ),
+        ]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        gw.adapters
+            .register_chat(Arc::new(SystemRecorder { seen: seen.clone() }))
+            .await;
+
+        let panel = PanelConfig {
+            id: "p".to_string(),
+            capability: Capability::TextChat,
+            distinct_by: DistinctBy::Family,
+            slots: vec![
+                PanelSlot {
+                    chain: "c-gemma".to_string(),
+                    label: Some("proposer".to_string()),
+                    system_prompt: Some("You are the proposer.".to_string()),
+                },
+                PanelSlot {
+                    chain: "c-qwen".to_string(),
+                    label: Some("challenger".to_string()),
+                    system_prompt: Some("You are the challenger.".to_string()),
+                },
+            ],
+        };
+
+        // Base request carries no system prompt, so each slot's outgoing system
+        // is exactly that slot's persona.
+        let resp = gw.execute_panel(&chat_request(), &panel).await.unwrap();
+        assert!(resp.slots.iter().all(|s| s.result.is_ok()));
+
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                Some("You are the challenger.".to_string()),
+                Some("You are the proposer.".to_string()),
+            ],
+            "each slot's system prompt must reach its own outgoing request",
         );
     }
 
@@ -3356,10 +3466,12 @@ mod tests {
                     PanelSlot {
                         chain: "c-gemma".to_string(),
                         label: Some("proposer".to_string()),
+                        system_prompt: None,
                     },
                     PanelSlot {
                         chain: "c-qwen".to_string(),
                         label: Some("challenger".to_string()),
+                        system_prompt: None,
                     },
                 ],
             },
@@ -3448,10 +3560,12 @@ mod tests {
                     PanelSlot {
                         chain: "c-gemma".to_string(),
                         label: None,
+                        system_prompt: None,
                     },
                     PanelSlot {
                         chain: "c-qwen".to_string(),
                         label: None,
+                        system_prompt: None,
                     },
                 ],
             },
