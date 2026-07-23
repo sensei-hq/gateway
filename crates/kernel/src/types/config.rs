@@ -146,6 +146,14 @@ pub struct PanelConfig {
     /// Distinctness enforced at formation time, before any inference.
     #[serde(default)]
     pub distinct_by: DistinctBy,
+    /// When `true`, also enforce `distinct_by` at **runtime** (gh#21): after
+    /// fan-out, a successful slot whose family a prior slot already produced is
+    /// **dropped** (its result becomes an error) rather than returned, so no two
+    /// returned slots share a family even when per-slot fallback converges.
+    /// Default `false` — non-strict: keep both and only record the overlap in
+    /// [`PanelResponse::collisions`]. No effect when `distinct_by` is `None`.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// One non-fan-out role in a consensus workflow (synthesizer or judge): the
@@ -473,6 +481,7 @@ mod tests {
                     },
                 ],
                 distinct_by: DistinctBy::Family,
+                strict: false,
             },
         );
         cfg.consensus.insert(
@@ -489,6 +498,7 @@ mod tests {
                         system_prompt: None,
                     }],
                     distinct_by: DistinctBy::Family,
+                    strict: false,
                 },
                 synthesizer: RoleSpec {
                     chain: "s".to_string(),
