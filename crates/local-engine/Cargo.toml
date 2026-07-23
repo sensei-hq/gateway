@@ -20,6 +20,7 @@ coldboot = []
 llama-cpp = ["dep:local-providers", "local-providers/llama-cpp", "coldboot"]
 fastembed = ["dep:local-providers", "local-providers/fastembed", "coldboot"]
 ort = ["dep:local-providers", "local-providers/ort", "coldboot"]
+kokoro = ["dep:local-providers", "local-providers/kokoro", "coldboot"]
 
 [dependencies]
 kernel = { package = "sensei-kernel", path = "../kernel" }

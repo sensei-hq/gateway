@@ -19,6 +19,7 @@ local-hf-download = ["local", "local-engine/hf-download"]
 local-llama-cpp = ["local", "local-engine/llama-cpp"]
 local-fastembed = ["local", "local-engine/fastembed"]
 local-ort = ["local", "local-engine/ort"]
+local-kokoro = ["local", "local-engine/kokoro"]
 
 [dependencies]
 # Ergonomic `stream! { ... yield ev; ... }` macro used by
