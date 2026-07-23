@@ -63,6 +63,13 @@ pub struct ModelConfig {
     pub max_output_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Model lineage for panel distinctness (e.g. `"gemma"`, `"qwen"`,
+    /// `"claude"`). Operator-declared and distinct from `provider` (the
+    /// backend): `gemma4` and `qwen3` share `provider = "ollama"` but differ in
+    /// family. `None` ⇒ the model id is treated as its own family for
+    /// `distinct_by: family` panel checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,6 +98,47 @@ pub struct FallbackChainConfig {
     pub capability: Capability,
     pub models: Vec<ChainEntry>,
     pub fallback_triggers: Vec<FallbackTrigger>,
+}
+
+/// How a [`PanelConfig`] requires its member slots to differ, so a fan-out
+/// panel actually queries *distinct* experts rather than collapsing onto one
+/// model. See `Gateway::execute_panel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistinctBy {
+    /// No distinctness requirement (e.g. a best-of-N / judge-selects panel).
+    #[default]
+    None,
+    /// Slot primaries must be distinct model ids.
+    Model,
+    /// Slot primaries must be distinct model *families* (e.g. `gemma` vs `qwen`)
+    /// — the axis that matters for consensus independence. See
+    /// [`ModelConfig::family`].
+    Family,
+}
+
+/// One member of a [`PanelConfig`]: a reference to an existing fallback chain,
+/// so the slot inherits that chain's primary model plus its fallback legs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelSlot {
+    /// Name of a chain in [`GatewayConfig::chains`] to run for this slot.
+    pub chain: String,
+    /// Human role label (e.g. `"proposer"`, `"challenger"`, `"reviewer"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// A fan-out "panel": N slots (each a chain) run concurrently for one request,
+/// returning all N answers for downstream aggregation (consensus / ensemble /
+/// best-of-N). See `Gateway::execute_panel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelConfig {
+    pub id: String,
+    pub capability: Capability,
+    pub slots: Vec<PanelSlot>,
+    /// Distinctness enforced at formation time, before any inference.
+    #[serde(default)]
+    pub distinct_by: DistinctBy,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +277,7 @@ mod tests {
             id: "claude-sonnet".to_string(),
             api_model_id: Some("claude-3-5-sonnet-20241022".to_string()),
             provider: "anthropic".to_string(),
+            family: Some("claude".to_string()),
             capabilities: vec![Capability::TextChat, Capability::TextEmbed],
             context_window: 200000,
             max_output_tokens: 8192,

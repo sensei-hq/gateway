@@ -175,6 +175,7 @@ mod tests {
             id: "gemma3:27b".to_string(),
             api_model_id: None,
             provider: "ollama".to_string(),
+            family: None,
             capabilities: vec![Capability::TextChat, Capability::TextEmbed],
             context_window: 128000,
             max_output_tokens: 8192,
