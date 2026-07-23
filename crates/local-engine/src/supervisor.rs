@@ -93,6 +93,16 @@ pub enum ProvisionPlan {
     Kokoro {
         config: local_providers::adapters::KokoroConfig,
     },
+
+    /// Pull Kokoro's model + voice files from HF, then coldboot + register the
+    /// TTS adapter (gh#23). The lexicon is *not* on the model repo — supply it as
+    /// a sibling via `config` (e.g. a relative `../us_gold.json`).
+    #[cfg(all(feature = "hf-download", feature = "kokoro"))]
+    HfKokoro {
+        /// Model + voice files to pull (`files[0]` is the ONNX model).
+        spec: crate::registry::PullSpec,
+        config: local_providers::adapters::KokoroConfig,
+    },
 }
 
 /// A [`ProvisionPlan`] that emits a predetermined phase sequence — no engine, no
@@ -419,6 +429,10 @@ async fn run_job(
         ProvisionPlan::Ort { config } => coldboot::run_ort(model, config, &tx, &ctx).await,
         #[cfg(feature = "kokoro")]
         ProvisionPlan::Kokoro { config } => coldboot::run_kokoro(model, config, &tx, &ctx).await,
+        #[cfg(all(feature = "hf-download", feature = "kokoro"))]
+        ProvisionPlan::HfKokoro { spec, config } => {
+            coldboot::run_hf_kokoro(model, spec, config, &tx, &ctx).await
+        }
     }
 }
 
@@ -656,6 +670,91 @@ mod coldboot {
         tx: &watch::Sender<ProvisionPhase>,
         ctx: &ColdbootCtx,
     ) {
+        emit(tx, ProvisionPhase::Verifying);
+        let entry = match resolve_entry(&model, ctx).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                emit(tx, ProvisionPhase::Failed { error: e });
+                return;
+            }
+        };
+
+        emit(tx, ProvisionPhase::Loading);
+        let loaded = tokio::task::spawn_blocking(move || {
+            local_providers::adapters::KokoroAdapter::load(&entry, config)
+        })
+        .await;
+        let adapter = match loaded {
+            Ok(Ok(adapter)) => adapter,
+            Ok(Err(e)) => {
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: e.to_string(),
+                    },
+                );
+                return;
+            }
+            Err(e) => {
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: format!("load task failed: {e}"),
+                    },
+                );
+                return;
+            }
+        };
+        ctx.registry.register(Arc::new(adapter)).await;
+        emit(tx, ProvisionPhase::Ready);
+    }
+
+    /// Pull Kokoro's model + voice files from HF (streaming progress), then load
+    /// the adapter and register it. Mirrors [`run_hf_gguf`] (pull) + [`run_kokoro`]
+    /// (load). The lexicon isn't on the model repo — `config` points at it as a
+    /// sibling the operator supplies.
+    #[cfg(all(feature = "hf-download", feature = "kokoro"))]
+    pub(super) async fn run_hf_kokoro(
+        model: String,
+        spec: crate::registry::PullSpec,
+        config: local_providers::adapters::KokoroConfig,
+        tx: &watch::Sender<ProvisionPhase>,
+        ctx: &ColdbootCtx,
+    ) {
+        let Some(puller) = ctx.puller.clone() else {
+            emit(
+                tx,
+                ProvisionPhase::Failed {
+                    error: "HF Kokoro plan needs a puller; call `with_puller` on the supervisor"
+                        .to_string(),
+                },
+            );
+            return;
+        };
+
+        emit(
+            tx,
+            ProvisionPhase::Downloading {
+                done: 0,
+                total: None,
+            },
+        );
+        let mut on_progress = {
+            let tx = tx.clone();
+            move |done, total| {
+                let _ = tx.send_replace(ProvisionPhase::Downloading { done, total });
+            }
+        };
+        if let Err(e) = puller.pull_with_progress(&spec, &mut on_progress).await {
+            emit(
+                tx,
+                ProvisionPhase::Failed {
+                    error: e.to_string(),
+                },
+            );
+            return;
+        }
+
         emit(tx, ProvisionPhase::Verifying);
         let entry = match resolve_entry(&model, ctx).await {
             Ok(entry) => entry,
