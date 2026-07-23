@@ -10,6 +10,8 @@
 
 use crate::lang::Lang;
 
+pub mod en;
+
 /// A per-language grapheme-to-phoneme converter (strategy).
 ///
 /// Implementations map input text to a Kokoro IPA phoneme string built from the
