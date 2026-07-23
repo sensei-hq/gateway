@@ -16,9 +16,9 @@
 //! - [`audio`] — 24 kHz `f32` PCM → WAV bytes (shared).
 //!
 //! The English G2P ([`EnglishG2p`]) is lexicon-driven — load misaki's Apache-2.0
-//! dictionary with [`Lexicon::from_misaki_json`]. ONNX inference (`input_ids` +
-//! `style` + `speed` → audio, behind an `onnx` feature) lands in a follow-up PR;
-//! see gh#23.
+//! dictionary with [`Lexicon::from_misaki_json`]. ONNX inference (`model`) and
+//! the end-to-end `synth::KokoroTts` (`text → WAV`) are behind the **`onnx`**
+//! feature (which pulls `ort`); see gh#23.
 //!
 //! # Pipeline
 //! ```text
@@ -35,12 +35,22 @@ pub mod tokenizer;
 pub mod vocab;
 pub mod voices;
 
+#[cfg(feature = "onnx")]
+pub mod model;
+#[cfg(feature = "onnx")]
+pub mod synth;
+
 pub use error::KokoroError;
 pub use g2p::G2p;
 pub use g2p::en::{EnglishG2p, Lexicon};
 pub use lang::Lang;
 pub use tokenizer::{Tokenized, tokenize};
 pub use voices::Voices;
+
+#[cfg(feature = "onnx")]
+pub use model::KokoroModel;
+#[cfg(feature = "onnx")]
+pub use synth::KokoroTts;
 
 /// The pre-inference step: tokenize a phoneme string and pick the matching voice
 /// style vector, ready to feed the model (`input_ids`, `style`).

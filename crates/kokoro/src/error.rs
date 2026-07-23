@@ -7,4 +7,7 @@ pub enum KokoroError {
     /// A voice-pack blob had an invalid length / shape.
     #[error("invalid voice pack: {0}")]
     VoicePack(String),
+    /// ONNX model load or inference failure (only under the `onnx` feature).
+    #[error("kokoro model: {0}")]
+    Model(String),
 }

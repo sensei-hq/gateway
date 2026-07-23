@@ -8,6 +8,15 @@ license = "MIT"
 [lib]
 name = "kokoro"
 
+[features]
+# ONNX inference via ONNX Runtime. Off by default: pulls `ort` (which downloads
+# the ONNX Runtime binary). The vocab / tokenizer / g2p / voices / audio core
+# needs none of it, so the default build stays light.
+onnx = ["dep:ort"]
+
 [dependencies]
 serde_json = "1"
 thiserror = "2"
+# Shares the workspace's ONNX Runtime major with local-providers' `ort` engine,
+# so the tree carries one `ort`. Optional + behind the `onnx` feature.
+ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"], optional = true }
