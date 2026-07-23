@@ -666,6 +666,63 @@ impl Gateway {
         })
     }
 
+    /// Resolve a named panel from [`GatewayConfig::panels`](crate::types::config::GatewayConfig::panels)
+    /// by [`request.panel`](InferenceRequest::panel) and fan it out via
+    /// [`execute_panel`](Self::execute_panel) (gh#19).
+    ///
+    /// `request.panel` must be set; an unset field or an id absent from the
+    /// config is [`GatewayError::InvalidConfig`] (fail fast, before any
+    /// inference) — consistent with how unknown chains are rejected.
+    pub async fn execute_panel_addressed(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<crate::panel::PanelResponse, GatewayError> {
+        let id = request
+            .panel
+            .as_deref()
+            .ok_or_else(|| GatewayError::InvalidConfig("request.panel is not set".to_string()))?;
+        // Clone the stored config out under a short-lived read lock; execute_panel
+        // re-acquires it, so the guard must not be held across the call.
+        let panel = {
+            let config = self.config.read().await;
+            config
+                .panels
+                .get(id)
+                .cloned()
+                .ok_or_else(|| GatewayError::InvalidConfig(format!("unknown panel '{id}'")))?
+        };
+        self.execute_panel(request, &panel).await
+    }
+
+    /// Resolve a named consensus workflow from
+    /// [`GatewayConfig::consensus`](crate::types::config::GatewayConfig::consensus)
+    /// by [`request.consensus`](InferenceRequest::consensus) and run it via
+    /// [`execute_consensus`](Self::execute_consensus) (gh#19).
+    ///
+    /// The workflow's prompt is taken from the request payload (the chat
+    /// messages' text). `request.consensus` must be set; an unset field, an
+    /// unknown id, or a payload with no text input is
+    /// [`GatewayError::InvalidConfig`].
+    pub async fn execute_consensus_addressed(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<crate::consensus::ConsensusResult, GatewayError> {
+        let id = request.consensus.as_deref().ok_or_else(|| {
+            GatewayError::InvalidConfig("request.consensus is not set".to_string())
+        })?;
+        let spec =
+            {
+                let config = self.config.read().await;
+                config.consensus.get(id).cloned().ok_or_else(|| {
+                    GatewayError::InvalidConfig(format!("unknown consensus '{id}'"))
+                })?
+            };
+        let input = request_input_text(&request.payload).ok_or_else(|| {
+            GatewayError::InvalidConfig("consensus request payload has no text input".to_string())
+        })?;
+        self.execute_consensus(&spec, &input).await
+    }
+
     /// Dispatch one attempt to the adapter registered for `router` + the
     /// request's capability, translating at the [`crate::dispatch`] boundary.
     ///
@@ -1202,6 +1259,26 @@ fn estimate_input_tokens(payload: &Payload) -> u32 {
     }
 }
 
+/// Extract the user-facing prompt text from a request payload, for addressing a
+/// consensus workflow (which takes a plain prompt). Chat → its messages' text
+/// joined by newlines; text-bearing media payloads → their prompt/text. Returns
+/// `None` when there is no text to run a consensus over (embed / stt).
+fn request_input_text(payload: &Payload) -> Option<String> {
+    let text = match payload {
+        Payload::Chat { messages, .. } => messages
+            .iter()
+            .map(|m| m.as_text())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Payload::Tts { text, .. } => text.clone(),
+        Payload::ImageGenerate { prompt, .. } | Payload::VideoGenerate { prompt, .. } => {
+            prompt.clone()
+        }
+        Payload::Embed { .. } | Payload::Stt { .. } => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,6 +1349,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         }
     }
 
@@ -1309,6 +1388,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         }
     }
 
@@ -1393,6 +1474,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1422,6 +1505,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
         gw.execute(&request).await.unwrap();
 
@@ -1499,6 +1584,8 @@ mod tests {
             models,
             chains: HashMap::new(),
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1522,6 +1609,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
         let response = gw.execute(&request).await.unwrap();
 
@@ -1609,6 +1698,8 @@ mod tests {
             models,
             chains: HashMap::new(),
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1633,6 +1724,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
         gw.execute(&request).await.unwrap();
 
@@ -1835,6 +1928,8 @@ mod tests {
             models,
             chains: HashMap::new(),
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -1859,6 +1954,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
         let msg = gw.execute(&request).await.unwrap_err().to_string();
         assert!(
@@ -1920,6 +2017,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let result = gw.execute(&request).await;
@@ -1951,6 +2050,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let response = gw.execute(&request).await.unwrap();
@@ -2134,6 +2235,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         }
     }
 
@@ -2353,6 +2456,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
@@ -2465,6 +2570,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let adapters = AdapterRegistry::new();
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
@@ -2612,6 +2719,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -2901,6 +3010,8 @@ mod tests {
             models,
             chains: HashMap::new(),
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -2928,6 +3039,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         let events = collect_stream(&gw, &request).await;
@@ -3031,6 +3144,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -3104,6 +3219,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
 
         match gw.execute_stream(&request).await {
@@ -3193,6 +3310,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -3267,6 +3386,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -3357,6 +3478,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -3446,6 +3569,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -3540,6 +3665,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
             threshold: 5,
@@ -3583,6 +3710,183 @@ mod tests {
         assert!(
             matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("independent")),
             "non-independent judge must be rejected, got {err:?}"
+        );
+    }
+
+    // --- Config-addressed panels / consensus (gh#19) ---
+
+    #[tokio::test]
+    async fn execute_panel_addressed_resolves_from_config() {
+        use crate::types::config::{DistinctBy, PanelConfig, PanelSlot};
+
+        let routers = HashMap::from([("noop".to_string(), router(true))]);
+        let models = HashMap::from([
+            (
+                "m-gemma".to_string(),
+                chat_model("m-gemma", "noop", "gemma"),
+            ),
+            ("m-qwen".to_string(), chat_model("m-qwen", "noop", "qwen")),
+        ]);
+        let chains = HashMap::from([
+            (
+                "c-gemma".to_string(),
+                one_model_chain("c-gemma", "m-gemma", "noop"),
+            ),
+            (
+                "c-qwen".to_string(),
+                one_model_chain("c-qwen", "m-qwen", "noop"),
+            ),
+        ]);
+        let panels = HashMap::from([(
+            "board".to_string(),
+            PanelConfig {
+                id: "board".to_string(),
+                capability: Capability::TextChat,
+                distinct_by: DistinctBy::Family,
+                slots: vec![
+                    PanelSlot {
+                        chain: "c-gemma".to_string(),
+                        label: Some("proposer".to_string()),
+                        system_prompt: None,
+                    },
+                    PanelSlot {
+                        chain: "c-qwen".to_string(),
+                        label: Some("challenger".to_string()),
+                        system_prompt: None,
+                    },
+                ],
+            },
+        )]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels,
+            consensus: Default::default(),
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_noop(&gw).await;
+
+        // Address the panel by id from the request; no explicit PanelConfig.
+        let mut req = chat_request();
+        req.panel = Some("board".to_string());
+        let resp = gw.execute_panel_addressed(&req).await.unwrap();
+        assert_eq!(resp.slots.len(), 2);
+        assert!(resp.slots.iter().all(|s| s.result.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn execute_panel_addressed_unknown_id_errors() {
+        let gw = test_gateway();
+        register_noop(&gw).await;
+        let mut req = chat_request();
+        req.panel = Some("nope".to_string());
+        let err = gw.execute_panel_addressed(&req).await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("unknown panel")),
+            "unknown panel id must fail fast, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_consensus_addressed_resolves_from_config() {
+        use crate::types::config::{ConsensusConfig, DistinctBy, PanelConfig, PanelSlot, RoleSpec};
+
+        let routers = HashMap::from([("noop".to_string(), router(true))]);
+        let models = HashMap::from([
+            (
+                "m-gemma".to_string(),
+                chat_model("m-gemma", "noop", "gemma"),
+            ),
+            ("m-qwen".to_string(), chat_model("m-qwen", "noop", "qwen")),
+            (
+                "m-synth".to_string(),
+                chat_model("m-synth", "noop", "mixtral"),
+            ),
+        ]);
+        let chains = HashMap::from([
+            (
+                "c-gemma".to_string(),
+                one_model_chain("c-gemma", "m-gemma", "noop"),
+            ),
+            (
+                "c-qwen".to_string(),
+                one_model_chain("c-qwen", "m-qwen", "noop"),
+            ),
+            (
+                "c-synth".to_string(),
+                one_model_chain("c-synth", "m-synth", "noop"),
+            ),
+        ]);
+        let consensus = HashMap::from([(
+            "debate".to_string(),
+            ConsensusConfig {
+                id: "debate".to_string(),
+                capability: Capability::TextChat,
+                panel: PanelConfig {
+                    id: "debate-panel".to_string(),
+                    capability: Capability::TextChat,
+                    distinct_by: DistinctBy::Family,
+                    slots: vec![
+                        PanelSlot {
+                            chain: "c-gemma".to_string(),
+                            label: Some("proposer".to_string()),
+                            system_prompt: None,
+                        },
+                        PanelSlot {
+                            chain: "c-qwen".to_string(),
+                            label: Some("challenger".to_string()),
+                            system_prompt: None,
+                        },
+                    ],
+                },
+                synthesizer: RoleSpec {
+                    chain: "c-synth".to_string(),
+                    system_prompt: Some("Merge.".to_string()),
+                },
+                judge: None,
+            },
+        )]);
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus,
+        };
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        register_noop(&gw).await;
+
+        // The prompt comes from the request payload; the workflow from its id.
+        let mut req = chat_request();
+        req.consensus = Some("debate".to_string());
+        let result = gw.execute_consensus_addressed(&req).await.unwrap();
+        assert_eq!(result.debate.len(), 2);
+        assert!(!result.synthesis_output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_consensus_addressed_unknown_id_errors() {
+        let gw = test_gateway();
+        register_noop(&gw).await;
+        let mut req = chat_request();
+        req.consensus = Some("nope".to_string());
+        let err = gw.execute_consensus_addressed(&req).await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::InvalidConfig(ref m) if m.contains("unknown consensus")),
+            "unknown consensus id must fail fast, got {err:?}"
         );
     }
 }

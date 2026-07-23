@@ -531,6 +531,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         }
     }
 

@@ -130,6 +130,8 @@ impl GatewayBuilder {
             models: self.models,
             chains: self.chains,
             constraints: self.constraints,
+            panels: Default::default(),
+            consensus: Default::default(),
         })
     }
 

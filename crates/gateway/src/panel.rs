@@ -264,6 +264,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         }
     }
 
@@ -347,6 +349,8 @@ mod tests {
                 },
                 budget: None,
                 auth: None,
+                panel: None,
+                consensus: None,
             }
         }
         fn system_of(req: &InferenceRequest) -> Option<String> {

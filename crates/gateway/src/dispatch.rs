@@ -236,6 +236,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         }
     }
 
@@ -279,6 +281,8 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
         };
         assert!(to_chat_request(&ir, None).is_err());
     }
