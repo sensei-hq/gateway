@@ -23,11 +23,15 @@ pub struct ConsensusResult {
     pub synthesis: InferenceResponse,
     /// The synthesizer's text output (convenience extraction).
     pub synthesis_output: String,
-    /// The judge's response, when a judge is configured.
+    /// The judge's response, when a **single** judge is configured.
     pub judgment: Option<InferenceResponse>,
-    /// The judge's text output, when a judge is configured.
+    /// The judge's text output, when a **single** judge is configured.
     pub judgment_output: Option<String>,
-    /// Debate + synthesis + judgment cost.
+    /// Per-judge results when a judge **quorum** is configured (gh#20); `None`
+    /// for a single judge or no judge. The gateway threads the individual
+    /// judgments through — the consumer tallies/weighs the votes.
+    pub judge_quorum: Option<PanelResponse>,
+    /// Debate + synthesis + judgment (single or quorum) cost.
     pub total_cost: Cost,
 }
 

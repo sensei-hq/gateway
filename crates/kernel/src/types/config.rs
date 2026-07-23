@@ -170,10 +170,18 @@ pub struct ConsensusConfig {
     pub panel: PanelConfig,
     /// Merges the debaters' outputs into one answer.
     pub synthesizer: RoleSpec,
-    /// Optional final evaluator; must be family-independent of every debater
-    /// (enforced before any inference).
+    /// Optional single final evaluator; must be family-independent of every
+    /// debater (enforced before any inference). Mutually exclusive with
+    /// `judge_quorum`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge: Option<RoleSpec>,
+    /// Optional final evaluator **quorum** (gh#20): a family-distinct panel of
+    /// judges that each score the synthesis, for a vote/tally instead of one
+    /// judge. Mutually exclusive with `judge`; every quorum member must also be
+    /// family-independent of every debater. Per-judge personas come from each
+    /// slot's [`PanelSlot::system_prompt`]. `None` ⇒ no quorum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_quorum: Option<PanelConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +498,7 @@ mod tests {
                     chain: "j".to_string(),
                     system_prompt: None,
                 }),
+                judge_quorum: None,
             },
         );
 
