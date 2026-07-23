@@ -1,6 +1,6 @@
 [package]
 name = "sensei-local-engine"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "Model resolvers (managed / Ollama / external) + Hugging Face pull for the sensei gateway"
 license = "MIT"
