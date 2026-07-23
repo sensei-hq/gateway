@@ -1,6 +1,6 @@
 [package]
 name = "sensei-kernel"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "Shared types, capability traits, and the adapter registry for the sensei gateway"
 license = "MIT"
