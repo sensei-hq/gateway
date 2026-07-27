@@ -13,9 +13,10 @@
 //!
 //! V1 ships the AEAD envelope ([`crypto`]); V2 the [`kek`] providers; V3 the [`store`]
 //! seam + the [`vault`] orchestrator; V4 rotation + the AAD re-seal migration
-//! ([`Vault::rotate_dek`], [`Vault::rotate_kek`], [`Vault::reseal_without_aad`]). Next:
-//! `TenantKeyCache` (V5).
+//! ([`Vault::rotate_dek`], [`Vault::rotate_kek`], [`Vault::reseal_without_aad`]); V5 the
+//! per-request [`TenantKeyCache`] both consumers sit behind.
 
+pub mod cache;
 pub mod crypto;
 pub mod kek;
 pub mod store;
@@ -24,6 +25,13 @@ pub mod vault;
 #[cfg(feature = "sqlx")]
 pub mod postgres;
 
-pub use kek::{KekProvider, Profile};
+#[cfg(test)]
+mod test_support;
+
+pub use cache::TenantKeyCache;
+pub use kek::{EnvKekProvider, KekProvider, Profile, StaticKekProvider};
 pub use store::{DekBlob, StoredCredential, VaultStore};
 pub use vault::{Vault, VaultError};
+
+#[cfg(feature = "sqlx")]
+pub use postgres::{PostgresVaultStore, SupabaseVaultKekProvider};
