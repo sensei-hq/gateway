@@ -287,6 +287,7 @@ fn build_step_request(step: &PurposeStep, input_text: &str) -> InferenceRequest 
         auth: None,
         panel: None,
         consensus: None,
+        allow_fallback: true,
     }
 }
 

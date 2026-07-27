@@ -238,6 +238,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         }
     }
 
@@ -254,6 +255,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         }
     }
 
@@ -299,6 +301,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
         assert!(to_chat_request(&ir, None).is_err());
     }
