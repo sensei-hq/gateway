@@ -12,7 +12,8 @@
 //! - Tamper, short blob, AAD mismatch, and a missing/invalid KEK all **fail closed**.
 //!
 //! V1 ships the AEAD envelope ([`crypto`]); V2 the [`kek`] providers; V3 the [`store`]
-//! seam + the [`vault`] orchestrator. Following the epic: rotation (V4) and
+//! seam + the [`vault`] orchestrator; V4 rotation + the AAD re-seal migration
+//! ([`Vault::rotate_dek`], [`Vault::rotate_kek`], [`Vault::reseal_without_aad`]). Next:
 //! `TenantKeyCache` (V5).
 
 pub mod crypto;
@@ -24,5 +25,5 @@ pub mod vault;
 pub mod postgres;
 
 pub use kek::{KekProvider, Profile};
-pub use store::{StoredCredential, VaultStore};
+pub use store::{DekBlob, StoredCredential, VaultStore};
 pub use vault::{Vault, VaultError};

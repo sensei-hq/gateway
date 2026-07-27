@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::kek::{KekError, KekProvider};
-use crate::store::{StoreError, StoredCredential, VaultStore};
+use crate::store::{DekBlob, StoreError, StoredCredential, VaultStore};
 
 fn store_err(e: sqlx::Error) -> StoreError {
     StoreError::Backend(e.to_string())
@@ -78,7 +78,7 @@ impl VaultStore for PostgresVaultStore {
                (tenant_id, id, router_id, encrypted_api_key, key_label, is_active, \
                 credential_type, modified_by) \
              values ($1, gen_random_uuid(), $2, $3, $4, true, 'api_key', $5) \
-             on conflict (tenant_id, router_id) do update set \
+             on conflict (tenant_id, router_id) where is_active do update set \
                encrypted_api_key = excluded.encrypted_api_key, \
                key_label = excluded.key_label, \
                is_active = true, \
@@ -156,6 +156,149 @@ impl VaultStore for PostgresVaultStore {
                 sealed,
             })
             .collect())
+    }
+
+    async fn rotate_dek(
+        &self,
+        tenant: Uuid,
+        new_sealed_dek: &[u8],
+        resealed: &[(Uuid, Vec<u8>)],
+        actor: &str,
+    ) -> Result<i32, StoreError> {
+        // One transaction: archive the old DEK, install the new one, re-seal every active
+        // credential. `for update` serializes concurrent rotations of the same tenant.
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        let (old_version, old_sealed): (i32, Vec<u8>) = sqlx::query_as(
+            "select dek_version, encrypted_dek from core.tenant_keys where tenant_id = $1 for update",
+        )
+        .bind(tenant)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(store_err)?;
+        let new_version = old_version + 1;
+
+        sqlx::query(
+            "insert into core.tenant_key_archive \
+               (tenant_id, dek_version, encrypted_dek, modified_by) \
+             values ($1, $2, $3, $4) on conflict (tenant_id, dek_version) do nothing",
+        )
+        .bind(tenant)
+        .bind(old_version)
+        .bind(&old_sealed)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err)?;
+
+        sqlx::query(
+            "update core.tenant_keys set encrypted_dek = $2, dek_version = $3, \
+               modified_at = now(), modified_by = $4 where tenant_id = $1",
+        )
+        .bind(tenant)
+        .bind(new_sealed_dek)
+        .bind(new_version)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err)?;
+
+        for (router, sealed) in resealed {
+            sqlx::query(
+                "update public.router_credentials set encrypted_api_key = $3, \
+                   modified_at = now(), modified_by = $4 \
+                 where tenant_id = $1 and router_id = $2 \
+                   and is_active = true and credential_type = 'api_key'",
+            )
+            .bind(tenant)
+            .bind(router)
+            .bind(sealed)
+            .bind(actor)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        }
+
+        tx.commit().await.map_err(store_err)?;
+        Ok(new_version)
+    }
+
+    async fn update_credential_blob(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        sealed: &[u8],
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "update public.router_credentials set encrypted_api_key = $3, \
+               modified_at = now(), modified_by = $4 \
+             where tenant_id = $1 and router_id = $2 \
+               and is_active = true and credential_type = 'api_key'",
+        )
+        .bind(tenant)
+        .bind(router)
+        .bind(sealed)
+        .bind(actor)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_all_dek_blobs(&self) -> Result<Vec<DekBlob>, StoreError> {
+        let current: Vec<(Uuid, i32, Vec<u8>)> =
+            sqlx::query_as("select tenant_id, dek_version, encrypted_dek from core.tenant_keys")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(store_err)?;
+        let archived: Vec<(Uuid, i32, Vec<u8>)> = sqlx::query_as(
+            "select tenant_id, dek_version, encrypted_dek from core.tenant_key_archive",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        let mut out = Vec::with_capacity(current.len() + archived.len());
+        out.extend(current.into_iter().map(|(t, v, s)| DekBlob {
+            tenant_id: t,
+            dek_version: v,
+            archived: false,
+            sealed: s,
+        }));
+        out.extend(archived.into_iter().map(|(t, v, s)| DekBlob {
+            tenant_id: t,
+            dek_version: v,
+            archived: true,
+            sealed: s,
+        }));
+        Ok(out)
+    }
+
+    async fn apply_dek_rewraps(&self, rewraps: &[(DekBlob, Vec<u8>)]) -> Result<(), StoreError> {
+        // One transaction so a crash can't leave DEKs split across the old and new KEK.
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        for (blob, sealed) in rewraps {
+            if blob.archived {
+                sqlx::query(
+                    "update core.tenant_key_archive set encrypted_dek = $3 \
+                     where tenant_id = $1 and dek_version = $2",
+                )
+                .bind(blob.tenant_id)
+                .bind(blob.dek_version)
+                .bind(sealed)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+            } else {
+                sqlx::query("update core.tenant_keys set encrypted_dek = $2 where tenant_id = $1")
+                    .bind(blob.tenant_id)
+                    .bind(sealed)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(store_err)?;
+            }
+        }
+        tx.commit().await.map_err(store_err)?;
+        Ok(())
     }
 }
 
@@ -336,5 +479,143 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Supabase (55322)"]
+    async fn postgres_rotation_and_reseal_round_trip() {
+        let pool = pool().await;
+        let kek = [13u8; 32];
+        let vault = Vault::new(
+            StaticKekProvider::new(kek),
+            PostgresVaultStore::new(pool.clone()),
+        );
+        let tenant = Uuid::new_v4();
+        let openai: Uuid =
+            sqlx::query_scalar("select id from config.routers where name = 'openai'")
+                .fetch_one(&pool)
+                .await
+                .expect("openai router seeded");
+        let anthropic: Uuid =
+            sqlx::query_scalar("select id from config.routers where name = 'anthropic'")
+                .fetch_one(&pool)
+                .await
+                .expect("anthropic router seeded");
+        sqlx::query(
+            "insert into core.tenants (id, name, slug, modified_by) \
+             values ($1, 'vault-rot-test', $2, 'test')",
+        )
+        .bind(tenant)
+        .bind(format!("vault-rot-{tenant}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Seed one crate-sealed (AAD-bound) credential; auto-provisions the tenant DEK.
+        vault
+            .store_router_key(tenant, openai, "sk-openai", Some("byok"), "tester")
+            .await
+            .unwrap();
+
+        // Seed a *legacy* (empty-AAD) credential the way the pre-crate inline vault would have:
+        // unseal the tenant DEK, seal with an empty AAD, insert an active row directly.
+        let sealed_dek: Vec<u8> =
+            sqlx::query_scalar("select encrypted_dek from core.tenant_keys where tenant_id = $1")
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let dek = crate::crypto::unseal_dek(&kek, &sealed_dek).unwrap();
+        let legacy = crate::crypto::seal_credential(&dek, b"", b"sk-legacy").unwrap();
+        sqlx::query(
+            "insert into public.router_credentials \
+               (tenant_id, router_id, encrypted_api_key, is_active, credential_type, modified_by) \
+             values ($1, $2, $3, true, 'api_key', 'seed')",
+        )
+        .bind(tenant)
+        .bind(anthropic)
+        .bind(&legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // AAD migration: the legacy row is unresolvable until re-sealed, then resolves.
+        assert!(vault.resolve_router_key(tenant, anthropic).await.is_err());
+        assert_eq!(
+            vault.reseal_without_aad(tenant, "migrator").await.unwrap(),
+            1
+        );
+        assert_eq!(
+            vault
+                .resolve_router_key(tenant, anthropic)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "sk-legacy"
+        );
+
+        // DEK rotation: version bumps, old DEK archived, both credentials still resolve.
+        assert_eq!(vault.rotate_dek(tenant, "rotator").await.unwrap(), 2);
+        let archived: i64 =
+            sqlx::query_scalar("select count(*) from core.tenant_key_archive where tenant_id = $1")
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(archived, 1, "prior DEK archived");
+        let keys = vault.resolve_tenant_keys(tenant).await.unwrap();
+        assert_eq!(keys.get("openai").map(String::as_str), Some("sk-openai"));
+        assert_eq!(keys.get("anthropic").map(String::as_str), Some("sk-legacy"));
+
+        // KEK re-wrap SQL (both the current + archived branches). `Vault::rotate_kek` itself is
+        // global (one master KEK over every tenant) and unit-tested; here we drive the store's
+        // transactional `apply_dek_rewraps` scoped to THIS tenant, since the shared DB holds
+        // other tenants' DEKs sealed under the real deployment KEK (not this test's).
+        let store = PostgresVaultStore::new(pool.clone());
+        let mine: Vec<DekBlob> = store
+            .list_all_dek_blobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.tenant_id == tenant)
+            .collect();
+        assert_eq!(mine.len(), 2, "current v2 + archived v1 for this tenant");
+        let new_kek = [14u8; 32];
+        let mut rewraps = Vec::with_capacity(mine.len());
+        for b in mine {
+            let dek = crate::crypto::unseal_dek(&kek, &b.sealed).unwrap();
+            let sealed = crate::crypto::seal_dek(&new_kek, &dek).unwrap();
+            rewraps.push((b, sealed));
+        }
+        store.apply_dek_rewraps(&rewraps).await.unwrap();
+
+        let new_vault = Vault::new(
+            StaticKekProvider::new(new_kek),
+            PostgresVaultStore::new(pool.clone()),
+        );
+        assert_eq!(
+            new_vault
+                .resolve_router_key(tenant, openai)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "sk-openai"
+        );
+        assert!(
+            vault.resolve_router_key(tenant, openai).await.is_err(),
+            "old KEK no longer unseals the re-wrapped DEK"
+        );
+
+        // cleanup (FK-safe order).
+        for stmt in [
+            "delete from public.router_credentials where tenant_id = $1",
+            "delete from core.tenant_key_archive where tenant_id = $1",
+            "delete from core.tenant_keys where tenant_id = $1",
+            "delete from core.tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(&pool).await.unwrap();
+        }
     }
 }
