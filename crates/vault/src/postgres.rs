@@ -78,7 +78,7 @@ impl VaultStore for PostgresVaultStore {
                (tenant_id, id, router_id, encrypted_api_key, key_label, is_active, \
                 credential_type, modified_by) \
              values ($1, gen_random_uuid(), $2, $3, $4, true, 'api_key', $5) \
-             on conflict (tenant_id, router_id) where is_active do update set \
+             on conflict (tenant_id, router_id, credential_type) where is_active do update set \
                encrypted_api_key = excluded.encrypted_api_key, \
                key_label = excluded.key_label, \
                is_active = true, \
@@ -299,6 +299,110 @@ impl VaultStore for PostgresVaultStore {
         }
         tx.commit().await.map_err(store_err)?;
         Ok(())
+    }
+
+    async fn store_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        sealed: &[u8],
+        expires_at_ms: Option<i64>,
+        scopes: Option<&str>,
+        client_id: Option<&str>,
+        actor: &str,
+    ) -> Result<Uuid, StoreError> {
+        // `oauth_expires_at` is timestamptz; convert epoch-ms → timestamptz in SQL so the crate
+        // needs no chrono/time dep. One active oauth row per (tenant, router) (partial unique
+        // on credential_type); an api_key row for the same pair coexists.
+        sqlx::query_scalar(
+            "insert into public.router_credentials \
+               (tenant_id, id, router_id, encrypted_oauth, oauth_expires_at, oauth_scopes, \
+                oauth_client_id, is_active, credential_type, modified_by) \
+             values ($1, gen_random_uuid(), $2, $3, \
+               case when $4::bigint is null then null else to_timestamp($4::bigint / 1000.0) end, \
+               $5, $6, true, 'oauth', $7) \
+             on conflict (tenant_id, router_id, credential_type) where is_active do update set \
+               encrypted_oauth = excluded.encrypted_oauth, \
+               oauth_expires_at = excluded.oauth_expires_at, \
+               oauth_scopes = excluded.oauth_scopes, \
+               oauth_client_id = excluded.oauth_client_id, \
+               is_active = true, \
+               modified_at = now(), \
+               modified_by = excluded.modified_by \
+             returning id",
+        )
+        .bind(tenant)
+        .bind(router)
+        .bind(sealed)
+        .bind(expires_at_ms)
+        .bind(scopes)
+        .bind(client_id)
+        .bind(actor)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_err)
+    }
+
+    async fn get_active_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+            "select encrypted_oauth from public.router_credentials \
+             where tenant_id = $1 and router_id = $2 \
+               and is_active = true and credential_type = 'oauth' and encrypted_oauth is not null",
+        )
+        .bind(tenant)
+        .bind(router)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(row.flatten())
+    }
+
+    async fn deactivate_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "update public.router_credentials set is_active = false, modified_by = $3 \
+             where tenant_id = $1 and router_id = $2 \
+               and credential_type = 'oauth' and is_active = true",
+        )
+        .bind(tenant)
+        .bind(router)
+        .bind(actor)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_active_oauth(&self, tenant: Uuid) -> Result<Vec<StoredCredential>, StoreError> {
+        let rows: Vec<(Uuid, String, Option<Vec<u8>>)> = sqlx::query_as(
+            "select k.router_id, r.name, k.encrypted_oauth \
+             from public.router_credentials k \
+             join config.routers r on r.id = k.router_id \
+             where k.tenant_id = $1 and k.is_active = true and k.credential_type = 'oauth' \
+               and k.encrypted_oauth is not null",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(router_id, router_name, sealed)| {
+                sealed.map(|sealed| StoredCredential {
+                    router_id,
+                    router_name,
+                    sealed,
+                })
+            })
+            .collect())
     }
 }
 
@@ -612,6 +716,114 @@ mod tests {
         for stmt in [
             "delete from public.router_credentials where tenant_id = $1",
             "delete from core.tenant_key_archive where tenant_id = $1",
+            "delete from core.tenant_keys where tenant_id = $1",
+            "delete from core.tenants where id = $1",
+        ] {
+            sqlx::query(stmt).bind(tenant).execute(&pool).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Supabase (55322)"]
+    async fn postgres_oauth_lifecycle_coexists_with_api_key() {
+        let pool = pool().await;
+        let vault = Vault::new(
+            StaticKekProvider::new([17u8; 32]),
+            PostgresVaultStore::new(pool.clone()),
+        );
+        let tenant = Uuid::new_v4();
+        let router: Uuid =
+            sqlx::query_scalar("select id from config.routers where name = 'anthropic'")
+                .fetch_one(&pool)
+                .await
+                .expect("anthropic router seeded");
+        sqlx::query(
+            "insert into core.tenants (id, name, slug, modified_by) \
+             values ($1, 'vault-oauth-test', $2, 'test')",
+        )
+        .bind(tenant)
+        .bind(format!("vault-oauth-{tenant}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Store an oauth credential; it round-trips and is sealed at rest.
+        vault
+            .store_oauth(
+                tenant,
+                router,
+                "oauth-tok-AAA",
+                None,
+                None,
+                None,
+                None,
+                "tester",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vault
+                .resolve_oauth(tenant, router)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token
+                .as_str(),
+            "oauth-tok-AAA"
+        );
+        let sealed: Vec<u8> = sqlx::query_scalar(
+            "select encrypted_oauth from public.router_credentials \
+             where tenant_id = $1 and router_id = $2 and credential_type = 'oauth' and is_active",
+        )
+        .bind(tenant)
+        .bind(router)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !sealed.windows(9).any(|w| w == b"oauth-tok"),
+            "plaintext token must not appear at rest"
+        );
+
+        // An api_key credential for the SAME (tenant, router) coexists (partial unique per type).
+        vault
+            .store_router_key(tenant, router, "sk-ant-static", Some("byok"), "tester")
+            .await
+            .unwrap();
+        assert_eq!(
+            vault
+                .resolve_router_key(tenant, router)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "sk-ant-static"
+        );
+        assert_eq!(
+            vault
+                .resolve_oauth(tenant, router)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token
+                .as_str(),
+            "oauth-tok-AAA",
+            "oauth credential survives the api_key insert"
+        );
+
+        // Revoke oauth only; the api_key stays active.
+        vault.revoke_oauth(tenant, router, "tester").await.unwrap();
+        assert!(vault.resolve_oauth(tenant, router).await.unwrap().is_none());
+        assert!(
+            vault
+                .resolve_router_key(tenant, router)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        for stmt in [
+            "delete from public.router_credentials where tenant_id = $1",
             "delete from core.tenant_keys where tenant_id = $1",
             "delete from core.tenants where id = $1",
         ] {
