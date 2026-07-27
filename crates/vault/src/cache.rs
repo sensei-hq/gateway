@@ -23,7 +23,11 @@ use crate::vault::{Vault, VaultError};
 /// BYOK disabled. Generic over the same `K`/`S` as the `Vault` so both consumers reuse it.
 pub struct TenantKeyCache<K, S> {
     vault: Option<Vault<K, S>>,
+    /// `router_name → api_key` per tenant.
     cache: RwLock<HashMap<Uuid, Arc<HashMap<String, String>>>>,
+    /// `router_name → oauth access_token` per tenant (raw tokens; the consumer marks them for
+    /// the credentials channel). Separate map so api_key and oauth resolve independently.
+    oauth_cache: RwLock<HashMap<Uuid, Arc<HashMap<String, String>>>>,
 }
 
 impl<K: KekProvider, S: VaultStore> TenantKeyCache<K, S> {
@@ -32,6 +36,7 @@ impl<K: KekProvider, S: VaultStore> TenantKeyCache<K, S> {
         Self {
             vault,
             cache: RwLock::new(HashMap::new()),
+            oauth_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -51,12 +56,32 @@ impl<K: KekProvider, S: VaultStore> TenantKeyCache<K, S> {
         Ok(map)
     }
 
-    /// Drop the tenant's cached map so the next [`get`](Self::get) re-decrypts (after a write).
-    pub async fn invalidate(&self, tenant: Uuid) {
-        self.cache.write().await.remove(&tenant);
+    /// The tenant's decrypted OAuth access tokens (`router_name → access_token`), memoized.
+    /// Raw tokens — the caller marks them for the credentials channel (e.g. the `oauth:` prefix).
+    /// Same fail-safe contract as [`get`](Self::get).
+    pub async fn get_oauth(
+        &self,
+        tenant: Uuid,
+    ) -> Result<Arc<HashMap<String, String>>, VaultError> {
+        let Some(vault) = &self.vault else {
+            return Ok(Arc::new(HashMap::new()));
+        };
+        if let Some(hit) = self.oauth_cache.read().await.get(&tenant).cloned() {
+            return Ok(hit);
+        }
+        let map = Arc::new(vault.resolve_tenant_oauth(tenant).await?);
+        self.oauth_cache.write().await.insert(tenant, map.clone());
+        Ok(map)
     }
 
-    /// Store/rotate a BYOK key then invalidate the cache. Errors if BYOK is disabled.
+    /// Drop the tenant's cached maps (both api_key and oauth) so the next read re-decrypts —
+    /// called after any credential write.
+    pub async fn invalidate(&self, tenant: Uuid) {
+        self.cache.write().await.remove(&tenant);
+        self.oauth_cache.write().await.remove(&tenant);
+    }
+
+    /// Store/rotate a BYOK api_key then invalidate the cache. Errors if BYOK is disabled.
     pub async fn store(
         &self,
         tenant: Uuid,
@@ -73,11 +98,53 @@ impl<K: KekProvider, S: VaultStore> TenantKeyCache<K, S> {
         Ok(id)
     }
 
-    /// Revoke a BYOK key then invalidate the cache. Errors if BYOK is disabled.
+    /// Revoke a BYOK api_key then invalidate the cache. Errors if BYOK is disabled.
     pub async fn revoke(&self, tenant: Uuid, router: Uuid, actor: &str) -> Result<(), VaultError> {
         self.vault()?
             .revoke_router_key(tenant, router, actor)
             .await?;
+        self.invalidate(tenant).await;
+        Ok(())
+    }
+
+    /// Store/rotate an OAuth credential then invalidate the cache. Errors if BYOK is disabled.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at_ms: Option<i64>,
+        scopes: Option<&str>,
+        client_id: Option<&str>,
+        actor: &str,
+    ) -> Result<Uuid, VaultError> {
+        let id = self
+            .vault()?
+            .store_oauth(
+                tenant,
+                router,
+                access_token,
+                refresh_token,
+                expires_at_ms,
+                scopes,
+                client_id,
+                actor,
+            )
+            .await?;
+        self.invalidate(tenant).await;
+        Ok(id)
+    }
+
+    /// Revoke an OAuth credential then invalidate the cache. Errors if BYOK is disabled.
+    pub async fn revoke_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        actor: &str,
+    ) -> Result<(), VaultError> {
+        self.vault()?.revoke_oauth(tenant, router, actor).await?;
         self.invalidate(tenant).await;
         Ok(())
     }
@@ -150,5 +217,34 @@ mod tests {
         c.store(b, router, None, "kB", "t").await.unwrap();
         assert_eq!(key(&c.get(a).await.unwrap()), Some("kA"));
         assert_eq!(key(&c.get(b).await.unwrap()), Some("kB"));
+    }
+
+    #[tokio::test]
+    async fn oauth_cache_serves_and_reflects_writes() {
+        let store = MemoryStore::default();
+        store.name_router(Uuid::from_u128(9), "anthropic");
+        let router = Uuid::from_u128(9);
+        let c = TenantKeyCache::new(Some(Vault::new(StaticKekProvider::new([7u8; 32]), store)));
+        let t = Uuid::new_v4();
+
+        // Empty before any oauth write (and this caches the empty map).
+        assert!(c.get_oauth(t).await.unwrap().is_empty());
+        c.store_oauth(t, router, "tok-1", None, None, None, None, "x")
+            .await
+            .unwrap();
+        // store_oauth invalidated the cache → the write is now visible.
+        assert_eq!(
+            c.get_oauth(t)
+                .await
+                .unwrap()
+                .get("anthropic")
+                .map(String::as_str),
+            Some("tok-1")
+        );
+        // The api_key map is independent and untouched.
+        assert!(c.get(t).await.unwrap().is_empty());
+
+        c.revoke_oauth(t, router, "x").await.unwrap();
+        assert!(c.get_oauth(t).await.unwrap().is_empty());
     }
 }

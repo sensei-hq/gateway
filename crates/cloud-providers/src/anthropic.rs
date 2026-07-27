@@ -384,18 +384,26 @@ fn extract_text(content: &[ContentBlock]) -> String {
 /// without a rebuild.
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 
-/// Apply the fixed Anthropic headers plus any operator-supplied
-/// `config.headers` to an outbound request builder.
+/// Header carrying Anthropic beta opt-ins. In OAuth (bearer) mode the oauth marker is sent
+/// here; an operator can override it via `config.headers` (like the version).
+const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
+/// Default beta marker for the Anthropic OAuth auth mode (overridable via `config.headers`).
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Apply the fixed Anthropic headers plus any operator-supplied `config.headers` to an
+/// outbound request builder.
 ///
-/// `anthropic-version` defaults to [`ANTHROPIC_VERSION`] but an operator
-/// can override it via `config.headers`. The version is resolved once up
-/// front (caller value wins) and skipped during the `config.headers`
-/// pass, so exactly one `anthropic-version` header is emitted rather than
-/// a duplicate. Every other custom header is forwarded verbatim, matching
-/// the openai/gemini/grok adapters.
+/// The auth header depends on the credential kind (F3 OAuth — per the kernel credentials-channel
+/// contract): an OAuth-marked value (`oauth:<token>`) is sent as `Authorization: Bearer <token>`
+/// plus the [`ANTHROPIC_BETA_HEADER`] oauth marker; a plain api_key goes in `x-api-key`.
+///
+/// `anthropic-version` (and, in OAuth mode, `anthropic-beta`) default here but an operator can
+/// override via `config.headers`; the resolved value wins and is skipped during the
+/// `config.headers` pass so exactly one of each is emitted. Every other custom header is
+/// forwarded verbatim, matching the openai/gemini/grok adapters.
 fn apply_request_headers(
     builder: reqwest::RequestBuilder,
-    api_key: &str,
+    credential: &str,
     config: &RouterConfig,
 ) -> reqwest::RequestBuilder {
     let anthropic_version = config
@@ -404,13 +412,31 @@ fn apply_request_headers(
         .map(String::as_str)
         .unwrap_or(ANTHROPIC_VERSION);
     let mut builder = builder
-        .header("x-api-key", api_key)
         .header(ANTHROPIC_VERSION_HEADER, anthropic_version)
         .header("content-type", "application/json");
+    let oauth_mode = match kernel::oauth_token(credential) {
+        Some(token) => {
+            let beta = config
+                .headers
+                .get(ANTHROPIC_BETA_HEADER)
+                .map(String::as_str)
+                .unwrap_or(ANTHROPIC_OAUTH_BETA);
+            builder = builder
+                .header("authorization", format!("Bearer {token}"))
+                .header(ANTHROPIC_BETA_HEADER, beta);
+            true
+        }
+        None => {
+            builder = builder.header("x-api-key", credential);
+            false
+        }
+    };
     for (k, v) in &config.headers {
-        // anthropic-version is already applied above with the caller's
-        // value winning; skip it here so we don't emit a duplicate.
+        // Skip headers already applied above (caller value won) so none is emitted twice.
         if k.eq_ignore_ascii_case(ANTHROPIC_VERSION_HEADER) {
+            continue;
+        }
+        if oauth_mode && k.eq_ignore_ascii_case(ANTHROPIC_BETA_HEADER) {
             continue;
         }
         builder = builder.header(k.as_str(), v.as_str());
@@ -788,6 +814,37 @@ mod tests {
         assert_eq!(h.get("x-custom").unwrap(), "abc");
         // No override present → the const fallback is used.
         assert_eq!(h.get("anthropic-version").unwrap(), ANTHROPIC_VERSION);
+    }
+
+    #[test]
+    fn apply_request_headers_uses_bearer_for_an_oauth_credential() {
+        // An oauth-marked credential authenticates via Authorization: Bearer + the oauth beta
+        // marker, and does NOT send x-api-key. (F3 OAuth — O-1.)
+        let config = config_with_headers(std::collections::HashMap::new());
+        let req = apply_request_headers(
+            Client::new().post("https://api.anthropic.com/v1/messages"),
+            "oauth:tok-XYZ",
+            &config,
+        )
+        .build()
+        .unwrap();
+        let h = req.headers();
+        assert!(
+            h.get("x-api-key").is_none(),
+            "oauth mode must not send x-api-key"
+        );
+        assert_eq!(h.get("authorization").unwrap(), "Bearer tok-XYZ");
+        assert_eq!(h.get("anthropic-beta").unwrap(), ANTHROPIC_OAUTH_BETA);
+        // A plain api_key still uses x-api-key and no bearer.
+        let req2 = apply_request_headers(
+            Client::new().post("https://api.anthropic.com/v1/messages"),
+            "sk-ant-static",
+            &config,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(req2.headers().get("x-api-key").unwrap(), "sk-ant-static");
+        assert!(req2.headers().get("authorization").is_none());
     }
 
     #[test]
