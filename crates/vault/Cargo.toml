@@ -8,6 +8,11 @@ license = "MIT"
 [lib]
 name = "vault"
 
+[features]
+# The Postgres `VaultStore` adapter + Supabase-Vault `KekProvider`. Off by default so the
+# core crate stays dependency-light; strategos/sensei enable it.
+sqlx = ["dep:sqlx"]
+
 [dependencies]
 aes-gcm = "0.10"
 async-trait = "0.1"
@@ -15,6 +20,7 @@ base64 = "0.22"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
