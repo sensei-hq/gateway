@@ -1,6 +1,7 @@
 pub mod capability;
 pub mod config;
 pub mod cost;
+pub mod credential;
 pub mod error;
 pub mod io;
 pub mod request;

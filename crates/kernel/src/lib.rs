@@ -15,5 +15,6 @@ pub use adapters::{AdapterRegistry, RegisterInto};
 pub use readiness::{ProvisionEvent, ProvisionPhase, ReadinessProbe};
 pub use registry::{ModelEntry, ModelFormat, ModelResolver, ModelSource, ResolveError};
 pub use types::capability::Capability;
+pub use types::credential::{OAUTH_PREFIX, oauth_token};
 pub use types::error::GatewayError;
 pub use types::request::{InferenceRequest, InferenceResponse};
