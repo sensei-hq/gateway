@@ -24,6 +24,7 @@ pub(crate) struct MemoryStore {
     pub(crate) deks: Arc<Mutex<HashMap<Uuid, DekCell>>>,
     pub(crate) archive: ArchiveMap,
     pub(crate) creds: Arc<Mutex<HashMap<(Uuid, Uuid), CredCell>>>,
+    pub(crate) oauth: Arc<Mutex<HashMap<(Uuid, Uuid), CredCell>>>,
     pub(crate) names: Arc<Mutex<HashMap<Uuid, String>>>, // router_id -> name
 }
 
@@ -197,5 +198,64 @@ impl VaultStore for MemoryStore {
             }
         }
         Ok(())
+    }
+
+    async fn store_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        sealed: &[u8],
+        _expires_at_ms: Option<i64>,
+        _scopes: Option<&str>,
+        _client_id: Option<&str>,
+        _actor: &str,
+    ) -> Result<Uuid, StoreError> {
+        self.oauth
+            .lock()
+            .unwrap()
+            .insert((tenant, router), (sealed.to_vec(), true));
+        Ok(Uuid::new_v4())
+    }
+
+    async fn get_active_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .oauth
+            .lock()
+            .unwrap()
+            .get(&(tenant, router))
+            .filter(|(_, active)| *active)
+            .map(|(s, _)| s.clone()))
+    }
+
+    async fn deactivate_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        _actor: &str,
+    ) -> Result<(), StoreError> {
+        if let Some(e) = self.oauth.lock().unwrap().get_mut(&(tenant, router)) {
+            e.1 = false;
+        }
+        Ok(())
+    }
+
+    async fn list_active_oauth(&self, tenant: Uuid) -> Result<Vec<StoredCredential>, StoreError> {
+        let names = self.names.lock().unwrap();
+        Ok(self
+            .oauth
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((t, _), (_, active))| *t == tenant && *active)
+            .map(|((_, r), (s, _))| StoredCredential {
+                router_id: *r,
+                router_name: names.get(r).cloned().unwrap_or_default(),
+                sealed: s.clone(),
+            })
+            .collect())
     }
 }

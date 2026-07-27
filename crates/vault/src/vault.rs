@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -27,6 +28,30 @@ pub enum VaultError {
     NoDek(Uuid),
     #[error("vault unavailable (no KEK configured)")]
     NoVault,
+    #[error("oauth bundle codec error")]
+    Codec,
+}
+
+/// The sealed shape of an OAuth credential — an `{access,refresh,expires,scopes}` bundle
+/// serialized to JSON and sealed (AAD-bound) under the tenant DEK, exactly like an api_key.
+/// Only `access_token` is required; the paste-token (`setup-token`) path leaves the rest
+/// `None` (long-lived, no refresh). `expires_at_ms` is unix epoch milliseconds.
+#[derive(Serialize, Deserialize)]
+struct OAuthBundle {
+    access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scopes: Option<String>,
+}
+
+/// A resolved OAuth credential: the bearer access token (in [`Zeroizing`]) + its optional
+/// expiry (epoch millis), for the injection path and — later — the refresh worker.
+pub struct OAuthToken {
+    pub access_token: Zeroizing<String>,
+    pub expires_at_ms: Option<i64>,
 }
 
 /// Seals/unseals provider credentials under a per-tenant DEK (sealed under `K`'s KEK),
@@ -223,6 +248,99 @@ impl<K: KekProvider, S: VaultStore> Vault<K, S> {
         }
         Ok(n)
     }
+
+    // --- OAuth credentials (F3 OAuth) ---------------------------------------------------------
+
+    /// Store (or rotate) an OAuth credential for `(tenant, router)`: seal the
+    /// `{access,refresh,expires,scopes}` bundle (AAD-bound, like an api_key) under the tenant
+    /// DEK and persist it as the active `credential_type='oauth'` row. Auto-provisions the DEK.
+    /// The paste-token path passes just `access_token` (rest `None`). Returns the row id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at_ms: Option<i64>,
+        scopes: Option<&str>,
+        client_id: Option<&str>,
+        actor: &str,
+    ) -> Result<Uuid, VaultError> {
+        self.ensure_tenant_dek(tenant, actor).await?;
+        let dek = self.dek(tenant).await?;
+        let bundle = OAuthBundle {
+            access_token: access_token.to_owned(),
+            refresh_token: refresh_token.map(str::to_owned),
+            expires_at_ms,
+            scopes: scopes.map(str::to_owned),
+        };
+        // Serialize into a Zeroizing buffer so the plaintext JSON is wiped after sealing.
+        let json = Zeroizing::new(serde_json::to_vec(&bundle).map_err(|_| VaultError::Codec)?);
+        let sealed = crypto::seal_credential(&dek, &Self::aad(tenant, router), &json)?;
+        Ok(self
+            .store
+            .store_oauth(
+                tenant,
+                router,
+                &sealed,
+                expires_at_ms,
+                scopes,
+                client_id,
+                actor,
+            )
+            .await?)
+    }
+
+    /// Resolve + decrypt the active OAuth credential for `(tenant, router)` → its bearer access
+    /// token + expiry, if any. A blob relocated to another `(tenant, router)` fails the AAD check.
+    pub async fn resolve_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+    ) -> Result<Option<OAuthToken>, VaultError> {
+        let Some(sealed) = self.store.get_active_oauth(tenant, router).await? else {
+            return Ok(None);
+        };
+        let dek = self.dek(tenant).await?;
+        let json = crypto::unseal_credential(&dek, &Self::aad(tenant, router), &sealed)?;
+        let bundle: OAuthBundle = serde_json::from_str(&json).map_err(|_| VaultError::Codec)?;
+        Ok(Some(OAuthToken {
+            access_token: Zeroizing::new(bundle.access_token),
+            expires_at_ms: bundle.expires_at_ms,
+        }))
+    }
+
+    /// Revoke (deactivate) the active OAuth credential for `(tenant, router)`.
+    pub async fn revoke_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        actor: &str,
+    ) -> Result<(), VaultError> {
+        Ok(self.store.deactivate_oauth(tenant, router, actor).await?)
+    }
+
+    /// Decrypt every active OAuth credential for the tenant into a `router_name → access_token`
+    /// map (what the engine matches on). The DEK is resolved once, only if rows exist.
+    pub async fn resolve_tenant_oauth(
+        &self,
+        tenant: Uuid,
+    ) -> Result<HashMap<String, String>, VaultError> {
+        let rows = self.store.list_active_oauth(tenant).await?;
+        let mut out = HashMap::new();
+        if rows.is_empty() {
+            return Ok(out);
+        }
+        let dek = self.dek(tenant).await?;
+        for row in rows {
+            let json =
+                crypto::unseal_credential(&dek, &Self::aad(tenant, row.router_id), &row.sealed)?;
+            let bundle: OAuthBundle = serde_json::from_str(&json).map_err(|_| VaultError::Codec)?;
+            out.insert(row.router_name, bundle.access_token);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -408,5 +526,71 @@ mod tests {
         );
         // Idempotent: a second pass finds nothing left to migrate.
         assert_eq!(v.reseal_without_aad(t, "migrator").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn oauth_round_trips_and_coexists_with_api_key() {
+        let v = vault();
+        let (t, r) = (Uuid::new_v4(), Uuid::new_v4());
+        v.store.name_router(r, "anthropic");
+        // An api_key and an oauth credential for the SAME (tenant, router) coexist.
+        v.store_router_key(t, r, "sk-ant-static", None, "tester")
+            .await
+            .unwrap();
+        v.store_oauth(t, r, "oauth-access-XYZ", None, None, None, None, "tester")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            v.resolve_oauth(t, r)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token
+                .as_str(),
+            "oauth-access-XYZ"
+        );
+        assert_eq!(
+            v.resolve_router_key(t, r).await.unwrap().unwrap().as_str(),
+            "sk-ant-static",
+            "the api_key credential is untouched by the oauth one"
+        );
+        assert_eq!(
+            v.resolve_tenant_oauth(t)
+                .await
+                .unwrap()
+                .get("anthropic")
+                .map(String::as_str),
+            Some("oauth-access-XYZ")
+        );
+
+        // Revoke the oauth credential only.
+        v.revoke_oauth(t, r, "tester").await.unwrap();
+        assert!(v.resolve_oauth(t, r).await.unwrap().is_none());
+        assert!(
+            v.resolve_router_key(t, r).await.unwrap().is_some(),
+            "revoking oauth leaves the api_key credential active"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_expiry_round_trips_from_the_bundle() {
+        let v = vault();
+        let (t, r) = (Uuid::new_v4(), Uuid::new_v4());
+        v.store_oauth(
+            t,
+            r,
+            "acc",
+            Some("refresh"),
+            Some(1_900_000_000_000),
+            Some("chat"),
+            None,
+            "t",
+        )
+        .await
+        .unwrap();
+        let tok = v.resolve_oauth(t, r).await.unwrap().unwrap();
+        assert_eq!(tok.access_token.as_str(), "acc");
+        assert_eq!(tok.expires_at_ms, Some(1_900_000_000_000));
     }
 }

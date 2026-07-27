@@ -122,4 +122,43 @@ pub trait VaultStore: Send + Sync {
     /// new. Each entry pairs a blob (from [`list_all_dek_blobs`](VaultStore::list_all_dek_blobs))
     /// with its new sealed bytes. `dek_version` is untouched — the DEK material is unchanged.
     async fn apply_dek_rewraps(&self, rewraps: &[(DekBlob, Vec<u8>)]) -> Result<(), StoreError>;
+
+    // --- OAuth credentials (F3 OAuth, `credential_type = 'oauth'`) -------------------------
+    // A `(tenant, router)` may hold one active `api_key` row and one active `oauth` row
+    // (the store enforces uniqueness per `credential_type`). OAuth bytes live in a separate
+    // column from `api_key`; the sealed blob is an opaque `{access,refresh,expires,scopes}`
+    // bundle the `Vault` seals/opens.
+
+    /// Store (upsert) the active oauth credential for `(tenant, router)`: the sealed bundle
+    /// plus its optional expiry (epoch millis), scopes, and client id. One active oauth row
+    /// per `(tenant, router)`; reactivates a revoked row. Returns the row id.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        sealed: &[u8],
+        expires_at_ms: Option<i64>,
+        scopes: Option<&str>,
+        client_id: Option<&str>,
+        actor: &str,
+    ) -> Result<Uuid, StoreError>;
+
+    /// The active oauth credential's sealed bundle for `(tenant, router)`, if any.
+    async fn get_active_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+    ) -> Result<Option<Vec<u8>>, StoreError>;
+
+    /// Deactivate the active oauth credential for `(tenant, router)` (revoke).
+    async fn deactivate_oauth(
+        &self,
+        tenant: Uuid,
+        router: Uuid,
+        actor: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Every active oauth credential for the tenant (for the per-request injection map).
+    async fn list_active_oauth(&self, tenant: Uuid) -> Result<Vec<StoredCredential>, StoreError>;
 }
