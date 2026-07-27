@@ -11,7 +11,8 @@
 //! - Key material and plaintext live in [`zeroize::Zeroizing`].
 //! - Tamper, short blob, AAD mismatch, and a missing/invalid KEK all **fail closed**.
 //!
-//! V1 ships the AEAD envelope ([`crypto`]). Following the epic: `KekProvider` (V2),
+//! V1 ships the AEAD envelope ([`crypto`]); V2 the [`kek`] providers. Following the epic:
 //! `VaultStore` + `Vault` (V3), rotation (V4), and `TenantKeyCache` (V5).
 
 pub mod crypto;
+pub mod kek;
