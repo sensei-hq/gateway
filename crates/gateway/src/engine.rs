@@ -239,10 +239,18 @@ impl Gateway {
             .map(|c| c.fallback_triggers.as_slice())
             .unwrap_or(&[]);
 
-        // 6. Walk candidates in order
+        // 6. Walk candidates in order. When the caller disables fallback
+        // (`allow_fallback = false`), attempt only the primary candidate — the
+        // failure branches below then have nothing to step down to, so a failed
+        // primary returns its error rather than walking the chain.
+        let max_attempts = if request.allow_fallback {
+            result.all_candidates.len()
+        } else {
+            1
+        };
         let mut attempts: Vec<Attempt> = Vec::new();
 
-        for (sequence, candidate) in (1_u8..).zip(result.all_candidates.iter()) {
+        for (sequence, candidate) in (1_u8..).zip(result.all_candidates.iter().take(max_attempts)) {
             let start = Instant::now();
 
             tracing::debug!(
@@ -938,7 +946,12 @@ impl Gateway {
         self.check_quota(&config, request, input_tokens).await?;
 
         // Owned state moved into the stream (it must be `'static`).
-        let candidates = result.all_candidates;
+        // Fallback disabled ⇒ keep only the primary candidate, so `has_more`
+        // is always false downstream and no ProviderSwitch/step-down can fire.
+        let mut candidates = result.all_candidates;
+        if !request.allow_fallback {
+            candidates.truncate(1);
+        }
         let fallback_triggers = result
             .chain
             .as_ref()
@@ -1445,6 +1458,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         }
     }
 
@@ -1562,6 +1576,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
         gw.execute(&request).await.unwrap();
 
@@ -1666,6 +1681,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
         let response = gw.execute(&request).await.unwrap();
 
@@ -1781,6 +1797,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
         gw.execute(&request).await.unwrap();
 
@@ -2011,6 +2028,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
         let msg = gw.execute(&request).await.unwrap_err().to_string();
         assert!(
@@ -2074,6 +2092,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let result = gw.execute(&request).await;
@@ -2107,6 +2126,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let response = gw.execute(&request).await.unwrap();
@@ -2432,6 +2452,40 @@ mod tests {
             response.attempts[1].status,
             crate::types::trace::AttemptStatus::Success
         );
+    }
+
+    #[tokio::test]
+    async fn no_fallback_when_disabled_stops_at_primary() {
+        // `allow_fallback = false` (workspace "Automatic fallback" off): a
+        // ProviderError on the primary is normally fallback-eligible, but with
+        // fallback disabled the engine must NOT step down to the ready noop —
+        // it returns the primary's failure with a single attempt. Guards the
+        // admin toggle against becoming cosmetic.
+        let gw = test_gateway_with_chain();
+        register_failing(
+            &gw,
+            GatewayError::ProviderError {
+                adapter: "failing".into(),
+                message: "server error".into(),
+                status: Some(500),
+            },
+        )
+        .await;
+        register_noop(&gw).await; // registered + ready, but must never be reached
+
+        let req = InferenceRequest {
+            allow_fallback: false,
+            ..chat_request()
+        };
+        match gw.execute(&req).await.unwrap_err() {
+            GatewayError::AllAttemptsFailed { attempts, .. } => {
+                assert_eq!(
+                    attempts, 1,
+                    "only the primary candidate is attempted when fallback is disabled"
+                );
+            }
+            other => panic!("expected AllAttemptsFailed (no fallback), got: {other}"),
+        }
     }
 
     #[tokio::test]
@@ -3096,6 +3150,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let events = collect_stream(&gw, &request).await;
@@ -3276,6 +3331,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         match gw.execute_stream(&request).await {

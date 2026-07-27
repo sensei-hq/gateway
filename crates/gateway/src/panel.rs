@@ -352,6 +352,7 @@ mod tests {
                 auth: None,
                 panel: None,
                 consensus: None,
+                allow_fallback: true,
             }
         }
         fn system_of(req: &InferenceRequest) -> Option<String> {

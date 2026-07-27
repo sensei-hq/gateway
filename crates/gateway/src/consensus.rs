@@ -80,6 +80,7 @@ pub(crate) fn build_chat_request(
         auth: None,
         panel: None,
         consensus: None,
+        allow_fallback: true,
     }
 }
 

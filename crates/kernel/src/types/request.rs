@@ -363,6 +363,12 @@ pub struct AuthContext {
     pub tier: Option<String>,
 }
 
+/// serde default for [`InferenceRequest::allow_fallback`]: an absent field
+/// means "walk the chain" (the historical behaviour).
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub capability: Capability,
@@ -389,6 +395,12 @@ pub struct InferenceRequest {
     /// not a consensus request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consensus: Option<String>,
+    /// When `false`, only the **primary** candidate is attempted — the engine
+    /// will not step down the fallback chain on error. Lets a consumer honor a
+    /// workspace "automatic fallback" policy that is switched off. Defaults to
+    /// `true` (absent ⇒ walk the chain, preserving prior behaviour).
+    #[serde(default = "default_true")]
+    pub allow_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +548,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -570,6 +583,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -824,6 +838,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -861,6 +876,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -974,6 +990,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1096,6 +1113,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1444,6 +1462,7 @@ mod tests {
             auth: None,
             panel: None,
             consensus: None,
+            allow_fallback: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"auth\""));
