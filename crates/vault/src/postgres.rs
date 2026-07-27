@@ -618,4 +618,50 @@ mod tests {
             sqlx::query(stmt).bind(tenant).execute(&pool).await.unwrap();
         }
     }
+
+    /// One-shot AAD migration for the strategos V5 cutover: re-seal every existing credential
+    /// (sealed by the pre-crate inline vault with an empty AAD) under the crate's
+    /// `tenant‖router` AAD. Idempotent — a second run migrates 0. Not part of any suite; run
+    /// deliberately against the real DB with the deploy KEK:
+    ///   TORII_KEK=… DATABASE_URL=… \
+    ///     cargo test -p sensei-vault --features sqlx -- --ignored reseal_all_pre_aad
+    #[tokio::test]
+    #[ignore = "one-shot AAD migration; needs a real DB + TORII_KEK"]
+    async fn reseal_all_pre_aad_credentials() {
+        let pool = pool().await;
+        let kek_b64 = std::env::var("TORII_KEK")
+            .or_else(|_| std::env::var("STRATEGOS_KEK"))
+            .expect("TORII_KEK (or STRATEGOS_KEK) must be set to reseal");
+        let kek: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(kek_b64.trim())
+            .expect("base64 KEK")
+            .try_into()
+            .expect("KEK must be 32 bytes");
+        let vault = Vault::new(
+            StaticKekProvider::new(kek),
+            PostgresVaultStore::new(pool.clone()),
+        );
+
+        let tenants: Vec<Uuid> = sqlx::query_scalar("select tenant_id from core.tenant_keys")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let mut total = 0;
+        for t in &tenants {
+            // Resilient per tenant: a DEK sealed under a *different* KEK (stale seed row, or a
+            // tenant mid-KEK-rotation) is skipped and logged, not fatal — so it can't block the
+            // real tenants' migration. Watch the log to confirm the intended tenant migrated.
+            match vault.reseal_without_aad(*t, "aad-migration").await {
+                Ok(n) => {
+                    eprintln!("reseal {t}: {n} credential(s) migrated");
+                    total += n;
+                }
+                Err(e) => eprintln!("reseal {t}: SKIPPED — {e} (DEK not under this KEK?)"),
+            }
+        }
+        eprintln!(
+            "reseal complete: {} tenant(s) scanned, {total} credential(s) migrated",
+            tenants.len()
+        );
+    }
 }

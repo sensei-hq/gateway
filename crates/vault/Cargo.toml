@@ -20,6 +20,8 @@ base64 = "0.22"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+# `sync` only — the RwLock behind TenantKeyCache; no runtime pulled in.
+tokio = { version = "1", features = ["sync"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid"], optional = true }
 
 [dev-dependencies]
