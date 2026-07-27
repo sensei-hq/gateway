@@ -239,6 +239,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         }
     }
 
@@ -256,6 +257,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         }
     }
 
@@ -302,6 +304,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
         assert!(to_chat_request(&ir, None).is_err());
     }

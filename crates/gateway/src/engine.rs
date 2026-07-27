@@ -271,7 +271,19 @@ impl Gateway {
                 Some(candidate.api_model_id.clone())
             };
             let endpoint = format!("{}:{}", candidate.router, candidate.model);
-            let cfg = &candidate.router_config;
+            // Per-call credential override: a tenant-aware consumer resolves the
+            // caller's key and injects it here, so the engine stays tenant-agnostic.
+            // Preferred over the router's configured api_key/env for this dispatch.
+            let cfg_override;
+            let cfg = match request.credentials.get(&candidate.router) {
+                Some(key) => {
+                    let mut c = candidate.router_config.clone();
+                    c.api_key = Some(key.clone());
+                    cfg_override = c;
+                    &cfg_override
+                }
+                None => &candidate.router_config,
+            };
 
             // Dispatch by capability to the matching registry map + typed method.
             // `None` means no adapter is registered for this router+capability —
@@ -1009,7 +1021,19 @@ impl Gateway {
                             fail_record_cb = true;
                         }
                         Ok(chat_req) => {
-                            match m.chat_stream(&candidate.router_config, &chat_req).await {
+                            // Per-call credential override (see `execute`): tenant-aware
+                            // consumer injects the key; engine stays tenant-agnostic.
+                            let cfg_override;
+                            let cfg = match request.credentials.get(&candidate.router) {
+                                Some(key) => {
+                                    let mut c = candidate.router_config.clone();
+                                    c.api_key = Some(key.clone());
+                                    cfg_override = c;
+                                    &cfg_override
+                                }
+                                None => &candidate.router_config,
+                            };
+                            match m.chat_stream(cfg, &chat_req).await {
                                 Ok(s) => got_stream = Some(s),
                                 Err(e) => {
                                     fail_code = stream_error_code(&e);
@@ -1459,6 +1483,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         }
     }
 
@@ -1577,6 +1602,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
         gw.execute(&request).await.unwrap();
 
@@ -1682,6 +1708,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
         let response = gw.execute(&request).await.unwrap();
 
@@ -1798,6 +1825,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
         gw.execute(&request).await.unwrap();
 
@@ -2029,6 +2057,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
         let msg = gw.execute(&request).await.unwrap_err().to_string();
         assert!(
@@ -2093,6 +2122,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let result = gw.execute(&request).await;
@@ -2127,6 +2157,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let response = gw.execute(&request).await.unwrap();
@@ -2475,6 +2506,7 @@ mod tests {
 
         let req = InferenceRequest {
             allow_fallback: false,
+            credentials: Default::default(),
             ..chat_request()
         };
         match gw.execute(&req).await.unwrap_err() {
@@ -2486,6 +2518,184 @@ mod tests {
             }
             other => panic!("expected AllAttemptsFailed (no fallback), got: {other}"),
         }
+    }
+
+    /// Minimal config: one keyless router "cap" with one TextChat model on it.
+    fn cap_config() -> GatewayConfig {
+        let mut routers = HashMap::new();
+        routers.insert(
+            "cap".to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "cap-model".to_string(),
+            ModelConfig {
+                id: "cap-model".to_string(),
+                api_model_id: None,
+                provider: "cap".to_string(),
+                family: None,
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: None,
+            },
+        );
+        let mut chains = HashMap::new();
+        chains.insert(
+            "cap_chain".to_string(),
+            FallbackChainConfig {
+                id: "cap_chain".to_string(),
+                capability: Capability::TextChat,
+                models: vec![ChainEntry {
+                    model: "cap-model".to_string(),
+                    router: Some("cap".to_string()),
+                    api_model_id: None,
+                    priority: 1,
+                }],
+                fallback_triggers: vec![],
+            },
+        );
+        GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_call_credential_reaches_the_adapter() {
+        use std::sync::Mutex;
+        // Adapter that records the api_key on the RouterConfig it was dispatched with.
+        struct Capturing {
+            seen: Arc<Mutex<Option<String>>>,
+        }
+        impl crate::adapters::capability::Model for Capturing {
+            fn id(&self) -> &str {
+                "cap"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::adapters::capability::ChatModel for Capturing {
+            async fn chat(
+                &self,
+                cfg: &RouterConfig,
+                _req: &crate::types::io::ChatRequest,
+            ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+                *self.seen.lock().unwrap() = cfg.api_key.clone();
+                Ok(crate::types::io::ChatResponse {
+                    content: Some("ok".into()),
+                    model: Some("cap-model".into()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let adapters = AdapterRegistry::new();
+        adapters
+            .register_chat(Arc::new(Capturing { seen: seen.clone() }))
+            .await;
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(cap_config(), adapters, cb);
+
+        // The wrapper resolves the tenant's key and hands it to the engine per call.
+        let mut req = chat_request();
+        req.credentials
+            .insert("cap".to_string(), "sekret-per-call".to_string());
+
+        let resp = gw.execute(&req).await.unwrap();
+        assert!(resp.success);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some("sekret-per-call".to_string()),
+            "the per-call credential must reach the adapter as RouterConfig.api_key"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_call_credential_reaches_the_stream_adapter() {
+        use crate::types::request::StreamChunk;
+        use std::sync::Mutex;
+        // Streaming adapter that records the api_key on the config it streams with.
+        struct CapturingStreamer {
+            seen: Arc<Mutex<Option<String>>>,
+        }
+        impl crate::adapters::capability::Model for CapturingStreamer {
+            fn id(&self) -> &str {
+                "cap"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::adapters::capability::ChatModel for CapturingStreamer {
+            async fn chat(
+                &self,
+                _cfg: &RouterConfig,
+                _req: &crate::types::io::ChatRequest,
+            ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+                Ok(crate::types::io::ChatResponse::default())
+            }
+            async fn chat_stream(
+                &self,
+                cfg: &RouterConfig,
+                _req: &crate::types::io::ChatRequest,
+            ) -> Result<
+                std::pin::Pin<
+                    Box<dyn futures::Stream<Item = Result<StreamChunk, GatewayError>> + Send>,
+                >,
+                GatewayError,
+            > {
+                *self.seen.lock().unwrap() = cfg.api_key.clone();
+                let chunks: Vec<Result<StreamChunk, GatewayError>> = vec![Ok(StreamChunk {
+                    content: "ok".to_string(),
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                    tool_calls: Vec::new(),
+                })];
+                Ok(Box::pin(futures::stream::iter(chunks)))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let adapters = AdapterRegistry::new();
+        adapters
+            .register_chat(Arc::new(CapturingStreamer { seen: seen.clone() }))
+            .await;
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 5,
+            timeout: Duration::from_secs(300),
+            half_open_max_requests: 3,
+        });
+        let gw = Gateway::new(cap_config(), adapters, cb);
+
+        let mut req = chat_request();
+        req.credentials
+            .insert("cap".to_string(), "stream-sekret".to_string());
+
+        let events = collect_stream(&gw, &req).await;
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+            "stream should complete with Done: {events:?}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some("stream-sekret".to_string()),
+            "the per-call credential must reach the stream adapter as RouterConfig.api_key"
+        );
     }
 
     #[tokio::test]
@@ -3151,6 +3361,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let events = collect_stream(&gw, &request).await;
@@ -3332,6 +3543,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         match gw.execute_stream(&request).await {

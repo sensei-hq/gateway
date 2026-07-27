@@ -353,6 +353,7 @@ mod tests {
                 panel: None,
                 consensus: None,
                 allow_fallback: true,
+                credentials: Default::default(),
             }
         }
         fn system_of(req: &InferenceRequest) -> Option<String> {
