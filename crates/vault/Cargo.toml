@@ -10,5 +10,6 @@ name = "vault"
 
 [dependencies]
 aes-gcm = "0.10"
+base64 = "0.22"
 thiserror = "2"
 zeroize = "1"
