@@ -20,6 +20,9 @@ pub mod kek;
 pub mod store;
 pub mod vault;
 
+#[cfg(feature = "sqlx")]
+pub mod postgres;
+
 pub use kek::{KekProvider, Profile};
 pub use store::{StoredCredential, VaultStore};
 pub use vault::{Vault, VaultError};
