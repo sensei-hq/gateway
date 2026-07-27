@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -369,7 +371,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub capability: Capability,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,6 +403,40 @@ pub struct InferenceRequest {
     /// `true` (absent ⇒ walk the chain, preserving prior behaviour).
     #[serde(default = "default_true")]
     pub allow_fallback: bool,
+    /// Per-call provider credential overrides (router → api_key), opaque to the
+    /// engine. When an entry matches the dispatched router, it is injected as
+    /// that call's `RouterConfig.api_key` (preferred over config/env). The
+    /// tenant-aware consumer resolves the caller's key and fills this per
+    /// request, so the engine stays tenant-agnostic. Redacted in `Debug`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub credentials: HashMap<String, String>,
+}
+
+/// Custom `Debug` that never prints credential secret values — `credentials`
+/// renders as the sorted set of router names it overrides (values redacted),
+/// mirroring `RouterConfig`'s key-hiding Debug. All other fields are verbatim.
+impl std::fmt::Debug for InferenceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferenceRequest")
+            .field("capability", &self.capability)
+            .field("model", &self.model)
+            .field("router", &self.router)
+            .field("chain", &self.chain)
+            .field("payload", &self.payload)
+            .field("budget", &self.budget)
+            .field("auth", &self.auth)
+            .field("panel", &self.panel)
+            .field("consensus", &self.consensus)
+            .field("allow_fallback", &self.allow_fallback)
+            .field(
+                "credentials",
+                &self
+                    .credentials
+                    .keys()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +567,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_redacts_credential_values_but_shows_routers() {
+        let mut req = InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::Chat {
+                messages: Vec::new(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: HashMap::new(),
+        };
+        req.credentials
+            .insert("openai".to_string(), "sk-super-secret-value".to_string());
+        let dbg = format!("{req:?}");
+        assert!(
+            !dbg.contains("sk-super-secret-value"),
+            "credential value must not appear in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("openai"),
+            "router name should appear so the override is debuggable: {dbg}"
+        );
+    }
+
+    #[test]
     fn chat_request_serde() {
         let request = InferenceRequest {
             capability: Capability::TextChat,
@@ -549,6 +619,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -584,6 +655,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -839,6 +911,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -877,6 +950,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -991,6 +1065,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1114,6 +1189,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1463,6 +1539,7 @@ mod tests {
             panel: None,
             consensus: None,
             allow_fallback: true,
+            credentials: Default::default(),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"auth\""));

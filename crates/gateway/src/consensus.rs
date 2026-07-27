@@ -81,6 +81,7 @@ pub(crate) fn build_chat_request(
         panel: None,
         consensus: None,
         allow_fallback: true,
+        credentials: Default::default(),
     }
 }
 
