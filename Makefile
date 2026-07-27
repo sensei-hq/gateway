@@ -6,6 +6,10 @@
 ##   crates/gateway          — routing engine (fallback chains, circuit breaker, budgets)
 ##   crates/local-providers  — in-process inference adapters, opt-in native deps (sensei-local-providers)
 ##   crates/local-engine     — model resolvers + Hugging Face pull (sensei-local-engine)
+##   crates/vault            — shared BYOK credential vault (envelope crypto, KEK/DEK) (sensei-vault)
+##
+## `make bump` auto-includes every crate via the crates/*/Cargo.toml glob, so a new
+## crate versions in lockstep with no Makefile change — this list is descriptive only.
 ##
 ## Consumed by sensei (sensei-hq/sensei) as a git dependency (`gateway` /
 ## `local-providers` / `local-engine`) pinned by tag. A release here is just a
