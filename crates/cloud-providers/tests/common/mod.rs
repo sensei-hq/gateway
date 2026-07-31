@@ -124,3 +124,36 @@ pub fn assert_provider_error_status(err: &GatewayError, status: Option<u16>) {
         other => panic!("expected ProviderError, got: {other:?}"),
     }
 }
+
+/// RAII guard that sets an env var for the life of the guard and removes it
+/// on drop — even if the test panics partway through. Replaces the
+/// hand-paired `unsafe { std::env::set_var(..) }` / `unsafe {
+/// std::env::remove_var(..) }` bookends that adapter tests use to exercise
+/// the `api_key_env` resolution path without leaking test env vars into
+/// other tests.
+pub struct EnvVarGuard {
+    key: &'static str,
+}
+
+impl EnvVarGuard {
+    /// Set `key=value` for the current process, returning a guard that
+    /// removes it again on drop.
+    pub fn set(key: &'static str, value: &str) -> Self {
+        // SAFETY: test-only; the mock tests that use this run single env
+        // vars that are unique per test (`__TEST_*_KEY_*__`), so concurrent
+        // mutation of the *same* key from other threads isn't a concern.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `set` above.
+        unsafe {
+            std::env::remove_var(self.key);
+        }
+    }
+}

@@ -19,6 +19,9 @@ use kernel::adapters::capability::{ChatModel, EmbedModel};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{EnvVarGuard, assert_authentication_error, assert_rate_limit_error};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -174,9 +177,7 @@ async fn openai_chat_mock() {
 
     // Set env var for the test
     let env_key = "__TEST_OPENAI_KEY_MOCK__";
-    unsafe {
-        std::env::set_var(env_key, "sk-test-mock-key");
-    }
+    let _env_guard = EnvVarGuard::set(env_key, "sk-test-mock-key");
 
     let canned = serde_json::json!({
         "choices": [{
@@ -206,11 +207,6 @@ async fn openai_chat_mock() {
     let usage = response.usage.unwrap();
     assert_eq!(usage.input_tokens, 12);
     assert_eq!(usage.output_tokens, 6);
-
-    // Cleanup
-    unsafe {
-        std::env::remove_var(env_key);
-    }
 }
 
 #[tokio::test]
@@ -218,9 +214,7 @@ async fn openai_embed_mock() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_OPENAI_KEY_EMBED__";
-    unsafe {
-        std::env::set_var(env_key, "sk-test-embed-key");
-    }
+    let _env_guard = EnvVarGuard::set(env_key, "sk-test-embed-key");
 
     let canned = serde_json::json!({
         "data": [
@@ -247,10 +241,6 @@ async fn openai_embed_mock() {
     let embeddings = response.embeddings;
     assert_eq!(embeddings.len(), 1);
     assert_eq!(embeddings[0], vec![0.01, 0.02, 0.03]);
-
-    unsafe {
-        std::env::remove_var(env_key);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,9 +252,7 @@ async fn anthropic_chat_mock() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_ANTHROPIC_KEY_MOCK__";
-    unsafe {
-        std::env::set_var(env_key, "sk-ant-test-mock-key");
-    }
+    let _env_guard = EnvVarGuard::set(env_key, "sk-ant-test-mock-key");
 
     let canned = serde_json::json!({
         "content": [{"type": "text", "text": "Hello from mock Anthropic!"}],
@@ -293,10 +281,6 @@ async fn anthropic_chat_mock() {
     assert_eq!(usage.input_tokens, 15);
     assert_eq!(usage.output_tokens, 7);
     assert_eq!(usage.total_tokens, 22);
-
-    unsafe {
-        std::env::remove_var(env_key);
-    }
 }
 
 #[tokio::test]
@@ -304,9 +288,7 @@ async fn anthropic_chat_401_auth_error() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_ANTHROPIC_KEY_401__";
-    unsafe {
-        std::env::set_var(env_key, "bad-key");
-    }
+    let _env_guard = EnvVarGuard::set(env_key, "bad-key");
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -321,17 +303,8 @@ async fn anthropic_chat_401_auth_error() {
     let config = router_config_with_key(&server.uri(), env_key);
     let request = chat_request("claude-haiku-4-5-20250414");
 
-    let result = adapter.chat(&config, &request).await;
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
-
-    unsafe {
-        std::env::remove_var(env_key);
-    }
+    let err = adapter.chat(&config, &request).await.unwrap_err();
+    assert_authentication_error(&err);
 }
 
 #[tokio::test]
@@ -339,9 +312,7 @@ async fn anthropic_chat_429_rate_limit() {
     let server = MockServer::start().await;
 
     let env_key = "__TEST_ANTHROPIC_KEY_429__";
-    unsafe {
-        std::env::set_var(env_key, "rate-limited-key");
-    }
+    let _env_guard = EnvVarGuard::set(env_key, "rate-limited-key");
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -356,17 +327,8 @@ async fn anthropic_chat_429_rate_limit() {
     let config = router_config_with_key(&server.uri(), env_key);
     let request = chat_request("claude-haiku-4-5-20250414");
 
-    let result = adapter.chat(&config, &request).await;
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::RateLimit { .. }),
-        "expected RateLimit error, got: {err:?}",
-    );
-
-    unsafe {
-        std::env::remove_var(env_key);
-    }
+    let err = adapter.chat(&config, &request).await.unwrap_err();
+    assert_rate_limit_error(&err);
 }
 
 // ---------------------------------------------------------------------------
