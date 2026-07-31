@@ -25,8 +25,9 @@ use kernel::adapters::capability::VideoModel;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
 mod common;
-use common::{assert_is_provider_error, assert_provider_error_status, mount_status, router_config};
+use common::{assert_is_provider_error, router_config};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -97,63 +98,18 @@ async fn luma_generate_video_happy_path() {
 // Authentication/RateLimit like the shared http_json helper.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn luma_submit_401_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/generations", 401, "invalid api key").await;
-
-    let adapter = LumaAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(401));
-}
-
-#[tokio::test]
-async fn luma_submit_403_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/generations", 403, "forbidden").await;
-
-    let adapter = LumaAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(403));
-}
-
-#[tokio::test]
-async fn luma_submit_429_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/generations", 429, "rate limited").await;
-
-    let adapter = LumaAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(429));
-}
-
-#[tokio::test]
-async fn luma_submit_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        "/generations",
-        500,
-        "internal server error",
-    )
-    .await;
-
-    let adapter = LumaAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        LumaAdapter::new().unwrap().generate_video(&config, &video_request()).await
+    },
+    method: "POST",
+    path: "/generations",
+    cases: {
+        luma_submit_401_maps_to_provider_error => (401, "invalid api key", common::ErrKind::Provider(Some(401))),
+        luma_submit_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
+        luma_submit_429_maps_to_provider_error => (429, "rate limited", common::ErrKind::Provider(Some(429))),
+        luma_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // ---------------------------------------------------------------------------
