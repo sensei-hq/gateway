@@ -23,6 +23,11 @@ export function GET() {
 	}
 	lines.push(
 		'',
+		'## Agent skill',
+		'',
+		`- [using-gateway skill](${SITE_URL}/skills/using-gateway/SKILL.md): drop-in guide to add + use the crates in your repo`,
+		`- Install: \`curl -fsSL ${SITE_URL}/skills/install.sh | sh\` (writes .claude/skills/using-gateway/SKILL.md)`,
+		'',
 		'## Full text',
 		'',
 		`- [All docs, concatenated](${SITE_URL}/llms-full.txt)`,

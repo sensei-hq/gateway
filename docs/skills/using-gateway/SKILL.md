@@ -24,6 +24,7 @@ caller never touches a provider SDK.
   https://gateway.sensei-hq.com/llms.txt · full corpus
   https://gateway.sensei-hq.com/llms-full.txt
 - **In-repo docs:** `docs/llms/` (usage guides) and `docs/features/` (reference).
+- **Update this skill:** re-run `curl -fsSL https://gateway.sensei-hq.com/skills/install.sh | sh`.
 
 Always confirm the current release tag before pinning — check the repo's
 [releases](https://github.com/sensei-hq/gateway/releases). Examples below use
