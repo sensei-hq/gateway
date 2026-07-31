@@ -9,9 +9,11 @@ export function GET() {
 	const lines = [
 		'# gateway',
 		'',
-		'> Shared LLM inference routing engine for Rust — fallback chains, per-endpoint',
-		'> circuit breaker, budget management and request tracing across ~16 cloud',
-		'> providers plus in-process local models, behind one trait-based config.',
+		'> Provider-agnostic multimodal inference routing engine for Rust — routes chat,',
+		'> embeddings, image, video and speech across ~16 cloud providers plus in-process',
+		'> local models. Fallback chains, per-endpoint circuit breaker, budget management,',
+		'> multi-model consensus/panels, request tracing and BYOK credentials (API key or',
+		'> OAuth/bearer), behind one trait-based config.',
 		'',
 		'## Docs',
 		''

@@ -1,16 +1,19 @@
-# gateway — LLM usage guides
+# gateway — usage guides
 
 Task-oriented, copy-pasteable guides for using the `gateway` crate (and its local
-companions `local-providers` + `local-engine`). For deep reference see
-`docs/features/`; this folder is the fast path for an agent that needs to *use* the crate.
+companions `local-providers` + `local-engine`, plus the optional `vault` credential
+crate). For deep reference see `docs/features/`; this folder is the fast path for an
+agent that needs to *use* the crate.
 
 ## What it is
 
-A **provider-agnostic LLM inference routing engine**. You configure providers +
-models + fallback chains once, then send requests **by capability** (chat, embed,
-image, …). The caller never picks a provider SDK — the gateway routes, retries
-down a fallback chain, trips a per-endpoint circuit breaker, meters cost, and
-(optionally) enforces subscription quotas.
+A **provider-agnostic multimodal inference routing engine**. You configure providers +
+models + fallback chains once, then send requests **by capability** — chat, embeddings,
+image, video and speech. The caller never picks a provider SDK — the gateway routes,
+retries down a fallback chain, trips a per-endpoint circuit breaker, meters cost, can
+run multi-model **consensus/panels**, and (optionally) enforces subscription quotas.
+Credentials (API key or OAuth/bearer) come from a caller-supplied map or the companion
+`vault` crate.
 
 ## The mental model (4 pieces)
 
