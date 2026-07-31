@@ -16,11 +16,9 @@ use kernel::adapters::capability::ImageModel;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
 mod common;
-use common::{
-    assert_authentication_error, assert_is_provider_error, assert_provider_error_status,
-    assert_rate_limit_error, mount_status, router_config,
-};
+use common::{assert_is_provider_error, router_config};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82,87 +80,23 @@ async fn flux_generate_image_happy_path() {
 }
 
 // ---------------------------------------------------------------------------
-// Submit error mappings
+// Submit error mappings — FLUX maps 401/403 → Authentication, 429 → RateLimit,
+// 500 → ProviderError (distinct mapping, unlike the fal/kling/luma/runway/replicate
+// adapters that route every submit status through ProviderError).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn flux_submit_401_maps_to_authentication() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        format!("/{DEFAULT_MODEL}"),
-        401,
-        "invalid api key",
-    )
-    .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert_authentication_error(&err);
-}
-
-#[tokio::test]
-async fn flux_submit_403_maps_to_authentication() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        format!("/{DEFAULT_MODEL}"),
-        403,
-        "forbidden",
-    )
-    .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert_authentication_error(&err);
-}
-
-#[tokio::test]
-async fn flux_submit_429_maps_to_rate_limit() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        format!("/{DEFAULT_MODEL}"),
-        429,
-        "rate limited",
-    )
-    .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert_rate_limit_error(&err);
-}
-
-#[tokio::test]
-async fn flux_submit_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        format!("/{DEFAULT_MODEL}"),
-        500,
-        "internal server error",
-    )
-    .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        FluxAdapter::new().unwrap().generate_image(&config, &image_request()).await
+    },
+    method: "POST",
+    path: format!("/{DEFAULT_MODEL}"),
+    cases: {
+        flux_submit_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
+        flux_submit_403_maps_to_authentication => (403, "forbidden", common::ErrKind::Auth),
+        flux_submit_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
+        flux_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // ---------------------------------------------------------------------------
