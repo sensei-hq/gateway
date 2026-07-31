@@ -20,7 +20,9 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod common;
-use common::{EnvVarGuard, assert_authentication_error, assert_rate_limit_error};
+use common::{
+    EnvVarGuard, assert_authentication_error, assert_rate_limit_error, mount_status_json,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -289,15 +291,14 @@ async fn anthropic_chat_401_auth_error() {
 
     let env_key = "__TEST_ANTHROPIC_KEY_401__";
     let _env_guard = EnvVarGuard::set(env_key, "bad-key");
-
-    Mock::given(method("POST"))
-        .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(401)
-                .set_body_json(serde_json::json!({"error": {"message": "invalid api key"}})),
-        )
-        .mount(&server)
-        .await;
+    mount_status_json(
+        &server,
+        "POST",
+        "/v1/messages",
+        401,
+        serde_json::json!({"error": {"message": "invalid api key"}}),
+    )
+    .await;
 
     let adapter = AnthropicAdapter::new().unwrap();
     let config = router_config_with_key(&server.uri(), env_key);
@@ -313,15 +314,14 @@ async fn anthropic_chat_429_rate_limit() {
 
     let env_key = "__TEST_ANTHROPIC_KEY_429__";
     let _env_guard = EnvVarGuard::set(env_key, "rate-limited-key");
-
-    Mock::given(method("POST"))
-        .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(429)
-                .set_body_json(serde_json::json!({"error": {"message": "rate limited"}})),
-        )
-        .mount(&server)
-        .await;
+    mount_status_json(
+        &server,
+        "POST",
+        "/v1/messages",
+        429,
+        serde_json::json!({"error": {"message": "rate limited"}}),
+    )
+    .await;
 
     let adapter = AnthropicAdapter::new().unwrap();
     let config = router_config_with_key(&server.uri(), env_key);
