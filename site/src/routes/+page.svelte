@@ -4,15 +4,14 @@
 	import Seo from '$lib/components/Seo.svelte';
 	import Eyebrow from '$lib/components/Eyebrow.svelte';
 	import SectionHead from '$lib/components/SectionHead.svelte';
-	import CrateCard from '$lib/components/CrateCard.svelte';
 	import CodeFrame from '$lib/components/CodeFrame.svelte';
 	import ArchDiagram from '$lib/components/ArchDiagram.svelte';
 	import ArrowIcon from '$lib/components/ArrowIcon.svelte';
 	import HeroSection from '$lib/components/HeroSection.svelte';
 	import ProofStrip from '$lib/components/ProofStrip.svelte';
 	import FeaturesSection from '$lib/components/FeaturesSection.svelte';
+	import CratesSection from '$lib/components/CratesSection.svelte';
 	import {
-		crates,
 		usage,
 		architecture,
 		consumers,
@@ -37,17 +36,7 @@
 
 <FeaturesSection />
 
-<!-- CRATES -->
-<section id="crates" class="grid-section border-y border-paper-edge bg-paper-soft">
-	<div class="mx-auto max-w-content px-6 py-section">
-		<SectionHead eyebrow={crates.eyebrow} title={crates.title} />
-		<div class="mt-12 grid gap-6 md:grid-cols-2">
-			{#each crates.items as c (c.name)}
-				<CrateCard crate={c} />
-			{/each}
-		</div>
-	</div>
-</section>
+<CratesSection />
 
 <!-- USAGE -->
 <section id="usage" class="grid-section">
