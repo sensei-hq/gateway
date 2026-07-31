@@ -4,7 +4,7 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::base::{build_client, error_from_response, resolve_api_key};
+use crate::base::{build_client, error_from_response};
 use kernel::adapters::capability::{ImageModel, Model};
 use kernel::adapters::{AdapterRegistry, RegisterInto};
 use kernel::types::config::RouterConfig;
@@ -31,15 +31,11 @@ const BASE_URL: &str = "https://api.stability.ai/v2beta";
 const DEFAULT_MODEL: &str = "sd3.5-large";
 
 fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
-    resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
-        adapter: "stability".into(),
-        message: "missing API key — set the env var specified in api_key_env".into(),
-    })
+    crate::base::require_api_key(config, "stability")
 }
 
 fn base_url(config: &RouterConfig) -> &str {
-    let url = config.url.trim_end_matches('/');
-    if url.is_empty() { BASE_URL } else { url }
+    crate::base::base_url_or(config, BASE_URL)
 }
 
 fn size_to_aspect_ratio(size: &Option<String>) -> &'static str {

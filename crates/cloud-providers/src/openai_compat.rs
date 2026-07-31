@@ -23,7 +23,7 @@ use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{error_from_response, http_json, resolve_api_key};
+use crate::base::{JsonEndpoint, error_from_response, http_json, resolve_api_key};
 use kernel::types::config::RouterConfig;
 use kernel::types::cost::TokenUsage;
 use kernel::types::error::GatewayError;
@@ -439,11 +439,13 @@ pub(crate) async fn chat(
 
     let resp: ChatCompletionResponse = http_json(
         client,
-        base_url,
-        "/v1/chat/completions",
+        JsonEndpoint {
+            base_url,
+            path: "/v1/chat/completions",
+            api_key: api_key.as_deref(),
+            extra_headers: &cfg.headers,
+        },
         &body,
-        api_key.as_deref(),
-        &cfg.headers,
     )
     .await?;
 
@@ -565,11 +567,13 @@ pub(crate) async fn embed(
 
     let resp: EmbedResponse = http_json(
         client,
-        base_url,
-        "/v1/embeddings",
+        JsonEndpoint {
+            base_url,
+            path: "/v1/embeddings",
+            api_key: api_key.as_deref(),
+            extra_headers: &cfg.headers,
+        },
         &body,
-        api_key.as_deref(),
-        &cfg.headers,
     )
     .await?;
 
@@ -617,6 +621,30 @@ fn process_stream_bytes(state: &mut OpenAiStreamState, bytes: &[u8]) {
     }
 }
 
+/// Absorb one event's tool-call deltas into the per-index accumulator.
+/// `id` + `function.name` arrive on the first delta for a given index;
+/// subsequent deltas only carry argument fragments (`function.arguments`),
+/// which are appended rather than replaced.
+fn absorb_tool_call_deltas(
+    tool_calls: &mut BTreeMap<u32, StreamingToolCall>,
+    deltas: &[StreamToolCallDelta],
+) {
+    for d in deltas {
+        let acc = tool_calls.entry(d.index).or_default();
+        if let Some(id) = &d.id {
+            acc.id = Some(id.clone());
+        }
+        if let Some(func) = &d.function {
+            if let Some(name) = &func.name {
+                acc.name = Some(name.clone());
+            }
+            if let Some(args) = &func.arguments {
+                acc.push_arguments(args);
+            }
+        }
+    }
+}
+
 /// Handle a single SSE `data:` line. Drops empty lines, the
 /// `[DONE]` sentinel, and any line that fails to parse — emitting
 /// chunks into `state.pending` when a parsed event carries data the
@@ -635,24 +663,8 @@ fn process_sse_line(state: &mut OpenAiStreamState, line: &str) {
         return;
     };
 
-    // Absorb any tool-call deltas into the per-index accumulator. id +
-    // function.name arrive on the first delta for an index; subsequent
-    // deltas only carry argument fragments.
     if let Some(deltas) = choice.delta.tool_calls.as_ref() {
-        for d in deltas {
-            let acc = state.tool_calls.entry(d.index).or_default();
-            if let Some(id) = &d.id {
-                acc.id = Some(id.clone());
-            }
-            if let Some(func) = &d.function {
-                if let Some(name) = &func.name {
-                    acc.name = Some(name.clone());
-                }
-                if let Some(args) = &func.arguments {
-                    acc.push_arguments(args);
-                }
-            }
-        }
+        absorb_tool_call_deltas(&mut state.tool_calls, deltas);
     }
 
     let content = choice.delta.content.clone().unwrap_or_default();
