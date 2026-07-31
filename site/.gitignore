@@ -11,3 +11,6 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .wrangler
 .DS_Store
+# Vitest browser-mode failure artifacts (screenshots + attachments)
+.vitest-attachments
+**/__screenshots__

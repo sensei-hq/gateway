@@ -15,6 +15,14 @@
 - Commit after each task once its tests are green and `bun run check` passes.
 - All `git`/`bun` commands run from the repo root unless a `cd site` is shown.
 
+**Test API (confirmed against `vitest-browser-svelte@3.0.0` + `@vitest/browser@4.1.10` in Task 0.3):**
+- `render()` is **async** — always `const screen = await render(Component, props?)`. (The draft snippets in later tasks show `const screen = render(...)`; add `await`.)
+- `screen` exposes `.container` (raw `HTMLElement`) plus Testing-Library locator methods spread on it (`getByRole`, `getByText`, `getByLabelText`, `getByTestId`, …).
+- `expect.element(locatorOrElement)` is globally augmented (retrying); `locator.element()` returns the raw node; `locator.click()` interacts. No jest-dom import needed.
+- Cleanup between tests is automatic (the package registers a `beforeEach` unmount).
+- The browser project prints as `client (chromium)` — grep for it to confirm a test really ran in the browser.
+- Failure artifacts (`.vitest-attachments`, `**/__screenshots__`) are gitignored in `site/.gitignore`.
+
 ---
 
 ## Phase 0 — Test harness
