@@ -4,15 +4,14 @@
 	import Seo from '$lib/components/Seo.svelte';
 	import Eyebrow from '$lib/components/Eyebrow.svelte';
 	import SectionHead from '$lib/components/SectionHead.svelte';
-	import InfoCard from '$lib/components/InfoCard.svelte';
 	import CrateCard from '$lib/components/CrateCard.svelte';
 	import CodeFrame from '$lib/components/CodeFrame.svelte';
 	import ArchDiagram from '$lib/components/ArchDiagram.svelte';
 	import ArrowIcon from '$lib/components/ArrowIcon.svelte';
 	import HeroSection from '$lib/components/HeroSection.svelte';
 	import ProofStrip from '$lib/components/ProofStrip.svelte';
+	import FeaturesSection from '$lib/components/FeaturesSection.svelte';
 	import {
-		features,
 		crates,
 		usage,
 		architecture,
@@ -36,17 +35,7 @@
 
 <ProofStrip />
 
-<!-- FEATURES -->
-<section id="features" class="grid-section">
-	<div class="mx-auto max-w-content px-6 py-section">
-		<SectionHead eyebrow={features.eyebrow} title={features.title} lede={features.lede} />
-		<div class="mt-12 grid gap-4 sm:grid-cols-2 md:grid-cols-3">
-			{#each features.items as f (f.tag)}
-				<InfoCard tag={f.tag} title={f.title} body={f.body} />
-			{/each}
-		</div>
-	</div>
-</section>
+<FeaturesSection />
 
 <!-- CRATES -->
 <section id="crates" class="grid-section border-y border-paper-edge bg-paper-soft">
