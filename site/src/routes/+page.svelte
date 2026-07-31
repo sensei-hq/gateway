@@ -11,10 +11,10 @@
 	import CtaSection from '$lib/components/CtaSection.svelte';
 
 	const description =
-		'gateway is a provider-agnostic LLM inference routing engine for Rust — fallback chains, per-endpoint circuit breaker, budget management and request tracing across ~16 cloud providers plus in-process local models, behind one trait-based config.';
+		'gateway is a provider-agnostic multimodal inference routing engine for Rust — routing chat, embeddings, image, video and speech across ~16 cloud providers plus in-process local models, with fallback chains, per-endpoint circuit breaker, budget management, multi-model consensus and request tracing behind one trait-based config.';
 </script>
 
-<Seo title="gateway — LLM inference routing engine for Rust" {description} />
+<Seo title="gateway — multimodal inference routing engine for Rust" {description} />
 
 <span id="top"></span>
 
