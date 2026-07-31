@@ -346,10 +346,9 @@ impl ProvisioningSupervisor {
         let sem = self.sem.clone();
         #[cfg(feature = "coldboot")]
         let ctx = self.ctx.clone();
+        let job = ProvisionJob { model, plan, tx };
         tokio::spawn(run_job(
-            model,
-            plan,
-            tx,
+            job,
             sem,
             #[cfg(feature = "coldboot")]
             ctx,
@@ -401,16 +400,24 @@ impl kernel::ReadinessProbe for ProvisioningSupervisor {
     }
 }
 
+/// A job's identity: the model it provisions, the plan driving it, and the
+/// phase channel it reports through. Bundled into one value so `run_job`
+/// doesn't carry each as its own parameter alongside the semaphore/context.
+struct ProvisionJob {
+    model: String,
+    plan: ProvisionPlan,
+    tx: watch::Sender<ProvisionPhase>,
+}
+
 /// Run one provisioning job to completion, driving `tx` through the plan's
 /// phases. Holds a semaphore permit for the job's lifetime so at most
 /// `max_concurrent` run at once.
 async fn run_job(
-    model: String,
-    plan: ProvisionPlan,
-    tx: watch::Sender<ProvisionPhase>,
+    job: ProvisionJob,
     sem: Arc<Semaphore>,
     #[cfg(feature = "coldboot")] ctx: ColdbootCtx,
 ) {
+    let ProvisionJob { model, plan, tx } = job;
     // `acquire_owned` errs only if the semaphore is closed, which we never do;
     // the permit releases on return (and on panic).
     let _permit = sem.acquire_owned().await;
@@ -469,6 +476,72 @@ mod coldboot {
             Ok(None) => Err(format!("model '{model}' is not known to any resolver")),
             Err(e) => Err(format!("resolving '{model}': {e}")),
         }
+    }
+
+    /// Load an adapter off the blocking pool via `load`, then register it —
+    /// driving `tx` through `Loading` → `Ready`/`Failed`. Shared tail behind
+    /// every provider whose job blocking-loads a [`kernel::adapters::RegisterInto`]
+    /// adapter and registers it (fastembed / ort / kokoro): only the concrete
+    /// adapter type and the `load` closure differ between them.
+    async fn load_blocking_and_register<A, E, F>(
+        tx: &watch::Sender<ProvisionPhase>,
+        ctx: &ColdbootCtx,
+        load: F,
+    ) where
+        A: kernel::adapters::RegisterInto + 'static,
+        E: std::fmt::Display + Send + 'static,
+        F: FnOnce() -> Result<A, E> + Send + 'static,
+    {
+        emit(tx, ProvisionPhase::Loading);
+        let loaded = tokio::task::spawn_blocking(load).await;
+        let adapter = match loaded {
+            Ok(Ok(adapter)) => adapter,
+            Ok(Err(e)) => {
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: e.to_string(),
+                    },
+                );
+                return;
+            }
+            Err(e) => {
+                emit(
+                    tx,
+                    ProvisionPhase::Failed {
+                        error: format!("load task failed: {e}"),
+                    },
+                );
+                return;
+            }
+        };
+        ctx.registry.register(Arc::new(adapter)).await;
+        emit(tx, ProvisionPhase::Ready);
+    }
+
+    /// Resolve `model` to its on-disk entry, then load + register it via
+    /// [`load_blocking_and_register`]. Shared body behind [`run_fastembed`],
+    /// [`run_ort`], and [`run_kokoro`] — the three plans that resolve first and
+    /// have no download step.
+    async fn resolve_load_and_register<A, E, F>(
+        model: &str,
+        tx: &watch::Sender<ProvisionPhase>,
+        ctx: &ColdbootCtx,
+        load: F,
+    ) where
+        A: kernel::adapters::RegisterInto + 'static,
+        E: std::fmt::Display + Send + 'static,
+        F: FnOnce(ModelEntry) -> Result<A, E> + Send + 'static,
+    {
+        emit(tx, ProvisionPhase::Verifying);
+        let entry = match resolve_entry(model, ctx).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                emit(tx, ProvisionPhase::Failed { error: e });
+                return;
+            }
+        };
+        load_blocking_and_register(tx, ctx, move || load(entry)).await;
     }
 
     /// Register the single embedded llama.cpp router (idempotent). It serves
@@ -573,44 +646,12 @@ mod coldboot {
         tx: &watch::Sender<ProvisionPhase>,
         ctx: &ColdbootCtx,
     ) {
-        emit(tx, ProvisionPhase::Verifying);
-        let entry = match resolve_entry(&model, ctx).await {
-            Ok(entry) => entry,
-            Err(e) => {
-                emit(tx, ProvisionPhase::Failed { error: e });
-                return;
-            }
-        };
-
-        emit(tx, ProvisionPhase::Loading);
-        // Native load is blocking — keep it off the async worker threads.
-        let loaded = tokio::task::spawn_blocking(move || {
+        // Native load is blocking — `resolve_load_and_register` keeps it off
+        // the async worker threads via `spawn_blocking`.
+        resolve_load_and_register(&model, tx, ctx, move |entry| {
             local_providers::adapters::FastembedAdapter::load(&entry, config)
         })
         .await;
-        let adapter = match loaded {
-            Ok(Ok(adapter)) => adapter,
-            Ok(Err(e)) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: e.to_string(),
-                    },
-                );
-                return;
-            }
-            Err(e) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: format!("load task failed: {e}"),
-                    },
-                );
-                return;
-            }
-        };
-        ctx.registry.register(Arc::new(adapter)).await;
-        emit(tx, ProvisionPhase::Ready);
     }
 
     /// Load an ONNX embedding model with ONNX Runtime and register it.
@@ -621,43 +662,10 @@ mod coldboot {
         tx: &watch::Sender<ProvisionPhase>,
         ctx: &ColdbootCtx,
     ) {
-        emit(tx, ProvisionPhase::Verifying);
-        let entry = match resolve_entry(&model, ctx).await {
-            Ok(entry) => entry,
-            Err(e) => {
-                emit(tx, ProvisionPhase::Failed { error: e });
-                return;
-            }
-        };
-
-        emit(tx, ProvisionPhase::Loading);
-        let loaded = tokio::task::spawn_blocking(move || {
+        resolve_load_and_register(&model, tx, ctx, move |entry| {
             local_providers::adapters::OrtAdapter::load(&entry, config)
         })
         .await;
-        let adapter = match loaded {
-            Ok(Ok(adapter)) => adapter,
-            Ok(Err(e)) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: e.to_string(),
-                    },
-                );
-                return;
-            }
-            Err(e) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: format!("load task failed: {e}"),
-                    },
-                );
-                return;
-            }
-        };
-        ctx.registry.register(Arc::new(adapter)).await;
-        emit(tx, ProvisionPhase::Ready);
     }
 
     /// Load Kokoro-82M for TTS and register it as a `TtsModel` (gh#23). Mirrors
@@ -670,43 +678,10 @@ mod coldboot {
         tx: &watch::Sender<ProvisionPhase>,
         ctx: &ColdbootCtx,
     ) {
-        emit(tx, ProvisionPhase::Verifying);
-        let entry = match resolve_entry(&model, ctx).await {
-            Ok(entry) => entry,
-            Err(e) => {
-                emit(tx, ProvisionPhase::Failed { error: e });
-                return;
-            }
-        };
-
-        emit(tx, ProvisionPhase::Loading);
-        let loaded = tokio::task::spawn_blocking(move || {
+        resolve_load_and_register(&model, tx, ctx, move |entry| {
             local_providers::adapters::KokoroAdapter::load(&entry, config)
         })
         .await;
-        let adapter = match loaded {
-            Ok(Ok(adapter)) => adapter,
-            Ok(Err(e)) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: e.to_string(),
-                    },
-                );
-                return;
-            }
-            Err(e) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: format!("load task failed: {e}"),
-                    },
-                );
-                return;
-            }
-        };
-        ctx.registry.register(Arc::new(adapter)).await;
-        emit(tx, ProvisionPhase::Ready);
     }
 
     /// Pull Kokoro's model + voice files from HF (streaming progress), then load
@@ -764,34 +739,10 @@ mod coldboot {
             }
         };
 
-        emit(tx, ProvisionPhase::Loading);
-        let loaded = tokio::task::spawn_blocking(move || {
+        load_blocking_and_register(tx, ctx, move || {
             local_providers::adapters::KokoroAdapter::load(&entry, config)
         })
         .await;
-        let adapter = match loaded {
-            Ok(Ok(adapter)) => adapter,
-            Ok(Err(e)) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: e.to_string(),
-                    },
-                );
-                return;
-            }
-            Err(e) => {
-                emit(
-                    tx,
-                    ProvisionPhase::Failed {
-                        error: format!("load task failed: {e}"),
-                    },
-                );
-                return;
-            }
-        };
-        ctx.registry.register(Arc::new(adapter)).await;
-        emit(tx, ProvisionPhase::Ready);
     }
 }
 
