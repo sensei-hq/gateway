@@ -55,6 +55,27 @@ async fn mount_submit(server: &MockServer, task_id: &str) {
         .await;
 }
 
+/// Submit succeeds, then the poll endpoint returns `poll`; assert the adapter maps it to a
+/// ProviderError (status `None` — the poll phase doesn't attach an HTTP status). The only
+/// axis that varies is that poll response — a terminal `"FAILED"` status, a 5xx, or an
+/// unparseable 200 body.
+async fn assert_poll_error(task_id: &str, poll: ResponseTemplate) {
+    let server = MockServer::start().await;
+    mount_submit(&server, task_id).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tasks/{task_id}")))
+        .respond_with(poll)
+        .mount(&server)
+        .await;
+
+    let err = RunwayAdapter::new()
+        .unwrap()
+        .generate_video(&router_config(&server.uri()), &video_request())
+        .await
+        .unwrap_err();
+    assert_provider_error_status(&err, None);
+}
+
 // ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
@@ -133,72 +154,38 @@ async fn runway_submit_unparseable_body_maps_to_provider_error() {
 // Poll-phase failures
 // ---------------------------------------------------------------------------
 
+/// A terminal `"FAILED"` poll status with a failure message -> ProviderError.
 #[tokio::test]
 async fn runway_poll_failed_status_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit(&server, "task-fail-1").await;
-
-    // First (and only) poll returns a terminal "FAILED" status with a
-    // failure message; the adapter surfaces it as a ProviderError.
-    Mock::given(method("GET"))
-        .and(path("/tasks/task-fail-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+    assert_poll_error(
+        "task-fail-1",
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "FAILED",
             "output": null,
             "failure": "content policy violation"
-        })))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, None);
+        })),
+    )
+    .await;
 }
 
+/// The poll endpoint itself returns a non-success HTTP status.
 #[tokio::test]
 async fn runway_poll_http_error_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit(&server, "task-fail-2").await;
-
-    // The poll endpoint itself returns a non-success HTTP status.
-    Mock::given(method("GET"))
-        .and(path("/tasks/task-fail-2"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("poll server error"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, None);
+    assert_poll_error(
+        "task-fail-2",
+        ResponseTemplate::new(500).set_body_string("poll server error"),
+    )
+    .await;
 }
 
+/// Poll returns 200 but an un-parseable status body.
 #[tokio::test]
 async fn runway_poll_unparseable_body_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit(&server, "task-fail-3").await;
-
-    // Poll returns 200 but an un-parseable status body.
-    Mock::given(method("GET"))
-        .and(path("/tasks/task-fail-3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("still not json"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, None);
+    assert_poll_error(
+        "task-fail-3",
+        ResponseTemplate::new(200).set_body_string("still not json"),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
