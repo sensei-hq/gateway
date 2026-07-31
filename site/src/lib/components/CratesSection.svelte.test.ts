@@ -8,6 +8,8 @@ test('renders the heading and one card per crate', async () => {
 	const screen = await render(CratesSection);
 	await expect.element(screen.getByText(crates.title)).toBeInTheDocument();
 	for (const c of crates.items) {
-		await expect.element(screen.getByText(c.name)).toBeInTheDocument();
+		// exact match: the crate name span (a name like "vault" also appears as a
+		// substring in its own description body, so a loose match is ambiguous).
+		await expect.element(screen.getByText(c.name, { exact: true })).toBeInTheDocument();
 	}
 });
