@@ -41,7 +41,7 @@ let resp     = gateway.execute(&request).await?;
 | [recipes](recipes.md) | Routing modes, fallback, streaming, cost, budget, persistence, quotas, tools |
 | [embedded-and-hf](embedded-and-hf.md) | Run local models (llama.cpp/ONNX) + download from the HF Hub |
 | [custom-adapters](custom-adapters.md) | Add a provider the crate doesn't ship |
-| [upgrade-0.2-to-0.3](upgrade-0.2-to-0.3.md) | Migrate a pinned dep from 0.2.x |
+| [upgrading](upgrading.md) | Re-pin a dep across releases (newest-first: 0.3→0.4, 0.2→0.3) |
 
 ## Key invariants (don't fight these)
 
