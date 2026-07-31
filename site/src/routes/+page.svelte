@@ -4,7 +4,7 @@
 	import Seo from '$lib/components/Seo.svelte';
 	import Eyebrow from '$lib/components/Eyebrow.svelte';
 	import SectionHead from '$lib/components/SectionHead.svelte';
-	import FeatureCard from '$lib/components/FeatureCard.svelte';
+	import InfoCard from '$lib/components/InfoCard.svelte';
 	import CrateCard from '$lib/components/CrateCard.svelte';
 	import CodeWindow from '$lib/components/CodeWindow.svelte';
 	import UsageTabs from '$lib/components/UsageTabs.svelte';
@@ -83,7 +83,7 @@
 		<SectionHead eyebrow={features.eyebrow} title={features.title} lede={features.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 md:grid-cols-3">
 			{#each features.items as f (f.tag)}
-				<FeatureCard tag={f.tag} title={f.title} body={f.body} />
+				<InfoCard tag={f.tag} title={f.title} body={f.body} />
 			{/each}
 		</div>
 	</div>
