@@ -15,10 +15,6 @@
 //! `GatewayError::ProviderError { status: Some(code), .. }`. These tests assert
 //! that ACTUAL behavior.
 
-use std::collections::HashMap;
-
-use kernel::types::config::RouterConfig;
-use kernel::types::error::GatewayError;
 use kernel::types::io::VideoRequest;
 
 use cloud_providers::kling::KlingAdapter;
@@ -27,23 +23,15 @@ use kernel::adapters::capability::VideoModel;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{assert_is_provider_error, assert_provider_error_status, mount_status, router_config};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const SAMPLE_URL: &str = "https://cdn.klingai.com/output/generated-video.mp4";
 const SUBMIT_PATH: &str = "/videos/text2video";
-
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn video_request() -> VideoRequest {
     VideoRequest {
@@ -151,109 +139,53 @@ async fn kling_generate_video_succeed_without_video_falls_back() {
 #[tokio::test]
 async fn kling_submit_401_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(SUBMIT_PATH))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", SUBMIT_PATH, 401, "invalid api key").await;
 
     let adapter = KlingAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(401),
-                ..
-            }
-        ),
-        "expected ProviderError with status 401, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(401));
 }
 
 #[tokio::test]
 async fn kling_submit_403_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(SUBMIT_PATH))
-        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", SUBMIT_PATH, 403, "forbidden").await;
 
     let adapter = KlingAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(403),
-                ..
-            }
-        ),
-        "expected ProviderError with status 403, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(403));
 }
 
 #[tokio::test]
 async fn kling_submit_429_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(SUBMIT_PATH))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", SUBMIT_PATH, 429, "rate limited").await;
 
     let adapter = KlingAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(429),
-                ..
-            }
-        ),
-        "expected ProviderError with status 429, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(429));
 }
 
 #[tokio::test]
 async fn kling_submit_500_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(SUBMIT_PATH))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", SUBMIT_PATH, 500, "internal server error").await;
 
     let adapter = KlingAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(500));
 }
 
 /// A 200 submit response whose body can't be parsed as the task envelope must
@@ -275,10 +207,7 @@ async fn kling_submit_unparseable_body_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError parsing submit response, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,10 +237,7 @@ async fn kling_poll_failed_status_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from failed poll, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 /// A non-success HTTP status on the poll endpoint -> mapped ProviderError.
@@ -332,10 +258,7 @@ async fn kling_poll_http_error_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from poll HTTP error, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 /// A 200 poll response whose body can't be parsed as the status envelope must
@@ -357,8 +280,5 @@ async fn kling_poll_unparseable_body_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError parsing poll status, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }

@@ -8,10 +8,6 @@
 //! returns "still processing", every mocked poll endpoint here returns a
 //! terminal status on its FIRST response so the tests stay sub-second.
 
-use std::collections::HashMap;
-
-use kernel::types::config::RouterConfig;
-use kernel::types::error::GatewayError;
 use kernel::types::io::ImageRequest;
 
 use cloud_providers::flux::FluxAdapter;
@@ -20,23 +16,18 @@ use kernel::adapters::capability::ImageModel;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{
+    assert_authentication_error, assert_is_provider_error, assert_provider_error_status,
+    assert_rate_limit_error, mount_status, router_config,
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const SAMPLE_URL: &str = "https://bfl.ai/output/generated-image.png";
 const DEFAULT_MODEL: &str = "flux-pro-1.1";
-
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn image_request() -> ImageRequest {
     ImageRequest {
@@ -97,91 +88,81 @@ async fn flux_generate_image_happy_path() {
 #[tokio::test]
 async fn flux_submit_401_maps_to_authentication() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
+    mount_status(
+        &server,
+        "POST",
+        format!("/{DEFAULT_MODEL}"),
+        401,
+        "invalid api key",
+    )
+    .await;
 
     let adapter = FluxAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
+    assert_authentication_error(&err);
 }
 
 #[tokio::test]
 async fn flux_submit_403_maps_to_authentication() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
-        .mount(&server)
-        .await;
+    mount_status(
+        &server,
+        "POST",
+        format!("/{DEFAULT_MODEL}"),
+        403,
+        "forbidden",
+    )
+    .await;
 
     let adapter = FluxAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
+    assert_authentication_error(&err);
 }
 
 #[tokio::test]
 async fn flux_submit_429_maps_to_rate_limit() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&server)
-        .await;
+    mount_status(
+        &server,
+        "POST",
+        format!("/{DEFAULT_MODEL}"),
+        429,
+        "rate limited",
+    )
+    .await;
 
     let adapter = FluxAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::RateLimit { .. }),
-        "expected RateLimit error, got: {err:?}",
-    );
+    assert_rate_limit_error(&err);
 }
 
 #[tokio::test]
 async fn flux_submit_500_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
-        .mount(&server)
-        .await;
+    mount_status(
+        &server,
+        "POST",
+        format!("/{DEFAULT_MODEL}"),
+        500,
+        "internal server error",
+    )
+    .await;
 
     let adapter = FluxAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(500));
 }
 
 // ---------------------------------------------------------------------------
@@ -216,10 +197,7 @@ async fn flux_poll_error_status_maps_to_provider_error() {
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from failed poll, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 #[tokio::test]
@@ -249,8 +227,5 @@ async fn flux_poll_failed_status_maps_to_provider_error() {
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from failed poll, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
