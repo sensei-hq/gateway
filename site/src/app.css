@@ -25,6 +25,12 @@
 	/* Faint hairline for the grid backdrop (independent of the token system). */
 	--grid-line: oklch(0.45 0.01 80 / 0.09);
 }
+/* Declared explicitly (not only on :root) so the VersioningSection's nested
+   inverted panel (data-mode flipped to light on a dark page) picks up the light
+   hairline rather than inheriting the dark one. */
+[data-mode='light'] {
+	--grid-line: oklch(0.45 0.01 80 / 0.09);
+}
 [data-mode='dark'] {
 	--grid-line: oklch(0.85 0.02 245 / 0.07);
 	/* primary is a single (constant) accent palette, so text on a primary fill
