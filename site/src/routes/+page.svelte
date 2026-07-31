@@ -4,15 +4,14 @@
 	import Seo from '$lib/components/Seo.svelte';
 	import Eyebrow from '$lib/components/Eyebrow.svelte';
 	import SectionHead from '$lib/components/SectionHead.svelte';
-	import CodeFrame from '$lib/components/CodeFrame.svelte';
 	import ArchDiagram from '$lib/components/ArchDiagram.svelte';
 	import ArrowIcon from '$lib/components/ArrowIcon.svelte';
 	import HeroSection from '$lib/components/HeroSection.svelte';
 	import ProofStrip from '$lib/components/ProofStrip.svelte';
 	import FeaturesSection from '$lib/components/FeaturesSection.svelte';
 	import CratesSection from '$lib/components/CratesSection.svelte';
+	import UsageSection from '$lib/components/UsageSection.svelte';
 	import {
-		usage,
 		architecture,
 		consumers,
 		versioning,
@@ -38,16 +37,7 @@
 
 <CratesSection />
 
-<!-- USAGE -->
-<section id="usage" class="grid-section">
-	<div class="mx-auto max-w-content px-6 py-section">
-		<SectionHead eyebrow={usage.eyebrow} title={usage.title} lede={usage.lede} />
-		<div class="mt-10">
-			<CodeFrame tabs={usage.tabs} />
-			<p class="mt-4 px-1 font-mono text-sm text-ink-soft">{usage.note}</p>
-		</div>
-	</div>
-</section>
+<UsageSection />
 
 <!-- ARCHITECTURE -->
 <section id="architecture" class="grid-section border-y border-paper-edge bg-paper-soft">
