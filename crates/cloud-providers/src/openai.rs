@@ -5,7 +5,7 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{build_client, error_from_response, resolve_api_key};
+use crate::base::{build_client, error_from_response};
 use crate::openai_compat;
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
@@ -74,10 +74,7 @@ const DEFAULT_MODEL: &str = "gpt-4o-mini";
 
 /// Require an API key, returning an Authentication error when missing.
 fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
-    resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
-        adapter: "openai".into(),
-        message: "missing API key — set the env var specified in api_key_env".into(),
-    })
+    crate::base::require_api_key(config, "openai")
 }
 
 // ---------------------------------------------------------------------------

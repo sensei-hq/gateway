@@ -35,22 +35,55 @@ pub fn resolve_api_key(config: &RouterConfig) -> Option<String> {
         .and_then(|env_var| std::env::var(env_var).ok())
 }
 
+/// [`resolve_api_key`], mapping a missing key to `GatewayError::Authentication`
+/// tagged with `adapter`. Shared by every async-job / REST adapter whose only
+/// auth failure mode at this point is "no key configured" — they call this
+/// before building the submit request so a missing key short-circuits
+/// without touching the wire.
+pub fn require_api_key(config: &RouterConfig, adapter: &str) -> Result<String, GatewayError> {
+    resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
+        adapter: adapter.into(),
+        message: "missing API key — set the env var specified in api_key_env".into(),
+    })
+}
+
+/// `config.url` with a trailing slash trimmed, falling back to `default`
+/// when the operator left `url` empty (e.g. the zero-value `RouterConfig`
+/// adapters build in `new()`/tests). Shared by every adapter that targets a
+/// fixed provider base URL but allows a per-router override.
+pub fn base_url_or<'a>(config: &'a RouterConfig, default: &'a str) -> &'a str {
+    let url = config.url.trim_end_matches('/');
+    if url.is_empty() { default } else { url }
+}
+
+/// Target + auth for an [`http_json`] call. Groups the parameters that
+/// always travel together (the endpoint a request is aimed at) so the
+/// function itself only takes the `client` doing the work and the `body`
+/// being sent, rather than five positional arguments.
+pub struct JsonEndpoint<'a> {
+    pub base_url: &'a str,
+    pub path: &'a str,
+    pub api_key: Option<&'a str>,
+    pub extra_headers: &'a HashMap<String, String>,
+}
+
 /// POST JSON to a provider endpoint, return parsed response.
 pub async fn http_json<T: serde::de::DeserializeOwned>(
     client: &Client,
-    base_url: &str,
-    path: &str,
+    endpoint: JsonEndpoint<'_>,
     body: &impl serde::Serialize,
-    api_key: Option<&str>,
-    extra_headers: &HashMap<String, String>,
 ) -> Result<T, GatewayError> {
-    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let url = format!(
+        "{}{}",
+        endpoint.base_url.trim_end_matches('/'),
+        endpoint.path
+    );
     let mut req = client.post(&url).json(body);
 
-    if let Some(key) = api_key {
+    if let Some(key) = endpoint.api_key {
         req = req.bearer_auth(key);
     }
-    for (k, v) in extra_headers {
+    for (k, v) in endpoint.extra_headers {
         req = req.header(k.as_str(), v.as_str());
     }
 
