@@ -6,6 +6,23 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## Unreleased
+
+Small breaking change to the **`sensei-vault`** OAuth API (a maintainability refactor —
+behaviour is unchanged). `store_oauth` now takes a struct instead of a long positional
+list:
+
+| Before | After |
+|---|---|
+| `Vault::store_oauth(tenant, router, access_token, refresh_token, expires_at_ms, scopes, client_id, actor)` | `Vault::store_oauth(tenant, router, &OAuthCredential { access_token, refresh_token, expires_at_ms, scopes, client_id }, actor)` |
+| `TenantKeyCache::store_oauth(…same…)` | `TenantKeyCache::store_oauth(tenant, router, &OAuthCredential { … }, actor)` |
+| `VaultStore::store_oauth(tenant, router, sealed, expires_at_ms, scopes, client_id, actor)` | `VaultStore::store_oauth(tenant, router, SealedOAuth { sealed, expires_at_ms, scopes, client_id }, actor)` |
+
+`OAuthCredential` and `SealedOAuth` are re-exported from the crate root. **Action:** if you
+implement `VaultStore` (e.g. sensei's own store adapter), update the `store_oauth`
+signature; if you only call the vault, update the call sites. Nothing else in the vault
+API changed.
+
 ## 0.3.x → 0.4.x
 
 Re-pinning from a `v0.3.x` tag to **`v0.4.x`**. This is the release where the workspace
