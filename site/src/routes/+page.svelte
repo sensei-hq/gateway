@@ -1,8 +1,6 @@
 <script lang="ts">
 	import { Button } from '@rokkit/ui';
-	import { vibe } from '@rokkit/states';
 	import Seo from '$lib/components/Seo.svelte';
-	import Eyebrow from '$lib/components/Eyebrow.svelte';
 	import SectionHead from '$lib/components/SectionHead.svelte';
 	import ArchDiagram from '$lib/components/ArchDiagram.svelte';
 	import ArrowIcon from '$lib/components/ArrowIcon.svelte';
@@ -12,17 +10,11 @@
 	import CratesSection from '$lib/components/CratesSection.svelte';
 	import UsageSection from '$lib/components/UsageSection.svelte';
 	import ConsumersSection from '$lib/components/ConsumersSection.svelte';
-	import {
-		architecture,
-		versioning,
-		start
-	} from '$lib/data';
+	import VersioningSection from '$lib/components/VersioningSection.svelte';
+	import { architecture, start } from '$lib/data';
 
 	const description =
 		'gateway is a provider-agnostic LLM inference routing engine for Rust — fallback chains, per-endpoint circuit breaker, budget management and request tracing across ~16 cloud providers plus in-process local models, behind one trait-based config.';
-
-	// The versioning panel flips to the opposite mode of the page (mockup detail).
-	const invMode = $derived(vibe.mode === 'dark' ? 'light' : 'dark');
 </script>
 
 <Seo title="gateway — LLM inference routing engine for Rust" {description} />
@@ -52,31 +44,7 @@
 
 <ConsumersSection />
 
-<!-- VERSIONING (inverted panel) -->
-<section id="versioning" data-mode={invMode} class="grid-section border-y border-paper-edge bg-paper">
-	<div
-		class="mx-auto grid max-w-content items-center gap-10 px-6 py-section md:grid-cols-2 md:gap-14"
-	>
-		<div class="flex flex-col gap-4">
-			<Eyebrow>{versioning.eyebrow}</Eyebrow>
-			<h2 class="font-display font-semibold text-h2 text-ink text-balance">{versioning.title}</h2>
-			<p class="max-w-xl text-lg text-ink-mute text-pretty">{versioning.lede}</p>
-		</div>
-		<div class="flex flex-col gap-3">
-			{#each versioning.steps as s (s.n)}
-				<div
-					class="flex items-start gap-3 rounded-lg border border-paper-edge bg-paper-mute px-5 py-4"
-				>
-					<span class="font-mono text-sm text-primary">{s.n}</span>
-					<div>
-						<div class="font-display font-semibold text-ink">{s.title}</div>
-						<div class="mt-1 font-mono text-sm text-ink-soft">{s.note}</div>
-					</div>
-				</div>
-			{/each}
-		</div>
-	</div>
-</section>
+<VersioningSection />
 
 <!-- CTA -->
 <section id="start" class="grid-section">
