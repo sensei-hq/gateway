@@ -7,7 +7,8 @@
 </script>
 
 <header
-	class="sticky top-0 z-40 border-b border-paper-edge bg-paper/80 backdrop-blur-md backdrop-saturate-150"
+	class="sticky top-0 z-40 border-b border-line backdrop-blur-md backdrop-saturate-150"
+	style="background-color: color-mix(in oklch, var(--paper) 92%, transparent)"
 >
 	<div class="mx-auto flex max-w-content items-center justify-between gap-6 px-6 py-3.5">
 		<a href="/#top" class="inline-flex items-center gap-2.5">
