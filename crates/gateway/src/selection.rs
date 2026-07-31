@@ -127,43 +127,60 @@ impl<'a> ModelSelectionService<'a> {
         let router_name = criteria.router.clone().unwrap_or_default();
         let model_name = criteria.model.clone().unwrap_or_default();
 
-        // Every validation failure below skips with the same shape: a single
-        // `SkippedCandidate` for this router+model and no selected/candidate.
-        // Closing over the names once here removes that boilerplate from
-        // each check.
-        let reject = |reason: String| SelectionResult {
-            selected: None,
-            all_candidates: vec![],
-            skipped: vec![SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason,
-            }],
-            chain: None,
-        };
+        match self.validate_direct(&router_name, &model_name, criteria) {
+            Ok(selected) => SelectionResult {
+                selected: None, // filled by caller
+                all_candidates: vec![selected],
+                skipped: vec![],
+                chain: None,
+            },
+            Err(reason) => SelectionResult {
+                selected: None,
+                all_candidates: vec![],
+                skipped: vec![SkippedCandidate {
+                    model: model_name,
+                    router: router_name,
+                    reason,
+                }],
+                chain: None,
+            },
+        }
+    }
 
+    /// Validate a caller-pinned router+model pair for tier 1, mirroring
+    /// [`Self::validate_chain_entry`]'s pipeline (router exists+enabled,
+    /// model exists+supports capability, circuit breaker, budget) without the
+    /// entry-level router/api_model_id resolution that tier 2/3 needs.
+    fn validate_direct(
+        &self,
+        router_name: &str,
+        model_name: &str,
+        criteria: &SelectionCriteria,
+    ) -> Result<SelectedModel, String> {
         // Validate router exists and is enabled
-        let router_config = match self.config.routers.get(&router_name) {
-            Some(rc) => rc,
-            None => return reject("router not found".to_string()),
-        };
+        let router_config = self
+            .config
+            .routers
+            .get(router_name)
+            .ok_or_else(|| "router not found".to_string())?;
         if !router_config.enabled {
-            return reject("router disabled".to_string());
+            return Err("router disabled".to_string());
         }
 
         // Validate model exists and supports capability
-        let model_config = match self.config.models.get(&model_name) {
-            Some(mc) => mc,
-            None => return reject("model not found".to_string()),
-        };
+        let model_config = self
+            .config
+            .models
+            .get(model_name)
+            .ok_or_else(|| "model not found".to_string())?;
         if !model_config.capabilities.contains(&criteria.capability) {
-            return reject(format!("does not support {:?}", criteria.capability));
+            return Err(format!("does not support {:?}", criteria.capability));
         }
 
         // Circuit breaker check
         let endpoint = format!("{}:{}", router_name, model_name);
         if !self.circuit_breaker.can_execute(&endpoint) {
-            return reject("circuit breaker open".to_string());
+            return Err("circuit breaker open".to_string());
         }
 
         // Cost estimation and budget check
@@ -171,7 +188,7 @@ impl<'a> ModelSelectionService<'a> {
         if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
             && est.estimated > budget
         {
-            return reject(format!(
+            return Err(format!(
                 "over budget (estimated {:.4}, budget {:.4})",
                 est.estimated, budget
             ));
@@ -180,24 +197,17 @@ impl<'a> ModelSelectionService<'a> {
         let api_model_id = model_config
             .api_model_id
             .clone()
-            .unwrap_or_else(|| model_name.clone());
+            .unwrap_or_else(|| model_name.to_string());
 
-        let selected = SelectedModel {
-            model: model_name,
-            router: router_name,
+        Ok(SelectedModel {
+            model: model_name.to_string(),
+            router: router_name.to_string(),
             router_config: router_config.clone(),
             model_config: model_config.clone(),
             api_model_id,
             priority: 1,
             cost_estimate,
-        };
-
-        SelectionResult {
-            selected: None, // filled by caller
-            all_candidates: vec![selected],
-            skipped: vec![],
-            chain: None,
-        }
+        })
     }
 
     /// Tier 2/3: Walk chain entries sorted by priority, validating each.
@@ -240,20 +250,17 @@ impl<'a> ModelSelectionService<'a> {
         let model_name = &entry.model;
 
         // Look up the model config
-        let model_config = match self.config.models.get(model_name) {
-            Some(mc) => mc,
-            None => {
-                let router_name = entry
-                    .router
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Err(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: "model not found".to_string(),
-                });
+        let model_config = self.config.models.get(model_name).ok_or_else(|| {
+            let router_name = entry
+                .router
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name,
+                reason: "model not found".to_string(),
             }
-        };
+        })?;
 
         // Resolve router: chain entry router, else model's provider
         let router_name = entry
@@ -262,16 +269,15 @@ impl<'a> ModelSelectionService<'a> {
             .unwrap_or_else(|| model_config.provider.clone());
 
         // Validate router exists and is enabled
-        let router_config = match self.config.routers.get(&router_name) {
-            Some(rc) => rc,
-            None => {
-                return Err(SkippedCandidate {
+        let router_config =
+            self.config
+                .routers
+                .get(&router_name)
+                .ok_or_else(|| SkippedCandidate {
                     model: model_name.clone(),
-                    router: router_name,
+                    router: router_name.clone(),
                     reason: "router not found".to_string(),
-                });
-            }
-        };
+                })?;
 
         if !router_config.enabled {
             return Err(SkippedCandidate {
