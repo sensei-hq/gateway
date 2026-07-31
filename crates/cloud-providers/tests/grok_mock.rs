@@ -22,10 +22,11 @@ use kernel::adapters::capability::{ChatModel, SttModel, TtsModel};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
 mod common;
 use common::{
-    assert_authentication_error, assert_provider_error_status, assert_rate_limit_error,
-    mount_status, router_config, router_config_missing_key,
+    assert_authentication_error, assert_provider_error_status, mount_status, router_config,
+    router_config_missing_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -110,70 +111,18 @@ async fn grok_chat_happy_path() {
 // Chat — error mappings (routed through the shared http_json helper)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn grok_chat_401_maps_to_authentication() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        "/v1/chat/completions",
-        401,
-        "invalid api key",
-    )
-    .await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = chat_request();
-
-    let err = adapter.chat(&config, &request).await.unwrap_err();
-    assert_authentication_error(&err);
-}
-
-#[tokio::test]
-async fn grok_chat_403_maps_to_authentication() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/v1/chat/completions", 403, "forbidden").await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = chat_request();
-
-    let err = adapter.chat(&config, &request).await.unwrap_err();
-    assert_authentication_error(&err);
-}
-
-#[tokio::test]
-async fn grok_chat_429_maps_to_rate_limit() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/v1/chat/completions", 429, "rate limited").await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = chat_request();
-
-    let err = adapter.chat(&config, &request).await.unwrap_err();
-    assert_rate_limit_error(&err);
-}
-
-#[tokio::test]
-async fn grok_chat_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        "/v1/chat/completions",
-        500,
-        "internal server error",
-    )
-    .await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = chat_request();
-
-    let err = adapter.chat(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        GrokAdapter::new().unwrap().chat(&config, &chat_request()).await
+    },
+    method: "POST",
+    path: "/v1/chat/completions",
+    cases: {
+        grok_chat_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
+        grok_chat_403_maps_to_authentication => (403, "forbidden", common::ErrKind::Auth),
+        grok_chat_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
+        grok_chat_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,57 +165,17 @@ async fn grok_stt_unsupported_format_returns_provider_error() {
     assert_provider_error_status(&err, None);
 }
 
-#[tokio::test]
-async fn grok_stt_401_maps_to_authentication() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        "/v1/audio/transcriptions",
-        401,
-        "invalid api key",
-    )
-    .await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = stt_request("wav");
-
-    let err = adapter.transcribe(&config, &request).await.unwrap_err();
-    assert_authentication_error(&err);
-}
-
-#[tokio::test]
-async fn grok_stt_429_maps_to_rate_limit() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        "/v1/audio/transcriptions",
-        429,
-        "rate limited",
-    )
-    .await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = stt_request("webm");
-
-    let err = adapter.transcribe(&config, &request).await.unwrap_err();
-    assert_rate_limit_error(&err);
-}
-
-#[tokio::test]
-async fn grok_stt_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/v1/audio/transcriptions", 500, "boom").await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = stt_request("m4a");
-
-    let err = adapter.transcribe(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        GrokAdapter::new().unwrap().transcribe(&config, &stt_request("wav")).await
+    },
+    method: "POST",
+    path: "/v1/audio/transcriptions",
+    cases: {
+        grok_stt_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
+        grok_stt_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
+        grok_stt_500_maps_to_provider_error => (500, "boom", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,43 +204,17 @@ async fn grok_tts_happy_path() {
     assert_eq!(response.audio, audio_bytes);
 }
 
-#[tokio::test]
-async fn grok_tts_403_maps_to_authentication() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/v1/audio/speech", 403, "forbidden").await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = tts_request();
-
-    let err = adapter.speak(&config, &request).await.unwrap_err();
-    assert_authentication_error(&err);
-}
-
-#[tokio::test]
-async fn grok_tts_429_maps_to_rate_limit() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/v1/audio/speech", 429, "slow down").await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = tts_request();
-
-    let err = adapter.speak(&config, &request).await.unwrap_err();
-    assert_rate_limit_error(&err);
-}
-
-#[tokio::test]
-async fn grok_tts_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/v1/audio/speech", 500, "internal error").await;
-
-    let adapter = GrokAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = tts_request();
-
-    let err = adapter.speak(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        GrokAdapter::new().unwrap().speak(&config, &tts_request()).await
+    },
+    method: "POST",
+    path: "/v1/audio/speech",
+    cases: {
+        grok_tts_403_maps_to_authentication => (403, "forbidden", common::ErrKind::Auth),
+        grok_tts_429_maps_to_rate_limit => (429, "slow down", common::ErrKind::RateLimit),
+        grok_tts_500_maps_to_provider_error => (500, "internal error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // ---------------------------------------------------------------------------
