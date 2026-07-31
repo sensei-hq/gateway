@@ -37,9 +37,7 @@ use ::ort::{
     value::Tensor,
 };
 use async_trait::async_trait;
-use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
-use kernel::types::io::{EmbedRequest, EmbedResponse};
 use std::path::Path;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
@@ -311,24 +309,9 @@ impl kernel::adapters::capability::Model for OrtAdapter {
     }
 }
 
-#[async_trait]
-impl kernel::adapters::capability::EmbedModel for OrtAdapter {
-    async fn embed(
-        &self,
-        _config: &RouterConfig,
-        req: &EmbedRequest,
-    ) -> Result<EmbedResponse, GatewayError> {
-        // `embed_response` rejects a request pinned to a model this adapter
-        // doesn't serve, then calls the inherent `OrtAdapter::embed(&[String])`
-        // below (preserving the ONNX session + tokenizer path) and wraps it.
-        super::embed_response(
-            &self.config.adapter_id,
-            &self.config.model_id,
-            req.model.as_deref(),
-            || self.embed(&req.texts),
-        )
-    }
-}
+// Embed-only, delegating to the inherent `OrtAdapter::embed` (ONNX session + tokenizer
+// path) via the shared macro.
+crate::impl_embed_via_inherent!(OrtAdapter);
 
 #[async_trait]
 impl kernel::adapters::RegisterInto for OrtAdapter {
