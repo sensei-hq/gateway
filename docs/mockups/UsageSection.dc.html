@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="stylesheet" href="./fonts.css">
+<script src="./content.js"></script>
+<script src="./uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime/uno.global.js"></script>
+</helmet>
+<section id="usage" class="shell py-section">
+  <dc-import name="SectionHead" eyebrow="{{ eyebrow }}" title="{{ title }}" body="{{ body }}" hint-size="100%,200px"></dc-import>
+  <div class="mt-9">
+    <dc-import name="CodeFrame" tabs="{{ tabs }}" active-tab="{{ activeTab }}" on-select-tab="{{ selectTab }}" code="{{ currentCode }}" hint-size="100%,260px"></dc-import>
+    <p class="meta mt-4">{{ footnote }}</p>
+  </div>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = { activeTab: null };
+  content() { return (typeof window !== 'undefined' && window.__GATEWAY_CONTENT) || {}; }
+  componentDidMount() { this.awaitContent(); }
+  awaitContent() {
+    if (typeof window === 'undefined' || window.__GATEWAY_CONTENT) return;
+    clearTimeout(this.__ct);
+    this.__ct = setTimeout(() => { this.awaitContent(); this.forceUpdate(); }, 100);
+  }
+  renderVals() {
+    const u = this.content().usage || {};
+    const tabs = u.tabs || [];
+    const activeTab = this.state.activeTab || (tabs[0] && tabs[0].id) || null;
+    const current = tabs.filter(t => t.id === activeTab)[0] || tabs[0] || {};
+    return {
+      eyebrow: u.eyebrow || '', title: u.title || '', body: u.body || '', footnote: u.footnote || '',
+      tabs: tabs.map(t => ({ id: t.id, label: t.label })),
+      activeTab,
+      currentCode: current.code || '',
+      selectTab: id => this.setState({ activeTab: id })
+    };
+  }
+}
+</script>
+</body>
+</html>

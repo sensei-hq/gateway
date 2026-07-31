@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="stylesheet" href="./fonts.css">
+<script src="./uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime/uno.global.js"></script>
+</helmet>
+<div class="frame">
+  <div class="{{ barCls }}">
+    <sc-if value="{{ hasTabs }}">
+      <sc-for list="{{ tabList }}" as="tab" hint-placeholder-count="3">
+        <button onClick="{{ tab.onSelect }}" class="{{ tab.cls }}">{{ tab.label }}</button>
+      </sc-for>
+    </sc-if>
+    <sc-if value="{{ hasChrome }}" hint-placeholder-val="{{ true }}">
+      <span class="dot bg-dot-red"></span>
+      <span class="dot bg-dot-amber"></span>
+      <span class="dot bg-dot-green"></span>
+      <span class="font-mono text-micro text-code-faint ml-1.5">{{ filename }}</span>
+    </sc-if>
+    <sc-if value="{{ copyable }}">
+      <button onClick="{{ copy }}" class="ml-auto font-mono text-micro text-code-faint bg-chip px-2.5 py-1 rounded-chip transition-colors duration-150 hover:text-code-fg">{{ copyLabel }}</button>
+    </sc-if>
+  </div>
+  <pre class="bg-code-bg text-code-fg text-code px-5 py-5 overflow-x-auto">{{ code }}</pre>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:620,&quot;height&quot;:240},&quot;filename&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;Cargo.toml&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;code&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;[dependencies]&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;copyable&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;},&quot;tabs&quot;:{&quot;editor&quot;:null,&quot;default&quot;:null,&quot;tsType&quot;:&quot;Array&lt;{ id: string; label: string }>&quot;},&quot;activeTab&quot;:{&quot;editor&quot;:null,&quot;default&quot;:null,&quot;tsType&quot;:&quot;string&quot;},&quot;onSelectTab&quot;:{&quot;editor&quot;:null,&quot;default&quot;:null,&quot;tsType&quot;:&quot;(id: string) => void&quot;}}">
+class Component extends DCLogic {
+  state = { copied: false };
+  copy = () => {
+    try { navigator.clipboard.writeText(this.props.code || ''); } catch (e) {}
+    this.setState({ copied: true });
+    clearTimeout(this.__t);
+    this.__t = setTimeout(() => this.setState({ copied: false }), 1500);
+  };
+  renderVals() {
+    const p = this.props || {};
+    const tabs = Array.isArray(p.tabs) ? p.tabs : [];
+    const active = p.activeTab || (tabs[0] && tabs[0].id);
+    const base = 'font-mono text-caption font-medium px-3.5 py-2.5 rounded-t-control transition-colors duration-150 ';
+    return {
+      filename: p.filename || 'code',
+      code: p.code || '',
+      copyable: !!p.copyable,
+      copyLabel: this.state.copied ? 'Copied' : 'Copy',
+      copy: this.copy,
+      hasTabs: tabs.length > 0,
+      hasChrome: tabs.length === 0,
+      barCls: 'bg-code-bar flex items-center border-b border-code-line ' + (tabs.length ? 'gap-0.5 px-2.5 pt-2' : 'gap-2 px-3.5 py-3'),
+      tabList: tabs.map(t => ({
+        label: t.label,
+        cls: base + (t.id === active ? 'text-code-fg bg-code-bg' : 'text-code-faint hover:text-code-fg'),
+        onSelect: () => { if (p.onSelectTab) p.onSelectTab(t.id); }
+      }))
+    };
+  }
+}
+</script>
+</body>
+</html>
