@@ -43,6 +43,15 @@ Derived accent tokens are re-declared on every themed subtree so nesting re-deri
 - The preflight is assembled from an array of lines, not a template literal, so a stray
   backtick can never kill the file.
 
+## App sync (`site/`)
+The `site/` SvelteKit app now mirrors this mockup inventory 1:1: `SiteHeader`, `SiteFooter`,
+`InfoCard`, `CodeFrame` (the merged `CodeWindow`+`UsageTabs`), every section block
+(`HeroSection`, `ProofStrip`, `FeaturesSection`, `CratesSection`, `UsageSection`,
+`ArchitectureSection`, `ConsumersSection`, `VersioningSection`, `CtaSection`), plus the
+internal `ArchDiagram` (d3) used by `ArchitectureSection`. `+page.svelte` is composition-only;
+each block reads its own slice of `site/src/lib/data.ts`, which is code-derived (not the
+stale `content.js` above). Every component has a co-located `*.svelte.test.ts`.
+
 ## Known deltas from the pre-migration design
 - Body copy stepped up to 16px (`text-body`) per the ≥16px minimum; the old 15px step
   survives as `text-sub` for dense card/nav copy.
