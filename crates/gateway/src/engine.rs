@@ -1380,11 +1380,33 @@ mod tests {
     use crate::types::capability::Capability;
     use crate::types::config::{
         ChainEntry, ConstraintsConfig, FallbackChainConfig, FallbackTrigger, GatewayConfig,
-        MeterUnit, ModelConfig, QuotaLimit, RouterConfig, TierConstraints, Window,
+        MeterUnit, ModelConfig, ModelPricing, QuotaLimit, RouterConfig, TierConstraints, Window,
     };
+    use crate::types::cost::TokenUsage;
     use crate::types::request::{AuthContext, Message, MessageRole, Payload};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The standard single-entry "chat_chain" -> "noop" fallback chain shared
+    /// by the noop-adapter test fixtures (also used, with its own model, by
+    /// `purpose.rs`'s equivalent fixture).
+    fn noop_chat_chain() -> FallbackChainConfig {
+        FallbackChainConfig {
+            id: "chat_chain".to_string(),
+            capability: Capability::TextChat,
+            models: vec![ChainEntry {
+                model: "noop".to_string(),
+                router: Some("noop".to_string()),
+                api_model_id: None,
+                priority: 1,
+            }],
+            fallback_triggers: vec![
+                FallbackTrigger::RateLimit,
+                FallbackTrigger::Timeout,
+                FallbackTrigger::ProviderError,
+            ],
+        }
+    }
 
     fn test_config_with_noop() -> GatewayConfig {
         let mut routers = HashMap::new();
@@ -1416,24 +1438,7 @@ mod tests {
         );
 
         let mut chains = HashMap::new();
-        chains.insert(
-            "chat_chain".to_string(),
-            FallbackChainConfig {
-                id: "chat_chain".to_string(),
-                capability: Capability::TextChat,
-                models: vec![ChainEntry {
-                    model: "noop".to_string(),
-                    router: Some("noop".to_string()),
-                    api_model_id: None,
-                    priority: 1,
-                }],
-                fallback_triggers: vec![
-                    FallbackTrigger::RateLimit,
-                    FallbackTrigger::Timeout,
-                    FallbackTrigger::ProviderError,
-                ],
-            },
-        );
+        chains.insert("chat_chain".to_string(), noop_chat_chain());
 
         GatewayConfig {
             routers,
@@ -1479,6 +1484,103 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+        }
+    }
+
+    /// A GatewayConfig with a single "priced" router+model (`TextChat`, no
+    /// chain, priced at $0.0008/1k input and $0.004/1k output), shared by the
+    /// tests that assert on `Cost::from_usage x pricing` / persisted spend.
+    fn priced_gateway_config() -> GatewayConfig {
+        let mut routers = HashMap::new();
+        routers.insert(
+            "priced".to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "priced".to_string(),
+            ModelConfig {
+                id: "priced".to_string(),
+                api_model_id: None,
+                provider: "priced".to_string(),
+                family: None,
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: Some(ModelPricing {
+                    input_per_1k: 0.0008,
+                    output_per_1k: 0.004,
+                    per_request: None,
+                }),
+            },
+        );
+        GatewayConfig {
+            routers,
+            models,
+            chains: HashMap::new(),
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        }
+    }
+
+    /// A chat request pinned directly at the "priced" router/model (no chain).
+    fn priced_chat_request() -> InferenceRequest {
+        InferenceRequest {
+            capability: Capability::TextChat,
+            model: Some("priced".to_string()),
+            router: Some("priced".to_string()),
+            chain: None,
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+        }
+    }
+
+    /// Chat adapter that reports a fixed, non-trivial token usage (1000 in /
+    /// 500 out), so callers can assert cost = usage x pricing (or persisted
+    /// spend) without a live provider.
+    struct UsageAdapter;
+    impl crate::adapters::capability::Model for UsageAdapter {
+        fn id(&self) -> &str {
+            "priced"
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::adapters::capability::ChatModel for UsageAdapter {
+        async fn chat(
+            &self,
+            _cfg: &RouterConfig,
+            _req: &crate::types::io::ChatRequest,
+        ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+            Ok(crate::types::io::ChatResponse {
+                content: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 500,
+                    total_tokens: 1500,
+                }),
+                model: Some("priced".to_string()),
+                degraded: false,
+            })
         }
     }
 
@@ -1606,98 +1708,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_fills_actual_cost_from_usage_and_pricing() {
-        use crate::types::config::ModelPricing;
-        use crate::types::cost::TokenUsage;
-
-        struct UsageAdapter;
-        impl crate::adapters::capability::Model for UsageAdapter {
-            fn id(&self) -> &str {
-                "priced"
-            }
-        }
-        #[async_trait::async_trait]
-        impl crate::adapters::capability::ChatModel for UsageAdapter {
-            async fn chat(
-                &self,
-                _cfg: &RouterConfig,
-                _req: &crate::types::io::ChatRequest,
-            ) -> Result<crate::types::io::ChatResponse, GatewayError> {
-                Ok(crate::types::io::ChatResponse {
-                    content: Some("ok".to_string()),
-                    tool_calls: Vec::new(),
-                    usage: Some(TokenUsage {
-                        input_tokens: 1000,
-                        output_tokens: 500,
-                        total_tokens: 1500,
-                    }),
-                    model: Some("priced".to_string()),
-                    degraded: false,
-                })
-            }
-        }
-
-        let mut routers = HashMap::new();
-        routers.insert(
-            "priced".to_string(),
-            RouterConfig {
-                url: "http://localhost".to_string(),
-                api_key_env: None,
-                api_key: None,
-                enabled: true,
-                timeout_ms: None,
-                headers: HashMap::new(),
-            },
-        );
-        let mut models = HashMap::new();
-        models.insert(
-            "priced".to_string(),
-            ModelConfig {
-                id: "priced".to_string(),
-                api_model_id: None,
-                provider: "priced".to_string(),
-                family: None,
-                capabilities: vec![Capability::TextChat],
-                context_window: 4096,
-                max_output_tokens: 1024,
-                pricing: Some(ModelPricing {
-                    input_per_1k: 0.0008,
-                    output_per_1k: 0.004,
-                    per_request: None,
-                }),
-            },
-        );
-        let config = GatewayConfig {
-            routers,
-            models,
-            chains: HashMap::new(),
-            constraints: Default::default(),
-            panels: Default::default(),
-            consensus: Default::default(),
-        };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
-        let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+        let gw = Gateway::new(priced_gateway_config(), AdapterRegistry::new(), cb);
         gw.adapters.register_chat(Arc::new(UsageAdapter)).await;
 
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
-            model: Some("priced".to_string()),
-            router: Some("priced".to_string()),
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "hi")],
-                system: None,
-                max_tokens: None,
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
-            auth: None,
-            panel: None,
-            consensus: None,
-            allow_fallback: true,
-            credentials: Default::default(),
-        };
-        let response = gw.execute(&request).await.unwrap();
+        let response = gw.execute(&priced_chat_request()).await.unwrap();
 
         // input 1000/1000 * 0.0008 = 0.0008; output 500/1000 * 0.004 = 0.002; total 0.0028
         let cost = response
@@ -1718,99 +1733,14 @@ mod tests {
         // With a store attached, a successful call is persisted so burn-rate
         // (`get_spend_since`) has data — the deferred store-wiring, now live.
         use crate::store::{GatewayStore, InMemoryStore};
-        use crate::types::config::ModelPricing;
-        use crate::types::cost::TokenUsage;
 
-        struct UsageAdapter;
-        impl crate::adapters::capability::Model for UsageAdapter {
-            fn id(&self) -> &str {
-                "priced"
-            }
-        }
-        #[async_trait::async_trait]
-        impl crate::adapters::capability::ChatModel for UsageAdapter {
-            async fn chat(
-                &self,
-                _cfg: &RouterConfig,
-                _req: &crate::types::io::ChatRequest,
-            ) -> Result<crate::types::io::ChatResponse, GatewayError> {
-                Ok(crate::types::io::ChatResponse {
-                    content: Some("ok".to_string()),
-                    tool_calls: Vec::new(),
-                    usage: Some(TokenUsage {
-                        input_tokens: 1000,
-                        output_tokens: 500,
-                        total_tokens: 1500,
-                    }),
-                    model: Some("priced".to_string()),
-                    degraded: false,
-                })
-            }
-        }
-
-        let mut routers = HashMap::new();
-        routers.insert(
-            "priced".to_string(),
-            RouterConfig {
-                url: "http://localhost".to_string(),
-                api_key_env: None,
-                api_key: None,
-                enabled: true,
-                timeout_ms: None,
-                headers: HashMap::new(),
-            },
-        );
-        let mut models = HashMap::new();
-        models.insert(
-            "priced".to_string(),
-            ModelConfig {
-                id: "priced".to_string(),
-                api_model_id: None,
-                provider: "priced".to_string(),
-                family: None,
-                capabilities: vec![Capability::TextChat],
-                context_window: 4096,
-                max_output_tokens: 1024,
-                pricing: Some(ModelPricing {
-                    input_per_1k: 0.0008,
-                    output_per_1k: 0.004,
-                    per_request: None,
-                }),
-            },
-        );
-        let config = GatewayConfig {
-            routers,
-            models,
-            chains: HashMap::new(),
-            constraints: Default::default(),
-            panels: Default::default(),
-            consensus: Default::default(),
-        };
         let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let store = Arc::new(InMemoryStore::default());
-        let gw = Gateway::new(config, AdapterRegistry::new(), cb).with_store(store.clone());
+        let gw = Gateway::new(priced_gateway_config(), AdapterRegistry::new(), cb)
+            .with_store(store.clone());
         gw.adapters.register_chat(Arc::new(UsageAdapter)).await;
 
-        let request = InferenceRequest {
-            capability: Capability::TextChat,
-            model: Some("priced".to_string()),
-            router: Some("priced".to_string()),
-            chain: None,
-            payload: Payload::Chat {
-                messages: vec![Message::text(MessageRole::User, "hi")],
-                system: None,
-                max_tokens: None,
-                temperature: None,
-                tools: Vec::new(),
-            },
-            budget: None,
-            auth: None,
-            panel: None,
-            consensus: None,
-            allow_fallback: true,
-            credentials: Default::default(),
-        };
-        gw.execute(&request).await.unwrap();
+        gw.execute(&priced_chat_request()).await.unwrap();
 
         // input 1000/1000*0.0008 + output 500/1000*0.004 = 0.0028; a row was
         // persisted, so the windowed spend reflects it.

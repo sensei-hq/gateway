@@ -389,6 +389,27 @@ mod tests {
 
     // -- helpers -----------------------------------------------------------
 
+    /// The standard single-entry "chat_chain" -> "noop" fallback chain shared
+    /// by the noop-adapter test fixtures (also used, with its own model, by
+    /// `engine.rs`'s equivalent fixture).
+    fn noop_chat_chain() -> FallbackChainConfig {
+        FallbackChainConfig {
+            id: "chat_chain".to_string(),
+            capability: Capability::TextChat,
+            models: vec![ChainEntry {
+                model: "noop".to_string(),
+                router: Some("noop".to_string()),
+                api_model_id: None,
+                priority: 1,
+            }],
+            fallback_triggers: vec![
+                FallbackTrigger::RateLimit,
+                FallbackTrigger::Timeout,
+                FallbackTrigger::ProviderError,
+            ],
+        }
+    }
+
     fn noop_gateway_config() -> GatewayConfig {
         let mut routers = HashMap::new();
         routers.insert(
@@ -424,24 +445,7 @@ mod tests {
         );
 
         let mut chains = HashMap::new();
-        chains.insert(
-            "chat_chain".to_string(),
-            FallbackChainConfig {
-                id: "chat_chain".to_string(),
-                capability: Capability::TextChat,
-                models: vec![ChainEntry {
-                    model: "noop".to_string(),
-                    router: Some("noop".to_string()),
-                    api_model_id: None,
-                    priority: 1,
-                }],
-                fallback_triggers: vec![
-                    FallbackTrigger::RateLimit,
-                    FallbackTrigger::Timeout,
-                    FallbackTrigger::ProviderError,
-                ],
-            },
-        );
+        chains.insert("chat_chain".to_string(), noop_chat_chain());
 
         GatewayConfig {
             routers,
