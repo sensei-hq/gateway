@@ -4,6 +4,20 @@
 @import '@rokkit/themes/base.css';
 @import '@rokkit/themes/zen-sumi.css';
 
+/* Preflight reset — ported from the mockup's Tailwind/UnoCSS preflight, which
+   presetWind3 does NOT ship (see docs/mockups/uploads/MIGRATION.md §5). Without
+   `border-style`, every bare-HTML `border` utility collapses to nothing (cards
+   render borderless); without `border-box`, padded full-width boxes overflow.
+   Zero specificity, so utilities and Rokkit's own per-component borders win. */
+*,
+::before,
+::after {
+	box-sizing: border-box;
+	border-width: 0;
+	border-style: solid;
+	border-color: currentColor;
+}
+
 :root {
 	scroll-behavior: smooth;
 	--section-y: 7rem;
