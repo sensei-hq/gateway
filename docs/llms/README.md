@@ -39,7 +39,7 @@ let resp     = gateway.execute(&request).await?;
 | [quickstart](quickstart.md) | Get a working chat/embed call end-to-end |
 | [configuration](configuration.md) | Define routers, models, chains, pricing, keys (builder or JSON) |
 | [recipes](recipes.md) | Routing modes, fallback, streaming, cost, budget, persistence, quotas, tools |
-| [embedded-and-hf](embedded-and-hf.md) | Run local models (llama.cpp/ONNX) + download from the HF Hub |
+| [local](local.md) | Run local models — Ollama (server or embedded), llama.cpp, ONNX, Kokoro TTS + HF download |
 | [custom-adapters](custom-adapters.md) | Add a provider the crate doesn't ship |
 | [upgrading](upgrading.md) | Re-pin a dep across releases (newest-first: 0.3→0.4, 0.2→0.3) |
 
