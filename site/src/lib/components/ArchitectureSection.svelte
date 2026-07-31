@@ -4,7 +4,7 @@
 	import { architecture } from '$lib/data';
 </script>
 
-<section id="architecture" class="grid-section border-y border-paper-edge bg-paper-soft">
+<section id="architecture" class="grid-section border-y border-line bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={architecture.eyebrow} title={architecture.title} />
 		<div class="mt-12">

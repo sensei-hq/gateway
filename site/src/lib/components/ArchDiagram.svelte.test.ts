@@ -20,6 +20,21 @@ test('renders an svg with the expected cards, capability rows and pills', async 
 	expect(svg.textContent).toContain('~16 adapters');
 });
 
+test('cloud and local backend boxes share the same height', async () => {
+	const screen = await render(ArchDiagram, { data: architecture.diagram });
+	const svg = await vi.waitFor(() => {
+		const el = screen.container.querySelector('svg');
+		if (!el) throw new Error('svg not drawn yet');
+		return el;
+	});
+	// The two right-column backend cards are the only rects drawn at x=830.
+	const backendRects = Array.from(svg.querySelectorAll('rect')).filter(
+		(r) => r.getAttribute('x') === '830'
+	);
+	expect(backendRects.length).toBe(2);
+	expect(backendRects[0].getAttribute('height')).toBe(backendRects[1].getAttribute('height'));
+});
+
 test('renders each cloud provider pill label', async () => {
 	const screen = await render(ArchDiagram, { data: architecture.diagram });
 	const svg = await vi.waitFor(() => {
