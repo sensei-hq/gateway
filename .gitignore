@@ -3,6 +3,9 @@ Cargo.lock
 **/*.rs.bk
 .DS_Store
 # Claude Code state/transcripts — can contain secrets. Never commit.
-.claude/
+# Exception: committed skills under .claude/skills/ are repo content (integration
+# guides), not personal state, so they ARE tracked.
+.claude/*
+!.claude/skills/
 # qlty: the project config (`.qlty/qlty.toml` + configs) IS committed so the
 # scan is repo-controlled; `.qlty/.gitignore` already ignores the cache/output.
