@@ -215,7 +215,7 @@
 		pills(cl, a.cloud.pills, 852, 140, 1044);
 
 		const lo = svg.append('g');
-		cardRect(lo, 830, 250, 230, 120, false);
+		cardRect(lo, 830, 250, 230, 150, false);
 		txt(lo, 852, 284, a.local.title, { size: 15 });
 		txt(lo, 852, 304, a.local.sub, { mono: true, size: 11.5, weight: 500, fill: T.accent });
 		pills(lo, a.local.pills, 852, 320, 1044);

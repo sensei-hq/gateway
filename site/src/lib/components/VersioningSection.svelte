@@ -10,7 +10,7 @@
 <section
 	id="versioning"
 	data-mode={invMode}
-	class="grid-section border-y border-paper-edge bg-paper"
+	class="grid-section border-y border-line bg-paper"
 >
 	<div class="mx-auto grid max-w-content items-center gap-10 px-6 py-section md:grid-cols-2 md:gap-14">
 		<div class="flex flex-col gap-4">

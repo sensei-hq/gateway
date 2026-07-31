@@ -3,7 +3,7 @@
 	import { brand, footer } from '$lib/data';
 </script>
 
-<footer class="border-t border-paper-edge bg-paper">
+<footer class="border-t border-line bg-paper">
 	<div class="mx-auto grid max-w-content gap-10 px-6 py-14 md:grid-cols-[1.5fr_1fr_1fr]">
 		<div class="flex flex-col gap-3">
 			<a href="/#top" class="inline-flex items-center gap-2.5">
@@ -27,7 +27,7 @@
 			</div>
 		{/each}
 	</div>
-	<div class="border-t border-paper-edge">
+	<div class="border-t border-line">
 		<div
 			class="mx-auto flex max-w-content flex-col gap-2 px-6 py-5 font-mono text-xs text-ink-soft sm:flex-row sm:items-center sm:justify-between"
 		>
