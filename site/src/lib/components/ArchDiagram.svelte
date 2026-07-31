@@ -1,11 +1,9 @@
 <script lang="ts">
 	import { select } from 'd3-selection';
 	import { vibe } from '@rokkit/states';
-	import { architecture, type ArchDiagramData } from '$lib/data';
+	import type { ArchDiagramData } from '$lib/data';
 
-	// `data` defaults to the diagram slice so the retained inline `<ArchDiagram />`
-	// in +page.svelte keeps compiling until Task 4.3 swaps in ArchitectureSection.
-	let { data = architecture.diagram }: { data?: ArchDiagramData } = $props();
+	let { data }: { data: ArchDiagramData } = $props();
 
 	let host: HTMLDivElement;
 	let probes: HTMLDivElement;
@@ -250,7 +248,9 @@
 <div bind:this={host} class="w-full min-h-75"></div>
 
 <style>
-	@keyframes gw-flow {
+	/* -global- keeps the name un-hashed so the d3 JS (which applies
+	   `animation: gw-flow …`) matches this rule; a scoped name would not. */
+	@keyframes -global-gw-flow {
 		to {
 			stroke-dashoffset: -27;
 		}
