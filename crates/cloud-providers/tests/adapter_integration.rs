@@ -285,50 +285,59 @@ async fn anthropic_chat_mock() {
     assert_eq!(usage.total_tokens, 22);
 }
 
-#[tokio::test]
-async fn anthropic_chat_401_auth_error() {
+/// Anthropic chat where the mocked `/v1/messages` fails with `status` +
+/// `{"error":{"message":…}}`; assert the mapped error via `assert_err`. Exercises the
+/// `api_key_env` resolution path (router_config_with_key + an EnvVarGuard). The two axes
+/// that vary per case are the status→error mapping and the env key/value.
+async fn assert_anthropic_chat_error(
+    env_key: &'static str,
+    key_val: &str,
+    status: u16,
+    message: &str,
+    assert_err: fn(&GatewayError),
+) {
     let server = MockServer::start().await;
-
-    let env_key = "__TEST_ANTHROPIC_KEY_401__";
-    let _env_guard = EnvVarGuard::set(env_key, "bad-key");
+    let _env_guard = EnvVarGuard::set(env_key, key_val);
     mount_status_json(
         &server,
         "POST",
         "/v1/messages",
-        401,
-        serde_json::json!({"error": {"message": "invalid api key"}}),
+        status,
+        serde_json::json!({ "error": { "message": message } }),
     )
     .await;
 
     let adapter = AnthropicAdapter::new().unwrap();
     let config = router_config_with_key(&server.uri(), env_key);
-    let request = chat_request("claude-haiku-4-5-20250414");
+    let err = adapter
+        .chat(&config, &chat_request("claude-haiku-4-5-20250414"))
+        .await
+        .unwrap_err();
+    assert_err(&err);
+}
 
-    let err = adapter.chat(&config, &request).await.unwrap_err();
-    assert_authentication_error(&err);
+#[tokio::test]
+async fn anthropic_chat_401_auth_error() {
+    assert_anthropic_chat_error(
+        "__TEST_ANTHROPIC_KEY_401__",
+        "bad-key",
+        401,
+        "invalid api key",
+        assert_authentication_error,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn anthropic_chat_429_rate_limit() {
-    let server = MockServer::start().await;
-
-    let env_key = "__TEST_ANTHROPIC_KEY_429__";
-    let _env_guard = EnvVarGuard::set(env_key, "rate-limited-key");
-    mount_status_json(
-        &server,
-        "POST",
-        "/v1/messages",
+    assert_anthropic_chat_error(
+        "__TEST_ANTHROPIC_KEY_429__",
+        "rate-limited-key",
         429,
-        serde_json::json!({"error": {"message": "rate limited"}}),
+        "rate limited",
+        assert_rate_limit_error,
     )
     .await;
-
-    let adapter = AnthropicAdapter::new().unwrap();
-    let config = router_config_with_key(&server.uri(), env_key);
-    let request = chat_request("claude-haiku-4-5-20250414");
-
-    let err = adapter.chat(&config, &request).await.unwrap_err();
-    assert_rate_limit_error(&err);
 }
 
 // ---------------------------------------------------------------------------
