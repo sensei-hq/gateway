@@ -23,8 +23,9 @@ use kernel::adapters::capability::VideoModel;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
 mod common;
-use common::{assert_provider_error_status, mount_status, router_config};
+use common::{assert_provider_error_status, router_config};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,56 +95,18 @@ async fn runway_generate_video_happy_path() {
 // Submit error mappings — all non-success maps to ProviderError.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn runway_submit_401_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/tasks", 401, "invalid api key").await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(401));
-}
-
-#[tokio::test]
-async fn runway_submit_403_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/tasks", 403, "forbidden").await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(403));
-}
-
-#[tokio::test]
-async fn runway_submit_429_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/tasks", 429, "rate limited").await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(429));
-}
-
-#[tokio::test]
-async fn runway_submit_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/tasks", 500, "internal server error").await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        RunwayAdapter::new().unwrap().generate_video(&config, &video_request()).await
+    },
+    method: "POST",
+    path: "/tasks",
+    cases: {
+        runway_submit_401_maps_to_provider_error => (401, "invalid api key", common::ErrKind::Provider(Some(401))),
+        runway_submit_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
+        runway_submit_429_maps_to_provider_error => (429, "rate limited", common::ErrKind::Provider(Some(429))),
+        runway_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 #[tokio::test]

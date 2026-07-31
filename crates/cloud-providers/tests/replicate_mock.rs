@@ -21,9 +21,10 @@ use kernel::adapters::capability::{ImageModel, VideoModel};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
 mod common;
 use common::{
-    assert_authentication_error, assert_provider_error_status, mount_status_json, router_config,
+    assert_authentication_error, assert_provider_error_status, router_config,
     router_config_missing_key,
 };
 
@@ -194,84 +195,22 @@ async fn replicate_image_succeeds() {
 //  to Authentication/RateLimit the way base::http_json does.)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn replicate_create_401_is_provider_error() {
-    let server = MockServer::start().await;
-    mount_status_json(
-        &server,
-        "POST",
-        "/predictions",
-        401,
-        serde_json::json!({"detail": "invalid token"}),
-    )
-    .await;
-
-    let adapter = ReplicateAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(Some("tencent/hunyuan-video"));
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(401));
-}
-
-#[tokio::test]
-async fn replicate_create_403_is_provider_error() {
-    let server = MockServer::start().await;
-    mount_status_json(
-        &server,
-        "POST",
-        "/predictions",
-        403,
-        serde_json::json!({"detail": "forbidden"}),
-    )
-    .await;
-
-    let adapter = ReplicateAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(Some("tencent/hunyuan-video"));
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(403));
-}
-
-#[tokio::test]
-async fn replicate_create_429_is_provider_error() {
-    let server = MockServer::start().await;
-    mount_status_json(
-        &server,
-        "POST",
-        "/predictions",
-        429,
-        serde_json::json!({"detail": "rate limited"}),
-    )
-    .await;
-
-    let adapter = ReplicateAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(Some("tencent/hunyuan-video"));
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(429));
-}
-
-#[tokio::test]
-async fn replicate_create_500_is_provider_error() {
-    let server = MockServer::start().await;
-    mount_status_json(
-        &server,
-        "POST",
-        "/predictions",
-        500,
-        serde_json::json!({"detail": "internal error"}),
-    )
-    .await;
-
-    let adapter = ReplicateAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(Some("tencent/hunyuan-video"));
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+// Replicate maps every non-success create status through ProviderError { status }
+// (the JSON `{"detail": …}` error envelope doesn't change the mapped variant).
+http_error_tests! {
+    call: |config| async move {
+        ReplicateAdapter::new().unwrap()
+            .generate_video(&config, &video_request(Some("tencent/hunyuan-video")))
+            .await
+    },
+    method: "POST",
+    path: "/predictions",
+    cases: {
+        replicate_create_401_is_provider_error => (401, "{\"detail\":\"invalid token\"}", common::ErrKind::Provider(Some(401))),
+        replicate_create_403_is_provider_error => (403, "{\"detail\":\"forbidden\"}", common::ErrKind::Provider(Some(403))),
+        replicate_create_429_is_provider_error => (429, "{\"detail\":\"rate limited\"}", common::ErrKind::Provider(Some(429))),
+        replicate_create_500_is_provider_error => (500, "{\"detail\":\"internal error\"}", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // ---------------------------------------------------------------------------

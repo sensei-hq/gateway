@@ -25,6 +25,7 @@ use kernel::adapters::capability::{ImageModel, Model, VideoModel};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
 mod common;
 use common::{
     assert_provider_error_status, mount_status, router_config, router_config_missing_key,
@@ -223,63 +224,18 @@ async fn fal_missing_api_key_authentication_error() {
 // RateLimit at submit time).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fal_submit_401_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/fal-ai/veo3", 401, "invalid api key").await;
-
-    let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(None);
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(401));
-}
-
-#[tokio::test]
-async fn fal_submit_403_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/fal-ai/veo3", 403, "forbidden").await;
-
-    let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(None);
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(403));
-}
-
-#[tokio::test]
-async fn fal_submit_429_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", "/fal-ai/veo3", 429, "rate limited").await;
-
-    let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(None);
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(429));
-}
-
-#[tokio::test]
-async fn fal_submit_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(
-        &server,
-        "POST",
-        "/fal-ai/veo3",
-        500,
-        "internal server error",
-    )
-    .await;
-
-    let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request(None);
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        FalAdapter::from_config(&config).unwrap().generate_video(&config, &video_request(None)).await
+    },
+    method: "POST",
+    path: "/fal-ai/veo3",
+    cases: {
+        fal_submit_401_maps_to_provider_error => (401, "invalid api key", common::ErrKind::Provider(Some(401))),
+        fal_submit_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
+        fal_submit_429_maps_to_provider_error => (429, "rate limited", common::ErrKind::Provider(Some(429))),
+        fal_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 #[tokio::test]

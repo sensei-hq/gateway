@@ -23,8 +23,9 @@ use kernel::adapters::capability::VideoModel;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
 mod common;
-use common::{assert_is_provider_error, assert_provider_error_status, mount_status, router_config};
+use common::{assert_is_provider_error, router_config};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -136,56 +137,18 @@ async fn kling_generate_video_succeed_without_video_falls_back() {
 // special-casing on this path.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn kling_submit_401_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", SUBMIT_PATH, 401, "invalid api key").await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(401));
-}
-
-#[tokio::test]
-async fn kling_submit_403_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", SUBMIT_PATH, 403, "forbidden").await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(403));
-}
-
-#[tokio::test]
-async fn kling_submit_429_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", SUBMIT_PATH, 429, "rate limited").await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(429));
-}
-
-#[tokio::test]
-async fn kling_submit_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-    mount_status(&server, "POST", SUBMIT_PATH, 500, "internal server error").await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_provider_error_status(&err, Some(500));
+http_error_tests! {
+    call: |config| async move {
+        KlingAdapter::new().unwrap().generate_video(&config, &video_request()).await
+    },
+    method: "POST",
+    path: SUBMIT_PATH,
+    cases: {
+        kling_submit_401_maps_to_provider_error => (401, "invalid api key", common::ErrKind::Provider(Some(401))),
+        kling_submit_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
+        kling_submit_429_maps_to_provider_error => (429, "rate limited", common::ErrKind::Provider(Some(429))),
+        kling_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 /// A 200 submit response whose body can't be parsed as the task envelope must
