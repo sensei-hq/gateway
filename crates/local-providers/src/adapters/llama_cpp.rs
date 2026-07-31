@@ -748,20 +748,15 @@ impl kernel::adapters::capability::EmbedModel for LlamaCppAdapter {
         _cfg: &RouterConfig,
         req: &EmbedRequest,
     ) -> Result<EmbedResponse, GatewayError> {
-        super::reject_model_mismatch(
+        // `embed_response` calls the inherent `LlamaCppAdapter::embed` below
+        // (the trait is referenced by full path, not `use`d, so the closure's
+        // method call binds to the inherent one) and wraps its result.
+        super::embed_response(
             &self.config.adapter_id,
             &self.config.model_id,
             req.model.as_deref(),
-        )?;
-
-        // Inherent `LlamaCppAdapter::embed` (the trait is referenced by full
-        // path, not `use`d, so this method call binds to the inherent one).
-        let embeddings = self.embed(&req.texts)?;
-        Ok(EmbedResponse {
-            embeddings,
-            usage: None,
-            degraded: false,
-        })
+            || self.embed(&req.texts),
+        )
     }
 }
 

@@ -64,3 +64,27 @@ pub(crate) fn reject_model_mismatch(
     }
     Ok(())
 }
+
+/// Runs `embed`, wrapping its dense vectors in an [`EmbedResponse`] — after
+/// rejecting a request pinned to a model this adapter doesn't serve. Shared
+/// by every embed-capable adapter's `EmbedModel::embed`: each supplies only
+/// its own inherent `embed(&[String])` as the closure, since the model-check
+/// and response-wrapping around it is otherwise identical (and was flagged
+/// as near-duplicate code between `fastembed.rs` and `ort.rs`).
+///
+/// [`EmbedResponse`]: kernel::types::io::EmbedResponse
+#[cfg(any(feature = "llama-cpp", feature = "ort", feature = "fastembed"))]
+pub(crate) fn embed_response(
+    adapter_id: &str,
+    model_id: &str,
+    requested: Option<&str>,
+    embed: impl FnOnce() -> Result<Vec<Vec<f32>>, kernel::types::error::GatewayError>,
+) -> Result<kernel::types::io::EmbedResponse, kernel::types::error::GatewayError> {
+    reject_model_mismatch(adapter_id, model_id, requested)?;
+    let embeddings = embed()?;
+    Ok(kernel::types::io::EmbedResponse {
+        embeddings,
+        usage: None,
+        degraded: false,
+    })
+}
