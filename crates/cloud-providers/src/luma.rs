@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::async_job::{JobConfig, poll_until_complete};
+use crate::async_job::{JobConfig, JobStatus, poll_until_complete};
 use crate::base::{build_client, get_json_bearer, post_json_bearer};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
@@ -38,6 +38,22 @@ struct LumaGenerationStatus {
     state: String,
     assets: Option<LumaAssets>,
     failure_reason: Option<String>,
+}
+
+impl JobStatus for LumaGenerationStatus {
+    fn terminal_outcome(self, adapter: &str) -> Result<Option<Self>, GatewayError> {
+        match self.state.as_str() {
+            "completed" => Ok(Some(self)),
+            "failed" => Err(GatewayError::ProviderError {
+                adapter: adapter.into(),
+                message: self
+                    .failure_reason
+                    .unwrap_or_else(|| "generation failed".to_string()),
+                status: None,
+            }),
+            _ => Ok(None), // queued, dreaming
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,18 +146,7 @@ impl kernel::adapters::capability::VideoModel for LumaAdapter {
         let gen_status = poll_until_complete(&job_config, || async {
             let status: LumaGenerationStatus =
                 get_json_bearer(client, &poll_url, api_key_ref, "luma").await?;
-
-            match status.state.as_str() {
-                "completed" => Ok(Some(status)),
-                "failed" => Err(GatewayError::ProviderError {
-                    adapter: "luma".into(),
-                    message: status
-                        .failure_reason
-                        .unwrap_or_else(|| "generation failed".to_string()),
-                    status: None,
-                }),
-                _ => Ok(None), // queued, dreaming
-            }
+            status.terminal_outcome("luma")
         })
         .await?;
 

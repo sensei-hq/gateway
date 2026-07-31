@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::async_job::{JobConfig, poll_until_complete};
+use crate::async_job::{JobConfig, JobStatus, poll_until_complete};
 use crate::base::{build_client, get_json_bearer, post_json_bearer};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
@@ -34,6 +34,20 @@ struct RunwayTaskStatus {
     status: String,
     output: Option<Vec<String>>,
     failure: Option<String>,
+}
+
+impl JobStatus for RunwayTaskStatus {
+    fn terminal_outcome(self, adapter: &str) -> Result<Option<Self>, GatewayError> {
+        match self.status.as_str() {
+            "SUCCEEDED" => Ok(Some(self)),
+            "FAILED" => Err(GatewayError::ProviderError {
+                adapter: adapter.into(),
+                message: self.failure.unwrap_or_else(|| "task failed".to_string()),
+                status: None,
+            }),
+            _ => Ok(None), // PENDING, RUNNING
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,16 +136,7 @@ impl kernel::adapters::capability::VideoModel for RunwayAdapter {
         let task_status = poll_until_complete(&job_config, || async {
             let status: RunwayTaskStatus =
                 get_json_bearer(client, &poll_url, api_key_ref, "runway").await?;
-
-            match status.status.as_str() {
-                "SUCCEEDED" => Ok(Some(status)),
-                "FAILED" => Err(GatewayError::ProviderError {
-                    adapter: "runway".into(),
-                    message: status.failure.unwrap_or_else(|| "task failed".to_string()),
-                    status: None,
-                }),
-                _ => Ok(None), // PENDING, RUNNING
-            }
+            status.terminal_outcome("runway")
         })
         .await?;
 
