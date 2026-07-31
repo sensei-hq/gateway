@@ -16,9 +16,6 @@
 //!     `JobConfig::default()` uses a 3-second poll interval and a
 //!     non-terminal first poll would sleep 3s before the second call.
 
-use std::collections::HashMap;
-
-use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ImageRequest, VideoRequest};
 
@@ -28,22 +25,14 @@ use kernel::adapters::capability::{ImageModel, Model, VideoModel};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{
+    assert_provider_error_status, mount_status, router_config, router_config_missing_key,
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// RouterConfig with a literal api_key so `resolve_api_key` returns it
-/// directly (no env var involved).
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn video_request(model: Option<&str>) -> VideoRequest {
     VideoRequest {
@@ -217,14 +206,7 @@ async fn fal_image_generate_custom_model() {
 async fn fal_missing_api_key_authentication_error() {
     let server = MockServer::start().await;
 
-    let config = RouterConfig {
-        url: server.uri(),
-        api_key: None,
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    };
+    let config = router_config_missing_key(&server.uri());
     let adapter = FalAdapter::from_config(&config).unwrap();
     let request = video_request(None);
 
@@ -244,148 +226,73 @@ async fn fal_missing_api_key_authentication_error() {
 #[tokio::test]
 async fn fal_submit_401_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/fal-ai/veo3"))
-        .respond_with(
-            ResponseTemplate::new(401)
-                .set_body_json(serde_json::json!({"error": "invalid api key"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/fal-ai/veo3", 401, "invalid api key").await;
 
     let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
     let config = router_config(&server.uri());
     let request = video_request(None);
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(401),
-                ..
-            }
-        ),
-        "expected ProviderError with status 401, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(401));
 }
 
 #[tokio::test]
 async fn fal_submit_403_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/fal-ai/veo3"))
-        .respond_with(
-            ResponseTemplate::new(403).set_body_json(serde_json::json!({"error": "forbidden"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/fal-ai/veo3", 403, "forbidden").await;
 
     let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
     let config = router_config(&server.uri());
     let request = video_request(None);
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(403),
-                ..
-            }
-        ),
-        "expected ProviderError with status 403, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(403));
 }
 
 #[tokio::test]
 async fn fal_submit_429_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/fal-ai/veo3"))
-        .respond_with(
-            ResponseTemplate::new(429).set_body_json(serde_json::json!({"error": "rate limited"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/fal-ai/veo3", 429, "rate limited").await;
 
     let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
     let config = router_config(&server.uri());
     let request = video_request(None);
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(429),
-                ..
-            }
-        ),
-        "expected ProviderError with status 429, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(429));
 }
 
 #[tokio::test]
 async fn fal_submit_500_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/fal-ai/veo3"))
-        .respond_with(
-            ResponseTemplate::new(500)
-                .set_body_json(serde_json::json!({"error": "internal server error"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status(
+        &server,
+        "POST",
+        "/fal-ai/veo3",
+        500,
+        "internal server error",
+    )
+    .await;
 
     let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
     let config = router_config(&server.uri());
     let request = video_request(None);
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(500));
 }
 
 #[tokio::test]
 async fn fal_image_submit_500_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/fal-ai/flux-pro/v1.1"))
-        .respond_with(
-            ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "boom"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/fal-ai/flux-pro/v1.1", 500, "boom").await;
 
     let adapter = FalAdapter::from_config(&router_config(&server.uri())).unwrap();
     let config = router_config(&server.uri());
     let request = image_request(None);
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(500));
 }
 
 // ---------------------------------------------------------------------------
@@ -490,10 +397,7 @@ async fn fal_poll_http_error_maps_to_provider_error() {
     let request = video_request(None);
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError with status None, got: {err:?}",
-    );
+    assert_provider_error_status(&err, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -534,16 +438,7 @@ async fn fal_result_http_error_maps_to_provider_error() {
     let request = video_request(None);
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(500));
 }
 
 // ---------------------------------------------------------------------------

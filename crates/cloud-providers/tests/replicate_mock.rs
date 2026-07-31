@@ -12,9 +12,6 @@
 //! "canceled") on the first poll so the 3-second `JobConfig::default()` poll
 //! interval is never reached — tests stay sub-second.
 
-use std::collections::HashMap;
-
-use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ImageRequest, VideoRequest};
 
@@ -24,20 +21,15 @@ use kernel::adapters::capability::{ImageModel, VideoModel};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{
+    assert_authentication_error, assert_provider_error_status, mount_status_json, router_config,
+    router_config_missing_key,
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn video_request(model: Option<&str>) -> VideoRequest {
     VideoRequest {
@@ -205,119 +197,81 @@ async fn replicate_image_succeeds() {
 #[tokio::test]
 async fn replicate_create_401_is_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/predictions"))
-        .respond_with(
-            ResponseTemplate::new(401)
-                .set_body_json(serde_json::json!({"detail": "invalid token"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status_json(
+        &server,
+        "POST",
+        "/predictions",
+        401,
+        serde_json::json!({"detail": "invalid token"}),
+    )
+    .await;
 
     let adapter = ReplicateAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request(Some("tencent/hunyuan-video"));
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(401),
-                ..
-            }
-        ),
-        "expected ProviderError status 401, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(401));
 }
 
 #[tokio::test]
 async fn replicate_create_403_is_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/predictions"))
-        .respond_with(
-            ResponseTemplate::new(403).set_body_json(serde_json::json!({"detail": "forbidden"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status_json(
+        &server,
+        "POST",
+        "/predictions",
+        403,
+        serde_json::json!({"detail": "forbidden"}),
+    )
+    .await;
 
     let adapter = ReplicateAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request(Some("tencent/hunyuan-video"));
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(403),
-                ..
-            }
-        ),
-        "expected ProviderError status 403, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(403));
 }
 
 #[tokio::test]
 async fn replicate_create_429_is_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/predictions"))
-        .respond_with(
-            ResponseTemplate::new(429).set_body_json(serde_json::json!({"detail": "rate limited"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status_json(
+        &server,
+        "POST",
+        "/predictions",
+        429,
+        serde_json::json!({"detail": "rate limited"}),
+    )
+    .await;
 
     let adapter = ReplicateAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request(Some("tencent/hunyuan-video"));
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(429),
-                ..
-            }
-        ),
-        "expected ProviderError status 429, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(429));
 }
 
 #[tokio::test]
 async fn replicate_create_500_is_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/predictions"))
-        .respond_with(
-            ResponseTemplate::new(500)
-                .set_body_json(serde_json::json!({"detail": "internal error"})),
-        )
-        .mount(&server)
-        .await;
+    mount_status_json(
+        &server,
+        "POST",
+        "/predictions",
+        500,
+        serde_json::json!({"detail": "internal error"}),
+    )
+    .await;
 
     let adapter = ReplicateAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request(Some("tencent/hunyuan-video"));
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError status 500, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(500));
 }
 
 // ---------------------------------------------------------------------------
@@ -427,10 +381,7 @@ async fn replicate_poll_http_error_is_provider_error() {
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
     // Poll-side HTTP failures are mapped with status: None.
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError status None, got: {err:?}",
-    );
+    assert_provider_error_status(&err, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,15 +393,9 @@ async fn replicate_missing_api_key_is_authentication_error() {
     let server = MockServer::start().await;
 
     let adapter = ReplicateAdapter::new().unwrap();
-    let mut config = router_config(&server.uri());
-    // Strip both key sources so resolve_api_key returns None.
-    config.api_key = None;
-    config.api_key_env = None;
+    let config = router_config_missing_key(&server.uri());
     let request = video_request(Some("tencent/hunyuan-video"));
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
+    assert_authentication_error(&err);
 }

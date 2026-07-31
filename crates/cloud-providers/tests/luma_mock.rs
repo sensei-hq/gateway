@@ -17,10 +17,6 @@
 //! `GatewayError::ProviderError` carrying `status: Some(<code>)`. The tests
 //! below assert that ACTUAL behavior.
 
-use std::collections::HashMap;
-
-use kernel::types::config::RouterConfig;
-use kernel::types::error::GatewayError;
 use kernel::types::io::VideoRequest;
 
 use cloud_providers::luma::LumaAdapter;
@@ -29,22 +25,14 @@ use kernel::adapters::capability::VideoModel;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{assert_is_provider_error, assert_provider_error_status, mount_status, router_config};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const SAMPLE_URL: &str = "https://storage.lumalabs.ai/dream-machine/video1.mp4";
-
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn video_request() -> VideoRequest {
     VideoRequest {
@@ -112,109 +100,60 @@ async fn luma_generate_video_happy_path() {
 #[tokio::test]
 async fn luma_submit_401_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/generations"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/generations", 401, "invalid api key").await;
 
     let adapter = LumaAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(401),
-                ..
-            }
-        ),
-        "expected ProviderError with status 401, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(401));
 }
 
 #[tokio::test]
 async fn luma_submit_403_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/generations"))
-        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/generations", 403, "forbidden").await;
 
     let adapter = LumaAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(403),
-                ..
-            }
-        ),
-        "expected ProviderError with status 403, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(403));
 }
 
 #[tokio::test]
 async fn luma_submit_429_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/generations"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/generations", 429, "rate limited").await;
 
     let adapter = LumaAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(429),
-                ..
-            }
-        ),
-        "expected ProviderError with status 429, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(429));
 }
 
 #[tokio::test]
 async fn luma_submit_500_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/generations"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
-        .mount(&server)
-        .await;
+    mount_status(
+        &server,
+        "POST",
+        "/generations",
+        500,
+        "internal server error",
+    )
+    .await;
 
     let adapter = LumaAdapter::new().unwrap();
     let config = router_config(&server.uri());
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(500));
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +176,7 @@ async fn luma_submit_unparseable_body_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from unparseable submit body, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,10 +214,7 @@ async fn luma_poll_failed_state_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from failed poll, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,10 +247,7 @@ async fn luma_poll_http_error_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from failed poll HTTP status, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 // ---------------------------------------------------------------------------
