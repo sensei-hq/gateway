@@ -380,35 +380,13 @@ mod tests {
     use crate::adapters::noop::NoopAdapter;
     use crate::adapters::{AdapterRegistry, RegisterInto};
     use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
-    use crate::types::config::{
-        ChainEntry, FallbackChainConfig, FallbackTrigger, GatewayConfig, ModelConfig, RouterConfig,
-    };
+    use crate::test_support::noop_chat_chain;
+    use crate::types::config::{GatewayConfig, ModelConfig, RouterConfig};
     use crate::types::cost::Cost;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     // -- helpers -----------------------------------------------------------
-
-    /// The standard single-entry "chat_chain" -> "noop" fallback chain shared
-    /// by the noop-adapter test fixtures (also used, with its own model, by
-    /// `engine.rs`'s equivalent fixture).
-    fn noop_chat_chain() -> FallbackChainConfig {
-        FallbackChainConfig {
-            id: "chat_chain".to_string(),
-            capability: Capability::TextChat,
-            models: vec![ChainEntry {
-                model: "noop".to_string(),
-                router: Some("noop".to_string()),
-                api_model_id: None,
-                priority: 1,
-            }],
-            fallback_triggers: vec![
-                FallbackTrigger::RateLimit,
-                FallbackTrigger::Timeout,
-                FallbackTrigger::ProviderError,
-            ],
-        }
-    }
 
     fn noop_gateway_config() -> GatewayConfig {
         let mut routers = HashMap::new();

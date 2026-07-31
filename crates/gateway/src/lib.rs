@@ -11,6 +11,8 @@ pub mod pruning;
 pub mod purpose;
 pub mod selection;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub use kernel::types;
 // Model-registry vocabulary (`ModelEntry`/`ModelSource`/`ModelFormat`/`ModelResolver`/
 // `ResolveError`) surfaced so a consumer that only depends on `sensei-gateway` can

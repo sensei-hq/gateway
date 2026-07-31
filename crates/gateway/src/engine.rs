@@ -1387,26 +1387,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// The standard single-entry "chat_chain" -> "noop" fallback chain shared
-    /// by the noop-adapter test fixtures (also used, with its own model, by
-    /// `purpose.rs`'s equivalent fixture).
-    fn noop_chat_chain() -> FallbackChainConfig {
-        FallbackChainConfig {
-            id: "chat_chain".to_string(),
-            capability: Capability::TextChat,
-            models: vec![ChainEntry {
-                model: "noop".to_string(),
-                router: Some("noop".to_string()),
-                api_model_id: None,
-                priority: 1,
-            }],
-            fallback_triggers: vec![
-                FallbackTrigger::RateLimit,
-                FallbackTrigger::Timeout,
-                FallbackTrigger::ProviderError,
-            ],
-        }
-    }
+    use crate::test_support::noop_chat_chain;
 
     fn test_config_with_noop() -> GatewayConfig {
         let mut routers = HashMap::new();
