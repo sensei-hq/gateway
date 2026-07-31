@@ -56,6 +56,26 @@ async fn mount_submit_ok(server: &MockServer, task_id: &str) {
         .await;
 }
 
+/// Submit succeeds, then the poll endpoint returns `poll`; assert the adapter maps it to a
+/// ProviderError. The only axis that varies across the poll-failure cases is that poll
+/// response — a terminal `"failed"` status, a 5xx, or an unparseable 200 body.
+async fn assert_poll_error(task_id: &str, poll: ResponseTemplate) {
+    let server = MockServer::start().await;
+    mount_submit_ok(&server, task_id).await;
+    Mock::given(method("GET"))
+        .and(path(format!("{SUBMIT_PATH}/{task_id}")))
+        .respond_with(poll)
+        .mount(&server)
+        .await;
+
+    let err = KlingAdapter::new()
+        .unwrap()
+        .generate_video(&router_config(&server.uri()), &video_request())
+        .await
+        .unwrap_err();
+    assert_is_provider_error(&err);
+}
+
 // ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
@@ -180,68 +200,32 @@ async fn kling_submit_unparseable_body_maps_to_provider_error() {
 /// The poll returns a terminal `"failed"` status -> mapped ProviderError.
 #[tokio::test]
 async fn kling_poll_failed_status_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit_ok(&server, "task-fail-1").await;
-
-    Mock::given(method("GET"))
-        .and(path(format!("{SUBMIT_PATH}/task-fail-1")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": {
-                "task_status": "failed",
-                "task_result": null
-            }
-        })))
-        .mount(&server)
-        .await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_is_provider_error(&err);
+    assert_poll_error(
+        "task-fail-1",
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "task_status": "failed", "task_result": null }
+        })),
+    )
+    .await;
 }
 
 /// A non-success HTTP status on the poll endpoint -> mapped ProviderError.
 #[tokio::test]
 async fn kling_poll_http_error_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit_ok(&server, "task-poll-500").await;
-
-    Mock::given(method("GET"))
-        .and(path(format!("{SUBMIT_PATH}/task-poll-500")))
-        .respond_with(ResponseTemplate::new(500).set_body_string("poll blew up"))
-        .mount(&server)
-        .await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_is_provider_error(&err);
+    assert_poll_error(
+        "task-poll-500",
+        ResponseTemplate::new(500).set_body_string("poll blew up"),
+    )
+    .await;
 }
 
 /// A 200 poll response whose body can't be parsed as the status envelope must
 /// surface as a ProviderError.
 #[tokio::test]
 async fn kling_poll_unparseable_body_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit_ok(&server, "task-poll-garbage").await;
-
-    Mock::given(method("GET"))
-        .and(path(format!("{SUBMIT_PATH}/task-poll-garbage")))
-        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-        .mount(&server)
-        .await;
-
-    let adapter = KlingAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert_is_provider_error(&err);
+    assert_poll_error(
+        "task-poll-garbage",
+        ResponseTemplate::new(200).set_body_string("not json"),
+    )
+    .await;
 }
