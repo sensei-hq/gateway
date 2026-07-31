@@ -88,3 +88,38 @@ pub(crate) fn embed_response(
         degraded: false,
     })
 }
+
+/// Generate the standard [`EmbedModel`](kernel::adapters::capability::EmbedModel) impl for an
+/// embed-only local adapter that delegates to [`embed_response`] over its inherent
+/// `embed(&[String])` method. `$adapter` must have a `config` field carrying `adapter_id` and
+/// `model_id` and an inherent `fn embed(&self, &[String]) -> Result<Vec<Vec<f32>>, GatewayError>`.
+/// Keeps each adapter's trait impl a single delegation instead of ~15 lines of identical
+/// boilerplate (ort, llama.cpp, …).
+#[cfg(any(feature = "llama-cpp", feature = "ort", feature = "fastembed"))]
+#[macro_export]
+macro_rules! impl_embed_via_inherent {
+    ($adapter:ty) => {
+        #[async_trait::async_trait]
+        impl kernel::adapters::capability::EmbedModel for $adapter {
+            async fn embed(
+                &self,
+                _cfg: &kernel::types::config::RouterConfig,
+                req: &kernel::types::io::EmbedRequest,
+            ) -> ::std::result::Result<
+                kernel::types::io::EmbedResponse,
+                kernel::types::error::GatewayError,
+            > {
+                // Reject a request pinned to a model this adapter doesn't serve, then call the
+                // inherent `embed(&[String])` (preserving the engine's session/tokenizer path)
+                // and wrap it. The capability trait is referenced by full path (not `use`d) so
+                // the closure's `self.embed(...)` binds to the inherent method, not this one.
+                $crate::adapters::embed_response(
+                    &self.config.adapter_id,
+                    &self.config.model_id,
+                    req.model.as_deref(),
+                    || self.embed(&req.texts),
+                )
+            }
+        }
+    };
+}

@@ -49,7 +49,7 @@ use futures::Stream;
 use kernel::registry::{ModelEntry, ModelSource};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
-use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use kernel::types::io::{ChatRequest, ChatResponse};
 use kernel::types::request::{Message, MessageRole, StreamChunk};
 use llama_cpp_2::{
     context::{
@@ -741,24 +741,8 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
     }
 }
 
-#[async_trait]
-impl kernel::adapters::capability::EmbedModel for LlamaCppAdapter {
-    async fn embed(
-        &self,
-        _cfg: &RouterConfig,
-        req: &EmbedRequest,
-    ) -> Result<EmbedResponse, GatewayError> {
-        // `embed_response` calls the inherent `LlamaCppAdapter::embed` below
-        // (the trait is referenced by full path, not `use`d, so the closure's
-        // method call binds to the inherent one) and wraps its result.
-        super::embed_response(
-            &self.config.adapter_id,
-            &self.config.model_id,
-            req.model.as_deref(),
-            || self.embed(&req.texts),
-        )
-    }
-}
+// Embed-only, delegating to the inherent `LlamaCppAdapter::embed` via the shared macro.
+crate::impl_embed_via_inherent!(LlamaCppAdapter);
 
 #[async_trait]
 impl kernel::adapters::RegisterInto for LlamaCppAdapter {
