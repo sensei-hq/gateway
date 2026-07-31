@@ -19,7 +19,7 @@ const META: Record<string, { slug: string; title: string; order: number }> = {
 	quickstart: { slug: 'quickstart', title: 'Quickstart', order: 1 },
 	configuration: { slug: 'configuration', title: 'Configuration', order: 2 },
 	recipes: { slug: 'recipes', title: 'Recipes', order: 3 },
-	'embedded-and-hf': { slug: 'embedded-and-hf', title: 'Embedded & HF download', order: 4 },
+	local: { slug: 'local', title: 'Local', order: 4 },
 	'custom-adapters': { slug: 'custom-adapters', title: 'Custom adapters', order: 5 },
 	upgrading: { slug: 'upgrading', title: 'Upgrading', order: 6 }
 };
