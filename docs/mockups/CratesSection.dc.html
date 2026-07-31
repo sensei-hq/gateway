@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="stylesheet" href="./fonts.css">
+<script src="./content.js"></script>
+<script src="./uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime/uno.global.js"></script>
+</helmet>
+<section id="crates" class="band">
+  <div class="shell py-section">
+    <dc-import name="SectionHead" eyebrow="{{ eyebrow }}" title="{{ title }}" hint-size="100%,110px"></dc-import>
+    <div class="grid grid-cols-2 gap-6 mt-10 lt-md:grid-cols-1">
+      <sc-for list="{{ items }}" as="c" hint-placeholder-count="2">
+        <div class="panel p-8">
+          <div class="flex items-center justify-between gap-3">
+            <span class="font-mono text-title font-semibold text-fg">{{ c.name }}</span>
+            <dc-import name="Chip" label="{{ c.version }}" tone="accent" hint-size="80px,24px"></dc-import>
+          </div>
+          <p class="text-sub text-muted mt-4 mb-5">{{ c.body }}</p>
+          <div class="flex flex-wrap items-center gap-2">
+            <sc-for list="{{ c.deps }}" as="dep" hint-placeholder-count="3">
+              <dc-import name="Chip" label="{{ dep }}" hint-size="80px,26px"></dc-import>
+            </sc-for>
+            <sc-if value="{{ c.note }}"><span class="meta">{{ c.note }}</span></sc-if>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  content() { return (typeof window !== 'undefined' && window.__GATEWAY_CONTENT) || {}; }
+  componentDidMount() { this.awaitContent(); }
+  awaitContent() {
+    if (typeof window === 'undefined' || window.__GATEWAY_CONTENT) return;
+    clearTimeout(this.__ct);
+    this.__ct = setTimeout(() => { this.awaitContent(); this.forceUpdate(); }, 100);
+  }
+  renderVals() {
+    const c = this.content().crates || {};
+    return { eyebrow: c.eyebrow || '', title: c.title || '', items: c.items || [] };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="stylesheet" href="./fonts.css">
+<script src="./content.js"></script>
+<script src="./uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime/uno.global.js"></script>
+</helmet>
+<footer class="bg-surface border-t border-line-hair">
+  <div class="shell grid grid-cols-4 gap-10 pt-14 pb-10 lt-md:grid-cols-2 lt-sm:grid-cols-1">
+    <div class="col-span-2 flex flex-col gap-4 lt-sm:col-span-1">
+      <div class="flex items-center gap-3">
+        <span class="w-6.5 h-6.5 rounded-control-sm bg-action text-on-action font-mono font-semibold text-sub flex items-center justify-center">{{ mark }}</span>
+        <span class="font-display font-semibold text-body tracking-brand">{{ brand }}</span>
+      </div>
+      <p class="text-sub text-faint max-w-short">{{ blurb }}</p>
+    </div>
+    <sc-for list="{{ columns }}" as="col" hint-placeholder-count="2">
+      <div class="flex flex-col gap-3.5">
+        <div class="font-mono text-micro uppercase tracking-eyebrow text-faint">{{ col.title }}</div>
+        <sc-for list="{{ col.links }}" as="l" hint-placeholder-count="3">
+          <a href="{{ l.href }}" class="nav-link">{{ l.label }}</a>
+        </sc-for>
+      </div>
+    </sc-for>
+  </div>
+  <div class="border-t border-line-hair">
+    <div class="shell flex flex-wrap justify-between gap-3 py-4 font-mono text-caption text-faint">
+      <span>{{ legal }}</span>
+      <span>{{ version }}</span>
+    </div>
+  </div>
+</footer>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  content() { return (typeof window !== 'undefined' && window.__GATEWAY_CONTENT) || {}; }
+  componentDidMount() { this.awaitContent(); }
+  awaitContent() {
+    if (typeof window === 'undefined' || window.__GATEWAY_CONTENT) return;
+    clearTimeout(this.__ct);
+    this.__ct = setTimeout(() => { this.awaitContent(); this.forceUpdate(); }, 100);
+  }
+  renderVals() {
+    const c = this.content();
+    const f = c.footer || {};
+    const nav = c.nav || {};
+    return {
+      mark: nav.mark || 'g', brand: nav.brand || 'gateway',
+      blurb: f.blurb || '', columns: f.columns || [],
+      legal: f.legal || '', version: c.version || ''
+    };
+  }
+}
+</script>
+</body>
+</html>
