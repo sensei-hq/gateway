@@ -147,10 +147,36 @@ local-ort          # ONNX Runtime (CPU)`
 	] as UsageTab[]
 };
 
+export type ArchNode = { title: string; sub: string };
+export type ArchDiagramData = {
+	app: ArchNode;
+	engine: { title: string; sub: string; caps: string[]; notes: string[] };
+	adapter: { line1: string; line2: string; sub: string };
+	cloud: { title: string; sub: string; pills: string[] };
+	local: { title: string; sub: string; pills: string[] };
+};
+
 export const architecture = {
 	eyebrow: 'Architecture',
 	title: 'One adapter surface, many backends.',
-	caption: 'a small set of capability traits — cloud and local backends compose in a single routing config'
+	caption:
+		'a small set of capability traits — cloud and local backends compose in a single routing config',
+	diagram: {
+		app: { title: 'Your app', sub: 'route(model)' },
+		engine: {
+			title: 'gateway',
+			sub: 'routing engine',
+			caps: ['fallback', 'circuit breaker', 'budget', 'tracing'],
+			notes: ['no DB · GatewayStore trait', 'reqwest · rustls · tokio']
+		},
+		adapter: { line1: 'Inference', line2: 'Adapter', sub: 'capability traits' },
+		cloud: {
+			title: 'Cloud providers',
+			sub: '~16 adapters',
+			pills: ['openai', 'anthropic', 'gemini', 'bedrock', 'grok']
+		},
+		local: { title: 'Local engines', sub: 'in-process', pills: ['llama.cpp', 'onnx', 'fastembed'] }
+	} as ArchDiagramData
 };
 
 export type Consumer = { name: string; glyph: string; repo: string };
