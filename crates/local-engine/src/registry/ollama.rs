@@ -218,16 +218,30 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The manifest coordinates + blob layer [`write_cache`] fakes up. Bundled
+    /// into one value since the individual `&str`/`u64` fields are only ever
+    /// passed together, one per test-fixture call.
+    struct CacheLayout<'a> {
+        registry: &'a str,
+        namespace: &'a str,
+        name: &'a str,
+        tag: &'a str,
+        digest: &'a str,
+        size: u64,
+    }
+
     /// Build a minimal valid Ollama cache layout with one manifest +
     /// matching blob. Returns the tempdir handle (must outlive the test).
-    async fn write_cache(
-        registry: &str,
-        namespace: &str,
-        name: &str,
-        tag: &str,
-        digest: &str,
-        size: u64,
-    ) -> TempDir {
+    async fn write_cache(layout: CacheLayout<'_>) -> TempDir {
+        let CacheLayout {
+            registry,
+            namespace,
+            name,
+            tag,
+            digest,
+            size,
+        } = layout;
+
         let dir = TempDir::new().unwrap();
         let manifest_dir = dir
             .path()
@@ -289,14 +303,14 @@ mod tests {
 
     #[tokio::test]
     async fn library_default_tag_resolves_with_short_id() {
-        let dir = write_cache(
-            "registry.ollama.ai",
-            "library",
-            "all-minilm",
-            "latest",
-            "abc123",
-            100,
-        )
+        let dir = write_cache(CacheLayout {
+            registry: "registry.ollama.ai",
+            namespace: "library",
+            name: "all-minilm",
+            tag: "latest",
+            digest: "abc123",
+            size: 100,
+        })
         .await;
         let r = OllamaResolver::new(dir.path());
 
@@ -326,7 +340,15 @@ mod tests {
 
     #[tokio::test]
     async fn non_default_tag_preserves_tag_in_id() {
-        let dir = write_cache("registry.ollama.ai", "library", "qwen", "7b", "deadbeef", 0).await;
+        let dir = write_cache(CacheLayout {
+            registry: "registry.ollama.ai",
+            namespace: "library",
+            name: "qwen",
+            tag: "7b",
+            digest: "deadbeef",
+            size: 0,
+        })
+        .await;
         let r = OllamaResolver::new(dir.path());
         let got = r.resolve("qwen:7b").await.unwrap().expect("present");
         assert_eq!(got.id, "qwen:7b");
@@ -334,14 +356,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_default_namespace_keeps_namespace_in_id() {
-        let dir = write_cache(
-            "registry.ollama.ai",
-            "myorg",
-            "private",
-            "latest",
-            "feed",
-            0,
-        )
+        let dir = write_cache(CacheLayout {
+            registry: "registry.ollama.ai",
+            namespace: "myorg",
+            name: "private",
+            tag: "latest",
+            digest: "feed",
+            size: 0,
+        })
         .await;
         let r = OllamaResolver::new(dir.path());
         let got = r.resolve("myorg/private").await.unwrap().expect("present");
@@ -350,14 +372,14 @@ mod tests {
 
     #[tokio::test]
     async fn missing_blob_makes_manifest_invisible_not_an_error() {
-        let dir = write_cache(
-            "registry.ollama.ai",
-            "library",
-            "ghost",
-            "latest",
-            "deadbeef",
-            0,
-        )
+        let dir = write_cache(CacheLayout {
+            registry: "registry.ollama.ai",
+            namespace: "library",
+            name: "ghost",
+            tag: "latest",
+            digest: "deadbeef",
+            size: 0,
+        })
         .await;
         // Remove the blob to simulate post-GC state.
         tokio::fs::remove_file(dir.path().join("blobs").join("sha256-deadbeef"))
