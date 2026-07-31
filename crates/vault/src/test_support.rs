@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
-use crate::store::{DekBlob, StoreError, StoredCredential, VaultStore};
+use crate::store::{DekBlob, SealedOAuth, StoreError, StoredCredential, VaultStore};
 
 /// `(sealed blob, is_active)` for a `(tenant, router)` pair.
 type CredCell = (Vec<u8>, bool);
@@ -204,16 +204,13 @@ impl VaultStore for MemoryStore {
         &self,
         tenant: Uuid,
         router: Uuid,
-        sealed: &[u8],
-        _expires_at_ms: Option<i64>,
-        _scopes: Option<&str>,
-        _client_id: Option<&str>,
+        record: SealedOAuth<'_>,
         _actor: &str,
     ) -> Result<Uuid, StoreError> {
         self.oauth
             .lock()
             .unwrap()
-            .insert((tenant, router), (sealed.to_vec(), true));
+            .insert((tenant, router), (record.sealed.to_vec(), true));
         Ok(Uuid::new_v4())
     }
 

@@ -30,8 +30,8 @@ mod test_support;
 
 pub use cache::TenantKeyCache;
 pub use kek::{EnvKekProvider, KekProvider, Profile, StaticKekProvider};
-pub use store::{DekBlob, StoredCredential, VaultStore};
-pub use vault::{Vault, VaultError};
+pub use store::{DekBlob, SealedOAuth, StoredCredential, VaultStore};
+pub use vault::{OAuthCredential, Vault, VaultError};
 
 #[cfg(feature = "sqlx")]
 pub use postgres::{PostgresVaultStore, SupabaseVaultKekProvider};

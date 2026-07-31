@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{self, CryptoError};
 use crate::kek::{KekError, KekProvider};
-use crate::store::{StoreError, VaultStore};
+use crate::store::{SealedOAuth, StoreError, VaultStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
@@ -52,6 +52,20 @@ struct OAuthBundle {
 pub struct OAuthToken {
     pub access_token: Zeroizing<String>,
     pub expires_at_ms: Option<i64>,
+}
+
+/// The plaintext OAuth credential a caller hands to [`Vault::store_oauth`] (and
+/// [`TenantKeyCache::store_oauth`](crate::cache::TenantKeyCache::store_oauth)): the access token
+/// plus optional refresh token, expiry (epoch millis), scopes, and client id. Grouped into one
+/// struct so the call isn't a long positional parameter list; borrows its strings — nothing is
+/// copied until sealing. The paste-token path sets just `access_token` (rest `None`).
+#[derive(Debug, Clone, Copy)]
+pub struct OAuthCredential<'a> {
+    pub access_token: &'a str,
+    pub refresh_token: Option<&'a str>,
+    pub expires_at_ms: Option<i64>,
+    pub scopes: Option<&'a str>,
+    pub client_id: Option<&'a str>,
 }
 
 /// Seals/unseals provider credentials under a per-tenant DEK (sealed under `K`'s KEK),
@@ -255,25 +269,20 @@ impl<K: KekProvider, S: VaultStore> Vault<K, S> {
     /// `{access,refresh,expires,scopes}` bundle (AAD-bound, like an api_key) under the tenant
     /// DEK and persist it as the active `credential_type='oauth'` row. Auto-provisions the DEK.
     /// The paste-token path passes just `access_token` (rest `None`). Returns the row id.
-    #[allow(clippy::too_many_arguments)]
     pub async fn store_oauth(
         &self,
         tenant: Uuid,
         router: Uuid,
-        access_token: &str,
-        refresh_token: Option<&str>,
-        expires_at_ms: Option<i64>,
-        scopes: Option<&str>,
-        client_id: Option<&str>,
+        cred: &OAuthCredential<'_>,
         actor: &str,
     ) -> Result<Uuid, VaultError> {
         self.ensure_tenant_dek(tenant, actor).await?;
         let dek = self.dek(tenant).await?;
         let bundle = OAuthBundle {
-            access_token: access_token.to_owned(),
-            refresh_token: refresh_token.map(str::to_owned),
-            expires_at_ms,
-            scopes: scopes.map(str::to_owned),
+            access_token: cred.access_token.to_owned(),
+            refresh_token: cred.refresh_token.map(str::to_owned),
+            expires_at_ms: cred.expires_at_ms,
+            scopes: cred.scopes.map(str::to_owned),
         };
         // Serialize into a Zeroizing buffer so the plaintext JSON is wiped after sealing.
         let json = Zeroizing::new(serde_json::to_vec(&bundle).map_err(|_| VaultError::Codec)?);
@@ -283,10 +292,12 @@ impl<K: KekProvider, S: VaultStore> Vault<K, S> {
             .store_oauth(
                 tenant,
                 router,
-                &sealed,
-                expires_at_ms,
-                scopes,
-                client_id,
+                SealedOAuth {
+                    sealed: &sealed,
+                    expires_at_ms: cred.expires_at_ms,
+                    scopes: cred.scopes,
+                    client_id: cred.client_id,
+                },
                 actor,
             )
             .await?)
@@ -537,9 +548,20 @@ mod tests {
         v.store_router_key(t, r, "sk-ant-static", None, "tester")
             .await
             .unwrap();
-        v.store_oauth(t, r, "oauth-access-XYZ", None, None, None, None, "tester")
-            .await
-            .unwrap();
+        v.store_oauth(
+            t,
+            r,
+            &OAuthCredential {
+                access_token: "oauth-access-XYZ",
+                refresh_token: None,
+                expires_at_ms: None,
+                scopes: None,
+                client_id: None,
+            },
+            "tester",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             v.resolve_oauth(t, r)
@@ -580,11 +602,13 @@ mod tests {
         v.store_oauth(
             t,
             r,
-            "acc",
-            Some("refresh"),
-            Some(1_900_000_000_000),
-            Some("chat"),
-            None,
+            &OAuthCredential {
+                access_token: "acc",
+                refresh_token: Some("refresh"),
+                expires_at_ms: Some(1_900_000_000_000),
+                scopes: Some("chat"),
+                client_id: None,
+            },
             "t",
         )
         .await

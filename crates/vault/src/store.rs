@@ -39,6 +39,17 @@ pub struct DekBlob {
     pub sealed: Vec<u8>,
 }
 
+/// The material to persist for an oauth credential: the sealed `{access,refresh,expires,scopes}`
+/// bundle plus the queryable metadata columns (expiry epoch-ms, scopes, client id). Grouped so
+/// [`VaultStore::store_oauth`] takes one record instead of a long positional parameter list.
+#[derive(Debug, Clone, Copy)]
+pub struct SealedOAuth<'a> {
+    pub sealed: &'a [u8],
+    pub expires_at_ms: Option<i64>,
+    pub scopes: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+}
+
 /// Storage of sealed vault material. Implementations persist bytes only — all sealing and
 /// unsealing happens in the [`Vault`](crate::vault::Vault). Backends must enforce
 /// RLS deny-all + `service_role`-only so these rows are never client-readable.
@@ -130,17 +141,13 @@ pub trait VaultStore: Send + Sync {
     // bundle the `Vault` seals/opens.
 
     /// Store (upsert) the active oauth credential for `(tenant, router)`: the sealed bundle
-    /// plus its optional expiry (epoch millis), scopes, and client id. One active oauth row
-    /// per `(tenant, router)`; reactivates a revoked row. Returns the row id.
-    #[allow(clippy::too_many_arguments)]
+    /// plus its metadata ([`SealedOAuth`]). One active oauth row per `(tenant, router)`;
+    /// reactivates a revoked row. Returns the row id.
     async fn store_oauth(
         &self,
         tenant: Uuid,
         router: Uuid,
-        sealed: &[u8],
-        expires_at_ms: Option<i64>,
-        scopes: Option<&str>,
-        client_id: Option<&str>,
+        record: SealedOAuth<'_>,
         actor: &str,
     ) -> Result<Uuid, StoreError>;
 
