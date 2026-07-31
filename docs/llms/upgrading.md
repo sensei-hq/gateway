@@ -6,7 +6,7 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
-## Unreleased
+## 0.4.x → 0.5.x
 
 Small breaking change to the **`sensei-vault`** OAuth API (a maintainability refactor —
 behaviour is unchanged). `store_oauth` now takes a struct instead of a long positional
