@@ -112,24 +112,28 @@ pub fn assert_err_kind(err: &GatewayError, kind: &ErrKind) {
     }
 }
 
+/// One mounted error response for [`assert_http_error`]: the `method`+`path` to intercept and
+/// the `status`+`body` to return. Groups the four "which error to mock" fields so the harness
+/// takes a spec rather than a long positional parameter list.
+pub struct HttpErrorCase {
+    pub method: &'static str,
+    pub path: String,
+    pub status: u16,
+    pub body: &'static str,
+}
+
 /// The shared body of every "mount an error status at one endpoint, call the adapter, assert
-/// the mapped `GatewayError`" test: start a server, mount `status` at `method`+`path`, run
-/// `call` against a [`router_config`] pointed at it, and assert the error is `kind`. `call`
+/// the mapped `GatewayError`" test: start a server, mount `case` (`status` at `method`+`path`),
+/// run `call` against a [`router_config`] pointed at it, and assert the error is `kind`. `call`
 /// receives the config and returns the adapter's own result (generic over the Ok type, which
 /// is discarded — only the error is checked). Drives the [`http_error_tests!`] macro.
-pub async fn assert_http_error<T, F, Fut>(
-    method: &'static str,
-    path: impl Into<String>,
-    status: u16,
-    body: &str,
-    kind: ErrKind,
-    call: F,
-) where
+pub async fn assert_http_error<T, F, Fut>(case: HttpErrorCase, kind: ErrKind, call: F)
+where
     F: FnOnce(RouterConfig) -> Fut,
     Fut: std::future::Future<Output = Result<T, GatewayError>>,
 {
     let server = MockServer::start().await;
-    mount_status(&server, method, path, status, body).await;
+    mount_status(&server, case.method, case.path, case.status, case.body).await;
     let err = match call(router_config(&server.uri())).await {
         Ok(_) => panic!("expected a GatewayError, got Ok"),
         Err(e) => e,
@@ -166,7 +170,17 @@ macro_rules! http_error_tests {
         $(
             #[tokio::test]
             async fn $name() {
-                common::assert_http_error($method, $path, $status, $body, $kind, $call).await;
+                common::assert_http_error(
+                    common::HttpErrorCase {
+                        method: $method,
+                        path: ($path).into(),
+                        status: $status,
+                        body: $body,
+                    },
+                    $kind,
+                    $call,
+                )
+                .await;
             }
         )+
     };
