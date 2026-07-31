@@ -318,22 +318,15 @@ impl kernel::adapters::capability::EmbedModel for OrtAdapter {
         _config: &RouterConfig,
         req: &EmbedRequest,
     ) -> Result<EmbedResponse, GatewayError> {
-        // Model resolution mirrors the `Payload::Embed` arm of `execute`:
-        // an explicit, non-matching model name is rejected up front.
-        super::reject_model_mismatch(
+        // `embed_response` rejects a request pinned to a model this adapter
+        // doesn't serve, then calls the inherent `OrtAdapter::embed(&[String])`
+        // below (preserving the ONNX session + tokenizer path) and wraps it.
+        super::embed_response(
             &self.config.adapter_id,
             &self.config.model_id,
             req.model.as_deref(),
-        )?;
-
-        // Inherent `OrtAdapter::embed(&[String])` wins method resolution over
-        // this trait method, preserving the ONNX session + tokenizer path.
-        let embeddings = self.embed(&req.texts)?;
-        Ok(EmbedResponse {
-            embeddings,
-            usage: None,
-            degraded: false,
-        })
+            || self.embed(&req.texts),
+        )
     }
 }
 
