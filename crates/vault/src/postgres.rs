@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::kek::{KekError, KekProvider};
-use crate::store::{DekBlob, StoreError, StoredCredential, VaultStore};
+use crate::store::{DekBlob, SealedOAuth, StoreError, StoredCredential, VaultStore};
 
 fn store_err(e: sqlx::Error) -> StoreError {
     StoreError::Backend(e.to_string())
@@ -32,6 +32,30 @@ pub struct PostgresVaultStore {
 impl PostgresVaultStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Deactivate the active credential of `credential_type` for `(tenant, router)` — the shared
+    /// body of `deactivate_credential` (`'api_key'`) and `deactivate_oauth` (`'oauth'`).
+    async fn deactivate(
+        &self,
+        credential_type: &str,
+        tenant: Uuid,
+        router: Uuid,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "update public.router_credentials set is_active = false, modified_by = $3 \
+             where tenant_id = $1 and router_id = $2 \
+               and credential_type = $4 and is_active = true",
+        )
+        .bind(tenant)
+        .bind(router)
+        .bind(actor)
+        .bind(credential_type)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
     }
 }
 
@@ -103,18 +127,7 @@ impl VaultStore for PostgresVaultStore {
         router: Uuid,
         actor: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "update public.router_credentials set is_active = false, modified_by = $3 \
-             where tenant_id = $1 and router_id = $2 \
-               and credential_type = 'api_key' and is_active = true",
-        )
-        .bind(tenant)
-        .bind(router)
-        .bind(actor)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(())
+        self.deactivate("api_key", tenant, router, actor).await
     }
 
     async fn get_active_credential(
@@ -305,10 +318,7 @@ impl VaultStore for PostgresVaultStore {
         &self,
         tenant: Uuid,
         router: Uuid,
-        sealed: &[u8],
-        expires_at_ms: Option<i64>,
-        scopes: Option<&str>,
-        client_id: Option<&str>,
+        record: SealedOAuth<'_>,
         actor: &str,
     ) -> Result<Uuid, StoreError> {
         // `oauth_expires_at` is timestamptz; convert epoch-ms → timestamptz in SQL so the crate
@@ -333,10 +343,10 @@ impl VaultStore for PostgresVaultStore {
         )
         .bind(tenant)
         .bind(router)
-        .bind(sealed)
-        .bind(expires_at_ms)
-        .bind(scopes)
-        .bind(client_id)
+        .bind(record.sealed)
+        .bind(record.expires_at_ms)
+        .bind(record.scopes)
+        .bind(record.client_id)
         .bind(actor)
         .fetch_one(&self.pool)
         .await
@@ -367,18 +377,7 @@ impl VaultStore for PostgresVaultStore {
         router: Uuid,
         actor: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "update public.router_credentials set is_active = false, modified_by = $3 \
-             where tenant_id = $1 and router_id = $2 \
-               and credential_type = 'oauth' and is_active = true",
-        )
-        .bind(tenant)
-        .bind(router)
-        .bind(actor)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(())
+        self.deactivate("oauth", tenant, router, actor).await
     }
 
     async fn list_active_oauth(&self, tenant: Uuid) -> Result<Vec<StoredCredential>, StoreError> {
@@ -450,7 +449,7 @@ mod tests {
     //!   cargo test -p sensei-vault --features sqlx -- --ignored
     use super::*;
     use crate::kek::StaticKekProvider;
-    use crate::vault::Vault;
+    use crate::vault::{OAuthCredential, Vault};
     use sqlx::postgres::PgPoolOptions;
 
     async fn pool() -> PgPool {
@@ -752,11 +751,13 @@ mod tests {
             .store_oauth(
                 tenant,
                 router,
-                "oauth-tok-AAA",
-                None,
-                None,
-                None,
-                None,
+                &OAuthCredential {
+                    access_token: "oauth-tok-AAA",
+                    refresh_token: None,
+                    expires_at_ms: None,
+                    scopes: None,
+                    client_id: None,
+                },
                 "tester",
             )
             .await
