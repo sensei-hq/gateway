@@ -697,6 +697,62 @@ fn process_sse_line(state: &mut OpenAiStreamState, line: &str) {
     }));
 }
 
+/// Generate the standard OpenAI-compatible [`ChatModel`](kernel::adapters::capability::ChatModel)
+/// impl for an adapter whose `chat`/`chat_stream` just require an API key then delegate to
+/// [`chat`]/[`chat_stream`] with a default model — the "thin delegation" contract described in
+/// this module's header. The adapter must have a `client: reqwest::Client` field.
+///
+/// - `$adapter` — the adapter type.
+/// - `model = $model` — default model id used when the request doesn't pin one.
+/// - `name = $name` — adapter name for the `Authentication` error when the key is missing.
+///
+/// ```ignore
+/// crate::impl_openai_compat_chat!(OpenAIAdapter, model = DEFAULT_MODEL, name = "openai");
+/// ```
+#[macro_export]
+macro_rules! impl_openai_compat_chat {
+    ($adapter:ty, model = $model:expr, name = $name:literal) => {
+        #[async_trait::async_trait]
+        impl kernel::adapters::capability::ChatModel for $adapter {
+            async fn chat(
+                &self,
+                config: &kernel::types::config::RouterConfig,
+                req: &kernel::types::io::ChatRequest,
+            ) -> ::std::result::Result<
+                kernel::types::io::ChatResponse,
+                kernel::types::error::GatewayError,
+            > {
+                // Require a key up front (the shared core treats it as optional, since local
+                // providers need none); a missing one short-circuits to Authentication.
+                $crate::base::require_api_key(config, $name)?;
+                $crate::openai_compat::chat(&self.client, &config.url, $model, config, req).await
+            }
+
+            async fn chat_stream(
+                &self,
+                config: &kernel::types::config::RouterConfig,
+                req: &kernel::types::io::ChatRequest,
+            ) -> ::std::result::Result<
+                ::std::pin::Pin<
+                    Box<
+                        dyn futures::Stream<
+                                Item = ::std::result::Result<
+                                    kernel::types::request::StreamChunk,
+                                    kernel::types::error::GatewayError,
+                                >,
+                            > + Send,
+                    >,
+                >,
+                kernel::types::error::GatewayError,
+            > {
+                $crate::base::require_api_key(config, $name)?;
+                $crate::openai_compat::chat_stream(&self.client, &config.url, $model, config, req)
+                    .await
+            }
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
