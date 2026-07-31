@@ -412,7 +412,6 @@ mod tests {
         ChainEntry, FallbackChainConfig, FallbackTrigger, ModelConfig, ModelPricing, RouterConfig,
     };
     use std::collections::HashMap;
-    use std::time::Duration;
 
     fn test_config() -> GatewayConfig {
         let mut routers = HashMap::new();
@@ -537,11 +536,7 @@ mod tests {
     }
 
     fn test_cb() -> CircuitBreakerManager {
-        CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        })
+        CircuitBreakerManager::new(CircuitBreakerConfig::default())
     }
 
     #[test]

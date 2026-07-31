@@ -1385,7 +1385,6 @@ mod tests {
     use crate::types::request::{AuthContext, Message, MessageRole, Payload};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
 
     fn test_config_with_noop() -> GatewayConfig {
         let mut routers = HashMap::new();
@@ -1449,11 +1448,7 @@ mod tests {
     fn test_gateway() -> Gateway {
         let config = test_config_with_noop();
         let adapters = AdapterRegistry::new();
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
 
         Gateway::new(config, adapters, cb)
     }
@@ -1571,11 +1566,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
 
         let seen_model = Arc::new(std::sync::Mutex::new(None));
@@ -1683,11 +1674,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         gw.adapters.register_chat(Arc::new(UsageAdapter)).await;
 
@@ -1799,11 +1786,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let store = Arc::new(InMemoryStore::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb).with_store(store.clone());
         gw.adapters.register_chat(Arc::new(UsageAdapter)).await;
@@ -1854,11 +1837,7 @@ mod tests {
     fn constrained_gateway(constraints: ConstraintsConfig, store: Arc<InMemoryStore>) -> Gateway {
         let mut config = test_config_with_noop();
         config.constraints = constraints;
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         Gateway::new(config, AdapterRegistry::new(), cb).with_store(store)
     }
 
@@ -2031,11 +2010,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
 
         let request = InferenceRequest {
@@ -2350,11 +2325,7 @@ mod tests {
     fn test_gateway_with_chain() -> Gateway {
         let config = test_config_with_failing_and_noop();
         let adapters = AdapterRegistry::new();
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         Gateway::new(config, adapters, cb)
     }
 
@@ -2606,11 +2577,7 @@ mod tests {
         adapters
             .register_chat(Arc::new(Capturing { seen: seen.clone() }))
             .await;
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(cap_config(), adapters, cb);
 
         // The wrapper resolves the tenant's key and hands it to the engine per call.
@@ -2675,11 +2642,7 @@ mod tests {
         adapters
             .register_chat(Arc::new(CapturingStreamer { seen: seen.clone() }))
             .await;
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(cap_config(), adapters, cb);
 
         let mut req = chat_request();
@@ -2779,11 +2742,7 @@ mod tests {
             consensus: Default::default(),
         };
         let adapters = AdapterRegistry::new();
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, adapters, cb);
         register_failing(
             &gw,
@@ -2893,11 +2852,7 @@ mod tests {
             consensus: Default::default(),
         };
         let adapters = AdapterRegistry::new();
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, adapters, cb);
         // Only register noop — "ghost" has no adapter
         register_noop(&gw).await;
@@ -3041,11 +2996,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_failing(
             &gw,
@@ -3092,11 +3043,7 @@ mod tests {
 
     #[test]
     fn try_new_accepts_valid_config() {
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         // test_config_with_noop() is internally consistent (router/model/chain).
         let result = Gateway::try_new(test_config_with_noop(), AdapterRegistry::new(), cb);
         assert!(result.is_ok(), "valid config should pass validation");
@@ -3108,11 +3055,7 @@ mod tests {
         let mut config = test_config_with_noop();
         config.chains.get_mut("chat_chain").unwrap().models[0].model = "does-not-exist".to_string();
 
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         match Gateway::try_new(config, AdapterRegistry::new(), cb) {
             Err(GatewayError::InvalidConfig(msg)) => {
                 assert!(
@@ -3127,11 +3070,7 @@ mod tests {
 
     #[test]
     fn try_new_rejects_empty_config() {
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         match Gateway::try_new(GatewayConfig::default(), AdapterRegistry::new(), cb) {
             Err(GatewayError::InvalidConfig(msg)) => {
                 assert!(msg.contains("no routers"), "unexpected message: {msg}");
@@ -3332,11 +3271,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         gw.adapters
             .register_chat(Arc::new(FakeStreamer {
@@ -3468,11 +3403,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         gw.adapters
             .register_chat(Arc::new(FakeStreamFailer {
@@ -3636,11 +3567,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_noop(&gw).await; // "noop" only; "ghost" has no adapter
 
@@ -3713,11 +3640,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_noop(&gw).await;
 
@@ -3806,11 +3729,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         gw.adapters
@@ -3898,11 +3817,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_noop(&gw).await;
 
@@ -3996,11 +3911,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_noop(&gw).await;
 
@@ -4096,11 +4007,7 @@ mod tests {
             panels,
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_noop(&gw).await;
 
@@ -4194,11 +4101,7 @@ mod tests {
             panels: Default::default(),
             consensus,
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_noop(&gw).await;
 
@@ -4309,11 +4212,7 @@ mod tests {
     }
 
     fn gw_from(config: GatewayConfig) -> Gateway {
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         Gateway::new(config, AdapterRegistry::new(), cb)
     }
 
@@ -4458,11 +4357,7 @@ mod tests {
             panels: Default::default(),
             consensus: Default::default(),
         };
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
         let gw = Gateway::new(config, AdapterRegistry::new(), cb);
         register_noop(&gw).await;
 

@@ -386,7 +386,6 @@ mod tests {
     use crate::types::cost::Cost;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
 
     // -- helpers -----------------------------------------------------------
 
@@ -457,11 +456,7 @@ mod tests {
     async fn noop_gateway() -> Gateway {
         let config = noop_gateway_config();
         let adapters = AdapterRegistry::new();
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
 
         let gw = Gateway::new(config, adapters, cb);
         Arc::new(NoopAdapter).register_into(&gw.adapters).await;
