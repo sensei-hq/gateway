@@ -1,6 +1,8 @@
 use crate::circuit_breaker::CircuitBreakerManager;
 use crate::types::capability::Capability;
-use crate::types::config::{FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig};
+use crate::types::config::{
+    ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
+};
 use crate::types::cost::CostEstimate;
 
 /// Criteria used to resolve which model(s) to try.
@@ -122,89 +124,46 @@ impl<'a> ModelSelectionService<'a> {
 
     /// Tier 1: Direct resolution — validate a single router+model pair.
     fn resolve_direct(&self, criteria: &SelectionCriteria) -> SelectionResult {
-        let mut skipped = Vec::new();
-
         let router_name = criteria.router.clone().unwrap_or_default();
         let model_name = criteria.model.clone().unwrap_or_default();
+
+        // Every validation failure below skips with the same shape: a single
+        // `SkippedCandidate` for this router+model and no selected/candidate.
+        // Closing over the names once here removes that boilerplate from
+        // each check.
+        let reject = |reason: String| SelectionResult {
+            selected: None,
+            all_candidates: vec![],
+            skipped: vec![SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name.clone(),
+                reason,
+            }],
+            chain: None,
+        };
 
         // Validate router exists and is enabled
         let router_config = match self.config.routers.get(&router_name) {
             Some(rc) => rc,
-            None => {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name.clone(),
-                    reason: "router not found".to_string(),
-                });
-                return SelectionResult {
-                    selected: None,
-                    all_candidates: vec![],
-                    skipped,
-                    chain: None,
-                };
-            }
+            None => return reject("router not found".to_string()),
         };
-
         if !router_config.enabled {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: "router disabled".to_string(),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
+            return reject("router disabled".to_string());
         }
 
         // Validate model exists and supports capability
         let model_config = match self.config.models.get(&model_name) {
             Some(mc) => mc,
-            None => {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name.clone(),
-                    reason: "model not found".to_string(),
-                });
-                return SelectionResult {
-                    selected: None,
-                    all_candidates: vec![],
-                    skipped,
-                    chain: None,
-                };
-            }
+            None => return reject("model not found".to_string()),
         };
-
         if !model_config.capabilities.contains(&criteria.capability) {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: format!("does not support {:?}", criteria.capability),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
+            return reject(format!("does not support {:?}", criteria.capability));
         }
 
         // Circuit breaker check
         let endpoint = format!("{}:{}", router_name, model_name);
         if !self.circuit_breaker.can_execute(&endpoint) {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: "circuit breaker open".to_string(),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
+            return reject("circuit breaker open".to_string());
         }
 
         // Cost estimation and budget check
@@ -212,20 +171,10 @@ impl<'a> ModelSelectionService<'a> {
         if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
             && est.estimated > budget
         {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: format!(
-                    "over budget (estimated {:.4}, budget {:.4})",
-                    est.estimated, budget
-                ),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
+            return reject(format!(
+                "over budget (estimated {:.4}, budget {:.4})",
+                est.estimated, budget
+            ));
         }
 
         let api_model_id = model_config
@@ -246,7 +195,7 @@ impl<'a> ModelSelectionService<'a> {
         SelectionResult {
             selected: None, // filled by caller
             all_candidates: vec![selected],
-            skipped,
+            skipped: vec![],
             chain: None,
         }
     }
@@ -265,106 +214,10 @@ impl<'a> ModelSelectionService<'a> {
         entries.sort_by_key(|e| e.priority);
 
         for entry in &entries {
-            let model_name = &entry.model;
-
-            // Look up the model config
-            let model_config = match self.config.models.get(model_name) {
-                Some(mc) => mc,
-                None => {
-                    let router_name = entry
-                        .router
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    skipped.push(SkippedCandidate {
-                        model: model_name.clone(),
-                        router: router_name,
-                        reason: "model not found".to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            // Resolve router: chain entry router, else model's provider
-            let router_name = entry
-                .router
-                .clone()
-                .unwrap_or_else(|| model_config.provider.clone());
-
-            // Validate router exists and is enabled
-            let router_config = match self.config.routers.get(&router_name) {
-                Some(rc) => rc,
-                None => {
-                    skipped.push(SkippedCandidate {
-                        model: model_name.clone(),
-                        router: router_name,
-                        reason: "router not found".to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            if !router_config.enabled {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: "router disabled".to_string(),
-                });
-                continue;
+            match self.validate_chain_entry(entry, criteria) {
+                Ok(candidate) => all_candidates.push(candidate),
+                Err(candidate) => skipped.push(candidate),
             }
-
-            // Validate capability
-            if !model_config.capabilities.contains(&criteria.capability) {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: format!("does not support {:?}", criteria.capability),
-                });
-                continue;
-            }
-
-            // Circuit breaker check
-            let endpoint = format!("{}:{}", router_name, model_name);
-            if !self.circuit_breaker.can_execute(&endpoint) {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: "circuit breaker open".to_string(),
-                });
-                continue;
-            }
-
-            // Cost estimation and budget check
-            let cost_estimate = self.estimate_cost(model_config, criteria);
-            if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
-                && est.estimated > budget
-            {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: format!(
-                        "over budget (estimated {:.4}, budget {:.4})",
-                        est.estimated, budget
-                    ),
-                });
-                continue;
-            }
-
-            // Resolve API model ID: chain entry override, else model config, else model id
-            let api_model_id = entry
-                .api_model_id
-                .clone()
-                .or_else(|| model_config.api_model_id.clone())
-                .unwrap_or_else(|| model_name.clone());
-
-            all_candidates.push(SelectedModel {
-                model: model_name.clone(),
-                router: router_name,
-                router_config: router_config.clone(),
-                model_config: model_config.clone(),
-                api_model_id,
-                priority: entry.priority,
-                cost_estimate,
-            });
         }
 
         SelectionResult {
@@ -373,6 +226,111 @@ impl<'a> ModelSelectionService<'a> {
             skipped,
             chain: Some(chain.clone()),
         }
+    }
+
+    /// Validate a single chain entry against `criteria`, mirroring
+    /// [`Self::resolve_direct`]'s pipeline but resolving the router from the
+    /// entry (falling back to the model's provider) and layering the entry's
+    /// own `api_model_id` override on top of the model's.
+    fn validate_chain_entry(
+        &self,
+        entry: &ChainEntry,
+        criteria: &SelectionCriteria,
+    ) -> Result<SelectedModel, SkippedCandidate> {
+        let model_name = &entry.model;
+
+        // Look up the model config
+        let model_config = match self.config.models.get(model_name) {
+            Some(mc) => mc,
+            None => {
+                let router_name = entry
+                    .router
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(SkippedCandidate {
+                    model: model_name.clone(),
+                    router: router_name,
+                    reason: "model not found".to_string(),
+                });
+            }
+        };
+
+        // Resolve router: chain entry router, else model's provider
+        let router_name = entry
+            .router
+            .clone()
+            .unwrap_or_else(|| model_config.provider.clone());
+
+        // Validate router exists and is enabled
+        let router_config = match self.config.routers.get(&router_name) {
+            Some(rc) => rc,
+            None => {
+                return Err(SkippedCandidate {
+                    model: model_name.clone(),
+                    router: router_name,
+                    reason: "router not found".to_string(),
+                });
+            }
+        };
+
+        if !router_config.enabled {
+            return Err(SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name,
+                reason: "router disabled".to_string(),
+            });
+        }
+
+        // Validate capability
+        if !model_config.capabilities.contains(&criteria.capability) {
+            return Err(SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name,
+                reason: format!("does not support {:?}", criteria.capability),
+            });
+        }
+
+        // Circuit breaker check
+        let endpoint = format!("{}:{}", router_name, model_name);
+        if !self.circuit_breaker.can_execute(&endpoint) {
+            return Err(SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name,
+                reason: "circuit breaker open".to_string(),
+            });
+        }
+
+        // Cost estimation and budget check
+        let cost_estimate = self.estimate_cost(model_config, criteria);
+        if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
+            && est.estimated > budget
+        {
+            return Err(SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name,
+                reason: format!(
+                    "over budget (estimated {:.4}, budget {:.4})",
+                    est.estimated, budget
+                ),
+            });
+        }
+
+        // Resolve API model ID: chain entry override, else model config, else model id
+        let api_model_id = entry
+            .api_model_id
+            .clone()
+            .or_else(|| model_config.api_model_id.clone())
+            .unwrap_or_else(|| model_name.clone());
+
+        Ok(SelectedModel {
+            model: model_name.clone(),
+            router: router_name,
+            router_config: router_config.clone(),
+            model_config: model_config.clone(),
+            api_model_id,
+            priority: entry.priority,
+            cost_estimate,
+        })
     }
 
     /// Tier 3: resolve by capability when the caller pinned neither a model
