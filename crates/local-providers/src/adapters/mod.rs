@@ -34,3 +34,33 @@ pub mod kokoro;
 
 #[cfg(feature = "kokoro")]
 pub use kokoro::{KokoroAdapter, KokoroConfig, KokoroLang};
+
+/// Rejects a request pinned to a model id this adapter doesn't serve. Every
+/// embedded adapter enforces the same contract: `req.model` is either unset
+/// (the request accepts whatever this adapter is configured for) or it must
+/// match `model_id` exactly.
+///
+/// Not gated to a single feature (unlike the adapter modules above) since
+/// every one of them calls it; gated on "any engine feature" so a
+/// no-features build doesn't carry a dead `pub(crate)` fn.
+#[cfg(any(
+    feature = "llama-cpp",
+    feature = "ort",
+    feature = "kokoro",
+    feature = "fastembed"
+))]
+pub(crate) fn reject_model_mismatch(
+    adapter_id: &str,
+    model_id: &str,
+    requested: Option<&str>,
+) -> Result<(), kernel::types::error::GatewayError> {
+    if let Some(requested) = requested
+        && requested != model_id
+    {
+        return Err(kernel::types::error::GatewayError::ModelUnavailable {
+            adapter: adapter_id.to_string(),
+            model: requested.to_string(),
+        });
+    }
+    Ok(())
+}

@@ -320,14 +320,11 @@ impl kernel::adapters::capability::EmbedModel for OrtAdapter {
     ) -> Result<EmbedResponse, GatewayError> {
         // Model resolution mirrors the `Payload::Embed` arm of `execute`:
         // an explicit, non-matching model name is rejected up front.
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
+        super::reject_model_mismatch(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+        )?;
 
         // Inherent `OrtAdapter::embed(&[String])` wins method resolution over
         // this trait method, preserving the ONNX session + tokenizer path.
