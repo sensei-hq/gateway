@@ -6,8 +6,7 @@
 	import SectionHead from '$lib/components/SectionHead.svelte';
 	import InfoCard from '$lib/components/InfoCard.svelte';
 	import CrateCard from '$lib/components/CrateCard.svelte';
-	import CodeWindow from '$lib/components/CodeWindow.svelte';
-	import UsageTabs from '$lib/components/UsageTabs.svelte';
+	import CodeFrame from '$lib/components/CodeFrame.svelte';
 	import ArchDiagram from '$lib/components/ArchDiagram.svelte';
 	import ArrowIcon from '$lib/components/ArrowIcon.svelte';
 	import {
@@ -60,7 +59,7 @@
 			</Button>
 		</div>
 		<div class="mt-6 w-full max-w-2xl text-left">
-			<CodeWindow filename={hero.code.filename} code={hero.code.source} />
+			<CodeFrame filename={hero.code.filename} code={hero.code.source} />
 		</div>
 	</div>
 </section>
@@ -106,7 +105,7 @@
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={usage.eyebrow} title={usage.title} lede={usage.lede} />
 		<div class="mt-10">
-			<UsageTabs tabs={usage.tabs} />
+			<CodeFrame tabs={usage.tabs} />
 			<p class="mt-4 px-1 font-mono text-sm text-ink-soft">{usage.note}</p>
 		</div>
 	</div>

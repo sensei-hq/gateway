@@ -160,7 +160,7 @@ pre {
 	font-variant-ligatures: none;
 }
 
-/* GitHub-style code-editor surface (mockup CodeWindow + usage tabs). Its own
+/* GitHub-style code-editor surface (mockup CodeFrame, chrome + tabs modes). Its own
    palette — distinct from the page paper — flipping with the mode. */
 .code-surface {
 	--code-bg: #f6f8fa;
