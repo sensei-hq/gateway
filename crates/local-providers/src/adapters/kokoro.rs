@@ -141,14 +141,11 @@ impl kernel::adapters::capability::TtsModel for KokoroAdapter {
     ) -> Result<TtsResponse, GatewayError> {
         // An explicit, non-matching model name is rejected up front (mirrors the
         // other adapters' model-resolution contract).
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
+        super::reject_model_mismatch(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+        )?;
 
         let speed = req.speed.unwrap_or(1.0);
         // Kokoro emits 24 kHz WAV; honoring `req.output_format` (e.g. MP3) needs

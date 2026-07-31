@@ -639,14 +639,11 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
         _cfg: &RouterConfig,
         req: &ChatRequest,
     ) -> Result<ChatResponse, GatewayError> {
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
+        super::reject_model_mismatch(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+        )?;
 
         let content = self.generate(
             &req.messages,
@@ -672,14 +669,11 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
         req: &ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
     {
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
+        super::reject_model_mismatch(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+        )?;
 
         // Resolve generation settings (mode-checked).
         let (default_max, default_temp, seed) = match self.config.mode {
@@ -732,11 +726,13 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
         tokio::task::spawn_blocking(move || {
             run_streaming_generation(
                 inner,
-                adapter_id,
-                prompt_tokens,
-                max_new,
-                temperature,
-                seed,
+                StreamingGenerationRequest {
+                    adapter_id,
+                    prompt_tokens,
+                    max_new,
+                    temperature,
+                    seed,
+                },
                 tx,
             );
         });
@@ -752,14 +748,11 @@ impl kernel::adapters::capability::EmbedModel for LlamaCppAdapter {
         _cfg: &RouterConfig,
         req: &EmbedRequest,
     ) -> Result<EmbedResponse, GatewayError> {
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
+        super::reject_model_mismatch(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+        )?;
 
         // Inherent `LlamaCppAdapter::embed` (the trait is referenced by full
         // path, not `use`d, so this method call binds to the inherent one).
@@ -780,6 +773,17 @@ impl kernel::adapters::RegisterInto for LlamaCppAdapter {
     }
 }
 
+/// Bundled inputs to [`run_streaming_generation`] — grouped into one value so
+/// the `spawn_blocking` worker call site doesn't carry five independent
+/// fields alongside `inner` and `tx`.
+struct StreamingGenerationRequest {
+    adapter_id: String,
+    prompt_tokens: Vec<LlamaToken>,
+    max_new: u32,
+    temperature: f32,
+    seed: u32,
+}
+
 /// Streaming generation body — runs in a `spawn_blocking` worker.
 /// Sends a [`StreamChunk`] for every UTF-8-valid prefix increment of
 /// the accumulated bytes, plus a final empty-content chunk with
@@ -794,13 +798,17 @@ impl kernel::adapters::RegisterInto for LlamaCppAdapter {
 /// original text exactly.
 fn run_streaming_generation(
     inner: Arc<Inner>,
-    adapter_id: String,
-    prompt_tokens: Vec<LlamaToken>,
-    max_new: u32,
-    temperature: f32,
-    seed: u32,
+    request: StreamingGenerationRequest,
     tx: tokio::sync::mpsc::Sender<Result<StreamChunk, GatewayError>>,
 ) {
+    let StreamingGenerationRequest {
+        adapter_id,
+        prompt_tokens,
+        max_new,
+        temperature,
+        seed,
+    } = request;
+
     let err = |message: String| GatewayError::ProviderError {
         adapter: adapter_id.clone(),
         message,
