@@ -44,9 +44,13 @@ impl PostgresVaultStore {
         actor: &str,
     ) -> Result<(), StoreError> {
         sqlx::query(
+            // credential_type::text keeps this comparison schema-agnostic: it works whether the
+            // column is varchar OR a Postgres enum (torii converted it to keyvault.credential_type).
+            // A bound &str param has no `enum = text` operator, so the cast decouples this crate
+            // from torii's physical column type — the crate never needs to know it's an enum.
             "update public.router_credentials set is_active = false, modified_by = $3 \
              where tenant_id = $1 and router_id = $2 \
-               and credential_type = $4 and is_active = true",
+               and credential_type::text = $4 and is_active = true",
         )
         .bind(tenant)
         .bind(router)
