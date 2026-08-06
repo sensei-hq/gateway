@@ -1,3 +1,11 @@
+---
+title: Capabilities & Adapters
+doctype: feature
+module: inference
+status: implemented
+source: crates/kernel/src/adapters/capability.rs
+---
+
 # Capabilities & Adapters
 
 > This page describes the capability-trait model shipped by the
@@ -293,3 +301,15 @@ capability-trait impls (and thus the maps the adapter registers into) *is* the
 declaration, checked by the compiler. Routing a chat request to Acme works iff
 `AcmeAdapter: ChatModel`; there is no way for the declaration to drift from the
 implementation.
+
+## Scenarios
+
+```gherkin
+Feature: Capabilities & adapters
+  Scenario: An adapter registers only into supported capability maps
+    Given an adapter implementing only ChatModel
+    Then registry.supports(Chat) is true and supports(Embed) is false
+  Scenario: An unsupported capability returns Unsupported
+    Given a chat-only adapter receives an embed request
+    Then it returns GatewayError::Unsupported
+```

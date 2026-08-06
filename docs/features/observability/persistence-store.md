@@ -1,3 +1,11 @@
+---
+title: Persistence Store
+doctype: feature
+module: observability
+status: implemented
+source: crates/gateway/src/store.rs
+---
+
 # Persistence Store
 
 The `gateway` crate has **no database of its own**. It never opens a connection,
@@ -144,3 +152,16 @@ the `ExecutionTrace` (returned to the caller) and the accounting data; the
 consumer is responsible for constructing `InferenceCall` / `StoredTrace` values
 and calling `insert_*` on its own store. `GatewayStore` defines the shape of that
 persistence layer but is not invoked from inside the crate.
+
+## Scenarios
+
+```gherkin
+Feature: Persistence store
+  Scenario: A GatewayStore records an inference call
+    Given a gateway configured with a GatewayStore
+    When a request completes
+    Then insert_inference_call is invoked with the call record
+  Scenario: A store error is best-effort
+    Given the store's insert fails
+    Then the request still succeeds and the error is logged, not propagated
+```

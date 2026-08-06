@@ -1,3 +1,11 @@
+---
+title: Circuit Breaker
+doctype: feature
+module: routing
+status: implemented
+source: crates/gateway/src/circuit_breaker.rs
+---
+
 # Circuit Breaker
 
 Per-endpoint circuit breaking for the inference routing engine. The breaker
@@ -245,3 +253,20 @@ Beyond the three methods above, `CircuitBreakerManager` exposes:
 
 The internal mutex is acquired with `.lock().unwrap_or_else(|e| e.into_inner())`,
 so a poisoned lock is recovered rather than propagated as a panic.
+
+## Scenarios
+
+```gherkin
+Feature: Circuit breaker
+  Scenario: Breaker opens after the failure threshold
+    Given the breaker threshold is 5
+    When router:modelA records 5 consecutive failures
+    Then the breaker for router:modelA is Open
+  Scenario: An open breaker skips the endpoint
+    Given router:modelA breaker is Open
+    Then modelA is a SkippedCandidate and the walk falls over
+  Scenario: Half-open probe closes on success
+    Given router:modelA breaker is Open and its timeout has elapsed
+    When a probe request to modelA succeeds
+    Then the breaker returns to Closed
+```

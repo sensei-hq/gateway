@@ -1,3 +1,11 @@
+---
+title: Providers
+doctype: feature
+module: inference
+status: implemented
+source: crates/cloud-providers/src
+---
+
 # Provider adapters
 
 The gateway routes every inference request through an **adapter**: a type that
@@ -112,3 +120,18 @@ gateway always yields a response.
   `RouterConfig` are silently ignored (auth is SigV4 via the AWS SDK). Only
   `headers` and the per-request model/params are used, which can surprise
   callers who set a URL or key expecting them to take effect.
+
+## Scenarios
+
+```gherkin
+Feature: Providers
+  Scenario: Anthropic adapter maps chat to the native API
+    Given an Anthropic router and a chat request
+    Then the adapter calls the Anthropic messages API and returns a ChatResponse
+  Scenario: OpenAI-compatible ids share one implementation
+    Given ids openrouter and vercel registered via with_id
+    Then both dispatch through the OpenAI adapter
+  Scenario: A 429 maps to a RateLimit error
+    Given a provider returns HTTP 429 with Retry-After
+    Then the adapter returns GatewayError::RateLimit { retry_after_ms }
+```

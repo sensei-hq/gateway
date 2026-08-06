@@ -1,34 +1,53 @@
-# Gateway — Feature Reference
+---
+title: Feature Reference — Module Index
+doctype: index
+module: index
+status: partial
+---
+
+# Gateway & Orchestrator — Feature Reference
 
 The `gateway` crate is a provider-agnostic **LLM inference routing engine**:
 connect provider credentials once, then route requests through named fallback
-chains with a per-endpoint circuit breaker, budget filtering, and request
-tracing. The companion `local-providers` crate adds in-process (local)
-inference — llama.cpp, ONNX Runtime, FastEmbed — behind the same adapter
-abstraction (with `local-engine` for model resolution + Hugging Face pull), so
-local and cloud models compose in one routing config.
+chains with health gates, budget filtering, and request tracing. The
+`local-providers` crate adds in-process inference behind the same adapter
+abstraction. Planned work extends this into an **agentic execution framework**
+(orchestrator) and a **decoupled data-tier** for catalog/config/usage. See the
+program design in
+[`../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../superpowers/specs/2026-08-06-sensei-orchestrator-design.md)
+and the full feature catalog in
+[`../superpowers/specs/2026-08-06-sensei-orchestrator-features-and-approach.md`](../superpowers/specs/2026-08-06-sensei-orchestrator-features-and-approach.md).
 
-This folder documents the library feature-by-feature. Every page traces its
-claims to source and carries a **Notes** section flagging existing quirks.
+Docs are organized **by module**. Each module has a `README.md` with a status
+table (Implemented · Partial · Planned). Every page leads with frontmatter and
+traces its claims to source, with a **Notes** section for quirks.
 
-## Contents
+## Modules
 
-| Page | What it covers |
-|------|----------------|
-| [routing-and-selection](routing-and-selection.md) | How a request becomes a provider call: routers, `ModelSelectionService`, `api_model_id` resolution, the three routing modes |
-| [fallback-chains](fallback-chains.md) | `FallbackChainConfig`/`ChainEntry`, `FallbackTrigger` variants, the candidate walk (continue vs. break) |
-| [circuit-breaker](circuit-breaker.md) | Per-endpoint breaker states, config, and how it skips candidates |
-| [budget-and-cost](budget-and-cost.md) | Token metering today (`ModelPricing`, `estimate_cost`, budget filtering); future quota/tiered metering |
-| [subscription-quota](subscription-quota.md) | Config-at-init tier quotas (`ConstraintsConfig`/`QuotaLimit`), `AuthContext`, the `check_quota` pre-flight guard, usage recording |
-| [capabilities-and-adapters](capabilities-and-adapters.md) | **Target** capability-trait model (`ChatModel`/`EmbedModel`/…), per-capability registry, how to add an adapter |
-| [providers](providers.md) | Reference for the 16 cloud adapters: id, base URL, auth style, capabilities, quirks |
-| [embedded-inference](embedded-inference.md) | `local-providers`: llama.cpp / ONNX / FastEmbed engines, cargo features |
-| [model-registry](model-registry.md) | `ModelResolver`, `ChainedResolver`, Managed / Ollama-read-through / External sources |
-| [streaming](streaming.md) | `stream()`, `StreamChunk`, `StreamingToolCall` accumulation, SSE parsing |
-| [tool-calling](tool-calling.md) | `ToolDefinition`/`ToolCall`, per-provider wire differences, streamed assembly |
-| [tracing-and-attempts](tracing-and-attempts.md) | `Attempt`/`AttemptStatus`, what callers see on success vs. failure |
-| [persistence-store](persistence-store.md) | The `GatewayStore` trait (consumer-implemented persistence) |
-| [configuration](configuration.md) | `GatewayConfig`/`RouterConfig`, `resolve_api_key` precedence, runtime config updates |
+### Gateway (existing core + Phase-1 enhancements)
+| Module | Status | Covers |
+|---|---|---|
+| [routing](routing/README.md) | Partial | selection · fallback chains · circuit breaker · **+ connection cooldown · model lockout · quota demote-to-tier** (SP-0) |
+| [catalog](catalog/README.md) | Partial | model registry · configuration · **+ free-tier catalog · tiers & chains · catalog refresh · config versioning** (SP-CAT) |
+| [inference](inference/README.md) | Implemented | providers · capabilities & adapters · streaming · tool-calling |
+| [governance](governance/README.md) | Partial | budget & cost · subscription quota · **+ usage metering · expiration tracking · predicted lockout** |
+| [local](local/README.md) | Implemented | embedded inference (llama.cpp / ONNX / FastEmbed) |
+| [observability](observability/README.md) | Implemented | tracing & attempts · persistence store (`GatewayStore`) |
+| [vault](vault/README.md) | Implemented | BYOK envelope-encrypted credential vault (`crates/vault`) |
+
+### Orchestrator (Phase 3 — planned)
+| Module | Status | Covers |
+|---|---|---|
+| [orchestrator](orchestrator/README.md) | Planned | execution graph · durable journal · agents/skills/tools · shared context · hooks |
+
+### Data-tier (Phase 4 — planned, extracted from torii)
+| Module | Status | Covers |
+|---|---|---|
+| [data-tier](data-tier/README.md) | Planned | catalog control-plane · management API · metering store |
+
+> **Layout:** every feature page leads with frontmatter (`doctype: feature`,
+> `status`, `phase`/`spec`, `source`) and carries a `## Scenarios` (Gherkin)
+> block; each module has a `README.md` with a status table.
 
 ## Capability × provider matrix
 
@@ -65,10 +84,7 @@ each adapter's `supports()` (cloud) / `supports_capability()` (embedded).
 | `ort` | | ✓ | | | | |
 
 Notes:
-- `noop` is the catch-all test/dev adapter — it accepts every capability and
-  returns a canned "no provider" response.
-- `openai` also registers under other ids (`openrouter`, `vercel`, `nvidia`, …)
-  via `with_id`, sharing one implementation across OpenAI-compatible endpoints.
-- `base` and `async_job` are shared helpers, not adapters — `async_job` drives
-  the submit-then-poll pattern used by the async media adapters.
-- This matrix must be updated when an adapter gains or loses a capability.
+- `noop` is the catch-all test/dev adapter — accepts every capability, returns a canned "no provider" response.
+- `openai` also registers under other ids (`openrouter`, `vercel`, `nvidia`, …) via `with_id`, sharing one implementation across OpenAI-compatible endpoints.
+- `base` and `async_job` are shared helpers, not adapters — `async_job` drives the submit-then-poll pattern for async media adapters.
+- Update this matrix when an adapter gains or loses a capability.

@@ -1,3 +1,11 @@
+---
+title: Configuration
+doctype: feature
+module: catalog
+status: implemented
+source: crates/kernel/src/types/config.rs, crates/gateway/src/config.rs
+---
+
 # Configuration
 
 The gateway is driven by a single in-memory config value, `GatewayConfig`. It
@@ -187,3 +195,19 @@ in the Keychain) so the next request picks up the change **without a daemon
 restart**. Because it overwrites `api_key` for every router with the resolver's
 return value, a resolver returning `None` for a router clears that router's
 literal key (after which `resolve_api_key` would fall back to `api_key_env`).
+
+## Scenarios
+
+```gherkin
+Feature: Configuration
+  Scenario: Literal api_key wins over api_key_env
+    Given a RouterConfig with both api_key and api_key_env set
+    Then resolve_api_key returns the literal api_key
+  Scenario: Invalid config is rejected
+    Given a chain referencing a model with no matching router
+    Then try_new returns an InvalidConfig error
+  Scenario: Runtime update hot-swaps chains
+    Given a running gateway
+    When try_update_config installs a new chain set
+    Then subsequent requests route by the new chains
+```

@@ -1,3 +1,11 @@
+---
+title: Fallback Chains
+doctype: feature
+module: routing
+status: implemented
+source: crates/gateway/src/engine.rs, crates/kernel/src/types/config.rs
+---
+
 # Feature: Fallback Chains
 
 - **Crate:** `gateway`
@@ -296,3 +304,19 @@ Behavior worth knowing:
 - **`FallbackTrigger` serializes `snake_case`;** config authors write
   `"rate_limit"`, `"provider_error"`, `"model_unavailable"`,
   `"budget_exceeded"`, `"timeout"`.
+
+## Scenarios
+
+```gherkin
+Feature: Fallback chains
+  Scenario: A triggerable error falls over
+    Given a chain [modelA, modelB] with fallback_triggers including rate_limit
+    And modelA returns a rate_limit error
+    Then the walk continues and modelB serves the request
+  Scenario: A non-triggerable error stops the walk
+    Given modelA returns an Authentication error (not in triggers)
+    Then the walk breaks and the error is returned (modelB is not tried)
+  Scenario: Success carries the attempts trail
+    Given modelA fails (triggerable) and modelB succeeds
+    Then the response.attempts records both the failed and the successful attempt
+```

@@ -1,3 +1,11 @@
+---
+title: Model Registry
+doctype: feature
+module: catalog
+status: implemented
+source: crates/local-engine/src
+---
+
 # Model Registry
 
 Resolves a stable model **id** to an on-disk path to the model bytes, drawing
@@ -272,3 +280,18 @@ interchangeably.
 - **`ManagedResolver::remove` and the file are decoupled.** Removing an index
   entry never touches the model bytes on disk; GC of the actual file is left to
   a higher layer.
+
+## Scenarios
+
+```gherkin
+Feature: Model registry & resolution
+  Scenario: Managed source resolves a model
+    Given a managed model id present in the registry
+    Then the resolver returns its endpoint without a remote pull
+  Scenario: Ollama read-through resolves a cached model
+    Given a model present in the local ~/.ollama cache
+    Then the Ollama source resolves it without downloading
+  Scenario: ChainedResolver falls through sources in order
+    Given a model absent from the first source but present in the second
+    Then the ChainedResolver returns the second source's resolution
+```

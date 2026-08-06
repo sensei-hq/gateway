@@ -1,3 +1,11 @@
+---
+title: Routing & Selection
+doctype: feature
+module: routing
+status: implemented
+source: crates/gateway/src/selection.rs
+---
+
 # Routing and Model Selection
 
 This document describes how the `gateway` crate turns an inbound
@@ -341,3 +349,19 @@ Behaviours worth flagging when reading the source:
 - **Adapter-not-found always continues**, unlike a provider error which only
   continues when a fallback trigger matches.
 - **Pinned models bypass `api_model_id` translation** (see the caveat above).
+
+## Scenarios
+
+```gherkin
+Feature: Routing & selection
+  Scenario: A pinned model bypasses chains
+    Given a request with model = "modelA"
+    Then exactly one candidate (modelA) is produced with no fallback chain
+  Scenario: A named chain selects by priority
+    Given a request with chain = "plan.frontier"
+    Then candidates are the chain's entries ordered by ascending priority
+  Scenario: Capability routing is deterministic
+    Given a request pinning neither model nor chain, capability = chat
+    And two chains match the capability
+    Then the chain with the lowest id is chosen (stable across runs)
+```
