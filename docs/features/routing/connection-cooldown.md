@@ -58,3 +58,15 @@ Feature: Connection cooldown
 
 - In-memory / per-process today. Future seam for multi-instance sharing (shared with [model lockout](model-lockout.md)).
 - Backoff uses decorrelated jitter to avoid synchronized retry storms across a fan-out.
+
+### Scenarios — added from design review
+
+```gherkin
+Feature: Connection cooldown (additional)
+  Scenario: Router cooldown takes precedence over model lockout in the skip reason
+    Given router R is cooling until now+30s
+    And modelA on R is also locked until now+300s
+    When the request is routed
+    Then modelA is skipped with reason Cooling (the earlier gate)
+    And resume_after still accounts for the router cooldown expiry
+```

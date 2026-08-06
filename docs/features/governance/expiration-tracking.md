@@ -10,7 +10,7 @@ source: crates/gateway (proactive expiry)
 
 # Expiration Tracking
 
-> **Status: Planned (Phase 1 · SP-0).** Reference: OmniRoute `providerExpiration`.
+> **Status: Planned — reactive `401→auth-lock` in SP-0 (Phase 1); the stateful expiration *tracking/alerts* in SP-DATA (Phase 4).** Reference: OmniRoute `providerExpiration`.
 
 Proactive tracking of credential/quota expiry per connection, so a credential is
 skipped (and an operator alerted) *before* it starts failing — the complement to

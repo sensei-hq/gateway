@@ -203,7 +203,7 @@ A **global monotonic `Seq`** stamps every effect completion and every shared-sco
 
 ### 9.1 Gateway boundary & lifecycle (integration contract)
 
-**The gateway is a long-lived, pure client — not open-per-task.** It is built once (`Gateway::new`/`try_new`/`FacadeBuilder::build`) with a `GatewayConfig` (chains/routers/models/adapters) and held as a shared `Arc<Gateway>`; there is no per-run create/close. Chains are **instance-level config assembled once** by the data-tier `config_loader` (tier-expansion → named `FallbackChainConfig`s) and hot-swapped via `update_config`/`try_update_config`; keys rotate via `refresh_router_keys`. Per request, callers pass only **which chain by name** (`request.chain`) and **BYOK keys** (`request.credentials`, router→key, applied as a per-call override — `engine.rs:278`). Health-gate state (breaker/cooldown/lockout, §12) therefore lives on the instance and is meaningfully long-lived across requests.
+**The gateway is a long-lived, pure client — not open-per-task.** It is built once (`Gateway::new`/`try_new`/`FacadeBuilder::build`) with a `GatewayConfig` (chains/routers/models/adapters) and held as a long-lived `Arc<Gateway>` (tenancy, if any, is a wrapper running **one entity per tenant** — the gateway *and* orchestrator cores have no tenant concept); there is no per-run create/close. Chains are **instance-level config assembled once** by the data-tier `config_loader` (tier-expansion → named `FallbackChainConfig`s) and hot-swapped via `update_config`/`try_update_config`; keys rotate via `refresh_router_keys`. Per request, callers pass only **which chain by name** (`request.chain`) and **BYOK keys** (`request.credentials`, router→key, applied as a per-call override — `engine.rs:278`). Health-gate state (breaker/cooldown/lockout, §12) therefore lives on the instance and is meaningfully long-lived across requests.
 
 **Agent execution is a wrapper on top; no agent metadata enters the gateway request.** The agent runtime compiles an `AgentInvocation` (skills · subagents · tools · context · inputs) into a plain `InferenceRequest`:
 - **skills** → composed into the system prompt (registry supplies bodies) — prompt text, not a gateway field;
@@ -241,7 +241,7 @@ Every error takes exactly one path — nothing dropped:
 |---|---|
 | success (`attempts` trail) | record `ModelCall` effect; bubble attempts to hooks |
 | `AllAttemptsFailed` (chain exhausted by real errors) | node fails → cascade-skip (hard edges) **or** caught by an enclosing `Loop` to replan |
-| terminal with `resume_after` (whole chain **locked out**, §12) | **durable pause** with a concrete wake-up time |
+| `AllGated { resume_after, human_action }` (whole chain gated, §12) | `resume_after = Some(t)` → **durable pause** to that wall-clock time; `None` (all terminal) → **fail-fast** with the human-action hint (never pause forever) |
 | `RateLimit{retry_after_ms}` surfaced at tool level | orchestrator owns backoff: **journaled `Timer`** (jittered) then retry, else pause |
 
 ### 11.3 Tools get their own taxonomy
@@ -260,7 +260,7 @@ New/enhanced **selection gates** in the gateway's `validate_chain_entry` pipelin
 | **Connection cooldown** (new) | router/connection | connection-level fault (`Network`, connect timeout) | backoff window (don't hammer a down provider model-by-model) |
 | **Model lockout** (new) | model | `QuotaExceeded`, `RateLimit{retry_after}`, `Authentication`, `ModelUnavailable` | `retry_after` / quota-reset / manual clear |
 
-**Key semantic change:** model lockout makes `QuotaExceeded` **demote to the next tier instead of terminating**. The run pauses only when the whole chain is locked out — and the terminal error's `resume_after` feeds the orchestrator's durable pause directly. This resolves the "one quota hit kills the run" adversarial finding.
+**Key semantic change:** a **provider** quota/rate-limit signal (classified from the adapter response — *not* the caller's subscription quota) **demotes to the next tier instead of terminating**; the run surfaces `GatewayError::AllGated { resume_after }` only when the whole chain is gated, feeding the orchestrator's durable pause. The caller's subscription `GatewayError::QuotaExceeded` (subject/tier) stays a **hard stop** and never demotes. Resolves the "one quota hit kills the run" finding without conflating the two quotas (see `docs/design/selection-policy-pipeline.md`).
 
 **State:** in-memory/per-process today (like the breaker). A future seam can persist gate state for multi-instance sharing (noted, not v1).
 
@@ -268,7 +268,7 @@ New/enhanced **selection gates** in the gateway's `validate_chain_entry` pipelin
 - **Cooldown duration by reason, not one value:** `rate_limit` ≈ 60s (fall over; recovers fast); `quota_exhausted` ≈ until the next reset boundary (tomorrow 00:00 / monthly reset), else ~1h; `credits_exhausted` → terminal until a human tops up (pause with a human-action resume hint); `auth`/`expired` → lock until the credential changes.
 - **Escalating backoff whose window outlives the cooldown:** a model that fails again right after its lockout expires keeps escalating instead of resetting to base. Clamp to an operator `maxCooldownMs` — **except** honor a real upstream reset hint exactly (never clamp "Resets in 92h" down to the cap).
 - **Rich classification** of limit signals: 429→`rate_limit`, 403/quota-body→`quota_exhausted`, credits→terminal; include text-pattern detection for providers that throttle via non-standard 400/403 bodies. This splits today's single `QuotaExceeded` into `rate_limit | quota-until-reset | credits-terminal`, each mapping to a distinct §11.2 outcome.
-- **Two scopes:** connection cooldown (all of a router's/credential's models) vs model lockout (one `router:model:credential`). Bounded map with an eviction cap so lockout state can't leak.
+- **Two scopes:** connection cooldown (all of a router's models) vs model lockout (one `router:model`). The gateway is **tenant-agnostic** — no tenant/credential dimension; a wrapper runs one gateway entity per tenant. Durability is the caller's via an `on_lockout` callback + `apply_lockout` re-seed (SP-0 design §5c); the gateway never persists. Bounded map with an eviction cap so lockout state can't leak.
 - **Proactive expiration tracking** (`providerExpiration`): track `oauth_token | subscription | api_credits | free_tier_reset` expiry per credential with pre-emptive `expiring_soon` alerts, and detect expiry from responses (401→token, 402→subscription, 429+reset→free_tier_reset) — skip a credential *before* it fails.
 - **Cumulative retry-wait budget** per request (`cooldownAwareRetry`): honor `Retry-After` but cap total wait across all retries; the orchestrator's journaled `Timer` (§11.2) adopts this cap.
 
@@ -323,7 +323,7 @@ Four phases, in this order (user-directed). The **gateway core stays pure/statel
 ### Phase 1 — Gateway enrichment (pure core)
 | SP | Title | Contents | Depends on |
 |---|---|---|---|
-| **SP-0** | Health gates | connection cooldown + model lockout in gateway selection (per-reason cooldowns, reset-window-aware expiry, escalation, rich 429/quota/credits classification, proactive expiration tracking, cumulative retry-budget — §12.1); `QuotaExceeded` demote-to-tier + `resume_after`. Coordinate with issue #39. | gateway |
+| **SP-0** | Health gates | connection cooldown + model lockout via a composable policy pipeline (per-reason cooldowns, reset-window expiry, escalation, 429/quota/credits classification at the adapter boundary, tenant-agnostic `router:model` key + `on_lockout` callback — see `docs/design/selection-policy-pipeline.md`); provider-quota demote-to-tier + `AllGated{resume_after}`. Coordinate with #39. Expiration-tracking (stateful) + cumulative-retry-budget are **out of SP-0** (SP-DATA / orchestrator). | gateway |
 | **SP-CAT** | Free-tier catalog + tiers + refresh | catalog schema gains free-tier fields (§12.2 — `free_type`/`pool_key`/`monthly_tokens`/`credit_tokens`/`tos`/`trains_on_prompts`) **and the `tiers` dimension** (curated/attribute-derived + intra-tier strategy — §6.2/§12.2, tier-refs in chains); bundled free-tier data; a **refresh mechanism** (CLI + periodic re-audit of models/providers/routers config, CI-gated totals à la OmniRoute's `computeFreeModelTotals`). Pure config/data — no stateful tracking yet. | gateway |
 
 ### Phase 2 — Reference chains (user-managed)
@@ -353,7 +353,7 @@ A deep-research **mini** run:
 2. **Partial failure:** 2 of the 5 searches fail; the run **still** produces a consolidated report from the 3 that succeeded (proves soft-edge + quorum), and the failure manifest is recorded (no silent drop).
 3. **Resume with no re-spend:** kill the process mid-run; on resume the fold rebuilds state and completes, and a **fake-gateway call counter proves zero duplicate `ModelCall`s** and zero duplicate successful `Observation`s (memoization works; tokens not re-spent).
 4. **Determinism fence:** changing the agent config between kill and resume → resume **halts loudly** with a determinism-violation diagnostic (input-hash/version fence).
-5. **Quota→pause:** a fake gateway returning terminal `QuotaExceeded` with `resume_after` → the run **pauses** with the correct reason + wake-up time and **resumes** cleanly on re-run.
+5. **Quota→pause:** a fake gateway returning `AllGated { resume_after: Some(t) }` → the run **pauses** with the correct wall-clock wake-up time and **resumes** cleanly; an all-terminal `AllGated { resume_after: None, human_action }` → **fail-fast** (no infinite pause).
 6. **No-silent-failures:** every error path yields a structured outcome + a hook emission (asserted).
 7. `Mutation`/two-phase/`in_doubt` **types and reconcile hook exist and are unit-tested**, even though the demo workload doesn't drive them.
 
