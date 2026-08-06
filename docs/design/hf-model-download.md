@@ -1,3 +1,13 @@
+---
+title: Hugging Face Model Download
+doctype: design
+module: catalog
+status: implemented
+feature:
+  - ../features/catalog/model-registry.md
+source: crates/local-engine/src
+---
+
 # Design: Hugging Face model download (HF-A)
 
 - **Status:** Approved (2026-07-18)
