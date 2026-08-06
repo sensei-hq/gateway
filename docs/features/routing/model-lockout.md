@@ -21,7 +21,7 @@ retrying a model that cannot currently succeed. Sits alongside the existing
 
 ## Behavior
 
-- **Keyed** per `router:model:credential` — a `ModelLockoutEntry { reason, failure_count, last_cooldown_ms, locked_until, escalation_count }`.
+- **Keyed** per `router:model` — a `ModelLockoutEntry { reason, failure_count, last_cooldown_ms, locked_until, escalation_count }`. The gateway is **tenant-agnostic** (no tenant/credential dimension); per-tenant isolation = one gateway entity per tenant (see the SP-0 design §5c). Durability is the caller's: the gateway fires an `on_lockout` callback and the caller persists it.
 - **Cooldown by reason**, not one fixed value:
   - `rate_limit` (429) → short (~60s); recovers fast.
   - `quota_exhausted` (403 / quota body) → until the next reset boundary (tomorrow 00:00 / monthly reset), else ~1h.
@@ -83,3 +83,53 @@ Feature: Model lockout
 - In-memory / per-process today (like the circuit breaker). A future seam can persist lockout state for multi-instance sharing.
 - Complemented by proactive [expiration tracking](../governance/expiration-tracking.md), which skips a credential *before* it fails.
 - **Provider-side, not subscription quota.** Lockout reacts to *upstream* limit signals (a model's 429/403/credits). The caller's own subscription `GatewayError::QuotaExceeded` (subject/tier — [governance/subscription-quota](../governance/subscription-quota.md)) is a separate **hard stop**, not a lockout, and must not fall over. Keep the two as distinct reason/error types.
+
+### Scenarios — added from design review
+
+```gherkin
+Feature: Model lockout (additional)
+  Scenario: A successful attempt clears prior lockout and escalation
+    Given modelA was rate-limited and its lockout has since expired
+    When modelA succeeds on the next request
+    Then modelA's lockout entry and escalation count are cleared
+    And a later single failure starts from the base cooldown, not an escalated one
+
+  Scenario: Escalation grows on repeated post-release failure
+    Given modelA failed, was released, and fails again immediately (max_cooldown high)
+    Then the second cooldown window is strictly longer than the first
+
+  Scenario: Escalation is clamped; an exact upstream reset is not
+    Given modelA has escalated past max_cooldown_ms
+    Then locked_until - now equals max_cooldown_ms exactly
+    And a genuine upstream reset hint (Until::Exact) is honored verbatim, never clamped
+
+  Scenario: A 403 quota after a 429 upgrades the lock
+    Given modelA is locked "rate_limit" until now+60s
+    And modelA then returns HTTP 403 with a quota body
+    Then modelA's lock reason becomes "quota_exhausted" until the reset boundary
+
+  Scenario: Auth failure locks the model terminally
+    Given modelA returns HTTP 401
+    Then modelA is locked with reason "auth" and until = None (terminal)
+    And it surfaces a credential-action hint, not a wake-up time
+
+  Scenario: Fixing the credential clears a terminal auth lock
+    Given modelA is terminally auth-locked
+    When refresh_router_keys installs a working key for its router
+    Then modelA's auth lock is cleared and it is eligible again
+
+  Scenario: The gateway announces a lockout; the caller persists it
+    Given modelA hits a provider quota
+    Then the gateway fires on_lockout(modelA, quota_exhausted, until = T)
+    And the caller persists the lockout (the gateway itself never persists)
+
+  Scenario: A caller re-seeds a persisted lockout on a fresh instance
+    Given the caller persisted "modelA locked until T"
+    When it starts a new gateway instance and calls apply_lockout(modelA, quota_exhausted, T)
+    Then modelA is skipped until T on the new instance
+
+  Scenario: The gateway core is tenant-agnostic
+    Given two tenants each run their own gateway entity
+    When tenant T1's gateway locks modelA
+    Then tenant T2's gateway is unaffected (no shared state; no tenant concept in core)
+```

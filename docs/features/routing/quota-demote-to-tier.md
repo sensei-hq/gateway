@@ -66,3 +66,39 @@ Feature: Quota demote-to-tier
 
 - Distinguish `quota_exhausted` (resets on a window → demote + `resume_after`) from `credits_exhausted` (terminal until top-up → human-action hint). See [model lockout](model-lockout.md) classification.
 - Depends on the tier model in [catalog/tiers-and-chains](../catalog/tiers-and-chains.md) for "next tier" semantics.
+
+### Scenarios — added from design review
+
+```gherkin
+Feature: Quota demote-to-tier (additional)
+  Scenario: Subscription quota exhaustion does NOT demote
+    Given a chain [modelA, modelB]
+    And the caller's subscription quota is exhausted (GatewayError::QuotaExceeded)
+    When the request is routed
+    Then the gateway returns QuotaExceeded
+    And modelB is NOT attempted and no model is locked out
+
+  Scenario: A provider 403 quota falls over on the SAME request
+    Given a chain [free model, cost-optimized model]
+    And the free model returns HTTP 403 with a quota body
+    When the request is routed
+    Then the free model's limit is classified recoverable and the walk falls over
+    And the cost-optimized model serves the request on this same request
+
+  Scenario: Mixed terminal + timed exhaustion
+    Given modelA is credits_exhausted (terminal) and modelB is rate_limited until T
+    When every candidate is gated
+    Then AllGated.resume_after = T (min over timed only)
+    And a human-action hint is surfaced for modelA
+    And resume_after ignores the terminal model
+
+  Scenario: All candidates terminal → fail fast, never pause
+    Given every candidate is credits_exhausted or auth-locked (until = None)
+    When every candidate is gated
+    Then AllGated.resume_after is None
+    And a human-action error is returned (the run does not pause forever)
+
+  Scenario: All candidates circuit-open → resume_after from breaker next_retry
+    Given every endpoint's breaker is Open with next_retry = T
+    Then AllGated.resume_after = min(next_retry)
+```

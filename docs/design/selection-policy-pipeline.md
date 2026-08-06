@@ -9,227 +9,199 @@ feature:
   - ../features/routing/connection-cooldown.md
   - ../features/routing/model-lockout.md
   - ../features/routing/quota-demote-to-tier.md
-source: crates/gateway/src/selection.rs, crates/gateway/src/circuit_breaker.rs, crates/gateway/src/engine.rs
+source: crates/gateway/src/selection.rs, crates/gateway/src/circuit_breaker.rs, crates/gateway/src/engine.rs, crates/cloud-providers/src/base.rs, crates/kernel/src/types/error.rs
+review: 4 parallel design reviews (coverage · SRP/consistency · adversarial correctness · sequencing) — resolutions in §0
 ---
 
 # Selection Policy Pipeline & Health Gates (SP-0)
 
-**Goal.** Add three model/router health gates — **connection cooldown**, **model
-lockout** (per-reason), and **quota demote-to-tier** — to gateway selection,
-by refactoring the current inline validation into a **composable policy
-pipeline** so future gates/strategies compose without editing a monolith.
+**Goal.** Add three provider health gates — **connection cooldown**, **model
+lockout** (per-reason), and **quota demote-to-tier** — via a
+composable policy pipeline, so future gates/strategies compose without a
+monolith, *and* so a provider limit actually causes fallover on the request that
+hits it (not just the next one).
 
-**Non-goals (SP-0).** Free-tier catalog + `tiers` dimension (SP-CAT), live usage
-metering + `headroom`/predicted-lockout (SP-DATA), persisted (multi-instance)
-gate state. SP-0 scaffolds the seams these plug into but ships only in-memory
-gates and keeps existing behavior otherwise unchanged.
+**Non-goals (SP-0).** Free-tier catalog + `tiers` (SP-CAT); live usage metering +
+`headroom`/predicted-lockout (SP-DATA); persisted/multi-instance health state;
+the *stateful* part of expiration tracking and the orchestrator's cumulative
+retry-wait budget (both moved out of SP-0 — §0/R-S3). SP-0 keeps only the
+reactive `401 → auth-lock` signal from expiration tracking.
 
-**Coordination.** Touches `selection.rs`/`circuit_breaker.rs`/`engine.rs` — the
-same hot path as issue #39 (engine/llama_cpp complexity refactor). Do #39 first
-or land this as part of it; this spec assumes the current structure.
+**Coordination.** Land **issue #39 (engine split) first** (or on a shared
+branch). SP-0 migration steps 1–4 are `selection.rs`/`circuit_breaker.rs`/new
+files (parallel-safe); step 5 edits the exact `engine.rs` outcome/exhaustion
+sites #39 relocates.
 
 ---
 
-## 1. Current state (what we're refactoring)
+## 0. Review resolutions (traceability)
+
+Four parallel functional/adversarial design reviews ran before this revision.
+Each finding and its resolution:
+
+| # | Finding (reviewer) | Resolution in this design |
+|---|---|---|
+| C1 | Gates only affect *next* request; in-flight fallover is `should_trigger_fallback` over a frozen list. `Network`/403-quota never fall over → demote fails on the triggering request. | **One classifier drives both** the in-flight walk *and* the lockout write (§3.1). A classified **recoverable** provider limit (`RateLimit`/`QuotaExhausted`) falls over in-walk; **terminal** (`CreditsExhausted`/`Auth`) breaks. The recorder writes the lockout for next time. |
+| C2 | `classify()` has no inputs — status (401/403 both → `Authentication`), body, and `retry_after_ms` (always `None`) are discarded before selection reacts. | Classify at the **adapter boundary** (`base.rs`): attach `ProviderSignal { status, retry_after, body_snippet(redacted) }` to the outcome; `classify()` is a pure fn over that (§3.2). Scope expands to `base.rs` + `error.rs`. |
+| C3 | `resume_after: Instant` isn't durable; reset boundaries are wall-clock. | `Instant` for internal math + tests; **exported `resume_after` is `DateTime<Utc>`** (§3.3). Reset boundaries use an injected calendar clock. |
+| C4 | `resume_after` read from selection-time `skipped` → `None` on the exhausting request. | Aggregate from **post-walk** health state (recorder returns the `until` it wrote; fold over attempted-failed + selection-time timed skips) (§3.3). |
+| H1 | `OutcomeSink` tagged "Observer" but mutates correctness state — collides with orchestrator journal≠hooks (D5). | **Rename → `HealthRecorder`** (reliable, never best-effort). Add a *separate* best-effort **`SelectionObserver`** seam mirroring `OrchestratorHooks` (carries the fallback trail for `on_agent_model_attempt`) (§2). |
+| H2 | `HealthStore` god-trait; read+write+3 concerns in one; "breaker implements the endpoint half" impossible. | Split into narrow ports: `EndpointHealthRead` + `RouterHealthRead` (gates), `HealthRecorder` (write). Breaker implements the endpoint read + recorder (§2). |
+| H4 | `CandidateView` "resolved" contradicts structural gates; eager cost defeats "budget last". | View construction is a **fallible resolver** emitting structural skips; pipeline starts at `Capability`; **cost is lazy** in `BudgetGate` (§2.1). |
+| H5 | Only `execute` wired; `execute_stream` diverges. | Both dispatch paths route through `recorders.on_outcome` (§5, step 2/5). |
+| H6 | Config-swap/key-rotation never clears terminal lockouts → dead until restart. | `try_update_config`/`refresh_router_keys` clear/evict affected health state (§5b). |
+| H7 | Escalation never resets on success; concurrent fan-out lost-update jumps to max. | Reset/decay on success (mirror breaker); increment **once per lock→release→relock cycle** via a generation guard (§3.2). |
+| M1 | Overloading `AllAttemptsFailed`; terminal-only exhaustion could pause forever. | New `GatewayError::AllGated { resume_after: Option<DateTime<Utc>>, skipped, human_action: Option<HumanAction> }`. Terminal-only ⇒ **fail-fast human-action, never pause** (§3.3). |
+| M2 | `CircuitOpen` carries no `until` → excluded from `resume_after`. | `CircuitOpen { until }` (breaker exposes `next_retry`); breaker adopts the injected clock (§2, §8). |
+| M3 | Can't distinguish exact reset from estimate on re-eval. | `Until::{ Exact(t), Backoff(t) }` — clamp only `Backoff` (§3.2). |
+| M4 | Per-tier strategy needs a tier tag; hardcoded `sort_by_key(priority)` fights a strategy. | `RoutingStrategy` is the **one** ordering seam; SP-0 ships `PriorityStrategy` replacing the hardcoded sort; `SelectedModel`/`ChainEntry` gain an optional `tier`/`segment` marker (populated by SP-CAT); `ctx` is an extensible struct (§2). |
+| M6 | Direct↔chain merge traps (check order, provider fallback, api_model_id, priority). | Parity pinned by tests **before** the merge; direct builder sets `no provider-fallback`, `priority=1`, `entry_api_model_id=None` (§6 step 1b). |
+| key | (Superseded by user direction) Cross-tenant leak concern assumed a shared instance. | Gateway is **tenant-agnostic**: per-tenant isolation = **one `Gateway` entity + config per tenant**, not per-credential keys. Lockout/cooldown keyed by plain `router:model` (per-instance). Plus an **external lockout/suspend control seam** so the tenant-aware caller drives lockout on *its* instance (§5c). |
+| S1 | #39 coupling. | #39 first; steps 1–4 parallel-safe, step 5 waits (§6). |
+| S2 | Sink halves dormant until a step-5 big-bang. | Recorder fan-out pulled into **step 2** (breaker-only, behavior-preserving) (§6). |
+| S3 | SP-0 scope drift (expiration stateful, retry-budget). | Moved out (non-goals); §16 + governance README reconciled. |
+| S4 | Is metering an OutcomeSink? | No — metering stays a **separate** write path (`GatewayStore`); predicted-lockout (SP-DATA) *reads* metering and *writes* a lockout via `HealthRecorder` (§9). |
+| S5 | Multi-instance `resume_after` authority. | Documented: authoritative only when one instance owns the subject's traffic; fleet-wide correctness deferred to persisted state (SP-DATA) (§9). |
+
+---
+
+## 1. Current state (what we refactor)
 
 `ModelSelectionService` holds `&GatewayConfig` + `&CircuitBreakerManager`.
 `validate_chain_entry` and its near-duplicate `validate_direct` run a fixed
-inline sequence — *model exists → router resolve+enabled → capability →
-circuit breaker → budget* — each producing a stringly-typed
-`SkippedCandidate { model, router, reason: String }`. The write side lives in
-the engine (`circuit_breaker.record_failure`/`record_success`).
+inline sequence (model → router → capability → breaker → budget) with a
+stringly-typed reason. `select_all` resolves the candidate list **once**;
+`engine.rs` walks that frozen list and decides fallover via
+`GatewayError::should_trigger_fallback`. The write side is
+`circuit_breaker.record_*` at four engine sites (2 in `execute`, 2 in
+`execute_stream`). Adapters collapse 401 **and** 403 to
+`GatewayError::Authentication` and never populate `RateLimit.retry_after_ms`
+(`base.rs`).
 
-Problems for extension: adding cooldown/lockout means more inline `if`s in two
-functions; reasons are untyped (so `resume_after` can't be derived); read
-(gate) and write (react) are entangled with concrete `CircuitBreakerManager`.
+## 2. Target design
 
-## 2. Target design (D14)
-
-Four separated concerns behind trait seams:
+Concerns and their seams:
 
 ```rust
-// ── Typed skip reason (replaces `reason: String`) ───────────────────────────
-pub enum LockReason { RateLimit, QuotaExhausted, CreditsExhausted, Auth }
+// ── Provider signal captured at the ADAPTER boundary (C2) ───────────────────
+pub struct ProviderSignal { pub status: Option<u16>, pub retry_after: Option<Duration>, pub body_snippet: Option<String> } // body redacted
 
+pub enum LockReason { RateLimit, QuotaExhausted, CreditsExhausted, Auth }   // provider-side only
+impl LockReason { fn is_recoverable(&self) -> bool /* RateLimit|QuotaExhausted */ }
+
+// classify is a PURE fn over the captured signal (unit-tested table)
+fn classify(sig: &ProviderSignal) -> Option<LockReason>;
+
+// ── Typed skip reason; timed variants carry provenance-tagged wall-anchored Until
+pub enum Until { Exact(Instant), Backoff(Instant) }   // clamp only Backoff (M3)
 pub enum SkipReason {
-    ModelNotFound,
-    RouterNotFound,
-    RouterDisabled,
-    UnsupportedCapability(Capability),
+    ModelNotFound, RouterNotFound, RouterDisabled, UnsupportedCapability(Capability),
     OverBudget { estimated: f64, budget: f64 },
-    CircuitOpen,
-    Cooling   { until: Instant },                 // connection cooldown
-    LockedOut { reason: LockReason, until: Option<Instant> }, // model lockout (None = terminal)
-    BelowMinCapability,                            // reserved (SP-CAT quality floor)
+    CircuitOpen { until: Instant },                    // M2
+    Cooling    { until: Instant },
+    LockedOut  { reason: LockReason, until: Option<Until> },  // None = terminal
 }
+impl SkipReason { fn until(&self) -> Option<Instant>; fn is_terminal(&self) -> bool; }
 
 pub enum GateVerdict { Admit, Skip(SkipReason) }
 
-// ── Admission: one gate = one responsibility (Chain of Responsibility) ───────
+// ── Admission: read-only gates (chain of responsibility) ────────────────────
 pub trait AdmissionGate: Send + Sync {
     fn name(&self) -> &'static str;
     fn evaluate(&self, cand: &CandidateView<'_>, ctx: &SelectionCtx<'_>) -> GateVerdict;
 }
-
-// ── Ordering: per-tier task-aware ordering (Strategy) — SP-CAT uses it fully ─
-pub trait RoutingStrategy: Send + Sync {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &SelectionCtx<'_>);
-}
-
-// ── Reaction: update state from an attempt outcome (Observer) ────────────────
-pub struct AttemptOutcome<'a> { pub error: Option<&'a GatewayError>, pub retry_after: Option<Duration> }
-pub trait OutcomeSink: Send + Sync {
-    fn on_outcome(&self, cand: &SelectedModel, outcome: &AttemptOutcome<'_>);
-}
-
-// ── State: ephemeral health, swappable (Ports & Adapters) ────────────────────
-pub trait HealthStore: Send + Sync {
-    fn endpoint_state(&self, endpoint: &str) -> EndpointHealth;   // breaker/lockout
-    fn router_state(&self, router: &str) -> RouterHealth;         // cooldown
-    fn record_endpoint(&self, endpoint: &str, ev: HealthEvent);
-    fn record_router(&self, router: &str, ev: HealthEvent);
-}
+// ── Ordering: the ONE ordering seam (Strategy); SP-0 ships PriorityStrategy ──
+pub trait RoutingStrategy: Send + Sync { fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &SelectionCtx<'_>); }
+// ── Reaction: RELIABLE state reducer (NOT an observer) ──────────────────────
+pub struct AttemptOutcome<'a> { pub endpoint: EndpointKey, pub error: Option<&'a GatewayError>, pub signal: Option<ProviderSignal>, pub success: bool }
+pub trait HealthRecorder: Send + Sync { fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<Instant>; } // returns the `until` it wrote (C4)
+// ── Health state: NARROW read ports (H2) ────────────────────────────────────
+pub trait EndpointHealthRead: Send + Sync { fn endpoint_state(&self, k: &EndpointKey) -> EndpointHealth; }
+pub trait RouterHealthRead:   Send + Sync { fn router_state(&self, router: &str) -> RouterHealth; }
+// ── Best-effort observability (mirrors OrchestratorHooks; H1) ────────────────
+pub trait SelectionObserver: Send + Sync { fn on_candidate_skipped(&self, _:&SkippedCandidate) {} fn on_attempt(&self, _:&AttemptInfo) {} } // no-op defaults, isolated-but-logged
 ```
 
-`CandidateView` is a cheap borrow of the resolved `(model_config, router_config,
-endpoint, cost_estimate)`; `SelectionCtx` carries `criteria` + a `&dyn
-HealthStore` + `now: Instant` (clock injected for deterministic tests).
+`EndpointKey { router, model }` is opaque (no hardcoded `format!`) so its shape
+can grow if ever needed. The gateway is **tenant-agnostic** — the key carries no
+credential/tenant dimension (§5c). `SelectionCtx` is a struct (config, read
+ports, injected `now`, injected calendar clock, optional usage source for
+SP-DATA) — extensible without a trait break.
 
-### 2.1 `validate_*` collapses to build-then-run
-
-Both `validate_direct` and `validate_chain_entry` become one path:
+### 2.1 `validate_*` collapses to resolve-then-gate-then-order
 
 ```
-fn admit(&self, cand: CandidateView, ctx) -> Result<SelectedModel, SkippedCandidate> {
-    for gate in self.gates {                       // ordered pipeline
-        if let GateVerdict::Skip(reason) = gate.evaluate(&cand, ctx) {
-            return Err(SkippedCandidate { model, router, reason });   // typed
-        }
-    }
-    Ok(cand.into_selected())
-}
+resolve(cand_source) -> Result<CandidateView, SkipReason>   // structural skips: ModelNotFound/RouterNotFound/RouterDisabled
+   → run gates [Capability, ConnectionCooldown, CircuitBreaker, ModelLockout, Budget(lazy cost)]
+   → PriorityStrategy.order(admitted)                        // the one ordering seam (replaces hardcoded sort)
 ```
+Direct and chain differ only in how `resolve` builds the view (§6 step 1b pins
+parity). Cost estimation moves off `ModelSelectionService` into `BudgetGate`.
 
-The two entry points differ only in how they build the `CandidateView` (direct:
-caller-pinned router; chain: entry router → model.provider, entry
-`api_model_id` override). This removes the duplication.
+### 2.2 Gate order & keys
+`Capability → ConnectionCooldown(router,cred) → CircuitBreaker(endpoint) →
+ModelLockout(endpoint) → Budget(lazy)`. Health reads key by `EndpointKey`
+(`router:model`) / `router` for cooldown. Tenant isolation is by instance, not by key (§5c).
 
-### 2.2 The SP-0 gate set (ordered; cheap → stateful → costly)
+## 3. Behavior
 
-| Order | Gate | Verdict | Notes |
-|---|---|---|---|
-| 1 | `ModelExistsGate` | `ModelNotFound` | structural |
-| 2 | `RouterGate` | `RouterNotFound` / `RouterDisabled` | structural |
-| 3 | `CapabilityGate` | `UnsupportedCapability` | structural |
-| 4 | `ConnectionCooldownGate` **(new)** | `Cooling{until}` | reads `HealthStore.router_state` |
-| 5 | `CircuitBreakerGate` | `CircuitOpen` | wraps existing `CircuitBreakerManager` (now a `HealthStore` impl) |
-| 6 | `ModelLockoutGate` **(new)** | `LockedOut{reason, until}` | reads `HealthStore.endpoint_state` |
-| 7 | `BudgetGate` | `OverBudget` | last: don't spend cost-estimation on already-skipped candidates |
+### 3.1 One classifier, two mechanisms (C1 — the core fix)
+On a provider response the adapter attaches a `ProviderSignal`. `classify(sig)`
+yields a `LockReason`. Then:
+- **In-flight walk:** if `reason.is_recoverable()` (rate-limit / quota) → this counts as a fallover trigger and the walk continues to the next candidate **on this request**; if terminal (credits / auth) → the walk breaks. This *replaces* relying on `should_trigger_fallback` misclassifying 403-quota as `Authentication`. (403+quota-body ⇒ `QuotaExhausted` recoverable; 401 ⇒ `Auth` terminal.)
+- **Next request:** the `HealthRecorder` writes a lockout/cooldown keyed by `EndpointKey`, so the gate skips it next time.
+Both use the **same** `classify()` — they cannot disagree.
 
-Order is data (a `Vec<Arc<dyn AdmissionGate>>`), so inserting/reordering is a
-registration change, not a code edit.
+### 3.2 Model lockout
+Per-reason durations (`rate_limit`≈60s; `quota_exhausted`→next reset boundary via the calendar clock, else ~1h; `credits`/`auth`→`until: None` terminal). `retry_after` from a real header ⇒ `Until::Exact` (never clamped); synthetic backoff ⇒ `Until::Backoff` (clamped to `max_cooldown_ms`). Escalation counter **resets/decays on success** and increments **at most once per lock→release→relock cycle** (generation guard; not once per concurrent failure). Bounded map with LRU eviction that never evicts an entry mid-lock.
 
-### 2.3 The SP-0 sinks
+### 3.3 Quota demote-to-tier + exhaustion
+Demote is emergent (recoverable classification falls over in-walk, §3.1). On full exhaustion the engine builds `resume_after` from **post-walk** state: `min` over `Until` of (a) selection-time timed skips **and** (b) the `until` each `HealthRecorder.on_outcome` returned for attempted-failed candidates, plus `CircuitOpen.until`. Result → `GatewayError::AllGated { resume_after: Option<DateTime<Utc>>, skipped, human_action }`:
+- some timed ⇒ `resume_after = Some(min)` → orchestrator durable pause (wall-clock).
+- all terminal / none timed ⇒ `resume_after = None` + `human_action` (top-up-credits / rotate-key / raise-budget) → **fail-fast, never pause forever**.
+`resume_after` means "earliest eligibility, retry not guaranteed." Subscription `GatewayError::QuotaExceeded` (subject/tier) stays a **hard stop**, never demotes, never carries `resume_after`.
 
-| Sink | Reacts to | Effect |
-|---|---|---|
-| `CircuitBreakerSink` | any failure / success | existing breaker `record_failure`/`record_success` |
-| `ConnectionCooldownSink` **(new)** | `GatewayError::Network` / connect timeout | start router cooldown (jittered backoff) |
-| `ModelLockoutSink` **(new)** | `RateLimit` / quota / credits / auth errors | lock endpoint by reason (see §3.2) |
+## 4. Config
+`GatewayConfig.resilience` (defaulted; absent ⇒ today's behavior): `connection_cooldown` (base/max/jitter/steps), `model_lockout` (per-reason durations, `max_cooldown_ms`, eviction_cap). Jitter RNG and calendar clock are **injected** (seedable) for deterministic tests (§8).
 
-The engine's existing `record_failure`/`record_success` calls become one call:
-`self.sinks.on_outcome(&selected, &outcome)`, fanning out to all sinks.
+## 5. Wiring (composition, not subclasses)
+`GatewayBuilder` gains `.with_gate` / `.with_recorder` / `.with_observer` / `.with_resilience(preset)`. `ModelSelectionService` takes `gates`, `strategy`, and the **read ports**; the engine owns the `HealthRecorder`s and the `SelectionObserver`s. `CircuitBreakerManager` implements `EndpointHealthRead` + `HealthRecorder` (endpoint concern only) — reused, not rewritten.
 
-## 3. New feature behavior
+### 5b Lifecycle (H6)
+`try_update_config` and `refresh_router_keys` clear `Auth`/`Credits` (terminal) lockouts for affected endpoints and evict health entries for removed/renamed `router:model`. Lockout lifecycle is specified relative to config lifecycle (not inherited implicitly from the breaker).
 
-### 3.1 Connection cooldown (`ConnectionCooldownGate` + `Sink`)
-- **Trigger:** `AttemptOutcome.error` is `Network` (or connect-phase `Timeout`).
-- **Effect:** `HealthStore.record_router(router, Cooldown{until: now + backoff})`; backoff jittered, escalating on repeat, clamped to `max_cooldown_ms`.
-- **Gate:** if `router_state(router).cooling_until > now` → `Skip(Cooling{until})`, skipping **all** of that router's models in one shot.
-
-### 3.2 Model lockout (`ModelLockoutGate` + `Sink`) — per-reason
-- **Classification** (a small pure `classify(error, status, body) -> LockReason` fn, unit-tested): 429 → `RateLimit`; 403/quota-body → `QuotaExhausted`; credits-exhausted body → `CreditsExhausted`; 401 → `Auth`. Text-pattern fallback for non-standard 400/403 bodies. **`classify` maps *provider* responses only** — the gateway's own subscription `GatewayError::QuotaExceeded` (subject/tier; `docs/design/subscription-quota-auth.md`) is a separate hard stop and is **never** a `LockReason`. Keep them distinct types.
-- **Cooldown by reason:** `RateLimit` → ~60s; `QuotaExhausted` → next reset boundary (00:00 / monthly), else ~1h; `CreditsExhausted` → `until = None` (terminal); `Auth` → `until = None` (until credential change). Honor an exact upstream reset hint verbatim (not clamped to `max_cooldown_ms`).
-- **Escalation:** repeated failure after release escalates the window (an escalation counter that outlives the cooldown), clamped to `max_cooldown_ms` (except exact reset hints).
-- **Gate:** `endpoint_state(endpoint).locked_until > now` → `Skip(LockedOut{reason, until})`.
-- **Bounded:** the lockout map has an eviction cap (LRU) so it can't leak.
-
-### 3.3 Quota demote-to-tier (emergent + engine aggregation)
-- **Emergent:** because `ModelLockoutGate` *skips* a quota-hit model rather than terminating, the chain naturally falls over to the next entry/tier. No new gate.
-- **Engine aggregation:** when the walk exhausts all candidates, compute
-  `resume_after = min(until)` over the *timed* skip reasons (`Cooling{until}`,
-  `LockedOut{Some(until)}`). Return a terminal error carrying `resume_after`
-  (and the structured skip set). Terminal (`until: None`) reasons surface a
-  human-action hint, not a wake-up time.
+### 5c Tenant-agnostic core + lockout callback (caller persists)
+**Neither the gateway nor the orchestrator has any concept of tenants** — tenancy is entirely a wrapper above them. The gateway keeps lockout/cooldown state **in-memory for its instance lifetime only** and **never persists** (consistent with the pure-core principle; the only persistence seams are the caller-implemented `GatewayStore`/`VaultStore`). Durability and any per-tenant scoping are the **caller's** responsibility, via a bidirectional seam:
+- **OUT (gateway → caller):** when the gateway marks a model locked / timed-out, it fires a **lockout callback** the caller persists — `on_lockout(EndpointKey, reason, until)` on `SelectionObserver` (best-effort, isolated). The gateway announces; it does not persist.
+- **IN (caller → gateway):** the caller re-seeds persisted lockouts on a fresh instance, or suspends a model from its own signals — `Gateway::apply_lockout(ep, reason, until)` / `clear_lockout(ep)`.
 
 ```rust
-// engine, exhaustion path
-let resume_after = result.skipped.iter().filter_map(|s| s.reason.until()).min();
-Err(GatewayError::AllGated { resume_after, skipped: result.skipped })
+trait SelectionObserver { fn on_lockout(&self, _:&EndpointKey, _:LockReason, _:Option<Until>) {} /* + on_candidate_skipped, on_attempt */ }
+impl Gateway { pub fn apply_lockout(&self, ep:&EndpointKey, reason:LockReason, until:Option<Until>); pub fn clear_lockout(&self, ep:&EndpointKey); }
 ```
-(Or extend `AllAttemptsFailed` with `resume_after: Option<Instant>` — see §5.)
+A suspension applies only to **this** instance's in-memory state — never system-wide, never per-tenant (the core doesn't know tenants). A multi-tenant wrapper runs **one gateway entity per tenant** and persists/re-seeds each independently.
 
-## 4. Config additions
-
-`GatewayConfig` gains an optional `resilience` block (all defaulted; absent →
-current behavior). Per-reason durations, escalation, and caps live here so they
-are operator-tunable, not hard-coded:
-
-```rust
-pub struct ResilienceConfig {
-    pub connection_cooldown: CooldownConfig,   // base_ms, max_ms, jitter, max_backoff_steps
-    pub model_lockout: LockoutConfig,          // rate_limit_ms, quota_ms, max_cooldown_ms, eviction_cap
-    // circuit_breaker already exists (CircuitBreakerConfig)
-}
-```
-
-## 5. Builder & wiring (composition, not subclasses)
-
-`GatewayBuilder` gains optional-layer registration; presets are recipes:
-
-```rust
-GatewayBuilder::new(config)
-    .with_gate(Arc::new(ConnectionCooldownGate::new(store.clone())))
-    .with_sink(Arc::new(ModelLockoutSink::new(store.clone())))
-    .with_resilience(ResiliencePreset::Standard)   // registers the §2.2/§2.3 set
-    .build();
-```
-- `ModelSelectionService` takes `gates: &[Arc<dyn AdmissionGate>]` + `strategy: &dyn RoutingStrategy` + `store: &dyn HealthStore` instead of `&CircuitBreakerManager`.
-- `CircuitBreakerManager` implements `HealthStore` (endpoint half) so it's reused, not rewritten; the breaker gate/sink wrap it.
-- Default preset preserves today's behavior + adds cooldown/lockout; a `Minimal` preset = structural gates only.
-
-## 6. Migration (strangler-fig, TDD, small commits)
-
-1. Introduce `SkipReason` enum + `SkippedCandidate.reason: SkipReason`; update call sites/tests (behavior-preserving). Commit.
-2. Extract the 5 existing inline checks into gates; `ModelSelectionService` runs the pipeline; `CircuitBreakerManager` implements `HealthStore`. All existing `selection.rs` tests still pass (now asserting typed reasons). Commit.
-3. Add `HealthStore` router half + `ConnectionCooldownGate`/`Sink`. Commit.
-4. Add `ModelLockoutGate`/`Sink` + `classify()` + per-reason cooldowns. Commit.
-5. Engine: dispatch outcomes to the sink pipeline; aggregate `resume_after` on exhaustion; extend the terminal error. Commit.
-6. Builder `.with_gate/.with_sink/.with_resilience` + `ResilienceConfig`. Commit.
-
-Each step keeps the suite green (never merge on red).
+## 6. Migration (strangler-fig · TDD · #39-first · small green commits)
+1. **Typed `SkipReason`** (replace string reasons; update assertions). 1b. **Pin direct↔chain parity** with tests for both-unknown-direct and model-only-no-router **before** merging the two validate paths.
+2. **Extract gates** + introduce the **`HealthRecorder` fan-out at all four outcome sites** with breaker-only (behavior-preserving, S2); `CircuitBreakerManager` implements the endpoint read + recorder; `PriorityStrategy` becomes the one ordering seam.
+3. **Adapter boundary:** capture `ProviderSignal` (status/retry_after/body); `classify()` pure fn (+ table test); stop collapsing 403-quota into `Authentication`. **ConnectionCooldown** gate+recorder (live end-to-end).
+4. **ModelLockout** gate+recorder (per-reason, provenance clamp, escalation guard, tenant-agnostic `router:model` key) + the `on_lockout` callback and `apply_lockout`/`clear_lockout` control (§5c). Wire recoverable classification into the in-flight walk (§3.1).
+5. **Engine (post-#39):** post-walk `resume_after` (wall-clock) + `AllGated` + `human_action`; both `execute` and `execute_stream`.
+6. **Builder** `.with_*` + `resilience` config + presets.
 
 ## 7. Acceptance criteria
+The Gherkin `## Scenarios` in the three feature docs — **expanded** with the review's missing scenarios (subscription-quota-does-not-demote; success-clears-lockout+escalation; two-reasons-racing; cooldown-vs-lockout precedence; mixed terminal+timed exhaustion; all-breaker-open resume_after; escalation-grows vs clamp split; 401 auth terminal; exact-reset-below-synthetic honored). Plus refactor-safety: every existing `selection.rs` test passes with typed reasons; direct↔chain parity tests green.
 
-The Gherkin scenarios in the feature docs are the acceptance spec:
-- [routing/connection-cooldown](../features/routing/connection-cooldown.md#scenarios)
-- [routing/model-lockout](../features/routing/model-lockout.md#scenarios)
-- [routing/quota-demote-to-tier](../features/routing/quota-demote-to-tier.md#scenarios)
+## 8. Testing
+- **Engine-level "served-by" tests** (assert `response.model`/served fallback), not only gate-verdict tests — a gate-isolation test alone is vacuous against "served by next model" (R1).
+- Per-gate unit tests (fake read ports + injected `now`); `classify()` table test.
+- **Injected seedable jitter RNG** (so "escalates" isn't flaky) and **injected calendar clock** (reset boundaries deterministic).
+- `resume_after` wall-clock assertions with ≥2 distinct expiries + one terminal (proves `min` over timed only, terminal excluded).
+- Escalation: reset-on-success; once-per-cycle under simulated concurrent failures.
+- Lifecycle: `refresh_router_keys` clears an `Auth` lock.
 
-Plus refactor-safety: every existing `selection.rs` test passes unchanged in
-behavior (typed reasons substituted for string matches).
-
-## 8. Testing strategy
-
-- **Per-gate unit tests** (each gate in isolation with a fake `HealthStore` + injected clock) — one test per Gherkin scenario.
-- **`classify()` table test** — status/body → `LockReason`.
-- **Pipeline test** — ordered fake gates prove first-skip-wins and reason propagation.
-- **Escalation test** — repeated failures grow the cooldown; exact reset hint not clamped.
-- **Engine exhaustion test** — all-gated → terminal error with correct `resume_after = min(until)`; terminal reason → no wake-up time.
-- Injected `now: Instant` (no `Instant::now()` inside gates) keeps time-based tests deterministic.
-
-## 9. Why this stays clean as features grow
-
-- New feature (e.g. `predicted-lockout`, `headroom`, `MinCapabilityGate`) = a new small gate/strategy/sink file + one registration line; **no existing file changes** (OCP).
-- Each unit has one responsibility (SRP), depends on trait seams (DIP), and implements only the traits it needs (ISP) — a structural check is just a gate; lockout is a gate + a sink.
-- Composition is via the builder (situation presets) + per-route strategy config — reasoning and research route differently in the *same* instance, no inheritance.
+## 9. Notes / boundaries
+- **Metering is a separate write path** (`GatewayStore`), not a `HealthRecorder`; predicted-lockout (SP-DATA) reads metering and writes a lockout via `HealthRecorder` — the `ModelLockoutGate` is unchanged.
+- **Read ports stay sync/in-memory** (hot path); "SP-DATA persists" = write-behind + warm-load, never sync DB on the gate path.
+- **Tenancy & durability:** the gateway *and* orchestrator cores have **no tenant concept** — a wrapper runs one gateway entity per tenant. In-memory health state is per-instance; **durability/re-seed across restarts is the caller's job** via the `on_lockout` callback + `apply_lockout` (§5c). `resume_after` is authoritative for the instance that owns the traffic.
+- **SRP/OCP:** a new gate/strategy/recorder is a new small file + one registration; existing units untouched. Gateway now has the *same* two-seam shape as the orchestrator (reliable recorder + best-effort observer) and the same narrow-trait + builder idiom.
