@@ -34,6 +34,11 @@ pub struct InferenceCall {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cost_usd: f64,
+    /// §D Ledger Normalize LN-4: the gateway's pre-call cost estimate (USD), snapshotted alongside the
+    /// actual `cost_usd` for estimate-vs-actual reconciliation (analytics A3/A4). `None` when the path
+    /// produced no estimate (e.g. the C6 judge). `serde(default)` keeps older payloads decodable.
+    #[serde(default)]
+    pub cost_estimated: Option<f64>,
     pub duration_ms: u64,
     pub status: CallStatus,
     pub error_type: Option<String>,
@@ -231,6 +236,7 @@ mod tests {
             input_tokens: Some(100),
             output_tokens: Some(50),
             cost_usd: cost,
+            cost_estimated: None,
             duration_ms: 1200,
             status: CallStatus::Success,
             error_type: None,

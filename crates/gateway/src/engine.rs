@@ -382,6 +382,7 @@ impl Gateway {
                         input_tokens: usage.map(|u| u.input_tokens),
                         output_tokens: usage.map(|u| u.output_tokens),
                         cost_usd: cost.unwrap_or(0.0),
+                        cost_estimated: None, // §D LN-4: embedded-plane estimate population deferred
                         duration_ms,
                         status: CallStatus::Success,
                         error_type: None,
@@ -480,6 +481,7 @@ impl Gateway {
                 input_tokens: last.tokens.as_ref().map(|u| u.input_tokens),
                 output_tokens: last.tokens.as_ref().map(|u| u.output_tokens),
                 cost_usd: last.cost.unwrap_or(0.0),
+                cost_estimated: None, // §D LN-4: embedded-plane estimate population deferred
                 duration_ms: last.duration_ms,
                 status: CallStatus::Failed,
                 error_type: last.error.clone(),
@@ -1106,6 +1108,7 @@ impl Gateway {
                         input_tokens: Some(tokens.input_tokens),
                         output_tokens: Some(tokens.output_tokens),
                         cost_usd: cost,
+                        cost_estimated: None, // §D LN-4: embedded-plane estimate population deferred
                         duration_ms: stream_start.elapsed().as_millis() as u64,
                         status: CallStatus::Success,
                         error_type: None,
