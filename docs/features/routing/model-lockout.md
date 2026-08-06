@@ -82,3 +82,4 @@ Feature: Model lockout
 
 - In-memory / per-process today (like the circuit breaker). A future seam can persist lockout state for multi-instance sharing.
 - Complemented by proactive [expiration tracking](../governance/expiration-tracking.md), which skips a credential *before* it fails.
+- **Provider-side, not subscription quota.** Lockout reacts to *upstream* limit signals (a model's 429/403/credits). The caller's own subscription `GatewayError::QuotaExceeded` (subject/tier — [governance/subscription-quota](../governance/subscription-quota.md)) is a separate **hard stop**, not a lockout, and must not fall over. Keep the two as distinct reason/error types.

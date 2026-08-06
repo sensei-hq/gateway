@@ -12,11 +12,19 @@ source: crates/gateway/src/engine.rs, crates/kernel/src/types/error.rs
 
 > **Status: Planned (Phase 1 · SP-0).** Design in [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §11.2/§12.
 
-Changes how a quota-exhausted model behaves in the candidate walk. Today
-`QuotaExceeded` is **terminal** — it never falls over (see
-[fallback-chains](fallback-chains.md)). With [model lockout](model-lockout.md),
-a quota hit instead **locks out that model and demotes to the next entry/tier**,
-so the chain keeps trying cheaper/other tiers before giving up.
+Changes how a **provider-side** quota/limit on a specific model behaves in the
+candidate walk. Today an upstream quota/rate-limit for a model surfaces as a
+terminal error with no fallover. With [model lockout](model-lockout.md), that
+provider limit instead **locks out that model and demotes to the next
+entry/tier**, so the chain keeps trying other tiers before giving up.
+
+> **Not the same as subscription quota.** The caller's per-subject/tier
+> `GatewayError::QuotaExceeded { unit, window, limit, used }` (subscription
+> metering — [governance/subscription-quota](../governance/subscription-quota.md),
+> design note `docs/design/subscription-quota-auth.md`) is a **hard stop that
+> correctly does NOT demote** — no other model escapes the caller's own quota.
+> Demote-to-tier applies only to *provider-side* limits (distinct reason/error
+> types; do not conflate).
 
 ## Behavior
 

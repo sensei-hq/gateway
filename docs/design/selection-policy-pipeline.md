@@ -148,7 +148,7 @@ The engine's existing `record_failure`/`record_success` calls become one call:
 - **Gate:** if `router_state(router).cooling_until > now` → `Skip(Cooling{until})`, skipping **all** of that router's models in one shot.
 
 ### 3.2 Model lockout (`ModelLockoutGate` + `Sink`) — per-reason
-- **Classification** (a small pure `classify(error, status, body) -> LockReason` fn, unit-tested): 429 → `RateLimit`; 403/quota-body → `QuotaExhausted`; credits-exhausted body → `CreditsExhausted`; 401 → `Auth`. Text-pattern fallback for non-standard 400/403 bodies.
+- **Classification** (a small pure `classify(error, status, body) -> LockReason` fn, unit-tested): 429 → `RateLimit`; 403/quota-body → `QuotaExhausted`; credits-exhausted body → `CreditsExhausted`; 401 → `Auth`. Text-pattern fallback for non-standard 400/403 bodies. **`classify` maps *provider* responses only** — the gateway's own subscription `GatewayError::QuotaExceeded` (subject/tier; `docs/design/subscription-quota-auth.md`) is a separate hard stop and is **never** a `LockReason`. Keep them distinct types.
 - **Cooldown by reason:** `RateLimit` → ~60s; `QuotaExhausted` → next reset boundary (00:00 / monthly), else ~1h; `CreditsExhausted` → `until = None` (terminal); `Auth` → `until = None` (until credential change). Honor an exact upstream reset hint verbatim (not clamped to `max_cooldown_ms`).
 - **Escalation:** repeated failure after release escalates the window (an escalation counter that outlives the cooldown), clamped to `max_cooldown_ms` (except exact reset hints).
 - **Gate:** `endpoint_state(endpoint).locked_until > now` → `Skip(LockedOut{reason, until})`.

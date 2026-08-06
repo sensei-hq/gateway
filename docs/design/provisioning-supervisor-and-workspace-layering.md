@@ -1,3 +1,14 @@
+---
+title: Provisioning Supervisor & Workspace Layering
+doctype: design
+module: local
+status: implemented
+feature:
+  - ../features/local/embedded-inference.md
+  - ../features/catalog/model-registry.md
+source: crates/local-engine/src
+---
+
 # Design: workspace layering + async provisioning supervisor + chain pruning
 
 - **Status:** Proposed (2026-07-20)

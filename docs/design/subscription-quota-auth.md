@@ -1,3 +1,15 @@
+---
+title: Subscription Quota + Auth (Metering)
+doctype: design
+module: governance
+status: implemented
+feature:
+  - ../features/governance/subscription-quota.md
+  - ../features/routing/model-lockout.md
+  - ../features/routing/quota-demote-to-tier.md
+source: crates/gateway/src/engine.rs, crates/gateway/src/store.rs
+---
+
 # Design: subscription/quota auth + metering (AUTH)
 
 - **Status:** Approved (2026-07-18)
@@ -268,3 +280,19 @@ Each step is green + committed on its own; the facade stays stable throughout.
 - No change to dollar metering, model selection, or the circuit breaker.
 - No `local-providers`/`local-engine` changes.
 ```
+
+## Relationship to SP-0 provider health gates (to-be)
+
+The `GatewayError::QuotaExceeded { unit, window, limit, used }` defined here is a
+**subscription (subject/tier) quota** — the caller's own contract limit, enforced
+pre-flight, and correctly a **hard stop** (§5f): no other model escapes the
+caller's quota, so it must not fall over. **This is unchanged by SP-0.**
+
+SP-0 adds a *separate, complementary* layer at the **provider** boundary: a model
+that returns an upstream 429/403/credits signal is classified (`rate_limit` /
+`quota_exhausted` / `credits_exhausted`) and **locked out per-model**, so the
+chain **demotes to the next tier** rather than terminating (see
+[routing/model-lockout](../features/routing/model-lockout.md) and
+[routing/quota-demote-to-tier](../features/routing/quota-demote-to-tier.md)).
+Provider `quota_exhausted` demotes; subject `QuotaExceeded` does not — the two
+must not be conflated in code (distinct error/reason types).
