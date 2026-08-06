@@ -1,3 +1,11 @@
+---
+title: Tracing & Attempts
+doctype: feature
+module: observability
+status: implemented
+source: crates/kernel/src/types/request.rs
+---
+
 # Tracing and Attempts
 
 Every call the engine makes against a provider endpoint is recorded as a
@@ -176,3 +184,15 @@ Notes and caveats:
   chunk). It, too, is a plain `Debug, Clone` struct with no serde. Treat
   `StreamEvent` as a forward-looking design for a gateway-level streaming trace
   that the engine does not yet emit.
+
+## Scenarios
+
+```gherkin
+Feature: Tracing & attempts
+  Scenario: Success carries the full attempts trail
+    Given one failed then one successful attempt
+    Then response.attempts lists both with their AttemptStatus
+  Scenario: Chain exhaustion preserves structured attempt detail
+    Given every candidate fails
+    Then AllAttemptsFailed carries attempts_detail (not a flattened string only)
+```

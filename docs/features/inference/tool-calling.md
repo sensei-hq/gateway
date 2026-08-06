@@ -1,3 +1,11 @@
+---
+title: Tool Calling
+doctype: feature
+module: inference
+status: implemented
+source: crates/kernel/src/types/request.rs, crates/cloud-providers/src
+---
+
 # Feature: Tool / Function Calling
 
 - **Status:** Reference (reflects code as of 2026-07-17)
@@ -375,3 +383,15 @@ non-streaming `execute()` path.
 | Result carrier | `role:Tool` + `MessageContent::ToolResult` | `role:"tool"` message | `tool_result` block in a `user` turn |
 | Streaming arg deltas | `StreamingToolCall.arguments_buffer` | `function.arguments` fragments (by `index`) | `input_json_delta.partial_json` (by `index`) |
 | Tools sent when streaming? | n/a | **Yes** | **No — deferred (`Vec::new()`)** |
+
+## Scenarios
+
+```gherkin
+Feature: Tool calling
+  Scenario: The gateway surfaces tool_calls but does not execute them
+    Given a chat request with tools and a model that returns a tool call
+    Then the response carries tool_calls and no tool is executed by the gateway
+  Scenario: Streamed tool-call fragments are accumulated
+    Given a provider streams input_json_delta fragments for a tool call
+    Then the fragments are reassembled into one complete StreamingToolCall
+```

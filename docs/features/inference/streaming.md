@@ -1,3 +1,11 @@
+---
+title: Streaming
+doctype: feature
+module: inference
+status: implemented
+source: crates/gateway/src/engine.rs
+---
+
 # Streaming
 
 How the `gateway` crate turns a provider's chunked HTTP response into a
@@ -258,3 +266,18 @@ All streaming adapters additionally reject non-`Chat` payloads up front with
 - **`StreamChunk` / `StreamingToolCall` are not serde types** (only
   `Debug` / `Clone` / `Default`). They live entirely inside the streaming
   pipeline and are never serialised to the wire.
+
+## Scenarios
+
+```gherkin
+Feature: Streaming
+  Scenario: Chunks stream until Done with usage and cost
+    Given a streaming chat request
+    Then Chunk events flow, ending with Done { model, tokens, cost }
+  Scenario: Pre-first-byte failure switches provider
+    Given modelA fails at setup and rate_limit is a trigger
+    Then a ProviderSwitch event precedes modelB's first chunk
+  Scenario: A mid-stream error is terminal
+    Given modelA has already emitted chunks and then errors
+    Then a StreamEvent::Error is emitted and the stream stops (no fallover)
+```

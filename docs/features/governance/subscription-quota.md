@@ -1,3 +1,11 @@
+---
+title: Subscription Quota
+doctype: feature
+module: governance
+status: implemented
+source: crates/gateway/src/engine.rs, crates/kernel/src/types/config.rs
+---
+
 # Feature: Subscription / Quota Metering (AUTH)
 
 - **Status:** Reference (reflects code as of 2026-07-18)
@@ -140,4 +148,16 @@ Without `with_store`, the gateway records nothing and enforces nothing.
 - **No PII in logs.** `subject_id` is an opaque `Uuid`; the engine never logs the
   auth context or subject. Consumer store impls own data-retention for attributed
   rows.
+```
+
+## Scenarios
+
+```gherkin
+Feature: Subscription quota
+  Scenario: A request within tier limits passes the pre-flight
+    Given an AuthContext whose tier has remaining quota in the window
+    Then check_quota passes and the request proceeds
+  Scenario: An exhausted quota is terminal
+    Given the tier's rolling-window quota is exhausted
+    Then check_quota returns QuotaExceeded and the request does not fall over
 ```

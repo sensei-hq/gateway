@@ -1,3 +1,11 @@
+---
+title: Embedded Inference
+doctype: feature
+module: local
+status: implemented
+source: crates/local-providers/src
+---
+
 # Embedded Inference
 
 In-process (local) inference adapters for the gateway. `local-providers` loads
@@ -226,3 +234,15 @@ embedder as the fallback.
 - **Crate split (v0.3.1).** The in-process adapters moved to `local-providers`
   and the model resolvers + HF pull to `local-engine`; the old `gateway-embedded`
   crate was retired. All five crates share one version.
+
+## Scenarios
+
+```gherkin
+Feature: Embedded inference
+  Scenario: llama.cpp runs a local GGUF chat in-process
+    Given the local-llama-cpp feature and a resolved GGUF model
+    Then a chat request returns a completion without a network call
+  Scenario: FastEmbed produces embeddings locally
+    Given the fastembed feature and an embed request
+    Then embeddings are returned from the in-process model
+```

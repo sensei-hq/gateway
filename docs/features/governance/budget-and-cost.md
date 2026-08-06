@@ -1,3 +1,11 @@
+---
+title: Budget & Cost
+doctype: feature
+module: governance
+status: implemented
+source: crates/gateway/src/engine.rs, crates/kernel/src/types/cost.rs
+---
+
 # Feature: Budget & Cost Metering
 
 - **Status:** Reference (reflects code as of 2026-07-17)
@@ -316,3 +324,15 @@ plan tier and/or a per-account quota (e.g. daily/monthly allowances of the kind 
 existing `Budget` struct hints at). That work is tracked separately in the gateway
 roadmap under the **AUTH** track and is out of scope for the current per-request budget
 cap.
+
+## Scenarios
+
+```gherkin
+Feature: Budget & cost
+  Scenario: An over-budget candidate is skipped at selection
+    Given a request budget below a model's estimated cost
+    Then that model is a SkippedCandidate
+  Scenario: Actual cost is computed from usage and pricing
+    Given a successful call with token usage and model pricing
+    Then actual_cost = usage × pricing is attached to the response
+```
