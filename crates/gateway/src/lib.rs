@@ -6,6 +6,7 @@ pub mod consensus;
 mod dispatch;
 pub mod engine;
 pub mod facade;
+pub mod gates;
 pub mod panel;
 pub mod pruning;
 pub mod purpose;
