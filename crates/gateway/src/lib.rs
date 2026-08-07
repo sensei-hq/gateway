@@ -13,6 +13,7 @@ pub mod purpose;
 pub mod selection;
 mod skip_reason;
 pub mod store;
+pub mod strategy;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub use kernel::types;
