@@ -7,12 +7,19 @@ use std::time::Instant;
 pub mod budget;
 pub mod capability;
 pub mod circuit_breaker_gate;
+pub mod cooldown;
 
 /// Read port for endpoint health (the circuit breaker implements it in Task 4;
 /// cooldown/lockout ports arrive in later SP-0 plans).
 pub trait EndpointHealthRead: Send + Sync {
     /// `Some(until)` if the endpoint is currently open/unavailable with a retry time.
     fn open_until(&self, endpoint: &str) -> Option<Instant>;
+}
+
+/// Read port for router-level health (connection cooldown; more router ports later).
+pub trait RouterHealthRead: Send + Sync {
+    /// `Some(until)` if the router is currently cooling down.
+    fn cooling_until(&self, router: &str) -> Option<Instant>;
 }
 
 /// A resolved candidate ready for gating (structural resolution already succeeded).

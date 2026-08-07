@@ -10,6 +10,7 @@ pub enum SkipReason {
     UnsupportedCapability(Capability),
     OverBudget { estimated: f64, budget: f64 },
     CircuitOpen { until: Instant },
+    Cooling { until: Instant },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -26,6 +27,7 @@ impl std::fmt::Display for SkipReason {
                 )
             }
             SkipReason::CircuitOpen { .. } => write!(f, "circuit breaker open"),
+            SkipReason::Cooling { .. } => write!(f, "router cooling down"),
         }
     }
 }
