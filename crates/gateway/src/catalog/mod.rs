@@ -1,3 +1,6 @@
+mod totals;
+pub use totals::*;
+
 use crate::types::config::{CostBand, ModelConfig};
 
 /// Blended $/1k cost band for a catalog model. An explicit `catalog.cost_band`
