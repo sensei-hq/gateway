@@ -12,22 +12,6 @@ pub enum SkipReason {
     CircuitOpen { until: Instant },
 }
 
-impl SkipReason {
-    pub fn until(&self) -> Option<Instant> {
-        match self {
-            SkipReason::CircuitOpen { until } => Some(*until),
-            _ => None,
-        }
-    }
-
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            SkipReason::ModelNotFound | SkipReason::UnsupportedCapability(_)
-        )
-    }
-}
-
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -56,7 +40,5 @@ mod tests {
             SkipReason::UnsupportedCapability(crate::types::capability::Capability::TextEmbed),
             SkipReason::UnsupportedCapability(_)
         ));
-        assert!(SkipReason::ModelNotFound.until().is_none());
-        assert!(!SkipReason::RouterNotFound.is_terminal());
     }
 }
