@@ -11,8 +11,8 @@
 //! `chat_stream()` opens a real SSE stream against `{base}/chat/completions`,
 //! yielding `data: ` chunks.
 //!
-//! Status mappings for both endpoints: 401/403 -> Authentication,
-//! 429 -> RateLimit, everything else -> ProviderError.
+//! Status mappings for both endpoints: 401 -> Authentication,
+//! 429 -> RateLimit, everything else (including 403) -> ProviderError.
 //!
 //! `base_url()` trims a trailing `/` from `config.url`; `server.uri()`
 //! has no trailing slash, so the mocked paths are exactly
@@ -159,7 +159,7 @@ http_error_tests! {
     path: "/v1/chat/completions",
     cases: {
         together_chat_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
-        together_chat_403_maps_to_authentication => (403, "forbidden", common::ErrKind::Auth),
+        together_chat_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
         together_chat_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
         together_chat_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
     }

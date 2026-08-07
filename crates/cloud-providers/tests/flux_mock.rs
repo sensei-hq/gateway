@@ -80,9 +80,10 @@ async fn flux_generate_image_happy_path() {
 }
 
 // ---------------------------------------------------------------------------
-// Submit error mappings — FLUX maps 401/403 → Authentication, 429 → RateLimit,
-// 500 → ProviderError (distinct mapping, unlike the fal/kling/luma/runway/replicate
-// adapters that route every submit status through ProviderError).
+// Submit error mappings — FLUX maps 401 → Authentication, 429 → RateLimit,
+// and every other code (including 403) → ProviderError carrying the status
+// (unlike the fal/kling/luma/runway/replicate adapters, which route every
+// submit status through ProviderError including 401).
 // ---------------------------------------------------------------------------
 
 http_error_tests! {
@@ -93,7 +94,7 @@ http_error_tests! {
     path: format!("/{DEFAULT_MODEL}"),
     cases: {
         flux_submit_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
-        flux_submit_403_maps_to_authentication => (403, "forbidden", common::ErrKind::Auth),
+        flux_submit_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
         flux_submit_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
         flux_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
     }
