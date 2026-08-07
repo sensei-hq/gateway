@@ -341,7 +341,14 @@ impl super::Gateway {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let _ = self.record_outcome(&endpoint, &candidate.router, false, Some(&err));
 
-                let should_fallback = err.should_trigger_fallback(fallback_triggers);
+                // Classify drives the in-flight fallover so the walk and the next-request
+                // lockout agree (design §3.1): a recoverable provider limit (429 / 403-quota)
+                // falls over on THIS request; a terminal one (401 / credits) stops; a non-limit
+                // error keeps the configured trigger semantics.
+                let should_fallback = match crate::gates::lockout::classify(&err) {
+                    Some(reason) => reason.is_recoverable(),
+                    None => err.should_trigger_fallback(fallback_triggers),
+                };
 
                 tracing::warn!(
                     sequence,
