@@ -1,9 +1,11 @@
-use crate::circuit_breaker::CircuitBreakerManager;
+use crate::circuit_breaker::{BreakerState, CircuitBreakerManager};
+use crate::skip_reason::SkipReason;
 use crate::types::capability::Capability;
 use crate::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
 };
 use crate::types::cost::CostEstimate;
+use std::time::Instant;
 
 /// Criteria used to resolve which model(s) to try.
 #[derive(Debug, Clone)]
@@ -33,7 +35,7 @@ pub struct SelectedModel {
 pub struct SkippedCandidate {
     pub model: String,
     pub router: String,
-    pub reason: String,
+    pub reason: SkipReason,
 }
 
 /// The result of model selection, containing the chosen model plus diagnostics.
@@ -97,6 +99,16 @@ impl<'a> ModelSelectionService<'a> {
         })
     }
 
+    /// The instant the circuit breaker for `endpoint` will next allow a
+    /// retry. Falls back to now if the breaker isn't actually open (should
+    /// not happen given the caller only asks after `can_execute` fails).
+    fn circuit_open_until(&self, endpoint: &str) -> Instant {
+        match self.circuit_breaker.get_state(endpoint) {
+            BreakerState::Open { next_retry } => next_retry,
+            _ => Instant::now(),
+        }
+    }
+
     /// Core resolution: determine candidates based on the 3-tier strategy,
     /// then validate each one through the pipeline.
     fn resolve_candidates(&self, criteria: &SelectionCriteria) -> SelectionResult {
@@ -156,15 +168,15 @@ impl<'a> ModelSelectionService<'a> {
         router_name: &str,
         model_name: &str,
         criteria: &SelectionCriteria,
-    ) -> Result<SelectedModel, String> {
+    ) -> Result<SelectedModel, SkipReason> {
         // Validate router exists and is enabled
         let router_config = self
             .config
             .routers
             .get(router_name)
-            .ok_or_else(|| "router not found".to_string())?;
+            .ok_or(SkipReason::RouterNotFound)?;
         if !router_config.enabled {
-            return Err("router disabled".to_string());
+            return Err(SkipReason::RouterDisabled);
         }
 
         // Validate model exists and supports capability
@@ -172,15 +184,19 @@ impl<'a> ModelSelectionService<'a> {
             .config
             .models
             .get(model_name)
-            .ok_or_else(|| "model not found".to_string())?;
+            .ok_or(SkipReason::ModelNotFound)?;
         if !model_config.capabilities.contains(&criteria.capability) {
-            return Err(format!("does not support {:?}", criteria.capability));
+            return Err(SkipReason::UnsupportedCapability(
+                criteria.capability.clone(),
+            ));
         }
 
         // Circuit breaker check
         let endpoint = format!("{}:{}", router_name, model_name);
         if !self.circuit_breaker.can_execute(&endpoint) {
-            return Err("circuit breaker open".to_string());
+            return Err(SkipReason::CircuitOpen {
+                until: self.circuit_open_until(&endpoint),
+            });
         }
 
         // Cost estimation and budget check
@@ -188,10 +204,10 @@ impl<'a> ModelSelectionService<'a> {
         if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
             && est.estimated > budget
         {
-            return Err(format!(
-                "over budget (estimated {:.4}, budget {:.4})",
-                est.estimated, budget
-            ));
+            return Err(SkipReason::OverBudget {
+                estimated: est.estimated,
+                budget,
+            });
         }
 
         let api_model_id = model_config
@@ -258,7 +274,7 @@ impl<'a> ModelSelectionService<'a> {
             SkippedCandidate {
                 model: model_name.clone(),
                 router: router_name,
-                reason: "model not found".to_string(),
+                reason: SkipReason::ModelNotFound,
             }
         })?;
 
@@ -276,14 +292,14 @@ impl<'a> ModelSelectionService<'a> {
                 .ok_or_else(|| SkippedCandidate {
                     model: model_name.clone(),
                     router: router_name.clone(),
-                    reason: "router not found".to_string(),
+                    reason: SkipReason::RouterNotFound,
                 })?;
 
         if !router_config.enabled {
             return Err(SkippedCandidate {
                 model: model_name.clone(),
                 router: router_name,
-                reason: "router disabled".to_string(),
+                reason: SkipReason::RouterDisabled,
             });
         }
 
@@ -292,7 +308,7 @@ impl<'a> ModelSelectionService<'a> {
             return Err(SkippedCandidate {
                 model: model_name.clone(),
                 router: router_name,
-                reason: format!("does not support {:?}", criteria.capability),
+                reason: SkipReason::UnsupportedCapability(criteria.capability.clone()),
             });
         }
 
@@ -302,7 +318,9 @@ impl<'a> ModelSelectionService<'a> {
             return Err(SkippedCandidate {
                 model: model_name.clone(),
                 router: router_name,
-                reason: "circuit breaker open".to_string(),
+                reason: SkipReason::CircuitOpen {
+                    until: self.circuit_open_until(&endpoint),
+                },
             });
         }
 
@@ -314,10 +332,10 @@ impl<'a> ModelSelectionService<'a> {
             return Err(SkippedCandidate {
                 model: model_name.clone(),
                 router: router_name,
-                reason: format!(
-                    "over budget (estimated {:.4}, budget {:.4})",
-                    est.estimated, budget
-                ),
+                reason: SkipReason::OverBudget {
+                    estimated: est.estimated,
+                    budget,
+                },
             });
         }
 
@@ -541,7 +559,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("router not found"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterNotFound
+        ));
     }
 
     #[test]
@@ -643,7 +664,10 @@ mod tests {
         let selected = result.selected.unwrap();
         assert_eq!(selected.model, "claude-haiku");
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("router disabled"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterDisabled
+        ));
         assert_eq!(result.skipped[0].model, "gemma3:27b");
     }
 
@@ -664,7 +688,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("does not support"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::UnsupportedCapability(_)
+        ));
     }
 
     #[test]
@@ -698,7 +725,8 @@ mod tests {
             result
                 .skipped
                 .iter()
-                .any(|s| s.model == "gemma3:27b" && s.reason.contains("circuit breaker"))
+                .any(|s| s.model == "gemma3:27b"
+                    && matches!(s.reason, SkipReason::CircuitOpen { .. }))
         );
     }
 
@@ -726,12 +754,9 @@ mod tests {
                 .iter()
                 .any(|c| c.model == "gemma3:27b")
         );
-        assert!(
-            result
-                .skipped
-                .iter()
-                .any(|s| s.model == "claude-haiku" && s.reason.contains("over budget"))
-        );
+        assert!(result.skipped.iter().any(
+            |s| s.model == "claude-haiku" && matches!(s.reason, SkipReason::OverBudget { .. })
+        ));
     }
 
     #[test]
@@ -810,7 +835,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("model not found"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::ModelNotFound
+        ));
     }
 
     #[test]
@@ -831,7 +859,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("does not support"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::UnsupportedCapability(_)
+        ));
     }
 
     #[test]
@@ -860,7 +891,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("circuit breaker"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::CircuitOpen { .. }
+        ));
     }
 
     #[test]
@@ -881,7 +915,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("over budget"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::OverBudget { .. }
+        ));
     }
 
     #[test]
@@ -902,7 +939,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("router disabled"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterDisabled
+        ));
     }
 
     #[test]
@@ -969,7 +1009,10 @@ mod tests {
         assert_eq!(result.all_candidates.len(), 1);
         assert_eq!(result.all_candidates[0].model, "gemma3:27b");
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("model not found"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::ModelNotFound
+        ));
     }
 
     #[test]
@@ -1015,7 +1058,7 @@ mod tests {
             result
                 .skipped
                 .iter()
-                .any(|s| s.model == "gemma3:27b" && s.reason.contains("router not found"))
+                .any(|s| s.model == "gemma3:27b" && matches!(s.reason, SkipReason::RouterNotFound))
         );
         // claude-haiku should still be available
         assert_eq!(result.all_candidates.len(), 1);
