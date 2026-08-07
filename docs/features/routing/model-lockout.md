@@ -2,7 +2,7 @@
 title: Model Lockout
 doctype: feature
 module: routing
-status: planned
+status: implemented
 phase: 1
 spec: SP-0
 source: crates/gateway/src/selection.rs, crates/gateway/src/circuit_breaker.rs
@@ -10,7 +10,15 @@ source: crates/gateway/src/selection.rs, crates/gateway/src/circuit_breaker.rs
 
 # Model Lockout
 
-> **Status: Planned (Phase 1 · SP-0).** Design in [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §12/§12.1. Reference implementation: OmniRoute `accountFallback`.
+> **Status: Implemented (Phase 1 · SP-0 (d)).** The lockout mechanism (keyed
+> `router:model` skip gate), limit-signal classification (429 →
+> `rate_limit`, 403/quota → `quota_exhausted`, credits → terminal, auth →
+> terminal), escalating backoff, the `on_lockout` callback, and
+> `apply_lockout` / `clear_lockout` re-seed are live; the terminal
+> `AllGated { resume_after }` it feeds landed in **(e)** (see
+> [quota demote-to-tier](quota-demote-to-tier.md)). Deferred to **(f)**: the
+> calendar-clock exact reset boundary, seedable jitter, and the bounded-LRU
+> eviction cap on the lockout map. Design in [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §12/§12.1. Reference implementation: OmniRoute `accountFallback`.
 
 A selection gate that temporarily removes a **single model** from a chain after a
 limit signal, so the candidate walk falls over to the next entry instead of
@@ -29,7 +37,7 @@ retrying a model that cannot currently succeed. Sits alongside the existing
   - `auth` / `expired` → locked until the credential changes.
 - **Escalating backoff** whose window outlives the cooldown: a model that fails again right after its lockout expires keeps escalating instead of resetting to base. Clamp to an operator `max_cooldown_ms` — **except** honor a real upstream reset hint exactly (never clamp a genuine "Resets in 92h" down to the cap).
 - **Classification** of limit signals: 429→`rate_limit`, 403/quota-body→`quota_exhausted`, credits→terminal; includes text-pattern detection for providers that throttle via non-standard 400/403 bodies.
-- **Bounded** map with an eviction cap so lockout state cannot leak.
+- **Bounded** map with an eviction cap so lockout state cannot leak. _(Planned — deferred to SP-0 (f); the map is currently unbounded.)_
 
 ## Interaction with the chain
 
