@@ -68,6 +68,8 @@ pub struct ModelSelectionService<'a> {
     health: &'a dyn EndpointHealthRead,
     /// Router health read port (the connection cooldown store implements it).
     router_health: &'a dyn RouterHealthRead,
+    /// Endpoint model-lockout read port (the model-lockout store implements it).
+    model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
     /// Orders admitted candidates (SP-0: priority ascending, stable).
     strategy: Box<dyn RoutingStrategy>,
 }
@@ -77,6 +79,7 @@ impl<'a> ModelSelectionService<'a> {
         config: &'a GatewayConfig,
         circuit_breaker: &'a CircuitBreakerManager,
         router_health: &'a dyn RouterHealthRead,
+        model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
     ) -> Self {
         Self {
             config,
@@ -84,10 +87,12 @@ impl<'a> ModelSelectionService<'a> {
                 Box::new(CapabilityGate),
                 Box::new(ConnectionCooldownGate),
                 Box::new(CircuitBreakerGate),
+                Box::new(crate::gates::lockout::ModelLockoutGate),
                 Box::new(BudgetGate),
             ],
             health: circuit_breaker,
             router_health,
+            model_lockout,
             strategy: Box::new(PriorityStrategy),
         }
     }
@@ -148,6 +153,7 @@ impl<'a> ModelSelectionService<'a> {
             now: Instant::now(),
             config: self.config,
             router_health: self.router_health,
+            model_lockout: self.model_lockout,
         };
         for gate in &self.gates {
             if let GateVerdict::Skip(reason) = gate.evaluate(&cand, &ctx) {
@@ -533,7 +539,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -555,7 +562,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -579,7 +587,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -603,7 +612,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextEmbed,
@@ -641,7 +651,8 @@ mod tests {
         );
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
         // Run several times: a HashMap-order bug would flake; min_by is stable.
         for _ in 0..10 {
             let result = svc.select(&SelectionCriteria {
@@ -662,7 +673,8 @@ mod tests {
         config.routers.get_mut("ollama").unwrap().enabled = false;
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -689,7 +701,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::AudioTranscribe,
@@ -713,6 +726,7 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
 
         // Open the circuit breaker for ollama:gemma3:27b
         let endpoint = "ollama:gemma3:27b";
@@ -722,7 +736,7 @@ mod tests {
         }
         assert!(!cb.can_execute(endpoint)); // confirm open
 
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -750,7 +764,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -780,7 +795,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -801,7 +817,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::AudioTranscribe,
@@ -821,7 +838,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -842,7 +860,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -866,7 +885,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         // all-minilm only supports TextEmbed, not AudioTranscribe
         let result = svc.select(&SelectionCriteria {
@@ -891,6 +911,7 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
 
         // Open the breaker for this direct endpoint
         let endpoint = "ollama:gemma3:27b";
@@ -900,7 +921,7 @@ mod tests {
         }
         assert!(!cb.can_execute(endpoint));
 
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -924,7 +945,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         // claude-haiku has pricing, set budget very low
         let result = svc.select(&SelectionCriteria {
@@ -950,7 +972,8 @@ mod tests {
         config.routers.get_mut("ollama").unwrap().enabled = false;
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -976,7 +999,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextEmbed,
@@ -1020,7 +1044,8 @@ mod tests {
         );
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -1069,7 +1094,8 @@ mod tests {
         );
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -1097,7 +1123,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
             model: Some("ghost".into()),
@@ -1118,7 +1145,8 @@ mod tests {
         let config = test_config();
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
-        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
             model: Some("gemma3:27b".into()),

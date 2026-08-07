@@ -57,6 +57,10 @@ pub struct Gateway {
     /// selection, write side is [`crate::gates::cooldown::ConnectionCooldownSink`]
     /// in `recorders` — both share this one store (see [`Gateway::new`]).
     cooldown: crate::gates::cooldown::ConnectionCooldownStore,
+    /// Endpoint model-lockout read/write state: read side wired into selection,
+    /// the write side (sink) lands in a later task — for now the store is only
+    /// ever empty, so the [`crate::gates::lockout::ModelLockoutGate`] always admits.
+    model_lockout: crate::gates::lockout::ModelLockoutStore,
 }
 
 impl Gateway {
@@ -68,6 +72,7 @@ impl Gateway {
         // Built before `recorders` so the gate's read-side field and the sink's
         // write-side handle share the SAME store (Arc-backed `Clone`).
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let model_lockout = crate::gates::lockout::ModelLockoutStore::new();
         let recorders: Vec<Arc<dyn crate::gates::HealthRecorder>> = vec![
             Arc::new(crate::gates::circuit_breaker_gate::CircuitBreakerSink::new(
                 circuit_breaker.clone(),
@@ -85,6 +90,7 @@ impl Gateway {
             probe: None,
             recorders,
             cooldown,
+            model_lockout,
         }
     }
 

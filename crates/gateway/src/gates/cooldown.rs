@@ -157,6 +157,7 @@ mod tests {
         };
         let gateway_config = GatewayConfig::default();
         let endpoint_health = FakeEndpointHealth;
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
         let ctx = SelectionCtx {
             capability: Capability::TextChat,
             budget: None,
@@ -165,6 +166,7 @@ mod tests {
             now,
             config: &gateway_config,
             router_health: &store,
+            model_lockout: &lockout,
         };
 
         // Not cooling yet → Admit.
