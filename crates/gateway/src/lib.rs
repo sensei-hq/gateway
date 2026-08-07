@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod budget;
+pub mod catalog;
 pub mod circuit_breaker;
 pub mod config;
 pub mod consensus;
