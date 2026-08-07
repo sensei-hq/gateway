@@ -24,6 +24,26 @@ impl ConnectionCooldownStore {
             .unwrap_or_else(|e| e.into_inner())
             .insert(router.to_string(), until);
     }
+    /// Number of tracked routers (active + expired-but-not-yet-evicted).
+    pub fn len(&self) -> usize {
+        self.cooling.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    /// Whether any router is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Over `cap` entries, drop those whose cooldown has already elapsed
+    /// (`until <= now`). Active cooldowns are never dropped, so the cap is soft
+    /// (bounded by concurrently-active routers). Prevents unbounded growth from
+    /// many short-lived routers.
+    pub fn evict_expired_over_cap(&self, cap: usize) {
+        let mut m = self.cooling.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() <= cap {
+            return;
+        }
+        let now = Instant::now();
+        m.retain(|_, until| *until > now);
+    }
 }
 impl RouterHealthRead for ConnectionCooldownStore {
     fn cooling_until(&self, router: &str) -> Option<Instant> {
@@ -65,11 +85,16 @@ pub const DEFAULT_CONNECTION_COOLDOWN: Duration = Duration::from_secs(30);
 pub struct ConnectionCooldownSink {
     store: ConnectionCooldownStore,
     cooldown: Duration,
+    eviction_cap: usize,
 }
 
 impl ConnectionCooldownSink {
-    pub fn new(store: ConnectionCooldownStore, cooldown: Duration) -> Self {
-        Self { store, cooldown }
+    pub fn new(store: ConnectionCooldownStore, cooldown: Duration, eviction_cap: usize) -> Self {
+        Self {
+            store,
+            cooldown,
+            eviction_cap,
+        }
     }
 }
 
@@ -83,6 +108,8 @@ impl HealthRecorder for ConnectionCooldownSink {
         ) {
             let until = Instant::now() + self.cooldown;
             self.store.start(o.router, until);
+            // Bound the map on the write path only (reads/successes never grow it).
+            self.store.evict_expired_over_cap(self.eviction_cap);
             Some(until)
         } else {
             None
@@ -199,7 +226,7 @@ mod tests {
     #[test]
     fn sink_cools_only_on_transport_fault() {
         let store = ConnectionCooldownStore::new();
-        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30));
+        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30), 4096);
         let now = Instant::now();
 
         let timeout_err = GatewayError::Timeout {
@@ -241,5 +268,77 @@ mod tests {
         });
         assert!(returned.is_none(), "success does not cool");
         assert!(store.cooling_until("C").is_none());
+    }
+
+    /// Over `cap`, EXPIRED cooldowns are dropped but ACTIVE ones are never
+    /// dropped — the load-bearing invariant. 3 expired + 2 active, cap = 2.
+    #[test]
+    fn evicts_expired_over_cap_keeps_active() {
+        let s = ConnectionCooldownStore::new();
+        let now = Instant::now();
+        // 3 expired + 2 active, cap = 2
+        s.start("expired1", now - Duration::from_secs(1));
+        s.start("expired2", now - Duration::from_secs(1));
+        s.start("expired3", now - Duration::from_secs(1));
+        s.start("active1", now + Duration::from_secs(60));
+        s.start("active2", now + Duration::from_secs(60));
+        s.evict_expired_over_cap(2);
+        // expired gone, active kept
+        assert!(s.cooling_until("expired1").is_none());
+        assert!(s.cooling_until("expired2").is_none());
+        assert!(s.cooling_until("expired3").is_none());
+        assert!(s.cooling_until("active1").is_some());
+        assert!(s.cooling_until("active2").is_some());
+    }
+
+    /// At/below the cap, nothing is evicted — even an expired entry is kept.
+    #[test]
+    fn evict_no_op_when_at_or_below_cap() {
+        let s = ConnectionCooldownStore::new();
+        let now = Instant::now();
+        s.start("a", now - Duration::from_secs(1)); // expired but under cap → kept
+        s.evict_expired_over_cap(4096);
+        assert!(s.cooling_until("a").is_some());
+    }
+
+    /// On the WRITE path, a tiny `eviction_cap` prunes expired entries while the
+    /// active cooldown (and the just-written one) survive; the map stays bounded.
+    #[test]
+    fn sink_evicts_expired_over_cap_on_write_keeps_active() {
+        let store = ConnectionCooldownStore::new();
+        let now = Instant::now();
+        // Pre-seed two expired entries and one active entry.
+        store.start("expired1", now - Duration::from_secs(1));
+        store.start("expired2", now - Duration::from_secs(1));
+        store.start("active", now + Duration::from_secs(60));
+        // Tiny cap so the next write trips eviction.
+        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30), 1);
+
+        let timeout_err = GatewayError::Timeout {
+            adapter: "a".into(),
+            model: "m".into(),
+            duration_ms: 1,
+        };
+        // Transport fault on a NEW router → writes "new" then evicts expired over cap.
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "new:m",
+            router: "new",
+            success: false,
+            error: Some(&timeout_err),
+        });
+
+        // Expired pruned; the active cooldown and just-written one survive.
+        assert!(store.cooling_until("expired1").is_none());
+        assert!(store.cooling_until("expired2").is_none());
+        assert!(
+            store.cooling_until("active").is_some(),
+            "active cooldown never evicted"
+        );
+        assert!(
+            store.cooling_until("new").is_some(),
+            "just-written cooldown present"
+        );
+        // Map bounded to the non-expired entries (active + new).
+        assert!(store.len() <= 2);
     }
 }

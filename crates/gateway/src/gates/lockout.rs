@@ -151,6 +151,29 @@ impl ModelLockoutStore {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|k, e| !(k.starts_with(&prefix) && e.reason.is_terminal()));
     }
+    /// Number of tracked endpoints (active + terminal + expired-not-yet-evicted).
+    pub fn len(&self) -> usize {
+        self.locks.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    /// Whether any endpoint is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Over `cap`, drop expired TIMED locks (`Some(u)` with `u <= now`). Active
+    /// timed locks and TERMINAL locks (`until: None`) are never dropped — the
+    /// design's "never evict mid-lock". Prevents unbounded growth from many
+    /// short-lived endpoints.
+    pub fn evict_expired_over_cap(&self, cap: usize) {
+        let mut m = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() <= cap {
+            return;
+        }
+        let now = Instant::now();
+        m.retain(|_, e| match e.until {
+            Some(u) => u > now, // active timed → keep; expired timed → drop
+            None => true,       // terminal → always keep
+        });
+    }
 }
 
 impl ModelLockoutRead for ModelLockoutStore {
@@ -240,6 +263,7 @@ pub struct ModelLockoutSink {
     store: ModelLockoutStore,
     policy: ModelLockoutPolicy,
     observers: LockoutBroadcaster,
+    eviction_cap: usize,
 }
 
 impl ModelLockoutSink {
@@ -247,11 +271,13 @@ impl ModelLockoutSink {
         store: ModelLockoutStore,
         policy: ModelLockoutPolicy,
         observers: LockoutBroadcaster,
+        eviction_cap: usize,
     ) -> Self {
         Self {
             store,
             policy,
             observers,
+            eviction_cap,
         }
     }
 
@@ -302,6 +328,8 @@ impl HealthRecorder for ModelLockoutSink {
 
         let until = self.deadline(reason, retry_after(err), escalation, now);
         self.store.set(o.endpoint, reason, until, escalation);
+        // Bound the map on the write path only (a success `clear`s and shrinks).
+        self.store.evict_expired_over_cap(self.eviction_cap);
         self.observers.fire(o.endpoint, reason, until);
         // `Some(deadline)` for a timed lock, `None` for a terminal lock — exactly
         // the recorder contract (a terminal lock has no wake-up instant).
@@ -582,6 +610,7 @@ mod tests {
             store.clone(),
             ModelLockoutPolicy::default(),
             LockoutBroadcaster::new(),
+            4096,
         );
         (store, sink)
     }
@@ -772,5 +801,109 @@ mod tests {
             LockReason::QuotaExhausted,
             "403-quota upgrades the active rate-limit lock"
         );
+    }
+
+    /// Over `cap`, expired TIMED locks are evicted; a TERMINAL lock (`until:
+    /// None`) and an ACTIVE timed lock (`until` future) are NEVER evicted — the
+    /// load-bearing "never evict mid-lock" invariant.
+    #[test]
+    fn evicts_expired_timed_locks_keeps_terminal_and_active() {
+        let s = ModelLockoutStore::new();
+        let now = Instant::now();
+        s.set(
+            "expired",
+            LockReason::RateLimit,
+            Some(now - Duration::from_secs(1)),
+            0,
+        );
+        s.set("terminal", LockReason::Auth, None, 0);
+        s.set(
+            "active",
+            LockReason::QuotaExhausted,
+            Some(now + Duration::from_secs(60)),
+            0,
+        );
+        // add filler expired entries to exceed a small cap
+        for i in 0..5 {
+            s.set(
+                &format!("e{i}"),
+                LockReason::RateLimit,
+                Some(now - Duration::from_secs(1)),
+                0,
+            );
+        }
+        s.evict_expired_over_cap(2);
+        assert!(s.locked("expired").is_none());
+        assert!(s.locked("terminal").is_some(), "terminal never evicted");
+        assert!(s.locked("active").is_some(), "active never evicted");
+    }
+
+    /// At/below the cap, nothing is evicted — even an expired timed lock is kept.
+    #[test]
+    fn lockout_evict_no_op_when_at_or_below_cap() {
+        let s = ModelLockoutStore::new();
+        let now = Instant::now();
+        s.set(
+            "expired",
+            LockReason::RateLimit,
+            Some(now - Duration::from_secs(1)),
+            0,
+        );
+        s.evict_expired_over_cap(4096);
+        assert!(s.locked("expired").is_some());
+    }
+
+    /// On the WRITE path, a tiny `eviction_cap` prunes expired timed locks while
+    /// the terminal and active locks (and the just-written one) survive.
+    #[test]
+    fn sink_evicts_expired_timed_locks_on_write_keeps_terminal_and_active() {
+        let store = ModelLockoutStore::new();
+        let now = Instant::now();
+        // Pre-seed expired timed, terminal, and active locks.
+        store.set(
+            "expired",
+            LockReason::RateLimit,
+            Some(now - Duration::from_secs(1)),
+            0,
+        );
+        store.set("terminal", LockReason::Auth, None, 0);
+        store.set(
+            "active",
+            LockReason::QuotaExhausted,
+            Some(now + Duration::from_secs(60)),
+            0,
+        );
+        // Tiny cap so the next write trips eviction.
+        let sink = ModelLockoutSink::new(
+            store.clone(),
+            ModelLockoutPolicy::default(),
+            LockoutBroadcaster::new(),
+            1,
+        );
+
+        // A fresh rate-limit failure on a NEW endpoint → writes then evicts.
+        let err = GatewayError::RateLimit {
+            adapter: "a".into(),
+            retry_after_ms: Some(1000),
+        };
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "new:m",
+            router: "new",
+            success: false,
+            error: Some(&err),
+        });
+
+        assert!(
+            store.locked("expired").is_none(),
+            "expired timed lock evicted"
+        );
+        assert!(store.locked("terminal").is_some(), "terminal never evicted");
+        assert!(
+            store.locked("active").is_some(),
+            "active timed lock never evicted"
+        );
+        assert!(store.locked("new:m").is_some(), "just-written lock present");
+        // Map bounded to the non-expired entries (terminal + active + new).
+        assert!(store.len() <= 3);
     }
 }

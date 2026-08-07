@@ -430,11 +430,13 @@ fn build_recorders(
         Arc::new(crate::gates::cooldown::ConnectionCooldownSink::new(
             cooldown.clone(),
             resilience.cooldown_base,
+            resilience.eviction_cap,
         )),
         Arc::new(crate::gates::lockout::ModelLockoutSink::new(
             model_lockout.clone(),
             resilience.lockout.clone(),
             observers.clone(),
+            resilience.eviction_cap,
         )),
     ]
 }
