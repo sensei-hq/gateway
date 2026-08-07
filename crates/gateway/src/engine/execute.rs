@@ -59,9 +59,16 @@ impl super::Gateway {
         );
         let result = svc.select_all(&criteria);
 
-        // 4. No candidates?
+        // 4. No candidates? Selection admitted nothing. If every skip was a gate
+        // (health-lock / cooling / breaker-open / over-budget), this is a durable
+        // `AllGated` pause rather than a bare `NoCandidates` — only an
+        // all-structural (misconfig / wrong-capability / nothing-configured)
+        // selection stays `NoCandidates`.
         if result.all_candidates.is_empty() {
             tracing::warn!("no candidates available for request");
+            if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {
+                return Err(gated);
+            }
             return Err(GatewayError::NoCandidates {
                 capability: request.capability.clone(),
             });
@@ -93,6 +100,11 @@ impl super::Gateway {
             1
         };
         let mut attempts: Vec<Attempt> = Vec::new();
+        // Per-attempt gate contributions, aggregated at exhaustion into `AllGated`
+        // (a recoverable limit that just locked its endpoint contributes a timed
+        // resume instant; a terminal one a human-action; a hard fault vetoes
+        // all-gated). Kept alongside `attempts` and consumed only at exhaustion.
+        let mut contributions: Vec<super::exhaustion::GateContribution> = Vec::new();
 
         for (sequence, candidate) in (1_u8..).zip(result.all_candidates.iter().take(max_attempts)) {
             match self
@@ -102,6 +114,7 @@ impl super::Gateway {
                     sequence,
                     fallback_triggers,
                     &mut attempts,
+                    &mut contributions,
                 )
                 .await
             {
@@ -128,6 +141,28 @@ impl super::Gateway {
                 }
             }
         }
+
+        // Aggregate selection-skips + per-attempt contributions: if every
+        // candidate was gated (health-skip or classified limit) and none
+        // hard-failed, this exhaustion is a durable `AllGated` pause; otherwise
+        // it stays the generic `AllAttemptsFailed`. Built from `&result.skipped`
+        // + `&contributions` (not `attempts`), so it can be computed before
+        // `attempts` is moved into `AllAttemptsFailed` below.
+        //
+        // Guard: only aggregate to `AllGated` when the walk actually attempted
+        // every candidate it was willing to try (`attempts.len() == max_attempts`).
+        // A terminal limit (401 / credits) `Stop`s the walk early and leaves the
+        // later, still-eligible candidates un-attempted (neither skipped nor
+        // contributed) — those are NOT gated, so the "every candidate gated"
+        // invariant fails and this stays `AllAttemptsFailed` (a `Stop` on the LAST
+        // candidate still counts as attempted-all, so `[A(429→over), B(auth→stop)]`
+        // is correctly all-gated).
+        let attempted_all = attempts.len() == max_attempts;
+        let gated = if attempted_all {
+            super::exhaustion::all_gated_error(&result.skipped, &contributions)
+        } else {
+            None
+        };
 
         let errors = attempts
             .iter()
@@ -171,11 +206,11 @@ impl super::Gateway {
             .await;
         }
 
-        Err(GatewayError::AllAttemptsFailed {
+        Err(gated.unwrap_or_else(|| GatewayError::AllAttemptsFailed {
             attempts: attempts.len(),
             errors,
             attempts_detail: attempts,
-        })
+        }))
     }
 
     /// Run one per-attempt step of the fallback-chain walk against a single
@@ -192,6 +227,7 @@ impl super::Gateway {
         sequence: u8,
         fallback_triggers: &[FallbackTrigger],
         attempts: &mut Vec<Attempt>,
+        contributions: &mut Vec<super::exhaustion::GateContribution>,
     ) -> StepOutcome {
         let start = Instant::now();
 
@@ -259,6 +295,10 @@ impl super::Gateway {
                     )),
                     fallback_triggered: false,
                 });
+                // A missing adapter is a hard/structural failure, not a gate — so
+                // it vetoes all-gated (`[A(no adapter), B(locked)]` ⇒
+                // AllAttemptsFailed, not AllGated).
+                contributions.push(super::exhaustion::GateContribution::HardFailure);
                 return StepOutcome::FallBack;
             }
         };
@@ -339,7 +379,11 @@ impl super::Gateway {
             }
             Err(err) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let _ = self.record_outcome(&endpoint, &candidate.router, false, Some(&err));
+                // Capture the instant the recorder pipeline just wrote (for a
+                // recoverable limit that locked this endpoint) so the exhaustion
+                // aggregation can attribute a timed resume to this attempt.
+                let written_until =
+                    self.record_outcome(&endpoint, &candidate.router, false, Some(&err));
 
                 // Classify drives the in-flight fallover so the walk and the next-request
                 // lockout agree (design §3.1): a recoverable provider limit (429 / 403-quota)
@@ -372,6 +416,7 @@ impl super::Gateway {
                     error: Some(err.to_string()),
                     fallback_triggered: should_fallback,
                 });
+                contributions.push(super::exhaustion::contribution_for(&err, written_until));
 
                 if should_fallback {
                     StepOutcome::FallBack

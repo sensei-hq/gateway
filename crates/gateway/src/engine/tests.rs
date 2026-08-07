@@ -3362,3 +3362,414 @@ async fn refresh_router_keys_clears_terminal_lock_but_keeps_timed() {
         "a timed (rate/quota) lock is unrelated to the key and must survive"
     );
 }
+
+// --- Task 4: AllGated{resume_after} at execute exhaustion (design §3.3) ---
+//
+// AllGated fires iff EVERY candidate was gated (skipped by a health gate at
+// selection, or attempted-and-classified as a recoverable/terminal provider
+// limit) and NONE hard-failed. `resume_after` is the wall-clock min over the
+// TIMED gates only; all-terminal ⇒ `None` + a `human_action` remedy.
+
+/// Two-candidate TextChat chain `[a-model@A, b-model@B]` with the given
+/// fallback triggers. Endpoints resolve to `"A:a-model"` and `"B:b-model"`.
+fn ab_chain_config(triggers: Vec<FallbackTrigger>) -> GatewayConfig {
+    ab_chain_config_priced(triggers, None)
+}
+
+/// Like [`ab_chain_config`], but both models carry the given optional pricing
+/// (used by the all-over-budget case).
+fn ab_chain_config_priced(
+    triggers: Vec<FallbackTrigger>,
+    pricing: Option<ModelPricing>,
+) -> GatewayConfig {
+    let mut routers = HashMap::new();
+    for id in ["A", "B"] {
+        routers.insert(
+            id.to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+    }
+    let mut models = HashMap::new();
+    for (model, provider) in [("a-model", "A"), ("b-model", "B")] {
+        models.insert(
+            model.to_string(),
+            ModelConfig {
+                id: model.to_string(),
+                api_model_id: None,
+                provider: provider.to_string(),
+                family: None,
+                capabilities: vec![Capability::TextChat],
+                context_window: 4096,
+                max_output_tokens: 1024,
+                pricing: pricing.clone(),
+            },
+        );
+    }
+    let mut chains = HashMap::new();
+    chains.insert(
+        "chat_chain".to_string(),
+        FallbackChainConfig {
+            id: "chat_chain".to_string(),
+            capability: Capability::TextChat,
+            models: vec![
+                ChainEntry {
+                    model: "a-model".to_string(),
+                    router: Some("A".to_string()),
+                    api_model_id: None,
+                    priority: 1,
+                },
+                ChainEntry {
+                    model: "b-model".to_string(),
+                    router: Some("B".to_string()),
+                    api_model_id: None,
+                    priority: 2,
+                },
+            ],
+            fallback_triggers: triggers,
+        },
+    );
+    GatewayConfig {
+        routers,
+        models,
+        chains,
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
+}
+
+fn ab_gateway(config: GatewayConfig) -> Gateway {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    Gateway::new(config, AdapterRegistry::new(), cb)
+}
+
+/// A chat adapter with a caller-chosen `id` that always fails with a
+/// freshly-built error, so distinct routers can return distinct provider
+/// failures in one gateway.
+struct ChatErrAdapter {
+    id: String,
+    err: Arc<dyn Fn() -> GatewayError + Send + Sync>,
+}
+
+impl crate::adapters::capability::Model for ChatErrAdapter {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for ChatErrAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Err((self.err)())
+    }
+}
+
+async fn register_chat_err(
+    gw: &Gateway,
+    id: &str,
+    err: impl Fn() -> GatewayError + Send + Sync + 'static,
+) {
+    gw.adapters
+        .register_chat(Arc::new(ChatErrAdapter {
+            id: id.to_string(),
+            err: Arc::new(err),
+        }))
+        .await;
+}
+
+/// Assert a wall-clock `resume_after` is `Some` and within `±tol_secs` of
+/// `now + expected_secs`. A tolerance window (not an exact instant) keeps the
+/// assertion robust against wall-clock drift, yet tight enough to reject `None`
+/// and the wrong endpoint's expiry.
+fn assert_resume_near(
+    resume_after: Option<chrono::DateTime<chrono::Utc>>,
+    expected_secs: i64,
+    tol_secs: i64,
+) {
+    let now = chrono::Utc::now();
+    let t = resume_after.expect("resume_after should be Some");
+    let lo = now + chrono::Duration::seconds(expected_secs - tol_secs);
+    let hi = now + chrono::Duration::seconds(expected_secs + tol_secs);
+    assert!(
+        t > lo && t < hi,
+        "resume_after {t} not within ±{tol_secs}s of now+{expected_secs}s (lo={lo}, hi={hi})"
+    );
+}
+
+/// (1) Every candidate pre-locked (timed quota) at selection → `AllGated` whose
+/// `resume_after` is the MIN over the two expiries (the nearer, B at ~1800s),
+/// and no `human_action` (a timed retry exists).
+#[tokio::test]
+async fn all_gated_at_selection_returns_allgated_with_min_resume() {
+    use crate::gates::lockout::LockReason;
+
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    gw.apply_lockout(
+        "A:a-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    );
+    gw.apply_lockout(
+        "B:b-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(1800)),
+    );
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllGated {
+            resume_after,
+            human_action,
+            ..
+        } => {
+            assert_resume_near(resume_after, 1800, 150); // the nearer of 3600 / 1800
+            assert!(
+                human_action.is_none(),
+                "a timed retry means no human action is surfaced"
+            );
+        }
+        other => panic!("expected AllGated, got: {other}"),
+    }
+}
+
+/// (2) Every candidate terminally locked (auth + credits) → `resume_after: None`
+/// and a `human_action` remedy (never pause forever).
+#[tokio::test]
+async fn all_gated_all_terminal_returns_none_resume_with_human_action() {
+    use crate::gates::lockout::LockReason;
+
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    gw.apply_lockout("A:a-model", LockReason::Auth, None);
+    gw.apply_lockout("B:b-model", LockReason::CreditsExhausted, None);
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllGated {
+            resume_after,
+            human_action,
+            ..
+        } => {
+            assert!(resume_after.is_none(), "all-terminal ⇒ no resume time");
+            assert!(
+                human_action.is_some(),
+                "a terminal remedy (top-up / rotate) must be surfaced"
+            );
+        }
+        other => panic!("expected AllGated, got: {other}"),
+    }
+}
+
+/// (3) Mixed terminal (A, credits) + timed (B, quota) → `resume_after` is the
+/// min over the TIMED gates only (B ~1800s); the terminal A is excluded, and a
+/// timed retry wins over the human action.
+#[tokio::test]
+async fn all_gated_mixed_terminal_and_timed_uses_min_over_timed_only() {
+    use crate::gates::lockout::LockReason;
+
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    gw.apply_lockout("A:a-model", LockReason::CreditsExhausted, None); // terminal
+    gw.apply_lockout(
+        "B:b-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(1800)),
+    ); // timed
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllGated {
+            resume_after,
+            human_action,
+            ..
+        } => {
+            assert_resume_near(resume_after, 1800, 150); // terminal A excluded from the min
+            assert!(
+                human_action.is_none(),
+                "a timed retry wins over the terminal remedy"
+            );
+        }
+        other => panic!("expected AllGated, got: {other}"),
+    }
+}
+
+/// (4) Every candidate's breaker tripped Open at selection → `AllGated` whose
+/// `resume_after` comes from the breaker `next_retry` (~300s default timeout).
+#[tokio::test]
+async fn all_gated_all_breaker_open_resume_from_next_retry() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default()); // threshold 5, timeout 300s
+    for ep in ["A:a-model", "B:b-model"] {
+        cb.can_execute(ep); // initialize
+        for _ in 0..5 {
+            cb.record_failure(ep);
+        }
+        assert!(!cb.can_execute(ep), "breaker for {ep} should be open");
+    }
+    let gw = Gateway::new(ab_chain_config(vec![]), AdapterRegistry::new(), cb);
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllGated { resume_after, .. } => {
+            assert_resume_near(resume_after, 300, 120); // breaker default timeout
+        }
+        other => panic!("expected AllGated, got: {other}"),
+    }
+}
+
+/// (5) Both candidates attempted and each fails with a recoverable 429 (no
+/// configured trigger; §3.1 fallover) → each is locked in-flight, so the walk
+/// exhausts to `AllGated` on THIS request, `resume_after` ~ the 60s rate-limit
+/// base (the min over the just-written timed locks).
+#[tokio::test]
+async fn attempted_exhaustion_all_recoverable_returns_allgated() {
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    register_chat_err(&gw, "A", || GatewayError::RateLimit {
+        adapter: "A".into(),
+        retry_after_ms: None,
+    })
+    .await;
+    register_chat_err(&gw, "B", || GatewayError::RateLimit {
+        adapter: "B".into(),
+        retry_after_ms: None,
+    })
+    .await;
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllGated { resume_after, .. } => {
+            assert_resume_near(resume_after, 60, 40); // rate-limit base ~60s
+        }
+        other => panic!("expected AllGated, got: {other}"),
+    }
+}
+
+/// (6) A hard failure among the attempts keeps `AllAttemptsFailed`: A (429,
+/// recoverable → locked) falls over to B (500, unclassified → hard failure), so
+/// NOT every candidate was gated. Pins that AllGated does not over-fire.
+#[tokio::test]
+async fn attempted_exhaustion_with_hard_failure_keeps_all_attempts_failed() {
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    register_chat_err(&gw, "A", || GatewayError::RateLimit {
+        adapter: "A".into(),
+        retry_after_ms: None,
+    })
+    .await;
+    register_chat_err(&gw, "B", || GatewayError::ProviderError {
+        adapter: "B".into(),
+        message: "boom".into(),
+        status: Some(500),
+    })
+    .await;
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllAttemptsFailed { attempts, .. } => {
+            assert_eq!(
+                attempts, 2,
+                "both candidates were attempted; B hard-failed ⇒ not all-gated"
+            );
+        }
+        other => panic!("expected AllAttemptsFailed, got: {other}"),
+    }
+}
+
+/// (7) A chain whose entries all reference missing models → every skip is
+/// Structural, so `AllGated` never fires and `NoCandidates` is preserved.
+#[tokio::test]
+async fn all_structural_selection_stays_no_candidates() {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "A".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let models = HashMap::new(); // no models — every chain entry is ModelNotFound
+    let mut chains = HashMap::new();
+    chains.insert(
+        "chat_chain".to_string(),
+        FallbackChainConfig {
+            id: "chat_chain".to_string(),
+            capability: Capability::TextChat,
+            models: vec![
+                ChainEntry {
+                    model: "ghost-a".to_string(),
+                    router: Some("A".to_string()),
+                    api_model_id: None,
+                    priority: 1,
+                },
+                ChainEntry {
+                    model: "ghost-b".to_string(),
+                    router: Some("A".to_string()),
+                    api_model_id: None,
+                    priority: 2,
+                },
+            ],
+            fallback_triggers: vec![],
+        },
+    );
+    let config = GatewayConfig {
+        routers,
+        models,
+        chains,
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    };
+    let gw = ab_gateway(config);
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::NoCandidates { capability } => {
+            assert_eq!(capability, Capability::TextChat);
+        }
+        other => panic!("expected NoCandidates (all-structural), got: {other}"),
+    }
+}
+
+/// (8) Every candidate priced over a tiny budget → `AllGated` with
+/// `resume_after: None` + `human_action: RaiseBudget`. A DELIBERATE change from
+/// the pre-(e) `NoCandidates` for an all-over-budget selection (OverBudget is a
+/// `Terminal(RaiseBudget)` gate, per design §3.3).
+#[tokio::test]
+async fn all_over_budget_returns_allgated_raise_budget() {
+    use crate::types::error::HumanAction;
+
+    let config = ab_chain_config_priced(
+        vec![],
+        Some(ModelPricing {
+            input_per_1k: 0.0008,
+            output_per_1k: 0.004,
+            per_request: None,
+        }),
+    );
+    let gw = ab_gateway(config);
+
+    // Every candidate's estimate (output term ~0.004 alone) exceeds this budget.
+    let req = InferenceRequest {
+        budget: Some(0.0001),
+        ..chat_request()
+    };
+
+    match gw.execute(&req).await.unwrap_err() {
+        GatewayError::AllGated {
+            resume_after,
+            human_action,
+            ..
+        } => {
+            assert!(
+                resume_after.is_none(),
+                "over-budget is terminal ⇒ no resume"
+            );
+            assert_eq!(human_action, Some(HumanAction::RaiseBudget));
+        }
+        other => panic!("expected AllGated (raise budget), got: {other}"),
+    }
+}
