@@ -376,36 +376,37 @@ impl Gateway {
         }
     }
 
-    /// Dispatch one attempt's outcome to every registered recorder (reliable write-side).
+    /// Dispatch one attempt's outcome to every registered recorder (reliable
+    /// write-side) and return the earliest `Instant` any recorder just wrote as
+    /// this endpoint's unavailability deadline, or `None` if none did.
     pub(super) fn record_outcome(
         &self,
         endpoint: &str,
         router: &str,
         success: bool,
         error: Option<&GatewayError>,
-    ) {
-        dispatch_outcome(&self.recorders, endpoint, router, success, error);
+    ) -> Option<std::time::Instant> {
+        dispatch_outcome(&self.recorders, endpoint, router, success, error)
     }
 }
 
 /// Dispatch an attempt outcome to every recorder. Free fn so the `'static`
 /// stream closure can own a cloned recorder set (where `&self` is unavailable).
+/// Returns the earliest deadline any recorder just wrote (min-fanned), or `None`.
 pub(super) fn dispatch_outcome(
     recorders: &[std::sync::Arc<dyn crate::gates::HealthRecorder>],
     endpoint: &str,
     router: &str,
     success: bool,
     error: Option<&crate::types::error::GatewayError>,
-) {
+) -> Option<std::time::Instant> {
     let o = crate::gates::AttemptOutcome {
         endpoint,
         router,
         success,
         error,
     };
-    for r in recorders {
-        r.on_outcome(&o);
-    }
+    recorders.iter().filter_map(|r| r.on_outcome(&o)).min()
 }
 
 #[cfg(test)]

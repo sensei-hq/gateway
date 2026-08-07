@@ -69,7 +69,12 @@ pub struct AttemptOutcome<'a> {
 /// Reliable write-side reducer: updates authoritative health state from an attempt
 /// outcome. NOT best-effort — distinct from the future `SelectionObserver`.
 pub trait HealthRecorder: Send + Sync {
-    fn on_outcome(&self, outcome: &AttemptOutcome<'_>);
+    /// Update authoritative health state from an attempt outcome, and return the
+    /// `Instant` until which this recorder now considers the endpoint unavailable
+    /// **if this outcome just made it so** (breaker next_retry / cooldown until /
+    /// timed lock deadline); `None` otherwise. The engine mins these into
+    /// `AllGated.resume_after` (design C4). Reliable write-side — NOT best-effort.
+    fn on_outcome(&self, outcome: &AttemptOutcome<'_>) -> Option<std::time::Instant>;
 }
 
 #[cfg(test)]

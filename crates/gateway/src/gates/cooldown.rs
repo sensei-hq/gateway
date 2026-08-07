@@ -74,14 +74,18 @@ impl ConnectionCooldownSink {
 }
 
 impl HealthRecorder for ConnectionCooldownSink {
-    fn on_outcome(&self, o: &AttemptOutcome<'_>) {
+    fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<Instant> {
         // Transport-level fault → cool the whole router (Network = connection failure;
         // Timeout = endpoint unreachable/too slow). Other errors do NOT cool.
         if matches!(
             o.error,
             Some(GatewayError::Network(_)) | Some(GatewayError::Timeout { .. })
         ) {
-            self.store.start(o.router, Instant::now() + self.cooldown);
+            let until = Instant::now() + self.cooldown;
+            self.store.start(o.router, until);
+            Some(until)
+        } else {
+            None
         }
     }
 }
@@ -203,35 +207,39 @@ mod tests {
             model: "m".into(),
             duration_ms: 1,
         };
-        sink.on_outcome(&AttemptOutcome {
+        let returned = sink.on_outcome(&AttemptOutcome {
             endpoint: "A:m",
             router: "A",
             success: false,
             error: Some(&timeout_err),
         });
-        let until = store.cooling_until("A");
-        assert!(until.is_some());
-        assert!(until.unwrap() > now);
+        // The sink returns the `until` it just wrote — a future instant equal to
+        // what the store now reports.
+        assert!(returned.is_some());
+        assert!(returned.unwrap() > now);
+        assert_eq!(returned, store.cooling_until("A"));
 
         let provider_err = GatewayError::ProviderError {
             adapter: "a".into(),
             message: "x".into(),
             status: Some(500),
         };
-        sink.on_outcome(&AttemptOutcome {
+        let returned = sink.on_outcome(&AttemptOutcome {
             endpoint: "B:m",
             router: "B",
             success: false,
             error: Some(&provider_err),
         });
+        assert!(returned.is_none(), "non-transport error does not cool");
         assert!(store.cooling_until("B").is_none());
 
-        sink.on_outcome(&AttemptOutcome {
+        let returned = sink.on_outcome(&AttemptOutcome {
             endpoint: "C:m",
             router: "C",
             success: true,
             error: None,
         });
+        assert!(returned.is_none(), "success does not cool");
         assert!(store.cooling_until("C").is_none());
     }
 }
