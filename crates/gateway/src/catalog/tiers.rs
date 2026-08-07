@@ -68,12 +68,20 @@ pub struct TierConfig {
     pub derive: Option<TierPredicate>,
 }
 
-/// Errors from tier resolution / assembly. Extended in Task 5 (`assemble`).
+/// Errors from tier resolution / assembly. `assemble` (Task 5) collects these
+/// across every chain before returning, so one misconfigured catalog surfaces
+/// all of its problems at once rather than only the first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssembleError {
     /// A curated tier member references a model id absent from the catalog.
     UnknownModelInTier { tier: String, model: String },
-    // Task 5 adds: UnknownTierRef, UnknownModelRef, EmptyTierAfterResolution
+    /// A chain's `Tier(id)` ref names a tier absent from the catalog.
+    UnknownTierRef(String),
+    /// A chain's concrete `Model(entry)` ref names a model absent from the catalog.
+    UnknownModelRef(String),
+    /// A referenced tier resolved to zero members (empty curated list and no
+    /// derived matches) — a chain leg that would contribute nothing.
+    EmptyTierAfterResolution(String),
 }
 
 impl std::fmt::Display for AssembleError {
@@ -81,6 +89,15 @@ impl std::fmt::Display for AssembleError {
         match self {
             AssembleError::UnknownModelInTier { tier, model } => {
                 write!(f, "tier '{tier}' references unknown model '{model}'")
+            }
+            AssembleError::UnknownTierRef(tier) => {
+                write!(f, "chain references unknown tier '{tier}'")
+            }
+            AssembleError::UnknownModelRef(model) => {
+                write!(f, "chain references unknown model '{model}'")
+            }
+            AssembleError::EmptyTierAfterResolution(tier) => {
+                write!(f, "tier '{tier}' resolved to zero members")
             }
         }
     }
