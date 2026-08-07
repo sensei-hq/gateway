@@ -11,7 +11,7 @@ pub mod panel;
 pub mod pruning;
 pub mod purpose;
 pub mod selection;
-mod skip_reason;
+pub mod skip_reason;
 pub mod store;
 pub mod strategy;
 #[cfg(test)]
@@ -29,6 +29,7 @@ pub use facade::{Facade, FacadeBuilder};
 pub use panel::{PanelResponse, PanelSlotResult};
 pub use pruning::{Availability, ChainWarning, prune_unavailable};
 pub use purpose::{ModelHint, Purpose, PurposeBuilder, PurposeResult, StepBuilder, StepInput};
+pub use skip_reason::SkipReason;
 pub use types::capability::Capability;
 pub use types::config::{ConsensusConfig, DistinctBy, PanelConfig, PanelSlot, RoleSpec};
 pub use types::error::GatewayError;
