@@ -686,6 +686,35 @@ async fn execute_records_attempts() {
     assert_eq!(response.attempts[0].adapter, "noop");
 }
 
+/// A `HealthRecorder` that just counts how many outcomes it observed. Wired
+/// in via direct access to `Gateway::recorders` — this module is a
+/// descendant of `engine`, so the private field is visible here without
+/// adding any public injection API (that's plan (f)'s `with_recorder`).
+struct CountingRecorder(Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::gates::HealthRecorder for CountingRecorder {
+    fn on_outcome(&self, _outcome: &crate::gates::AttemptOutcome<'_>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn execute_fans_outcome_out_to_registered_recorders() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut gw = test_gateway();
+    register_noop(&gw).await;
+    let count = Arc::new(AtomicUsize::new(0));
+    gw.recorders.push(Arc::new(CountingRecorder(count.clone())));
+
+    let response = gw.execute(&chat_request()).await.unwrap();
+
+    assert_eq!(response.attempts.len(), 1);
+    // One successful attempt ⇒ every registered recorder sees exactly one
+    // outcome (the pre-existing breaker sink plus this counting recorder).
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn execute_update_config_takes_effect() {
     let gw = test_gateway();
