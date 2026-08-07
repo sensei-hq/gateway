@@ -100,7 +100,7 @@ impl super::Gateway {
             .map(|c| c.fallback_triggers.clone())
             .unwrap_or_default();
         let adapters = self.adapters.clone();
-        let circuit_breaker = self.circuit_breaker.clone();
+        let recorders = self.recorders.clone();
         let store = self.store.clone();
         let request = request.clone();
         let pinned_model = request.model.clone();
@@ -179,7 +179,7 @@ impl super::Gateway {
 
                 if let Some(mut inner) = got_stream {
                     // A candidate produced a stream: commit to it.
-                    circuit_breaker.record_success(&endpoint);
+                    super::dispatch_outcome(&recorders, &endpoint, true, None);
                     let stream_start = Instant::now();
                     tracing::debug!(adapter = %candidate.router, model = %candidate.model, "streaming candidate");
                     for ev in pending_switches.drain(..) {
@@ -261,7 +261,11 @@ impl super::Gateway {
 
                 // Setup failure for this candidate.
                 if fail_record_cb {
-                    circuit_breaker.record_failure(&endpoint);
+                    // The original `GatewayError` isn't retained past the match
+                    // arms above (only its string projections are); `None` is
+                    // behavior-identical here since the breaker sink only reads
+                    // `success`, never `error`.
+                    super::dispatch_outcome(&recorders, &endpoint, false, None);
                 }
                 tracing::warn!(
                     adapter = %candidate.router,
