@@ -63,6 +63,13 @@ mod tests {
         }
     }
 
+    struct NeverLocked;
+    impl crate::gates::lockout::ModelLockoutRead for NeverLocked {
+        fn locked(&self, _endpoint: &str) -> Option<crate::gates::lockout::LockView> {
+            None
+        }
+    }
+
     fn priced_model_config() -> ModelConfig {
         ModelConfig {
             id: "claude-haiku".to_string(),
@@ -118,6 +125,7 @@ mod tests {
             now: Instant::now(),
             config: gateway_config,
             router_health: &NeverCooling,
+            model_lockout: &NeverLocked,
         }
     }
 

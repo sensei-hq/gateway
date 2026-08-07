@@ -40,6 +40,7 @@ pub struct SelectionCtx<'a> {
     pub now: Instant,
     pub config: &'a GatewayConfig,
     pub router_health: &'a dyn RouterHealthRead,
+    pub model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
 }
 
 pub enum GateVerdict {

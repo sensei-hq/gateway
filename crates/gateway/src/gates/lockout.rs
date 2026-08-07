@@ -141,10 +141,45 @@ impl ModelLockoutRead for ModelLockoutStore {
     }
 }
 
+use super::{AdmissionGate, CandidateView, GateVerdict, SelectionCtx};
+use crate::skip_reason::SkipReason;
+
+/// Gate: the candidate's `router:model` must not be under an active lockout —
+/// terminal (`until = None`) or timed (`until > now`). An expired timed lock
+/// admits (the entry lingers only for the sink's escalation memory, later task).
+pub struct ModelLockoutGate;
+
+impl AdmissionGate for ModelLockoutGate {
+    fn name(&self) -> &'static str {
+        "model_lockout"
+    }
+    fn evaluate(&self, c: &CandidateView<'_>, x: &SelectionCtx<'_>) -> GateVerdict {
+        match x.model_lockout.locked(&c.endpoint) {
+            Some(v) => match v.until {
+                None => GateVerdict::Skip(SkipReason::LockedOut {
+                    reason: v.reason,
+                    until: None,
+                }),
+                Some(until) if until > x.now => GateVerdict::Skip(SkipReason::LockedOut {
+                    reason: v.reason,
+                    until: Some(until),
+                }),
+                _ => GateVerdict::Admit, // expired timed lock
+            },
+            None => GateVerdict::Admit,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gates::EndpointHealthRead;
+    use crate::gates::cooldown::ConnectionCooldownStore;
+    use crate::types::capability::Capability;
+    use crate::types::config::{GatewayConfig, ModelConfig, RouterConfig};
     use crate::types::error::GatewayError;
+    use std::time::Duration;
 
     fn provider(status: u16, msg: &str) -> GatewayError {
         GatewayError::ProviderError {
@@ -225,5 +260,107 @@ mod tests {
         // clear removes it
         s.clear("r:m");
         assert!(s.locked("r:m").is_none());
+    }
+
+    /// Fake endpoint health port returning None regardless of endpoint (not
+    /// under test here; the ctx needs one to construct).
+    struct FakeEndpointHealth;
+    impl EndpointHealthRead for FakeEndpointHealth {
+        fn open_until(&self, _endpoint: &str) -> Option<Instant> {
+            None
+        }
+    }
+
+    fn test_model_config() -> ModelConfig {
+        ModelConfig {
+            id: "m".to_string(),
+            api_model_id: None,
+            provider: "r".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 128000,
+            max_output_tokens: 8192,
+            pricing: None,
+        }
+    }
+
+    fn test_router_config() -> RouterConfig {
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    /// Unknown endpoint → `Admit`; terminal lock (`until = None`) →
+    /// `Skip(LockedOut { until: None })`; timed lock in the future →
+    /// `Skip(LockedOut { until: Some(_) })`; expired timed lock → `Admit`.
+    /// One store + one ctx reused across scenarios (the store's interior
+    /// mutability lets `set` change state between `evaluate` calls).
+    #[test]
+    fn gate_reads_lockout_store() {
+        let store = ModelLockoutStore::new();
+        let now = Instant::now();
+
+        let model_config = test_model_config();
+        let router_config = test_router_config();
+        let cand = CandidateView {
+            model: "m",
+            router: "r",
+            endpoint: "r:m".to_string(),
+            model_config: &model_config,
+            router_config: &router_config,
+        };
+        let gateway_config = GatewayConfig::default();
+        let endpoint_health = FakeEndpointHealth;
+        let router_health = ConnectionCooldownStore::new();
+        let ctx = SelectionCtx {
+            capability: Capability::TextChat,
+            budget: None,
+            input_tokens: None,
+            health: &endpoint_health,
+            now,
+            config: &gateway_config,
+            router_health: &router_health,
+            model_lockout: &store,
+        };
+
+        // Unknown endpoint → Admit.
+        assert!(matches!(
+            ModelLockoutGate.evaluate(&cand, &ctx),
+            GateVerdict::Admit
+        ));
+
+        // Terminal lock (until = None) → Skip(LockedOut { until: None }).
+        store.set("r:m", LockReason::Auth, None);
+        assert!(matches!(
+            ModelLockoutGate.evaluate(&cand, &ctx),
+            GateVerdict::Skip(SkipReason::LockedOut { until: None, .. })
+        ));
+
+        // Timed lock in the future → Skip(LockedOut { until: Some(_) }).
+        store.set(
+            "r:m",
+            LockReason::RateLimit,
+            Some(now + Duration::from_secs(60)),
+        );
+        assert!(matches!(
+            ModelLockoutGate.evaluate(&cand, &ctx),
+            GateVerdict::Skip(SkipReason::LockedOut { until: Some(_), .. })
+        ));
+
+        // Expired timed lock (until before now) → Admit.
+        store.set(
+            "r:m",
+            LockReason::RateLimit,
+            Some(now - Duration::from_secs(1)),
+        );
+        assert!(matches!(
+            ModelLockoutGate.evaluate(&cand, &ctx),
+            GateVerdict::Admit
+        ));
     }
 }

@@ -103,6 +103,7 @@ mod tests {
         };
         let gateway_config = GatewayConfig::default();
         let health = FakeHealth(Some(Instant::now()));
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
         let ctx = SelectionCtx {
             capability: Capability::TextChat,
             budget: None,
@@ -111,6 +112,7 @@ mod tests {
             now: Instant::now(),
             config: &gateway_config,
             router_health: &NeverCooling,
+            model_lockout: &lockout,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);
@@ -133,6 +135,7 @@ mod tests {
         };
         let gateway_config = GatewayConfig::default();
         let health = FakeHealth(None);
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
         let ctx = SelectionCtx {
             capability: Capability::TextChat,
             budget: None,
@@ -141,6 +144,7 @@ mod tests {
             now: Instant::now(),
             config: &gateway_config,
             router_health: &NeverCooling,
+            model_lockout: &lockout,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);
