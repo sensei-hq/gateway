@@ -1,4 +1,7 @@
-use super::{AdmissionGate, CandidateView, GateVerdict, SelectionCtx};
+use super::{
+    AdmissionGate, AttemptOutcome, CandidateView, GateVerdict, HealthRecorder, SelectionCtx,
+};
+use crate::circuit_breaker::CircuitBreakerManager;
 use crate::skip_reason::SkipReason;
 
 /// Gate: the candidate's endpoint must not be circuit-broken open.
@@ -13,6 +16,27 @@ impl AdmissionGate for CircuitBreakerGate {
         match x.health.open_until(&c.endpoint) {
             Some(until) => GateVerdict::Skip(SkipReason::CircuitOpen { until }),
             None => GateVerdict::Admit,
+        }
+    }
+}
+
+/// Behavior-preserving breaker write-side: success→record_success, failure→record_failure.
+pub struct CircuitBreakerSink {
+    breaker: CircuitBreakerManager,
+}
+
+impl CircuitBreakerSink {
+    pub fn new(breaker: CircuitBreakerManager) -> Self {
+        Self { breaker }
+    }
+}
+
+impl HealthRecorder for CircuitBreakerSink {
+    fn on_outcome(&self, o: &AttemptOutcome<'_>) {
+        if o.success {
+            self.breaker.record_success(o.endpoint);
+        } else {
+            self.breaker.record_failure(o.endpoint);
         }
     }
 }
@@ -111,5 +135,29 @@ mod tests {
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);
         assert!(matches!(verdict, GateVerdict::Admit));
+    }
+
+    #[test]
+    fn circuit_breaker_sink_records_success_and_failure() {
+        use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+            threshold: 1,
+            ..Default::default()
+        });
+        cb.can_execute("r:m"); // init
+        let sink = CircuitBreakerSink::new(cb.clone());
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "r:m",
+            success: false,
+            error: None,
+        });
+        assert_eq!(cb.get_state("r:m").name(), "open"); // threshold 1 → opens on one failure
+        cb.can_execute("r:n");
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "r:n",
+            success: true,
+            error: None,
+        });
+        assert_eq!(cb.get_state("r:n").name(), "closed");
     }
 }
