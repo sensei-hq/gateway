@@ -50,6 +50,9 @@ pub struct Gateway {
     /// to [`GatewayError::ModelNotReady`]. `None` ⇒ behaviour is byte-identical
     /// to before this seam.
     probe: Option<Arc<dyn kernel::ReadinessProbe>>,
+    /// Write-side health recorders fanned out on every attempt outcome
+    /// (currently just the circuit breaker sink; more land in later plans).
+    recorders: Vec<Arc<dyn crate::gates::HealthRecorder>>,
 }
 
 impl Gateway {
@@ -58,12 +61,16 @@ impl Gateway {
         adapters: AdapterRegistry,
         circuit_breaker: CircuitBreakerManager,
     ) -> Self {
+        let recorders: Vec<Arc<dyn crate::gates::HealthRecorder>> = vec![Arc::new(
+            crate::gates::circuit_breaker_gate::CircuitBreakerSink::new(circuit_breaker.clone()),
+        )];
         Self {
             config: Arc::new(RwLock::new(config)),
             adapters,
             circuit_breaker,
             store: None,
             probe: None,
+            recorders,
         }
     }
 
@@ -286,6 +293,23 @@ impl Gateway {
         let mut config = self.config.write().await;
         for (id, router) in config.routers.iter_mut() {
             router.api_key = resolver(id);
+        }
+    }
+
+    /// Dispatch one attempt's outcome to every registered recorder (reliable write-side).
+    pub(super) fn record_outcome(
+        &self,
+        endpoint: &str,
+        success: bool,
+        error: Option<&GatewayError>,
+    ) {
+        let o = crate::gates::AttemptOutcome {
+            endpoint,
+            success,
+            error,
+        };
+        for r in &self.recorders {
+            r.on_outcome(&o);
         }
     }
 }
