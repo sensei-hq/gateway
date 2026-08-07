@@ -1,5 +1,10 @@
-use crate::circuit_breaker::{BreakerState, CircuitBreakerManager};
+use crate::circuit_breaker::CircuitBreakerManager;
+use crate::gates::budget::BudgetGate;
+use crate::gates::capability::CapabilityGate;
+use crate::gates::circuit_breaker_gate::CircuitBreakerGate;
+use crate::gates::{AdmissionGate, CandidateView, EndpointHealthRead, GateVerdict, SelectionCtx};
 use crate::skip_reason::SkipReason;
+use crate::strategy::{PriorityStrategy, RoutingStrategy};
 use crate::types::capability::Capability;
 use crate::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
@@ -48,17 +53,31 @@ pub struct SelectionResult {
 }
 
 /// Resolves which model(s) to use for a given request via 3-tier resolution
-/// (direct, named chain, capability) with a validation pipeline per candidate.
+/// (direct, named chain, capability). Structural resolution (router/model
+/// lookup) happens per path; the shared admission pipeline then runs the
+/// ordered [`AdmissionGate`]s (capability, circuit breaker, budget) and the
+/// [`RoutingStrategy`] orders the admitted candidates.
 pub struct ModelSelectionService<'a> {
     config: &'a GatewayConfig,
-    circuit_breaker: &'a CircuitBreakerManager,
+    /// Ordered admission gates: capability, circuit breaker, budget.
+    gates: Vec<Box<dyn AdmissionGate>>,
+    /// Endpoint health read port (the circuit breaker implements it).
+    health: &'a dyn EndpointHealthRead,
+    /// Orders admitted candidates (SP-0: priority ascending, stable).
+    strategy: Box<dyn RoutingStrategy>,
 }
 
 impl<'a> ModelSelectionService<'a> {
     pub fn new(config: &'a GatewayConfig, circuit_breaker: &'a CircuitBreakerManager) -> Self {
         Self {
             config,
-            circuit_breaker,
+            gates: vec![
+                Box::new(CapabilityGate),
+                Box::new(CircuitBreakerGate),
+                Box::new(BudgetGate),
+            ],
+            health: circuit_breaker,
+            strategy: Box::new(PriorityStrategy),
         }
     }
 
@@ -99,14 +118,41 @@ impl<'a> ModelSelectionService<'a> {
         })
     }
 
-    /// The instant the circuit breaker for `endpoint` will next allow a
-    /// retry. Falls back to now if the breaker isn't actually open (should
-    /// not happen given the caller only asks after `can_execute` fails).
-    fn circuit_open_until(&self, endpoint: &str) -> Instant {
-        match self.circuit_breaker.get_state(endpoint) {
-            BreakerState::Open { next_retry } => next_retry,
-            _ => Instant::now(),
+    /// Shared admission path: run each gate in order over a structurally
+    /// resolved candidate. On the first `Skip(reason)` return the reason; on
+    /// all-Admit build the `SelectedModel`, attaching the full `CostEstimate`
+    /// (the `BudgetGate` independently computes an f64 from the same formula).
+    fn admit(
+        &self,
+        cand: CandidateView<'_>,
+        api_model_id: String,
+        priority: u8,
+        criteria: &SelectionCriteria,
+    ) -> Result<SelectedModel, SkipReason> {
+        let ctx = SelectionCtx {
+            capability: criteria.capability.clone(),
+            budget: criteria.budget,
+            input_tokens: criteria.input_tokens,
+            health: self.health,
+            now: Instant::now(),
+            config: self.config,
+        };
+        for gate in &self.gates {
+            if let GateVerdict::Skip(reason) = gate.evaluate(&cand, &ctx) {
+                return Err(reason);
+            }
         }
+
+        let cost_estimate = self.estimate_cost(cand.model_config, criteria);
+        Ok(SelectedModel {
+            model: cand.model.to_string(),
+            router: cand.router.to_string(),
+            router_config: cand.router_config.clone(),
+            model_config: cand.model_config.clone(),
+            api_model_id,
+            priority,
+            cost_estimate,
+        })
     }
 
     /// Core resolution: determine candidates based on the 3-tier strategy,
@@ -159,17 +205,19 @@ impl<'a> ModelSelectionService<'a> {
         }
     }
 
-    /// Validate a caller-pinned router+model pair for tier 1, mirroring
-    /// [`Self::validate_chain_entry`]'s pipeline (router exists+enabled,
-    /// model exists+supports capability, circuit breaker, budget) without the
-    /// entry-level router/api_model_id resolution that tier 2/3 needs.
+    /// Structural resolution for tier 1: router-first. Look up the router
+    /// BEFORE the model (empty/missing → `RouterNotFound`, disabled →
+    /// `RouterDisabled`), then the model (missing → `ModelNotFound`). No
+    /// provider fallback. `priority = 1`; `api_model_id` is 2-level
+    /// (model_config override else model id). The shared gate pipeline
+    /// (capability, circuit breaker, budget) runs in [`Self::admit`].
     fn validate_direct(
         &self,
         router_name: &str,
         model_name: &str,
         criteria: &SelectionCriteria,
     ) -> Result<SelectedModel, SkipReason> {
-        // Validate router exists and is enabled
+        // Validate router exists and is enabled (router-first).
         let router_config = self
             .config
             .routers
@@ -179,54 +227,32 @@ impl<'a> ModelSelectionService<'a> {
             return Err(SkipReason::RouterDisabled);
         }
 
-        // Validate model exists and supports capability
+        // Validate model exists.
         let model_config = self
             .config
             .models
             .get(model_name)
             .ok_or(SkipReason::ModelNotFound)?;
-        if !model_config.capabilities.contains(&criteria.capability) {
-            return Err(SkipReason::UnsupportedCapability(
-                criteria.capability.clone(),
-            ));
-        }
-
-        // Circuit breaker check
-        let endpoint = format!("{}:{}", router_name, model_name);
-        if !self.circuit_breaker.can_execute(&endpoint) {
-            return Err(SkipReason::CircuitOpen {
-                until: self.circuit_open_until(&endpoint),
-            });
-        }
-
-        // Cost estimation and budget check
-        let cost_estimate = self.estimate_cost(model_config, criteria);
-        if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
-            && est.estimated > budget
-        {
-            return Err(SkipReason::OverBudget {
-                estimated: est.estimated,
-                budget,
-            });
-        }
 
         let api_model_id = model_config
             .api_model_id
             .clone()
             .unwrap_or_else(|| model_name.to_string());
 
-        Ok(SelectedModel {
-            model: model_name.to_string(),
-            router: router_name.to_string(),
-            router_config: router_config.clone(),
-            model_config: model_config.clone(),
-            api_model_id,
-            priority: 1,
-            cost_estimate,
-        })
+        let cand = CandidateView {
+            model: model_name,
+            router: router_name,
+            endpoint: format!("{router_name}:{model_name}"),
+            model_config,
+            router_config,
+        };
+        self.admit(cand, api_model_id, 1, criteria)
     }
 
-    /// Tier 2/3: Walk chain entries sorted by priority, validating each.
+    /// Tier 2/3: Walk chain entries, structurally resolving + gating each, then
+    /// order the admitted candidates via the strategy (SP-0: priority
+    /// ascending, stable — identical to the previous hardcoded entry sort,
+    /// since a stable sort of the admitted subset preserves the same order).
     fn resolve_chain(
         &self,
         chain: &FallbackChainConfig,
@@ -235,16 +261,14 @@ impl<'a> ModelSelectionService<'a> {
         let mut all_candidates = Vec::new();
         let mut skipped = Vec::new();
 
-        // Sort entries by priority
-        let mut entries = chain.models.clone();
-        entries.sort_by_key(|e| e.priority);
-
-        for entry in &entries {
+        for entry in &chain.models {
             match self.validate_chain_entry(entry, criteria) {
                 Ok(candidate) => all_candidates.push(candidate),
                 Err(candidate) => skipped.push(candidate),
             }
         }
+
+        self.strategy.order(&mut all_candidates);
 
         SelectionResult {
             selected: None, // filled by caller
@@ -254,10 +278,13 @@ impl<'a> ModelSelectionService<'a> {
         }
     }
 
-    /// Validate a single chain entry against `criteria`, mirroring
-    /// [`Self::resolve_direct`]'s pipeline but resolving the router from the
-    /// entry (falling back to the model's provider) and layering the entry's
-    /// own `api_model_id` override on top of the model's.
+    /// Structural resolution for a single chain entry: model-first. Look up the
+    /// model (missing → `ModelNotFound`), resolve the router from the entry
+    /// (falling back to the model's provider), then validate it (missing →
+    /// `RouterNotFound`, disabled → `RouterDisabled`). `priority = entry.priority`;
+    /// `api_model_id` is 3-level (entry override → model_config → model id). The
+    /// shared gate pipeline (capability, circuit breaker, budget) runs in
+    /// [`Self::admit`].
     fn validate_chain_entry(
         &self,
         entry: &ChainEntry,
@@ -265,7 +292,7 @@ impl<'a> ModelSelectionService<'a> {
     ) -> Result<SelectedModel, SkippedCandidate> {
         let model_name = &entry.model;
 
-        // Look up the model config
+        // Look up the model config (model-first).
         let model_config = self.config.models.get(model_name).ok_or_else(|| {
             let router_name = entry
                 .router
@@ -278,13 +305,13 @@ impl<'a> ModelSelectionService<'a> {
             }
         })?;
 
-        // Resolve router: chain entry router, else model's provider
+        // Resolve router: chain entry router, else model's provider.
         let router_name = entry
             .router
             .clone()
             .unwrap_or_else(|| model_config.provider.clone());
 
-        // Validate router exists and is enabled
+        // Validate router exists and is enabled.
         let router_config =
             self.config
                 .routers
@@ -303,58 +330,26 @@ impl<'a> ModelSelectionService<'a> {
             });
         }
 
-        // Validate capability
-        if !model_config.capabilities.contains(&criteria.capability) {
-            return Err(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name,
-                reason: SkipReason::UnsupportedCapability(criteria.capability.clone()),
-            });
-        }
-
-        // Circuit breaker check
-        let endpoint = format!("{}:{}", router_name, model_name);
-        if !self.circuit_breaker.can_execute(&endpoint) {
-            return Err(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name,
-                reason: SkipReason::CircuitOpen {
-                    until: self.circuit_open_until(&endpoint),
-                },
-            });
-        }
-
-        // Cost estimation and budget check
-        let cost_estimate = self.estimate_cost(model_config, criteria);
-        if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
-            && est.estimated > budget
-        {
-            return Err(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name,
-                reason: SkipReason::OverBudget {
-                    estimated: est.estimated,
-                    budget,
-                },
-            });
-        }
-
-        // Resolve API model ID: chain entry override, else model config, else model id
+        // Resolve API model ID: chain entry override, else model config, else model id.
         let api_model_id = entry
             .api_model_id
             .clone()
             .or_else(|| model_config.api_model_id.clone())
             .unwrap_or_else(|| model_name.clone());
 
-        Ok(SelectedModel {
-            model: model_name.clone(),
-            router: router_name,
-            router_config: router_config.clone(),
-            model_config: model_config.clone(),
-            api_model_id,
-            priority: entry.priority,
-            cost_estimate,
-        })
+        let cand = CandidateView {
+            model: model_name,
+            router: &router_name,
+            endpoint: format!("{router_name}:{model_name}"),
+            model_config,
+            router_config,
+        };
+        self.admit(cand, api_model_id, entry.priority, criteria)
+            .map_err(|reason| SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name.clone(),
+                reason,
+            })
     }
 
     /// Tier 3: resolve by capability when the caller pinned neither a model
