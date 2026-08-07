@@ -30,6 +30,10 @@ pub(super) fn contribution_for(
     match classify(err) {
         Some(r) if r.is_recoverable() => match written_until {
             Some(u) => GateContribution::Timed(u),
+            // Defensive fallback, not a live path: a recoverable classification
+            // always drives `ModelLockoutSink` to write a timed deadline (`Some`),
+            // so `written_until == None` here shouldn't occur — treat it as a hard
+            // failure (the safe default) rather than a timed lock with no deadline.
             None => GateContribution::HardFailure,
         },
         Some(LockReason::CreditsExhausted) => GateContribution::Terminal(HumanAction::TopUpCredits),

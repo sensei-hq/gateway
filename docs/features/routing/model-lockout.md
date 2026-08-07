@@ -10,15 +10,19 @@ source: crates/gateway/src/selection.rs, crates/gateway/src/circuit_breaker.rs
 
 # Model Lockout
 
-> **Status: Implemented (Phase 1 · SP-0 (d)).** The lockout mechanism (keyed
+> **Status: Implemented (Phase 1 · SP-0 — complete).** The lockout mechanism (keyed
 > `router:model` skip gate), limit-signal classification (429 →
 > `rate_limit`, 403/quota → `quota_exhausted`, credits → terminal, auth →
 > terminal), escalating backoff, the `on_lockout` callback, and
 > `apply_lockout` / `clear_lockout` re-seed are live; the terminal
 > `AllGated { resume_after }` it feeds landed in **(e)** (see
-> [quota demote-to-tier](quota-demote-to-tier.md)). Deferred to **(f)**: the
-> calendar-clock exact reset boundary, seedable jitter, and the bounded-LRU
-> eviction cap on the lockout map. Design in [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §12/§12.1. Reference implementation: OmniRoute `accountFallback`.
+> [quota demote-to-tier](quota-demote-to-tier.md)). **(f)** landed the
+> operator-tunable `ResilienceConfig` (`Gateway::with_resilience`), a bounded
+> eviction cap on the lockout map, and deterministic per-endpoint jitter —
+> completing SP-0 (health gates). Still deferred (post-SP-0 / SP-DATA): the
+> calendar-clock exact reset boundary (the fixed ~1h quota default is a
+> self-correcting approximation) and an opaque `EndpointKey` (the `router:model`
+> string key is used throughout). Design in [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §12/§12.1. Reference implementation: OmniRoute `accountFallback`.
 
 A selection gate that temporarily removes a **single model** from a chain after a
 limit signal, so the candidate walk falls over to the next entry instead of
@@ -32,12 +36,12 @@ retrying a model that cannot currently succeed. Sits alongside the existing
 - **Keyed** per `router:model` — a `ModelLockoutEntry { reason, failure_count, last_cooldown_ms, locked_until, escalation_count }`. The gateway is **tenant-agnostic** (no tenant/credential dimension); per-tenant isolation = one gateway entity per tenant (see the SP-0 design §5c). Durability is the caller's: the gateway fires an `on_lockout` callback and the caller persists it.
 - **Cooldown by reason**, not one fixed value:
   - `rate_limit` (429) → short (~60s); recovers fast.
-  - `quota_exhausted` (403 / quota body) → until the next reset boundary (tomorrow 00:00 / monthly reset), else ~1h.
+  - `quota_exhausted` (403 / quota body) → a longer window. _Target:_ the next reset boundary (tomorrow 00:00 / monthly reset). _Implemented:_ a fixed `quota_default` (~1h) — the exact calendar reset boundary is deferred to SP-0 (f)+/SP-DATA. The fixed default is self-correcting: a consumer that retries while still quota'd simply re-locks for another `quota_default` and never over-serves.
   - `credits_exhausted` → terminal until a human tops up (surface as a human-action hint, do not auto-retry).
   - `auth` / `expired` → locked until the credential changes.
 - **Escalating backoff** whose window outlives the cooldown: a model that fails again right after its lockout expires keeps escalating instead of resetting to base. Clamp to an operator `max_cooldown_ms` — **except** honor a real upstream reset hint exactly (never clamp a genuine "Resets in 92h" down to the cap).
 - **Classification** of limit signals: 429→`rate_limit`, 403/quota-body→`quota_exhausted`, credits→terminal; includes text-pattern detection for providers that throttle via non-standard 400/403 bodies.
-- **Bounded** map with an eviction cap so lockout state cannot leak. _(Planned — deferred to SP-0 (f); the map is currently unbounded.)_
+- **Bounded** map with an eviction cap (`eviction_cap`, default 4096) so lockout state cannot leak: over the cap, expired timed entries are evicted on write, while active and terminal locks are never dropped. _(Implemented in SP-0 (f).)_
 
 ## Interaction with the chain
 
@@ -63,6 +67,9 @@ Feature: Model lockout
     And the request is served by modelB
     And modelA's lockout expires after the rate_limit cooldown (~60s)
 
+  # Target behavior. The implementation locks for a fixed quota_default (~1h),
+  # NOT a calendar-precise reset boundary (deferred to SP-0 (f)+/SP-DATA); the
+  # fixed default is self-correcting — a still-quota'd retry simply re-locks.
   Scenario: Quota-exhausted model is locked until its reset window
     Given modelA returns HTTP 403 with a quota-exhausted body
     When the request is routed
