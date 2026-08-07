@@ -1064,4 +1064,45 @@ mod tests {
         assert_eq!(result.all_candidates.len(), 1);
         assert_eq!(result.all_candidates[0].model, "claude-haiku");
     }
+
+    #[test]
+    fn direct_both_router_and_model_unknown_reports_router_first() {
+        let config = test_config();
+        let cb = test_cb();
+        let svc = ModelSelectionService::new(&config, &cb);
+        let result = svc.select(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: Some("ghost".into()),
+            router: Some("nope".into()),
+            chain: None,
+            budget: None,
+            input_tokens: None,
+        });
+        // Current behavior: direct validates the router first.
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterNotFound
+        ));
+    }
+
+    #[test]
+    fn direct_model_only_no_router_is_router_not_found_today() {
+        let config = test_config();
+        let cb = test_cb();
+        let svc = ModelSelectionService::new(&config, &cb);
+        let result = svc.select(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: Some("gemma3:27b".into()),
+            router: None,
+            chain: None,
+            budget: None,
+            input_tokens: None,
+        });
+        // Direct does NOT provider-fallback today → empty router → "router not found".
+        assert!(result.selected.is_none());
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterNotFound
+        ));
+    }
 }
