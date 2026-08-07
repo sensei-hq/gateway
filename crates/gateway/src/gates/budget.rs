@@ -55,6 +55,14 @@ mod tests {
         }
     }
 
+    /// Router health port stub for tests that don't exercise cooldown.
+    struct NeverCooling;
+    impl crate::gates::RouterHealthRead for NeverCooling {
+        fn cooling_until(&self, _router: &str) -> Option<Instant> {
+            None
+        }
+    }
+
     fn priced_model_config() -> ModelConfig {
         ModelConfig {
             id: "claude-haiku".to_string(),
@@ -109,6 +117,7 @@ mod tests {
             health,
             now: Instant::now(),
             config: gateway_config,
+            router_health: &NeverCooling,
         }
     }
 

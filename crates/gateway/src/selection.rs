@@ -2,7 +2,10 @@ use crate::circuit_breaker::CircuitBreakerManager;
 use crate::gates::budget::BudgetGate;
 use crate::gates::capability::CapabilityGate;
 use crate::gates::circuit_breaker_gate::CircuitBreakerGate;
-use crate::gates::{AdmissionGate, CandidateView, EndpointHealthRead, GateVerdict, SelectionCtx};
+use crate::gates::cooldown::ConnectionCooldownGate;
+use crate::gates::{
+    AdmissionGate, CandidateView, EndpointHealthRead, GateVerdict, RouterHealthRead, SelectionCtx,
+};
 use crate::skip_reason::SkipReason;
 use crate::strategy::{PriorityStrategy, RoutingStrategy};
 use crate::types::capability::Capability;
@@ -55,28 +58,36 @@ pub struct SelectionResult {
 /// Resolves which model(s) to use for a given request via 3-tier resolution
 /// (direct, named chain, capability). Structural resolution (router/model
 /// lookup) happens per path; the shared admission pipeline then runs the
-/// ordered [`AdmissionGate`]s (capability, circuit breaker, budget) and the
+/// ordered [`AdmissionGate`]s (capability, connection cooldown, circuit breaker, budget) and the
 /// [`RoutingStrategy`] orders the admitted candidates.
 pub struct ModelSelectionService<'a> {
     config: &'a GatewayConfig,
-    /// Ordered admission gates: capability, circuit breaker, budget.
+    /// Ordered admission gates: capability, connection cooldown, circuit breaker, budget.
     gates: Vec<Box<dyn AdmissionGate>>,
     /// Endpoint health read port (the circuit breaker implements it).
     health: &'a dyn EndpointHealthRead,
+    /// Router health read port (the connection cooldown store implements it).
+    router_health: &'a dyn RouterHealthRead,
     /// Orders admitted candidates (SP-0: priority ascending, stable).
     strategy: Box<dyn RoutingStrategy>,
 }
 
 impl<'a> ModelSelectionService<'a> {
-    pub fn new(config: &'a GatewayConfig, circuit_breaker: &'a CircuitBreakerManager) -> Self {
+    pub fn new(
+        config: &'a GatewayConfig,
+        circuit_breaker: &'a CircuitBreakerManager,
+        router_health: &'a dyn RouterHealthRead,
+    ) -> Self {
         Self {
             config,
             gates: vec![
                 Box::new(CapabilityGate),
+                Box::new(ConnectionCooldownGate),
                 Box::new(CircuitBreakerGate),
                 Box::new(BudgetGate),
             ],
             health: circuit_breaker,
+            router_health,
             strategy: Box::new(PriorityStrategy),
         }
     }
@@ -136,6 +147,7 @@ impl<'a> ModelSelectionService<'a> {
             health: self.health,
             now: Instant::now(),
             config: self.config,
+            router_health: self.router_health,
         };
         for gate in &self.gates {
             if let GateVerdict::Skip(reason) = gate.evaluate(&cand, &ctx) {
@@ -210,7 +222,7 @@ impl<'a> ModelSelectionService<'a> {
     /// `RouterDisabled`), then the model (missing → `ModelNotFound`). No
     /// provider fallback. `priority = 1`; `api_model_id` is 2-level
     /// (model_config override else model id). The shared gate pipeline
-    /// (capability, circuit breaker, budget) runs in [`Self::admit`].
+    /// (capability, connection cooldown, circuit breaker, budget) runs in [`Self::admit`].
     fn validate_direct(
         &self,
         router_name: &str,
@@ -283,7 +295,7 @@ impl<'a> ModelSelectionService<'a> {
     /// (falling back to the model's provider), then validate it (missing →
     /// `RouterNotFound`, disabled → `RouterDisabled`). `priority = entry.priority`;
     /// `api_model_id` is 3-level (entry override → model_config → model id). The
-    /// shared gate pipeline (capability, circuit breaker, budget) runs in
+    /// shared gate pipeline (capability, connection cooldown, circuit breaker, budget) runs in
     /// [`Self::admit`].
     fn validate_chain_entry(
         &self,
@@ -520,7 +532,8 @@ mod tests {
     fn tier1_direct_selection() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -541,7 +554,8 @@ mod tests {
     fn tier1_direct_unknown_router() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -564,7 +578,8 @@ mod tests {
     fn tier2_chain_selection() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -587,7 +602,8 @@ mod tests {
     fn tier3_capability_selection() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextEmbed,
@@ -624,7 +640,8 @@ mod tests {
             },
         );
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
         // Run several times: a HashMap-order bug would flake; min_by is stable.
         for _ in 0..10 {
             let result = svc.select(&SelectionCriteria {
@@ -644,7 +661,8 @@ mod tests {
         let mut config = test_config();
         config.routers.get_mut("ollama").unwrap().enabled = false;
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -670,7 +688,8 @@ mod tests {
     fn skips_wrong_capability() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::AudioTranscribe,
@@ -693,6 +712,7 @@ mod tests {
     fn skips_circuit_breaker_open() {
         let config = test_config();
         let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
 
         // Open the circuit breaker for ollama:gemma3:27b
         let endpoint = "ollama:gemma3:27b";
@@ -702,7 +722,7 @@ mod tests {
         }
         assert!(!cb.can_execute(endpoint)); // confirm open
 
-        let svc = ModelSelectionService::new(&config, &cb);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -729,7 +749,8 @@ mod tests {
     fn skips_over_budget() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -758,7 +779,8 @@ mod tests {
     fn api_model_id_override() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -778,7 +800,8 @@ mod tests {
     fn no_chain_for_capability() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::AudioTranscribe,
@@ -797,7 +820,8 @@ mod tests {
     fn chain_not_found() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -817,7 +841,8 @@ mod tests {
     fn direct_model_not_found() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -840,7 +865,8 @@ mod tests {
     fn direct_model_wrong_capability() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         // all-minilm only supports TextEmbed, not AudioTranscribe
         let result = svc.select(&SelectionCriteria {
@@ -864,6 +890,7 @@ mod tests {
     fn direct_circuit_breaker_open() {
         let config = test_config();
         let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
 
         // Open the breaker for this direct endpoint
         let endpoint = "ollama:gemma3:27b";
@@ -873,7 +900,7 @@ mod tests {
         }
         assert!(!cb.can_execute(endpoint));
 
-        let svc = ModelSelectionService::new(&config, &cb);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -896,7 +923,8 @@ mod tests {
     fn direct_over_budget() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         // claude-haiku has pricing, set budget very low
         let result = svc.select(&SelectionCriteria {
@@ -921,7 +949,8 @@ mod tests {
         let mut config = test_config();
         config.routers.get_mut("ollama").unwrap().enabled = false;
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -946,7 +975,8 @@ mod tests {
         // to model.provider ("ollama")
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextEmbed,
@@ -989,7 +1019,8 @@ mod tests {
             },
         );
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -1037,7 +1068,8 @@ mod tests {
             },
         );
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -1064,7 +1096,8 @@ mod tests {
     fn direct_both_router_and_model_unknown_reports_router_first() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
             model: Some("ghost".into()),
@@ -1084,7 +1117,8 @@ mod tests {
     fn direct_model_only_no_router_is_router_not_found_today() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown);
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
             model: Some("gemma3:27b".into()),

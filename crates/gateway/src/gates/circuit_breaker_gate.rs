@@ -58,6 +58,14 @@ mod tests {
         }
     }
 
+    /// Router health port stub for tests that don't exercise cooldown.
+    struct NeverCooling;
+    impl crate::gates::RouterHealthRead for NeverCooling {
+        fn cooling_until(&self, _router: &str) -> Option<Instant> {
+            None
+        }
+    }
+
     fn test_model_config() -> ModelConfig {
         ModelConfig {
             id: "gemma3:27b".to_string(),
@@ -102,6 +110,7 @@ mod tests {
             health: &health,
             now: Instant::now(),
             config: &gateway_config,
+            router_health: &NeverCooling,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);
@@ -131,6 +140,7 @@ mod tests {
             health: &health,
             now: Instant::now(),
             config: &gateway_config,
+            router_health: &NeverCooling,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);

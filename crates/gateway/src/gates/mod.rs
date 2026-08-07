@@ -38,6 +38,7 @@ pub struct SelectionCtx<'a> {
     pub health: &'a dyn EndpointHealthRead,
     pub now: Instant,
     pub config: &'a GatewayConfig,
+    pub router_health: &'a dyn RouterHealthRead,
 }
 
 pub enum GateVerdict {
