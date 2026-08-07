@@ -1,8 +1,12 @@
-use super::{AdmissionGate, CandidateView, GateVerdict, RouterHealthRead, SelectionCtx};
+use super::{
+    AdmissionGate, AttemptOutcome, CandidateView, GateVerdict, HealthRecorder, RouterHealthRead,
+    SelectionCtx,
+};
 use crate::skip_reason::SkipReason;
+use crate::types::error::GatewayError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// In-memory per-router cooldown state (read by the gate, written by the sink).
 /// Arc-backed + Clone so a read reference and an owned sink copy share one map.
@@ -45,6 +49,39 @@ impl AdmissionGate for ConnectionCooldownGate {
         match x.router_health.cooling_until(c.router) {
             Some(until) if until > x.now => GateVerdict::Skip(SkipReason::Cooling { until }),
             _ => GateVerdict::Admit,
+        }
+    }
+}
+
+/// Default router cooldown after a transport fault (operator-configurable via
+/// ResilienceConfig in plan (f); a constant for now).
+pub const DEFAULT_CONNECTION_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Write side: on a transport-level fault (`Network`/`Timeout`), cool the
+/// whole router for the configured cooldown duration so the (read-side) gate
+/// skips all of its models on the next selection. Other errors do NOT cool —
+/// they're provider/request faults, not evidence the router itself is
+/// unreachable.
+pub struct ConnectionCooldownSink {
+    store: ConnectionCooldownStore,
+    cooldown: Duration,
+}
+
+impl ConnectionCooldownSink {
+    pub fn new(store: ConnectionCooldownStore, cooldown: Duration) -> Self {
+        Self { store, cooldown }
+    }
+}
+
+impl HealthRecorder for ConnectionCooldownSink {
+    fn on_outcome(&self, o: &AttemptOutcome<'_>) {
+        // Transport-level fault → cool the whole router (Network = connection failure;
+        // Timeout = endpoint unreachable/too slow). Other errors do NOT cool.
+        if matches!(
+            o.error,
+            Some(GatewayError::Network(_)) | Some(GatewayError::Timeout { .. })
+        ) {
+            self.store.start(o.router, Instant::now() + self.cooldown);
         }
     }
 }
@@ -149,5 +186,50 @@ mod tests {
             ConnectionCooldownGate.evaluate(&cand, &ctx),
             GateVerdict::Admit
         ));
+    }
+
+    /// Transport faults (`Timeout`) cool the router; a non-transport error
+    /// (`ProviderError`) does NOT; neither does a successful outcome.
+    #[test]
+    fn sink_cools_only_on_transport_fault() {
+        let store = ConnectionCooldownStore::new();
+        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30));
+        let now = Instant::now();
+
+        let timeout_err = GatewayError::Timeout {
+            adapter: "a".into(),
+            model: "m".into(),
+            duration_ms: 1,
+        };
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "A:m",
+            router: "A",
+            success: false,
+            error: Some(&timeout_err),
+        });
+        let until = store.cooling_until("A");
+        assert!(until.is_some());
+        assert!(until.unwrap() > now);
+
+        let provider_err = GatewayError::ProviderError {
+            adapter: "a".into(),
+            message: "x".into(),
+            status: Some(500),
+        };
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "B:m",
+            router: "B",
+            success: false,
+            error: Some(&provider_err),
+        });
+        assert!(store.cooling_until("B").is_none());
+
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "C:m",
+            router: "C",
+            success: true,
+            error: None,
+        });
+        assert!(store.cooling_until("C").is_none());
     }
 }

@@ -158,6 +158,7 @@ mod tests {
         let sink = CircuitBreakerSink::new(cb.clone());
         sink.on_outcome(&AttemptOutcome {
             endpoint: "r:m",
+            router: "r",
             success: false,
             error: None,
         });
@@ -165,6 +166,7 @@ mod tests {
         cb.can_execute("r:n");
         sink.on_outcome(&AttemptOutcome {
             endpoint: "r:n",
+            router: "r",
             success: true,
             error: None,
         });

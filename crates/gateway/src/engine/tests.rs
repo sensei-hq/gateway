@@ -1,6 +1,7 @@
 use super::*;
 use crate::adapters::noop::NoopAdapter;
 use crate::circuit_breaker::CircuitBreakerConfig;
+use crate::gates::RouterHealthRead;
 use crate::store::InMemoryStore;
 use crate::types::capability::Capability;
 use crate::types::config::{
@@ -1019,6 +1020,45 @@ async fn execute_fallback_on_provider_error() {
         response.attempts[1].status,
         crate::types::trace::AttemptStatus::Success
     );
+}
+
+#[tokio::test]
+async fn timeout_cools_router_and_next_selection_skips_it() {
+    // A `Timeout` outcome on "failing" is a transport-level fault: the
+    // write-side `ConnectionCooldownSink` (registered in `Gateway::new`)
+    // should cool the whole router, so the read-side `ConnectionCooldownGate`
+    // skips its candidate on the very next selection.
+    let gw = test_gateway_with_chain();
+    register_failing(
+        &gw,
+        GatewayError::Timeout {
+            adapter: "failing".into(),
+            model: "fail-model".into(),
+            duration_ms: 1,
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    // First execute: "failing" times out (a configured fallback trigger), the
+    // chain falls over to noop, and the outcome cools router "failing".
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response.model, Some("noop".to_string()));
+    assert_eq!(response.attempts.len(), 2);
+    assert_eq!(response.attempts[0].adapter, "failing");
+
+    let until = gw.cooldown.cooling_until("failing");
+    assert!(
+        until.is_some_and(|u| u > Instant::now()),
+        "a Timeout outcome should start an active cooldown for router 'failing'"
+    );
+
+    // Second execute: "failing" is now skipped at selection (Cooling), so
+    // only noop is attempted — one successful attempt, no fallback needed.
+    let response2 = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response2.model, Some("noop".to_string()));
+    assert_eq!(response2.attempts.len(), 1);
+    assert_eq!(response2.attempts[0].adapter, "noop");
 }
 
 #[tokio::test]
