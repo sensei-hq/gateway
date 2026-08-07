@@ -72,6 +72,75 @@ fn classify_403_body(message: &str) -> LockReason {
     }
 }
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// A single endpoint's lockout state; `until = None` is terminal. Task 5 (the
+/// sink) re-adds an `escalation` generation counter here alongside its reader.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LockEntry {
+    pub reason: LockReason,
+    pub until: Option<Instant>,
+}
+
+/// What the gate reads for a candidate: the active lock's reason + deadline.
+#[derive(Debug, Clone, Copy)]
+pub struct LockView {
+    pub reason: LockReason,
+    pub until: Option<Instant>, // None = terminal
+}
+
+/// Read port for endpoint model-lockout state (read by the gate, later task).
+pub trait ModelLockoutRead: Send + Sync {
+    /// The endpoint's lock entry (reason + deadline), or `None` if not tracked.
+    /// Expiry is NOT applied here — the gate compares `until` to its injected
+    /// `now` (mirrors `RouterHealthRead::cooling_until`), and the entry is
+    /// retained past expiry so escalation memory survives a release.
+    fn locked(&self, endpoint: &str) -> Option<LockView>;
+}
+
+/// In-memory per-endpoint (`"router:model"`) lockout state, Arc-backed + Clone so
+/// the gate's read reference, the sink's owned copy, and `Gateway`'s apply/clear
+/// share one map. Same pattern as `ConnectionCooldownStore`.
+#[derive(Clone, Default)]
+pub struct ModelLockoutStore {
+    locks: Arc<Mutex<HashMap<String, LockEntry>>>,
+}
+
+impl ModelLockoutStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Insert/replace the endpoint's lock (used by the sink and `apply_lockout`).
+    pub fn set(&self, endpoint: &str, reason: LockReason, until: Option<Instant>) {
+        self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(endpoint.to_string(), LockEntry { reason, until });
+    }
+    /// Remove the endpoint's lock (success / `clear_lockout`).
+    pub fn clear(&self, endpoint: &str) {
+        self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(endpoint);
+    }
+}
+
+impl ModelLockoutRead for ModelLockoutStore {
+    fn locked(&self, endpoint: &str) -> Option<LockView> {
+        self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(endpoint)
+            .map(|e| LockView {
+                reason: e.reason,
+                until: e.until,
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +208,22 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn store_records_and_reads_locks() {
+        let s = ModelLockoutStore::new();
+        assert!(s.locked("r:m").is_none()); // unknown → not locked
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        s.set("r:m", LockReason::RateLimit, Some(until));
+        let v = s.locked("r:m").expect("locked");
+        assert_eq!(v.reason, LockReason::RateLimit);
+        assert_eq!(v.until, Some(until));
+        // terminal lock: until = None
+        s.set("r:x", LockReason::Auth, None);
+        assert_eq!(s.locked("r:x").unwrap().until, None);
+        // clear removes it
+        s.clear("r:m");
+        assert!(s.locked("r:m").is_none());
     }
 }

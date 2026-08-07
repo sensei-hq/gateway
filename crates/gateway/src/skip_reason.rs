@@ -8,9 +8,20 @@ pub enum SkipReason {
     RouterNotFound,
     RouterDisabled,
     UnsupportedCapability(Capability),
-    OverBudget { estimated: f64, budget: f64 },
-    CircuitOpen { until: Instant },
-    Cooling { until: Instant },
+    OverBudget {
+        estimated: f64,
+        budget: f64,
+    },
+    CircuitOpen {
+        until: Instant,
+    },
+    Cooling {
+        until: Instant,
+    },
+    LockedOut {
+        reason: crate::gates::lockout::LockReason,
+        until: Option<Instant>,
+    },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -28,6 +39,7 @@ impl std::fmt::Display for SkipReason {
             }
             SkipReason::CircuitOpen { .. } => write!(f, "circuit breaker open"),
             SkipReason::Cooling { .. } => write!(f, "router cooling down"),
+            SkipReason::LockedOut { reason, .. } => write!(f, "model locked out ({reason:?})"),
         }
     }
 }
