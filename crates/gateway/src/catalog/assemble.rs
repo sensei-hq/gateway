@@ -335,6 +335,110 @@ mod tests {
         );
     }
 
+    // ---- Canonical worked example: curated ∪ derived across multiple tiers --
+    //
+    // This is the single documented reference for how tiers × chains compose.
+    // It exercises every headline of SP-CAT in one runnable example: a tier that
+    // draws members from BOTH a curated id AND a `derive` predicate, a second
+    // tier, a chain authored purely as tier-refs, and the "add a model, every
+    // chain updates — no chain edit" property.
+
+    #[test]
+    fn worked_example_free_tier_research_chain() {
+        // The `free` tier draws members from BOTH paths:
+        //   * curated  — `house_local`, a self-hosted model the operator treats
+        //     as free but that carries no `free_type` metadata; hand-pinned so it
+        //     always leads the tier.
+        //   * derived  — every model whose catalog declares a free tier
+        //     (`FreeMatch::Any`), picked up automatically and ordered by id.
+        // A `cost_optimized` tier holds a curated paid fallback. The
+        // `research_bulk` chain is authored purely as tier-refs
+        // `[free, cost_optimized]` — it never names an individual model.
+        //
+        // The tiers + chain are defined ONCE (in `build`); only the model set
+        // varies between the two assemblies, so the second assembly proves the
+        // change flows through membership, never a chain edit.
+        let build = |models: HashMap<String, ModelConfig>| CatalogConfig {
+            routers: HashMap::new(),
+            models,
+            tiers: map(vec![
+                (
+                    "free",
+                    TierConfig {
+                        strategy: IntraTierStrategy::Priority,
+                        members: vec!["house_local".into()], // curated path
+                        derive: Some(TierPredicate {
+                            free: Some(FreeMatch::Any), // derived path
+                            ..Default::default()
+                        }),
+                    },
+                ),
+                ("cost_optimized", priority_tier(&["cheap_paid"])),
+            ]),
+            chains: map(vec![(
+                "research_bulk",
+                chain(
+                    Capability::TextChat,
+                    vec![tier("free"), tier("cost_optimized")],
+                ),
+            )]),
+            constraints: Default::default(),
+        };
+
+        // Baseline catalog: one curated free model, two derived free models, and
+        // one curated cost-optimized fallback.
+        let baseline = map(vec![
+            ("house_local", model("house_local", "noop")), // curated → free
+            ("gemini_free", free_model("gemini_free", "google")), // derived → free
+            ("groq_free", free_model("groq_free", "groq")), // derived → free
+            ("cheap_paid", model("cheap_paid", "p")),      // curated → cost_optimized
+        ]);
+
+        let cfg = assemble(build(baseline.clone())).expect("assembles");
+        // Free members first — curated `house_local`, then the derived free
+        // models ordered by id — then the cost-optimized fallback, with ascending
+        // priority across the whole expanded chain.
+        assert_eq!(
+            chain_shape(&cfg, "research_bulk"),
+            vec![
+                ("house_local", 1), // curated free, pinned first
+                ("gemini_free", 2), // derived free (id-ordered)
+                ("groq_free", 3),   // derived free
+                ("cheap_paid", 4),  // cost-optimized fallback
+            ],
+        );
+
+        // Now add a NEW free model that matches the `free` tier's `derive`
+        // predicate. `build` is byte-for-byte identical, so the chain definition
+        // is untouched — only the catalog grew.
+        let mut grown = baseline;
+        grown.insert("mistral_free".into(), free_model("mistral_free", "mistral"));
+
+        let after = assemble(build(grown)).expect("assembles");
+        // `mistral_free` now appears in `research_bulk`, id-ordered among the
+        // derived free models, and the cost-optimized fallback slides to last —
+        // all without editing the chain.
+        assert_eq!(
+            chain_shape(&after, "research_bulk"),
+            vec![
+                ("house_local", 1),
+                ("gemini_free", 2),
+                ("groq_free", 3),
+                ("mistral_free", 4),
+                ("cheap_paid", 5),
+            ],
+        );
+        // The headline, made explicit: a model added to the catalog joined every
+        // chain that references the `free` tier, purely by matching `derive`.
+        assert!(
+            after.chains["research_bulk"]
+                .models
+                .iter()
+                .any(|e| e.model == "mistral_free"),
+            "the newly-added free model joins research_bulk with no chain edit",
+        );
+    }
+
     #[test]
     fn cross_tier_duplicate_appears_once_first_tier_wins_position() {
         // `shared` is in BOTH tiers; it must appear once, at its FIRST (free)

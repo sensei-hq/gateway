@@ -2,15 +2,15 @@
 title: Free-Tier Catalog
 doctype: feature
 module: catalog
-status: planned
+status: implemented
 phase: 1
 spec: SP-CAT
-source: catalog data
+source: crates/kernel/src/types/config.rs (CatalogMeta) + crates/gateway/src/catalog/totals.rs (free_tier_totals)
 ---
 
 # Free-Tier Catalog
 
-> **Status: Planned (Phase 1 · SP-CAT).** Design §12.2. Reference: OmniRoute `freeModelCatalog`.
+> **Status: Implemented (Phase 1 · SP-CAT).** Design §12.2. Reference: OmniRoute `freeModelCatalog`.
 
 First-class free-tier metadata on catalog models, so chains can prefer free
 models and usage can be tracked against documented limits.
@@ -44,12 +44,18 @@ Feature: Free-tier catalog
     Given a model with free_type "recurring-uncapped"
     Then it appears in the catalog but is excluded from the token headline
 
-  Scenario: CI fails if docs drift from computed totals
-    Given the documented headline differs from computeFreeModelTotals()
-    Then the docs-counts check fails the build
+  Scenario: A unit test fails if docs drift from computed totals
+    Given the documented headline differs from free_tier_totals()
+    Then the drift gate fails the build
 ```
 
 ## Notes
 
-- Catalog *data* is config (pure). Live *usage* against these limits is the [data-tier](../../features/README.md) metering store (Phase 4).
+- The **drift gate is a unit test** — `example_catalog_totals_match_documented_headline`
+  in `crates/gateway/src/catalog/totals.rs` recomputes `free_tier_totals()` over
+  the checked-in `testdata/example_free_catalog.json` and asserts it against the
+  documented headline (no external fetch, no network).
+- Catalog *data* is config (pure). Live *usage* against these limits is the
+  [data-tier](../../features/README.md) metering store — a separate, deliberately
+  **held-off** persistence layer (SP-DATA, Phase 4).
 - Feeds [tiers & chains](tiers-and-chains.md) (the `free` tier) and [governance/usage-metering](../governance/usage-metering.md).
