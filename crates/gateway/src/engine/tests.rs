@@ -41,6 +41,7 @@ fn test_config_with_noop() -> GatewayConfig {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
 
@@ -126,6 +127,7 @@ fn priced_gateway_config() -> GatewayConfig {
                 output_per_1k: 0.004,
                 per_request: None,
             }),
+            catalog: None,
         },
     );
     GatewayConfig {
@@ -250,6 +252,7 @@ async fn chain_selection_injects_resolved_api_model_id() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     let mut chains = HashMap::new();
@@ -537,6 +540,7 @@ async fn reserved_capability_returns_unsupported_not_no_adapter() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     let config = GatewayConfig {
@@ -837,6 +841,7 @@ fn test_config_with_failing_and_noop() -> GatewayConfig {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     models.insert(
@@ -850,6 +855,7 @@ fn test_config_with_failing_and_noop() -> GatewayConfig {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
 
@@ -1424,6 +1430,7 @@ fn cap_config() -> GatewayConfig {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     let mut chains = HashMap::new();
@@ -1621,6 +1628,7 @@ async fn execute_all_fail_returns_error() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
 
@@ -1710,6 +1718,7 @@ async fn execute_adapter_not_found() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     models.insert(
@@ -1723,6 +1732,7 @@ async fn execute_adapter_not_found() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
 
@@ -1809,6 +1819,7 @@ async fn execute_all_fail_populates_attempts_detail() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     models.insert(
@@ -1822,6 +1833,7 @@ async fn execute_all_fail_populates_attempts_detail() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
 
@@ -2120,6 +2132,7 @@ async fn execute_stream_yields_chunks_then_done_with_cost() {
                 output_per_1k: 0.004,
                 per_request: None,
             }),
+            catalog: None,
         },
     );
     let config = GatewayConfig {
@@ -2216,6 +2229,7 @@ async fn execute_stream_falls_back_before_first_byte() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     models.insert(
@@ -2229,6 +2243,7 @@ async fn execute_stream_falls_back_before_first_byte() {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         },
     );
     let mut chains = HashMap::new();
@@ -2614,6 +2629,7 @@ fn chat_model(id: &str, provider: &str, family: &str) -> ModelConfig {
         context_window: 4096,
         max_output_tokens: 1024,
         pricing: None,
+        catalog: None,
     }
 }
 
@@ -3714,6 +3730,7 @@ fn ab_chain_config_priced(
                 context_window: 4096,
                 max_output_tokens: 1024,
                 pricing: pricing.clone(),
+                catalog: None,
             },
         );
     }

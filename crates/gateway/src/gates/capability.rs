@@ -53,6 +53,7 @@ mod tests {
             context_window: 512,
             max_output_tokens: 0,
             pricing: None,
+            catalog: None,
         }
     }
 

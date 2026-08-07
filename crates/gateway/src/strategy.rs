@@ -39,6 +39,7 @@ mod tests {
             context_window: 0,
             max_output_tokens: 0,
             pricing: None,
+            catalog: None,
         };
         SelectedModel {
             model: model.to_string(),
