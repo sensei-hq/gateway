@@ -155,12 +155,15 @@ pub fn assemble(catalog: CatalogConfig) -> Result<GatewayConfig, AssembleError>;
 
 **"Refresh" in SP-CAT = re-audit/validation**, NOT an external fetch: a `catalog::audit(catalog)` pass recomputes totals, validates pool-dedup consistency, and a **test/CI gate** fails the build if a documented headline (in the feature doc / a checked-in fixture) drifts from `free_tier_totals` (the `free-tier-catalog.md` "docs-counts" scenario). External catalog fetch/import is SP-DATA.
 
-## 8. What SP-CAT deliberately does NOT do (deferred to SP-DATA / later)
+## 8. Persistence stance + what SP-CAT deliberately does NOT do
 
-- **DB persistence + external fetch/import** (`config_loader`, staging import) — Phase-4 SP-DATA produces a `CatalogConfig` from the DB, then reuses this same `assemble`.
-- **Live-usage-driven `Headroom`/`LeastUsed`** — needs the metering store; stubbed to `Priority` here with a warning + seam.
-- **`config_versioning` + the replay version-fence** — Phase-4.
-- **Proactive expiration tracking** (`free_tier_reset` detection from 429+reset, etc.) — governance/SP-DATA.
+**The app stays config-driven — no persistence.** DB persistence is a **separate layer, deliberately held off** (user directive, 2026-08-07). SP-CAT and every near-term slice (reference chains, the orchestrator) run purely on config in memory: a hand-authored (or programmatically built) `CatalogConfig` → `assemble` → `GatewayConfig`, hot-swapped via `update_config`. The pre-existing optional seams (`GatewayStore`/`VaultStore`) stay **default-off** and are not a dependency of this work. SP-DATA (the DB `config_loader` + tracking) remains a distinct, later, optional layer — **not** a near-term follow-up — and, when it lands, it targets this same `assemble` seam without changing the pure core.
+
+Deferred, therefore, out of SP-CAT (and out of the config-driven program until/unless persistence is explicitly taken up):
+- **DB persistence + external fetch/import** (`config_loader`, staging import) — a separate later layer that would produce a `CatalogConfig` and reuse this same `assemble`.
+- **Live-usage-driven `Headroom`/`LeastUsed`** — needs a usage/metering store (persistence); **stays stubbed to `Priority`** with a loud warning + seam for as long as the program is config-driven-only. This is not a silent gap: `assemble` warns when a tier requests a dynamic strategy.
+- **`config_versioning` + the replay version-fence** — a persistence concern; later.
+- **Proactive expiration tracking** (`free_tier_reset` detection from 429+reset, etc.) — stateful; later.
 
 ## 9. Testing & acceptance
 
