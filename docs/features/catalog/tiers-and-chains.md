@@ -2,15 +2,15 @@
 title: Tiers & Chains
 doctype: feature
 module: catalog
-status: planned
+status: implemented
 phase: 1
 spec: SP-CAT
-source: catalog + crates/gateway/src/selection.rs
+source: crates/gateway/src/catalog/{tiers,assemble}.rs
 ---
 
 # Tiers & Chains
 
-> **Status: Planned (Phase 1 · SP-CAT).** Design §6.2/§12.2 (decision D13).
+> **Status: Implemented (Phase 1 · SP-CAT).** Design §6.2/§12.2 (decision D13).
 
 **Tiers and chains are orthogonal axes that compose.** A **tier** is a named
 catalog segment — curated or attribute-derived from `auth_type` / cost band /
@@ -29,9 +29,15 @@ research.bulk = [free → cost-optimized → fallback-specialty]
 ```
 
 **Resolution split (keeps the gateway core pure):** static tier *membership*
-expands into ordered candidates at config-assembly; dynamic intra-tier
-*ordering* (`headroom`/`least-used`) is chosen at request time from live lockout
-+ usage state; cross-segment fallover uses the existing trigger logic.
+expands into ordered candidates at config-assembly (`catalog::assemble`);
+cross-segment fallover uses the existing trigger logic. Intra-tier *ordering* is
+where the config-driven boundary shows: `priority` and `cost` are pure functions
+of config and are live today, but the dynamic strategies `headroom`/`least-used`
+need live lockout + usage state — i.e. the **persistence layer SP-CAT
+deliberately holds off**. Those two therefore **stub to `priority` and emit a
+`tracing::warn!`** (never a silent degrade; callers can also detect it via
+`IntraTierStrategy::is_dynamic`). They are **not** functional as live-usage
+orderings yet.
 
 ## Scenarios
 
@@ -47,6 +53,8 @@ Feature: Tiers & chains
     Given model f3 is added to the free tier
     Then research.bulk includes f3 without editing the chain
 
+  # DEFERRED: headroom/least-used need live usage (persistence, held off); today
+  # they stub to `priority` with a warning. See Notes.
   Scenario: Intra-tier strategy orders within a segment at request time
     Given the cost-optimized tier uses the headroom strategy
     Then within that segment the model with the most remaining quota is tried first
@@ -59,5 +67,14 @@ Feature: Tiers & chains
 
 ## Notes
 
+- Implemented as pure config → config: `CatalogConfig` (tiers + tier-ref chains)
+  → `catalog::assemble` → concrete `GatewayConfig` chains, in memory. Curated ∪
+  derived membership and ordering live in `crates/gateway/src/catalog/tiers.rs`;
+  chain expansion (dedup + ascending priority, fails loud) in
+  `crates/gateway/src/catalog/assemble.rs`. The canonical worked example is the
+  `worked_example_free_tier_research_chain` test.
+- **`headroom`/`least-used` are deferred:** they need live usage state from the
+  held-off persistence layer, so they currently stub to `priority` with a
+  `tracing::warn!`. `priority` and `cost` are live.
 - Supersedes the earlier flat "tiers = chains" shorthand.
 - Reuses torii's `routing_policies` / `chain_models` / `chain_bindings`.
