@@ -86,14 +86,23 @@ pub struct ConnectionCooldownSink {
     store: ConnectionCooldownStore,
     cooldown: Duration,
     eviction_cap: usize,
+    /// Deterministic per-router jitter fraction added to the SYNTHETIC cooldown
+    /// to spread retry storms (Task 4). `0.0` ⇒ off (exactly `now + cooldown`).
+    jitter_fraction: f64,
 }
 
 impl ConnectionCooldownSink {
-    pub fn new(store: ConnectionCooldownStore, cooldown: Duration, eviction_cap: usize) -> Self {
+    pub fn new(
+        store: ConnectionCooldownStore,
+        cooldown: Duration,
+        eviction_cap: usize,
+        jitter_fraction: f64,
+    ) -> Self {
         Self {
             store,
             cooldown,
             eviction_cap,
+            jitter_fraction,
         }
     }
 }
@@ -106,7 +115,16 @@ impl HealthRecorder for ConnectionCooldownSink {
             o.error,
             Some(GatewayError::Network(_)) | Some(GatewayError::Timeout { .. })
         ) {
-            let until = Instant::now() + self.cooldown;
+            // Deterministic per-router jitter spreads simultaneous router faults
+            // across the cooldown window (`jitter_fraction = 0.0` ⇒ exactly
+            // `now + cooldown`, today's behavior).
+            let until = Instant::now()
+                + self.cooldown
+                + crate::resilience::deterministic_jitter(
+                    o.router,
+                    self.cooldown,
+                    self.jitter_fraction,
+                );
             self.store.start(o.router, until);
             // Bound the map on the write path only (reads/successes never grow it).
             self.store.evict_expired_over_cap(self.eviction_cap);
@@ -226,7 +244,7 @@ mod tests {
     #[test]
     fn sink_cools_only_on_transport_fault() {
         let store = ConnectionCooldownStore::new();
-        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30), 4096);
+        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30), 4096, 0.0);
         let now = Instant::now();
 
         let timeout_err = GatewayError::Timeout {
@@ -312,7 +330,7 @@ mod tests {
         store.start("expired2", now - Duration::from_secs(1));
         store.start("active", now + Duration::from_secs(60));
         // Tiny cap so the next write trips eviction.
-        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30), 1);
+        let sink = ConnectionCooldownSink::new(store.clone(), Duration::from_secs(30), 1, 0.0);
 
         let timeout_err = GatewayError::Timeout {
             adapter: "a".into(),
@@ -340,5 +358,75 @@ mod tests {
         );
         // Map bounded to the non-expired entries (active + new).
         assert!(store.len() <= 2);
+    }
+
+    /// A transport fault carried by every scenario here.
+    fn timeout_err() -> GatewayError {
+        GatewayError::Timeout {
+            adapter: "a".into(),
+            model: "m".into(),
+            duration_ms: 1,
+        }
+    }
+
+    /// With `jitter_fraction = 0.0` (the default) the cooldown deadline is exactly
+    /// `now + base` — behavior-preserving, NOT widened. Asserts `until` sits in a
+    /// tiny scheduling window at `now + base`, never larger (a stray jitter would
+    /// push it past `now + base`).
+    #[test]
+    fn sink_no_jitter_when_fraction_zero() {
+        let store = ConnectionCooldownStore::new();
+        let base = Duration::from_secs(60);
+        let sink = ConnectionCooldownSink::new(store.clone(), base, 4096, 0.0);
+        let now = Instant::now();
+        let err = timeout_err();
+        let until = sink
+            .on_outcome(&AttemptOutcome {
+                endpoint: "R:m",
+                router: "R",
+                success: false,
+                error: Some(&err),
+            })
+            .expect("transport fault cools");
+        assert!(until >= now + base, "at least the full base cooldown");
+        assert!(
+            until < now + base + Duration::from_secs(1),
+            "exactly base, no jitter (within a tiny scheduling margin)"
+        );
+    }
+
+    /// With `jitter_fraction > 0` the cooldown deadline is `now + base +
+    /// jitter(router)`, equal to the deterministic per-router offset (flake-free)
+    /// and within `[now+base, now+base*1.5)`.
+    #[test]
+    fn sink_applies_deterministic_jitter_when_fraction_positive() {
+        let store = ConnectionCooldownStore::new();
+        let base = Duration::from_secs(1000); // large base ⇒ wide 500s jitter span
+        let sink = ConnectionCooldownSink::new(store.clone(), base, 4096, 0.5);
+        let now = Instant::now();
+        let err = timeout_err();
+        let until = sink
+            .on_outcome(&AttemptOutcome {
+                endpoint: "R:m",
+                router: "R",
+                success: false,
+                error: Some(&err),
+            })
+            .expect("transport fault cools");
+        let jitter = crate::resilience::deterministic_jitter("R", base, 0.5);
+        // Deadline carries exactly the deterministic per-router jitter (± margin).
+        assert!(
+            until >= now + base + jitter,
+            "carries the deterministic per-router jitter"
+        );
+        assert!(
+            until < now + base + jitter + Duration::from_secs(1),
+            "no more than base + deterministic jitter"
+        );
+        // Within [now+base, now+base*1.5).
+        assert!(until >= now + base);
+        assert!(until < now + base + base / 2);
+        // Deterministic: the sink wrote exactly this deadline to the store.
+        assert_eq!(store.cooling_until("R"), Some(until));
     }
 }
