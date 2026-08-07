@@ -2,7 +2,7 @@
 title: Quota Demote-to-Tier
 doctype: feature
 module: routing
-status: planned
+status: implemented
 phase: 1
 spec: SP-0
 source: crates/gateway/src/engine.rs, crates/kernel/src/types/error.rs
@@ -10,7 +10,12 @@ source: crates/gateway/src/engine.rs, crates/kernel/src/types/error.rs
 
 # Quota Demote-to-Tier
 
-> **Status: Planned (Phase 1 · SP-0).** Design in [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §11.2/§12.
+> **Status: Implemented (Phase 1 · SP-0 (d)+(e)).** Demote-to-tier, in-flight
+> §3.1 recoverable fallover, and the terminal `AllGated { resume_after,
+> human_action }` (both `execute` and `execute_stream`) are live. Deferred to
+> **(f)**: the calendar-clock exact reset boundary, seedable jitter, and
+> bounded-LRU eviction of lockout state. Design in
+> [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §11.2/§12.
 
 Changes how a **provider-side** quota/limit on a specific model behaves in the
 candidate walk. Today an upstream quota/rate-limit for a model surfaces as a
@@ -28,7 +33,7 @@ entry/tier**, so the chain keeps trying other tiers before giving up.
 
 ## Behavior
 
-- On `quota_exhausted` for a model: lock it out (until its reset boundary) and continue the walk — do **not** terminate the request.
+- On `quota_exhausted` for a model: lock it out (until its reset boundary — currently a base window; the exact calendar-clock boundary is deferred to SP-0 (f)) and continue the walk — do **not** terminate the request.
 - The request only fails when **every** entry in the chain is gated (locked out / cooling down / breaker-open / over-budget).
 - The terminal error then carries `resume_after = min(expiry across gated entries)` — a concrete wake-up time.
 

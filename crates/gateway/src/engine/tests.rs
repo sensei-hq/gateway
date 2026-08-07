@@ -4018,3 +4018,196 @@ async fn all_over_budget_returns_allgated_raise_budget() {
         other => panic!("expected AllGated (raise budget), got: {other}"),
     }
 }
+
+// --- Task 6: acceptance scenarios (quota-demote-to-tier.md) ---
+//
+// Named end-to-end tests for the `quota-demote-to-tier.md` Gherkins whose
+// observable behavior is not already pinned by Tasks 3–5. The rest of that
+// feature doc's scenarios are covered by existing named tests (see the mapping
+// in this crate's Task-6 report): "provider 403 quota falls over on the SAME
+// request" = `recoverable_quota_403_falls_over_without_trigger`; "all tiers
+// gated returns resume_after" = `all_gated_at_selection_returns_allgated_with_min_resume`;
+// "mixed terminal + timed" = `all_gated_mixed_terminal_and_timed_uses_min_over_timed_only`;
+// "all candidates terminal → None + human action" = `all_gated_all_terminal_returns_none_resume_with_human_action`;
+// "all candidates circuit-open" = `all_gated_all_breaker_open_resume_from_next_retry`.
+
+/// A minimal recorded `InferenceCall` attributed to `subject` (one Success
+/// request on tier "free", now), used to pre-seed a store so `get_usage_since`
+/// already reports usage at a tier cap — without routing a live call through
+/// the engine (which would itself attempt a model).
+fn seed_request_call(subject: Uuid) -> crate::store::InferenceCall {
+    crate::store::InferenceCall {
+        id: Uuid::new_v4(),
+        session_id: None,
+        project_id: None,
+        capability: Capability::TextChat,
+        chain_id: None,
+        adapter: "seed".to_string(),
+        model: "seed".to_string(),
+        api_model_id: None,
+        input_tokens: Some(0),
+        output_tokens: Some(0),
+        cost_usd: 0.0,
+        cost_estimated: None,
+        duration_ms: 0,
+        status: crate::store::CallStatus::Success,
+        error_type: None,
+        fallback_sequence: 0,
+        recorded_at: Utc::now(),
+        subject_id: Some(subject),
+        tier: Some("free".to_string()),
+    }
+}
+
+/// A chat adapter with a caller-chosen `id` that succeeds and bumps a shared
+/// counter, so a test can prove whether the engine ever attempted it. Both A
+/// and B are "healthy/ready" (a live provider would serve the request), which
+/// is what makes the subscription-quota guard non-vacuous: if the hard stop
+/// did NOT short-circuit, one of these WOULD be attempted.
+struct CountingOkAdapter {
+    id: String,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::adapters::capability::Model for CountingOkAdapter {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for CountingOkAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::types::io::ChatResponse {
+            content: Some("ok".to_string()),
+            model: Some(self.id.clone()),
+            ..Default::default()
+        })
+    }
+}
+
+/// Scenario: "Subscription quota exhaustion does NOT demote" (the demote-vs-
+/// hard-stop guard). The caller's per-subject/tier `QuotaExceeded` — a hard
+/// stop raised by `check_quota` BEFORE selection — must NOT fall over to the
+/// next tier and must NOT become `AllGated`: no model is attempted and nothing
+/// is locked out. This is the end-to-end distinction between the subscription
+/// hard stop and a provider-side limit (which DOES demote via §3.1 / lockout).
+#[tokio::test]
+async fn subscription_quota_exhaustion_does_not_demote_or_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Chain [A, B]; a store pre-seeded with one request for `subject` so a
+    // 1/day tier cap is already exhausted for the very next authed call.
+    let store = Arc::new(InMemoryStore::default());
+    let subject = Uuid::new_v4();
+    store
+        .insert_inference_call(&seed_request_call(subject))
+        .await
+        .unwrap();
+
+    let mut config = ab_chain_config(vec![]);
+    config.constraints = ConstraintsConfig {
+        tiers: HashMap::from([(
+            "free".to_string(),
+            TierConstraints {
+                quota: requests_per_day(1),
+                per_capability: HashMap::new(),
+            },
+        )]),
+        default: None,
+    };
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let gw = Gateway::new(config, AdapterRegistry::new(), cb).with_store(store);
+
+    // Both candidates are healthy + ready: a shared counter proves neither
+    // `chat` is reached once the subscription quota short-circuits selection.
+    let hits = Arc::new(AtomicUsize::new(0));
+    for id in ["A", "B"] {
+        gw.adapters
+            .register_chat(Arc::new(CountingOkAdapter {
+                id: id.to_string(),
+                hits: hits.clone(),
+            }))
+            .await;
+    }
+
+    let mut req = chat_request();
+    req.auth = Some(AuthContext {
+        subject_id: subject,
+        tier: Some("free".to_string()),
+    });
+
+    // (a) The subscription hard stop surfaces as QuotaExceeded, NOT AllGated.
+    match gw.execute(&req).await.unwrap_err() {
+        GatewayError::QuotaExceeded {
+            unit,
+            window,
+            limit,
+            used,
+        } => {
+            assert_eq!(unit, MeterUnit::Requests);
+            assert_eq!(window, Window::Day);
+            assert_eq!(limit, 1);
+            assert_eq!(used, 1);
+        }
+        other => panic!(
+            "a subscription quota must hard-stop as QuotaExceeded, never demote/AllGated, got: {other}"
+        ),
+    }
+
+    // (b) It fires BEFORE selection: no provider was contacted...
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no model may be attempted on a subscription hard stop"
+    );
+    // (c) ...and NOTHING was locked out — a subject hard stop is not a
+    // provider-side limit, so it must not demote-by-lockout either.
+    assert!(
+        gw.model_lockout.get("A:a-model").is_none(),
+        "the subscription hard stop must not lock model A"
+    );
+    assert!(
+        gw.model_lockout.get("B:b-model").is_none(),
+        "the subscription hard stop must not lock model B"
+    );
+}
+
+/// Scenario: "A durable consumer pauses and resumes at resume_after". An
+/// all-gated selection surfaces `AllGated { resume_after: Some(t), .. }` whose
+/// `t` is a USABLE FUTURE wall-clock instant (`t > Utc::now()`) — the concrete
+/// wake-up time the orchestrator records as a durable pause. There is no
+/// orchestrator here, so this asserts the pause INPUT's shape/value (a future
+/// `DateTime<Utc>`), which is the contract a durable consumer depends on.
+#[tokio::test]
+async fn all_gated_resume_after_is_a_future_pause_instant() {
+    use crate::gates::lockout::LockReason;
+
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    gw.apply_lockout(
+        "A:a-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    );
+    gw.apply_lockout(
+        "B:b-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(1800)),
+    );
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllGated { resume_after, .. } => {
+            let t = resume_after.expect("a timed all-gated exposes a wake-up instant");
+            assert!(
+                t > chrono::Utc::now(),
+                "resume_after {t} must be a FUTURE instant a durable consumer can pause until"
+            );
+        }
+        other => panic!("expected AllGated, got: {other}"),
+    }
+}
