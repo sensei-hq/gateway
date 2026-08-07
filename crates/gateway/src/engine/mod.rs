@@ -133,8 +133,8 @@ impl Gateway {
         self
     }
 
-    /// Tune the health gates (cooldown/lockout durations; eviction cap and jitter
-    /// arrive in later work). Builder-style; rebuilds the recorder pipeline from
+    /// Tune the health gates (cooldown/lockout durations, eviction cap, and
+    /// deterministic per-endpoint jitter). Builder-style; rebuilds the recorder pipeline from
     /// `resilience` while preserving the SAME Arc-backed stores/observers/breaker,
     /// so the read-side gates keep reading what the sinks write. Absent ⇒
     /// [`ResilienceConfig::default`] (today's behavior). Construction-time only —
@@ -431,12 +431,14 @@ fn build_recorders(
             cooldown.clone(),
             resilience.cooldown_base,
             resilience.eviction_cap,
+            resilience.jitter_fraction,
         )),
         Arc::new(crate::gates::lockout::ModelLockoutSink::new(
             model_lockout.clone(),
             resilience.lockout.clone(),
             observers.clone(),
             resilience.eviction_cap,
+            resilience.jitter_fraction,
         )),
     ]
 }

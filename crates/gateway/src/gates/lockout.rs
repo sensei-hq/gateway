@@ -264,6 +264,10 @@ pub struct ModelLockoutSink {
     policy: ModelLockoutPolicy,
     observers: LockoutBroadcaster,
     eviction_cap: usize,
+    /// Deterministic per-endpoint jitter fraction added to SYNTHETIC backoff to
+    /// spread retry storms (Task 4). A real `Retry-After` is NEVER jittered.
+    /// `0.0` ⇒ off (today's behavior).
+    jitter_fraction: f64,
 }
 
 impl ModelLockoutSink {
@@ -272,29 +276,33 @@ impl ModelLockoutSink {
         policy: ModelLockoutPolicy,
         observers: LockoutBroadcaster,
         eviction_cap: usize,
+        jitter_fraction: f64,
     ) -> Self {
         Self {
             store,
             policy,
             observers,
             eviction_cap,
+            jitter_fraction,
         }
     }
 
     /// Compute the lock deadline. Terminal → `None`. A real retry-after is exact
-    /// (never clamped). Otherwise synthetic backoff = base * 2^escalation, clamped.
+    /// (never clamped, never jittered). Otherwise synthetic backoff =
+    /// base * 2^escalation, clamped, then spread by deterministic per-endpoint jitter.
     fn deadline(
         &self,
         reason: LockReason,
         retry_after: Option<Duration>,
         escalation: u32,
         now: Instant,
+        endpoint: &str,
     ) -> Option<Instant> {
         if reason.is_terminal() {
             return None;
         }
         if let Some(exact) = retry_after {
-            return Some(now + exact); // honored verbatim, never clamped
+            return Some(now + exact); // honored verbatim, never clamped, never jittered
         }
         let base = match reason {
             LockReason::RateLimit => self.policy.rate_limit_base,
@@ -303,7 +311,11 @@ impl ModelLockoutSink {
         };
         let factor = 1u32.checked_shl(escalation.min(16)).unwrap_or(u32::MAX);
         let backoff = base.saturating_mul(factor).min(self.policy.max_cooldown);
-        Some(now + backoff)
+        // Deterministic per-endpoint jitter spreads synthetic backoffs across
+        // endpoints (`jitter_fraction = 0.0` ⇒ exactly `now + backoff`).
+        let jittered = backoff
+            + crate::resilience::deterministic_jitter(endpoint, backoff, self.jitter_fraction);
+        Some(now + jittered)
     }
 }
 
@@ -326,7 +338,7 @@ impl HealthRecorder for ModelLockoutSink {
             None => 0,
         };
 
-        let until = self.deadline(reason, retry_after(err), escalation, now);
+        let until = self.deadline(reason, retry_after(err), escalation, now, o.endpoint);
         self.store.set(o.endpoint, reason, until, escalation);
         // Bound the map on the write path only (a success `clear`s and shrinks).
         self.store.evict_expired_over_cap(self.eviction_cap);
@@ -611,6 +623,7 @@ mod tests {
             ModelLockoutPolicy::default(),
             LockoutBroadcaster::new(),
             4096,
+            0.0,
         );
         (store, sink)
     }
@@ -879,6 +892,7 @@ mod tests {
             ModelLockoutPolicy::default(),
             LockoutBroadcaster::new(),
             1,
+            0.0,
         );
 
         // A fresh rate-limit failure on a NEW endpoint → writes then evicts.
@@ -905,5 +919,71 @@ mod tests {
         assert!(store.locked("new:m").is_some(), "just-written lock present");
         // Map bounded to the non-expired entries (terminal + active + new).
         assert!(store.len() <= 3);
+    }
+
+    /// A real `Retry-After` (429 with `retry_after_ms`) is honored verbatim (~2s)
+    /// and is NEVER jittered, EVEN with `jitter_fraction > 0` — the exact upstream
+    /// signal wins over synthetic spread. Asserts a tight ~2s window that any
+    /// mistaken jitter (tens/hundreds of ms on the 2s base) would blow past.
+    #[test]
+    fn sink_never_jitters_exact_retry_after() {
+        let store = ModelLockoutStore::new();
+        let sink = ModelLockoutSink::new(
+            store.clone(),
+            ModelLockoutPolicy::default(),
+            LockoutBroadcaster::new(),
+            4096,
+            0.5, // jitter ON — must STILL be ignored for an exact Retry-After
+        );
+        let now = Instant::now();
+        let err = GatewayError::RateLimit {
+            adapter: "a".into(),
+            retry_after_ms: Some(2000),
+        };
+        let until = sink.on_outcome(&fail(&err)).expect("timed lock");
+        assert!(
+            until > now + Duration::from_millis(1900),
+            "retry-after honored (~2s)"
+        );
+        assert!(
+            until < now + Duration::from_millis(2100),
+            "retry-after exact — NOT widened by jitter"
+        );
+    }
+
+    /// Synthetic backoff (a 429 with NO `retry_after_ms`) IS spread by the
+    /// deterministic per-endpoint jitter when `jitter_fraction > 0`: the deadline
+    /// is `now + base + jitter(endpoint)`, within `[now+base, now+base*1.5)`.
+    #[test]
+    fn sink_jitters_synthetic_backoff() {
+        let store = ModelLockoutStore::new();
+        let sink = ModelLockoutSink::new(
+            store.clone(),
+            ModelLockoutPolicy::default(),
+            LockoutBroadcaster::new(),
+            4096,
+            0.5,
+        );
+        let now = Instant::now();
+        // Rate limit WITHOUT retry_after ⇒ synthetic 60s base backoff.
+        let err = GatewayError::RateLimit {
+            adapter: "a".into(),
+            retry_after_ms: None,
+        };
+        let until = sink.on_outcome(&fail(&err)).expect("timed lock");
+        let base = ModelLockoutPolicy::default().rate_limit_base; // 60s
+        let jitter = crate::resilience::deterministic_jitter("r:m", base, 0.5);
+        // Deadline = now + base + deterministic jitter (± tiny scheduling margin).
+        assert!(
+            until >= now + base + jitter,
+            "carries the deterministic per-endpoint jitter"
+        );
+        assert!(
+            until < now + base + jitter + Duration::from_secs(1),
+            "no more than base + deterministic jitter"
+        );
+        // Within [now+base, now+base*1.5).
+        assert!(until >= now + base);
+        assert!(until < now + base + base / 2);
     }
 }
