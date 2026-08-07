@@ -303,14 +303,25 @@ impl Gateway {
         success: bool,
         error: Option<&GatewayError>,
     ) {
-        let o = crate::gates::AttemptOutcome {
-            endpoint,
-            success,
-            error,
-        };
-        for r in &self.recorders {
-            r.on_outcome(&o);
-        }
+        dispatch_outcome(&self.recorders, endpoint, success, error);
+    }
+}
+
+/// Dispatch an attempt outcome to every recorder. Free fn so the `'static`
+/// stream closure can own a cloned recorder set (where `&self` is unavailable).
+pub(super) fn dispatch_outcome(
+    recorders: &[std::sync::Arc<dyn crate::gates::HealthRecorder>],
+    endpoint: &str,
+    success: bool,
+    error: Option<&crate::types::error::GatewayError>,
+) {
+    let o = crate::gates::AttemptOutcome {
+        endpoint,
+        success,
+        error,
+    };
+    for r in recorders {
+        r.on_outcome(&o);
     }
 }
 
