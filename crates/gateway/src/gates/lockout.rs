@@ -141,6 +141,16 @@ impl ModelLockoutStore {
             .unwrap_or_else(|e| e.into_inner())
             .remove(endpoint);
     }
+    /// Clear terminal (`Auth`/`Credits`) locks on all of `router`'s endpoints
+    /// (keys `"{router}:*"`). Used after `refresh_router_keys` — a new credential
+    /// may fix an auth/credits lock. Timed locks (rate/quota) are left intact.
+    pub fn clear_terminal_for_router(&self, router: &str) {
+        let prefix = format!("{router}:");
+        self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, e| !(k.starts_with(&prefix) && e.reason.is_terminal()));
+    }
 }
 
 impl ModelLockoutRead for ModelLockoutStore {
@@ -426,6 +436,34 @@ mod tests {
         // clear removes it
         s.clear("r:m");
         assert!(s.locked("r:m").is_none());
+    }
+
+    /// `clear_terminal_for_router` is both terminal-only AND router-scoped:
+    /// with a terminal and a timed lock on the SAME router, only the terminal
+    /// one is removed (proving the `is_terminal()` predicate, not mere router
+    /// scoping); a terminal lock on a different router is left untouched.
+    #[test]
+    fn clear_terminal_for_router_removes_only_terminal_on_that_router() {
+        let s = ModelLockoutStore::new();
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        s.set("r1:auth-model", LockReason::Auth, None, 0); // terminal, r1
+        s.set(
+            "r1:quota-model",
+            LockReason::QuotaExhausted,
+            Some(future),
+            0,
+        ); // timed, r1
+        s.set("r2:auth-model", LockReason::Auth, None, 0); // terminal, r2 (untouched)
+        s.clear_terminal_for_router("r1");
+        assert!(
+            s.locked("r1:auth-model").is_none(),
+            "terminal on r1 cleared"
+        );
+        assert!(s.locked("r1:quota-model").is_some(), "timed on r1 survives");
+        assert!(
+            s.locked("r2:auth-model").is_some(),
+            "other router untouched"
+        );
     }
 
     /// Fake endpoint health port returning None regardless of endpoint (not

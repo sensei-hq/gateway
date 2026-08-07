@@ -3065,3 +3065,143 @@ async fn execute_panel_strict_drops_runtime_family_convergence() {
         strict.collisions
     );
 }
+
+// --- Task 6: on_lockout callback + apply/clear + terminal-lock lifecycle ---
+
+/// A best-effort `SelectionObserver` that records every announced lockout as
+/// `(endpoint, reason, until.is_some())`. Playing the *caller*, it is what
+/// "persists" — the gateway only announces (design §5c).
+struct RecordingObserver(
+    Arc<std::sync::Mutex<Vec<(String, crate::gates::lockout::LockReason, bool)>>>,
+);
+
+impl crate::gates::lockout::SelectionObserver for RecordingObserver {
+    fn on_lockout(
+        &self,
+        endpoint: &str,
+        reason: crate::gates::lockout::LockReason,
+        until: Option<Instant>,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((endpoint.to_string(), reason, until.is_some()));
+    }
+}
+
+/// (a) The gateway FIRES `on_lockout` when the sink locks an endpoint; the
+/// observer (the caller) is what records it. A 403-quota failover locks
+/// `failing:fail-model` (timed → `until.is_some()`), and the observer sees it.
+#[tokio::test]
+async fn on_lockout_callback_fires_caller_persists() {
+    use crate::gates::lockout::LockReason;
+
+    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observer = Arc::new(RecordingObserver(recorded.clone()));
+    let gw = test_gateway_with_chain().with_observer(observer.clone());
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "quota exceeded".into(),
+            status: Some(403),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    gw.execute(&chat_request()).await.unwrap();
+
+    let recorded = recorded.lock().unwrap();
+    assert!(
+        recorded.contains(&(
+            "failing:fail-model".to_string(),
+            LockReason::QuotaExhausted,
+            true
+        )),
+        "the gateway must announce the timed quota lock to the observer, got {recorded:?}"
+    );
+}
+
+/// (b) `apply_lockout` re-seeds a persisted lock on a fresh instance (no prior
+/// failure): the gate then skips `failing:fail-model`, so only noop is
+/// attempted. `clear_lockout` restores it — the endpoint is tried first again.
+#[tokio::test]
+async fn apply_and_clear_lockout_reseed_and_restore() {
+    use crate::gates::lockout::LockReason;
+
+    let gw = test_gateway_with_chain();
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "quota exceeded".into(),
+            status: Some(403),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    // Re-seed a timed quota lock without ever failing: the caller persisted it
+    // and hands it back on this fresh instance.
+    gw.apply_lockout(
+        "failing:fail-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    );
+
+    // The locked endpoint is skipped at selection → only noop is attempted.
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response.model, Some("noop".to_string()));
+    assert_eq!(
+        response.attempts.len(),
+        1,
+        "the re-seeded lock must skip failing:fail-model (noop only)"
+    );
+    assert_eq!(response.attempts[0].adapter, "noop");
+
+    // Clearing the lock makes the endpoint eligible again: it is attempted
+    // first (403-quota), then falls over to noop — two attempts.
+    gw.clear_lockout("failing:fail-model");
+    let response2 = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response2.model, Some("noop".to_string()));
+    assert_eq!(
+        response2.attempts.len(),
+        2,
+        "after clear, failing:fail-model is tried first again"
+    );
+    assert_eq!(response2.attempts[0].adapter, "failing");
+}
+
+/// (c) `refresh_router_keys` clears TERMINAL (`Auth`/`Credits`) locks on every
+/// configured router's endpoints — a fresh credential may fix them — but leaves
+/// TIMED locks intact (a rate/quota reset is unrelated to the key). Selectivity
+/// is proven by a timed lock on a *different*, unconfigured endpoint surviving.
+#[tokio::test]
+async fn refresh_router_keys_clears_terminal_lock_but_keeps_timed() {
+    use crate::gates::lockout::LockReason;
+
+    let gw = test_gateway_with_chain();
+
+    // Terminal Auth lock on a configured router's endpoint...
+    gw.apply_lockout("failing:fail-model", LockReason::Auth, None);
+    // ...and a timed quota lock on a different (unconfigured) endpoint, which
+    // must survive — proving the clear is both terminal-only and router-scoped.
+    gw.apply_lockout(
+        "other:other-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    );
+
+    gw.refresh_router_keys(|_| Some("new-key".to_string()))
+        .await;
+
+    assert!(
+        gw.model_lockout.get("failing:fail-model").is_none(),
+        "a fresh credential must clear the terminal Auth lock"
+    );
+    assert!(
+        gw.model_lockout.get("other:other-model").is_some(),
+        "a timed (rate/quota) lock is unrelated to the key and must survive"
+    );
+}
