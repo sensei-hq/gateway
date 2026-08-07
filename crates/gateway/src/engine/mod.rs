@@ -53,8 +53,9 @@ pub struct Gateway {
     /// Write-side health recorders fanned out on every attempt outcome
     /// (currently just the circuit breaker sink; more land in later plans).
     recorders: Vec<Arc<dyn crate::gates::HealthRecorder>>,
-    /// Router-level connection cooldown read/write state (read side wired into
-    /// selection now; nothing writes to it yet — that lands in Task 3).
+    /// Router-level connection cooldown read/write state: read side wired into
+    /// selection, write side is [`crate::gates::cooldown::ConnectionCooldownSink`]
+    /// in `recorders` — both share this one store (see [`Gateway::new`]).
     cooldown: crate::gates::cooldown::ConnectionCooldownStore,
 }
 
@@ -64,9 +65,18 @@ impl Gateway {
         adapters: AdapterRegistry,
         circuit_breaker: CircuitBreakerManager,
     ) -> Self {
-        let recorders: Vec<Arc<dyn crate::gates::HealthRecorder>> = vec![Arc::new(
-            crate::gates::circuit_breaker_gate::CircuitBreakerSink::new(circuit_breaker.clone()),
-        )];
+        // Built before `recorders` so the gate's read-side field and the sink's
+        // write-side handle share the SAME store (Arc-backed `Clone`).
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let recorders: Vec<Arc<dyn crate::gates::HealthRecorder>> = vec![
+            Arc::new(crate::gates::circuit_breaker_gate::CircuitBreakerSink::new(
+                circuit_breaker.clone(),
+            )),
+            Arc::new(crate::gates::cooldown::ConnectionCooldownSink::new(
+                cooldown.clone(),
+                crate::gates::cooldown::DEFAULT_CONNECTION_COOLDOWN,
+            )),
+        ];
         Self {
             config: Arc::new(RwLock::new(config)),
             adapters,
@@ -74,7 +84,7 @@ impl Gateway {
             store: None,
             probe: None,
             recorders,
-            cooldown: crate::gates::cooldown::ConnectionCooldownStore::new(),
+            cooldown,
         }
     }
 
@@ -304,10 +314,11 @@ impl Gateway {
     pub(super) fn record_outcome(
         &self,
         endpoint: &str,
+        router: &str,
         success: bool,
         error: Option<&GatewayError>,
     ) {
-        dispatch_outcome(&self.recorders, endpoint, success, error);
+        dispatch_outcome(&self.recorders, endpoint, router, success, error);
     }
 }
 
@@ -316,11 +327,13 @@ impl Gateway {
 pub(super) fn dispatch_outcome(
     recorders: &[std::sync::Arc<dyn crate::gates::HealthRecorder>],
     endpoint: &str,
+    router: &str,
     success: bool,
     error: Option<&crate::types::error::GatewayError>,
 ) {
     let o = crate::gates::AttemptOutcome {
         endpoint,
+        router,
         success,
         error,
     };

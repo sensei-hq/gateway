@@ -52,11 +52,14 @@ pub trait AdmissionGate: Send + Sync {
 }
 
 /// A single attempt's outcome, fed to the write-side recorders. `endpoint` is the
-/// opaque "router:model" key (matches the read-side breaker keying). `error` is
-/// carried for later recorders (cooldown/lockout classify it); the breaker sink
-/// uses only `success`.
+/// opaque "router:model" key (matches the read-side breaker keying). `router` is
+/// carried separately since `endpoint` can't be split reliably back into
+/// router/model (model ids contain `:`, e.g. `gemma3:27b`) — the cooldown sink
+/// needs it to key the router-level store. `error` is carried for later
+/// recorders (cooldown/lockout classify it); the breaker sink uses only `success`.
 pub struct AttemptOutcome<'a> {
     pub endpoint: &'a str,
+    pub router: &'a str,
     pub success: bool,
     pub error: Option<&'a GatewayError>,
 }
