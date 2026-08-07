@@ -87,9 +87,10 @@ pub async fn mount_status_json(
 }
 
 /// Which `GatewayError` variant a mapped HTTP status is expected to produce — the one
-/// axis that genuinely varies per provider (flux/grok/together map 401/403→Authentication,
-/// 429→RateLimit; the async-job adapters fal/kling/luma/runway/replicate route every submit
-/// status through `ProviderError`). Passed to [`assert_http_error`] / the
+/// axis that genuinely varies per provider (flux/grok/together map 401→Authentication,
+/// 429→RateLimit, and every other code including 403→`ProviderError`; the async-job adapters
+/// fal/kling/luma/runway/replicate route every submit status through `ProviderError`). Passed
+/// to [`assert_http_error`] / the
 /// [`http_error_tests!`](crate::http_error_tests) macro so the shared harness asserts the
 /// right variant.
 pub enum ErrKind {

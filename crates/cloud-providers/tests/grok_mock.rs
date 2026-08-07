@@ -9,9 +9,9 @@
 //!     parses `{text}`.
 //!   - `speak()`      -> POST `/v1/audio/speech`, returns the raw audio bytes.
 //!
-//! All auth uses a Bearer token; every endpoint maps 401/403 ->
-//! Authentication, 429 -> RateLimit, and any other non-success status ->
-//! ProviderError { status: Some(..), .. }.
+//! All auth uses a Bearer token; every endpoint maps 401 ->
+//! Authentication, 429 -> RateLimit, and any other non-success status
+//! (including 403) -> ProviderError { status: Some(..), .. }.
 
 use kernel::types::io::{ChatRequest, SttRequest, TtsRequest};
 use kernel::types::request::{AudioFormat, Message, MessageRole};
@@ -119,7 +119,7 @@ http_error_tests! {
     path: "/v1/chat/completions",
     cases: {
         grok_chat_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
-        grok_chat_403_maps_to_authentication => (403, "forbidden", common::ErrKind::Auth),
+        grok_chat_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
         grok_chat_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
         grok_chat_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
     }
@@ -211,7 +211,7 @@ http_error_tests! {
     method: "POST",
     path: "/v1/audio/speech",
     cases: {
-        grok_tts_403_maps_to_authentication => (403, "forbidden", common::ErrKind::Auth),
+        grok_tts_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
         grok_tts_429_maps_to_rate_limit => (429, "slow down", common::ErrKind::RateLimit),
         grok_tts_500_maps_to_provider_error => (500, "internal error", common::ErrKind::Provider(Some(500))),
     }
