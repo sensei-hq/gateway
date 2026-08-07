@@ -90,21 +90,16 @@ impl Gateway {
         let lockout_observers = crate::gates::lockout::LockoutBroadcaster::new();
         // Built AFTER `model_lockout` so the sink's write handle and the gate's
         // read-side field share the SAME Arc-backed store (the gate skips what
-        // the sink locked).
-        let recorders: Vec<Arc<dyn crate::gates::HealthRecorder>> = vec![
-            Arc::new(crate::gates::circuit_breaker_gate::CircuitBreakerSink::new(
-                circuit_breaker.clone(),
-            )),
-            Arc::new(crate::gates::cooldown::ConnectionCooldownSink::new(
-                cooldown.clone(),
-                crate::gates::cooldown::DEFAULT_CONNECTION_COOLDOWN,
-            )),
-            Arc::new(crate::gates::lockout::ModelLockoutSink::new(
-                model_lockout.clone(),
-                Default::default(),
-                lockout_observers.clone(),
-            )),
-        ];
+        // the sink locked). The default config reproduces today's constants
+        // (30s cooldown, 60s/1h/6h lockout) — `with_resilience` rebuilds this
+        // from a tuned config while preserving the same shared handles.
+        let recorders = build_recorders(
+            &circuit_breaker,
+            &cooldown,
+            &model_lockout,
+            &lockout_observers,
+            &crate::resilience::ResilienceConfig::default(),
+        );
         Self {
             config: Arc::new(RwLock::new(config)),
             adapters,
@@ -135,6 +130,26 @@ impl Gateway {
         observer: Arc<dyn crate::gates::lockout::SelectionObserver>,
     ) -> Self {
         self.lockout_observers.register(observer);
+        self
+    }
+
+    /// Tune the health gates (cooldown/lockout durations; eviction cap and jitter
+    /// arrive in later work). Builder-style; rebuilds the recorder pipeline from
+    /// `resilience` while preserving the SAME Arc-backed stores/observers/breaker,
+    /// so the read-side gates keep reading what the sinks write. Absent ⇒
+    /// [`ResilienceConfig::default`] (today's behavior). Construction-time only —
+    /// NOT hot-swappable via `update_config` (which carries routing config, not
+    /// resilience policy).
+    ///
+    /// [`ResilienceConfig::default`]: crate::resilience::ResilienceConfig::default
+    pub fn with_resilience(mut self, resilience: crate::resilience::ResilienceConfig) -> Self {
+        self.recorders = build_recorders(
+            &self.circuit_breaker,
+            &self.cooldown,
+            &self.model_lockout,
+            &self.lockout_observers,
+            &resilience,
+        );
         self
     }
 
@@ -389,6 +404,39 @@ impl Gateway {
     ) -> Option<std::time::Instant> {
         dispatch_outcome(&self.recorders, endpoint, router, success, error)
     }
+}
+
+/// Build the write-side health recorder pipeline from a [`ResilienceConfig`].
+///
+/// The single sink-construction site, shared by [`Gateway::new`] (with
+/// [`ResilienceConfig::default`]) and [`Gateway::with_resilience`]. Each sink is
+/// handed a **clone** of the caller's Arc-backed store/observers/breaker, so the
+/// rebuilt sinks write to the SAME shared handles the read-side gates read —
+/// only the tunable durations (cooldown base, lockout policy) change.
+///
+/// [`ResilienceConfig`]: crate::resilience::ResilienceConfig
+/// [`ResilienceConfig::default`]: crate::resilience::ResilienceConfig::default
+fn build_recorders(
+    breaker: &CircuitBreakerManager,
+    cooldown: &crate::gates::cooldown::ConnectionCooldownStore,
+    model_lockout: &crate::gates::lockout::ModelLockoutStore,
+    observers: &crate::gates::lockout::LockoutBroadcaster,
+    resilience: &crate::resilience::ResilienceConfig,
+) -> Vec<Arc<dyn crate::gates::HealthRecorder>> {
+    vec![
+        Arc::new(crate::gates::circuit_breaker_gate::CircuitBreakerSink::new(
+            breaker.clone(),
+        )),
+        Arc::new(crate::gates::cooldown::ConnectionCooldownSink::new(
+            cooldown.clone(),
+            resilience.cooldown_base,
+        )),
+        Arc::new(crate::gates::lockout::ModelLockoutSink::new(
+            model_lockout.clone(),
+            resilience.lockout.clone(),
+            observers.clone(),
+        )),
+    ]
 }
 
 /// Dispatch an attempt outcome to every recorder. Free fn so the `'static`

@@ -1081,6 +1081,66 @@ async fn timeout_cools_router_and_next_selection_skips_it() {
 }
 
 #[tokio::test]
+async fn with_resilience_overrides_cooldown_base() {
+    // A gateway tuned with a very short `cooldown_base` (50ms) must cool the
+    // router for ~50ms, NOT the 30s default: `with_resilience` rebuilds the
+    // recorder pipeline from the config while preserving the SAME shared
+    // `cooldown` store, so the gate reads what the (reconfigured) sink writes.
+    let gw = test_gateway_with_chain().with_resilience(crate::resilience::ResilienceConfig {
+        cooldown_base: std::time::Duration::from_millis(50),
+        ..Default::default()
+    });
+    register_failing(
+        &gw,
+        GatewayError::Timeout {
+            adapter: "failing".into(),
+            model: "fail-model".into(),
+            duration_ms: 1,
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    // Execute so "failing" times out and gets cooled by the rebuilt sink.
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response.model, Some("noop".to_string()));
+
+    let until = gw.cooldown.cooling_until("failing").expect("cooled");
+    let now = std::time::Instant::now();
+    assert!(
+        until <= now + std::time::Duration::from_millis(500),
+        "custom 50ms base, not 30s"
+    );
+}
+
+#[tokio::test]
+async fn default_gateway_still_uses_30s_cooldown() {
+    // The SAME setup WITHOUT `with_resilience` preserves today's behavior: the
+    // default recorder pipeline cools the router for the 30s default.
+    let gw = test_gateway_with_chain();
+    register_failing(
+        &gw,
+        GatewayError::Timeout {
+            adapter: "failing".into(),
+            model: "fail-model".into(),
+            duration_ms: 1,
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response.model, Some("noop".to_string()));
+
+    let until = gw.cooldown.cooling_until("failing").expect("cooled");
+    let now = std::time::Instant::now();
+    assert!(
+        until > now + std::time::Duration::from_secs(25),
+        "the 30s default cooldown is preserved"
+    );
+}
+
+#[tokio::test]
 async fn quota_403_locks_model_and_next_selection_skips_it() {
     // A 403-quota outcome on "failing" is a classified provider limit: the
     // write-side `ModelLockoutSink` (registered in `Gateway::new`) locks the
