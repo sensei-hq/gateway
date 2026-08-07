@@ -10,11 +10,14 @@ source: crates/gateway/src/engine.rs, crates/kernel/src/types/error.rs
 
 # Quota Demote-to-Tier
 
-> **Status: Implemented (Phase 1 · SP-0 (d)+(e)).** Demote-to-tier, in-flight
+> **Status: Implemented (Phase 1 · SP-0 — complete).** Demote-to-tier, in-flight
 > §3.1 recoverable fallover, and the terminal `AllGated { resume_after,
-> human_action }` (both `execute` and `execute_stream`) are live. Deferred to
-> **(f)**: the calendar-clock exact reset boundary, seedable jitter, and
-> bounded-LRU eviction of lockout state. Design in
+> human_action }` (both `execute` and `execute_stream`) are live. **(f)** landed
+> the operator-tunable `ResilienceConfig` (`Gateway::with_resilience`), bounded
+> eviction of lockout/cooldown state, and deterministic per-endpoint jitter —
+> completing SP-0 (health gates). Still deferred (post-SP-0 / SP-DATA): the
+> calendar-clock exact reset boundary (the base quota window is a self-correcting
+> approximation) and an opaque `EndpointKey`. Design in
 > [`../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../../superpowers/specs/2026-08-06-sensei-orchestrator-design.md) §11.2/§12.
 
 Changes how a **provider-side** quota/limit on a specific model behaves in the
@@ -71,6 +74,7 @@ Feature: Quota demote-to-tier
 
 - Distinguish `quota_exhausted` (resets on a window → demote + `resume_after`) from `credits_exhausted` (terminal until top-up → human-action hint). See [model lockout](model-lockout.md) classification.
 - Depends on the tier model in [catalog/tiers-and-chains](../catalog/tiers-and-chains.md) for "next tier" semantics.
+- **Precedence with the subscription hard-stop.** The subscription `GatewayError::QuotaExceeded` (subject hard-stop, raised by `check_quota` before the candidate walk) is distinct from provider-side limits. When a subject is over-quota AND its providers are also all-gated at selection, the all-gated path currently surfaces first — the empty-candidate `AllGated` check runs before `check_quota`. Both mean "cannot serve now", so this is a deliberate precedence, to revisit if the subject hard-stop should always win.
 
 ### Scenarios — added from design review
 
