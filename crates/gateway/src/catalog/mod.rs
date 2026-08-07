@@ -1,4 +1,6 @@
+mod tiers;
 mod totals;
+pub use tiers::*;
 pub use totals::*;
 
 use crate::types::config::{CostBand, ModelConfig};
