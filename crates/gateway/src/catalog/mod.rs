@@ -1,5 +1,7 @@
+mod assemble;
 mod tiers;
 mod totals;
+pub use assemble::*;
 pub use tiers::*;
 pub use totals::*;
 
