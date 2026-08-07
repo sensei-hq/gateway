@@ -8,6 +8,7 @@ pub mod budget;
 pub mod capability;
 pub mod circuit_breaker_gate;
 pub mod cooldown;
+pub mod lockout;
 
 /// Read port for endpoint health (the circuit breaker implements it in Task 4;
 /// cooldown/lockout ports arrive in later SP-0 plans).
