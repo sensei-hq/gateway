@@ -3,6 +3,10 @@ use crate::types::capability::Capability;
 use crate::types::config::{GatewayConfig, ModelConfig, RouterConfig};
 use std::time::Instant;
 
+pub mod budget;
+pub mod capability;
+pub mod circuit_breaker_gate;
+
 /// Read port for endpoint health (the circuit breaker implements it in Task 4;
 /// cooldown/lockout ports arrive in later SP-0 plans).
 pub trait EndpointHealthRead: Send + Sync {
