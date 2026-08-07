@@ -176,6 +176,29 @@ impl CircuitBreakerManager {
     }
 }
 
+impl crate::gates::EndpointHealthRead for CircuitBreakerManager {
+    /// Read port used by [`crate::gates::circuit_breaker_gate::CircuitBreakerGate`].
+    ///
+    /// This MUST preserve `can_execute`'s exact semantics, including its
+    /// `Open -> HalfOpen` transition side effect when the timeout has
+    /// expired: that transition is what lets a breaker recover, and a
+    /// pure-read `get_state`-only implementation would silently drop it. If
+    /// `can_execute` allows the request, we admit (`None`); otherwise we
+    /// report the diagnostic retry instant (`until`, currently unused by the
+    /// gate beyond `SkipReason::CircuitOpen`'s payload). The pure-read /
+    /// recorder-driven split arrives in the write-side plan.
+    fn open_until(&self, endpoint: &str) -> Option<std::time::Instant> {
+        if self.can_execute(endpoint) {
+            None
+        } else {
+            match self.get_state(endpoint) {
+                BreakerState::Open { next_retry } => Some(next_retry),
+                _ => Some(std::time::Instant::now()), // unreachable: can_execute==false only when Open
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +399,50 @@ mod tests {
         // record_failure in Open state should not change state
         mgr.record_failure("ep1");
         assert_eq!(mgr.get_state("ep1").name(), "open");
+    }
+
+    mod endpoint_health_read {
+        use super::*;
+        use crate::gates::EndpointHealthRead;
+
+        #[test]
+        fn open_until_some_when_breaker_open() {
+            let mgr = make_manager(1, 60_000);
+            mgr.can_execute("ep1"); // initialize
+            mgr.record_failure("ep1"); // -> Open, timeout far in the future
+            assert_eq!(mgr.get_state("ep1").name(), "open");
+            assert!(mgr.open_until("ep1").is_some());
+            // Blocked, so the state must remain Open (no expired timeout to consume).
+            assert_eq!(mgr.get_state("ep1").name(), "open");
+        }
+
+        #[test]
+        fn open_until_none_for_fresh_endpoint() {
+            let mgr = make_manager(5, 5000);
+            assert!(mgr.open_until("never_seen").is_none());
+        }
+
+        #[test]
+        fn open_until_preserves_half_open_recovery_side_effect() {
+            // Pin that `open_until`, exactly like `can_execute`, transitions an
+            // expired-timeout Open breaker to HalfOpen. This is a side effect,
+            // not a pure read: dropping it would silently break circuit
+            // recovery, since HalfOpen is what lets probe requests back in.
+            let mgr = make_manager(1, 0); // 0ms timeout -> immediately expired
+            mgr.can_execute("ep1"); // initialize
+            mgr.record_failure("ep1"); // -> Open
+            assert_eq!(mgr.get_state("ep1").name(), "open");
+
+            let until = mgr.open_until("ep1");
+            assert!(
+                until.is_none(),
+                "expired Open must admit (None), mirroring can_execute's true"
+            );
+            assert_eq!(
+                mgr.get_state("ep1").name(),
+                "half_open",
+                "open_until must trigger the same Open->HalfOpen transition as can_execute"
+            );
+        }
     }
 }
