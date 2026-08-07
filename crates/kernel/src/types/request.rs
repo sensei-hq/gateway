@@ -559,6 +559,12 @@ pub enum StreamEvent {
     Error {
         code: String,
         message: String,
+        /// Wall-clock instant after which a durable pause may resume, mirroring
+        /// [`crate::types::error::GatewayError::AllGated`]. `Some` only when the
+        /// terminal error is an all-gated exhaustion whose gates are timed;
+        /// `None` for every other error (plain provider failure, mid-stream
+        /// fault, terminal all-gated needing human action).
+        resume_after: Option<chrono::DateTime<chrono::Utc>>,
     },
 }
 
@@ -1453,9 +1459,10 @@ mod tests {
         let event = StreamEvent::Error {
             code: "500".into(),
             message: "fail".into(),
+            resume_after: None,
         };
         match event {
-            StreamEvent::Error { code, message } => {
+            StreamEvent::Error { code, message, .. } => {
                 assert_eq!(code, "500");
                 assert_eq!(message, "fail");
             }

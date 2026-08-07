@@ -82,8 +82,16 @@ impl super::Gateway {
         );
         let result = svc.select_all(&criteria);
 
+        // No candidates? If every skip was a gate (health-lock / cooling /
+        // breaker-open / over-budget) this is a durable `AllGated` pause rather
+        // than a bare `NoCandidates` — mirrors `execute`'s selection-empty branch.
+        // Only an all-structural (misconfig / wrong-capability) selection stays
+        // `NoCandidates`.
         if result.all_candidates.is_empty() {
             tracing::warn!("no candidates available for streaming request");
+            if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {
+                return Err(gated);
+            }
             return Err(GatewayError::NoCandidates {
                 capability: request.capability.clone(),
             });
@@ -93,6 +101,16 @@ impl super::Gateway {
         self.check_quota(&config, request, input_tokens).await?;
 
         // Owned state moved into the stream (it must be `'static`).
+        // Move the selection-skips out for the `'static` closure — consumed only
+        // at stream-exhaustion to decide `AllGated` vs a plain terminal error
+        // (distinct field from `all_candidates`, so this partial move is fine).
+        let skipped_owned: Vec<crate::selection::SkippedCandidate> = result.skipped;
+        // Per-attempt gate contributions, aggregated at exhaustion into `AllGated`
+        // (a recoverable limit that just locked its endpoint contributes a timed
+        // resume instant; a terminal one a human-action; a hard fault vetoes
+        // all-gated). Mirrors `execute`'s `contributions`; lives across loop
+        // iterations, so it is declared here and moved into the stream closure.
+        let mut contributions: Vec<super::exhaustion::GateContribution> = Vec::new();
         // Fallback disabled ⇒ keep only the primary candidate, so `has_more`
         // is always false downstream and no ProviderSwitch/step-down can fire.
         let mut candidates = result.all_candidates;
@@ -136,7 +154,13 @@ impl super::Gateway {
                 let mut fail_code = String::new();
                 let mut fail_message = String::new();
                 let mut fail_should_fallback = false;
-                let mut fail_record_cb = false;
+                // The real setup `GatewayError`, retained so it reaches the
+                // recorder sinks (cooldown / lockout) and drives exhaustion
+                // aggregation. `None` for the no-adapter arm (not a provider
+                // fault) — previously the error's string projections were kept
+                // but the error itself was dropped, so a stream-setup failure
+                // never cooled/locked its router/endpoint.
+                let mut fail_error: Option<GatewayError> = None;
 
                 match adapters.chat(&candidate.router).await {
                     None => {
@@ -146,14 +170,20 @@ impl super::Gateway {
                         // A missing adapter is not a provider fault; skip to the
                         // next candidate unconditionally (mirrors `execute`).
                         fail_should_fallback = true;
-                        fail_record_cb = false;
                     }
                     Some(m) => match crate::dispatch::to_chat_request(&request, model) {
                         Err(e) => {
                             fail_code = stream_error_code(&e);
                             fail_message = e.to_string();
-                            fail_should_fallback = e.should_trigger_fallback(&fallback_triggers);
-                            fail_record_cb = true;
+                            // Classify-first fallover, identical to `execute` (§3.1):
+                            // a recoverable provider limit demotes on THIS request;
+                            // a terminal one stops; a non-limit error keeps the
+                            // configured trigger semantics.
+                            fail_should_fallback = match crate::gates::lockout::classify(&e) {
+                                Some(reason) => reason.is_recoverable(),
+                                None => e.should_trigger_fallback(&fallback_triggers),
+                            };
+                            fail_error = Some(e);
                         }
                         Ok(chat_req) => {
                             // Per-call credential override (see `execute`): tenant-aware
@@ -173,9 +203,14 @@ impl super::Gateway {
                                 Err(e) => {
                                     fail_code = stream_error_code(&e);
                                     fail_message = e.to_string();
+                                    // Classify-first fallover, identical to
+                                    // `execute` (§3.1).
                                     fail_should_fallback =
-                                        e.should_trigger_fallback(&fallback_triggers);
-                                    fail_record_cb = true;
+                                        match crate::gates::lockout::classify(&e) {
+                                            Some(reason) => reason.is_recoverable(),
+                                            None => e.should_trigger_fallback(&fallback_triggers),
+                                        };
+                                    fail_error = Some(e);
                                 }
                             }
                         }
@@ -211,6 +246,7 @@ impl super::Gateway {
                                 yield StreamEvent::Error {
                                     code: stream_error_code(&e),
                                     message: e.to_string(),
+                                    resume_after: None,
                                 };
                                 return;
                             }
@@ -265,21 +301,31 @@ impl super::Gateway {
                     return;
                 }
 
-                // Setup failure for this candidate.
-                if fail_record_cb {
-                    // The original `GatewayError` isn't retained past the match
-                    // arms above (only its string projections are), so recorders
-                    // that classify by error variant (the cooldown sink) can't
-                    // act here — a stream setup failure never cools its router,
-                    // unlike `execute`'s failure path. The breaker sink is
-                    // unaffected either way since it only reads `success`.
-                    let _ = super::dispatch_outcome(
-                        &recorders,
-                        &endpoint,
-                        &candidate.router,
-                        false,
-                        None,
-                    );
+                // Setup failure for this candidate. Dispatch the RETAINED error
+                // to every recorder so the cooldown / lockout sinks classify it —
+                // a stream-setup failure now cools/locks exactly like `execute`'s
+                // failure path (previously the error was dropped here and never
+                // reached the sinks). Capture the instant any recorder just wrote
+                // (a recoverable limit that locked this endpoint) so exhaustion
+                // can attribute a timed resume to this attempt.
+                match &fail_error {
+                    Some(err) => {
+                        let written_until = super::dispatch_outcome(
+                            &recorders,
+                            &endpoint,
+                            &candidate.router,
+                            false,
+                            Some(err),
+                        );
+                        contributions
+                            .push(super::exhaustion::contribution_for(err, written_until));
+                    }
+                    None => {
+                        // No adapter registered → a hard/structural failure, not a
+                        // gate (vetoes all-gated). Mirrors `execute`: the no-adapter
+                        // path dispatches no recorder outcome.
+                        contributions.push(super::exhaustion::GateContribution::HardFailure);
+                    }
                 }
                 tracing::warn!(
                     adapter = %candidate.router,
@@ -301,15 +347,40 @@ impl super::Gateway {
                     continue;
                 }
 
-                // No further candidates to try (or a non-fallback error):
-                // flush the switch history, then a terminal Error.
+                // No further candidates to try (or a non-fallback stop): flush
+                // the switch history, then a terminal Error.
                 for ev in pending_switches.drain(..) {
                     yield ev;
                 }
-                yield StreamEvent::Error {
-                    code: fail_code,
-                    message: fail_message,
-                };
+                // Guard (mirrors `execute`): only aggregate to `AllGated` when the
+                // walk reached the LAST candidate (`!has_more`) — every candidate
+                // was attempted-and-gated. A non-fallback stop that left untried,
+                // still-eligible candidates (`has_more`) is NOT all-gated, so it
+                // stays a plain terminal error.
+                if !has_more {
+                    match super::exhaustion::all_gated_error(&skipped_owned, &contributions) {
+                        Some(GatewayError::AllGated { resume_after, .. }) => {
+                            yield StreamEvent::Error {
+                                code: "all_gated".to_string(),
+                                message: fail_message,
+                                resume_after,
+                            };
+                        }
+                        _ => {
+                            yield StreamEvent::Error {
+                                code: fail_code,
+                                message: fail_message,
+                                resume_after: None,
+                            };
+                        }
+                    }
+                } else {
+                    yield StreamEvent::Error {
+                        code: fail_code,
+                        message: fail_message,
+                        resume_after: None,
+                    };
+                }
                 return;
             }
         };
