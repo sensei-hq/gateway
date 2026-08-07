@@ -282,13 +282,13 @@ impl ModelLockoutSink {
 }
 
 impl HealthRecorder for ModelLockoutSink {
-    fn on_outcome(&self, o: &AttemptOutcome<'_>) {
+    fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<Instant> {
         if o.success {
             self.store.clear(o.endpoint); // success clears lock + escalation
-            return;
+            return None;
         }
-        let Some(err) = o.error else { return };
-        let Some(reason) = classify(err) else { return };
+        let err = o.error?; // no error carried → nothing to lock
+        let reason = classify(err)?; // not a provider-limit signal → no lock
 
         let now = Instant::now();
         let prior = self.store.get(o.endpoint);
@@ -303,6 +303,9 @@ impl HealthRecorder for ModelLockoutSink {
         let until = self.deadline(reason, retry_after(err), escalation, now);
         self.store.set(o.endpoint, reason, until, escalation);
         self.observers.fire(o.endpoint, reason, until);
+        // `Some(deadline)` for a timed lock, `None` for a terminal lock — exactly
+        // the recorder contract (a terminal lock has no wake-up instant).
+        until
     }
 }
 
@@ -603,11 +606,13 @@ mod tests {
             adapter: "a".into(),
             retry_after_ms: Some(2000),
         };
-        sink.on_outcome(&fail(&err));
+        let returned = sink.on_outcome(&fail(&err));
 
         let v = store.locked("r:m").expect("locked");
         assert_eq!(v.reason, LockReason::RateLimit);
         let until = v.until.expect("timed lock");
+        // The sink returns the timed deadline it just wrote — equal to `store.get`.
+        assert_eq!(returned, Some(until));
         assert!(
             until > now + Duration::from_millis(1500),
             "retry-after honored (>1.5s)"
@@ -664,11 +669,13 @@ mod tests {
         let (store, sink) = sink_with_default();
         let now = Instant::now();
         let err = provider(403, "You have exceeded your quota for this model");
-        sink.on_outcome(&fail(&err));
+        let returned = sink.on_outcome(&fail(&err));
 
         let v = store.locked("r:m").expect("locked");
         assert_eq!(v.reason, LockReason::QuotaExhausted);
         let until = v.until.expect("timed lock");
+        // The sink returns the timed deadline it just wrote — equal to `store.get`.
+        assert_eq!(returned, Some(until));
         assert!(
             until > now + Duration::from_secs(3000),
             "quota ~1h (>3000s)"
@@ -688,13 +695,15 @@ mod tests {
             adapter: "a".into(),
             message: "bad key".into(),
         };
-        sink.on_outcome(&fail(&auth));
+        let returned = sink.on_outcome(&fail(&auth));
+        assert_eq!(returned, None, "terminal lock has no wake-up instant");
         let v = store.locked("r:m").expect("locked");
         assert_eq!(v.reason, LockReason::Auth);
         assert_eq!(v.until, None, "terminal → no wake-up time");
 
         let credits = provider(403, "insufficient credits, please add billing");
-        sink.on_outcome(&fail(&credits));
+        let returned = sink.on_outcome(&fail(&credits));
+        assert_eq!(returned, None, "terminal lock has no wake-up instant");
         let v = store.locked("r:m").expect("locked");
         assert_eq!(v.reason, LockReason::CreditsExhausted);
         assert_eq!(v.until, None, "terminal → no wake-up time");
@@ -711,12 +720,13 @@ mod tests {
             Some(now + Duration::from_secs(60)),
             3,
         );
-        sink.on_outcome(&AttemptOutcome {
+        let returned = sink.on_outcome(&AttemptOutcome {
             endpoint: "r:m",
             router: "r",
             success: true,
             error: None,
         });
+        assert_eq!(returned, None, "success returns no wake-up instant");
         assert!(
             store.locked("r:m").is_none(),
             "success clears lock + escalation"
@@ -728,7 +738,8 @@ mod tests {
     fn sink_ignores_non_limit_faults() {
         let (store, sink) = sink_with_default();
 
-        sink.on_outcome(&fail(&provider(500, "boom")));
+        let returned = sink.on_outcome(&fail(&provider(500, "boom")));
+        assert_eq!(returned, None, "non-limit fault returns no wake-up instant");
         assert!(store.locked("r:m").is_none(), "500 is not a provider limit");
 
         let timeout = GatewayError::Timeout {
@@ -736,7 +747,8 @@ mod tests {
             model: "m".into(),
             duration_ms: 1,
         };
-        sink.on_outcome(&fail(&timeout));
+        let returned = sink.on_outcome(&fail(&timeout));
+        assert_eq!(returned, None, "non-limit fault returns no wake-up instant");
         assert!(
             store.locked("r:m").is_none(),
             "timeout is a transport fault, not a provider limit"

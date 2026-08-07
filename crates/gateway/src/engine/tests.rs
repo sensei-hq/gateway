@@ -694,8 +694,12 @@ async fn execute_records_attempts() {
 struct CountingRecorder(Arc<std::sync::atomic::AtomicUsize>);
 
 impl crate::gates::HealthRecorder for CountingRecorder {
-    fn on_outcome(&self, _outcome: &crate::gates::AttemptOutcome<'_>) {
+    fn on_outcome(
+        &self,
+        _outcome: &crate::gates::AttemptOutcome<'_>,
+    ) -> Option<std::time::Instant> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
     }
 }
 

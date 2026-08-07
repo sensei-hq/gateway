@@ -266,7 +266,7 @@ impl super::Gateway {
         match outcome {
             Ok(mut response) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                self.record_outcome(&endpoint, &candidate.router, true, None);
+                let _ = self.record_outcome(&endpoint, &candidate.router, true, None);
 
                 // Fill cost: the pre-call estimate from selection, and the
                 // actual dollar cost from the returned token usage × the
@@ -339,7 +339,7 @@ impl super::Gateway {
             }
             Err(err) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                self.record_outcome(&endpoint, &candidate.router, false, Some(&err));
+                let _ = self.record_outcome(&endpoint, &candidate.router, false, Some(&err));
 
                 let should_fallback = err.should_trigger_fallback(fallback_triggers);
 

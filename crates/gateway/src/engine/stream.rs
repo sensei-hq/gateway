@@ -184,7 +184,8 @@ impl super::Gateway {
 
                 if let Some(mut inner) = got_stream {
                     // A candidate produced a stream: commit to it.
-                    super::dispatch_outcome(&recorders, &endpoint, &candidate.router, true, None);
+                    let _ =
+                        super::dispatch_outcome(&recorders, &endpoint, &candidate.router, true, None);
                     let stream_start = Instant::now();
                     tracing::debug!(adapter = %candidate.router, model = %candidate.model, "streaming candidate");
                     for ev in pending_switches.drain(..) {
@@ -272,7 +273,13 @@ impl super::Gateway {
                     // act here — a stream setup failure never cools its router,
                     // unlike `execute`'s failure path. The breaker sink is
                     // unaffected either way since it only reads `success`.
-                    super::dispatch_outcome(&recorders, &endpoint, &candidate.router, false, None);
+                    let _ = super::dispatch_outcome(
+                        &recorders,
+                        &endpoint,
+                        &candidate.router,
+                        false,
+                        None,
+                    );
                 }
                 tracing::warn!(
                     adapter = %candidate.router,
