@@ -84,6 +84,7 @@ mod tests {
                 output_per_1k: 0.004,
                 per_request: None,
             }),
+            catalog: None,
         }
     }
 
@@ -97,6 +98,7 @@ mod tests {
             context_window: 128000,
             max_output_tokens: 8192,
             pricing: None,
+            catalog: None,
         }
     }
 

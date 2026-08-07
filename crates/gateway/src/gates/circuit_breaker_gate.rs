@@ -84,6 +84,7 @@ mod tests {
             context_window: 128000,
             max_output_tokens: 8192,
             pricing: None,
+            catalog: None,
         }
     }
 
