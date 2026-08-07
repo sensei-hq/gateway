@@ -1062,6 +1062,91 @@ async fn timeout_cools_router_and_next_selection_skips_it() {
 }
 
 #[tokio::test]
+async fn quota_403_locks_model_and_next_selection_skips_it() {
+    // A 403-quota outcome on "failing" is a classified provider limit: the
+    // write-side `ModelLockoutSink` (registered in `Gateway::new`) locks the
+    // endpoint `failing:fail-model`, so the read-side `ModelLockoutGate` skips
+    // that candidate on the very next selection and the chain never attempts it.
+    let gw = test_gateway_with_chain();
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "quota exceeded".into(),
+            status: Some(403),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    // First execute: "failing" returns the 403-quota (a configured ProviderError
+    // fallback trigger), the chain falls over to noop, and the sink locks the
+    // endpoint. Both candidates are attempted this time.
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response.model, Some("noop".to_string()));
+    assert_eq!(response.attempts.len(), 2);
+    assert_eq!(response.attempts[0].adapter, "failing");
+
+    // The sink classified the 403-quota body and wrote the SHARED lockout store:
+    // a timed (recoverable) QuotaExhausted lock, active into the future.
+    let entry = gw
+        .model_lockout
+        .get("failing:fail-model")
+        .expect("sink should have locked failing:fail-model");
+    assert_eq!(
+        entry.reason,
+        crate::gates::lockout::LockReason::QuotaExhausted
+    );
+    assert!(
+        entry.until.is_some_and(|u| u > Instant::now()),
+        "a quota lock is timed and currently active"
+    );
+
+    // Second execute: the endpoint is now skipped at selection (LockedOut), so
+    // only noop is attempted — a single successful attempt, no fallback. This is
+    // the non-vacuous proof: if the sink had not fired or the store were not
+    // shared with the gate, "failing" would be attempted first (two attempts).
+    let response2 = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response2.model, Some("noop".to_string()));
+    assert_eq!(response2.attempts.len(), 1);
+    assert_eq!(response2.attempts[0].adapter, "noop");
+}
+
+#[tokio::test]
+async fn provider_500_does_not_lock_model() {
+    // A 500 `ProviderError` triggers fallback but is NOT a provider limit, so
+    // `classify` returns `None` and the sink locks nothing — "failing" is still
+    // attempted first on the next selection.
+    let gw = test_gateway_with_chain();
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "server error".into(),
+            status: Some(500),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response.model, Some("noop".to_string()));
+    assert_eq!(response.attempts.len(), 2);
+    assert!(
+        gw.model_lockout.get("failing:fail-model").is_none(),
+        "a 500 is not a provider limit → nothing locked"
+    );
+
+    // Second execute: with nothing locked, "failing" is still attempted first
+    // and again falls over to noop (two attempts) — proving the absence of a
+    // lock is behavioral, not just an empty store.
+    let response2 = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response2.model, Some("noop".to_string()));
+    assert_eq!(response2.attempts.len(), 2);
+    assert_eq!(response2.attempts[0].adapter, "failing");
+}
+
+#[tokio::test]
 async fn no_fallback_when_disabled_stops_at_primary() {
     // `allow_fallback = false` (workspace "Automatic fallback" off): a
     // ProviderError on the primary is normally fallback-eligible, but with
