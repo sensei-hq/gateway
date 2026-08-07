@@ -51,7 +51,7 @@ impl super::Gateway {
         };
 
         // 3. Select all candidates
-        let svc = ModelSelectionService::new(&config, &self.circuit_breaker);
+        let svc = ModelSelectionService::new(&config, &self.circuit_breaker, &self.cooldown);
         let result = svc.select_all(&criteria);
 
         // 4. No candidates?

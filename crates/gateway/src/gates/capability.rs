@@ -35,6 +35,14 @@ mod tests {
         }
     }
 
+    /// Router health port stub for tests that don't exercise cooldown.
+    struct NeverCooling;
+    impl crate::gates::RouterHealthRead for NeverCooling {
+        fn cooling_until(&self, _router: &str) -> Option<Instant> {
+            None
+        }
+    }
+
     fn embed_only_model_config() -> ModelConfig {
         ModelConfig {
             id: "all-minilm".to_string(),
@@ -79,6 +87,7 @@ mod tests {
             health: &health,
             now: Instant::now(),
             config: &gateway_config,
+            router_health: &NeverCooling,
         };
 
         let verdict = CapabilityGate.evaluate(&cand, &ctx);
@@ -108,6 +117,7 @@ mod tests {
             health: &health,
             now: Instant::now(),
             config: &gateway_config,
+            router_health: &NeverCooling,
         };
 
         let verdict = CapabilityGate.evaluate(&cand, &ctx);

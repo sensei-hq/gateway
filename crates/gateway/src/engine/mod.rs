@@ -53,6 +53,9 @@ pub struct Gateway {
     /// Write-side health recorders fanned out on every attempt outcome
     /// (currently just the circuit breaker sink; more land in later plans).
     recorders: Vec<Arc<dyn crate::gates::HealthRecorder>>,
+    /// Router-level connection cooldown read/write state (read side wired into
+    /// selection now; nothing writes to it yet — that lands in Task 3).
+    cooldown: crate::gates::cooldown::ConnectionCooldownStore,
 }
 
 impl Gateway {
@@ -71,6 +74,7 @@ impl Gateway {
             store: None,
             probe: None,
             recorders,
+            cooldown: crate::gates::cooldown::ConnectionCooldownStore::new(),
         }
     }
 
