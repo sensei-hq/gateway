@@ -23,6 +23,7 @@ pub(super) fn stream_error_code(err: &GatewayError) -> String {
         GatewayError::NoCandidates { .. } => "no_candidates".to_string(),
         GatewayError::NotConfigured => "not_configured".to_string(),
         GatewayError::AllAttemptsFailed { .. } => "all_attempts_failed".to_string(),
+        GatewayError::AllGated { .. } => "all_gated".to_string(),
         GatewayError::ModelNotReady { .. } => "model_not_ready".to_string(),
         GatewayError::InvalidConfig(_) => "invalid_config".to_string(),
         GatewayError::Network(_) => "network".to_string(),
