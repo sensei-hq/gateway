@@ -62,6 +62,12 @@ pub struct Gateway {
     /// both share this one store (see [`Gateway::new`]) so the gate skips what
     /// the sink locked.
     model_lockout: crate::gates::lockout::ModelLockoutStore,
+    /// Best-effort lockout observers the sink fires into (§5c: the gateway
+    /// announces, the caller persists). Registered via [`Gateway::with_observer`]
+    /// and shared — one Arc-backed registry — with the
+    /// [`crate::gates::lockout::ModelLockoutSink`] in `recorders` (see
+    /// [`Gateway::new`]) so a registered observer sees every lock the sink writes.
+    lockout_observers: crate::gates::lockout::LockoutBroadcaster,
 }
 
 impl Gateway {
@@ -74,11 +80,12 @@ impl Gateway {
         // write-side handle share the SAME store (Arc-backed `Clone`).
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
         let model_lockout = crate::gates::lockout::ModelLockoutStore::new();
-        // Empty registry the sink fires into (a no-op until Task 6's
-        // `with_observer` registers one). The `Gateway` keeps no handle yet:
-        // its only consumer is `with_observer`, which lands in Task 6 alongside
-        // the retained field — adding the field now would be a never-read
-        // (dead-code) field under `-D warnings`.
+        // Empty registry the sink fires into (a no-op until `with_observer`
+        // registers one). Built here and retained on the `Gateway` so the
+        // read/write sides share ONE Arc-backed registry: `with_observer`
+        // registers into this handle, and the sink below is handed a clone of
+        // the SAME registry — so a registered observer sees every lock the
+        // sink writes (§5c: the gateway announces, the caller persists).
         let lockout_observers = crate::gates::lockout::LockoutBroadcaster::new();
         // Built AFTER `model_lockout` so the sink's write handle and the gate's
         // read-side field share the SAME Arc-backed store (the gate skips what
@@ -94,7 +101,7 @@ impl Gateway {
             Arc::new(crate::gates::lockout::ModelLockoutSink::new(
                 model_lockout.clone(),
                 Default::default(),
-                lockout_observers,
+                lockout_observers.clone(),
             )),
         ];
         Self {
@@ -106,6 +113,7 @@ impl Gateway {
             recorders,
             cooldown,
             model_lockout,
+            lockout_observers,
         }
     }
 
@@ -115,6 +123,35 @@ impl Gateway {
     pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
         self.store = Some(store);
         self
+    }
+
+    /// Register a best-effort lockout observer (the caller persists what the
+    /// gateway announces). Builder-style; the core never persists (§5c). The
+    /// observer is fired on every lock the [`crate::gates::lockout::ModelLockoutSink`]
+    /// writes, since both share one Arc-backed registry (see [`Gateway::new`]).
+    pub fn with_observer(
+        self,
+        observer: Arc<dyn crate::gates::lockout::SelectionObserver>,
+    ) -> Self {
+        self.lockout_observers.register(observer);
+        self
+    }
+
+    /// Re-seed a persisted lockout on this instance (caller → gateway, §5c).
+    /// Tenant scoping is the caller's — this touches only this instance's
+    /// in-memory store; the gateway itself persists nothing.
+    pub fn apply_lockout(
+        &self,
+        endpoint: &str,
+        reason: crate::gates::lockout::LockReason,
+        until: Option<Instant>,
+    ) {
+        self.model_lockout.set(endpoint, reason, until, 0);
+    }
+
+    /// Clear a lockout (caller-driven suspend release / manual override).
+    pub fn clear_lockout(&self, endpoint: &str) {
+        self.model_lockout.clear(endpoint);
     }
 
     /// Attach a readiness probe (the local engine's provisioning supervisor).
@@ -328,6 +365,14 @@ impl Gateway {
         let mut config = self.config.write().await;
         for (id, router) in config.routers.iter_mut() {
             router.api_key = resolver(id);
+        }
+        // A refreshed credential may fix an auth/credits lock on any of that
+        // router's endpoints, so clear its terminal locks — the model is
+        // eligible again next request. Timed (rate/quota) locks are unrelated
+        // to the key and are left intact. `model_lockout` is a separate,
+        // Arc-backed field, so this coexists with the `config` write guard.
+        for id in config.routers.keys() {
+            self.model_lockout.clear_terminal_for_router(id);
         }
     }
 

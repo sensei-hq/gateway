@@ -10,8 +10,9 @@
 //! terminal status on its FIRST response so the tests stay sub-second.
 //!
 //! NOTE: unlike the FLUX adapter (which routes submit errors through
-//! `http_json` and thus maps 401/403 -> Authentication and 429 -> RateLimit),
-//! Kling's `generate_video()` maps EVERY non-success submit status directly to
+//! `http_json` and thus maps 401 -> Authentication, 403 -> ProviderError{status},
+//! and 429 -> RateLimit), Kling's `generate_video()` maps EVERY non-success
+//! submit status directly to
 //! `GatewayError::ProviderError { status: Some(code), .. }`. These tests assert
 //! that ACTUAL behavior.
 
