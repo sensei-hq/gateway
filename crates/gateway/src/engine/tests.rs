@@ -2286,6 +2286,251 @@ async fn execute_stream_non_chat_capability_errors_up_front() {
     }
 }
 
+// --- Task 5: execute_stream AllGated + §3.1 fallover + retained-error gap ---
+//
+// `execute_stream` reaches parity with `execute`: selection-empty where every
+// candidate is gated returns `Err(AllGated)`; a recoverable provider limit at
+// stream setup falls over on THIS request (§3.1, independent of the configured
+// triggers); stream-setup exhaustion where every attempt was gated yields a
+// terminal `StreamEvent::Error { code: "all_gated", resume_after: Some(_) }`;
+// and — the gap this closes — the REAL `GatewayError` now reaches the recorder
+// sinks at setup, so a setup failure cools/locks its router/endpoint.
+
+/// A chat adapter whose `chat_stream` fails at setup with a freshly-built
+/// error (the streaming analogue of `ChatErrAdapter`), so distinct routers can
+/// return distinct setup failures in one gateway.
+struct FakeStreamErrAdapter {
+    id: String,
+    err: Arc<dyn Fn() -> GatewayError + Send + Sync>,
+}
+
+impl crate::adapters::capability::Model for FakeStreamErrAdapter {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamErrAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        Err((self.err)())
+    }
+}
+
+async fn register_stream_err(
+    gw: &Gateway,
+    id: &str,
+    err: impl Fn() -> GatewayError + Send + Sync + 'static,
+) {
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamErrAdapter {
+            id: id.to_string(),
+            err: Arc::new(err),
+        }))
+        .await;
+}
+
+/// (1) Every candidate pre-locked (timed quota) at selection → `execute_stream`
+/// returns `Err(AllGated)` BEFORE the stream, `resume_after` = min over the two
+/// expiries (B at ~1800s). The streaming analogue of the `execute` selection
+/// case.
+#[tokio::test]
+async fn execute_stream_all_gated_at_selection_returns_allgated() {
+    use crate::gates::lockout::LockReason;
+
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    gw.apply_lockout(
+        "A:a-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    );
+    gw.apply_lockout(
+        "B:b-model",
+        LockReason::QuotaExhausted,
+        Some(Instant::now() + std::time::Duration::from_secs(1800)),
+    );
+
+    match gw.execute_stream(&chat_request()).await {
+        Err(GatewayError::AllGated {
+            resume_after,
+            human_action,
+            ..
+        }) => {
+            assert_resume_near(resume_after, 1800, 150); // the nearer of 3600 / 1800
+            assert!(
+                human_action.is_none(),
+                "a timed retry means no human action is surfaced"
+            );
+        }
+        Err(other) => panic!("expected Err(AllGated), got: {other}"),
+        Ok(_) => panic!("expected Err(AllGated) before any stream, got a stream"),
+    }
+}
+
+/// (2) §3.1 in the stream: `[A (429 at setup), B (ok)]` with NO configured
+/// triggers → A's recoverable rate-limit demotes to B on THIS request (a
+/// `ProviderSwitch` then B's chunks then `Done { model: "b-model" }`), where
+/// pre-§3.1 a 429 without a `RateLimit` trigger terminated the stream.
+#[tokio::test]
+async fn execute_stream_recoverable_limit_falls_over_without_trigger() {
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    register_stream_err(&gw, "A", || GatewayError::RateLimit {
+        adapter: "A".into(),
+        retry_after_ms: None,
+    })
+    .await;
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "B".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &chat_request()).await;
+
+    assert!(
+        matches!(events.first(), Some(StreamEvent::ProviderSwitch { from_adapter, to_adapter, .. }) if from_adapter == "A" && to_adapter == "B"),
+        "a recoverable 429 at setup must demote to B (leading ProviderSwitch), got {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { model, .. }) if model == "b-model"),
+        "the request must complete on B (Done for b-model), got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error { .. })),
+        "a successful §3.1 fallover must not emit an Error event, got {events:?}"
+    );
+}
+
+/// (3) Stream-setup exhaustion where every attempt was gated: `[A (429), B
+/// (429)]` with NO configured triggers → both fall over at setup and each is
+/// locked in-flight, so the LAST event is a terminal
+/// `StreamEvent::Error { code: "all_gated", resume_after: Some(_) }` (~60s
+/// rate-limit base, the min over the just-written timed locks).
+#[tokio::test]
+async fn execute_stream_setup_exhaustion_all_recoverable_is_all_gated() {
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    register_stream_err(&gw, "A", || GatewayError::RateLimit {
+        adapter: "A".into(),
+        retry_after_ms: None,
+    })
+    .await;
+    register_stream_err(&gw, "B", || GatewayError::RateLimit {
+        adapter: "B".into(),
+        retry_after_ms: None,
+    })
+    .await;
+
+    let events = collect_stream(&gw, &chat_request()).await;
+
+    match events.last() {
+        Some(StreamEvent::Error {
+            code, resume_after, ..
+        }) => {
+            assert_eq!(code, "all_gated", "every attempt gated ⇒ all_gated code");
+            assert_resume_near(*resume_after, 60, 40); // rate-limit base ~60s
+        }
+        other => panic!("expected a terminal all_gated Error, got {other:?}"),
+    }
+}
+
+/// (4) Gap-closer: a stream-setup `Timeout` on A now reaches the recorder
+/// sinks, so router "A" is cooled (previously the setup error was dropped and
+/// `dispatch_outcome` was passed `None`, so nothing cooled). `[A (Timeout), B
+/// (ok)]` with a `Timeout` trigger falls over to B; the cooldown on "A" proves
+/// the real error was dispatched.
+#[tokio::test]
+async fn execute_stream_setup_failure_cools_router_closing_the_gap() {
+    let gw = ab_gateway(ab_chain_config(vec![FallbackTrigger::Timeout]));
+    register_stream_err(&gw, "A", || GatewayError::Timeout {
+        adapter: "A".into(),
+        model: "a-model".into(),
+        duration_ms: 1,
+    })
+    .await;
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "B".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &chat_request()).await;
+    // Sanity: A's Timeout fell over to B and the stream completed on B.
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { model, .. }) if model == "b-model"),
+        "expected the stream to complete on B, got {events:?}"
+    );
+
+    // The gap: the real Timeout reached the ConnectionCooldownSink, cooling "A".
+    let until = gw.cooldown.cooling_until("A");
+    assert!(
+        until.is_some_and(|u| u > Instant::now()),
+        "a stream-setup Timeout must cool router 'A' (the real error now reaches the sinks)"
+    );
+}
+
+/// (5) Guard: an early terminal stop leaves a PLAIN error, not all_gated.
+/// `[A (401 auth), B (ok)]` → A's terminal auth stops the walk with B still
+/// untried, so the terminal `StreamEvent::Error` carries `resume_after: None`
+/// and is NOT coded `all_gated` (mirrors `execute_stops_on_auth_error`'s
+/// guard: an untried, still-eligible candidate means "not every candidate was
+/// gated").
+#[tokio::test]
+async fn execute_stream_early_terminal_stop_is_not_all_gated() {
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    register_stream_err(&gw, "A", || GatewayError::Authentication {
+        adapter: "A".into(),
+        message: "bad key".into(),
+    })
+    .await;
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "B".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &chat_request()).await;
+
+    assert!(
+        !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+        "the untried B must never stream (auth stops the walk), got {events:?}"
+    );
+    match events.last() {
+        Some(StreamEvent::Error {
+            code, resume_after, ..
+        }) => {
+            assert_ne!(code, "all_gated", "an early terminal stop is NOT all_gated");
+            assert_eq!(code, "authentication");
+            assert!(
+                resume_after.is_none(),
+                "a non-fallback stop with an untried candidate carries no resume_after"
+            );
+        }
+        other => panic!("expected a terminal plain Error, got {other:?}"),
+    }
+}
+
 // --- Panel fan-out (execute_panel) ---
 
 fn router(enabled: bool) -> RouterConfig {
