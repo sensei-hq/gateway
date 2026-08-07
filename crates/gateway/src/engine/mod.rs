@@ -58,8 +58,9 @@ pub struct Gateway {
     /// in `recorders` — both share this one store (see [`Gateway::new`]).
     cooldown: crate::gates::cooldown::ConnectionCooldownStore,
     /// Endpoint model-lockout read/write state: read side wired into selection,
-    /// the write side (sink) lands in a later task — for now the store is only
-    /// ever empty, so the [`crate::gates::lockout::ModelLockoutGate`] always admits.
+    /// write side is [`crate::gates::lockout::ModelLockoutSink`] in `recorders` —
+    /// both share this one store (see [`Gateway::new`]) so the gate skips what
+    /// the sink locked.
     model_lockout: crate::gates::lockout::ModelLockoutStore,
 }
 
@@ -73,6 +74,15 @@ impl Gateway {
         // write-side handle share the SAME store (Arc-backed `Clone`).
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
         let model_lockout = crate::gates::lockout::ModelLockoutStore::new();
+        // Empty registry the sink fires into (a no-op until Task 6's
+        // `with_observer` registers one). The `Gateway` keeps no handle yet:
+        // its only consumer is `with_observer`, which lands in Task 6 alongside
+        // the retained field — adding the field now would be a never-read
+        // (dead-code) field under `-D warnings`.
+        let lockout_observers = crate::gates::lockout::LockoutBroadcaster::new();
+        // Built AFTER `model_lockout` so the sink's write handle and the gate's
+        // read-side field share the SAME Arc-backed store (the gate skips what
+        // the sink locked).
         let recorders: Vec<Arc<dyn crate::gates::HealthRecorder>> = vec![
             Arc::new(crate::gates::circuit_breaker_gate::CircuitBreakerSink::new(
                 circuit_breaker.clone(),
@@ -80,6 +90,11 @@ impl Gateway {
             Arc::new(crate::gates::cooldown::ConnectionCooldownSink::new(
                 cooldown.clone(),
                 crate::gates::cooldown::DEFAULT_CONNECTION_COOLDOWN,
+            )),
+            Arc::new(crate::gates::lockout::ModelLockoutSink::new(
+                model_lockout.clone(),
+                Default::default(),
+                lockout_observers,
             )),
         ];
         Self {

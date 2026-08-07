@@ -74,14 +74,16 @@ fn classify_403_body(message: &str) -> LockReason {
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// A single endpoint's lockout state; `until = None` is terminal. Task 5 (the
-/// sink) re-adds an `escalation` generation counter here alongside its reader.
+/// A single endpoint's lockout state; `until = None` is terminal. Carries an
+/// `escalation` generation counter the sink reads to grow the backoff window
+/// once per lock→release→relock cycle (not per concurrent failure).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LockEntry {
     pub reason: LockReason,
     pub until: Option<Instant>,
+    pub escalation: u32,
 }
 
 /// What the gate reads for a candidate: the active lock's reason + deadline.
@@ -113,11 +115,24 @@ impl ModelLockoutStore {
         Self::default()
     }
     /// Insert/replace the endpoint's lock (used by the sink and `apply_lockout`).
-    pub fn set(&self, endpoint: &str, reason: LockReason, until: Option<Instant>) {
+    pub fn set(&self, endpoint: &str, reason: LockReason, until: Option<Instant>, escalation: u32) {
+        self.locks.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            endpoint.to_string(),
+            LockEntry {
+                reason,
+                until,
+                escalation,
+            },
+        );
+    }
+    /// The endpoint's raw lock entry (reason + deadline + escalation), or `None`.
+    /// Read by the sink to decide whether a fresh failure escalates the window.
+    pub(crate) fn get(&self, endpoint: &str) -> Option<LockEntry> {
         self.locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(endpoint.to_string(), LockEntry { reason, until });
+            .get(endpoint)
+            .copied()
     }
     /// Remove the endpoint's lock (success / `clear_lockout`).
     pub fn clear(&self, endpoint: &str) {
@@ -138,6 +153,157 @@ impl ModelLockoutRead for ModelLockoutStore {
                 reason: e.reason,
                 until: e.until,
             })
+    }
+}
+
+use super::{AttemptOutcome, HealthRecorder};
+
+/// Best-effort, isolated observer of gateway health decisions. The gateway
+/// **announces** a lockout; the caller **persists** it (the tenant-agnostic core
+/// never persists — design §5c). The `Gateway::with_observer` wiring lands in
+/// Task 6. More methods arrive with later observability work.
+pub trait SelectionObserver: Send + Sync {
+    /// `until = None` ⇒ terminal (surface a human-action hint — top-up / rotate
+    /// key — not a wake-up time).
+    fn on_lockout(&self, endpoint: &str, reason: LockReason, until: Option<Instant>);
+}
+
+/// Arc-backed, Clone registry shared between `Gateway` (registers via
+/// `with_observer`, Task 6) and the sink (fires). Empty until an observer is
+/// registered. Same shared-handle pattern as `ModelLockoutStore`.
+#[derive(Clone, Default)]
+pub struct LockoutBroadcaster {
+    observers: Arc<Mutex<Vec<Arc<dyn SelectionObserver>>>>,
+}
+
+impl LockoutBroadcaster {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn register(&self, obs: Arc<dyn SelectionObserver>) {
+        self.observers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(obs);
+    }
+    /// Fire best-effort. Clone the handles out before calling so an observer
+    /// can't deadlock by re-entering the registry.
+    pub fn fire(&self, endpoint: &str, reason: LockReason, until: Option<Instant>) {
+        let observers = self
+            .observers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for o in observers {
+            o.on_lockout(endpoint, reason, until);
+        }
+    }
+}
+
+/// Per-reason lockout durations. Operator-configurable via `ResilienceConfig` in
+/// plan (f); defaults here. (Quota uses a fixed default; the calendar-clock
+/// reset-boundary refinement is plan (e).)
+#[derive(Debug, Clone)]
+pub struct ModelLockoutPolicy {
+    pub rate_limit_base: Duration,
+    pub quota_default: Duration,
+    pub max_cooldown: Duration,
+}
+
+impl Default for ModelLockoutPolicy {
+    fn default() -> Self {
+        Self {
+            rate_limit_base: Duration::from_secs(60),
+            quota_default: Duration::from_secs(3600),
+            max_cooldown: Duration::from_secs(6 * 3600),
+        }
+    }
+}
+
+/// Write side: classify a failed outcome and lock the endpoint accordingly; a
+/// success clears it. Terminal reasons (`Auth`/`Credits`) lock with `until: None`.
+/// Timed reasons escalate **once per lock→release→relock cycle** (not per
+/// concurrent failure): escalation grows only when the prior lock had already
+/// expired. A real `Retry-After` is honored exactly (never clamped); synthetic
+/// backoff is clamped to `max_cooldown`.
+pub struct ModelLockoutSink {
+    store: ModelLockoutStore,
+    policy: ModelLockoutPolicy,
+    observers: LockoutBroadcaster,
+}
+
+impl ModelLockoutSink {
+    pub fn new(
+        store: ModelLockoutStore,
+        policy: ModelLockoutPolicy,
+        observers: LockoutBroadcaster,
+    ) -> Self {
+        Self {
+            store,
+            policy,
+            observers,
+        }
+    }
+
+    /// Compute the lock deadline. Terminal → `None`. A real retry-after is exact
+    /// (never clamped). Otherwise synthetic backoff = base * 2^escalation, clamped.
+    fn deadline(
+        &self,
+        reason: LockReason,
+        retry_after: Option<Duration>,
+        escalation: u32,
+        now: Instant,
+    ) -> Option<Instant> {
+        if reason.is_terminal() {
+            return None;
+        }
+        if let Some(exact) = retry_after {
+            return Some(now + exact); // honored verbatim, never clamped
+        }
+        let base = match reason {
+            LockReason::RateLimit => self.policy.rate_limit_base,
+            LockReason::QuotaExhausted => self.policy.quota_default,
+            _ => unreachable!("terminal handled above"),
+        };
+        let factor = 1u32.checked_shl(escalation.min(16)).unwrap_or(u32::MAX);
+        let backoff = base.saturating_mul(factor).min(self.policy.max_cooldown);
+        Some(now + backoff)
+    }
+}
+
+impl HealthRecorder for ModelLockoutSink {
+    fn on_outcome(&self, o: &AttemptOutcome<'_>) {
+        if o.success {
+            self.store.clear(o.endpoint); // success clears lock + escalation
+            return;
+        }
+        let Some(err) = o.error else { return };
+        let Some(reason) = classify(err) else { return };
+
+        let now = Instant::now();
+        let prior = self.store.get(o.endpoint);
+        // Generation guard: escalate only on a genuine relock (prior lock expired),
+        // not on a concurrent failure during an active lock.
+        let escalation = match prior {
+            Some(p) if matches!(p.until, Some(u) if u <= now) => p.escalation.saturating_add(1),
+            Some(p) => p.escalation, // still-active or terminal prior → keep
+            None => 0,
+        };
+
+        let until = self.deadline(reason, retry_after(err), escalation, now);
+        self.store.set(o.endpoint, reason, until, escalation);
+        self.observers.fire(o.endpoint, reason, until);
+    }
+}
+
+/// A real `Retry-After` (429 only, here) → exact duration; otherwise `None`.
+fn retry_after(err: &GatewayError) -> Option<Duration> {
+    match err {
+        GatewayError::RateLimit {
+            retry_after_ms: Some(ms),
+            ..
+        } => Some(Duration::from_millis(*ms)),
+        _ => None,
     }
 }
 
@@ -250,12 +416,12 @@ mod tests {
         let s = ModelLockoutStore::new();
         assert!(s.locked("r:m").is_none()); // unknown → not locked
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        s.set("r:m", LockReason::RateLimit, Some(until));
+        s.set("r:m", LockReason::RateLimit, Some(until), 0);
         let v = s.locked("r:m").expect("locked");
         assert_eq!(v.reason, LockReason::RateLimit);
         assert_eq!(v.until, Some(until));
         // terminal lock: until = None
-        s.set("r:x", LockReason::Auth, None);
+        s.set("r:x", LockReason::Auth, None, 0);
         assert_eq!(s.locked("r:x").unwrap().until, None);
         // clear removes it
         s.clear("r:m");
@@ -335,7 +501,7 @@ mod tests {
         ));
 
         // Terminal lock (until = None) → Skip(LockedOut { until: None }).
-        store.set("r:m", LockReason::Auth, None);
+        store.set("r:m", LockReason::Auth, None, 0);
         assert!(matches!(
             ModelLockoutGate.evaluate(&cand, &ctx),
             GateVerdict::Skip(SkipReason::LockedOut { until: None, .. })
@@ -346,6 +512,7 @@ mod tests {
             "r:m",
             LockReason::RateLimit,
             Some(now + Duration::from_secs(60)),
+            0,
         );
         assert!(matches!(
             ModelLockoutGate.evaluate(&cand, &ctx),
@@ -357,10 +524,203 @@ mod tests {
             "r:m",
             LockReason::RateLimit,
             Some(now - Duration::from_secs(1)),
+            0,
         );
         assert!(matches!(
             ModelLockoutGate.evaluate(&cand, &ctx),
             GateVerdict::Admit
         ));
+    }
+
+    // ---- ModelLockoutSink (write side) --------------------------------------
+
+    /// Fresh store + a default-policy sink sharing it, and no observers.
+    fn sink_with_default() -> (ModelLockoutStore, ModelLockoutSink) {
+        let store = ModelLockoutStore::new();
+        let sink = ModelLockoutSink::new(
+            store.clone(),
+            ModelLockoutPolicy::default(),
+            LockoutBroadcaster::new(),
+        );
+        (store, sink)
+    }
+
+    /// A failed attempt outcome on endpoint `"r:m"` carrying `err`.
+    fn fail(err: &GatewayError) -> AttemptOutcome<'_> {
+        AttemptOutcome {
+            endpoint: "r:m",
+            router: "r",
+            success: false,
+            error: Some(err),
+        }
+    }
+
+    /// A real `Retry-After` (429) is honored verbatim (~2s), NOT clamped up to
+    /// the 60s base.
+    #[test]
+    fn sink_honors_retry_after_exactly() {
+        let (store, sink) = sink_with_default();
+        let now = Instant::now();
+        let err = GatewayError::RateLimit {
+            adapter: "a".into(),
+            retry_after_ms: Some(2000),
+        };
+        sink.on_outcome(&fail(&err));
+
+        let v = store.locked("r:m").expect("locked");
+        assert_eq!(v.reason, LockReason::RateLimit);
+        let until = v.until.expect("timed lock");
+        assert!(
+            until > now + Duration::from_millis(1500),
+            "retry-after honored (>1.5s)"
+        );
+        assert!(
+            until < now + Duration::from_secs(3),
+            "retry-after exact, not clamped up to the 60s base (<3s)"
+        );
+    }
+
+    /// No retry-after → base ~60s at escalation 0; a genuine relock after the
+    /// prior lock expired escalates to a strictly-longer window (~120s), never
+    /// exceeding `max_cooldown`.
+    #[test]
+    fn sink_times_lock_at_base_then_escalates_on_relock() {
+        let (store, sink) = sink_with_default();
+        let now = Instant::now();
+        let err = GatewayError::RateLimit {
+            adapter: "a".into(),
+            retry_after_ms: None,
+        };
+
+        sink.on_outcome(&fail(&err));
+        let first = store.locked("r:m").expect("locked").until.expect("timed");
+        assert!(first > now + Duration::from_secs(55), "base ~60s (>55s)");
+        assert!(first < now + Duration::from_secs(70), "base ~60s (<70s)");
+        assert_eq!(store.get("r:m").unwrap().escalation, 0);
+
+        // Pre-seed an EXPIRED lock so the next failure is a genuine relock.
+        store.set(
+            "r:m",
+            LockReason::RateLimit,
+            Some(now - Duration::from_secs(1)),
+            0,
+        );
+        sink.on_outcome(&fail(&err));
+
+        let entry = store.get("r:m").unwrap();
+        assert_eq!(entry.escalation, 1, "relock after expiry escalates once");
+        let second = entry.until.expect("timed");
+        assert!(
+            second > now + Duration::from_secs(90),
+            "escalated window strictly longer than the base (>90s)"
+        );
+        assert!(
+            second <= now + ModelLockoutPolicy::default().max_cooldown,
+            "escalated window never exceeds max_cooldown"
+        );
+    }
+
+    /// A 403 quota body → timed lock at the ~1h quota default.
+    #[test]
+    fn sink_locks_quota_at_default() {
+        let (store, sink) = sink_with_default();
+        let now = Instant::now();
+        let err = provider(403, "You have exceeded your quota for this model");
+        sink.on_outcome(&fail(&err));
+
+        let v = store.locked("r:m").expect("locked");
+        assert_eq!(v.reason, LockReason::QuotaExhausted);
+        let until = v.until.expect("timed lock");
+        assert!(
+            until > now + Duration::from_secs(3000),
+            "quota ~1h (>3000s)"
+        );
+        assert!(
+            until < now + Duration::from_secs(4000),
+            "quota ~1h (<4000s)"
+        );
+    }
+
+    /// 401 and a 403-credits body → terminal locks with `until: None`.
+    #[test]
+    fn sink_locks_terminal_reasons_with_no_deadline() {
+        let (store, sink) = sink_with_default();
+
+        let auth = GatewayError::Authentication {
+            adapter: "a".into(),
+            message: "bad key".into(),
+        };
+        sink.on_outcome(&fail(&auth));
+        let v = store.locked("r:m").expect("locked");
+        assert_eq!(v.reason, LockReason::Auth);
+        assert_eq!(v.until, None, "terminal → no wake-up time");
+
+        let credits = provider(403, "insufficient credits, please add billing");
+        sink.on_outcome(&fail(&credits));
+        let v = store.locked("r:m").expect("locked");
+        assert_eq!(v.reason, LockReason::CreditsExhausted);
+        assert_eq!(v.until, None, "terminal → no wake-up time");
+    }
+
+    /// A successful outcome clears the endpoint's lock (and escalation).
+    #[test]
+    fn sink_success_clears_lock() {
+        let (store, sink) = sink_with_default();
+        let now = Instant::now();
+        store.set(
+            "r:m",
+            LockReason::RateLimit,
+            Some(now + Duration::from_secs(60)),
+            3,
+        );
+        sink.on_outcome(&AttemptOutcome {
+            endpoint: "r:m",
+            router: "r",
+            success: true,
+            error: None,
+        });
+        assert!(
+            store.locked("r:m").is_none(),
+            "success clears lock + escalation"
+        );
+    }
+
+    /// Non-limit faults (500 `ProviderError`, `Timeout`) never lock.
+    #[test]
+    fn sink_ignores_non_limit_faults() {
+        let (store, sink) = sink_with_default();
+
+        sink.on_outcome(&fail(&provider(500, "boom")));
+        assert!(store.locked("r:m").is_none(), "500 is not a provider limit");
+
+        let timeout = GatewayError::Timeout {
+            adapter: "a".into(),
+            model: "m".into(),
+            duration_ms: 1,
+        };
+        sink.on_outcome(&fail(&timeout));
+        assert!(
+            store.locked("r:m").is_none(),
+            "timeout is a transport fault, not a provider limit"
+        );
+    }
+
+    /// A 403-quota over an already-active rate-limit lock upgrades the reason.
+    #[test]
+    fn sink_403_quota_upgrades_active_rate_limit() {
+        let (store, sink) = sink_with_default();
+        let now = Instant::now();
+        store.set(
+            "r:m",
+            LockReason::RateLimit,
+            Some(now + Duration::from_secs(60)),
+            0,
+        );
+        sink.on_outcome(&fail(&provider(403, "quota exceeded")));
+        assert_eq!(
+            store.locked("r:m").unwrap().reason,
+            LockReason::QuotaExhausted,
+            "403-quota upgrades the active rate-limit lock"
+        );
     }
 }
