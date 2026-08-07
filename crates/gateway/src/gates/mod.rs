@@ -1,6 +1,7 @@
 use crate::skip_reason::SkipReason;
 use crate::types::capability::Capability;
 use crate::types::config::{GatewayConfig, ModelConfig, RouterConfig};
+use crate::types::error::GatewayError;
 use std::time::Instant;
 
 pub mod budget;
@@ -40,6 +41,22 @@ pub enum GateVerdict {
 pub trait AdmissionGate: Send + Sync {
     fn name(&self) -> &'static str;
     fn evaluate(&self, cand: &CandidateView<'_>, ctx: &SelectionCtx<'_>) -> GateVerdict;
+}
+
+/// A single attempt's outcome, fed to the write-side recorders. `endpoint` is the
+/// opaque "router:model" key (matches the read-side breaker keying). `error` is
+/// carried for later recorders (cooldown/lockout classify it); the breaker sink
+/// uses only `success`.
+pub struct AttemptOutcome<'a> {
+    pub endpoint: &'a str,
+    pub success: bool,
+    pub error: Option<&'a GatewayError>,
+}
+
+/// Reliable write-side reducer: updates authoritative health state from an attempt
+/// outcome. NOT best-effort — distinct from the future `SelectionObserver`.
+pub trait HealthRecorder: Send + Sync {
+    fn on_outcome(&self, outcome: &AttemptOutcome<'_>);
 }
 
 #[cfg(test)]
