@@ -905,6 +905,21 @@ async fn register_failing(gw: &Gateway, error: GatewayError) {
         .await;
 }
 
+/// Like `test_gateway_with_chain` but with caller-chosen fallback triggers on
+/// the `failing`→`noop` chain, so a test can prove the classify()-driven
+/// in-flight fallover is independent of the configured trigger set (design
+/// §3.1).
+fn gateway_with_triggers(triggers: Vec<FallbackTrigger>) -> Gateway {
+    let mut config = test_config_with_failing_and_noop();
+    config
+        .chains
+        .get_mut("chat_chain")
+        .expect("chat_chain exists")
+        .fallback_triggers = triggers;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    Gateway::new(config, AdapterRegistry::new(), cb)
+}
+
 /// Readiness probe returning canned phases per model (Absent for unknown ids).
 struct FakeProbe {
     phases: HashMap<String, kernel::ProvisionPhase>,
@@ -1182,6 +1197,144 @@ async fn no_fallback_when_disabled_stops_at_primary() {
             );
         }
         other => panic!("expected AllAttemptsFailed (no fallback), got: {other}"),
+    }
+}
+
+// --- Task 3: classify()-driven in-flight fallover (design §3.1) ---
+//
+// The candidate walk's fallover decision is driven by the SAME `classify()`
+// used for next-request lockout: a RECOVERABLE provider limit (429 / 403-quota)
+// demotes to the next candidate on THIS request even without a configured
+// trigger; a TERMINAL one (401 / 403-credits) stops; a non-limit error keeps
+// the configured `should_trigger_fallback` semantics. "Served by B" == the
+// request completes on the second candidate (`response.model == "noop"`).
+
+/// A 429 with NO `RateLimit` trigger configured now falls over to the next
+/// candidate (recoverable). Pre-§3.1 this STOPPED at the primary.
+#[tokio::test]
+async fn recoverable_rate_limit_falls_over_without_trigger() {
+    let gw = gateway_with_triggers(vec![]);
+    register_failing(
+        &gw,
+        GatewayError::RateLimit {
+            adapter: "failing".into(),
+            retry_after_ms: None,
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(
+        response.model,
+        Some("noop".to_string()),
+        "a recoverable 429 must demote to the next candidate (served by B)"
+    );
+    assert_eq!(response.attempts.len(), 2);
+    assert_eq!(response.attempts[0].adapter, "failing");
+    assert!(response.attempts[0].fallback_triggered);
+}
+
+/// A 403-quota body with NO `ProviderError` trigger configured now falls over
+/// (recoverable). Pre-§3.1 this STOPPED at the primary.
+#[tokio::test]
+async fn recoverable_quota_403_falls_over_without_trigger() {
+    let gw = gateway_with_triggers(vec![]);
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "quota exceeded".into(),
+            status: Some(403),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(
+        response.model,
+        Some("noop".to_string()),
+        "a recoverable 403-quota must demote to the next candidate (served by B)"
+    );
+    assert_eq!(response.attempts.len(), 2);
+    assert_eq!(response.attempts[0].adapter, "failing");
+    assert!(response.attempts[0].fallback_triggered);
+}
+
+/// A terminal 403-credits body does NOT fall over — even WITH `ProviderError`
+/// configured as a trigger, a terminal limit stops the walk (the ready noop is
+/// never tried).
+#[tokio::test]
+async fn terminal_credits_403_stops_even_with_trigger() {
+    let gw = gateway_with_triggers(vec![FallbackTrigger::ProviderError]);
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "insufficient credits".into(),
+            status: Some(403),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllAttemptsFailed { attempts, .. } => assert_eq!(
+            attempts, 1,
+            "a terminal credits limit stops; the ready noop is never tried"
+        ),
+        other => panic!("expected AllAttemptsFailed, got: {other}"),
+    }
+}
+
+/// An unclassified 500 keeps the configured trigger semantics: WITH a
+/// `ProviderError` trigger it falls over (the `classify()==None` branch defers
+/// to `should_trigger_fallback`).
+#[tokio::test]
+async fn unclassified_500_falls_over_with_trigger() {
+    let gw = gateway_with_triggers(vec![FallbackTrigger::ProviderError]);
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "boom".into(),
+            status: Some(500),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    let response = gw.execute(&chat_request()).await.unwrap();
+    assert_eq!(response.model, Some("noop".to_string()));
+    assert_eq!(response.attempts.len(), 2);
+    assert_eq!(response.attempts[0].adapter, "failing");
+    assert!(response.attempts[0].fallback_triggered);
+}
+
+/// The other half of the pin: an unclassified 500 WITHOUT a `ProviderError`
+/// trigger STOPS — proving the `classify()==None` branch still honors
+/// `should_trigger_fallback` (not a blanket fallover).
+#[tokio::test]
+async fn unclassified_500_stops_without_trigger() {
+    let gw = gateway_with_triggers(vec![]);
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "boom".into(),
+            status: Some(500),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllAttemptsFailed { attempts, .. } => assert_eq!(
+            attempts, 1,
+            "an unclassified 500 with no matching trigger stops (classify()==None)"
+        ),
+        other => panic!("expected AllAttemptsFailed, got: {other}"),
     }
 }
 
