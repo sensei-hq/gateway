@@ -1,69 +1,46 @@
-//! Canonical OpenAI-compatible chat / embed / streaming core.
+//! Pure wire-format conversion between gateway types and the OpenAI-compatible
+//! `/v1/chat/completions` / `/v1/embeddings` JSON shape.
 //!
-//! Every OpenAI-compatible cloud adapter (openai, ollama, grok,
-//! together, huggingface, …) speaks the same `/v1/chat/completions` and
-//! `/v1/embeddings` wire format. Rather than re-declare the wire types
-//! and request/response plumbing in each adapter, this module owns the
-//! full-featured variant once (tools + multimodal + streaming-with-tools)
-//! and exposes three `pub(crate)` entry points — [`chat`], [`chat_stream`],
-//! and [`embed`] — that speak the gateway's typed
-//! [`io`](kernel::types::io) request/response structs and encapsulate the
-//! HTTP.
-//!
-//! Adapters keep their own `struct`, `Model::id`, base-url / default-model
-//! consts, and any non-OpenAI-compat capabilities (image / audio); their
-//! `ChatModel`/`EmbedModel` methods become thin delegations to the entry
-//! points here. See `docs/design/hf-inference-adapter.md` §3.
+//! Everything here is a total function of its inputs — gateway [`Message`]s
+//! and [`ToolDefinition`]s in, OpenAI request JSON out; OpenAI response /
+//! SSE stream events in, [`ChatResponse`]-shaped pieces and [`StreamChunk`]s
+//! out. None of it touches HTTP, auth, or adapter state (the `Client`,
+//! credentials, and `RouterConfig` plumbing, plus the byte-level SSE
+//! polling loop, all stay in `super`), which is what makes it
+//! unit-testable without a network round-trip.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::pin::Pin;
+use super::*;
 
-use futures::Stream;
-use futures::stream::StreamExt;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::base::{JsonEndpoint, error_from_response, http_json, resolve_api_key};
-use kernel::types::config::RouterConfig;
 use kernel::types::cost::TokenUsage;
-use kernel::types::error::GatewayError;
-use kernel::types::io::{ChatRequest, ChatResponse};
 use kernel::types::request::{
-    MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamChunk,
-    StreamingToolCall, ToolCall, ToolDefinition,
+    MediaAttachment, MediaSource, Message, MessageContent, MessageRole, StreamingToolCall,
+    ToolDefinition,
 };
-
-/// Boxed streaming type shared by the capability traits.
-pub(crate) type ChunkStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>;
-
-/// Adapter label used in error mapping on the streaming path (the
-/// non-streaming path routes errors through [`http_json`], which labels
-/// them `"http"`). The concrete adapter id isn't threaded through the
-/// shared core, so this is a generic placeholder — no test asserts on it.
-const ADAPTER: &str = "openai_compat";
 
 // ---------------------------------------------------------------------------
 // Wire types — OpenAI chat/embed request/response structs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
+pub(super) struct ChatCompletionRequest {
+    pub(super) model: String,
+    pub(super) messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+    pub(super) max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    stream: bool,
+    pub(super) temperature: Option<f32>,
+    pub(super) stream: bool,
     /// Tool / function definitions the model may call. Wrapped in
     /// `{type: "function", function: {…}}` per OpenAI's wire shape;
     /// omitted entirely when no tools are configured for this turn.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ChatTool>,
+    pub(super) tools: Vec<ChatTool>,
 }
 
 #[derive(Debug, Serialize)]
-struct ChatTool {
+pub(super) struct ChatTool {
     #[serde(rename = "type")]
     tool_type: &'static str, // always "function" for now
     function: ChatToolFunction,
@@ -78,7 +55,7 @@ struct ChatToolFunction {
 }
 
 #[derive(Debug, Serialize)]
-struct ChatMessage {
+pub(super) struct ChatMessage {
     role: String,
     /// Polymorphic body: a plain string for text-only turns, or an
     /// array of typed content parts (text + image_url) for
@@ -127,7 +104,7 @@ struct ImageUrl {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct OpenAiToolCall {
+pub(super) struct OpenAiToolCall {
     id: String,
     #[serde(rename = "type")]
     tool_type: String,
@@ -144,50 +121,50 @@ struct OpenAiToolCallFunction {
 }
 
 #[derive(Debug, Serialize)]
-struct EmbedRequest {
-    model: String,
-    input: Vec<String>,
+pub(super) struct EmbedRequest {
+    pub(super) model: String,
+    pub(super) input: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
-    usage: Option<UsageResponse>,
+pub(super) struct ChatCompletionResponse {
+    pub(super) choices: Vec<ChatChoice>,
+    pub(super) usage: Option<UsageResponse>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatResponseMessage,
+pub(super) struct ChatChoice {
+    pub(super) message: ChatResponseMessage,
     #[allow(dead_code)]
     finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatResponseMessage {
-    content: Option<String>,
+pub(super) struct ChatResponseMessage {
+    pub(super) content: Option<String>,
     /// Tool calls the assistant decided to emit. Absent for plain
     /// text replies; present (and possibly non-empty) when tools were
     /// advertised on the request.
     #[serde(default)]
-    tool_calls: Option<Vec<OpenAiToolCall>>,
+    pub(super) tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct UsageResponse {
+pub(super) struct UsageResponse {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
-struct EmbedResponse {
-    data: Vec<EmbedData>,
-    usage: Option<UsageResponse>,
+pub(super) struct EmbedResponse {
+    pub(super) data: Vec<EmbedData>,
+    pub(super) usage: Option<UsageResponse>,
 }
 
 #[derive(Debug, Deserialize)]
-struct EmbedData {
-    embedding: Vec<f32>,
+pub(super) struct EmbedData {
+    pub(super) embedding: Vec<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,7 +224,10 @@ fn role_to_string(role: &MessageRole) -> &'static str {
     }
 }
 
-fn build_chat_messages(messages: &[Message], system: &Option<String>) -> Vec<ChatMessage> {
+pub(super) fn build_chat_messages(
+    messages: &[Message],
+    system: &Option<String>,
+) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(sys) = system {
         out.push(ChatMessage {
@@ -353,7 +333,7 @@ fn attachment_to_part(att: &MediaAttachment) -> Option<ContentPart> {
 
 /// Convert a gateway [`ToolDefinition`] into OpenAI's wire shape
 /// (`{type: "function", function: {name, description?, parameters}}`).
-fn build_tools(tools: &[ToolDefinition]) -> Vec<ChatTool> {
+pub(super) fn build_tools(tools: &[ToolDefinition]) -> Vec<ChatTool> {
     tools
         .iter()
         .map(|t| ChatTool {
@@ -384,7 +364,7 @@ fn to_openai_tool_call(tc: &ToolCall) -> OpenAiToolCall {
 /// Convert OpenAI's wire [`OpenAiToolCall`] back to a gateway
 /// [`ToolCall`]. Non-function tool types (none today, but the API leaves
 /// the door open) are filtered upstream by the caller.
-fn from_openai_tool_call(tc: &OpenAiToolCall) -> ToolCall {
+pub(super) fn from_openai_tool_call(tc: &OpenAiToolCall) -> ToolCall {
     ToolCall {
         id: tc.id.clone(),
         name: tc.function.name.clone(),
@@ -392,7 +372,7 @@ fn from_openai_tool_call(tc: &OpenAiToolCall) -> ToolCall {
     }
 }
 
-fn usage_from_response(usage: &Option<UsageResponse>) -> Option<TokenUsage> {
+pub(super) fn usage_from_response(usage: &Option<UsageResponse>) -> Option<TokenUsage> {
     usage.as_ref().map(|u| {
         let input = u.prompt_tokens.unwrap_or(0);
         let output = u.completion_tokens.unwrap_or(0);
@@ -402,188 +382,6 @@ fn usage_from_response(usage: &Option<UsageResponse>) -> Option<TokenUsage> {
             output_tokens: output,
             total_tokens: total,
         }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
-
-/// Non-streaming chat completion against `{base_url}/v1/chat/completions`.
-///
-/// Model = `req.model` else `default_model`. Auth = bearer from
-/// [`resolve_api_key`] (omitted when absent, e.g. local Ollama) plus any
-/// `cfg.headers`. Forwards tools + multimodal attachments and parses
-/// content + tool_calls + usage back out.
-pub(crate) async fn chat(
-    client: &Client,
-    base_url: &str,
-    default_model: &str,
-    cfg: &RouterConfig,
-    req: &ChatRequest,
-) -> Result<ChatResponse, GatewayError> {
-    let api_key = resolve_api_key(cfg);
-    let model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model.to_string());
-
-    let body = ChatCompletionRequest {
-        model: model.clone(),
-        messages: build_chat_messages(&req.messages, &req.system),
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        stream: false,
-        tools: build_tools(&req.tools),
-    };
-
-    let resp: ChatCompletionResponse = http_json(
-        client,
-        JsonEndpoint {
-            base_url,
-            path: "/v1/chat/completions",
-            api_key: api_key.as_deref(),
-            extra_headers: &cfg.headers,
-        },
-        &body,
-    )
-    .await?;
-
-    let first = resp.choices.first();
-    let content = first.and_then(|c| c.message.content.clone());
-    let tool_calls: Vec<ToolCall> = first
-        .and_then(|c| c.message.tool_calls.as_ref())
-        .map(|tcs| tcs.iter().map(from_openai_tool_call).collect())
-        .unwrap_or_default();
-    let usage = usage_from_response(&resp.usage);
-
-    Ok(ChatResponse {
-        content,
-        tool_calls,
-        usage,
-        model: Some(model),
-        degraded: false,
-    })
-}
-
-/// Streaming chat completion. Same request-building as [`chat`] with
-/// `stream: true`; parses the SSE `data:` frames into [`StreamChunk`]s,
-/// accumulating fragmented tool-call arguments per index and emitting the
-/// assembled calls on the terminal `finish_reason` chunk.
-pub(crate) async fn chat_stream(
-    client: &Client,
-    base_url: &str,
-    default_model: &str,
-    cfg: &RouterConfig,
-    req: &ChatRequest,
-) -> Result<ChunkStream, GatewayError> {
-    let api_key = resolve_api_key(cfg);
-    let model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model.to_string());
-
-    let body = ChatCompletionRequest {
-        model,
-        messages: build_chat_messages(&req.messages, &req.system),
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        stream: true,
-        tools: build_tools(&req.tools),
-    };
-
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let mut request = client.post(&url).json(&body);
-    if let Some(key) = &api_key {
-        request = request.bearer_auth(key);
-    }
-    for (k, v) in &cfg.headers {
-        request = request.header(k.as_str(), v.as_str());
-    }
-
-    let response = request.send().await?;
-    let status = response.status();
-
-    if !status.is_success() {
-        return Err(error_from_response(ADAPTER, response).await);
-    }
-
-    let byte_stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(response.bytes_stream());
-    let initial = OpenAiStreamState {
-        byte_stream,
-        line_buf: String::new(),
-        tool_calls: BTreeMap::new(),
-        pending: VecDeque::new(),
-        eof: false,
-    };
-
-    let stream = futures::stream::unfold(initial, |mut state| async move {
-        loop {
-            if let Some(item) = state.pending.pop_front() {
-                return Some((item, state));
-            }
-            if state.eof {
-                return None;
-            }
-            match state.byte_stream.next().await {
-                Some(Ok(bytes)) => process_stream_bytes(&mut state, &bytes),
-                Some(Err(e)) => {
-                    state.pending.push_back(Err(GatewayError::ProviderError {
-                        adapter: ADAPTER.into(),
-                        message: format!("{ADAPTER} stream error: {e}"),
-                        status: None,
-                    }));
-                    state.eof = true;
-                }
-                None => state.eof = true,
-            }
-        }
-    });
-
-    Ok(Box::pin(stream))
-}
-
-/// Batch embeddings against `{base_url}/v1/embeddings`.
-///
-/// Model = `req.model` else `default_model`. Auth = bearer from
-/// [`resolve_api_key`] (omitted when absent) plus any `cfg.headers`.
-pub(crate) async fn embed(
-    client: &Client,
-    base_url: &str,
-    default_model: &str,
-    cfg: &RouterConfig,
-    req: &kernel::types::io::EmbedRequest,
-) -> Result<kernel::types::io::EmbedResponse, GatewayError> {
-    let api_key = resolve_api_key(cfg);
-    let model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model.to_string());
-
-    let body = EmbedRequest {
-        model,
-        input: req.texts.clone(),
-    };
-
-    let resp: EmbedResponse = http_json(
-        client,
-        JsonEndpoint {
-            base_url,
-            path: "/v1/embeddings",
-            api_key: api_key.as_deref(),
-            extra_headers: &cfg.headers,
-        },
-        &body,
-    )
-    .await?;
-
-    let embeddings: Vec<Vec<f32>> = resp.data.into_iter().map(|d| d.embedding).collect();
-    let usage = usage_from_response(&resp.usage);
-
-    Ok(kernel::types::io::EmbedResponse {
-        embeddings,
-        usage,
-        degraded: false,
     })
 }
 
@@ -601,18 +399,19 @@ pub(crate) async fn embed(
 ///   accumulators into a final `StreamChunk.tool_calls`.
 /// - Errors and emissions are queued in `pending`, so a single byte
 ///   chunk can produce zero or more gateway chunks.
-struct OpenAiStreamState {
-    byte_stream: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
-    line_buf: String,
-    tool_calls: BTreeMap<u32, StreamingToolCall>,
-    pending: VecDeque<Result<StreamChunk, GatewayError>>,
-    eof: bool,
+pub(super) struct OpenAiStreamState {
+    pub(super) byte_stream:
+        Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    pub(super) line_buf: String,
+    pub(super) tool_calls: BTreeMap<u32, StreamingToolCall>,
+    pub(super) pending: VecDeque<Result<StreamChunk, GatewayError>>,
+    pub(super) eof: bool,
 }
 
 /// Drive one byte chunk through the SSE line splitter. Each complete
 /// line is handed to [`process_sse_line`]; an incomplete trailing
 /// line stays in `line_buf` for the next call.
-fn process_stream_bytes(state: &mut OpenAiStreamState, bytes: &[u8]) {
+pub(super) fn process_stream_bytes(state: &mut OpenAiStreamState, bytes: &[u8]) {
     state.line_buf.push_str(&String::from_utf8_lossy(bytes));
     while let Some(newline_pos) = state.line_buf.find('\n') {
         let mut line = state.line_buf.drain(..=newline_pos).collect::<String>();
@@ -695,62 +494,6 @@ fn process_sse_line(state: &mut OpenAiStreamState, line: &str) {
         usage,
         tool_calls,
     }));
-}
-
-/// Generate the standard OpenAI-compatible [`ChatModel`](kernel::adapters::capability::ChatModel)
-/// impl for an adapter whose `chat`/`chat_stream` just require an API key then delegate to
-/// [`chat`]/[`chat_stream`] with a default model — the "thin delegation" contract described in
-/// this module's header. The adapter must have a `client: reqwest::Client` field.
-///
-/// - `$adapter` — the adapter type.
-/// - `model = $model` — default model id used when the request doesn't pin one.
-/// - `name = $name` — adapter name for the `Authentication` error when the key is missing.
-///
-/// ```ignore
-/// crate::impl_openai_compat_chat!(OpenAIAdapter, model = DEFAULT_MODEL, name = "openai");
-/// ```
-#[macro_export]
-macro_rules! impl_openai_compat_chat {
-    ($adapter:ty, model = $model:expr, name = $name:literal) => {
-        #[async_trait::async_trait]
-        impl kernel::adapters::capability::ChatModel for $adapter {
-            async fn chat(
-                &self,
-                config: &kernel::types::config::RouterConfig,
-                req: &kernel::types::io::ChatRequest,
-            ) -> ::std::result::Result<
-                kernel::types::io::ChatResponse,
-                kernel::types::error::GatewayError,
-            > {
-                // Require a key up front (the shared core treats it as optional, since local
-                // providers need none); a missing one short-circuits to Authentication.
-                $crate::base::require_api_key(config, $name)?;
-                $crate::openai_compat::chat(&self.client, &config.url, $model, config, req).await
-            }
-
-            async fn chat_stream(
-                &self,
-                config: &kernel::types::config::RouterConfig,
-                req: &kernel::types::io::ChatRequest,
-            ) -> ::std::result::Result<
-                ::std::pin::Pin<
-                    Box<
-                        dyn futures::Stream<
-                                Item = ::std::result::Result<
-                                    kernel::types::request::StreamChunk,
-                                    kernel::types::error::GatewayError,
-                                >,
-                            > + Send,
-                    >,
-                >,
-                kernel::types::error::GatewayError,
-            > {
-                $crate::base::require_api_key(config, $name)?;
-                $crate::openai_compat::chat_stream(&self.client, &config.url, $model, config, req)
-                    .await
-            }
-        }
-    };
 }
 
 // ---------------------------------------------------------------------------
