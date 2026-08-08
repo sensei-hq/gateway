@@ -6,18 +6,26 @@ use std::sync::Arc;
 
 use gateway::Gateway;
 use kernel::types::capability::Capability;
-use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload};
+use kernel::types::request::{
+    InferenceRequest, Message, MessageContent, MessageRole, Payload, ToolCall, ToolDefinition,
+};
 use orchestrator_core::{
-    EffectClass, EffectId, ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind,
-    OrchestratorError, RunId, Seq, effect_id,
+    AgentDefinition, AgentRef, EffectClass, EffectId, ExecutionJournal, Graph, JournalEvent,
+    NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, effect_id,
 };
 use sha2::{Digest, Sha256};
+
+use crate::agent::prompt::{assemble_prompt, over_budget};
+use crate::agent::tools::ToolRegistry;
 
 /// The deterministic executor over a durable journal, wired to the gateway.
 pub struct Executor {
     gateway: Arc<Gateway>,
     journal: Arc<dyn ExecutionJournal>,
     version: String,
+    registry: Arc<Registry>,
+    tools: Arc<ToolRegistry>,
+    max_steps: usize,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure
@@ -27,6 +35,16 @@ pub struct RunOutcome {
     pub completed: Vec<NodeId>,
     pub failed: Option<(NodeId, String)>,
     pub outputs: HashMap<NodeId, serde_json::Value>,
+}
+
+/// The state folded from a journal on resume: the effect memo plus which nodes
+/// have already been started/completed (so an Agent node's `NodeStarted`/
+/// `NodeCompleted` are appended at most once across resumes).
+#[derive(Default)]
+struct Fold {
+    memo: HashMap<EffectId, (String, serde_json::Value)>,
+    started: std::collections::HashSet<NodeId>,
+    completed: std::collections::HashSet<NodeId>,
 }
 
 impl Executor {
@@ -41,7 +59,28 @@ impl Executor {
             gateway,
             journal,
             version: version.into(),
+            registry: Arc::new(Registry::default()),
+            tools: Arc::new(ToolRegistry::default()),
+            max_steps: 8,
         }
+    }
+
+    /// Attach the agent registry an `Agent` node resolves its definition against.
+    pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Attach the executable tool runtime an `Agent` node dispatches Pure calls to.
+    pub fn with_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Override the ReAct loop's max turns (default 8).
+    pub fn with_max_steps(mut self, n: usize) -> Self {
+        self.max_steps = n;
+        self
     }
 
     /// Execute a fresh linear graph end-to-end: journal `RunStarted`, then drive
@@ -55,7 +94,7 @@ impl Executor {
             },
         )
         .await?;
-        self.drive(run, graph, &HashMap::new()).await
+        self.drive(run, graph, &Fold::default()).await
     }
 
     /// Resume (or freshly start) a run from its durable journal — the headline
@@ -103,7 +142,7 @@ impl Executor {
         let terminal = events
             .iter()
             .any(|(_, e)| matches!(e, JournalEvent::RunCompleted));
-        let mut memo: HashMap<EffectId, (String, serde_json::Value)> = HashMap::new();
+        let mut fold = Fold::default();
         let mut outcome = RunOutcome::default();
         for (_, event) in &events {
             match event {
@@ -114,10 +153,17 @@ impl Executor {
                     output,
                     ..
                 } => {
-                    memo.insert(effect_id.clone(), (input_hash.clone(), output.clone()));
+                    fold.memo
+                        .insert(effect_id.clone(), (input_hash.clone(), output.clone()));
                     outcome.outputs.insert(node.clone(), output.clone());
                 }
-                JournalEvent::NodeCompleted { node } => outcome.completed.push(node.clone()),
+                JournalEvent::NodeStarted { node } => {
+                    fold.started.insert(node.clone());
+                }
+                JournalEvent::NodeCompleted { node } => {
+                    fold.completed.insert(node.clone());
+                    outcome.completed.push(node.clone());
+                }
                 _ => {}
             }
         }
@@ -130,7 +176,7 @@ impl Executor {
 
         // Resume the tail: `drive`'s memo branch replays the completed prefix
         // (no gateway call, no new `EffectRecorded`) and finishes the run.
-        self.drive(run, graph, &memo).await
+        self.drive(run, graph, &fold).await
     }
 
     /// Shared node loop for both `run` (empty memo) and `start` (memo folded
@@ -149,84 +195,99 @@ impl Executor {
         &self,
         run: RunId,
         graph: &Graph,
-        memo: &HashMap<EffectId, (String, serde_json::Value)>,
+        fold: &Fold,
     ) -> Result<RunOutcome, OrchestratorError> {
         let mut outcome = RunOutcome::default();
         for (index, node) in graph.nodes.iter().enumerate() {
-            let NodeKind::ModelCall { chain, payload } = &node.kind;
-            let eid = effect_id("", 0, index);
-            let ih = input_hash(chain, payload)?;
+            match &node.kind {
+                NodeKind::ModelCall { chain, payload } => {
+                    let eid = effect_id("", 0, index);
+                    let ih = input_hash(chain, payload)?;
 
-            if let Some((recorded_ih, output)) = memo.get(&eid) {
-                if recorded_ih != &ih {
-                    return Err(OrchestratorError::DeterminismViolation {
-                        node: node.id.clone(),
-                        effect_id: eid,
-                    });
+                    if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
+                        if recorded_ih != &ih {
+                            return Err(OrchestratorError::DeterminismViolation {
+                                node: node.id.clone(),
+                                effect_id: eid,
+                            });
+                        }
+                        // Memoized: replay the recorded output — no gateway call, no
+                        // new `EffectRecorded` (it is already in the journal).
+                        outcome.outputs.insert(node.id.clone(), output.clone());
+                        outcome.completed.push(node.id.clone());
+                        continue;
+                    }
+
+                    self.append(
+                        run,
+                        JournalEvent::NodeStarted {
+                            node: node.id.clone(),
+                        },
+                    )
+                    .await?;
+
+                    let request = build_request(chain, payload);
+                    match self.gateway.execute(&request).await {
+                        Ok(response) => {
+                            let output = serde_json::json!({
+                                "model": response.model,
+                                "text": response.content.clone().unwrap_or_default(),
+                            });
+                            // `EffectRecorded.seq` is advisory: `append` assigns the
+                            // authoritative outer `Seq`, and the Task 4 resume fold
+                            // orders events by that outer `(Seq, event)` from `load` —
+                            // never by this in-event field — so it is set to 0 rather
+                            // than the (circular) value `append` would return.
+                            self.append(
+                                run,
+                                JournalEvent::EffectRecorded {
+                                    node: node.id.clone(),
+                                    effect_id: eid,
+                                    class: EffectClass::Pure,
+                                    input_hash: ih,
+                                    seq: 0,
+                                    output: output.clone(),
+                                },
+                            )
+                            .await?;
+                            self.append(
+                                run,
+                                JournalEvent::NodeCompleted {
+                                    node: node.id.clone(),
+                                },
+                            )
+                            .await?;
+                            outcome.outputs.insert(node.id.clone(), output);
+                            outcome.completed.push(node.id.clone());
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.append(
+                                run,
+                                JournalEvent::NodeFailed {
+                                    node: node.id.clone(),
+                                    error: message.clone(),
+                                },
+                            )
+                            .await?;
+                            // Surface the failure in the outcome and stop the run — the
+                            // failure is reported, not swallowed.
+                            outcome.failed = Some((node.id.clone(), message));
+                            return Ok(outcome);
+                        }
+                    }
                 }
-                // Memoized: replay the recorded output — no gateway call, no new
-                // `EffectRecorded` (it is already in the journal).
-                outcome.outputs.insert(node.id.clone(), output.clone());
-                outcome.completed.push(node.id.clone());
-                continue;
-            }
-
-            self.append(
-                run,
-                JournalEvent::NodeStarted {
-                    node: node.id.clone(),
-                },
-            )
-            .await?;
-
-            let request = build_request(chain, payload);
-            match self.gateway.execute(&request).await {
-                Ok(response) => {
-                    let output = serde_json::json!({
-                        "model": response.model,
-                        "text": response.content.clone().unwrap_or_default(),
-                    });
-                    // `EffectRecorded.seq` is advisory: `append` assigns the
-                    // authoritative outer `Seq`, and the Task 4 resume fold
-                    // orders events by that outer `(Seq, event)` from `load` —
-                    // never by this in-event field — so it is set to 0 rather
-                    // than the (circular) value `append` would return.
-                    self.append(
-                        run,
-                        JournalEvent::EffectRecorded {
-                            node: node.id.clone(),
-                            effect_id: eid,
-                            class: EffectClass::Pure,
-                            input_hash: ih,
-                            seq: 0,
-                            output: output.clone(),
-                        },
-                    )
-                    .await?;
-                    self.append(
-                        run,
-                        JournalEvent::NodeCompleted {
-                            node: node.id.clone(),
-                        },
-                    )
-                    .await?;
-                    outcome.outputs.insert(node.id.clone(), output);
-                    outcome.completed.push(node.id.clone());
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    self.append(
-                        run,
-                        JournalEvent::NodeFailed {
-                            node: node.id.clone(),
-                            error: message.clone(),
-                        },
-                    )
-                    .await?;
-                    // Surface the failure in the outcome and stop the run — the
-                    // failure is reported, not swallowed.
-                    outcome.failed = Some((node.id.clone(), message));
-                    return Ok(outcome);
+                NodeKind::Agent { agent, input } => {
+                    match self.drive_agent(run, node, agent, input, fold).await? {
+                        AgentStep::Completed(output) => {
+                            outcome.outputs.insert(node.id.clone(), output);
+                            outcome.completed.push(node.id.clone());
+                        }
+                        AgentStep::Failed(message) => {
+                            outcome.failed = Some((node.id.clone(), message));
+                            return Ok(outcome);
+                        }
+                    }
                 }
             }
         }
@@ -242,6 +303,226 @@ impl Executor {
             .append(run, event)
             .await
             .map_err(OrchestratorError::Journal)
+    }
+}
+
+/// The terminal result of one `Agent` node: a completed output, or a node-level
+/// failure (budget/max-steps/gateway/tool) already journaled as `NodeFailed`.
+enum AgentStep {
+    Completed(serde_json::Value),
+    Failed(String),
+}
+
+impl Executor {
+    /// Run one `Agent` node's ReAct loop. Each turn is a Pure `ModelCall` effect
+    /// (iteration-aware id `effect_id(node.id, turn, 0)`); each Pure tool call is a
+    /// Pure effect (`effect_id(node.id, turn, k+1)`). Memoized turns/tools replay
+    /// from the journal with no gateway call and no re-execution (resume without
+    /// re-spend); an input-hash mismatch halts with `DeterminismViolation`.
+    async fn drive_agent(
+        &self,
+        run: RunId,
+        node: &orchestrator_core::Node,
+        agent_ref: &AgentRef,
+        input: &serde_json::Value,
+        fold: &Fold,
+    ) -> Result<AgentStep, OrchestratorError> {
+        let agent: &AgentDefinition = self
+            .registry
+            .agent(&agent_ref.0)
+            .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
+        let (system, tools) = assemble_prompt(&self.registry, agent)?;
+        let chain = agent.chain.clone();
+        let min_win = self.gateway.min_context_window(&chain).await;
+
+        let mut messages: Vec<Message> =
+            vec![Message::text(MessageRole::User, render_input(input))];
+        let mut node_started = fold.started.contains(&node.id);
+
+        for turn in 0..self.max_steps {
+            let eid = effect_id(&node.id.0, turn as u64, 0);
+            let ih = agent_input_hash(&chain, &system, &messages, &tools)?;
+
+            // Reuse a memoized turn (resume): no gateway call, no re-append.
+            let turn_output = if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
+                if recorded_ih != &ih {
+                    return Err(OrchestratorError::DeterminismViolation {
+                        node: node.id.clone(),
+                        effect_id: eid,
+                    });
+                }
+                output.clone()
+            } else {
+                // Live turn: budget → NodeStarted (once) → gateway → EffectRecorded.
+                if over_budget(min_win, &system, &messages, &tools) {
+                    let est = est_prompt_tokens(&system, &messages, &tools);
+                    let err = OrchestratorError::PromptOverBudget {
+                        node: node.id.clone(),
+                        turn,
+                        est,
+                        min_win: min_win.unwrap_or(0),
+                    };
+                    let message = err.to_string();
+                    self.append(
+                        run,
+                        JournalEvent::NodeFailed {
+                            node: node.id.clone(),
+                            error: message.clone(),
+                        },
+                    )
+                    .await?;
+                    return Ok(AgentStep::Failed(message));
+                }
+                if !node_started {
+                    self.append(
+                        run,
+                        JournalEvent::NodeStarted {
+                            node: node.id.clone(),
+                        },
+                    )
+                    .await?;
+                    node_started = true;
+                }
+                let request = build_chat_request(&chain, &system, messages.clone(), tools.clone());
+                match self.gateway.execute(&request).await {
+                    Ok(response) => {
+                        let output = serde_json::json!({
+                            "model": response.model,
+                            "text": response.content.clone().unwrap_or_default(),
+                            "tool_calls": response.tool_calls,
+                        });
+                        self.append(
+                            run,
+                            JournalEvent::EffectRecorded {
+                                node: node.id.clone(),
+                                effect_id: eid,
+                                class: EffectClass::Pure,
+                                input_hash: ih,
+                                seq: 0,
+                                output: output.clone(),
+                            },
+                        )
+                        .await?;
+                        output
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: node.id.clone(),
+                                error: message.clone(),
+                            },
+                        )
+                        .await?;
+                        return Ok(AgentStep::Failed(message));
+                    }
+                }
+            };
+
+            let tool_calls: Vec<ToolCall> = serde_json::from_value(
+                turn_output
+                    .get("tool_calls")
+                    .cloned()
+                    .unwrap_or(serde_json::json!([])),
+            )?;
+            if tool_calls.is_empty() {
+                // Final answer.
+                if !fold.completed.contains(&node.id) {
+                    self.append(
+                        run,
+                        JournalEvent::NodeCompleted {
+                            node: node.id.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                let text = turn_output.get("text").cloned().unwrap_or_default();
+                let model = turn_output
+                    .get("model")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return Ok(AgentStep::Completed(
+                    serde_json::json!({ "model": model, "text": text }),
+                ));
+            }
+
+            // Execute (or replay) each tool call, then extend the transcript.
+            let assistant_text = turn_output
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            messages.push(Message {
+                role: MessageRole::Assistant,
+                content: MessageContent::Text {
+                    text: assistant_text,
+                },
+                tool_calls: tool_calls.clone(),
+                attachments: Vec::new(),
+            });
+            for (k, call) in tool_calls.iter().enumerate() {
+                let teid = effect_id(&node.id.0, turn as u64, k + 1);
+                let args: serde_json::Value =
+                    serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+                let tih = tool_input_hash(&call.name, &call.arguments);
+                let result = if let Some((recorded_ih, output)) = fold.memo.get(&teid) {
+                    if recorded_ih != &tih {
+                        return Err(OrchestratorError::DeterminismViolation {
+                            node: node.id.clone(),
+                            effect_id: teid,
+                        });
+                    }
+                    output.clone()
+                } else {
+                    match self.tools.execute(&call.name, args) {
+                        Ok(result) => {
+                            self.append(
+                                run,
+                                JournalEvent::EffectRecorded {
+                                    node: node.id.clone(),
+                                    effect_id: teid,
+                                    class: EffectClass::Pure,
+                                    input_hash: tih,
+                                    seq: 0,
+                                    output: result.clone(),
+                                },
+                            )
+                            .await?;
+                            result
+                        }
+                        Err(err) => {
+                            let message = err.to_string();
+                            self.append(
+                                run,
+                                JournalEvent::NodeFailed {
+                                    node: node.id.clone(),
+                                    error: message.clone(),
+                                },
+                            )
+                            .await?;
+                            return Ok(AgentStep::Failed(message));
+                        }
+                    }
+                };
+                messages.push(Message::tool_result(call.id.clone(), result.to_string()));
+            }
+        }
+
+        // Ran out of steps without a final answer.
+        let err = OrchestratorError::AgentMaxStepsExceeded {
+            node: node.id.clone(),
+        };
+        let message = err.to_string();
+        self.append(
+            run,
+            JournalEvent::NodeFailed {
+                node: node.id.clone(),
+                error: message.clone(),
+            },
+        )
+        .await?;
+        Ok(AgentStep::Failed(message))
     }
 }
 
@@ -284,12 +565,195 @@ fn build_request(chain: &str, payload: &serde_json::Value) -> InferenceRequest {
     }
 }
 
+/// Render an agent node's JSON `input` into user-message text: a JSON string
+/// passes through; any other value is serialized (deterministic — feeds the hash).
+fn render_input(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Compile one ReAct turn into a chat `InferenceRequest` (system + transcript +
+/// tools) over the agent's chain. `budget: None` — cost budgeting is the gateway's
+/// dormant axis in slice 2 (see the design); this request carries only window-fit.
+fn build_chat_request(
+    chain: &str,
+    system: &str,
+    messages: Vec<Message>,
+    tools: Vec<ToolDefinition>,
+) -> InferenceRequest {
+    InferenceRequest {
+        capability: Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some(chain.to_string()),
+        payload: Payload::Chat {
+            messages,
+            system: Some(system.to_string()),
+            max_tokens: None,
+            temperature: None,
+            tools,
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+    }
+}
+
+/// Determinism key for a ReAct turn: `sha256_hex(chain | system | messages | tools)`.
+fn agent_input_hash(
+    chain: &str,
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Result<String, OrchestratorError> {
+    let messages = serde_json::to_string(messages)?;
+    let tools = serde_json::to_string(tools)?;
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{chain}|{system}|{messages}|{tools}").as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Determinism key for a Pure tool call: `sha256_hex(name | arguments)`.
+fn tool_input_hash(name: &str, arguments: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{name}|{arguments}").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Estimate a prompt's tokens (for the over-budget diagnostic's `est`).
+fn est_prompt_tokens(system: &str, messages: &[Message], tools: &[ToolDefinition]) -> usize {
+    use crate::agent::prompt::est_tokens;
+    let mut est = est_tokens(system);
+    for m in messages {
+        est += est_tokens(m.content.as_text());
+    }
+    for t in tools {
+        est += est_tokens(&t.name)
+            + t.description.as_deref().map(est_tokens).unwrap_or(0)
+            + est_tokens(&t.input_schema.to_string());
+    }
+    est
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{demo_reference_gateway, failing_after_gateway, recording_gateway};
     use orchestrator_core::{Graph, JournalError, Node, NodeId, NodeKind};
     use orchestrator_store::InMemoryJournal;
+
+    use crate::agent::tools::{Calc, ToolRegistry};
+    use orchestrator_core::{AgentDefinition, AgentRef, Registry};
+    use std::sync::Arc;
+
+    fn agent_def(chain: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: "a".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: chain.into(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "SYS".into(),
+        }
+    }
+
+    /// A demo registry/executor: one agent "a" on the recording chain "c".
+    fn agent_registry(chain: &str) -> Arc<Registry> {
+        Arc::new(Registry::default().with_agent(agent_def(chain)))
+    }
+
+    fn agent_node(id: &str, agent: &str, input: &str) -> Node {
+        Node {
+            id: NodeId(id.into()),
+            kind: NodeKind::Agent {
+                agent: AgentRef(agent.into()),
+                input: serde_json::json!(input),
+            },
+            deps: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_node_single_turn_runs_through_gateway_and_journals() {
+        let (gateway, calls) = recording_gateway().await; // returns empty tool_calls → final on turn 0
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+            .with_registry(agent_registry("c"))
+            .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(Calc))));
+
+        let n1 = NodeId("n1".into());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "hello")],
+        };
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = exec.run(run, &graph).await.expect("run");
+
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+        assert_eq!(outcome.completed, vec![n1.clone()]);
+        assert_eq!(outcome.outputs[&n1]["text"], "canned-response");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "one model turn, one gateway call"
+        );
+
+        let kinds: Vec<String> = journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| label(e))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "RunStarted",
+                "NodeStarted(n1)",
+                "EffectRecorded(n1)",
+                "NodeCompleted(n1)",
+                "RunCompleted"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_node_halts_over_budget_before_any_gateway_call() {
+        let (gateway, calls) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        // max_context of chain "c" is 4096; force a tiny window via max_steps? No —
+        // budget uses the chain window. Use a registry whose agent has a huge body.
+        let big = AgentDefinition {
+            system_prompt: "x".repeat(100_000),
+            ..agent_def("c")
+        };
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+            .with_registry(Arc::new(Registry::default().with_agent(big)))
+            .with_tools(Arc::new(ToolRegistry::default()));
+
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "hi")],
+        };
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = exec.run(run, &graph).await.expect("run yields an outcome");
+        match &outcome.failed {
+            Some((node, msg)) => {
+                assert_eq!(node.0, "n1");
+                assert!(msg.contains("over budget"), "{msg}");
+            }
+            None => panic!("expected an over-budget failure"),
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "over-budget halts before spending"
+        );
+    }
 
     fn model_call(chain: &str, prompt: &str) -> NodeKind {
         NodeKind::ModelCall {

@@ -41,4 +41,15 @@ pub enum OrchestratorError {
     UnknownTool(String),
     #[error("tool {tool:?} failed: {message}")]
     Tool { tool: String, message: String },
+    #[error("unknown agent {0:?}")]
+    UnknownAgent(String),
+    #[error("prompt over budget at node {node:?} turn {turn}: est {est} > window {min_win}")]
+    PromptOverBudget {
+        node: NodeId,
+        turn: usize,
+        est: usize,
+        min_win: u32,
+    },
+    #[error("agent node {node:?} exceeded max_steps")]
+    AgentMaxStepsExceeded { node: NodeId },
 }
