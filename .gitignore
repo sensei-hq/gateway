@@ -6,3 +6,5 @@ Cargo.lock
 .claude/
 # qlty: the project config (`.qlty/qlty.toml` + configs) IS committed so the
 # scan is repo-controlled; `.qlty/.gitignore` already ignores the cache/output.
+# Git worktrees for isolated feature work (superpowers workflow).
+/.worktrees/
