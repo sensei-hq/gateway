@@ -105,10 +105,17 @@ enum FmValue {
 }
 
 /// Split `---\n<frontmatter>\n---\n<body>` into (frontmatter, body).
+///
+/// Zero-field frontmatter (`---\n---\n<body>`) is valid: `rest` then starts
+/// with the closing delimiter itself, rather than containing `"\n---"`, so
+/// that case is checked separately before falling back to `find`.
 fn split_frontmatter(input: &str) -> Result<(&str, &str), OrchestratorError> {
     let rest = input
         .strip_prefix("---\n")
         .ok_or_else(|| OrchestratorError::FrontmatterParse("missing opening '---'".into()))?;
+    if let Some(body) = rest.strip_prefix("---") {
+        return Ok(("", body.trim_start_matches('\n')));
+    }
     let end = rest
         .find("\n---")
         .ok_or_else(|| OrchestratorError::FrontmatterParse("missing closing '---'".into()))?;
@@ -238,6 +245,56 @@ mod tests {
         assert_eq!(s.name, "concise");
         assert_eq!(s.description.as_deref(), Some("Be terse"));
         assert_eq!(s.body, "Use short sentences.\n");
+    }
+
+    #[test]
+    fn skill_from_frontmatter_defaults_description_to_none() {
+        let md = "---\nname: concise\n---\nUse short sentences.\n";
+        let s = SkillDef::from_frontmatter(md).expect("parses");
+        assert_eq!(s.description, None);
+    }
+
+    #[test]
+    fn from_frontmatter_missing_opening_delimiter_errors() {
+        let md = "name: n\n---\nbody";
+        assert!(matches!(
+            AgentDefinition::from_frontmatter(md),
+            Err(OrchestratorError::FrontmatterParse(_))
+        ));
+    }
+
+    #[test]
+    fn from_frontmatter_missing_closing_delimiter_errors() {
+        let md = "---\nname: n\nbody";
+        assert!(matches!(
+            AgentDefinition::from_frontmatter(md),
+            Err(OrchestratorError::FrontmatterParse(_))
+        ));
+    }
+
+    #[test]
+    fn from_frontmatter_line_without_colon_errors() {
+        let md = "---\nname n\n---\nb";
+        assert!(matches!(
+            AgentDefinition::from_frontmatter(md),
+            Err(OrchestratorError::FrontmatterParse(_))
+        ));
+    }
+
+    #[test]
+    fn from_frontmatter_zero_field_frontmatter_splits_and_fails_on_missing_name() {
+        // The delimiter split must succeed (empty frontmatter is valid), and the
+        // resulting error must be the downstream "missing required key", not a
+        // (wrong) "missing closing '---'".
+        match AgentDefinition::from_frontmatter("---\n---\nbody\n") {
+            Err(OrchestratorError::FrontmatterParse(msg)) => {
+                assert!(
+                    msg.contains("required key"),
+                    "expected a missing-required-key error, got: {msg}"
+                );
+            }
+            other => panic!("expected FrontmatterParse(missing required key), got {other:?}"),
+        }
     }
 
     fn tool_spec(name: &str) -> ToolSpec {
