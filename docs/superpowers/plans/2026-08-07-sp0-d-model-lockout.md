@@ -274,12 +274,12 @@ fn store_records_and_reads_locks() {
     let s = ModelLockoutStore::new();
     assert!(s.locked("r:m").is_none());                     // unknown → not locked
     let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    s.set("r:m", LockReason::RateLimit, Some(until), 0);
+    s.set("r:m", LockReason::RateLimit, Some(until));
     let v = s.locked("r:m").expect("locked");
     assert_eq!(v.reason, LockReason::RateLimit);
     assert_eq!(v.until, Some(until));
     // terminal lock: until = None
-    s.set("r:x", LockReason::Auth, None, 0);
+    s.set("r:x", LockReason::Auth, None);
     assert_eq!(s.locked("r:x").unwrap().until, None);
     // clear removes it
     s.clear("r:m");
@@ -301,13 +301,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// A single endpoint's lockout state. `escalation` grows per lock→release→relock
-/// cycle (the sink's generation guard); `until = None` is terminal.
+/// A single endpoint's lockout state. `until = None` is terminal. (The sink's
+/// `escalation` field is added in Task 5, where a reader exists — introducing it
+/// here would trip `-D warnings` dead-code.)
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LockEntry {
     pub reason: LockReason,
     pub until: Option<Instant>,
-    pub escalation: u32,
 }
 
 /// What the gate reads for a candidate: the active lock's reason + deadline.
@@ -338,20 +338,17 @@ impl ModelLockoutStore {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Insert/replace the endpoint's lock (used by the sink and `apply_lockout`).
-    pub fn set(&self, endpoint: &str, reason: LockReason, until: Option<Instant>, escalation: u32) {
+    /// Insert/replace the endpoint's lock. (Task 5 adds an `escalation` param +
+    /// `get` when the sink needs them.)
+    pub fn set(&self, endpoint: &str, reason: LockReason, until: Option<Instant>) {
         self.locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(endpoint.to_string(), LockEntry { reason, until, escalation });
+            .insert(endpoint.to_string(), LockEntry { reason, until });
     }
-    /// Remove the endpoint's lock + escalation memory (success / `clear_lockout`).
+    /// Remove the endpoint's lock (success / `clear_lockout`).
     pub fn clear(&self, endpoint: &str) {
         self.locks.lock().unwrap_or_else(|e| e.into_inner()).remove(endpoint);
-    }
-    /// The current entry, cloned (used by the sink to compute escalation).
-    pub(crate) fn get(&self, endpoint: &str) -> Option<LockEntry> {
-        self.locks.lock().unwrap_or_else(|e| e.into_inner()).get(endpoint).copied()
     }
 }
 
@@ -440,7 +437,7 @@ impl AdmissionGate for ModelLockoutGate {
   - "403 after 429 upgrades the lock": pre-seed `RateLimit` timed lock, feed a 403-quota → reason becomes `QuotaExhausted`.
   Drive the sink directly: `sink.on_outcome(&AttemptOutcome { endpoint: "r:m", router: "r", success: false, error: Some(&err) })` then assert via `store.locked("r:m")`.
 - [ ] **Step 2:** run → FAIL.
-- [ ] **Step 3: Implement** in `gates/lockout.rs`:
+- [ ] **Step 3: Implement** in `gates/lockout.rs`. **First, restore the escalation plumbing deferred from Task 3** (now that the sink reads it): add `pub escalation: u32` back to `LockEntry`; change `ModelLockoutStore::set` to `set(&self, endpoint, reason, until, escalation: u32)` (construct `LockEntry { reason, until, escalation }`); re-add `pub(crate) fn get(&self, endpoint) -> Option<LockEntry>` (`.get(endpoint).copied()`). Update the Task-3 `store_records_and_reads_locks` test's two `set(...)` calls to pass a 4th arg `0`. `apply_lockout` (Task 6) will call `set(.., 0)`. Then add the policy + sink:
 ```rust
 use super::{AttemptOutcome, HealthRecorder};
 use std::time::Duration;
@@ -635,7 +632,7 @@ fn retry_after(err: &GatewayError) -> Option<Duration> {
     }
 ```
     (Router ids are config keys without `:`, so `"{router}:"` is an unambiguous prefix even though the model segment may contain `:`.)
-  - `engine/mod.rs`:
+  - `engine/mod.rs` — **first, retain the observer registry (deferred from Task 5, which gave the sink a local broadcaster to avoid a dead field):** add `lockout_observers: crate::gates::lockout::LockoutBroadcaster,` to the `Gateway` struct; in `new`, bind `let lockout_observers = crate::gates::lockout::LockoutBroadcaster::new();` and pass `lockout_observers.clone()` into `ModelLockoutSink::new(...)` (replacing Task 5's inline `LockoutBroadcaster::new()`), and add `lockout_observers,` to the struct literal. Now `with_observer` registers into the SAME Arc-backed broadcaster the sink fires. Then the methods:
 ```rust
     /// Register a best-effort lockout observer (the caller persists what the
     /// gateway announces). Builder-style; the core never persists (§5c).
