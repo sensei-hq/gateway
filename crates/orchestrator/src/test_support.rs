@@ -27,9 +27,12 @@ pub type RecordedCall = (Option<String>, String);
 pub type CallLog = Arc<Mutex<Vec<RecordedCall>>>;
 
 /// Chat adapter that records each call into a shared log and returns a canned,
-/// non-degraded (successful) response.
+/// non-degraded (successful) response. `fail_after` is the crash injector for
+/// the resume test: `Some(n)` ⇒ succeed for the first `n` calls then error on
+/// every call after that; `None` ⇒ always succeed.
 pub struct RecordingAdapter {
     calls: CallLog,
+    fail_after: Option<usize>,
 }
 
 impl Model for RecordingAdapter {
@@ -50,10 +53,25 @@ impl ChatModel for RecordingAdapter {
             .first()
             .map(|m| m.as_text().to_string())
             .unwrap_or_default();
-        self.calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((req.model.clone(), prompt));
+        // Record the call first (so the log counts even a failed dispatch), then
+        // read the 1-based index of *this* call to decide success vs. failure.
+        let call_index = {
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push((req.model.clone(), prompt));
+            calls.len()
+        };
+        // Crash injector: model a provider dying mid-run by erroring once the
+        // call count passes `fail_after`. A single-candidate chain surfaces this
+        // straight to `Gateway::execute` as an `Err`.
+        if let Some(succeed) = self.fail_after
+            && call_index > succeed
+        {
+            return Err(GatewayError::ProviderError {
+                adapter: self.id().to_string(),
+                message: "injected mid-run failure".to_string(),
+                status: Some(500),
+            });
+        }
         Ok(ChatResponse {
             content: Some("canned-response".into()),
             tool_calls: Vec::new(),
@@ -66,9 +84,10 @@ impl ChatModel for RecordingAdapter {
 
 /// Build a minimal gateway whose chain `"c"` resolves `TextChat` to the
 /// recording adapter (router `"r"`, model `"m"`), returning the gateway and the
-/// shared call log. The adapter is registered into the `AdapterRegistry` before
-/// `Gateway::new` because `Gateway::adapters` is crate-private.
-pub async fn recording_gateway() -> (Gateway, CallLog) {
+/// shared call log. `fail_after` is threaded into the adapter's crash injector.
+/// The adapter is registered into the `AdapterRegistry` before `Gateway::new`
+/// because `Gateway::adapters` is crate-private.
+async fn build_gateway(fail_after: Option<usize>) -> (Gateway, CallLog) {
     let mut routers = HashMap::new();
     routers.insert(
         "r".to_string(),
@@ -128,8 +147,20 @@ pub async fn recording_gateway() -> (Gateway, CallLog) {
     adapters
         .register_chat(Arc::new(RecordingAdapter {
             calls: calls.clone(),
+            fail_after,
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     (Gateway::new(config, adapters, cb), calls)
+}
+
+/// A gateway whose recording adapter always succeeds.
+pub async fn recording_gateway() -> (Gateway, CallLog) {
+    build_gateway(None).await
+}
+
+/// A gateway whose recording adapter succeeds for its first `succeed` calls and
+/// errors thereafter — the crash injector for the resume-without-re-spend test.
+pub async fn failing_after_gateway(succeed: usize) -> (Gateway, CallLog) {
+    build_gateway(Some(succeed)).await
 }
