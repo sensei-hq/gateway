@@ -3,13 +3,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::OrchestratorError;
 use crate::ids::NodeId;
 
-/// The kind of work a node performs. Slice 1 has a single variant: a raw
-/// `ModelCall` that compiles directly into an `InferenceRequest`.
+/// The kind of work a node performs. Two variants: a raw `ModelCall` that
+/// compiles directly into an `InferenceRequest` (slice 1), and an `Agent` node
+/// that runs a durable ReAct loop over a named agent (slice 2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeKind {
     ModelCall {
         chain: String,
         payload: serde_json::Value,
+    },
+    Agent {
+        agent: crate::registry::AgentRef,
+        input: serde_json::Value,
     },
 }
 
