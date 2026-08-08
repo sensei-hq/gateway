@@ -30,4 +30,15 @@ pub enum OrchestratorError {
     UnknownToolRef { agent: String, tool: String },
     #[error("payload serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error(
+        "tool {tool:?} has non-Pure effect class {class:?}; Observation/Mutation are deferred to SP-1 slice 4"
+    )]
+    ToolEffectDeferred {
+        tool: String,
+        class: crate::effect::EffectClass,
+    },
+    #[error("unknown tool {0:?}")]
+    UnknownTool(String),
+    #[error("tool {tool:?} failed: {message}")]
+    Tool { tool: String, message: String },
 }
