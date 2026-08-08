@@ -287,7 +287,7 @@ fn build_request(chain: &str, payload: &serde_json::Value) -> InferenceRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{failing_after_gateway, recording_gateway};
+    use crate::test_support::{demo_reference_gateway, failing_after_gateway, recording_gateway};
     use orchestrator_core::{Graph, JournalError, Node, NodeId, NodeKind};
     use orchestrator_store::InMemoryJournal;
 
@@ -673,6 +673,74 @@ mod tests {
             after.len(),
             before.len(),
             "resume of a completed run appends nothing at all"
+        );
+    }
+
+    /// Real end-to-end: the durable executor drives the REAL gateway assembled
+    /// from the illustrative demo catalog (`gateway::catalog::assemble(
+    /// demo_catalog())`) over a REFERENCE chain (`research.bulk`). The selector
+    /// walks `groq-llama-free` (no adapter → fall over) → `deepseek-chat` (no
+    /// adapter → fall over) → `llama3.1-local` (served by the local ollama
+    /// adapter). The run completes and the orchestrator records the model the
+    /// chain fell over to — proving the spine drives the real gateway + a real
+    /// reference chain, not a bespoke test-only single-model chain.
+    #[tokio::test]
+    async fn run_drives_real_reference_chain_end_to_end_to_local_fallover() {
+        let (gateway, calls) = demo_reference_gateway().await;
+        let journal = InMemoryJournal::new();
+        let executor = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+
+        // A single `ModelCall` node on the reference chain `research.bulk`.
+        let n1 = NodeId("n1".into());
+        let graph = Graph {
+            nodes: vec![Node {
+                id: n1.clone(),
+                kind: NodeKind::ModelCall {
+                    chain: "research.bulk".into(),
+                    payload: serde_json::json!({ "prompt": "hello" }),
+                },
+                deps: vec![],
+            }],
+        };
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = executor.run(run, &graph).await.expect("run succeeds");
+
+        // The reference chain ran to completion via genuine fallover.
+        assert!(
+            outcome.failed.is_none(),
+            "the reference chain runs to completion via fallover: {:?}",
+            outcome.failed
+        );
+        assert_eq!(outcome.completed, vec![n1.clone()], "n1 completed");
+        // The load-bearing assertion: the orchestrator recorded that the chain
+        // fell over the credential-gated cloud entries to the LOCAL model.
+        assert_eq!(
+            outcome.outputs[&n1]["model"], "llama3.1-local",
+            "the reference chain fell over cloud entries to the local model, recorded by the orchestrator: {:?}",
+            outcome.outputs[&n1],
+        );
+
+        // The chain genuinely reached the local adapter (the terminal candidate
+        // was served, not short-circuited earlier).
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the served terminal candidate hit the local ollama adapter exactly once",
+        );
+
+        // And the journal is a clean single-node run ending on RunCompleted.
+        let events = journal.load(run).await.expect("load");
+        let kinds: Vec<String> = events.iter().map(|(_, e)| label(e)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "RunStarted",
+                "NodeStarted(n1)",
+                "EffectRecorded(n1)",
+                "NodeCompleted(n1)",
+                "RunCompleted",
+            ],
         );
     }
 }
