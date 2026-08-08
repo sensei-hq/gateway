@@ -70,6 +70,12 @@ pub struct CatalogMeta {
     /// Where the model runs (local vs cloud).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<Locality>,
+    /// Arbitrary attribute labels (e.g. `"reasoning"`, `"frontier"`) used by
+    /// tier predicates to derive membership on labels beyond the fixed
+    /// attributes above. Absent ⇒ `[]` (backward-compatible; no tag-derived
+    /// tiering).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Free-tier terms for a model: the recurrence shape, any token allowances, an
@@ -436,6 +442,7 @@ mod tests {
             auth_type: Some(AuthType::ApiKey),
             cost_band: None,
             locality: Some(Locality::Cloud),
+            tags: vec![],
         };
         let m2 = ModelConfig {
             catalog: Some(meta),
@@ -450,6 +457,21 @@ mod tests {
             back.catalog.as_ref().unwrap().auth_type,
             Some(AuthType::ApiKey)
         );
+    }
+
+    #[test]
+    fn catalog_meta_tags_default_absent_and_roundtrip() {
+        // Backward-compatible: a CatalogMeta JSON without `tags` deserializes to
+        // an empty tag list (absent ⇒ []), so existing catalogs keep working.
+        let meta: CatalogMeta = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(meta.tags, Vec::<String>::new());
+
+        // A JSON carrying tags roundtrips faithfully.
+        let meta: CatalogMeta = serde_json::from_str(r#"{"tags":["reasoning"]}"#).unwrap();
+        assert_eq!(meta.tags, vec!["reasoning".to_string()]);
+        let s = serde_json::to_string(&meta).unwrap();
+        let back: CatalogMeta = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tags, vec!["reasoning".to_string()]);
     }
 
     #[test]

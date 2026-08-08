@@ -52,6 +52,11 @@ pub struct TierPredicate {
     pub capability: Option<Capability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<Locality>,
+    /// Required tags: a model matches iff its catalog carries EVERY listed tag
+    /// (AND/subset). Absent ⇒ don't-care; a model with no catalog (or no tags)
+    /// matches only an absent or empty tag predicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
 }
 
 /// A tier: an intra-tier ordering strategy plus its membership sources —
@@ -129,7 +134,15 @@ fn matches(pred: &TierPredicate, model: &ModelConfig) -> bool {
     let loc_ok = pred
         .locality
         .is_none_or(|l| model.catalog.as_ref().and_then(|c| c.locality) == Some(l));
-    free_ok && auth_ok && band_ok && cap_ok && loc_ok
+    let tags_ok = pred.tags.as_ref().is_none_or(|req| {
+        let have = model
+            .catalog
+            .as_ref()
+            .map(|c| c.tags.as_slice())
+            .unwrap_or(&[]);
+        req.iter().all(|t| have.contains(t)) // every required tag present (AND); absent pred = pass
+    });
+    free_ok && auth_ok && band_ok && cap_ok && loc_ok && tags_ok
 }
 
 /// Explicit ordering rank for a cost band (ascending = cheaper first).
@@ -485,6 +498,96 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(tier_members("t", &tier, &models).unwrap(), ids(&["both"]));
+    }
+
+    // ---- Derived membership: tags (AND / subset) ---------------------------
+
+    #[test]
+    fn derived_match_tags_single() {
+        // A model carrying the required tag matches; models missing it (a
+        // different tag, or no catalog at all) are excluded.
+        let reasoning = with_catalog(
+            "reasoning",
+            CatalogMeta {
+                tags: vec!["reasoning".into()],
+                ..Default::default()
+            },
+        );
+        let other = with_catalog(
+            "other",
+            CatalogMeta {
+                tags: vec!["chat".into()],
+                ..Default::default()
+            },
+        );
+        let models = map(vec![reasoning, other, base("bare")]);
+        let tier = derive_only(TierPredicate {
+            tags: Some(vec!["reasoning".into()]),
+            ..Default::default()
+        });
+        assert_eq!(
+            tier_members("t", &tier, &models).unwrap(),
+            ids(&["reasoning"])
+        );
+    }
+
+    #[test]
+    fn derived_match_tags_requires_all() {
+        // A two-tag predicate is an AND/subset check: a model must carry BOTH
+        // tags; one with only a single required tag is excluded.
+        let both = with_catalog(
+            "both",
+            CatalogMeta {
+                tags: vec!["reasoning".into(), "frontier".into()],
+                ..Default::default()
+            },
+        );
+        let one = with_catalog(
+            "one",
+            CatalogMeta {
+                tags: vec!["reasoning".into()],
+                ..Default::default()
+            },
+        );
+        let models = map(vec![both, one]);
+        let tier = derive_only(TierPredicate {
+            tags: Some(vec!["reasoning".into(), "frontier".into()]),
+            ..Default::default()
+        });
+        assert_eq!(tier_members("t", &tier, &models).unwrap(), ids(&["both"]));
+    }
+
+    #[test]
+    fn derived_match_tags_and_auth_type() {
+        // Combined AND across fields: tag "reasoning" AND auth OauthCli. The
+        // tagged+oauth model matches; a tagged model with a different auth_type
+        // is excluded (the `premium-reasoning` tier shape).
+        let premium = with_catalog(
+            "premium",
+            CatalogMeta {
+                tags: vec!["reasoning".into()],
+                auth_type: Some(AuthType::OauthCli),
+                ..Default::default()
+            },
+        );
+        let tagged_apikey = with_catalog(
+            "tagged_apikey",
+            CatalogMeta {
+                tags: vec!["reasoning".into()],
+                auth_type: Some(AuthType::ApiKey),
+                ..Default::default()
+            },
+        );
+        let models = map(vec![premium, tagged_apikey]);
+        let tier = derive_only(TierPredicate {
+            auth_type: Some(AuthType::OauthCli),
+            tags: Some(vec!["reasoning".into()]),
+            ..Default::default()
+        });
+        assert_eq!(
+            tier_members("t", &tier, &models).unwrap(),
+            ids(&["premium"])
+        );
     }
 
     // ---- Union + dedup (curated wins) --------------------------------------
