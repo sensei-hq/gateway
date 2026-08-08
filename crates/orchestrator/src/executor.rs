@@ -977,6 +977,140 @@ mod tests {
         );
     }
 
+    /// Headline: a run that dies at turn 1 resumes and completes WITHOUT re-calling
+    /// the gateway for turn 0 or re-executing turn 0's tool — memoized on resume.
+    #[tokio::test]
+    async fn agent_resume_does_not_respend_completed_turns() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "add 2 and 3")],
+        };
+
+        // Run 1: turn 0 (calc tool_call) succeeds, then turn 1 is scripted to ERROR
+        // (script exhausted → ProviderError). Turn 0's model + calc effects are
+        // journaled; the node fails at turn 1; NO RunCompleted.
+        let (gw1, calls1) = scripted_gateway(vec![tool_call_response(
+            "t1",
+            "calc",
+            "{\"op\":\"add\",\"a\":2,\"b\":3}",
+        )])
+        .await;
+        let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+            .with_registry(tool_agent_registry())
+            .with_tools(calc_tools());
+        let outcome1 = exec1
+            .run(run, &graph)
+            .await
+            .expect("run 1 yields an outcome");
+        assert!(outcome1.failed.is_some(), "run 1 fails at turn 1");
+        assert_eq!(
+            calls1.lock().unwrap().len(),
+            2,
+            "run 1 called the gateway for turn 0 and the failing turn 1"
+        );
+
+        // Run 2: a FRESH scripted gateway that serves ONLY turn 1's final answer,
+        // over the SAME journal. Resume memoizes turn 0 (model + calc) → the run-2
+        // gateway is called exactly once (turn 1).
+        let (gw2, calls2) = scripted_gateway(vec![final_response("the answer is 5")]).await;
+        let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+            .with_registry(tool_agent_registry())
+            .with_tools(calc_tools());
+        let outcome2 = exec2.start(run, &graph).await.expect("resume completes");
+        assert!(outcome2.failed.is_none(), "{:?}", outcome2.failed);
+        assert_eq!(
+            outcome2.outputs[&NodeId("n1".into())]["text"],
+            "the answer is 5"
+        );
+
+        // The proof: run-2's gateway saw EXACTLY ONE call (turn 1). Turn 0 was
+        // replayed from the journal — not re-spent — and calc was not re-executed.
+        assert_eq!(
+            calls2.lock().unwrap().len(),
+            1,
+            "resume re-spent nothing for turn 0: {:?}",
+            calls2.lock().unwrap()
+        );
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, e)| matches!(e, JournalEvent::RunCompleted))
+                .count(),
+            1
+        );
+    }
+
+    /// Editing a skill body changes the turn's system prompt → its input-hash no
+    /// longer matches the memoized turn → resume halts with DeterminismViolation
+    /// (never mixes new instructions into a memoized old turn). No gateway call.
+    #[tokio::test]
+    async fn agent_resume_halts_when_a_skill_changed_under_a_completed_turn() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+
+        // A registry with agent "a" (skill "s") whose skill body is parameterized.
+        let registry = |body: &str| {
+            Arc::new(
+                Registry::default()
+                    .with_agent(AgentDefinition {
+                        skills: vec!["s".into()],
+                        ..agent_def("c")
+                    })
+                    .with_skill(orchestrator_core::SkillDef {
+                        name: "s".into(),
+                        description: None,
+                        body: body.into(),
+                    }),
+            )
+        };
+
+        // Graph [agent n1, model n2]. Run 1 with skill body "V1": n1's single turn
+        // succeeds (gateway call 1), then n2 fails (gateway call 2) → n1 is fully
+        // journaled+completed, but there is NO RunCompleted (a partial run to resume).
+        let graph = Graph {
+            nodes: vec![
+                agent_node("n1", "a", "hi"),
+                Node {
+                    id: NodeId("n2".into()),
+                    kind: model_call("c", "b"),
+                    deps: vec![NodeId("n1".into())],
+                },
+            ],
+        };
+        let (gw1, _c1) = failing_after_gateway(1).await;
+        let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+            .with_registry(registry("V1"));
+        let out1 = exec1
+            .run(run, &graph)
+            .await
+            .expect("run 1 yields an outcome");
+        assert!(
+            out1.failed.is_some(),
+            "n2 fails, leaving n1's turn journaled without RunCompleted"
+        );
+
+        // Run 2: resume with skill body CHANGED to "V2" → n1's turn system prompt
+        // (and thus input-hash) differs from the memoized turn → determinism halt.
+        let (gw2, calls2) = recording_gateway().await;
+        let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+            .with_registry(registry("V2"));
+        let err = exec2
+            .start(run, &graph)
+            .await
+            .expect_err("determinism violation");
+        assert!(
+            matches!(err, OrchestratorError::DeterminismViolation { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            calls2.lock().unwrap().len(),
+            0,
+            "a determinism violation never touches the gateway"
+        );
+    }
+
     fn model_call(chain: &str, prompt: &str) -> NodeKind {
         NodeKind::ModelCall {
             chain: chain.to_string(),
