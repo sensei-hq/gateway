@@ -14,3 +14,4 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+uuid = { version = "1", features = ["v4"] }
