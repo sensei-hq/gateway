@@ -670,11 +670,14 @@ fn est_prompt_tokens(system: &str, messages: &[Message], tools: &[ToolDefinition
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{demo_reference_gateway, failing_after_gateway, recording_gateway};
+    use crate::test_support::{
+        demo_reference_gateway, failing_after_gateway, final_response, recording_gateway,
+        scripted_gateway, tool_call_response,
+    };
     use orchestrator_core::{Graph, JournalError, Node, NodeId, NodeKind};
     use orchestrator_store::InMemoryJournal;
 
-    use crate::agent::tools::{Calc, ToolRegistry};
+    use crate::agent::tools::{Calc, Tool, ToolRegistry};
     use orchestrator_core::{AgentDefinition, AgentRef, Registry};
     use std::sync::Arc;
 
@@ -704,6 +707,136 @@ mod tests {
             },
             deps: vec![],
         }
+    }
+
+    fn tool_agent_registry() -> Arc<Registry> {
+        // The core `Registry` needs the tool's *schema* (`ToolSpec`, via
+        // `Tool::spec()`) to compile it into the prompt (`assemble_prompt`);
+        // the *executable* side is the separate `ToolRegistry` (`calc_tools`).
+        Arc::new(
+            Registry::default()
+                .with_agent(AgentDefinition {
+                    tools: vec!["calc".into()],
+                    ..agent_def("c")
+                })
+                .with_tool(Calc.spec()),
+        )
+    }
+    fn calc_tools() -> Arc<ToolRegistry> {
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(Calc)))
+    }
+
+    #[tokio::test]
+    async fn agent_react_loop_executes_a_pure_tool_and_feeds_the_result_back() {
+        let (gateway, calls) = scripted_gateway(vec![
+            tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}"),
+            final_response("the answer is 5"),
+        ])
+        .await;
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+            .with_registry(tool_agent_registry())
+            .with_tools(calc_tools());
+
+        let n1 = NodeId("n1".into());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "add 2 and 3")],
+        };
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = exec.run(run, &graph).await.expect("run");
+
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+        assert_eq!(outcome.outputs[&n1]["text"], "the answer is 5");
+        assert_eq!(calls.lock().unwrap().len(), 2, "two model turns");
+
+        let kinds: Vec<String> = journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| label(e))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "RunStarted",
+                "NodeStarted(n1)",
+                "EffectRecorded(n1)",
+                "EffectRecorded(n1)", // turn-0 model + calc
+                "EffectRecorded(n1)", // turn-1 model (final)
+                "NodeCompleted(n1)",
+                "RunCompleted",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_a_non_pure_tool_loudly() {
+        let (gateway, _calls) =
+            scripted_gateway(vec![tool_call_response("t1", "read", "{}")]).await;
+        let journal = InMemoryJournal::new();
+        struct Reader;
+        impl crate::agent::tools::Tool for Reader {
+            fn spec(&self) -> orchestrator_core::ToolSpec {
+                orchestrator_core::ToolSpec {
+                    name: "read".into(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                    effect_class: orchestrator_core::EffectClass::Observation,
+                }
+            }
+            fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+                Ok(serde_json::json!({}))
+            }
+        }
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+            .with_registry(Arc::new(
+                Registry::default()
+                    .with_agent(AgentDefinition {
+                        tools: vec!["read".into()],
+                        ..agent_def("c")
+                    })
+                    .with_tool(Reader.spec()),
+            ))
+            .with_tools(Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(Reader)),
+            ));
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "read")],
+        };
+        let outcome = exec
+            .run(RunId(uuid::Uuid::new_v4()), &graph)
+            .await
+            .expect("outcome");
+        let (_, msg) = outcome.failed.expect("non-Pure tool fails the node");
+        assert!(msg.contains("slice 4"), "deferral message: {msg}");
+    }
+
+    #[tokio::test]
+    async fn agent_halts_at_max_steps_when_the_model_never_finalizes() {
+        let (gateway, calls) = scripted_gateway(vec![
+            tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":1,\"b\":1}"),
+            tool_call_response("t2", "calc", "{\"op\":\"add\",\"a\":1,\"b\":1}"),
+        ])
+        .await;
+        let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+            .with_registry(tool_agent_registry())
+            .with_tools(calc_tools())
+            .with_max_steps(2);
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "loop")],
+        };
+        let outcome = exec
+            .run(RunId(uuid::Uuid::new_v4()), &graph)
+            .await
+            .expect("outcome");
+        let (_, msg) = outcome.failed.expect("max_steps halts");
+        assert!(msg.contains("max_steps"), "{msg}");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "exactly max_steps model turns"
+        );
     }
 
     #[tokio::test]
