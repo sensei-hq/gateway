@@ -170,6 +170,21 @@ impl Gateway {
         self.model_lockout.clear(endpoint);
     }
 
+    /// The smallest `context_window` among a chain's models (read-only; folds the
+    /// chain's `ChainEntry`s against the model table). `None` if the chain is
+    /// unknown or has no resolvable models. Used by the agent runtime to budget a
+    /// prompt to the model it might fall over to — selection is untouched.
+    pub async fn min_context_window(&self, chain: &str) -> Option<u32> {
+        let cfg = self.config.read().await;
+        let chain = cfg.chains.get(chain)?;
+        chain
+            .models
+            .iter()
+            .filter_map(|entry| cfg.models.get(&entry.model))
+            .map(|m| m.context_window)
+            .min()
+    }
+
     /// Attach a readiness probe (the local engine's provisioning supervisor).
     /// Builder-style, mirroring [`Self::with_store`]. When set, chain exhaustion
     /// consults the probe and degrades a still-provisioning candidate to a
@@ -464,3 +479,87 @@ pub(super) fn dispatch_outcome(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod min_window_tests {
+    use super::*;
+    use crate::adapters::AdapterRegistry;
+    use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
+    use kernel::types::capability::Capability;
+    use kernel::types::config::{
+        ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
+    };
+    use std::collections::HashMap;
+
+    fn model(id: &str, window: u32) -> ModelConfig {
+        ModelConfig {
+            id: id.into(),
+            api_model_id: None,
+            provider: "r".into(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: window,
+            max_output_tokens: 1024,
+            pricing: None,
+            catalog: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn min_context_window_is_the_smallest_model_in_the_chain() {
+        let mut routers = HashMap::new();
+        routers.insert(
+            "r".into(),
+            RouterConfig {
+                url: "http://x".into(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert("big".into(), model("big", 200_000));
+        models.insert("small".into(), model("small", 8_000));
+        let mut chains = HashMap::new();
+        chains.insert(
+            "c".into(),
+            FallbackChainConfig {
+                id: "c".into(),
+                capability: Capability::TextChat,
+                models: vec![
+                    ChainEntry {
+                        model: "big".into(),
+                        router: Some("r".into()),
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                    ChainEntry {
+                        model: "small".into(),
+                        router: Some("r".into()),
+                        api_model_id: None,
+                        priority: 2,
+                    },
+                ],
+                fallback_triggers: Vec::new(),
+            },
+        );
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        };
+        let gw = Gateway::new(
+            config,
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+
+        assert_eq!(gw.min_context_window("c").await, Some(8_000));
+        assert_eq!(gw.min_context_window("nope").await, None);
+    }
+}
