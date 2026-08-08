@@ -164,3 +164,67 @@ pub async fn recording_gateway() -> (Gateway, CallLog) {
 pub async fn failing_after_gateway(succeed: usize) -> (Gateway, CallLog) {
     build_gateway(Some(succeed)).await
 }
+
+/// A local stand-in for a live Ollama runner, used by the reference-chain
+/// end-to-end test. Registered under the router id `"ollama"`, it serves
+/// `TextChat` with no network I/O and returns `model: None` so the engine fills
+/// `ChatResponse.model` from the *selected candidate* (`llama3.1-local`). Each
+/// call is recorded so the test can prove the chain actually reached the local
+/// adapter (rather than short-circuiting earlier).
+pub struct LocalOllamaAdapter {
+    calls: CallLog,
+}
+
+impl Model for LocalOllamaAdapter {
+    fn id(&self) -> &str {
+        "ollama"
+    }
+}
+
+#[async_trait]
+impl ChatModel for LocalOllamaAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt));
+        Ok(ChatResponse {
+            content: Some("served by local llama3.1".into()),
+            tool_calls: Vec::new(),
+            usage: None,
+            // `None` ⇒ the engine records the selected candidate's id on the
+            // response, which is the fallover proof the e2e asserts on.
+            model: None,
+            degraded: false,
+        })
+    }
+}
+
+/// Build the REAL gateway from the illustrative demo catalog
+/// (`gateway::catalog::assemble(demo_catalog())`) with a [`LocalOllamaAdapter`]
+/// registered for the `"ollama"` router ONLY — the credential-gated cloud
+/// entries at the head of `research.bulk` (`groq-llama-free`, `deepseek-chat`)
+/// have no adapter, so the chain falls over to the local `llama3.1-local`
+/// model. Returns the gateway plus the adapter's shared call log.
+pub async fn demo_reference_gateway() -> (Gateway, CallLog) {
+    let config = gateway::catalog::assemble(gateway::catalog::demo_catalog())
+        .expect("demo catalog assembles");
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(LocalOllamaAdapter {
+            calls: calls.clone(),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(config, adapters, cb), calls)
+}
