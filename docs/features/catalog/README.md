@@ -19,6 +19,7 @@ metadata, a tiers dimension, a refresh mechanism, and config versioning.
 | [Configuration](configuration.md) | Implemented | `crates/kernel/src/types/config.rs` | `GatewayConfig`/`RouterConfig`; runtime updates |
 | [Free-tier catalog](free-tier-catalog.md) | Implemented (SP-CAT) | `crates/kernel/src/types/config.rs` (`CatalogMeta`) + `crates/gateway/src/catalog/totals.rs` | `free_type`/`pool_key`/`monthly_tokens`/`tos`/`trains_on_prompts`; pool-deduped totals + drift gate |
 | [Tiers & chains](tiers-and-chains.md) | Implemented (SP-CAT) | `crates/gateway/src/catalog/{tiers,assemble}.rs` | tiers as a dimension; chains compose tier-refs. `headroom`/`least-used` stub to `priority` (deferred) |
+| [Reference chains](reference-chains.md) | Implemented (SP-REF) | `crates/gateway/src/catalog/presets.rs` | portable attribute-derived tier/chain presets + illustrative runnable demo catalog |
 | [Catalog refresh](catalog-refresh.md) | Partial (SP-CAT) | `crates/gateway/src/catalog/totals.rs` | re-audit + totals drift gate implemented; external DB `config_loader` deferred (SP-DATA) |
 | [Config versioning](config-versioning.md) | Planned (Phase 4 · SP-DATA) | data-tier | `config_versions` + bump; ties to the replay version-fence — deferred |
 
