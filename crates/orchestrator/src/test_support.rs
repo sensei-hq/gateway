@@ -3,7 +3,7 @@
 //! adapter/reference-chain test harness (`gateway::engine::tests` /
 //! `gateway::catalog::presets`). Kept behind `#[cfg(test)]`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -17,6 +17,7 @@ use kernel::types::config::{
 };
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse};
+use kernel::types::request::ToolCall;
 
 /// One recorded gateway call: the resolved model id the adapter was dispatched
 /// with, plus a fingerprint of the payload (the first user message's text).
@@ -82,12 +83,11 @@ impl ChatModel for RecordingAdapter {
     }
 }
 
-/// Build a minimal gateway whose chain `"c"` resolves `TextChat` to the
-/// recording adapter (router `"r"`, model `"m"`), returning the gateway and the
-/// shared call log. `fail_after` is threaded into the adapter's crash injector.
-/// The adapter is registered into the `AdapterRegistry` before `Gateway::new`
-/// because `Gateway::adapters` is crate-private.
-async fn build_gateway(fail_after: Option<usize>) -> (Gateway, CallLog) {
+/// The shared single-chain `GatewayConfig` for the test harness: chain `"c"`
+/// resolves `TextChat` to router `"r"` / model `"m"` (context window 4096).
+/// Factored out of `build_gateway` so `scripted_gateway` (a different adapter,
+/// same topology) doesn't duplicate the routers/models/chains assembly.
+fn single_chain_config() -> GatewayConfig {
     let mut routers = HashMap::new();
     routers.insert(
         "r".to_string(),
@@ -133,14 +133,23 @@ async fn build_gateway(fail_after: Option<usize>) -> (Gateway, CallLog) {
         },
     );
 
-    let config = GatewayConfig {
+    GatewayConfig {
         routers,
         models,
         chains,
         constraints: Default::default(),
         panels: Default::default(),
         consensus: Default::default(),
-    };
+    }
+}
+
+/// Build a minimal gateway whose chain `"c"` resolves `TextChat` to the
+/// recording adapter (router `"r"`, model `"m"`), returning the gateway and the
+/// shared call log. `fail_after` is threaded into the adapter's crash injector.
+/// The adapter is registered into the `AdapterRegistry` before `Gateway::new`
+/// because `Gateway::adapters` is crate-private.
+async fn build_gateway(fail_after: Option<usize>) -> (Gateway, CallLog) {
+    let config = single_chain_config();
 
     let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
     let adapters = AdapterRegistry::new();
@@ -163,6 +172,89 @@ pub async fn recording_gateway() -> (Gateway, CallLog) {
 /// errors thereafter — the crash injector for the resume-without-re-spend test.
 pub async fn failing_after_gateway(succeed: usize) -> (Gateway, CallLog) {
     build_gateway(Some(succeed)).await
+}
+
+/// Chat adapter that replays a scripted queue of responses (one per turn), so a
+/// test can drive a multi-turn ReAct loop: e.g. [turn0: a `calc` tool_call, turn1:
+/// a final text]. Records each call's prompt like `RecordingAdapter`.
+pub struct ScriptedAdapter {
+    calls: CallLog,
+    script: Mutex<VecDeque<ChatResponse>>,
+}
+
+impl Model for ScriptedAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for ScriptedAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt));
+        let next = self
+            .script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        next.ok_or_else(|| GatewayError::ProviderError {
+            adapter: "r".into(),
+            message: "script exhausted".into(),
+            status: Some(500),
+        })
+    }
+}
+
+/// A gateway on chain "c" whose scripted adapter yields `responses` in order.
+pub async fn scripted_gateway(responses: Vec<ChatResponse>) -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(ScriptedAdapter {
+            calls: calls.clone(),
+            script: Mutex::new(responses.into()),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
+}
+
+/// Convenience: a `ChatResponse` carrying a single tool call.
+pub fn tool_call_response(id: &str, name: &str, arguments: &str) -> ChatResponse {
+    ChatResponse {
+        content: Some(String::new()),
+        tool_calls: vec![ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }],
+        usage: None,
+        model: Some("m".into()),
+        degraded: false,
+    }
+}
+
+/// Convenience: a final text `ChatResponse` (no tool calls).
+pub fn final_response(text: &str) -> ChatResponse {
+    ChatResponse {
+        content: Some(text.into()),
+        tool_calls: Vec::new(),
+        usage: None,
+        model: Some("m".into()),
+        degraded: false,
+    }
 }
 
 /// A local stand-in for a live Ollama runner, used by the reference-chain
