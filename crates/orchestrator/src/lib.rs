@@ -6,6 +6,7 @@
 //! `InferenceRequest`, runs through the gateway, and is journaled with a
 //! structural effect id + input hash.
 
+pub mod agent;
 pub mod executor;
 
 #[cfg(test)]
