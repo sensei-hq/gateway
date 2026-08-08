@@ -22,4 +22,6 @@ pub enum OrchestratorError {
     InvalidGraph(String),
     #[error("gateway error: {0}")]
     Gateway(String),
+    #[error("payload serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 }

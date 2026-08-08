@@ -1,5 +1,14 @@
 //! `sensei-orchestrator` — the deterministic executor over a durable journal,
 //! wired to the real gateway.
 //!
-//! Slice 1 will provide the `Executor` (run + resume); this crate is a scaffold
-//! stub until then (Tasks 3–5).
+//! Slice 1 provides the [`Executor`]: a fresh linear `run` (Task 3) and a
+//! resume/fold `start` (Task 4). Each `ModelCall` node compiles into a plain
+//! `InferenceRequest`, runs through the gateway, and is journaled with a
+//! structural effect id + input hash.
+
+pub mod executor;
+
+#[cfg(test)]
+mod test_support;
+
+pub use executor::{Executor, RunOutcome};
