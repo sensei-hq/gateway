@@ -170,7 +170,30 @@ impl Executor {
 
         if terminal {
             // Already done: return the folded outcome; do NOT re-drive (which
-            // would append a second `RunCompleted`).
+            // would append a second `RunCompleted`). But first project each Agent
+            // node's folded output — the RAW final model-turn effect (`{model,
+            // text, tool_calls}`) — down to the canonical `{model, text}` that a
+            // fresh `run` and a non-terminal resume return from
+            // `AgentStep::Completed`, so a completed Agent node yields an
+            // identical JSON shape on every completion path (design §4). This is a
+            // pure projection of the already-folded outputs — no re-drive, no
+            // append. `ModelCall` nodes already store the canonical shape and are
+            // left untouched.
+            for node in &graph.nodes {
+                if let NodeKind::Agent { .. } = &node.kind
+                    && let Some(output) = outcome.outputs.get(&node.id).cloned()
+                {
+                    let model = output
+                        .get("model")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let text = output.get("text").cloned().unwrap_or_default();
+                    outcome.outputs.insert(
+                        node.id.clone(),
+                        serde_json::json!({ "model": model, "text": text }),
+                    );
+                }
+            }
             return Ok(outcome);
         }
 
@@ -179,18 +202,22 @@ impl Executor {
         self.drive(run, graph, &fold).await
     }
 
-    /// Shared node loop for both `run` (empty memo) and `start` (memo folded
-    /// from the journal, Task 4). `memo` maps each node's structural
-    /// [`EffectId`] to its recorded `(input_hash, output)`:
+    /// Shared node loop for both `run` (an empty [`Fold`]) and `start` (a `Fold`
+    /// folded from the journal, Task 4). The `fold: &Fold` carries three sets:
     ///
-    /// - a memo hit whose input-hash matches ⇒ replay the recorded output with
-    ///   NO gateway call and NO new `EffectRecorded` (it is already journaled);
-    /// - a memo hit whose input-hash differs ⇒ a determinism violation (the
-    ///   graph changed under a resume) — halt;
-    /// - a memo miss ⇒ execute the node against the gateway and journal it.
+    /// - `fold.memo` maps each effect's structural [`EffectId`] to its recorded
+    ///   `(input_hash, output)`. A hit whose input-hash matches replays the
+    ///   recorded output with NO gateway call and NO new `EffectRecorded` (it is
+    ///   already journaled); a hit whose input-hash differs is a determinism
+    ///   violation (the graph changed under a resume) — halt; a miss executes the
+    ///   node against the gateway and journals it.
+    /// - `fold.started` / `fold.completed` name the nodes whose `NodeStarted` /
+    ///   `NodeCompleted` are already journaled, so an `Agent` node's ReAct loop
+    ///   appends each at most once across resumes (a `ModelCall` node runs
+    ///   atomically per drive and does not consult them).
     ///
-    /// For a fresh `run` the memo is always empty, so every node executes; the
-    /// memo branches exist for Task 4's resume and are reachable code.
+    /// For a fresh `run` the fold is empty, so every node executes; the memo
+    /// branches exist for Task 4's resume and are reachable code.
     async fn drive(
         &self,
         run: RunId,
@@ -752,6 +779,68 @@ mod tests {
             calls.lock().unwrap().len(),
             0,
             "over-budget halts before spending"
+        );
+    }
+
+    /// A terminal resume of a completed Agent node returns the SAME canonical
+    /// `{model, text}` output as the original `run` — not the raw 3-key final
+    /// model-turn effect (`{model, text, tool_calls}`). Proves the durable output
+    /// shape is identical across every completion path, while preserving the
+    /// no-op-reappend contract (the terminal resume appends nothing).
+    #[tokio::test]
+    async fn agent_node_terminal_resume_yields_canonical_output_shape() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let n1 = NodeId("n1".into());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "hello")],
+        };
+
+        // Run 1: drive the single-turn agent node to full completion.
+        let (gw1, _calls1) = recording_gateway().await;
+        let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+            .with_registry(agent_registry("c"))
+            .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(Calc))));
+        let outcome1 = exec1.run(run, &graph).await.expect("first run completes");
+        assert!(outcome1.failed.is_none());
+        assert_eq!(outcome1.completed, vec![n1.clone()]);
+
+        let before = journal.load(run).await.unwrap();
+
+        // Terminal resume on a FRESH gateway: returns the folded outcome without
+        // re-driving, projected to the canonical agent-node output shape.
+        let (gw2, calls2) = recording_gateway().await;
+        let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+            .with_registry(agent_registry("c"))
+            .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(Calc))));
+        let outcome2 = exec2
+            .start(run, &graph)
+            .await
+            .expect("resume of a completed agent run");
+
+        // Same canonical shape on terminal resume as on the original run.
+        assert_eq!(
+            outcome2.outputs[&n1], outcome1.outputs[&n1],
+            "terminal resume yields the same output shape as the original run"
+        );
+        // Canonical `{model, text}` — NOT the 3-key raw model-turn effect.
+        assert!(
+            outcome2.outputs[&n1].get("tool_calls").is_none(),
+            "terminal-resume agent output is canonical (no raw tool_calls key): {:?}",
+            outcome2.outputs[&n1]
+        );
+        assert_eq!(
+            calls2.lock().unwrap().len(),
+            0,
+            "a completed run is not re-driven — no gateway call"
+        );
+
+        // No-op reappend preserved: the terminal resume appended nothing.
+        let after = journal.load(run).await.unwrap();
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "terminal resume of a completed agent run appends nothing"
         );
     }
 
