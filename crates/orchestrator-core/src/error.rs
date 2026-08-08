@@ -22,6 +22,12 @@ pub enum OrchestratorError {
     InvalidGraph(String),
     #[error("gateway error: {0}")]
     Gateway(String),
+    #[error("frontmatter parse error: {0}")]
+    FrontmatterParse(String),
+    #[error("agent {agent:?} references unknown skill {skill:?}")]
+    UnknownSkillRef { agent: String, skill: String },
+    #[error("agent {agent:?} references unknown tool {tool:?}")]
+    UnknownToolRef { agent: String, tool: String },
     #[error("payload serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
