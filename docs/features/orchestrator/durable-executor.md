@@ -17,7 +17,10 @@ source: crates/orchestrator*
 > design [`../../superpowers/specs/2026-08-08-sp1-orchestrator-spine-design.md`](../../superpowers/specs/2026-08-08-sp1-orchestrator-spine-design.md).
 > This is slice 1 of SP-1 — a linear `ModelCall` graph of **Pure** effects. The
 > agent runtime, fan-out/quorum, non-pure effects, and persistence beyond the
-> in-memory journal are [deferred](#deferred).
+> in-memory journal are [deferred](#deferred). **Slice 2:** `NodeKind::Agent`
+> now rides this same spine — each ReAct turn is a Pure effect with an
+> iteration-aware `effect_id`, so resume/memoization extends into the agent
+> loop (see [agents-skills-tools](agents-skills-tools.md)).
 
 The executor drives a graph of nodes, each a call to the real
 [gateway](../routing/README.md), and journals every step so a crashed run can

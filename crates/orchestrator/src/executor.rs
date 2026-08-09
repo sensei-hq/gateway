@@ -1589,4 +1589,47 @@ mod tests {
             ],
         );
     }
+
+    /// Real end-to-end: an `Agent` node whose role resolves to the reference chain
+    /// `research.bulk` drives the REAL gateway (assembled from `demo_catalog`). The
+    /// chain falls over the credential-gated cloud entries to the local ollama
+    /// model; the agent's single (no-tool) turn is served by `llama3.1-local`.
+    #[tokio::test]
+    async fn agent_node_drives_real_reference_chain_to_local_fallover() {
+        let (gateway, calls) = demo_reference_gateway().await;
+        let journal = InMemoryJournal::new();
+        let registry = Arc::new(Registry::default().with_agent(AgentDefinition {
+            name: "researcher".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: "research.bulk".into(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "Research carefully.".into(),
+        }));
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_tools(Arc::new(ToolRegistry::default()));
+
+        let n1 = NodeId("n1".into());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "researcher", "summarize the news")],
+        };
+        let outcome = exec
+            .run(RunId(uuid::Uuid::new_v4()), &graph)
+            .await
+            .expect("run");
+
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+        assert_eq!(
+            outcome.outputs[&n1]["model"], "llama3.1-local",
+            "fell over to the local model: {:?}",
+            outcome.outputs[&n1]
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the served terminal candidate hit the local adapter once"
+        );
+    }
 }
