@@ -1040,6 +1040,32 @@ mod tests {
                 .count(),
             1
         );
+
+        // The non-vacuous proof: turn 0's model effect and its calc tool effect
+        // each appear in EXACTLY ONE `EffectRecorded` across BOTH runs — recorded
+        // once in run 1, and NOT re-appended in run 2. If the memo lookup were
+        // broken (forcing turn 0 to re-run live on resume), these effects would
+        // be re-recorded and this count would be 2, even though `calls2 == 1` and
+        // the final-text assertion above would still spuriously pass (a lone
+        // scripted final response finalizes a wrongly-re-run turn 0 in one call).
+        let recorded_count = |eid: &EffectId| {
+            events
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(e, JournalEvent::EffectRecorded { effect_id: rec, .. } if rec == eid)
+                })
+                .count()
+        };
+        assert_eq!(
+            recorded_count(&effect_id("n1", 0, 0)),
+            1,
+            "turn 0's model call was replayed from the journal on resume (memoized), not re-recorded/re-spent"
+        );
+        assert_eq!(
+            recorded_count(&effect_id("n1", 0, 1)),
+            1,
+            "turn 0's calc tool was memoized on resume, not re-executed/re-recorded"
+        );
     }
 
     /// Editing a skill body changes the turn's system prompt → its input-hash no
