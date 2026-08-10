@@ -79,12 +79,30 @@ impl ExecutionJournal for InMemoryJournal {
             .get(&run)
             .cloned())
     }
+
+    async fn compact(
+        &self,
+        run: RunId,
+        remove_seqs: &[Seq],
+        add: JournalEvent,
+    ) -> Result<(), JournalError> {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        let events = runs.entry(run).or_default();
+        // Drop the compacted events, then append the manifest (a fresh, higher
+        // Seq) — the remaining events keep their original ascending Seq order.
+        events.retain(|(s, _)| !remove_seqs.contains(s));
+        events.push((seq, add));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestrator_core::{ExecutionJournal, JournalEvent, NodeId, RunId, Snapshot};
+    use orchestrator_core::{
+        ChildStatus, CompactChild, Digest, ExecutionJournal, JournalEvent, NodeId, RunId, Snapshot,
+    };
 
     fn run_started() -> JournalEvent {
         JournalEvent::RunStarted {
@@ -199,6 +217,41 @@ mod tests {
         let tail = journal.load_since(run, s0).await.unwrap();
         assert_eq!(tail.len(), 1, "only the one event after s0");
         assert_eq!(tail[0].0, s1);
+    }
+
+    #[tokio::test]
+    async fn compact_removes_the_named_events_and_appends_the_manifest() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let s0 = journal.append(run, run_started()).await.unwrap();
+        let s1 = journal.append(run, node_started()).await.unwrap();
+        let s2 = journal.append(run, node_started()).await.unwrap();
+
+        // Compact away s1 and s2, appending a MapCompacted manifest in one step.
+        let manifest = JournalEvent::MapCompacted {
+            node: NodeId("m".into()),
+            children: vec![CompactChild {
+                index: 0,
+                status: ChildStatus::Ok,
+                digest: Some(Digest("abc".into())),
+                input_hash: Some("h".into()),
+            }],
+        };
+        journal.compact(run, &[s1, s2], manifest).await.unwrap();
+
+        let events = journal.load(run).await.unwrap();
+        let seqs: Vec<Seq> = events.iter().map(|(s, _)| *s).collect();
+        assert!(seqs.contains(&s0), "the untouched event stays: {seqs:?}");
+        assert!(
+            !seqs.contains(&s1) && !seqs.contains(&s2),
+            "the compacted events are removed: {seqs:?}"
+        );
+        assert!(
+            events.iter().any(
+                |(_, e)| matches!(e, JournalEvent::MapCompacted { node, .. } if node.0 == "m")
+            ),
+            "the manifest is appended"
+        );
     }
 
     #[tokio::test]

@@ -1,9 +1,34 @@
 use serde::{Deserialize, Serialize};
 
-use crate::content::EffectOutput;
+use crate::content::{Digest, EffectOutput};
 use crate::effect::{EffectClass, EffectId};
 use crate::error::JournalError;
 use crate::ids::{NodeId, RunId, Seq};
+
+/// A compacted per-child record (§5.3): after a `Map`'s `Consolidate` completes,
+/// each child's full `EffectRecorded` collapses to this small shape and leaves
+/// the hot fold path. The child's content stays retrievable from the
+/// `ContentStore` by [`digest`](CompactChild::digest) — never dropped. The
+/// `input_hash` lets the resume fold rebuild the child's memo entry (as a
+/// content ref) so a replay still re-spends nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactChild {
+    pub index: usize,
+    pub status: ChildStatus,
+    /// The content address of the child's output — `Some` for an `Ok` child,
+    /// `None` for a `Failed` one (which never journaled an output).
+    pub digest: Option<Digest>,
+    /// The child effect's determinism key (`Ok` children only) — feeds memo
+    /// reconstruction on resume.
+    pub input_hash: Option<String>,
+}
+
+/// A compacted child's terminal status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChildStatus {
+    Ok,
+    Failed,
+}
 
 /// An append-only event in a run's durable journal. Folding a run's events
 /// reconstructs its state for deterministic resume.
@@ -46,6 +71,15 @@ pub enum JournalEvent {
     MapExpanded {
         node: NodeId,
         child_count: usize,
+    },
+    /// A completed `Map`'s per-child `EffectRecorded` records were compacted
+    /// (§5.3) once its `Consolidate` finished: the children collapse to a small
+    /// `{index, status, digest}` manifest (content stays addressable in the CAS).
+    /// The fold rebuilds the children's memo (as content refs) from this, so the
+    /// Map replays on resume without re-spending.
+    MapCompacted {
+        node: NodeId,
+        children: Vec<CompactChild>,
     },
     RunCompleted,
     RunPaused {
@@ -114,6 +148,21 @@ pub trait ExecutionJournal: Send + Sync {
     /// default returns `None` (fold-from-start).
     async fn latest_snapshot(&self, _run: RunId) -> Result<Option<Snapshot>, JournalError> {
         Ok(None)
+    }
+
+    /// Compaction primitive (§5.3): remove the events at `remove_seqs` and append
+    /// `add` in one step. Generic — the executor picks the seqs (a completed
+    /// Map's per-child `EffectRecorded`) and `add` (a `MapCompacted` manifest);
+    /// the journal stays oblivious to Map semantics. The default is a graceful
+    /// no-removal append (a backend without compaction keeps the child records but
+    /// still records the manifest); [`InMemoryJournal`] overrides it to remove.
+    async fn compact(
+        &self,
+        run: RunId,
+        _remove_seqs: &[Seq],
+        add: JournalEvent,
+    ) -> Result<(), JournalError> {
+        self.append(run, add).await.map(|_| ())
     }
 }
 
