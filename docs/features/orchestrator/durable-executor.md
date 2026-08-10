@@ -20,7 +20,13 @@ source: crates/orchestrator*
 > in-memory journal are [deferred](#deferred). **Slice 2:** `NodeKind::Agent`
 > now rides this same spine — each ReAct turn is a Pure effect with an
 > iteration-aware `effect_id`, so resume/memoization extends into the agent
-> loop (see [agents-skills-tools](agents-skills-tools.md)).
+> loop (see [agents-skills-tools](agents-skills-tools.md)). **Slice 3:** `Map`
+> fan-out, `Quorum`, `Consolidate`, snapshots, and CAS split-on-output.
+> **Slice 4:** all three effect classes are now live — **Observation** (TTL
+> memoize / re-read via an injected `Clock`) and **Mutation** (two-phase
+> `EffectIntent → EffectRecorded` + in-doubt reconcile → durable `RunPaused`);
+> see the [effect-class table](#the-effect-class-model). Real reconcile providers,
+> a sandbox/permission model, and a `PostgresJournal` remain [deferred](#deferred).
 
 The executor drives a graph of nodes, each a call to the real
 [gateway](../routing/README.md), and journals every step so a crashed run can
@@ -30,14 +36,14 @@ journal instead of re-issuing (and re-paying for) them.
 ## The effect-class model
 
 Every nondeterministic or expensive operation is an **effect**, classed by
-idempotency. Slice 1 implements only the first class; the other two are typed
-and reserved so the journal format is forward-compatible.
+idempotency. As of slice 4 all three classes are live; the executor dispatches a
+tool call on its `ToolSpec.effect_class`.
 
-| Class | Meaning | Slice-1 status |
+| Class | Meaning | Status |
 |---|---|---|
-| **Pure** | Deterministic given its input; memoize forever (e.g. a model call). | **Live** — the only class the executor records/replays. |
-| **Observation** | A read whose value can drift; memoize with TTL + provenance. | Typed only; [deferred](#deferred) to slice 4. |
-| **Mutation** | An external write; two-phase (intent → record) + idempotency key + reconcile. | Typed only; [deferred](#deferred) to slice 4. |
+| **Pure** | Deterministic given its input; memoize forever (e.g. a model call). | **Live** (slice 1) — memoize-forever; replayed on resume. |
+| **Observation** | A read whose value can drift; memoize with TTL + provenance. | **Live** (slice 4) — a memo hit replays while fresh (`fetched_at + ttl_secs` per the injected `Clock`), else re-reads and records a superseding `EffectRecorded` with fresh `ObservationMeta{fetched_at, ttl_secs, source}`. |
+| **Mutation** | An external write; two-phase (intent → record) + idempotency key + reconcile. | **Live** (slice 4) — journals `EffectIntent{idempotency_key, args_hash}` **before** the side effect, then `EffectRecorded`. On resume an Intent without a Recorded is **in-doubt** → a per-tool `ReconcileProvider` decides: `Confirmed`⇒record (don't re-run), `NotApplied`⇒run once under the standing Intent, `Indeterminate`/absent⇒durable `RunPaused` (never guess). |
 
 ## Journal, effect id, and memoization
 
@@ -141,9 +147,17 @@ Held off to later SP-1 slices (and beyond); slice 1 ships none of these:
 
 - **Slice 2** — the agent/skill/tool registry (md + frontmatter) and the
   prompt-assembly runtime (`AgentInvocation → InferenceRequest` compilation).
-- **Slice 3** — `Map` fan-out, quorum, and the CAS blackboard / shared context.
-- **Slice 4** — the **Observation** and **Mutation** effect classes, two-phase
-  intent→record, and the crash-in-doubt reconcile path.
+- ~~**Slice 3** — `Map` fan-out, quorum, and the CAS blackboard / shared context.~~ **Done.**
+- ~~**Slice 4** — the **Observation** and **Mutation** effect classes, two-phase
+  intent→record, and the crash-in-doubt reconcile path.~~ **Done** (see the
+  [effect-class table](#the-effect-class-model)). Still deferred within slice 4:
+  - **SP-4** — real reconcile providers (query-by-idempotency-key against real
+    services), author-supplied idempotency keys, saga/compensation, and the tool
+    permission model + sandbox + workspace isolation. Slice 4 ships demo tools
+    (`Search`/`RecordNote`) and a sink-backed test reconciler only.
+  - **SP-6** — `AwaitSignal`/`HumanGate` + signal delivery + pause-expiry; slice 4
+    emits a durable `RunPaused` resolved out-of-band, with no re-arm mechanism yet.
 - **Later** — planner / loops, streaming, hooks (best-effort progress), and a
-  `PostgresJournal`. There is **no persistence beyond the in-memory journal** in
-  this slice; `ExecutionJournal` is the seam a durable store implements later.
+  `PostgresJournal`. There is **no persistence beyond the in-memory journal** yet;
+  `ExecutionJournal` is the seam a durable store implements later. The two-phase
+  `EffectIntent` fsync is in-memory here (**SP-DATA**).
