@@ -3124,3 +3124,74 @@ async fn oversized_dependency_context_halts_over_budget_never_truncates() {
         None => panic!("expected B to halt over budget"),
     }
 }
+
+/// Regression (determinism, review Finding 1): a SOFT dependency is NOT read into
+/// an agent's context, so a soft dep that flips terminal-state across a crash
+/// (Failed on run 1 → Succeeds on resume) does NOT change the dependent's prompt
+/// and the resume completes cleanly — reads are Hard-dep-only so the resolved
+/// context stays a pure function of the journal.
+#[tokio::test]
+async fn a_soft_dependency_is_not_read_so_a_flip_across_resume_is_safe() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // S is a ModelCall that FAILS on run 1 (prompt contains FAIL); B is an agent
+    // that SOFT-deps S. B still runs (soft dep terminal) with empty context.
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("S".into()),
+                kind: model_call("c", "FAIL"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "go", vec![Dep::soft("S")]),
+        ],
+    };
+    // Run 1: content-gated gateway fails S; B (soft-dep, terminal) runs turn 0
+    // (calc) then turn 1 exhausted... use scripted so B partially completes.
+    // Simpler: content_gated fails S and serves B. Drive B to completion.
+    let (gw1, _c1) = content_gated_gateway().await;
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content.clone())
+        .with_context_store(ctx)
+        .run(run, &graph)
+        .await
+        .expect("run 1");
+    // S failed (no ContextWrite for S); B completed with empty context; the
+    // failure suppressed RunCompleted → resumable.
+    assert!(o1.failed.is_some(), "S failed");
+    assert!(
+        o1.completed.iter().any(|n| n.0 == "B"),
+        "B ran despite the soft-dep failure"
+    );
+    let events1 = journal.load(run).await.unwrap();
+    assert!(
+        !events1
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::ContextWrite { key, .. } if key.0 == "S")),
+        "a failed S published no ContextWrite"
+    );
+
+    // Resume: S now SUCCEEDS (recording gw) and publishes ContextWrite(S). B is
+    // memoized. If B had read the soft dep, its prompt would now differ and the
+    // resume would trip DeterminismViolation — it must NOT (soft deps not read).
+    let ctx2 = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gw2, _c2) = recording_gateway().await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx2)
+        .start(run, &graph)
+        .await
+        .expect("resume must not trip a determinism violation on a soft-dep flip");
+    assert!(
+        o2.failed.is_none() && o2.paused.is_none(),
+        "resume completes: {:?}",
+        o2.failed
+    );
+}

@@ -116,13 +116,23 @@ like every control append), the executor:
 ## 6. Read path (prompt assembly)
 
 When driving an `Agent` node, before the first turn the executor resolves its
-context: for each declared dependency `dep` of the node, `ctx.get(Run, dep.on)` →
+context: for each **`Hard`** dependency `dep` of the node, `ctx.get(Run, dep.on)` →
 if `Some(ref)`, `ctx.load(&ref)` (or use `ref.summary` when present per D5) →
 collect `(key, value)`. These are passed to `assemble_prompt` and rendered into
 the `## Context` section. Reads are ordered by the node's declared dependency
-order (deterministic). A soft-dependency that did not complete yields `Ok(None)`
-and is simply omitted (its terminal state is fold-stable, so its
-presence/absence is deterministic).
+order (deterministic).
+
+**Reads are restricted to `Hard` deps** — a correctness requirement, not a
+convenience. A `Hard` dep must have `Completed` (and therefore published its
+`ContextWrite`) before the dependent runs, so its entry is present and
+value-stable across a resume. A `Soft` dep only needs to be *terminal*, which
+includes `Failed`/`Skipped` — states that publish nothing and, because a
+failed/skipped node carries no memo, **re-run on resume and can flip to
+succeeded**. Reading a soft dep would then change the dependent's prompt on
+resume, tripping the determinism fence (loud, but the run becomes permanently
+unresumable). Excluding soft deps keeps the resolved context a pure function of
+the journal. (Making soft-dep context safe would require freezing the resolved
+key-set per node in the journal — deferred.)
 
 The resolved context is assembled **once per node** (invariant across the ReAct
 turns, like the system prompt), so it lives in the `AgentRun` context bundle.
@@ -173,6 +183,9 @@ dependency-scoping is a correctness requirement, not a convenience.
 
 ## 10. Deferred (stated)
 
+- **Soft-dependency context reads** — excluded (§6); would need the resolved
+  key-set frozen per node in the journal so a soft dep's resume flip can't diverge
+  the prompt.
 - Agent-facing `read_context` / `write_context` tools (explicit info-needs).
 - Active summarize/select budgeting (beyond the existing over-budget halt).
 - `Scope::Node` / `Scope::Plan` reads and writes; per-agent private scratch.

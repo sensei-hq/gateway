@@ -194,10 +194,13 @@ impl Executor {
     }
 
     /// Wire the scoped blackboard (§8): completed node outputs publish to it, and
-    /// an `Agent` node's prompt is assembled with its dependencies' outputs read
-    /// from it. Injected (shared across the crash/resume seam). Requires a
-    /// `ContentStore` (entries are CAS refs). No store ⇒ every blackboard step is
-    /// a no-op, so behavior stays byte-identical.
+    /// an `Agent` node's prompt is assembled with its `Hard` dependencies' outputs
+    /// read from it. The store carries its own CAS (entries are content refs); on
+    /// resume it is **rebuilt fresh** from the journaled `ContextWrite`s (via
+    /// `insert_ref`), so only its backing CAS must persist across the crash seam —
+    /// pass a fresh `ContextStore` over the same CAS on resume, not the original
+    /// in-memory instance. No store ⇒ every blackboard step is a no-op, so behavior
+    /// stays byte-identical.
     pub fn with_context_store(mut self, context: Arc<dyn ContextStore>) -> Self {
         self.context = Some(context);
         self
@@ -637,12 +640,20 @@ impl Executor {
     }
 
     /// Resolve a node's dependency context from the blackboard (§8, D2): the
-    /// Run-scoped output of each DECLARED dependency, in declared order. Reads are
-    /// dependency-scoped (not all-Run) so a resume is replay-stable — every dep's
-    /// `ContextWrite` is journaled before this node runs, so the resolved context
-    /// (and thus the agent prompt) is byte-identical on resume. A dependency with
-    /// no entry (e.g. a soft dep that did not complete) is omitted. No store ⇒
-    /// empty.
+    /// Run-scoped output of each **`Hard`** dependency, in declared order. Reads
+    /// are restricted to `Hard` deps (not all declared deps, and not all-Run) so a
+    /// resume is replay-stable: a `Hard` dep must have `Completed` — and therefore
+    /// published its `ContextWrite` — before this node runs, so its entry is
+    /// present and value-stable across a resume, and the resolved context (hence
+    /// the agent prompt and its input-hash) is byte-identical.
+    ///
+    /// `Soft` deps are deliberately EXCLUDED: a `Soft` dep only needs to be
+    /// terminal, which includes `Failed`/`Skipped` (no `ContextWrite`). Since a
+    /// failed/skipped node carries no memo and re-runs on resume, its terminal
+    /// state — and thus its blackboard presence — can flip across a crash, which
+    /// would change a dependent's prompt and trip the determinism fence. Reading
+    /// only `Hard` deps keeps the resolved context a pure function of the journal.
+    /// No store ⇒ empty.
     async fn resolve_context(
         &self,
         node: &orchestrator_core::Node,
@@ -652,6 +663,9 @@ impl Executor {
         };
         let mut out = Vec::new();
         for dep in &node.deps {
+            if dep.kind != orchestrator_core::EdgeKind::Hard {
+                continue;
+            }
             let key = ContextKey(dep.on.0.clone());
             if let Some(r) = ctx.get(Scope::Run, key.clone()).await? {
                 out.push((key, ctx.load(&r).await?));
