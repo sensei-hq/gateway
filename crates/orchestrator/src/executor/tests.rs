@@ -2951,3 +2951,176 @@ async fn agent_prompt_includes_its_dependency_output_from_the_blackboard() {
         "B read A's blackboard output (A's system marker) into its prompt: {b_text}"
     );
 }
+
+/// Acceptance §8.5 — resume rehydrates the blackboard and re-spends nothing.
+/// A(model)→B(agent, dep A): B dies at turn 1; resuming with a FRESH context
+/// store (empty entries) sharing the SAME CAS forces rehydration to repopulate
+/// A's entry, so B's prompt is identical and its completed turns replay — the
+/// resume gateway sees only B's tail turn.
+#[tokio::test]
+async fn resume_rehydrates_the_blackboard_and_respends_nothing() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("A".into()),
+                kind: model_call("c", "plan"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("A")]),
+        ],
+    };
+    let (gw1, _c1) = scripted_gateway(vec![
+        final_response("A-done"),
+        tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":1,\"b\":1}"),
+    ])
+    .await;
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content.clone())
+        .with_context_store(ctx)
+        .run(run, &graph)
+        .await
+        .expect("seed");
+    assert!(o1.failed.is_some(), "B fails at turn 1 (script exhausted)");
+
+    let ctx2 = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gw2, calls2) = scripted_gateway(vec![final_response("the answer is 2")]).await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx2)
+        .start(run, &graph)
+        .await
+        .expect("resume");
+    assert!(
+        o2.failed.is_none() && o2.paused.is_none(),
+        "{:?}",
+        o2.failed
+    );
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        1,
+        "resume re-spent only B's tail turn (A + B turn 0 memoized, blackboard rehydrated)"
+    );
+}
+
+/// Acceptance §8.7 — a tampered upstream context on resume halts loud. Rewrite
+/// A's `ContextWrite` to point at a different blob; B's prompt then differs from
+/// the memoized turn → `DeterminismViolation` on B, never a silent mix.
+#[tokio::test]
+async fn tampered_upstream_context_on_resume_halts_with_determinism_violation() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("A".into()),
+                kind: model_call("c", "plan"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("A")]),
+        ],
+    };
+    let (gw1, _c1) = scripted_gateway(vec![
+        final_response("A-done"),
+        tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":1,\"b\":1}"),
+    ])
+    .await;
+    Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content.clone())
+        .with_context_store(ctx)
+        .run(run, &graph)
+        .await
+        .expect("seed");
+
+    // Tamper: a different blob, and rewrite A's ContextWrite to reference it.
+    let bytes = serde_json::to_vec(&serde_json::json!({"model":"m","text":"TAMPERED"})).unwrap();
+    let digest = content.put(&bytes).await.unwrap();
+    let tampered = InMemoryJournal::new();
+    for (_, e) in journal.load(run).await.unwrap() {
+        let e = match e {
+            JournalEvent::ContextWrite {
+                scope,
+                key,
+                summary,
+                seq,
+                ..
+            } if key.0 == "A" => JournalEvent::ContextWrite {
+                scope,
+                key,
+                summary,
+                seq,
+                content: orchestrator_core::ContentRef {
+                    digest: digest.clone(),
+                    size: bytes.len(),
+                    summary: None,
+                },
+            },
+            other => other,
+        };
+        tampered.append(run, e).await.unwrap();
+    }
+
+    let ctx2 = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let err = Executor::new(Arc::new(gw2), Arc::new(tampered.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx2)
+        .start(run, &graph)
+        .await
+        .expect_err("tampered upstream context halts the resume");
+    assert!(
+        matches!(&err, OrchestratorError::DeterminismViolation { node, .. } if node.0 == "B"),
+        "got {err:?}"
+    );
+}
+
+/// Acceptance §8.7 (over-budget) — an oversized dependency context busts the
+/// per-turn window and halts loud (`over budget`), never silently truncated.
+#[tokio::test]
+async fn oversized_dependency_context_halts_over_budget_never_truncates() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("A".into()),
+                kind: model_call("c", "plan"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("A")]),
+        ],
+    };
+    // A's output is huge → B's prompt (with A's context) exceeds the 4096 window.
+    let (gw, _c) = scripted_gateway(vec![final_response(&"x".repeat(100_000))]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run yields an outcome");
+    match &out.failed {
+        Some((node, msg)) => {
+            assert_eq!(node.0, "B");
+            assert!(msg.contains("over budget"), "{msg}");
+        }
+        None => panic!("expected B to halt over budget"),
+    }
+}
