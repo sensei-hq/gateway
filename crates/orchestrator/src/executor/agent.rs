@@ -2,7 +2,9 @@
 //! its per-turn tool execution (`run_agent_tools`). Split out of `super` for
 //! readability; both are `impl Executor` methods and share its private state.
 
-use kernel::types::request::{InferenceRequest, Message, MessageContent, MessageRole, ToolCall};
+use kernel::types::request::{
+    InferenceRequest, Message, MessageContent, MessageRole, ToolCall, ToolDefinition,
+};
 use orchestrator_core::{
     AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, OrchestratorError,
     RunId, effect_id,
@@ -13,6 +15,19 @@ use super::support::{
 };
 use super::{AgentStep, Executor, Fold};
 use crate::agent::prompt::{assemble_prompt, over_budget};
+
+/// The invariant-across-turns context of one agent invocation — assembled once
+/// (agent lookup, prompt, chain, window budget) so the per-turn helpers share it
+/// instead of each threading the same six values through their signatures.
+struct AgentRun<'a> {
+    run: RunId,
+    node_id: &'a NodeId,
+    chain: String,
+    system: String,
+    tools: Vec<ToolDefinition>,
+    min_win: Option<u32>,
+    fold: &'a Fold,
+}
 
 impl Executor {
     /// Run one agent ReAct loop against `node_id` — a top-level `Agent` node's id,
@@ -38,63 +53,28 @@ impl Executor {
         let (system, tools) = assemble_prompt(&self.registry, agent)?;
         let chain = agent.chain.clone();
         let min_win = self.gateway.min_context_window(&chain).await;
+        let ar = AgentRun {
+            run,
+            node_id,
+            chain,
+            system,
+            tools,
+            min_win,
+            fold,
+        };
 
         let mut messages: Vec<Message> =
             vec![Message::text(MessageRole::User, render_input(input))];
         let mut node_started = fold.started.contains(node_id);
 
         for turn in 0..self.max_steps {
-            let eid = effect_id(&node_id.0, turn as u64, 0);
-            let ih = agent_input_hash(&chain, &system, &messages, &tools)?;
-
-            // Reuse a memoized turn (resume): no gateway call, no re-append.
-            let turn_output = if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
-                if recorded_ih != &ih {
-                    return Err(OrchestratorError::DeterminismViolation {
-                        node: node_id.clone(),
-                        effect_id: eid,
-                    });
-                }
-                self.materialize(output).await?
-            } else {
-                // Live turn: budget → NodeStarted (once) → gateway → EffectRecorded.
-                if over_budget(min_win, &system, &messages, &tools) {
-                    let est = est_prompt_tokens(&system, &messages, &tools);
-                    let err = OrchestratorError::PromptOverBudget {
-                        node: node_id.clone(),
-                        turn,
-                        est,
-                        min_win: min_win.unwrap_or(0),
-                    };
-                    let message = err.to_string();
-                    self.append(
-                        run,
-                        JournalEvent::NodeFailed {
-                            node: node_id.clone(),
-                            error: message.clone(),
-                        },
-                    )
-                    .await?;
-                    return Ok(AgentStep::Failed(message));
-                }
-                if !node_started {
-                    self.append(
-                        run,
-                        JournalEvent::NodeStarted {
-                            node: node_id.clone(),
-                        },
-                    )
-                    .await?;
-                    node_started = true;
-                }
-                let request = build_chat_request(&chain, &system, messages.clone(), tools.clone());
-                match self
-                    .dispatch_model_turn(run, node_id, eid, ih, request)
-                    .await?
-                {
-                    Ok(output) => output,
-                    Err(failure) => return Ok(AgentStep::Failed(failure)),
-                }
+            // Produce this turn's model output — memoized replay or a live call.
+            let turn_output = match self
+                .agent_turn_output(&ar, turn, &messages, &mut node_started)
+                .await?
+            {
+                Ok(output) => output,
+                Err(failure) => return Ok(AgentStep::Failed(failure)),
             };
 
             let tool_calls: Vec<ToolCall> = serde_json::from_value(
@@ -104,42 +84,22 @@ impl Executor {
                     .unwrap_or(serde_json::json!([])),
             )?;
             if tool_calls.is_empty() {
-                // Final answer.
-                if !fold.completed.contains(node_id) {
-                    self.append(
-                        run,
-                        JournalEvent::NodeCompleted {
-                            node: node_id.clone(),
-                        },
-                    )
-                    .await?;
-                }
-                let text = turn_output.get("text").cloned().unwrap_or_default();
-                let model = turn_output
-                    .get("model")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                return Ok(AgentStep::Completed(
-                    serde_json::json!({ "model": model, "text": text }),
-                ));
+                return self.finish_agent(&ar, &turn_output).await;
             }
 
             // Not a final answer → execute this turn's tool calls and extend the
             // transcript. A tool failure ends the node (already journaled).
-            match self
-                .run_agent_tools(run, node_id, turn, &turn_output, fold)
-                .await?
-            {
+            match self.run_agent_tools(&ar, turn, &turn_output).await? {
                 Ok(turn_messages) => messages.extend(turn_messages),
                 Err(failure) => return Ok(AgentStep::Failed(failure)),
             }
         }
 
         // Ran out of steps without a final answer.
-        let err = OrchestratorError::AgentMaxStepsExceeded {
+        let message = OrchestratorError::AgentMaxStepsExceeded {
             node: node_id.clone(),
-        };
-        let message = err.to_string();
+        }
+        .to_string();
         self.append(
             run,
             JournalEvent::NodeFailed {
@@ -151,6 +111,93 @@ impl Executor {
         Ok(AgentStep::Failed(message))
     }
 
+    /// Produce one ReAct turn's model output: a memoized turn replays from the
+    /// journal (no gateway call; a hash mismatch is a fatal `DeterminismViolation`);
+    /// otherwise a live turn runs the budget gate → `NodeStarted` (once, tracked in
+    /// `node_started`) → gateway → `EffectRecorded`. The inner `Result` is the
+    /// turn's output value, or a node-level failure message (over-budget or a
+    /// gateway error, already journaled `NodeFailed`).
+    async fn agent_turn_output(
+        &self,
+        ar: &AgentRun<'_>,
+        turn: usize,
+        messages: &[Message],
+        node_started: &mut bool,
+    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+        let eid = effect_id(&ar.node_id.0, turn as u64, 0);
+        let ih = agent_input_hash(&ar.chain, &ar.system, messages, &ar.tools)?;
+
+        if let Some((recorded_ih, output)) = ar.fold.memo.get(&eid) {
+            if recorded_ih != &ih {
+                return Err(OrchestratorError::DeterminismViolation {
+                    node: ar.node_id.clone(),
+                    effect_id: eid,
+                });
+            }
+            return Ok(Ok(self.materialize(output).await?));
+        }
+
+        // Live turn. Budget-gate before spending; halt loud if over.
+        if over_budget(ar.min_win, &ar.system, messages, &ar.tools) {
+            let message = OrchestratorError::PromptOverBudget {
+                node: ar.node_id.clone(),
+                turn,
+                est: est_prompt_tokens(&ar.system, messages, &ar.tools),
+                min_win: ar.min_win.unwrap_or(0),
+            }
+            .to_string();
+            self.append(
+                ar.run,
+                JournalEvent::NodeFailed {
+                    node: ar.node_id.clone(),
+                    error: message.clone(),
+                },
+            )
+            .await?;
+            return Ok(Err(message));
+        }
+        if !*node_started {
+            self.append(
+                ar.run,
+                JournalEvent::NodeStarted {
+                    node: ar.node_id.clone(),
+                },
+            )
+            .await?;
+            *node_started = true;
+        }
+        let request =
+            build_chat_request(&ar.chain, &ar.system, messages.to_vec(), ar.tools.clone());
+        self.dispatch_model_turn(ar.run, ar.node_id, eid, ih, request)
+            .await
+    }
+
+    /// Finalize a completed agent node: journal `NodeCompleted` once (guarded on
+    /// resume) and return the canonical `{model, text}` output.
+    async fn finish_agent(
+        &self,
+        ar: &AgentRun<'_>,
+        turn_output: &serde_json::Value,
+    ) -> Result<AgentStep, OrchestratorError> {
+        if !ar.fold.completed.contains(ar.node_id) {
+            self.append(
+                ar.run,
+                JournalEvent::NodeCompleted {
+                    node: ar.node_id.clone(),
+                },
+            )
+            .await?;
+        }
+        let text = turn_output.get("text").cloned().unwrap_or_default();
+        let model = turn_output
+            .get("model")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        Ok(AgentStep::Completed(
+            serde_json::json!({ "model": model, "text": text }),
+        ))
+    }
+
     /// Execute (or replay) one ReAct turn's tool calls and return the transcript
     /// messages to append (the assistant turn + each tool result). Each Pure tool
     /// call is a Pure effect `effect_id(node_id, turn, k+1)`: a memo hit replays it
@@ -159,11 +206,9 @@ impl Executor {
     /// message (already journaled `NodeFailed`) — the same shape as a Map child.
     async fn run_agent_tools(
         &self,
-        run: RunId,
-        node_id: &NodeId,
+        ar: &AgentRun<'_>,
         turn: usize,
         turn_output: &serde_json::Value,
-        fold: &Fold,
     ) -> Result<Result<Vec<Message>, String>, OrchestratorError> {
         let assistant_text = turn_output
             .get("text")
@@ -185,14 +230,14 @@ impl Executor {
             attachments: Vec::new(),
         }];
         for (k, call) in tool_calls.iter().enumerate() {
-            let teid = effect_id(&node_id.0, turn as u64, k + 1);
+            let teid = effect_id(&ar.node_id.0, turn as u64, k + 1);
             let args: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
             let tih = tool_input_hash(&call.name, &call.arguments);
-            let result = if let Some((recorded_ih, output)) = fold.memo.get(&teid) {
+            let result = if let Some((recorded_ih, output)) = ar.fold.memo.get(&teid) {
                 if recorded_ih != &tih {
                     return Err(OrchestratorError::DeterminismViolation {
-                        node: node_id.clone(),
+                        node: ar.node_id.clone(),
                         effect_id: teid,
                     });
                 }
@@ -202,9 +247,9 @@ impl Executor {
                     Ok(result) => {
                         let recorded = self.split_output(&result).await?;
                         self.append(
-                            run,
+                            ar.run,
                             JournalEvent::EffectRecorded {
-                                node: node_id.clone(),
+                                node: ar.node_id.clone(),
                                 effect_id: teid,
                                 class: EffectClass::Pure,
                                 input_hash: tih,
@@ -218,9 +263,9 @@ impl Executor {
                     Err(err) => {
                         let message = err.to_string();
                         self.append(
-                            run,
+                            ar.run,
                             JournalEvent::NodeFailed {
-                                node: node_id.clone(),
+                                node: ar.node_id.clone(),
                                 error: message.clone(),
                             },
                         )
