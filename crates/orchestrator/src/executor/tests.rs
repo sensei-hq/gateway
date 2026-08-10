@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    content_gated_gateway, demo_reference_gateway, failing_after_gateway, final_response,
-    recording_gateway, scripted_gateway, tool_call_response,
+    content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
+    failing_after_gateway, final_response, recording_gateway, scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, Graph, JournalError, MapBody, Node, NodeId, NodeKind,
@@ -2469,4 +2469,163 @@ async fn map_of_agents_then_consolidate_drives_the_real_reference_chain_to_local
             "child {i} ran as an agent sub-run (has its own node lifecycle): {labels:?}"
         );
     }
+}
+
+/// Acceptance §8.8 (real-gateway e2e) — a `Map { body: Agent("researcher") }`
+/// whose agent's ReAct loop calls the `Search` Observation, `Quorum`-aggregated →
+/// `Consolidate { Agent("synthesizer") }`, PLUS an independent `Agent("recorder")`
+/// node whose loop calls the `RecordNote` Mutation — all driven THROUGH the real
+/// gateway (demo catalog, `research.bulk` fallover to the local model) with an
+/// injected clock + reconcilers. Proves Observation fan-out (recorded with
+/// provenance), Mutation two-phase, and a clean completion in one run. (Resume is
+/// proven exhaustively by the §8.1–8.7 acceptance tests above.)
+#[tokio::test]
+async fn e2e_map_observation_agents_plus_mutation_agent_through_the_real_gateway() {
+    let (gateway, _calls) = demo_reference_tool_gateway().await;
+    let journal = InMemoryJournal::new();
+    let search_calls = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let mk_agent = |name: &str, tools: Vec<String>| AgentDefinition {
+        name: name.into(),
+        area: "research".into(),
+        kind: "reasoning".into(),
+        chain: "research.bulk".into(),
+        tools,
+        skills: vec![],
+        system_prompt: "Work carefully.".into(),
+    };
+    let search = Arc::new(Search::new(search_calls.clone()));
+    let recorder_tool = Arc::new(RecordNote::new(sink.clone()));
+    let registry = Arc::new(
+        Registry::default()
+            .with_agent(mk_agent("researcher", vec!["search".into()]))
+            .with_agent(mk_agent("synthesizer", vec![]))
+            .with_agent(mk_agent("recorder", vec!["record_note".into()]))
+            .with_tool(search.spec())
+            .with_tool(recorder_tool.spec()),
+    );
+    let tools = Arc::new(
+        ToolRegistry::default()
+            .with_tool(search.clone())
+            .with_tool(recorder_tool.clone()),
+    );
+    let reconcilers = Arc::new(
+        ReconcileRegistry::default()
+            .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone()))),
+    );
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry)
+        .with_tools(tools)
+        .with_reconcilers(reconcilers)
+        .with_clock(Arc::new(AdvanceableClock::at(OBS_T0)));
+
+    let m = NodeId("m".into());
+    let cons = NodeId("cons".into());
+    let rec = NodeId("rec".into());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: m.clone(),
+                kind: NodeKind::Map {
+                    body: MapBody::Agent(AgentRef("researcher".into())),
+                    over: vec![
+                        serde_json::json!("topic-0"),
+                        serde_json::json!("topic-1"),
+                        serde_json::json!("topic-2"),
+                    ],
+                    concurrency: 4,
+                    aggregation: Aggregation::Quorum {
+                        min_count: None,
+                        min_fraction: Some(0.6),
+                    },
+                },
+                deps: vec![],
+            },
+            Node {
+                id: cons.clone(),
+                kind: NodeKind::Consolidate {
+                    over: m.clone(),
+                    min_viable: 1,
+                    body: MapBody::Agent(AgentRef("synthesizer".into())),
+                },
+                deps: vec![Dep::soft("m")],
+            },
+            agent_node("rec", "recorder", "log the run"),
+        ],
+    };
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("e2e run");
+
+    // Everything completes cleanly.
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "{:?}",
+        outcome.failed
+    );
+    for n in [&m, &cons, &rec] {
+        assert!(
+            outcome.completed.contains(n),
+            "{} completed: {:?}",
+            n.0,
+            outcome.completed
+        );
+    }
+    assert_eq!(
+        outcome.outputs[&m]["manifest"]["ok"], 3,
+        "quorum met — all 3 children ok"
+    );
+
+    // Observation fan-out: each of the 3 children read Search live once, and each
+    // records with provenance {source: "search"}.
+    assert_eq!(
+        search_calls.load(Ordering::SeqCst),
+        3,
+        "each fanned-out child agent read the Search Observation once"
+    );
+    let events = journal.load(run).await.unwrap();
+    let obs_provenance = events
+        .iter()
+        .filter(|(_, e)| {
+            matches!(e, JournalEvent::EffectRecorded { class: EffectClass::Observation, observation: Some(meta), .. } if meta.source == "search")
+        })
+        .count();
+    assert_eq!(
+        obs_provenance, 3,
+        "3 Observation records carry search provenance across the fan-out"
+    );
+
+    // Mutation two-phase: the recorder's record_note journals EffectIntent then
+    // EffectRecorded, and the side effect landed exactly once.
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["log the run".to_string()],
+        "the Mutation applied exactly once through the real gateway"
+    );
+    let rec_labels: Vec<String> = events
+        .iter()
+        .filter(|(_, e)| {
+            matches!(e,
+                JournalEvent::EffectIntent { node, .. } | JournalEvent::EffectRecorded { node, .. }
+                    if node.0 == "rec")
+        })
+        .map(|(_, e)| label(e))
+        .collect();
+    let intent_at = rec_labels
+        .iter()
+        .position(|l| l == "EffectIntent(rec)")
+        .expect("recorder journaled an EffectIntent");
+    assert_eq!(
+        rec_labels[intent_at + 1],
+        "EffectRecorded(rec)",
+        "record_note is two-phase — Intent → Recorded: {rec_labels:?}"
+    );
+
+    // The synthesis agent ran on the reference chain and fell over to the local model.
+    assert_eq!(
+        outcome.outputs[&cons]["model"], "llama3.1-local",
+        "the Consolidate's agent synthesized via the local fallover: {:?}",
+        outcome.outputs[&cons]
+    );
 }
