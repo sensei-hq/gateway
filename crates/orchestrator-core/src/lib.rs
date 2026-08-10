@@ -11,7 +11,7 @@ pub mod registry;
 
 pub use effect::{EffectClass, EffectId, effect_id};
 pub use error::{JournalError, OrchestratorError};
-pub use graph::{Graph, Node, NodeKind};
+pub use graph::{Aggregation, Dep, EdgeKind, Graph, MapBody, Node, NodeKind};
 pub use ids::{NodeId, RunId, Seq};
 pub use journal::{ExecutionJournal, JournalEvent};
 pub use registry::{AgentDefinition, AgentRef, Registry, SkillDef, ToolSpec};

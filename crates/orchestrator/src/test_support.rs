@@ -217,6 +217,68 @@ impl ChatModel for ScriptedAdapter {
     }
 }
 
+/// Chat adapter that succeeds unless the first user message contains the marker
+/// substring `"FAIL"`, in which case it errors. Lets a fan-out test pick which
+/// specific children fail **by item content** — deterministic regardless of the
+/// nondeterministic concurrent dispatch order (unlike `ScriptedAdapter`, which
+/// is keyed on call order).
+pub struct ContentGatedAdapter {
+    calls: CallLog,
+}
+
+impl Model for ContentGatedAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for ContentGatedAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt.clone()));
+        if prompt.contains("FAIL") {
+            return Err(GatewayError::ProviderError {
+                adapter: "r".into(),
+                message: format!("content-gated failure for {prompt:?}"),
+                status: Some(500),
+            });
+        }
+        Ok(ChatResponse {
+            content: Some(format!("ok:{prompt}")),
+            tool_calls: Vec::new(),
+            usage: None,
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway on chain `"c"` whose adapter fails any request whose prompt
+/// contains `"FAIL"` and succeeds otherwise — the fan-out partial-failure fixture.
+pub async fn content_gated_gateway() -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(ContentGatedAdapter {
+            calls: calls.clone(),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
+}
+
 /// A gateway on chain "c" whose scripted adapter yields `responses` in order.
 pub async fn scripted_gateway(responses: Vec<ChatResponse>) -> (Gateway, CallLog) {
     let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
