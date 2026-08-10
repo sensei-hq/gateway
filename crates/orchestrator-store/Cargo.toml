@@ -11,6 +11,7 @@ name = "orchestrator_store"
 [dependencies]
 orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }
 async-trait = "0.1"
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

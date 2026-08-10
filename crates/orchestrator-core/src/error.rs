@@ -60,4 +60,8 @@ pub enum OrchestratorError {
         have: usize,
         need: usize,
     },
+    #[error("blackboard collision: scope {scope} already has key {key:?}")]
+    ContextKeyCollision { scope: String, key: String },
+    #[error("content-store digest miss: {0} — content is not addressable")]
+    ContentDigestMiss(String),
 }

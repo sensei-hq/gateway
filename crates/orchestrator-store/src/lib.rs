@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use orchestrator_core::{ExecutionJournal, JournalError, JournalEvent, RunId, Seq};
 
+mod stores;
+pub use stores::{InMemoryContentStore, InMemoryContextStore};
+
 /// The shared, `Seq`-stamped event log keyed by run, guarded for concurrent
 /// appends and clonable across executors.
 type SharedLog = Arc<Mutex<HashMap<RunId, Vec<(Seq, JournalEvent)>>>>;
