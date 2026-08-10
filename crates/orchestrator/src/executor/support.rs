@@ -91,6 +91,11 @@ pub(crate) fn fold_journal(
                 fold.completed.insert(node.clone());
                 completed.push(node.clone());
             }
+            // The intent phase of a two-phase Mutation (§7.3). An effect id in
+            // `intents` with no matching `EffectRecorded` is in-doubt on resume.
+            JournalEvent::EffectIntent { effect_id, .. } => {
+                fold.intents.insert(effect_id.clone());
+            }
             JournalEvent::MapCompacted { node, children } => {
                 for c in children {
                     if c.status == ChildStatus::Ok
@@ -241,6 +246,15 @@ pub(crate) fn agent_input_hash(
 pub(crate) fn tool_input_hash(name: &str, arguments: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{name}|{arguments}").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// The `content_hash` element of an Observation's provenance (§7.1): the sha256
+/// hex of the recorded output's serialized bytes.
+#[allow(dead_code)] // used by the Observation path (slice-4 Task 7)
+pub(crate) fn content_hash(value: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(value).unwrap_or_default());
     format!("{:x}", hasher.finalize())
 }
 

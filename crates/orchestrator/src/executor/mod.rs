@@ -60,6 +60,18 @@ pub struct RunOutcome {
     pub failed: Option<(NodeId, String)>,
     pub skipped: Vec<NodeId>,
     pub outputs: HashMap<NodeId, serde_json::Value>,
+    /// Set when the run halted on a durable pause (§7.3) — e.g. an in-doubt
+    /// Mutation whose reconcile was `Indeterminate`. Like `failed`, a pause
+    /// suppresses `RunCompleted`; the run stays resumable.
+    pub paused: Option<PauseInfo>,
+}
+
+/// A durable pause: the run stopped resumable (no `RunCompleted`) at `node`,
+/// never blindly applying/memoizing the effect in question (§7.3).
+#[derive(Debug, Clone)]
+pub struct PauseInfo {
+    pub node: NodeId,
+    pub reason: String,
 }
 
 /// The state folded from a journal on resume: the effect memo plus which nodes
@@ -74,6 +86,10 @@ struct Fold {
     memo: HashMap<EffectId, (String, EffectOutput)>,
     started: std::collections::HashSet<NodeId>,
     completed: std::collections::HashSet<NodeId>,
+    /// Effect ids that journaled an `EffectIntent` (§7.3). An id in `intents` but
+    /// NOT in `memo` (no `EffectRecorded`) is an **in-doubt** Mutation on resume.
+    #[allow(dead_code)] // read by the in-doubt Mutation path (slice-4 Task 9)
+    intents: std::collections::HashSet<EffectId>,
 }
 
 /// The mutable scheduling state threaded through a `drive` loop: the accumulating
@@ -306,9 +322,10 @@ impl Executor {
             // unless the run later crashes and resumes.
             self.write_snapshot(run, &state.outcome).await?;
         }
-        // A run with any failure is not marked complete — it stays resumable
-        // (the slice-1/2 contract), even though soft-dependent branches ran.
-        if state.outcome.failed.is_none() {
+        // A run with any failure OR a durable pause is not marked complete — it
+        // stays resumable (the slice-1/2 contract), even though soft-dependent
+        // branches ran.
+        if state.outcome.failed.is_none() && state.outcome.paused.is_none() {
             self.append(run, JournalEvent::RunCompleted).await?;
         }
         Ok(state.outcome)
@@ -354,6 +371,18 @@ impl Executor {
                     &mut state.outcome,
                 )
                 .await?;
+            }
+            NodeExec::Paused { reason } => {
+                // Durable pause (§7.3): record it (first pause wins), mark terminal,
+                // and do NOT cascade. The run stays resumable — `drive` suppresses
+                // `RunCompleted` while `paused` is set.
+                if state.outcome.paused.is_none() {
+                    state.outcome.paused = Some(PauseInfo {
+                        node: node.id.clone(),
+                        reason,
+                    });
+                }
+                state.terminal.insert(node.id.clone());
             }
         }
         Ok(())
@@ -504,6 +533,7 @@ impl Executor {
                         message,
                         output: None,
                     }),
+                    AgentStep::Paused(reason) => Ok(NodeExec::Paused { reason }),
                 }
             }
             NodeKind::Map { .. } => self.run_map(run, node, fold).await,
@@ -524,11 +554,15 @@ impl Executor {
     }
 }
 
-/// The terminal result of one `Agent` node: a completed output, or a node-level
-/// failure (budget/max-steps/gateway/tool) already journaled as `NodeFailed`.
+/// The terminal result of one `Agent` node: a completed output, a node-level
+/// failure (budget/max-steps/gateway/tool) already journaled as `NodeFailed`, or
+/// a durable **pause** — an in-doubt Mutation whose reconcile was `Indeterminate`
+/// (§7.3), journaled as `RunPaused`, never blindly applied.
 enum AgentStep {
     Completed(serde_json::Value),
     Failed(String),
+    #[allow(dead_code)] // produced by drive_agent's Mutation reconcile (slice-4 Task 9)
+    Paused(String),
 }
 
 /// The terminal result of one scheduled node (any kind): its completed output,
@@ -543,6 +577,11 @@ enum NodeExec {
     Failed {
         message: String,
         output: Option<serde_json::Value>,
+    },
+    /// The node halted on a durable pause (§7.3) — the run stops resumable (no
+    /// `RunCompleted`), never blindly applying the in-doubt effect.
+    Paused {
+        reason: String,
     },
 }
 

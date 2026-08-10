@@ -169,6 +169,7 @@ impl Executor {
                         message,
                         output: None,
                     }),
+                    AgentStep::Paused(reason) => Ok(NodeExec::Paused { reason }),
                 }
             }
         }
@@ -251,6 +252,15 @@ impl Executor {
                         {
                             Ok(AgentStep::Completed(output)) => Ok(Ok(output)),
                             Ok(AgentStep::Failed(message)) => Ok(Err(message)),
+                            // A Mutation pause inside a fanned-out Map child is out
+                            // of slice-4 scope (the demo places Mutations at the
+                            // top level / Consolidate, never in Map children):
+                            // surface it as the child's manifest error rather than
+                            // threading a pause out of `join_all`. Whole-Map pause
+                            // propagation lands with agent-child Mutations later.
+                            Ok(AgentStep::Paused(reason)) => {
+                                Ok(Err(format!("paused (unsupported in map child): {reason}")))
+                            }
                             Err(fatal) => Err(fatal),
                         }
                     }
