@@ -2792,3 +2792,93 @@ async fn with_context_store_builder_is_wired() {
     let _exec =
         Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1").with_context_store(ctx);
 }
+
+/// Acceptance §8.2 — a completed node publishes to Run/node.id; the journal
+/// carries a ContextWrite whose content is a CAS ref (not inline), and the blob
+/// round-trips from the blackboard.
+#[tokio::test]
+async fn completed_node_publishes_a_context_ref_to_the_blackboard() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gw, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, n1, _n2) = two_node_graph("a", "b");
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_content_store(content)
+        .with_context_store(ctx.clone())
+        .run(run, &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::ContextWrite { key, .. } if key.0 == n1.0)),
+        "n1's completion journaled a ContextWrite: {:?}",
+        events.iter().map(|(_, e)| label(e)).collect::<Vec<_>>()
+    );
+    let got = ctx
+        .get(
+            orchestrator_core::Scope::Run,
+            orchestrator_core::ContextKey(n1.0.clone()),
+        )
+        .await
+        .unwrap()
+        .expect("n1 present on the blackboard");
+    assert_eq!(ctx.load(&got).await.unwrap()["text"], "canned-response");
+}
+
+/// Acceptance §8.1 — no context store wired ⇒ NO ContextWrite events ⇒
+/// byte-identical to slice 4.
+#[tokio::test]
+async fn no_context_store_journals_no_context_writes() {
+    let (gw, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, _n1, _n2) = two_node_graph("a", "b");
+    Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("run");
+    assert!(
+        journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, e)| !matches!(e, JournalEvent::ContextWrite { .. })),
+        "no store ⇒ no ContextWrite"
+    );
+}
+
+/// Acceptance §8.4 — a duplicate (Run, key) publish surfaces ContextKeyCollision
+/// loudly (never a silent overwrite). Pre-seed Run/"n1" WITHOUT a ContextWrite so
+/// the fold-guard does not skip, then run — n1's publish collides.
+#[tokio::test]
+async fn duplicate_context_key_publish_is_a_loud_collision() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    ctx.put(
+        orchestrator_core::Scope::Run,
+        orchestrator_core::ContextKey("n1".into()),
+        serde_json::json!({ "pre": "seeded" }),
+    )
+    .await
+    .unwrap();
+    let (gw, _c) = recording_gateway().await;
+    let (graph, _n1, _n2) = two_node_graph("a", "b");
+    let err = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect_err("duplicate publish collides");
+    assert!(
+        matches!(err, OrchestratorError::ContextKeyCollision { .. }),
+        "got {err:?}"
+    );
+}
