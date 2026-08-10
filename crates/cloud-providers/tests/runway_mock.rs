@@ -15,10 +15,6 @@
 //! `GatewayError::ProviderError { status: Some(code), .. }`. These tests assert
 //! that ACTUAL behaviour rather than the generic auth/rate-limit mappings.
 
-use std::collections::HashMap;
-
-use kernel::types::config::RouterConfig;
-use kernel::types::error::GatewayError;
 use kernel::types::io::VideoRequest;
 
 use cloud_providers::runway::RunwayAdapter;
@@ -27,23 +23,16 @@ use kernel::adapters::capability::VideoModel;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
+mod common;
+use common::{assert_provider_error_status, router_config};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const SAMPLE_URL: &str = "https://cdn.runwayml.com/output/generated-video.mp4";
 const TASK_ID: &str = "task-abc-123";
-
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn video_request() -> VideoRequest {
     VideoRequest {
@@ -64,6 +53,27 @@ async fn mount_submit(server: &MockServer, task_id: &str) {
         )
         .mount(server)
         .await;
+}
+
+/// Submit succeeds, then the poll endpoint returns `poll`; assert the adapter maps it to a
+/// ProviderError (status `None` — the poll phase doesn't attach an HTTP status). The only
+/// axis that varies is that poll response — a terminal `"FAILED"` status, a 5xx, or an
+/// unparseable 200 body.
+async fn assert_poll_error(task_id: &str, poll: ResponseTemplate) {
+    let server = MockServer::start().await;
+    mount_submit(&server, task_id).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tasks/{task_id}")))
+        .respond_with(poll)
+        .mount(&server)
+        .await;
+
+    let err = RunwayAdapter::new()
+        .unwrap()
+        .generate_video(&router_config(&server.uri()), &video_request())
+        .await
+        .unwrap_err();
+    assert_provider_error_status(&err, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -106,112 +116,18 @@ async fn runway_generate_video_happy_path() {
 // Submit error mappings — all non-success maps to ProviderError.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn runway_submit_401_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/tasks"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(401),
-                ..
-            }
-        ),
-        "expected ProviderError with status 401, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn runway_submit_403_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/tasks"))
-        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(403),
-                ..
-            }
-        ),
-        "expected ProviderError with status 403, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn runway_submit_429_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/tasks"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(429),
-                ..
-            }
-        ),
-        "expected ProviderError with status 429, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn runway_submit_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/tasks"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+http_error_tests! {
+    call: |config| async move {
+        RunwayAdapter::new().unwrap().generate_video(&config, &video_request()).await
+    },
+    method: "POST",
+    path: "/tasks",
+    cases: {
+        runway_submit_401_maps_to_provider_error => (401, "invalid api key", common::ErrKind::Provider(Some(401))),
+        runway_submit_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
+        runway_submit_429_maps_to_provider_error => (429, "rate limited", common::ErrKind::Provider(Some(429))),
+        runway_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 #[tokio::test]
@@ -231,97 +147,45 @@ async fn runway_submit_unparseable_body_maps_to_provider_error() {
     let request = video_request();
 
     let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(200),
-                ..
-            }
-        ),
-        "expected ProviderError from unparseable submit body, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(200));
 }
 
 // ---------------------------------------------------------------------------
 // Poll-phase failures
 // ---------------------------------------------------------------------------
 
+/// A terminal `"FAILED"` poll status with a failure message -> ProviderError.
 #[tokio::test]
 async fn runway_poll_failed_status_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit(&server, "task-fail-1").await;
-
-    // First (and only) poll returns a terminal "FAILED" status with a
-    // failure message; the adapter surfaces it as a ProviderError.
-    Mock::given(method("GET"))
-        .and(path("/tasks/task-fail-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+    assert_poll_error(
+        "task-fail-1",
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "FAILED",
             "output": null,
             "failure": "content policy violation"
-        })))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError from FAILED poll, got: {err:?}",
-    );
+        })),
+    )
+    .await;
 }
 
+/// The poll endpoint itself returns a non-success HTTP status.
 #[tokio::test]
 async fn runway_poll_http_error_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit(&server, "task-fail-2").await;
-
-    // The poll endpoint itself returns a non-success HTTP status.
-    Mock::given(method("GET"))
-        .and(path("/tasks/task-fail-2"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("poll server error"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError from failed poll HTTP status, got: {err:?}",
-    );
+    assert_poll_error(
+        "task-fail-2",
+        ResponseTemplate::new(500).set_body_string("poll server error"),
+    )
+    .await;
 }
 
+/// Poll returns 200 but an un-parseable status body.
 #[tokio::test]
 async fn runway_poll_unparseable_body_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    mount_submit(&server, "task-fail-3").await;
-
-    // Poll returns 200 but an un-parseable status body.
-    Mock::given(method("GET"))
-        .and(path("/tasks/task-fail-3"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("still not json"))
-        .mount(&server)
-        .await;
-
-    let adapter = RunwayAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = video_request();
-
-    let err = adapter.generate_video(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { status: None, .. }),
-        "expected ProviderError from unparseable poll body, got: {err:?}",
-    );
+    assert_poll_error(
+        "task-fail-3",
+        ResponseTemplate::new(200).set_body_string("still not json"),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

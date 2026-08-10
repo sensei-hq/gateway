@@ -8,25 +8,15 @@
 <body>
 <x-dc>
 <helmet data-dc-atomics>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./fonts.css">
+<script src="./uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime/uno.global.js"></script>
 </helmet>
-<div style="{{ style }}">{{ label }}</div>
+<div class="eyebrow">{{ label }}</div>
 </x-dc>
-<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:200,&quot;height&quot;:20},&quot;label&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;The routing engine&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;dark&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;}}">
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:220,&quot;height&quot;:20},&quot;label&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;The routing engine&quot;,&quot;tsType&quot;:&quot;string&quot;}}">
 class Component extends DCLogic {
-  renderVals() {
-    const p = this.props || {};
-    const dark = !!p.dark;
-    return {
-      label: p.label || '',
-      style: {
-        fontFamily: '"JetBrains Mono",ui-monospace,monospace',
-        fontSize: '12.5px', fontWeight: 600,
-        color: dark ? '#58a6ff' : '#2f7ff2',
-        letterSpacing: '.04em', textTransform: 'uppercase',
-      },
-    };
-  }
+  renderVals() { return { label: (this.props || {}).label || '' }; }
 }
 </script>
 </body>

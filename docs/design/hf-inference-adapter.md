@@ -1,3 +1,13 @@
+---
+title: Hugging Face Inference Adapter
+doctype: design
+module: inference
+status: implemented
+feature:
+  - ../features/inference/providers.md
+source: crates/cloud-providers/src
+---
+
 # Design: OpenAI-compat consolidation + Hugging Face Inference adapter (HF-B)
 
 - **Status:** Draft (decisions carried from the HF/auth brainstorm; recorded here against post-refactor state)

@@ -173,24 +173,16 @@ impl kernel::adapters::capability::EmbedModel for FastembedAdapter {
         _cfg: &RouterConfig,
         req: &EmbedRequest,
     ) -> Result<EmbedResponse, GatewayError> {
-        // Preserve the legacy `execute` model resolution: reject a request
-        // pinned to a model this adapter does not serve.
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
-        // Inherent `FastembedAdapter::embed(&[String])` does the fastembed
-        // model loading/pooling; fastembed reports no token usage.
-        let embeddings = self.embed(&req.texts)?;
-        Ok(EmbedResponse {
-            embeddings,
-            usage: None,
-            degraded: false,
-        })
+        // `embed_response` preserves the legacy `execute` model resolution
+        // (reject a request pinned to a model this adapter does not serve),
+        // then calls the inherent `FastembedAdapter::embed(&[String])` below
+        // (fastembed model loading/pooling; no token usage) and wraps it.
+        super::embed_response(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+            || self.embed(&req.texts),
+        )
     }
 }
 

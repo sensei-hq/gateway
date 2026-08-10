@@ -1,6 +1,6 @@
 [package]
 name = "sensei-vault"
-version = "0.4.8"
+version = "0.5.1"
 edition = "2024"
 description = "Shared BYOK credential vault (AES-256-GCM envelope, KEK/DEK, tenant‖router AAD binding) for sensei + strategos"
 license = "MIT"

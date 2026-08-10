@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::kek::KekProvider;
 use crate::store::VaultStore;
-use crate::vault::{Vault, VaultError};
+use crate::vault::{OAuthCredential, Vault, VaultError};
 
 /// Memoizes each tenant's decrypted BYOK key map in front of a [`Vault`]. `None` vault ⇒
 /// BYOK disabled. Generic over the same `K`/`S` as the `Vault` so both consumers reuse it.
@@ -108,30 +108,16 @@ impl<K: KekProvider, S: VaultStore> TenantKeyCache<K, S> {
     }
 
     /// Store/rotate an OAuth credential then invalidate the cache. Errors if BYOK is disabled.
-    #[allow(clippy::too_many_arguments)]
     pub async fn store_oauth(
         &self,
         tenant: Uuid,
         router: Uuid,
-        access_token: &str,
-        refresh_token: Option<&str>,
-        expires_at_ms: Option<i64>,
-        scopes: Option<&str>,
-        client_id: Option<&str>,
+        cred: &OAuthCredential<'_>,
         actor: &str,
     ) -> Result<Uuid, VaultError> {
         let id = self
             .vault()?
-            .store_oauth(
-                tenant,
-                router,
-                access_token,
-                refresh_token,
-                expires_at_ms,
-                scopes,
-                client_id,
-                actor,
-            )
+            .store_oauth(tenant, router, cred, actor)
             .await?;
         self.invalidate(tenant).await;
         Ok(id)
@@ -229,9 +215,20 @@ mod tests {
 
         // Empty before any oauth write (and this caches the empty map).
         assert!(c.get_oauth(t).await.unwrap().is_empty());
-        c.store_oauth(t, router, "tok-1", None, None, None, None, "x")
-            .await
-            .unwrap();
+        c.store_oauth(
+            t,
+            router,
+            &OAuthCredential {
+                access_token: "tok-1",
+                refresh_token: None,
+                expires_at_ms: None,
+                scopes: None,
+                client_id: None,
+            },
+            "x",
+        )
+        .await
+        .unwrap();
         // store_oauth invalidated the cache → the write is now visible.
         assert_eq!(
             c.get_oauth(t)

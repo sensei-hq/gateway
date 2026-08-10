@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use reqwest::Client;
 
-use crate::base::{build_client, resolve_api_key};
+use crate::base::build_client;
 use crate::openai_compat;
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
@@ -51,16 +51,12 @@ impl HuggingFaceAdapter {
 
 /// Resolve the base URL: operator-supplied `config.url`, else the router default.
 fn base_url(config: &RouterConfig) -> &str {
-    let url = config.url.trim_end_matches('/');
-    if url.is_empty() { BASE_URL } else { url }
+    crate::base::base_url_or(config, BASE_URL)
 }
 
 /// HF requires a token — fail before any network I/O when none is present.
 fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
-    resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
-        adapter: "huggingface".into(),
-        message: "missing API key — set the env var specified in api_key_env".into(),
-    })
+    crate::base::require_api_key(config, "huggingface")
 }
 
 impl kernel::adapters::capability::Model for HuggingFaceAdapter {

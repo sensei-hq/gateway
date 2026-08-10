@@ -34,3 +34,92 @@ pub mod kokoro;
 
 #[cfg(feature = "kokoro")]
 pub use kokoro::{KokoroAdapter, KokoroConfig, KokoroLang};
+
+/// Rejects a request pinned to a model id this adapter doesn't serve. Every
+/// embedded adapter enforces the same contract: `req.model` is either unset
+/// (the request accepts whatever this adapter is configured for) or it must
+/// match `model_id` exactly.
+///
+/// Not gated to a single feature (unlike the adapter modules above) since
+/// every one of them calls it; gated on "any engine feature" so a
+/// no-features build doesn't carry a dead `pub(crate)` fn.
+#[cfg(any(
+    feature = "llama-cpp",
+    feature = "ort",
+    feature = "kokoro",
+    feature = "fastembed"
+))]
+pub(crate) fn reject_model_mismatch(
+    adapter_id: &str,
+    model_id: &str,
+    requested: Option<&str>,
+) -> Result<(), kernel::types::error::GatewayError> {
+    if let Some(requested) = requested
+        && requested != model_id
+    {
+        return Err(kernel::types::error::GatewayError::ModelUnavailable {
+            adapter: adapter_id.to_string(),
+            model: requested.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Runs `embed`, wrapping its dense vectors in an [`EmbedResponse`] — after
+/// rejecting a request pinned to a model this adapter doesn't serve. Shared
+/// by every embed-capable adapter's `EmbedModel::embed`: each supplies only
+/// its own inherent `embed(&[String])` as the closure, since the model-check
+/// and response-wrapping around it is otherwise identical (and was flagged
+/// as near-duplicate code between `fastembed.rs` and `ort.rs`).
+///
+/// [`EmbedResponse`]: kernel::types::io::EmbedResponse
+#[cfg(any(feature = "llama-cpp", feature = "ort", feature = "fastembed"))]
+pub(crate) fn embed_response(
+    adapter_id: &str,
+    model_id: &str,
+    requested: Option<&str>,
+    embed: impl FnOnce() -> Result<Vec<Vec<f32>>, kernel::types::error::GatewayError>,
+) -> Result<kernel::types::io::EmbedResponse, kernel::types::error::GatewayError> {
+    reject_model_mismatch(adapter_id, model_id, requested)?;
+    let embeddings = embed()?;
+    Ok(kernel::types::io::EmbedResponse {
+        embeddings,
+        usage: None,
+        degraded: false,
+    })
+}
+
+/// Generate the standard [`EmbedModel`](kernel::adapters::capability::EmbedModel) impl for an
+/// embed-only local adapter that delegates to [`embed_response`] over its inherent
+/// `embed(&[String])` method. `$adapter` must have a `config` field carrying `adapter_id` and
+/// `model_id` and an inherent `fn embed(&self, &[String]) -> Result<Vec<Vec<f32>>, GatewayError>`.
+/// Keeps each adapter's trait impl a single delegation instead of ~15 lines of identical
+/// boilerplate (ort, llama.cpp, …).
+#[cfg(any(feature = "llama-cpp", feature = "ort", feature = "fastembed"))]
+#[macro_export]
+macro_rules! impl_embed_via_inherent {
+    ($adapter:ty) => {
+        #[async_trait::async_trait]
+        impl kernel::adapters::capability::EmbedModel for $adapter {
+            async fn embed(
+                &self,
+                _cfg: &kernel::types::config::RouterConfig,
+                req: &kernel::types::io::EmbedRequest,
+            ) -> ::std::result::Result<
+                kernel::types::io::EmbedResponse,
+                kernel::types::error::GatewayError,
+            > {
+                // Reject a request pinned to a model this adapter doesn't serve, then call the
+                // inherent `embed(&[String])` (preserving the engine's session/tokenizer path)
+                // and wrap it. The capability trait is referenced by full path (not `use`d) so
+                // the closure's `self.embed(...)` binds to the inherent method, not this one.
+                $crate::adapters::embed_response(
+                    &self.config.adapter_id,
+                    &self.config.model_id,
+                    req.model.as_deref(),
+                    || self.embed(&req.texts),
+                )
+            }
+        }
+    };
+}

@@ -1,16 +1,23 @@
 pub mod adapters;
 pub mod budget;
+pub mod catalog;
 pub mod circuit_breaker;
 pub mod config;
 pub mod consensus;
 mod dispatch;
 pub mod engine;
 pub mod facade;
+pub mod gates;
 pub mod panel;
 pub mod pruning;
 pub mod purpose;
+pub mod resilience;
 pub mod selection;
+pub mod skip_reason;
 pub mod store;
+pub mod strategy;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub use kernel::types;
 // Model-registry vocabulary (`ModelEntry`/`ModelSource`/`ModelFormat`/`ModelResolver`/
 // `ResolveError`) surfaced so a consumer that only depends on `sensei-gateway` can
@@ -24,6 +31,7 @@ pub use facade::{Facade, FacadeBuilder};
 pub use panel::{PanelResponse, PanelSlotResult};
 pub use pruning::{Availability, ChainWarning, prune_unavailable};
 pub use purpose::{ModelHint, Purpose, PurposeBuilder, PurposeResult, StepBuilder, StepInput};
+pub use skip_reason::SkipReason;
 pub use types::capability::Capability;
 pub use types::config::{ConsensusConfig, DistinctBy, PanelConfig, PanelSlot, RoleSpec};
 pub use types::error::GatewayError;

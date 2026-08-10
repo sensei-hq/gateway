@@ -1,3 +1,14 @@
+---
+title: Hard/Atomic Quota & Calendar Windows
+doctype: design
+module: governance
+status: sketch
+feature:
+  - ../features/governance/subscription-quota.md
+  - ../features/routing/model-lockout.md
+source: crates/gateway/src/engine.rs
+---
+
 # Sketch: hard/atomic quota + calendar windows (AUTH follow-ups)
 
 - **Status:** Sketch — future work, not scheduled
@@ -85,3 +96,15 @@ Calendar windows are the **cheap, high-value** one (small, no store change, no
 trait break) — do first. Hard/atomic limits are the **bigger** lift (reservation
 lifecycle, TTL sweep, per-impl atomicity) — do only if a tier needs a strict
 (billing-grade) cap rather than a gross guard.
+
+## Relevance to SP-0 model lockout (to-be)
+
+Part B (**calendar-aligned windows** — `window_start(now, Window, Calendar, tz)`)
+is now directly relevant to SP-0 **model lockout**: a provider `quota_exhausted`
+locks a model out **until its next reset boundary** (today 00:00 / the 1st),
+which is exactly this `window_start` computation (see
+[routing/model-lockout](../features/routing/model-lockout.md)). Recommendation:
+implement `window_start` (+ optional `tz`) **once** and share it between
+subscription calendar-quota and lockout reset-boundary cooldowns, rather than
+duplicating the boundary math — which pulls Part B's value forward. Part A
+(atomic reservations) stays orthogonal to SP-0.

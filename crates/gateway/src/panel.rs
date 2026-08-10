@@ -221,6 +221,7 @@ mod tests {
             context_window: 4096,
             max_output_tokens: 1024,
             pricing: None,
+            catalog: None,
         }
     }
 

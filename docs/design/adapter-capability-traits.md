@@ -1,3 +1,13 @@
+---
+title: Adapter Capability Traits
+doctype: design
+module: inference
+status: implemented
+feature:
+  - ../features/inference/capabilities-and-adapters.md
+source: crates/kernel/src/adapters/capability.rs
+---
+
 # Design: Capability-Segregated Adapter Traits
 
 - **Status:** Draft (awaiting review)

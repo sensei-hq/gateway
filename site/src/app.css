@@ -4,11 +4,31 @@
 @import '@rokkit/themes/base.css';
 @import '@rokkit/themes/zen-sumi.css';
 
+/* Preflight reset — ported from the mockup's Tailwind/UnoCSS preflight, which
+   presetWind3 does NOT ship (see docs/mockups/uploads/MIGRATION.md §5). Without
+   `border-style`, every bare-HTML `border` utility collapses to nothing (cards
+   render borderless); without `border-box`, padded full-width boxes overflow.
+   Zero specificity, so utilities and Rokkit's own per-component borders win. */
+*,
+::before,
+::after {
+	box-sizing: border-box;
+	border-width: 0;
+	border-style: solid;
+	border-color: currentColor;
+}
+
 :root {
 	scroll-behavior: smooth;
 	--section-y: 7rem;
 	--content: 76rem;
 	/* Faint hairline for the grid backdrop (independent of the token system). */
+	--grid-line: oklch(0.45 0.01 80 / 0.09);
+}
+/* Declared explicitly (not only on :root) so the VersioningSection's nested
+   inverted panel (data-mode flipped to light on a dark page) picks up the light
+   hairline rather than inheriting the dark one. */
+[data-mode='light'] {
 	--grid-line: oklch(0.45 0.01 80 / 0.09);
 }
 [data-mode='dark'] {
@@ -160,7 +180,7 @@ pre {
 	font-variant-ligatures: none;
 }
 
-/* GitHub-style code-editor surface (mockup CodeWindow + usage tabs). Its own
+/* GitHub-style code-editor surface (mockup CodeFrame, chrome + tabs modes). Its own
    palette — distinct from the page paper — flipping with the mode. */
 .code-surface {
 	--code-bg: #f6f8fa;

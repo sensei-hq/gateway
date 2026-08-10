@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::async_job::{JobConfig, poll_until_complete};
-use crate::base::{build_client, resolve_api_key};
+use crate::base::build_client;
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ImageRequest, ImageResponse, VideoRequest, VideoResponse};
@@ -35,15 +35,11 @@ const BASE_URL: &str = "https://api.replicate.com/v1";
 const DEFAULT_MODEL: &str = "tencent/hunyuan-video";
 
 fn require_api_key(config: &RouterConfig) -> Result<String, GatewayError> {
-    resolve_api_key(config).ok_or_else(|| GatewayError::Authentication {
-        adapter: "replicate".into(),
-        message: "missing API key — set the env var specified in api_key_env".into(),
-    })
+    crate::base::require_api_key(config, "replicate")
 }
 
 fn base_url(config: &RouterConfig) -> &str {
-    let url = config.url.trim_end_matches('/');
-    if url.is_empty() { BASE_URL } else { url }
+    crate::base::base_url_or(config, BASE_URL)
 }
 
 /// Extract video URL from Replicate output, which can be a string or array of strings.

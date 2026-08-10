@@ -1,5 +1,5 @@
 //! Postgres backing for the vault, behind the `sqlx` feature: a [`VaultStore`] over
-//! strategos' `core.tenant_keys` + `public.router_credentials`, and a [`KekProvider`]
+//! strategos' `keyvault.tenant_keys` + `keyvault.router_credentials`, and a [`KekProvider`]
 //! that reads the KEK from **Supabase Vault** (closes gap #1 / torii#17 — the KEK never
 //! sits raw in the process env).
 //!
@@ -14,13 +14,13 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::kek::{KekError, KekProvider};
-use crate::store::{DekBlob, StoreError, StoredCredential, VaultStore};
+use crate::store::{DekBlob, SealedOAuth, StoreError, StoredCredential, VaultStore};
 
 fn store_err(e: sqlx::Error) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
-/// `VaultStore` over strategos' `core.tenant_keys` (DEK) + `public.router_credentials`
+/// `VaultStore` over strategos' `keyvault.tenant_keys` (DEK) + `keyvault.router_credentials`
 /// (`credential_type = 'api_key'`). Stores opaque sealed bytes only — the [`Vault`] does
 /// all crypto.
 ///
@@ -33,12 +33,40 @@ impl PostgresVaultStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Deactivate the active credential of `credential_type` for `(tenant, router)` — the shared
+    /// body of `deactivate_credential` (`'api_key'`) and `deactivate_oauth` (`'oauth'`).
+    async fn deactivate(
+        &self,
+        credential_type: &str,
+        tenant: Uuid,
+        router: Uuid,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            // credential_type::text keeps this comparison schema-agnostic: it works whether the
+            // column is varchar OR a Postgres enum (torii converted it to keyvault.credential_type).
+            // A bound &str param has no `enum = text` operator, so the cast decouples this crate
+            // from torii's physical column type — the crate never needs to know it's an enum.
+            "update keyvault.router_credentials set is_active = false, modified_by = $3 \
+             where tenant_id = $1 and router_id = $2 \
+               and credential_type::text = $4 and is_active = true",
+        )
+        .bind(tenant)
+        .bind(router)
+        .bind(actor)
+        .bind(credential_type)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl VaultStore for PostgresVaultStore {
     async fn get_encrypted_dek(&self, tenant: Uuid) -> Result<Option<Vec<u8>>, StoreError> {
-        sqlx::query_scalar("select encrypted_dek from core.tenant_keys where tenant_id = $1")
+        sqlx::query_scalar("select encrypted_dek from keyvault.tenant_keys where tenant_id = $1")
             .bind(tenant)
             .fetch_optional(&self.pool)
             .await
@@ -53,7 +81,7 @@ impl VaultStore for PostgresVaultStore {
     ) -> Result<bool, StoreError> {
         // Never overwrite an existing DEK (would orphan every credential sealed under it).
         let r = sqlx::query(
-            "insert into core.tenant_keys (tenant_id, encrypted_dek, dek_version, modified_by) \
+            "insert into keyvault.tenant_keys (tenant_id, encrypted_dek, dek_version, modified_by) \
              values ($1, $2, 1, $3) on conflict (tenant_id) do nothing",
         )
         .bind(tenant)
@@ -74,7 +102,7 @@ impl VaultStore for PostgresVaultStore {
         actor: &str,
     ) -> Result<Uuid, StoreError> {
         sqlx::query_scalar(
-            "insert into public.router_credentials \
+            "insert into keyvault.router_credentials \
                (tenant_id, id, router_id, encrypted_api_key, key_label, is_active, \
                 credential_type, modified_by) \
              values ($1, gen_random_uuid(), $2, $3, $4, true, 'api_key', $5) \
@@ -103,18 +131,7 @@ impl VaultStore for PostgresVaultStore {
         router: Uuid,
         actor: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "update public.router_credentials set is_active = false, modified_by = $3 \
-             where tenant_id = $1 and router_id = $2 \
-               and credential_type = 'api_key' and is_active = true",
-        )
-        .bind(tenant)
-        .bind(router)
-        .bind(actor)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(())
+        self.deactivate("api_key", tenant, router, actor).await
     }
 
     async fn get_active_credential(
@@ -123,7 +140,7 @@ impl VaultStore for PostgresVaultStore {
         router: Uuid,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         sqlx::query_scalar(
-            "select encrypted_api_key from public.router_credentials \
+            "select encrypted_api_key from keyvault.router_credentials \
              where tenant_id = $1 and router_id = $2 \
                and is_active = true and credential_type = 'api_key'",
         )
@@ -140,8 +157,8 @@ impl VaultStore for PostgresVaultStore {
     ) -> Result<Vec<StoredCredential>, StoreError> {
         let rows: Vec<(Uuid, String, Vec<u8>)> = sqlx::query_as(
             "select k.router_id, r.name, k.encrypted_api_key \
-             from public.router_credentials k \
-             join config.routers r on r.id = k.router_id \
+             from keyvault.router_credentials k \
+             join catalog.routers r on r.id = k.router_id \
              where k.tenant_id = $1 and k.is_active = true and k.credential_type = 'api_key'",
         )
         .bind(tenant)
@@ -169,7 +186,7 @@ impl VaultStore for PostgresVaultStore {
         // credential. `for update` serializes concurrent rotations of the same tenant.
         let mut tx = self.pool.begin().await.map_err(store_err)?;
         let (old_version, old_sealed): (i32, Vec<u8>) = sqlx::query_as(
-            "select dek_version, encrypted_dek from core.tenant_keys where tenant_id = $1 for update",
+            "select dek_version, encrypted_dek from keyvault.tenant_keys where tenant_id = $1 for update",
         )
         .bind(tenant)
         .fetch_one(&mut *tx)
@@ -178,7 +195,7 @@ impl VaultStore for PostgresVaultStore {
         let new_version = old_version + 1;
 
         sqlx::query(
-            "insert into core.tenant_key_archive \
+            "insert into keyvault.tenant_key_archive \
                (tenant_id, dek_version, encrypted_dek, modified_by) \
              values ($1, $2, $3, $4) on conflict (tenant_id, dek_version) do nothing",
         )
@@ -191,7 +208,7 @@ impl VaultStore for PostgresVaultStore {
         .map_err(store_err)?;
 
         sqlx::query(
-            "update core.tenant_keys set encrypted_dek = $2, dek_version = $3, \
+            "update keyvault.tenant_keys set encrypted_dek = $2, dek_version = $3, \
                modified_at = now(), modified_by = $4 where tenant_id = $1",
         )
         .bind(tenant)
@@ -204,7 +221,7 @@ impl VaultStore for PostgresVaultStore {
 
         for (router, sealed) in resealed {
             sqlx::query(
-                "update public.router_credentials set encrypted_api_key = $3, \
+                "update keyvault.router_credentials set encrypted_api_key = $3, \
                    modified_at = now(), modified_by = $4 \
                  where tenant_id = $1 and router_id = $2 \
                    and is_active = true and credential_type = 'api_key'",
@@ -230,7 +247,7 @@ impl VaultStore for PostgresVaultStore {
         actor: &str,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "update public.router_credentials set encrypted_api_key = $3, \
+            "update keyvault.router_credentials set encrypted_api_key = $3, \
                modified_at = now(), modified_by = $4 \
              where tenant_id = $1 and router_id = $2 \
                and is_active = true and credential_type = 'api_key'",
@@ -246,13 +263,14 @@ impl VaultStore for PostgresVaultStore {
     }
 
     async fn list_all_dek_blobs(&self) -> Result<Vec<DekBlob>, StoreError> {
-        let current: Vec<(Uuid, i32, Vec<u8>)> =
-            sqlx::query_as("select tenant_id, dek_version, encrypted_dek from core.tenant_keys")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(store_err)?;
+        let current: Vec<(Uuid, i32, Vec<u8>)> = sqlx::query_as(
+            "select tenant_id, dek_version, encrypted_dek from keyvault.tenant_keys",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
         let archived: Vec<(Uuid, i32, Vec<u8>)> = sqlx::query_as(
-            "select tenant_id, dek_version, encrypted_dek from core.tenant_key_archive",
+            "select tenant_id, dek_version, encrypted_dek from keyvault.tenant_key_archive",
         )
         .fetch_all(&self.pool)
         .await
@@ -279,7 +297,7 @@ impl VaultStore for PostgresVaultStore {
         for (blob, sealed) in rewraps {
             if blob.archived {
                 sqlx::query(
-                    "update core.tenant_key_archive set encrypted_dek = $3 \
+                    "update keyvault.tenant_key_archive set encrypted_dek = $3 \
                      where tenant_id = $1 and dek_version = $2",
                 )
                 .bind(blob.tenant_id)
@@ -289,12 +307,14 @@ impl VaultStore for PostgresVaultStore {
                 .await
                 .map_err(store_err)?;
             } else {
-                sqlx::query("update core.tenant_keys set encrypted_dek = $2 where tenant_id = $1")
-                    .bind(blob.tenant_id)
-                    .bind(sealed)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(store_err)?;
+                sqlx::query(
+                    "update keyvault.tenant_keys set encrypted_dek = $2 where tenant_id = $1",
+                )
+                .bind(blob.tenant_id)
+                .bind(sealed)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
             }
         }
         tx.commit().await.map_err(store_err)?;
@@ -305,17 +325,14 @@ impl VaultStore for PostgresVaultStore {
         &self,
         tenant: Uuid,
         router: Uuid,
-        sealed: &[u8],
-        expires_at_ms: Option<i64>,
-        scopes: Option<&str>,
-        client_id: Option<&str>,
+        record: SealedOAuth<'_>,
         actor: &str,
     ) -> Result<Uuid, StoreError> {
         // `oauth_expires_at` is timestamptz; convert epoch-ms → timestamptz in SQL so the crate
         // needs no chrono/time dep. One active oauth row per (tenant, router) (partial unique
         // on credential_type); an api_key row for the same pair coexists.
         sqlx::query_scalar(
-            "insert into public.router_credentials \
+            "insert into keyvault.router_credentials \
                (tenant_id, id, router_id, encrypted_oauth, oauth_expires_at, oauth_scopes, \
                 oauth_client_id, is_active, credential_type, modified_by) \
              values ($1, gen_random_uuid(), $2, $3, \
@@ -333,10 +350,10 @@ impl VaultStore for PostgresVaultStore {
         )
         .bind(tenant)
         .bind(router)
-        .bind(sealed)
-        .bind(expires_at_ms)
-        .bind(scopes)
-        .bind(client_id)
+        .bind(record.sealed)
+        .bind(record.expires_at_ms)
+        .bind(record.scopes)
+        .bind(record.client_id)
         .bind(actor)
         .fetch_one(&self.pool)
         .await
@@ -349,7 +366,7 @@ impl VaultStore for PostgresVaultStore {
         router: Uuid,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
-            "select encrypted_oauth from public.router_credentials \
+            "select encrypted_oauth from keyvault.router_credentials \
              where tenant_id = $1 and router_id = $2 \
                and is_active = true and credential_type = 'oauth' and encrypted_oauth is not null",
         )
@@ -367,25 +384,14 @@ impl VaultStore for PostgresVaultStore {
         router: Uuid,
         actor: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "update public.router_credentials set is_active = false, modified_by = $3 \
-             where tenant_id = $1 and router_id = $2 \
-               and credential_type = 'oauth' and is_active = true",
-        )
-        .bind(tenant)
-        .bind(router)
-        .bind(actor)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(())
+        self.deactivate("oauth", tenant, router, actor).await
     }
 
     async fn list_active_oauth(&self, tenant: Uuid) -> Result<Vec<StoredCredential>, StoreError> {
         let rows: Vec<(Uuid, String, Option<Vec<u8>>)> = sqlx::query_as(
             "select k.router_id, r.name, k.encrypted_oauth \
-             from public.router_credentials k \
-             join config.routers r on r.id = k.router_id \
+             from keyvault.router_credentials k \
+             join catalog.routers r on r.id = k.router_id \
              where k.tenant_id = $1 and k.is_active = true and k.credential_type = 'oauth' \
                and k.encrypted_oauth is not null",
         )
@@ -450,7 +456,7 @@ mod tests {
     //!   cargo test -p sensei-vault --features sqlx -- --ignored
     use super::*;
     use crate::kek::StaticKekProvider;
-    use crate::vault::Vault;
+    use crate::vault::{OAuthCredential, Vault};
     use sqlx::postgres::PgPoolOptions;
 
     async fn pool() -> PgPool {
@@ -473,7 +479,7 @@ mod tests {
         );
         let tenant = Uuid::new_v4();
         let router: Uuid =
-            sqlx::query_scalar("select id from config.routers where name = 'openai'")
+            sqlx::query_scalar("select id from catalog.routers where name = 'openai'")
                 .fetch_one(&pool)
                 .await
                 .expect("openai router seeded");
@@ -502,7 +508,7 @@ mod tests {
             "sk-crate-AAA"
         );
         let sealed: Vec<u8> = sqlx::query_scalar(
-            "select encrypted_api_key from public.router_credentials \
+            "select encrypted_api_key from keyvault.router_credentials \
              where tenant_id = $1 and router_id = $2 and is_active",
         )
         .bind(tenant)
@@ -543,8 +549,8 @@ mod tests {
 
         // cleanup (FK-safe order).
         for stmt in [
-            "delete from public.router_credentials where tenant_id = $1",
-            "delete from core.tenant_keys where tenant_id = $1",
+            "delete from keyvault.router_credentials where tenant_id = $1",
+            "delete from keyvault.tenant_keys where tenant_id = $1",
             "delete from core.tenants where id = $1",
         ] {
             sqlx::query(stmt).bind(tenant).execute(&pool).await.unwrap();
@@ -596,12 +602,12 @@ mod tests {
         );
         let tenant = Uuid::new_v4();
         let openai: Uuid =
-            sqlx::query_scalar("select id from config.routers where name = 'openai'")
+            sqlx::query_scalar("select id from catalog.routers where name = 'openai'")
                 .fetch_one(&pool)
                 .await
                 .expect("openai router seeded");
         let anthropic: Uuid =
-            sqlx::query_scalar("select id from config.routers where name = 'anthropic'")
+            sqlx::query_scalar("select id from catalog.routers where name = 'anthropic'")
                 .fetch_one(&pool)
                 .await
                 .expect("anthropic router seeded");
@@ -623,16 +629,17 @@ mod tests {
 
         // Seed a *legacy* (empty-AAD) credential the way the pre-crate inline vault would have:
         // unseal the tenant DEK, seal with an empty AAD, insert an active row directly.
-        let sealed_dek: Vec<u8> =
-            sqlx::query_scalar("select encrypted_dek from core.tenant_keys where tenant_id = $1")
-                .bind(tenant)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let sealed_dek: Vec<u8> = sqlx::query_scalar(
+            "select encrypted_dek from keyvault.tenant_keys where tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let dek = crate::crypto::unseal_dek(&kek, &sealed_dek).unwrap();
         let legacy = crate::crypto::seal_credential(&dek, b"", b"sk-legacy").unwrap();
         sqlx::query(
-            "insert into public.router_credentials \
+            "insert into keyvault.router_credentials \
                (tenant_id, router_id, encrypted_api_key, is_active, credential_type, modified_by) \
              values ($1, $2, $3, true, 'api_key', 'seed')",
         )
@@ -661,12 +668,13 @@ mod tests {
 
         // DEK rotation: version bumps, old DEK archived, both credentials still resolve.
         assert_eq!(vault.rotate_dek(tenant, "rotator").await.unwrap(), 2);
-        let archived: i64 =
-            sqlx::query_scalar("select count(*) from core.tenant_key_archive where tenant_id = $1")
-                .bind(tenant)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let archived: i64 = sqlx::query_scalar(
+            "select count(*) from keyvault.tenant_key_archive where tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(archived, 1, "prior DEK archived");
         let keys = vault.resolve_tenant_keys(tenant).await.unwrap();
         assert_eq!(keys.get("openai").map(String::as_str), Some("sk-openai"));
@@ -714,9 +722,9 @@ mod tests {
 
         // cleanup (FK-safe order).
         for stmt in [
-            "delete from public.router_credentials where tenant_id = $1",
-            "delete from core.tenant_key_archive where tenant_id = $1",
-            "delete from core.tenant_keys where tenant_id = $1",
+            "delete from keyvault.router_credentials where tenant_id = $1",
+            "delete from keyvault.tenant_key_archive where tenant_id = $1",
+            "delete from keyvault.tenant_keys where tenant_id = $1",
             "delete from core.tenants where id = $1",
         ] {
             sqlx::query(stmt).bind(tenant).execute(&pool).await.unwrap();
@@ -733,7 +741,7 @@ mod tests {
         );
         let tenant = Uuid::new_v4();
         let router: Uuid =
-            sqlx::query_scalar("select id from config.routers where name = 'anthropic'")
+            sqlx::query_scalar("select id from catalog.routers where name = 'anthropic'")
                 .fetch_one(&pool)
                 .await
                 .expect("anthropic router seeded");
@@ -752,11 +760,13 @@ mod tests {
             .store_oauth(
                 tenant,
                 router,
-                "oauth-tok-AAA",
-                None,
-                None,
-                None,
-                None,
+                &OAuthCredential {
+                    access_token: "oauth-tok-AAA",
+                    refresh_token: None,
+                    expires_at_ms: None,
+                    scopes: None,
+                    client_id: None,
+                },
                 "tester",
             )
             .await
@@ -772,7 +782,7 @@ mod tests {
             "oauth-tok-AAA"
         );
         let sealed: Vec<u8> = sqlx::query_scalar(
-            "select encrypted_oauth from public.router_credentials \
+            "select encrypted_oauth from keyvault.router_credentials \
              where tenant_id = $1 and router_id = $2 and credential_type = 'oauth' and is_active",
         )
         .bind(tenant)
@@ -823,8 +833,8 @@ mod tests {
         );
 
         for stmt in [
-            "delete from public.router_credentials where tenant_id = $1",
-            "delete from core.tenant_keys where tenant_id = $1",
+            "delete from keyvault.router_credentials where tenant_id = $1",
+            "delete from keyvault.tenant_keys where tenant_id = $1",
             "delete from core.tenants where id = $1",
         ] {
             sqlx::query(stmt).bind(tenant).execute(&pool).await.unwrap();
@@ -854,7 +864,7 @@ mod tests {
             PostgresVaultStore::new(pool.clone()),
         );
 
-        let tenants: Vec<Uuid> = sqlx::query_scalar("select tenant_id from core.tenant_keys")
+        let tenants: Vec<Uuid> = sqlx::query_scalar("select tenant_id from keyvault.tenant_keys")
             .fetch_all(&pool)
             .await
             .unwrap();
