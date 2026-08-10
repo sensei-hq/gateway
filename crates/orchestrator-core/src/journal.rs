@@ -54,6 +54,29 @@ pub enum JournalEvent {
     },
 }
 
+/// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
+/// snapshot store (out-of-band — NOT an event in the log, so the control-flow
+/// event order stays byte-identical) after each scheduling round; the latest
+/// wins. A resume seeds from the latest snapshot and folds only the journal
+/// **tail** (events with `Seq >` [`seq`](Snapshot::seq)), bounding fold cost for
+/// wide/long runs.
+///
+/// Carries the completed/skipped node sets and each completed node's output (as
+/// a ref-or-inline [`EffectOutput`], so large outputs stay lean). The per-effect
+/// memo for a partially-completed tail node is rebuilt by folding the tail, so
+/// it is not stored here; the blackboard's `context_refs` are deferred until the
+/// executor writes to the `ContextStore`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// The journal `Seq` this snapshot covers up to; a resume folds events with
+    /// `Seq >` this.
+    pub seq: Seq,
+    pub completed: Vec<NodeId>,
+    pub skipped: Vec<NodeId>,
+    /// Each completed node's output, keyed by node id (ref-or-inline).
+    pub outputs: Vec<(NodeId, EffectOutput)>,
+}
+
 /// The durable-journal seam. Slice 1 ships an in-memory implementation; a
 /// `PostgresJournal` implements this same trait in a later slice.
 ///
@@ -62,6 +85,36 @@ pub enum JournalEvent {
 pub trait ExecutionJournal: Send + Sync {
     async fn append(&self, run: RunId, event: JournalEvent) -> Result<Seq, JournalError>;
     async fn load(&self, run: RunId) -> Result<Vec<(Seq, JournalEvent)>, JournalError>;
+
+    /// Load only the journal **tail** — events with `Seq > since`. The default
+    /// filters [`load`](Self::load); a persistent backend overrides this with an
+    /// indexed range query. Powers snapshot-resume (fold the tail, not the whole
+    /// log).
+    async fn load_since(
+        &self,
+        run: RunId,
+        since: Seq,
+    ) -> Result<Vec<(Seq, JournalEvent)>, JournalError> {
+        Ok(self
+            .load(run)
+            .await?
+            .into_iter()
+            .filter(|(seq, _)| *seq > since)
+            .collect())
+    }
+
+    /// Persist the latest round-boundary [`Snapshot`] for `run` (latest wins).
+    /// The default is a no-op — a backend without snapshot support simply folds
+    /// from the start (the slice-1/2 path); [`InMemoryJournal`] overrides it.
+    async fn snapshot(&self, _run: RunId, _snap: Snapshot) -> Result<(), JournalError> {
+        Ok(())
+    }
+
+    /// The latest [`Snapshot`] for `run`, or `None` if none was written. The
+    /// default returns `None` (fold-from-start).
+    async fn latest_snapshot(&self, _run: RunId) -> Result<Option<Snapshot>, JournalError> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
