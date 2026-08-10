@@ -40,6 +40,11 @@ pub struct ToolSpec {
     pub description: Option<String>,
     pub input_schema: serde_json::Value,
     pub effect_class: EffectClass,
+    /// TTL (seconds) for an `Observation` tool's memoized read; `None` = never
+    /// memoize (always re-read on resume). Ignored for Pure/Mutation.
+    pub ttl_secs: Option<u64>,
+    /// Provenance `source` label recorded with an Observation. Defaults to the tool name.
+    pub source: Option<String>,
 }
 
 /// In-memory registry of agents/skills/tool-specs, built by a demo/preset
@@ -303,6 +308,8 @@ mod tests {
             description: None,
             input_schema: serde_json::json!({}),
             effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
         }
     }
 

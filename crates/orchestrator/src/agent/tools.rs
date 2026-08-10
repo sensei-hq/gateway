@@ -61,6 +61,8 @@ impl Tool for Calc {
                 "required": ["op","a","b"]
             }),
             effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
         }
     }
 
@@ -125,6 +127,8 @@ mod tests {
                 description: None,
                 input_schema: serde_json::json!({}),
                 effect_class: EffectClass::Observation,
+                ttl_secs: None,
+                source: None,
             }
         }
         fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {

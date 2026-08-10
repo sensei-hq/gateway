@@ -113,6 +113,8 @@ async fn agent_rejects_a_non_pure_tool_loudly() {
                 description: None,
                 input_schema: serde_json::json!({}),
                 effect_class: orchestrator_core::EffectClass::Observation,
+                ttl_secs: None,
+                source: None,
             }
         }
         fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {

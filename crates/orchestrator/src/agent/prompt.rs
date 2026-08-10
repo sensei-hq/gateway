@@ -102,6 +102,8 @@ mod tests {
                 description: Some("adds".into()),
                 input_schema: serde_json::json!({"type":"object"}),
                 effect_class: EffectClass::Pure,
+                ttl_secs: None,
+                source: None,
             });
         (reg, agent)
     }
