@@ -1,16 +1,54 @@
 use super::*;
 use crate::test_support::{
-    content_gated_gateway, demo_reference_gateway, failing_after_gateway, final_response,
-    recording_gateway, scripted_gateway, tool_call_response,
+    content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
+    failing_after_gateway, final_response, recording_gateway, scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, Graph, JournalError, MapBody, Node, NodeId, NodeKind,
 };
 use orchestrator_store::InMemoryJournal;
 
-use crate::agent::tools::{Calc, Tool, ToolRegistry};
-use orchestrator_core::{AgentDefinition, AgentRef, Registry};
+use crate::agent::tools::{
+    AlwaysIndeterminate, Calc, NoteReconciler, ReconcileRegistry, RecordNote, Search, Tool,
+    ToolRegistry,
+};
+use orchestrator_core::{
+    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, Registry,
+};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A test `Clock` backed by a shared, mutable instant so a resume can be driven
+/// at a chosen point relative to an Observation's `fetched_at` (§7.1). Cloning
+/// shares the same instant; `advance` moves time forward for every clone's reads.
+#[derive(Clone)]
+struct AdvanceableClock(Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>);
+impl AdvanceableClock {
+    fn at(unix_secs: i64) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(
+            chrono::DateTime::from_timestamp(unix_secs, 0).expect("valid timestamp"),
+        )))
+    }
+    /// Move the shared clock forward by `secs` — the next `now()` (on any clone)
+    /// reflects it. Used to cross an Observation's TTL between a run and its resume.
+    fn advance(&self, secs: i64) {
+        *self.0.lock().unwrap() += chrono::Duration::seconds(secs);
+    }
+}
+impl Clock for AdvanceableClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// Count the `EffectRecorded` events for one effect id — distinguishes a memo
+/// replay (unchanged) from a live re-read/re-record (incremented).
+fn effect_recorded_count(events: &[(Seq, JournalEvent)], eid: &EffectId) -> usize {
+    events
+        .iter()
+        .filter(|(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id: r, .. } if r == eid))
+        .count()
+}
 
 fn agent_def(chain: &str) -> AgentDefinition {
     AgentDefinition {
@@ -99,47 +137,6 @@ async fn agent_react_loop_executes_a_pure_tool_and_feeds_the_result_back() {
             "RunCompleted",
         ]
     );
-}
-
-#[tokio::test]
-async fn agent_rejects_a_non_pure_tool_loudly() {
-    let (gateway, _calls) = scripted_gateway(vec![tool_call_response("t1", "read", "{}")]).await;
-    let journal = InMemoryJournal::new();
-    struct Reader;
-    impl crate::agent::tools::Tool for Reader {
-        fn spec(&self) -> orchestrator_core::ToolSpec {
-            orchestrator_core::ToolSpec {
-                name: "read".into(),
-                description: None,
-                input_schema: serde_json::json!({}),
-                effect_class: orchestrator_core::EffectClass::Observation,
-            }
-        }
-        fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
-            Ok(serde_json::json!({}))
-        }
-    }
-    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
-        .with_registry(Arc::new(
-            Registry::default()
-                .with_agent(AgentDefinition {
-                    tools: vec!["read".into()],
-                    ..agent_def("c")
-                })
-                .with_tool(Reader.spec()),
-        ))
-        .with_tools(Arc::new(
-            ToolRegistry::default().with_tool(Arc::new(Reader)),
-        ));
-    let graph = Graph {
-        nodes: vec![agent_node("n1", "a", "read")],
-    };
-    let outcome = exec
-        .run(RunId(uuid::Uuid::new_v4()), &graph)
-        .await
-        .expect("outcome");
-    let (_, msg) = outcome.failed.expect("non-Pure tool fails the node");
-    assert!(msg.contains("slice 4"), "deferral message: {msg}");
 }
 
 #[tokio::test]
@@ -398,6 +395,501 @@ async fn agent_resume_does_not_respend_completed_turns() {
     );
 }
 
+const OBS_T0: i64 = 1_000_000_000;
+
+/// Seed a partial agent run that reads the `search` Observation (`ttl=60`,
+/// `fetched_at` = the clock's instant) then dies at turn 1 (script exhausted) —
+/// no `RunCompleted`. The counter reflects the one live read (`== 1`).
+async fn seed_observation(
+    counter: Arc<AtomicUsize>,
+    clock: AdvanceableClock,
+) -> (InMemoryJournal, RunId) {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "search it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "search",
+        "{\"query\":\"rust\"}",
+    )])
+    .await;
+    let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter))),
+        ))
+        .with_clock(Arc::new(clock))
+        .run(run, &graph)
+        .await
+        .expect("seed run yields an outcome");
+    assert!(o.failed.is_some(), "seed dies at turn 1 (script exhausted)");
+    (journal, run)
+}
+
+/// Resume the seeded Observation run at the clock's current instant; return the
+/// journal events after it completes.
+async fn resume_observation(
+    journal: InMemoryJournal,
+    run: RunId,
+    counter: Arc<AtomicUsize>,
+    clock: AdvanceableClock,
+) -> Vec<(Seq, JournalEvent)> {
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "search it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+    Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter))),
+        ))
+        .with_clock(Arc::new(clock))
+        .start(run, &graph)
+        .await
+        .expect("resume completes");
+    journal.load(run).await.unwrap()
+}
+
+/// Acceptance §8.1 — within TTL, a resume REPLAYS the memoized Observation: the
+/// live `search` is not re-executed and no second `EffectRecorded` is appended.
+#[tokio::test]
+async fn observation_within_ttl_replays_without_reexecuting() {
+    let search_eid = effect_id("n1", 0, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let clock = AdvanceableClock::at(OBS_T0);
+    let (j, run) = seed_observation(counter.clone(), clock.clone()).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "seed read search once");
+
+    clock.advance(30); // < ttl (60)
+    let events = resume_observation(j, run, counter.clone(), clock).await;
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "within TTL the Observation replays from the memo — search NOT re-executed"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &search_eid),
+        1,
+        "a fresh Observation is not re-recorded on resume"
+    );
+}
+
+/// Acceptance §8.2 — past TTL, a resume RE-READS the Observation: the live
+/// `search` runs once more, and a second `EffectRecorded` (fresh provenance)
+/// supersedes the stale one.
+#[tokio::test]
+async fn observation_past_ttl_rereads_and_supersedes() {
+    let search_eid = effect_id("n1", 0, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let clock = AdvanceableClock::at(OBS_T0);
+    let (j, run) = seed_observation(counter.clone(), clock.clone()).await;
+
+    clock.advance(90); // > ttl (60)
+    let events = resume_observation(j, run, counter.clone(), clock).await;
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "past TTL the Observation is re-read — search executed once more"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &search_eid),
+        2,
+        "a stale re-read appends a second, superseding EffectRecorded"
+    );
+    // Every record for the effect carries fresh Observation provenance (§7.1).
+    let sources: Vec<String> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded {
+                effect_id: r,
+                observation: Some(m),
+                ..
+            } if r == &search_eid => Some(m.source.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        vec!["search".to_string(), "search".to_string()],
+        "both the original read and the re-read journal Observation provenance"
+    );
+}
+
+/// Acceptance §8.3 (happy path, live): a live Mutation is two-phase — it journals
+/// an `EffectIntent` (before the side effect) then an `EffectRecorded` (after), in
+/// that order, and applies the side effect exactly once.
+#[tokio::test]
+async fn mutation_two_phase_journals_intent_then_recorded() {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "record_note", "{\"note\":\"hello\"}"),
+        final_response("done"),
+    ])
+    .await;
+    let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink.clone()))),
+        ));
+    let o = exec.run(run, &graph).await.expect("run completes");
+    assert!(o.failed.is_none(), "{:?}", o.failed);
+
+    // The side effect ran exactly once.
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "the note sink saw the mutation exactly once"
+    );
+
+    // The tool effect's Intent immediately precedes its Recorded.
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert_eq!(
+        labels.iter().filter(|l| *l == "EffectIntent(n1)").count(),
+        1,
+        "exactly one EffectIntent for the single Mutation: {labels:?}"
+    );
+    let intent_idx = labels
+        .iter()
+        .position(|l| l == "EffectIntent(n1)")
+        .expect("an EffectIntent was journaled before the side effect");
+    assert_eq!(
+        labels[intent_idx + 1],
+        "EffectRecorded(n1)",
+        "the Mutation's EffectRecorded immediately follows its Intent: {labels:?}"
+    );
+}
+
+/// Acceptance §8.3 (happy path, resume): a completed Mutation (Intent+Recorded
+/// journaled) is MEMOIZED on resume — replayed from the journal, never re-applied.
+/// The shared sink proves the side effect lands exactly once across both runs.
+#[tokio::test]
+async fn mutation_resume_memoizes_completed_effect_without_reapplying() {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+
+    // Seed: turn 0 records the Mutation (Intent+Recorded); turn 1 script-exhausted
+    // → fails → no RunCompleted. The one live application lands in the sink.
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "record_note",
+        "{\"note\":\"hello\"}",
+    )])
+    .await;
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink.clone()))),
+        ))
+        .run(run, &graph)
+        .await
+        .expect("seed yields an outcome");
+    assert!(o1.failed.is_some(), "seed dies at turn 1");
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "seed applied the mutation once"
+    );
+
+    // Resume on the SAME sink: the Mutation memo-hits (Recorded present) → replayed,
+    // NOT re-applied → the sink is unchanged and the run completes.
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink.clone()))),
+        ))
+        .start(run, &graph)
+        .await
+        .expect("resume completes");
+    assert!(
+        o2.failed.is_none() && o2.paused.is_none(),
+        "{:?}",
+        o2.failed
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "resume memoized the completed Mutation — side effect applied exactly once total"
+    );
+}
+
+/// Build a journal in the **in-doubt** state (§7.3): a real run through the
+/// two-phase Mutation, truncated to the prefix up to and including the note's
+/// `EffectIntent` — so the resume sees an Intent with no matching `EffectRecorded`.
+async fn seed_in_doubt_note() -> (InMemoryJournal, RunId) {
+    let full = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "record_note", "{\"note\":\"hello\"}"),
+        final_response("done"),
+    ])
+    .await;
+    Executor::new(Arc::new(gw), Arc::new(full.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+            RecordNote::new(Arc::new(std::sync::Mutex::new(Vec::new()))),
+        ))))
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("seed run journaled an EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+    (seeded, run)
+}
+
+/// Resume an in-doubt run with a caller-owned note `sink` (its contents model
+/// whether the side effect applied before the crash) + reconcilers; return the
+/// outcome and journal events.
+async fn resume_in_doubt(
+    journal: InMemoryJournal,
+    run: RunId,
+    sink: Arc<std::sync::Mutex<Vec<String>>>,
+    reconcilers: ReconcileRegistry,
+) -> (RunOutcome, Vec<(Seq, JournalEvent)>) {
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink))),
+        ))
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+    let events = journal.load(run).await.unwrap();
+    (out, events)
+}
+
+/// Acceptance §8.4 — in-doubt Mutation, reconcile `Confirmed`: the world already
+/// holds the note (the side effect applied before the crash), so the real
+/// `NoteReconciler` confirms it — the executor records without re-running, and the
+/// sink keeps exactly one copy. The run completes.
+#[tokio::test]
+async fn in_doubt_confirmed_records_without_rerunning_the_side_effect() {
+    let note_eid = effect_id("n1", 0, 1);
+    let (journal, run) = seed_in_doubt_note().await;
+    let sink = Arc::new(std::sync::Mutex::new(vec!["hello".to_string()]));
+    let reconcilers = ReconcileRegistry::default()
+        .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone())));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "Confirmed completes"
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "Confirmed: the side effect is NOT repeated — the sink still holds exactly one note"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &note_eid),
+        1,
+        "Confirmed appends the Mutation's EffectRecorded once"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
+
+/// Acceptance §8.5 — in-doubt Mutation, reconcile `NotApplied`: the world does NOT
+/// hold the note (the crash was before the side effect), so the real
+/// `NoteReconciler` says NotApplied and the effect runs now — exactly once, under
+/// the standing Intent (no second Intent). The run completes.
+#[tokio::test]
+async fn in_doubt_not_applied_runs_the_effect_once_under_the_standing_intent() {
+    let (journal, run) = seed_in_doubt_note().await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers = ReconcileRegistry::default()
+        .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone())));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "NotApplied completes"
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "NotApplied: the side effect runs exactly once on resume"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+            .count(),
+        1,
+        "NotApplied re-uses the standing Intent — no second EffectIntent"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted))
+    );
+}
+
+/// Acceptance §8.6 — in-doubt Mutation, `Indeterminate` (an `AlwaysIndeterminate`
+/// provider that cannot decide): the executor pauses loud — journals `RunPaused`,
+/// sets `outcome.paused`, applies NOTHING, and does not complete.
+#[tokio::test]
+async fn in_doubt_indeterminate_pauses_without_applying() {
+    let (journal, run) = seed_in_doubt_note().await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
+
+    let pause = out.paused.expect("Indeterminate pauses the run");
+    assert_eq!(pause.node, NodeId("n1".into()));
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a paused run does not complete"
+    );
+}
+
+/// Acceptance §8.7 (no silent failure) — if a tool effect's recorded input hash
+/// no longer matches the (replayed) tool call on resume, the executor halts loud
+/// with a `DeterminismViolation` on that effect — it never silently re-runs or
+/// re-memoizes, never re-executes the tool, and never touches the gateway.
+#[tokio::test]
+async fn changed_tool_input_on_resume_halts_with_determinism_violation() {
+    let tool_eid = effect_id("n1", 0, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "search it")],
+    };
+
+    // Seed a consistent partial run: turn 0 records the model + the search
+    // Observation (n1,0,1); turn 1 script-exhausted → fails → no RunCompleted.
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "search",
+        "{\"query\":\"rust\"}",
+    )])
+    .await;
+    Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter.clone()))),
+        ))
+        .with_clock(Arc::new(AdvanceableClock::at(OBS_T0)))
+        .run(run, &graph)
+        .await
+        .expect("seed yields an outcome");
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "seed read search once");
+
+    // Tamper: copy the journal into a fresh one, rewriting ONLY the search effect's
+    // recorded input_hash. The model turn is left untouched, so it replays cleanly
+    // and the TOOL fence is what trips.
+    let tampered = InMemoryJournal::new();
+    for (_, e) in journal.load(run).await.unwrap() {
+        let e = match e {
+            JournalEvent::EffectRecorded {
+                effect_id,
+                node,
+                class,
+                seq,
+                output,
+                observation,
+                ..
+            } if effect_id == tool_eid => JournalEvent::EffectRecorded {
+                node,
+                effect_id,
+                class,
+                seq,
+                output,
+                observation,
+                input_hash: "TAMPERED".into(),
+            },
+            other => other,
+        };
+        tampered.append(run, e).await.unwrap();
+    }
+
+    // Resume: turn 0 model memo-hits and replays the search tool call; the tool
+    // effect's memoized input_hash ("TAMPERED") ≠ the replayed call's hash → halt.
+    let (gw2, calls2) = recording_gateway().await;
+    let err = Executor::new(Arc::new(gw2), Arc::new(tampered.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter.clone()))),
+        ))
+        .with_clock(Arc::new(AdvanceableClock::at(OBS_T0)))
+        .start(run, &graph)
+        .await
+        .expect_err("a changed tool input halts the resume");
+    match err {
+        OrchestratorError::DeterminismViolation { node, effect_id } => {
+            assert_eq!(node, NodeId("n1".into()));
+            assert_eq!(
+                effect_id, tool_eid,
+                "the violation is on the tampered tool effect"
+            );
+        }
+        other => panic!("expected DeterminismViolation, got {other:?}"),
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "the tool was never re-executed"
+    );
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        0,
+        "a determinism violation never touches the gateway"
+    );
+}
+
 /// Editing a skill body changes the turn's system prompt → its input-hash no
 /// longer matches the memoized turn → resume halts with DeterminismViolation
 /// (never mixes new instructions into a memoized old turn). No gateway call.
@@ -517,6 +1009,7 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::RunStarted { .. } => "RunStarted".to_string(),
         JournalEvent::NodeStarted { node } => format!("NodeStarted({})", node.0),
         JournalEvent::EffectRecorded { node, .. } => format!("EffectRecorded({})", node.0),
+        JournalEvent::EffectIntent { node, .. } => format!("EffectIntent({})", node.0),
         JournalEvent::NodeCompleted { node } => format!("NodeCompleted({})", node.0),
         JournalEvent::NodeFailed { node, .. } => format!("NodeFailed({})", node.0),
         JournalEvent::NodeSkipped { node } => format!("NodeSkipped({})", node.0),
@@ -1070,6 +1563,7 @@ async fn start_halts_on_determinism_violation_without_calling_gateway() {
                 output: EffectOutput::Inline(
                     serde_json::json!({ "model": "m", "text": "canned-response" }),
                 ),
+                observation: None,
             },
         )
         .await
@@ -1975,4 +2469,310 @@ async fn map_of_agents_then_consolidate_drives_the_real_reference_chain_to_local
             "child {i} ran as an agent sub-run (has its own node lifecycle): {labels:?}"
         );
     }
+}
+
+/// Acceptance §8.8 (real-gateway e2e) — a `Map { body: Agent("researcher") }`
+/// whose agent's ReAct loop calls the `Search` Observation, `Quorum`-aggregated →
+/// `Consolidate { Agent("synthesizer") }`, PLUS an independent `Agent("recorder")`
+/// node whose loop calls the `RecordNote` Mutation — all driven THROUGH the real
+/// gateway (demo catalog, `research.bulk` fallover to the local model) with an
+/// injected clock + reconcilers. Proves Observation fan-out (recorded with
+/// provenance), Mutation two-phase, and a clean completion in one run. (Resume is
+/// proven exhaustively by the §8.1–8.7 acceptance tests above.)
+#[tokio::test]
+async fn e2e_map_observation_agents_plus_mutation_agent_through_the_real_gateway() {
+    let (gateway, _calls) = demo_reference_tool_gateway().await;
+    let journal = InMemoryJournal::new();
+    let search_calls = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let mk_agent = |name: &str, tools: Vec<String>| AgentDefinition {
+        name: name.into(),
+        area: "research".into(),
+        kind: "reasoning".into(),
+        chain: "research.bulk".into(),
+        tools,
+        skills: vec![],
+        system_prompt: "Work carefully.".into(),
+    };
+    let search = Arc::new(Search::new(search_calls.clone()));
+    let recorder_tool = Arc::new(RecordNote::new(sink.clone()));
+    let registry = Arc::new(
+        Registry::default()
+            .with_agent(mk_agent("researcher", vec!["search".into()]))
+            .with_agent(mk_agent("synthesizer", vec![]))
+            .with_agent(mk_agent("recorder", vec!["record_note".into()]))
+            .with_tool(search.spec())
+            .with_tool(recorder_tool.spec()),
+    );
+    let tools = Arc::new(
+        ToolRegistry::default()
+            .with_tool(search.clone())
+            .with_tool(recorder_tool.clone()),
+    );
+    let reconcilers = Arc::new(
+        ReconcileRegistry::default()
+            .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone()))),
+    );
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry)
+        .with_tools(tools)
+        .with_reconcilers(reconcilers)
+        .with_clock(Arc::new(AdvanceableClock::at(OBS_T0)));
+
+    let m = NodeId("m".into());
+    let cons = NodeId("cons".into());
+    let rec = NodeId("rec".into());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: m.clone(),
+                kind: NodeKind::Map {
+                    body: MapBody::Agent(AgentRef("researcher".into())),
+                    over: vec![
+                        serde_json::json!("topic-0"),
+                        serde_json::json!("topic-1"),
+                        serde_json::json!("topic-2"),
+                    ],
+                    concurrency: 4,
+                    aggregation: Aggregation::Quorum {
+                        min_count: None,
+                        min_fraction: Some(0.6),
+                    },
+                },
+                deps: vec![],
+            },
+            Node {
+                id: cons.clone(),
+                kind: NodeKind::Consolidate {
+                    over: m.clone(),
+                    min_viable: 1,
+                    body: MapBody::Agent(AgentRef("synthesizer".into())),
+                },
+                deps: vec![Dep::soft("m")],
+            },
+            agent_node("rec", "recorder", "log the run"),
+        ],
+    };
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("e2e run");
+
+    // Everything completes cleanly.
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "{:?}",
+        outcome.failed
+    );
+    for n in [&m, &cons, &rec] {
+        assert!(
+            outcome.completed.contains(n),
+            "{} completed: {:?}",
+            n.0,
+            outcome.completed
+        );
+    }
+    assert_eq!(
+        outcome.outputs[&m]["manifest"]["ok"], 3,
+        "quorum met — all 3 children ok"
+    );
+
+    // Observation fan-out: each of the 3 children read Search live once, and each
+    // records with provenance {source: "search"}.
+    assert_eq!(
+        search_calls.load(Ordering::SeqCst),
+        3,
+        "each fanned-out child agent read the Search Observation once"
+    );
+    let events = journal.load(run).await.unwrap();
+    let obs_provenance = events
+        .iter()
+        .filter(|(_, e)| {
+            matches!(e, JournalEvent::EffectRecorded { class: EffectClass::Observation, observation: Some(meta), .. } if meta.source == "search")
+        })
+        .count();
+    assert_eq!(
+        obs_provenance, 3,
+        "3 Observation records carry search provenance across the fan-out"
+    );
+
+    // Mutation two-phase: the recorder's record_note journals EffectIntent then
+    // EffectRecorded, and the side effect landed exactly once.
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["log the run".to_string()],
+        "the Mutation applied exactly once through the real gateway"
+    );
+    let rec_labels: Vec<String> = events
+        .iter()
+        .filter(|(_, e)| {
+            matches!(e,
+                JournalEvent::EffectIntent { node, .. } | JournalEvent::EffectRecorded { node, .. }
+                    if node.0 == "rec")
+        })
+        .map(|(_, e)| label(e))
+        .collect();
+    let intent_at = rec_labels
+        .iter()
+        .position(|l| l == "EffectIntent(rec)")
+        .expect("recorder journaled an EffectIntent");
+    assert_eq!(
+        rec_labels[intent_at + 1],
+        "EffectRecorded(rec)",
+        "record_note is two-phase — Intent → Recorded: {rec_labels:?}"
+    );
+
+    // The synthesis agent ran on the reference chain and fell over to the local model.
+    assert_eq!(
+        outcome.outputs[&cons]["model"], "llama3.1-local",
+        "the Consolidate's agent synthesized via the local fallover: {:?}",
+        outcome.outputs[&cons]
+    );
+}
+
+/// Regression (no-silent-failure §7.3): an in-doubt Mutation inside a fanned-out
+/// Map CHILD pauses the WHOLE run loud — it must NEVER journal `RunCompleted` over
+/// the unresolved Intent (which would silently abandon the side effect). Seed a
+/// `Map{Agent("recorder")}` child through its `record_note` Mutation, truncate to
+/// the child's `EffectIntent`, then resume with an Indeterminate reconciler → the
+/// Map (and run) pause; `RunPaused` is journaled, `RunCompleted` is NOT, and no
+/// side effect is applied.
+#[tokio::test]
+async fn in_doubt_mutation_in_a_map_child_pauses_the_whole_run() {
+    let run = RunId(uuid::Uuid::new_v4());
+    let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
+        let recorder = AgentDefinition {
+            name: "recorder".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: "research.bulk".into(),
+            tools: vec!["record_note".into()],
+            skills: vec![],
+            system_prompt: "Record.".into(),
+        };
+        (
+            Arc::new(
+                Registry::default()
+                    .with_agent(recorder)
+                    .with_tool(RecordNote::new(sink.clone()).spec()),
+            ),
+            Arc::new(ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink)))),
+        )
+    };
+    let map_graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("m".into()),
+            kind: NodeKind::Map {
+                body: MapBody::Agent(AgentRef("recorder".into())),
+                over: vec![serde_json::json!("item-0")],
+                concurrency: 1,
+                aggregation: Aggregation::BestEffort,
+            },
+            deps: vec![],
+        }],
+    };
+
+    // Seed: run the Map to completion, then truncate to the child's EffectIntent
+    // (drops its record_note EffectRecorded) → the child is in-doubt on resume.
+    let full = InMemoryJournal::new();
+    let (seed_reg, seed_tools) = mk_recorder(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let (gw_s, _c) = demo_reference_tool_gateway().await;
+    Executor::new(Arc::new(gw_s), Arc::new(full.clone()), "v1")
+        .with_registry(seed_reg)
+        .with_tools(seed_tools)
+        .run(run, &map_graph)
+        .await
+        .expect("seed Map run completes");
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("the child journaled a record_note EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // Resume with an Indeterminate reconciler + a FRESH empty sink → the child's
+    // Mutation is in-doubt → it pauses → the whole Map pauses.
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (reg, tools) = mk_recorder(sink.clone());
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (gw_r, _c2) = demo_reference_tool_gateway().await;
+    let outcome = Executor::new(Arc::new(gw_r), Arc::new(seeded.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(tools)
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &map_graph)
+        .await
+        .expect("resume yields an outcome");
+
+    let pause = outcome
+        .paused
+        .expect("the in-doubt Map child pauses the whole run");
+    assert_eq!(
+        pause.node,
+        NodeId("m".into()),
+        "the Map node is the pause point"
+    );
+    let resumed = seeded.load(run).await.unwrap();
+    assert!(
+        resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run must NOT complete over an unresolved in-doubt Intent (no silent failure)"
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+}
+
+/// The pause is re-entrant: a run paused on an in-doubt Mutation (Indeterminate)
+/// resumes to COMPLETION once its reconciler becomes decisive, and the standing
+/// Intent still bounds the side effect to exactly one application.
+#[tokio::test]
+async fn a_paused_in_doubt_run_resumes_to_completion_when_the_reconciler_decides() {
+    let (journal, run) = seed_in_doubt_note().await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    // First resume: Indeterminate → paused, nothing applied.
+    let indeterminate =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (out1, _e1) = resume_in_doubt(journal.clone(), run, sink.clone(), indeterminate).await;
+    assert!(out1.paused.is_some(), "first resume pauses (Indeterminate)");
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "nothing applied while paused"
+    );
+
+    // Second resume of the SAME journal (now carrying RunPaused, which the fold
+    // ignores so the Mutation stays in-doubt): the reconciler now says NotApplied
+    // → the effect runs exactly once and the run completes.
+    let decisive = ReconcileRegistry::default()
+        .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone())));
+    let (out2, events2) = resume_in_doubt(journal, run, sink.clone(), decisive).await;
+    assert!(
+        out2.failed.is_none() && out2.paused.is_none(),
+        "second resume completes: {:?}",
+        out2.paused
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "the mutation applied exactly once across both resumes"
+    );
+    assert!(
+        events2
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
 }

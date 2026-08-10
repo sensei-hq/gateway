@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use gateway::Gateway;
 use orchestrator_core::{
-    ContentStore, EffectClass, EffectId, EffectOutput, ExecutionJournal, Graph, JournalEvent,
-    NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, effect_id,
+    Clock, ContentStore, EffectClass, EffectId, EffectOutput, ExecutionJournal, Graph,
+    JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError, Registry, RunId, Seq,
+    SystemClock, effect_id,
 };
 
-use crate::agent::tools::ToolRegistry;
+use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
 
 mod agent;
 mod content;
@@ -41,6 +42,11 @@ pub struct Executor {
     /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
     /// when a `content` store is wired.
     cas_threshold: usize,
+    /// The wall-clock an Observation's TTL is checked against (default
+    /// `SystemClock`) — injected so tests can control time deterministically.
+    clock: Arc<dyn Clock>,
+    /// Reconcile providers, queried when a Mutation is in-doubt on resume.
+    reconcilers: Arc<ReconcileRegistry>,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -54,6 +60,18 @@ pub struct RunOutcome {
     pub failed: Option<(NodeId, String)>,
     pub skipped: Vec<NodeId>,
     pub outputs: HashMap<NodeId, serde_json::Value>,
+    /// Set when the run halted on a durable pause (§7.3) — e.g. an in-doubt
+    /// Mutation whose reconcile was `Indeterminate`. Like `failed`, a pause
+    /// suppresses `RunCompleted`; the run stays resumable.
+    pub paused: Option<PauseInfo>,
+}
+
+/// A durable pause: the run stopped resumable (no `RunCompleted`) at `node`,
+/// never blindly applying/memoizing the effect in question (§7.3).
+#[derive(Debug, Clone)]
+pub struct PauseInfo {
+    pub node: NodeId,
+    pub reason: String,
 }
 
 /// The state folded from a journal on resume: the effect memo plus which nodes
@@ -68,6 +86,13 @@ struct Fold {
     memo: HashMap<EffectId, (String, EffectOutput)>,
     started: std::collections::HashSet<NodeId>,
     completed: std::collections::HashSet<NodeId>,
+    /// Effect ids that journaled an `EffectIntent` (§7.3). An id in `intents` but
+    /// NOT in `memo` (no `EffectRecorded`) is an **in-doubt** Mutation on resume.
+    intents: std::collections::HashSet<EffectId>,
+    /// Each `Observation` effect's recorded freshness + provenance (§7.1). A memo
+    /// hit whose `fetched_at + ttl` has lapsed (per the injected `Clock`) is
+    /// re-read instead of replayed.
+    observations: HashMap<EffectId, ObservationMeta>,
 }
 
 /// The mutable scheduling state threaded through a `drive` loop: the accumulating
@@ -98,6 +123,8 @@ impl Executor {
             concurrency: 8,
             content: None,
             cas_threshold: 4096,
+            clock: Arc::new(SystemClock),
+            reconcilers: Arc::new(ReconcileRegistry::default()),
         }
     }
 
@@ -141,6 +168,18 @@ impl Executor {
     /// Override the ReAct loop's max turns (default 8).
     pub fn with_max_steps(mut self, n: usize) -> Self {
         self.max_steps = n;
+        self
+    }
+
+    /// Inject the wall-clock (default `SystemClock`) — Observation TTL reads it.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Attach reconcile providers, queried when a Mutation is in-doubt on resume.
+    pub fn with_reconcilers(mut self, reconcilers: Arc<ReconcileRegistry>) -> Self {
+        self.reconcilers = reconcilers;
         self
     }
 
@@ -286,9 +325,10 @@ impl Executor {
             // unless the run later crashes and resumes.
             self.write_snapshot(run, &state.outcome).await?;
         }
-        // A run with any failure is not marked complete — it stays resumable
-        // (the slice-1/2 contract), even though soft-dependent branches ran.
-        if state.outcome.failed.is_none() {
+        // A run with any failure OR a durable pause is not marked complete — it
+        // stays resumable (the slice-1/2 contract), even though soft-dependent
+        // branches ran.
+        if state.outcome.failed.is_none() && state.outcome.paused.is_none() {
             self.append(run, JournalEvent::RunCompleted).await?;
         }
         Ok(state.outcome)
@@ -334,6 +374,18 @@ impl Executor {
                     &mut state.outcome,
                 )
                 .await?;
+            }
+            NodeExec::Paused { reason } => {
+                // Durable pause (§7.3): record it (first pause wins), mark terminal,
+                // and do NOT cascade. The run stays resumable — `drive` suppresses
+                // `RunCompleted` while `paused` is set.
+                if state.outcome.paused.is_none() {
+                    state.outcome.paused = Some(PauseInfo {
+                        node: node.id.clone(),
+                        reason,
+                    });
+                }
+                state.terminal.insert(node.id.clone());
             }
         }
         Ok(())
@@ -447,6 +499,7 @@ impl Executor {
                                 input_hash: ih,
                                 seq: 0,
                                 output: recorded,
+                                observation: None,
                             },
                         )
                         .await?;
@@ -483,6 +536,7 @@ impl Executor {
                         message,
                         output: None,
                     }),
+                    AgentStep::Paused(reason) => Ok(NodeExec::Paused { reason }),
                 }
             }
             NodeKind::Map { .. } => self.run_map(run, node, fold).await,
@@ -503,11 +557,14 @@ impl Executor {
     }
 }
 
-/// The terminal result of one `Agent` node: a completed output, or a node-level
-/// failure (budget/max-steps/gateway/tool) already journaled as `NodeFailed`.
+/// The terminal result of one `Agent` node: a completed output, a node-level
+/// failure (budget/max-steps/gateway/tool) already journaled as `NodeFailed`, or
+/// a durable **pause** — an in-doubt Mutation whose reconcile was `Indeterminate`
+/// (§7.3), journaled as `RunPaused`, never blindly applied.
 enum AgentStep {
     Completed(serde_json::Value),
     Failed(String),
+    Paused(String),
 }
 
 /// The terminal result of one scheduled node (any kind): its completed output,
@@ -522,6 +579,11 @@ enum NodeExec {
     Failed {
         message: String,
         output: Option<serde_json::Value>,
+    },
+    /// The node halted on a durable pause (§7.3) — the run stops resumable (no
+    /// `RunCompleted`), never blindly applying the in-doubt effect.
+    Paused {
+        reason: String,
     },
 }
 

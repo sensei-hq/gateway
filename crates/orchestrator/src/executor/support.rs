@@ -78,11 +78,17 @@ pub(crate) fn fold_journal(
                 effect_id,
                 input_hash,
                 output,
+                observation,
                 ..
             } => {
                 fold.memo
                     .insert(effect_id.clone(), (input_hash.clone(), output.clone()));
                 node_last_output.insert(node.clone(), output.clone());
+                // §7.1: an Observation's latest record wins its freshness slot, so
+                // a stale re-read (which appends a fresh record) supersedes.
+                if let Some(meta) = observation {
+                    fold.observations.insert(effect_id.clone(), meta.clone());
+                }
             }
             JournalEvent::NodeStarted { node } => {
                 fold.started.insert(node.clone());
@@ -90,6 +96,11 @@ pub(crate) fn fold_journal(
             JournalEvent::NodeCompleted { node } => {
                 fold.completed.insert(node.clone());
                 completed.push(node.clone());
+            }
+            // The intent phase of a two-phase Mutation (§7.3). An effect id in
+            // `intents` with no matching `EffectRecorded` is in-doubt on resume.
+            JournalEvent::EffectIntent { effect_id, .. } => {
+                fold.intents.insert(effect_id.clone());
             }
             JournalEvent::MapCompacted { node, children } => {
                 for c in children {
