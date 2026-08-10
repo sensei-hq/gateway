@@ -11,7 +11,7 @@ pub mod ids;
 pub mod journal;
 pub mod registry;
 
-pub use content::{ContentRef, ContentStore, Digest, digest_of};
+pub use content::{ContentRef, ContentStore, Digest, EffectOutput, digest_of};
 pub use context::{ContextKey, ContextRef, ContextStore, Scope};
 pub use effect::{EffectClass, EffectId, effect_id};
 pub use error::{JournalError, OrchestratorError};

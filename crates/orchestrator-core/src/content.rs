@@ -23,6 +23,19 @@ pub struct ContentRef {
     pub summary: Option<String>,
 }
 
+/// An effect's recorded output as carried by the journal (§7.4): either a small
+/// value stored **inline** in the log (the slice-1/2 behavior), or — for a
+/// payload whose serialized size exceeds the executor's `cas_threshold` — a
+/// content-addressed [`ContentRef`] whose bytes live once in a [`ContentStore`].
+/// The split keeps the durable journal a lean control-flow log; the resume fold
+/// reads this without loading blobs, and a node materializes the value lazily
+/// via [`ContentStore::get`] only when it actually consumes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EffectOutput {
+    Inline(serde_json::Value),
+    Ref(ContentRef),
+}
+
 /// Compute the content address of `bytes`: `sha256` hex.
 pub fn digest_of(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::new();

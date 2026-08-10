@@ -10,8 +10,9 @@ use kernel::types::request::{
     InferenceRequest, Message, MessageContent, MessageRole, Payload, ToolCall, ToolDefinition,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, Aggregation, EffectClass, EffectId, ExecutionJournal, Graph,
-    JournalEvent, MapBody, NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, effect_id,
+    AgentDefinition, AgentRef, Aggregation, ContentRef, ContentStore, EffectClass, EffectId,
+    EffectOutput, ExecutionJournal, Graph, JournalEvent, MapBody, NodeId, NodeKind,
+    OrchestratorError, Registry, RunId, Seq, effect_id,
 };
 use sha2::{Digest, Sha256};
 
@@ -27,6 +28,16 @@ pub struct Executor {
     tools: Arc<ToolRegistry>,
     max_steps: usize,
     concurrency: usize,
+    /// The content-addressed store (§7.4) an over-threshold effect output is
+    /// split into. `None` (the default) means no CAS is wired, so every output
+    /// stays inline in the journal (the slice-1/2 behavior); wire a shared store
+    /// via [`with_content_store`](Self::with_content_store) to enable the split —
+    /// shared across the crash/resume boundary so a resume reads blobs back.
+    content: Option<Arc<dyn ContentStore>>,
+    /// The serialized-byte size **above which** an effect output is stored in the
+    /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
+    /// when a `content` store is wired.
+    cas_threshold: usize,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -47,7 +58,11 @@ pub struct RunOutcome {
 /// `NodeCompleted` are appended at most once across resumes).
 #[derive(Default)]
 struct Fold {
-    memo: HashMap<EffectId, (String, serde_json::Value)>,
+    /// Each effect's structural id → its recorded `(input_hash, output)`. The
+    /// output is a ref-or-inline [`EffectOutput`]: folding stores it verbatim
+    /// (no blob load); a node materializes lazily via [`Executor::materialize`]
+    /// only when it replays the effect.
+    memo: HashMap<EffectId, (String, EffectOutput)>,
     started: std::collections::HashSet<NodeId>,
     completed: std::collections::HashSet<NodeId>,
 }
@@ -68,7 +83,26 @@ impl Executor {
             tools: Arc::new(ToolRegistry::default()),
             max_steps: 8,
             concurrency: 8,
+            content: None,
+            cas_threshold: 4096,
         }
+    }
+
+    /// Wire the content-addressed store (§7.4) that over-threshold effect outputs
+    /// split into. Injected (not defaulted to a concrete impl) so the executor
+    /// stays decoupled from any store crate, and so a resume can share the SAME
+    /// store as the original run — the crash/resume seam the CAS blobs live in.
+    pub fn with_content_store(mut self, content: Arc<dyn ContentStore>) -> Self {
+        self.content = Some(content);
+        self
+    }
+
+    /// Override the CAS split threshold (default 4 KiB): an effect output whose
+    /// serialized size exceeds this is stored in the `ContentStore` and the
+    /// journal carries a [`ContentRef`]; smaller outputs stay inline.
+    pub fn with_cas_threshold(mut self, bytes: usize) -> Self {
+        self.cas_threshold = bytes;
+        self
     }
 
     /// Override the global fan-out concurrency cap (default 8) — the ceiling on
@@ -158,6 +192,11 @@ impl Executor {
             .any(|(_, e)| matches!(e, JournalEvent::RunCompleted));
         let mut fold = Fold::default();
         let mut outcome = RunOutcome::default();
+        // The last recorded output per node, kept as a **ref** (never loaded) —
+        // the fold reads refs without deserializing blobs (§7.4). Only a terminal
+        // resume materializes these, lazily and bounded (one per node); the
+        // non-terminal path re-materializes on demand while `drive` replays.
+        let mut node_last_output: HashMap<NodeId, EffectOutput> = HashMap::new();
         for (_, event) in &events {
             match event {
                 JournalEvent::EffectRecorded {
@@ -169,7 +208,7 @@ impl Executor {
                 } => {
                     fold.memo
                         .insert(effect_id.clone(), (input_hash.clone(), output.clone()));
-                    outcome.outputs.insert(node.clone(), output.clone());
+                    node_last_output.insert(node.clone(), output.clone());
                 }
                 JournalEvent::NodeStarted { node } => {
                     fold.started.insert(node.clone());
@@ -184,15 +223,22 @@ impl Executor {
 
         if terminal {
             // Already done: return the folded outcome; do NOT re-drive (which
-            // would append a second `RunCompleted`). But first project each Agent
-            // node's folded output — the RAW final model-turn effect (`{model,
-            // text, tool_calls}`) — down to the canonical `{model, text}` that a
-            // fresh `run` and a non-terminal resume return from
-            // `AgentStep::Completed`, so a completed Agent node yields an
-            // identical JSON shape on every completion path (design §4). This is a
-            // pure projection of the already-folded outputs — no re-drive, no
-            // append. `ModelCall` nodes already store the canonical shape and are
-            // left untouched.
+            // would append a second `RunCompleted`). Materialize each node's final
+            // output lazily from its folded ref (inline value, or a CAS blob) —
+            // the only place the terminal fold touches content, bounded to one
+            // read per node.
+            for (node, output) in &node_last_output {
+                let value = self.materialize(output).await?;
+                outcome.outputs.insert(node.clone(), value);
+            }
+            // Then project each Agent node's folded output — the RAW final
+            // model-turn effect (`{model, text, tool_calls}`) — down to the
+            // canonical `{model, text}` that a fresh `run` and a non-terminal
+            // resume return from `AgentStep::Completed`, so a completed Agent node
+            // yields an identical JSON shape on every completion path (design §4).
+            // This is a pure projection of the already-materialized outputs — no
+            // re-drive, no append. `ModelCall` nodes already store the canonical
+            // shape and are left untouched.
             for node in &graph.nodes {
                 if let NodeKind::Agent { .. } = &node.kind
                     && let Some(output) = outcome.outputs.get(&node.id).cloned()
@@ -391,8 +437,9 @@ impl Executor {
                         });
                     }
                     // Memoized: replay the recorded output — no gateway call, no
-                    // new `EffectRecorded` (it is already in the journal).
-                    return Ok(NodeExec::Completed(output.clone()));
+                    // new `EffectRecorded` (it is already in the journal). The
+                    // output is materialized lazily (inline value, or a CAS blob).
+                    return Ok(NodeExec::Completed(self.materialize(output).await?));
                 }
 
                 self.append(
@@ -415,6 +462,7 @@ impl Executor {
                         // events by that outer `(Seq, event)` from `load` — never by
                         // this in-event field — so it is set to 0 rather than the
                         // (circular) value `append` would return.
+                        let recorded = self.split_output(&output).await?;
                         self.append(
                             run,
                             JournalEvent::EffectRecorded {
@@ -423,7 +471,7 @@ impl Executor {
                                 class: EffectClass::Pure,
                                 input_hash: ih,
                                 seq: 0,
-                                output: output.clone(),
+                                output: recorded,
                             },
                         )
                         .await?;
@@ -559,6 +607,7 @@ impl Executor {
                             "model": response.model,
                             "text": response.content.clone().unwrap_or_default(),
                         });
+                        let recorded = self.split_output(&output).await?;
                         self.append(
                             run,
                             JournalEvent::EffectRecorded {
@@ -567,7 +616,7 @@ impl Executor {
                                 class: EffectClass::Pure,
                                 input_hash: ih,
                                 seq: 0,
-                                output: output.clone(),
+                                output: recorded,
                             },
                         )
                         .await?;
@@ -754,7 +803,7 @@ impl Executor {
                     effect_id: eid,
                 });
             }
-            return Ok(Ok(output.clone()));
+            return Ok(Ok(self.materialize(output).await?));
         }
 
         let request = build_request(chain, item);
@@ -764,6 +813,7 @@ impl Executor {
                     "model": response.model,
                     "text": response.content.clone().unwrap_or_default(),
                 });
+                let recorded = self.split_output(&output).await?;
                 self.append(
                     run,
                     JournalEvent::EffectRecorded {
@@ -772,13 +822,62 @@ impl Executor {
                         class: EffectClass::Pure,
                         input_hash: ih,
                         seq: 0,
-                        output: output.clone(),
+                        output: recorded,
                     },
                 )
                 .await?;
                 Ok(Ok(output))
             }
             Err(error) => Ok(Err(error.to_string())),
+        }
+    }
+
+    /// Split an effect output for the journal (§7.4): if a `ContentStore` is
+    /// wired and the serialized output exceeds `cas_threshold`, `put` the bytes
+    /// into the CAS and return a [`ContentRef`] (identical content dedupes to one
+    /// digest); otherwise carry the value inline. Keeps the durable journal a
+    /// lean control-flow log while large payloads live once in the CAS.
+    async fn split_output(
+        &self,
+        output: &serde_json::Value,
+    ) -> Result<EffectOutput, OrchestratorError> {
+        // No CAS wired ⇒ everything stays inline (the slice-1/2 behavior).
+        let Some(content) = &self.content else {
+            return Ok(EffectOutput::Inline(output.clone()));
+        };
+        let bytes = serde_json::to_vec(output)?;
+        if bytes.len() <= self.cas_threshold {
+            return Ok(EffectOutput::Inline(output.clone()));
+        }
+        // Over threshold: store the bytes in the CAS (identical content dedupes
+        // to one digest) and carry a lightweight ref in the journal.
+        let digest = content.put(&bytes).await?;
+        Ok(EffectOutput::Ref(ContentRef {
+            digest,
+            size: bytes.len(),
+            summary: None,
+        }))
+    }
+
+    /// Materialize a recorded [`EffectOutput`] into its value: an inline value is
+    /// cloned; a [`ContentRef`] is fetched lazily from the `ContentStore` and
+    /// deserialized. A ref with no store wired, or a digest miss, is loud
+    /// ([`ContentDigestMiss`](OrchestratorError::ContentDigestMiss)) — never a
+    /// silent empty value.
+    async fn materialize(
+        &self,
+        out: &EffectOutput,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        match out {
+            EffectOutput::Inline(value) => Ok(value.clone()),
+            EffectOutput::Ref(r) => {
+                let store = self
+                    .content
+                    .as_ref()
+                    .ok_or_else(|| OrchestratorError::ContentDigestMiss(r.digest.0.clone()))?;
+                let bytes = store.get(&r.digest).await?;
+                Ok(serde_json::from_slice(&bytes)?)
+            }
         }
     }
 
@@ -853,7 +952,7 @@ impl Executor {
                         effect_id: eid,
                     });
                 }
-                output.clone()
+                self.materialize(output).await?
             } else {
                 // Live turn: budget → NodeStarted (once) → gateway → EffectRecorded.
                 if over_budget(min_win, &system, &messages, &tools) {
@@ -893,6 +992,7 @@ impl Executor {
                             "text": response.content.clone().unwrap_or_default(),
                             "tool_calls": response.tool_calls,
                         });
+                        let recorded = self.split_output(&output).await?;
                         self.append(
                             run,
                             JournalEvent::EffectRecorded {
@@ -901,7 +1001,7 @@ impl Executor {
                                 class: EffectClass::Pure,
                                 input_hash: ih,
                                 seq: 0,
-                                output: output.clone(),
+                                output: recorded,
                             },
                         )
                         .await?;
@@ -975,10 +1075,11 @@ impl Executor {
                             effect_id: teid,
                         });
                     }
-                    output.clone()
+                    self.materialize(output).await?
                 } else {
                     match self.tools.execute(&call.name, args) {
                         Ok(result) => {
+                            let recorded = self.split_output(&result).await?;
                             self.append(
                                 run,
                                 JournalEvent::EffectRecorded {
@@ -987,7 +1088,7 @@ impl Executor {
                                     class: EffectClass::Pure,
                                     input_hash: tih,
                                     seq: 0,
-                                    output: result.clone(),
+                                    output: recorded,
                                 },
                             )
                             .await?;
@@ -2174,7 +2275,9 @@ mod tests {
                     class: EffectClass::Pure,
                     input_hash: ih_a,
                     seq: 0,
-                    output: serde_json::json!({ "model": "m", "text": "canned-response" }),
+                    output: EffectOutput::Inline(
+                        serde_json::json!({ "model": "m", "text": "canned-response" }),
+                    ),
                 },
             )
             .await
@@ -2434,6 +2537,187 @@ mod tests {
             calls.lock().unwrap().len(),
             1,
             "the served terminal candidate hit the local adapter once"
+        );
+    }
+
+    /// Acceptance 7 (split + dedupe) — with a `ContentStore` wired, an effect
+    /// output whose serialized size exceeds `cas_threshold` is stored in the CAS
+    /// and the journal carries a `ContentRef` (never the inline value); two
+    /// identical outputs share one digest (dedupe); a below-threshold output
+    /// stays inline (the gate cuts both ways). The blob round-trips via the CAS.
+    #[tokio::test]
+    async fn cas_threshold_splits_large_outputs_to_deduped_refs_and_keeps_small_ones_inline() {
+        use orchestrator_store::InMemoryContentStore;
+
+        // Two ModelCall nodes; the recording gateway returns the SAME canned
+        // output for both (~38 bytes), so with a low threshold both split to ONE
+        // shared digest, and with the default high threshold both stay inline.
+        let (graph, n1, n2) = two_node_graph("a", "b");
+
+        // Low threshold (8 < ~38 bytes) → both outputs split to refs.
+        let (gw_lo, _c_lo) = recording_gateway().await;
+        let journal_lo = InMemoryJournal::new();
+        let content = Arc::new(InMemoryContentStore::new());
+        let exec_lo = Executor::new(Arc::new(gw_lo), Arc::new(journal_lo.clone()), "v1")
+            .with_content_store(content.clone())
+            .with_cas_threshold(8);
+        let run_lo = RunId(uuid::Uuid::new_v4());
+        let out_lo = exec_lo
+            .run(run_lo, &graph)
+            .await
+            .expect("low-threshold run");
+        assert!(out_lo.failed.is_none(), "{:?}", out_lo.failed);
+
+        // Every EffectRecorded carries a Ref; collect their digests.
+        let digests: Vec<String> = journal_lo
+            .load(run_lo)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::EffectRecorded {
+                    output: EffectOutput::Ref(r),
+                    ..
+                } => Some(r.digest.0.clone()),
+                JournalEvent::EffectRecorded {
+                    output: EffectOutput::Inline(v),
+                    ..
+                } => panic!("over-threshold output must split to a Ref, got inline {v}"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(digests.len(), 2, "both nodes recorded a ref");
+        assert_eq!(
+            digests[0], digests[1],
+            "identical outputs dedupe to one digest"
+        );
+
+        // The blob is addressable in the CAS and round-trips to the recorded value.
+        let bytes = content
+            .get(&orchestrator_core::Digest(digests[0].clone()))
+            .await
+            .expect("blob present in the CAS");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["text"], "canned-response");
+        // The outcome still exposes the full materialized value.
+        assert_eq!(out_lo.outputs[&n1]["text"], "canned-response");
+        assert_eq!(out_lo.outputs[&n2]["text"], "canned-response");
+
+        // Default (4 KiB) threshold with a store wired → the same small output
+        // stays INLINE (behavior-preserving).
+        let (gw_hi, _c_hi) = recording_gateway().await;
+        let journal_hi = InMemoryJournal::new();
+        let exec_hi = Executor::new(Arc::new(gw_hi), Arc::new(journal_hi.clone()), "v1")
+            .with_content_store(Arc::new(InMemoryContentStore::new()));
+        let run_hi = RunId(uuid::Uuid::new_v4());
+        exec_hi
+            .run(run_hi, &graph)
+            .await
+            .expect("high-threshold run");
+        for (_, e) in journal_hi.load(run_hi).await.unwrap() {
+            if let JournalEvent::EffectRecorded { output, .. } = e {
+                assert!(
+                    matches!(output, EffectOutput::Inline(_)),
+                    "below-threshold output stays inline: {output:?}"
+                );
+            }
+        }
+    }
+
+    /// Acceptance 7 (lazy fold + resume) — a large memoized output is recorded as
+    /// a ref; on resume the fold reads that ref WITHOUT loading its blob, and the
+    /// node re-materializes it from the SHARED CAS exactly once (the memoized
+    /// replay) — re-spending no tokens. If the fold eagerly loaded blobs, the CAS
+    /// `get` count on resume would be 2 (fold + replay) instead of 1.
+    #[tokio::test]
+    async fn resume_folds_a_ref_lazily_and_rematerializes_it_from_the_cas_without_respending() {
+        use orchestrator_core::{ContentStore, Digest};
+        use orchestrator_store::InMemoryContentStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A get-counting CAS wrapper — proves the fold does not load blobs.
+        struct CountingCas {
+            inner: InMemoryContentStore,
+            gets: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ContentStore for CountingCas {
+            async fn put(&self, bytes: &[u8]) -> Result<Digest, OrchestratorError> {
+                self.inner.put(bytes).await
+            }
+            async fn get(&self, d: &Digest) -> Result<Vec<u8>, OrchestratorError> {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+                self.inner.get(d).await
+            }
+        }
+
+        let gets = Arc::new(AtomicUsize::new(0));
+        let content: Arc<dyn ContentStore> = Arc::new(CountingCas {
+            inner: InMemoryContentStore::new(),
+            gets: gets.clone(),
+        });
+
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (graph, n1, n2) = two_node_graph("a", "b");
+
+        // Run 1: n1 succeeds (recorded as a ref via the low threshold), n2 fails
+        // → no RunCompleted. The live path never reads back from the CAS.
+        let (gw1, _c1) = failing_after_gateway(1).await;
+        let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+            .with_content_store(content.clone())
+            .with_cas_threshold(8);
+        let out1 = exec1
+            .run(run, &graph)
+            .await
+            .expect("run 1 yields an outcome");
+        assert!(
+            out1.failed.is_some(),
+            "n2 fails, leaving n1 journaled without RunCompleted"
+        );
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            0,
+            "the live run never reads back from the CAS"
+        );
+
+        // n1's effect was recorded as a REF (not inline).
+        let n1_is_ref = journal.load(run).await.unwrap().iter().any(|(_, e)| {
+            matches!(
+                e,
+                JournalEvent::EffectRecorded { node, output: EffectOutput::Ref(_), .. }
+                    if node == &n1
+            )
+        });
+        assert!(n1_is_ref, "n1's over-threshold output was split to a ref");
+
+        // Run 2: resume on a FRESH gateway over the SAME journal + SAME CAS. The
+        // fold reads n1's ref without loading it; the replay materializes it once.
+        let gets_before_run2 = gets.load(Ordering::SeqCst);
+        let (gw2, calls2) = recording_gateway().await;
+        let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+            .with_content_store(content.clone())
+            .with_cas_threshold(8);
+        let out2 = exec2.start(run, &graph).await.expect("resume completes");
+        assert!(out2.failed.is_none(), "{:?}", out2.failed);
+        assert_eq!(out2.completed, vec![n1.clone(), n2.clone()]);
+        assert_eq!(
+            out2.outputs[&n1]["text"], "canned-response",
+            "n1 re-materialized from the CAS"
+        );
+
+        // The proof of lazy fold: resume loaded n1's blob EXACTLY ONCE (the
+        // memoized replay), not twice (which an eager fold would cause).
+        assert_eq!(
+            gets.load(Ordering::SeqCst) - gets_before_run2,
+            1,
+            "resume loaded n1's blob once (lazy replay), never during the fold"
+        );
+        // And n1 was not re-spent: the run-2 gateway was called only for n2.
+        assert_eq!(
+            calls2.lock().unwrap().len(),
+            1,
+            "resume re-called the gateway only for the tail n2"
         );
     }
 }
