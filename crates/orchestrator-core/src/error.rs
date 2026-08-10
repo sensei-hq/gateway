@@ -52,4 +52,12 @@ pub enum OrchestratorError {
     },
     #[error("agent node {node:?} exceeded max_steps")]
     AgentMaxStepsExceeded { node: NodeId },
+    #[error(
+        "consolidate {node:?} starved: {have} viable input(s), need {need} — refusing to synthesize over too few survivors"
+    )]
+    ConsolidateStarved {
+        node: NodeId,
+        have: usize,
+        need: usize,
+    },
 }
