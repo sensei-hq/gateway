@@ -12,7 +12,7 @@ use kernel::types::request::{
 use orchestrator_core::{
     AgentDefinition, AgentRef, Aggregation, ContentRef, ContentStore, EffectClass, EffectId,
     EffectOutput, ExecutionJournal, Graph, JournalEvent, MapBody, NodeId, NodeKind,
-    OrchestratorError, Registry, RunId, Seq, effect_id,
+    OrchestratorError, Registry, RunId, Seq, Snapshot, effect_id,
 };
 use sha2::{Digest, Sha256};
 
@@ -355,6 +355,13 @@ impl Executor {
                     }
                 }
             }
+
+            // Round boundary (§5.2): checkpoint the run's progress to the snapshot
+            // store, OUT-OF-BAND (no journal event, so the control-flow log stays
+            // byte-identical). A resume seeds from the latest snapshot and folds
+            // only the tail. Written even on a fresh `run` — harmlessly unused
+            // unless the run later crashes and resumes.
+            self.write_snapshot(run, &outcome).await?;
         }
         // A run with any failure is not marked complete — it stays resumable
         // (the slice-1/2 contract), even though soft-dependent branches ran.
@@ -362,6 +369,41 @@ impl Executor {
             self.append(run, JournalEvent::RunCompleted).await?;
         }
         Ok(outcome)
+    }
+
+    /// Write a round-boundary [`Snapshot`] of the current outcome to the journal's
+    /// snapshot store (§5.2). Its `seq` is the current max journal `Seq` — the
+    /// boundary a resume folds past; each completed node's output is carried as a
+    /// ref-or-inline [`EffectOutput`] (large ones split into the CAS, keeping the
+    /// snapshot lean). A backend without snapshot support no-ops (trait default).
+    async fn write_snapshot(
+        &self,
+        run: RunId,
+        outcome: &RunOutcome,
+    ) -> Result<(), OrchestratorError> {
+        let seq = self
+            .journal
+            .load(run)
+            .await
+            .map_err(OrchestratorError::Journal)?
+            .iter()
+            .map(|(seq, _)| *seq)
+            .max()
+            .unwrap_or(0);
+        let mut outputs = Vec::with_capacity(outcome.outputs.len());
+        for (node, value) in &outcome.outputs {
+            outputs.push((node.clone(), self.split_output(value).await?));
+        }
+        let snap = Snapshot {
+            seq,
+            completed: outcome.completed.clone(),
+            skipped: outcome.skipped.clone(),
+            outputs,
+        };
+        self.journal
+            .snapshot(run, snap)
+            .await
+            .map_err(OrchestratorError::Journal)
     }
 
     /// Cascade-skip: mark every not-yet-terminal node that `Hard`-depends on
@@ -2718,6 +2760,61 @@ mod tests {
             calls2.lock().unwrap().len(),
             1,
             "resume re-called the gateway only for the tail n2"
+        );
+    }
+
+    /// Increment 8a — the executor writes a round-boundary snapshot after each
+    /// scheduling round (out-of-band, so the journal event order is unchanged):
+    /// the latest snapshot captures every completed node and its output.
+    #[tokio::test]
+    async fn drive_writes_a_round_boundary_snapshot_capturing_completed_nodes() {
+        let (gateway, _calls) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+        let (graph, n1, n2) = two_node_graph("a", "b"); // linear → two rounds
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = exec.run(run, &graph).await.expect("run");
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+        // The latest snapshot reflects BOTH completed nodes and carries each
+        // node's output.
+        let snap = journal
+            .latest_snapshot(run)
+            .await
+            .unwrap()
+            .expect("a snapshot was written");
+        assert!(
+            snap.completed.contains(&n1) && snap.completed.contains(&n2),
+            "snapshot lists completed nodes: {:?}",
+            snap.completed
+        );
+        let keyed: Vec<&NodeId> = snap.outputs.iter().map(|(k, _)| k).collect();
+        assert!(
+            keyed.contains(&&n1) && keyed.contains(&&n2),
+            "snapshot carries per-node outputs: {keyed:?}"
+        );
+        assert!(snap.seq > 0, "snapshot records a journal boundary seq");
+
+        // The journal event order is byte-identical (snapshots are out-of-band).
+        let kinds: Vec<String> = journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| label(e))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "RunStarted",
+                "NodeStarted(n1)",
+                "EffectRecorded(n1)",
+                "NodeCompleted(n1)",
+                "NodeStarted(n2)",
+                "EffectRecorded(n2)",
+                "NodeCompleted(n2)",
+                "RunCompleted",
+            ],
         );
     }
 }
