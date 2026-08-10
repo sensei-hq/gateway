@@ -7,8 +7,8 @@ use std::sync::Arc;
 use gateway::Gateway;
 use orchestrator_core::{
     Clock, ContentStore, EffectClass, EffectId, EffectOutput, ExecutionJournal, Graph,
-    JournalEvent, NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, SystemClock,
-    effect_id,
+    JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError, Registry, RunId, Seq,
+    SystemClock, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -90,6 +90,10 @@ struct Fold {
     /// NOT in `memo` (no `EffectRecorded`) is an **in-doubt** Mutation on resume.
     #[allow(dead_code)] // read by the in-doubt Mutation path (slice-4 Task 9)
     intents: std::collections::HashSet<EffectId>,
+    /// Each `Observation` effect's recorded freshness + provenance (§7.1). A memo
+    /// hit whose `fetched_at + ttl` has lapsed (per the injected `Clock`) is
+    /// re-read instead of replayed.
+    observations: HashMap<EffectId, ObservationMeta>,
 }
 
 /// The mutable scheduling state threaded through a `drive` loop: the accumulating

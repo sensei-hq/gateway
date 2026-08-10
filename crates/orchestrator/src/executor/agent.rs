@@ -6,8 +6,8 @@ use kernel::types::request::{
     InferenceRequest, Message, MessageContent, MessageRole, ToolCall, ToolDefinition,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, OrchestratorError,
-    RunId, effect_id,
+    AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, ObservationMeta,
+    OrchestratorError, RunId, effect_id,
 };
 
 use super::support::{
@@ -231,53 +231,131 @@ impl Executor {
         }];
         for (k, call) in tool_calls.iter().enumerate() {
             let teid = effect_id(&ar.node_id.0, turn as u64, k + 1);
-            let args: serde_json::Value =
-                serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
-            let tih = tool_input_hash(&call.name, &call.arguments);
-            let result = if let Some((recorded_ih, output)) = ar.fold.memo.get(&teid) {
-                if recorded_ih != &tih {
-                    return Err(OrchestratorError::DeterminismViolation {
-                        node: ar.node_id.clone(),
-                        effect_id: teid,
-                    });
-                }
-                self.materialize(output).await?
-            } else {
-                match self.tools.execute(&call.name, args) {
-                    Ok(result) => {
-                        let recorded = self.split_output(&result).await?;
-                        self.append(
-                            ar.run,
-                            JournalEvent::EffectRecorded {
-                                node: ar.node_id.clone(),
-                                effect_id: teid,
-                                class: EffectClass::Pure,
-                                input_hash: tih,
-                                seq: 0,
-                                output: recorded,
-                                observation: None,
-                            },
-                        )
-                        .await?;
-                        result
-                    }
-                    Err(err) => {
-                        let message = err.to_string();
-                        self.append(
-                            ar.run,
-                            JournalEvent::NodeFailed {
-                                node: ar.node_id.clone(),
-                                error: message.clone(),
-                            },
-                        )
-                        .await?;
-                        return Ok(Err(message));
-                    }
-                }
+            let result = match self.execute_tool_effect(ar, &teid, call).await? {
+                Ok(value) => value,
+                Err(failure) => return Ok(Err(failure)),
             };
             out.push(Message::tool_result(call.id.clone(), result.to_string()));
         }
         Ok(Ok(out))
+    }
+
+    /// Execute (or replay) ONE tool call as a durable effect, dispatched by its
+    /// [`EffectClass`] (§7.1). The outer `Result` is a fatal journal/CAS/
+    /// determinism error; the inner `Result` is the tool's output value, or its
+    /// failure message (already journaled `NodeFailed`, same shape as a turn).
+    ///
+    /// - **Pure** — a memo hit replays (never re-executes); a miss executes and
+    ///   records `observation: None`.
+    /// - **Observation** — a memo hit replays only while FRESH (`fetched_at + ttl`
+    ///   has not lapsed per the injected `Clock`); a stale hit (or a miss) re-reads
+    ///   and appends a superseding record with fresh [`ObservationMeta`].
+    /// - **Mutation** — a memo hit (Intent+Recorded) replays; a miss executes and
+    ///   records `class: Mutation`. The two-phase Intent and in-doubt reconcile
+    ///   land in slice-4 Tasks 8–9.
+    async fn execute_tool_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+        let args: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+        let tih = tool_input_hash(&call.name, &call.arguments);
+        let spec = self.tools.spec_of(&call.name);
+        let class = spec
+            .as_ref()
+            .map(|s| s.effect_class)
+            .unwrap_or(EffectClass::Pure);
+
+        // Memo hit: replay, unless it is a STALE Observation (fall through to a
+        // live re-read). The determinism fence guards every replay.
+        if let Some((recorded_ih, output)) = ar.fold.memo.get(teid) {
+            if recorded_ih != &tih {
+                return Err(OrchestratorError::DeterminismViolation {
+                    node: ar.node_id.clone(),
+                    effect_id: teid.clone(),
+                });
+            }
+            let stale = class == EffectClass::Observation && !self.observation_fresh(ar, teid);
+            if !stale {
+                return Ok(Ok(self.materialize(output).await?));
+            }
+        }
+
+        // Live path: execute the tool and journal its record. Observations carry
+        // freshness/provenance so a later resume can decide replay-vs-re-read.
+        let observation = (class == EffectClass::Observation).then(|| ObservationMeta {
+            fetched_at: self.clock.now(),
+            ttl_secs: spec.as_ref().and_then(|s| s.ttl_secs).unwrap_or(0),
+            source: spec
+                .as_ref()
+                .and_then(|s| s.source.clone())
+                .unwrap_or_else(|| call.name.clone()),
+        });
+        self.record_tool_effect(ar, teid, call, args, &tih, (class, observation))
+            .await
+    }
+
+    /// Whether a memoized `Observation` is still fresh: its recorded
+    /// `fetched_at + ttl_secs` has not lapsed per the injected `Clock`. A missing
+    /// provenance record or `ttl_secs == 0` (a `None` TTL) is never fresh — always
+    /// re-read (§7.1).
+    fn observation_fresh(&self, ar: &AgentRun<'_>, teid: &EffectId) -> bool {
+        match ar.fold.observations.get(teid) {
+            Some(meta) => {
+                meta.ttl_secs > 0
+                    && self.clock.now()
+                        <= meta.fetched_at + chrono::Duration::seconds(meta.ttl_secs as i64)
+            }
+            None => false,
+        }
+    }
+
+    /// Execute a tool live and journal its `EffectRecorded` (shared by all effect
+    /// classes). On a tool error, journal `NodeFailed` and return the failure
+    /// message. `observation` is `Some` only for Observation effects.
+    async fn record_tool_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        args: serde_json::Value,
+        tih: &str,
+        record: (EffectClass, Option<ObservationMeta>),
+    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+        let (class, observation) = record;
+        match self.tools.execute(&call.name, args) {
+            Ok(result) => {
+                let recorded = self.split_output(&result).await?;
+                self.append(
+                    ar.run,
+                    JournalEvent::EffectRecorded {
+                        node: ar.node_id.clone(),
+                        effect_id: teid.clone(),
+                        class,
+                        input_hash: tih.to_string(),
+                        seq: 0,
+                        output: recorded,
+                        observation,
+                    },
+                )
+                .await?;
+                Ok(Ok(result))
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.append(
+                    ar.run,
+                    JournalEvent::NodeFailed {
+                        node: ar.node_id.clone(),
+                        error: message.clone(),
+                    },
+                )
+                .await?;
+                Ok(Err(message))
+            }
+        }
     }
 
     /// Dispatch one live model turn through the gateway and journal its result:
