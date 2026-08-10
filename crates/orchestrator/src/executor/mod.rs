@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use gateway::Gateway;
 use orchestrator_core::{
-    Clock, ContentStore, ContextStore, EffectClass, EffectId, EffectOutput, ExecutionJournal,
-    Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError, Registry, RunId,
-    Seq, SystemClock, effect_id,
+    Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId, EffectOutput,
+    ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError,
+    Registry, RunId, Scope, Seq, SystemClock, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -97,6 +97,11 @@ struct Fold {
     /// hit whose `fetched_at + ttl` has lapsed (per the injected `Clock`) is
     /// re-read instead of replayed.
     observations: HashMap<EffectId, ObservationMeta>,
+    /// Blackboard entries folded from `ContextWrite` events (§8). On resume the
+    /// store is rehydrated from these (refs, no blob load), and a completed node
+    /// whose key is already here is NOT re-published — the guard against a
+    /// memoized replay re-`put`ting (which would collide) or re-journaling.
+    context: HashMap<(Scope, ContextKey), ContextRef>,
 }
 
 /// The mutable scheduling state threaded through a `drive` loop: the accumulating
@@ -279,6 +284,11 @@ impl Executor {
             return Ok(outcome);
         }
 
+        // Rehydrate the blackboard from folded `ContextWrite`s (§8) so a resumed
+        // Agent node reads its dependencies' context identically to the original
+        // run (deterministic prompt → memoized turns replay).
+        self.rehydrate_context(&fold).await?;
+
         // Resume the tail: `drive`'s memo branch replays the completed prefix
         // (no gateway call, no new `EffectRecorded`) and finishes the run.
         self.drive(run, graph, &fold).await
@@ -331,7 +341,7 @@ impl Executor {
                 let result = self
                     .run_node(run, index, node, fold, &state.outcome.outputs)
                     .await?;
-                self.apply_node_result(run, graph, node, result, &mut state)
+                self.apply_node_result(run, graph, node, result, fold, &mut state)
                     .await?;
             }
             // Round boundary (§5.2): checkpoint progress to the snapshot store,
@@ -361,10 +371,14 @@ impl Executor {
         graph: &Graph,
         node: &orchestrator_core::Node,
         result: NodeExec,
+        fold: &Fold,
         state: &mut DriveState,
     ) -> Result<(), OrchestratorError> {
         match result {
             NodeExec::Completed(output) => {
+                // Publish to the blackboard BEFORE moving `output` into `outputs`
+                // (§8); fold-guarded so a memoized replay does not re-publish.
+                self.publish_context(run, &node.id, &output, fold).await?;
                 state.outcome.outputs.insert(node.id.clone(), output);
                 state.outcome.completed.push(node.id.clone());
                 state.completed.insert(node.id.clone());
@@ -569,6 +583,53 @@ impl Executor {
             .append(run, event)
             .await
             .map_err(OrchestratorError::Journal)
+    }
+
+    /// Publish a completed node's output to the blackboard (§8): `put` it under
+    /// `Run/node.id` (bytes → CAS, ref kept) and journal a `ContextWrite`.
+    /// Fold-guarded — a memoized replay on resume (key already in `fold.context`)
+    /// is skipped, so it never re-`put`s (which would collide) or re-journals. No
+    /// context store wired ⇒ a no-op (behavior byte-identical).
+    async fn publish_context(
+        &self,
+        run: RunId,
+        node_id: &NodeId,
+        output: &serde_json::Value,
+        fold: &Fold,
+    ) -> Result<(), OrchestratorError> {
+        let Some(ctx) = &self.context else {
+            return Ok(());
+        };
+        let key = ContextKey(node_id.0.clone());
+        if fold.context.contains_key(&(Scope::Run, key.clone())) {
+            return Ok(());
+        }
+        let r = ctx.put(Scope::Run, key, output.clone()).await?;
+        self.append(
+            run,
+            JournalEvent::ContextWrite {
+                scope: r.scope.clone(),
+                key: r.key.clone(),
+                content: r.content.clone(),
+                summary: r.summary.clone(),
+                seq: 0,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Rehydrate the injected blackboard from folded `ContextWrite`s on resume —
+    /// `insert_ref` only, no blob load; the CAS persists across the crash seam, so
+    /// a later `load` reads the value back. No context store wired ⇒ a no-op.
+    async fn rehydrate_context(&self, fold: &Fold) -> Result<(), OrchestratorError> {
+        let Some(ctx) = &self.context else {
+            return Ok(());
+        };
+        for r in fold.context.values() {
+            ctx.insert_ref(r.clone()).await?;
+        }
+        Ok(())
     }
 }
 

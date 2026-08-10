@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use kernel::types::capability::Capability;
 use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload, ToolDefinition};
 use orchestrator_core::{
-    ChildStatus, ContentRef, EdgeKind, EffectOutput, Graph, JournalEvent, MapBody, Node, NodeId,
-    NodeKind, OrchestratorError, Seq, effect_id,
+    ChildStatus, ContentRef, ContextRef, EdgeKind, EffectOutput, Graph, JournalEvent, MapBody,
+    Node, NodeId, NodeKind, OrchestratorError, Seq, effect_id,
 };
 use sha2::{Digest, Sha256};
 
@@ -101,6 +101,25 @@ pub(crate) fn fold_journal(
             // `intents` with no matching `EffectRecorded` is in-doubt on resume.
             JournalEvent::EffectIntent { effect_id, .. } => {
                 fold.intents.insert(effect_id.clone());
+            }
+            // A blackboard publish (§8): fold it so a resume rehydrates the store
+            // (as refs, no blob load) and the publish-guard skips re-publishing.
+            JournalEvent::ContextWrite {
+                scope,
+                key,
+                content,
+                summary,
+                ..
+            } => {
+                fold.context.insert(
+                    (scope.clone(), key.clone()),
+                    ContextRef {
+                        key: key.clone(),
+                        scope: scope.clone(),
+                        content: content.clone(),
+                        summary: summary.clone(),
+                    },
+                );
             }
             JournalEvent::MapCompacted { node, children } => {
                 for c in children {
