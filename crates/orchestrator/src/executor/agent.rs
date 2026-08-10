@@ -6,8 +6,8 @@ use kernel::types::request::{
     InferenceRequest, Message, MessageContent, MessageRole, ToolCall, ToolDefinition,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, ObservationMeta,
-    OrchestratorError, ReconcileOutcome, RunId, effect_id, idempotency_key,
+    AgentDefinition, AgentRef, ContextKey, EffectClass, EffectId, JournalEvent, NodeId,
+    ObservationMeta, OrchestratorError, ReconcileOutcome, RunId, effect_id, idempotency_key,
 };
 
 use super::support::{
@@ -53,13 +53,14 @@ impl Executor {
         node_id: &NodeId,
         agent_ref: &AgentRef,
         input: &serde_json::Value,
+        context: &[(ContextKey, serde_json::Value)],
         fold: &Fold,
     ) -> Result<AgentStep, OrchestratorError> {
         let agent: &AgentDefinition = self
             .registry
             .agent(&agent_ref.0)
             .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
-        let (system, tools) = assemble_prompt(&self.registry, agent)?;
+        let (system, tools) = assemble_prompt(&self.registry, agent, context)?;
         let chain = agent.chain.clone();
         let min_win = self.gateway.min_context_window(&chain).await;
         let ar = AgentRun {

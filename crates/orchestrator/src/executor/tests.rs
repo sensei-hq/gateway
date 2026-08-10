@@ -1,7 +1,8 @@
 use super::*;
 use crate::test_support::{
     content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
-    failing_after_gateway, final_response, recording_gateway, scripted_gateway, tool_call_response,
+    echo_system_gateway, failing_after_gateway, final_response, recording_gateway,
+    scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, Graph, JournalError, MapBody, Node, NodeId, NodeKind,
@@ -2880,5 +2881,73 @@ async fn duplicate_context_key_publish_is_a_loud_collision() {
     assert!(
         matches!(err, OrchestratorError::ContextKeyCollision { .. }),
         "got {err:?}"
+    );
+}
+
+/// An Agent node with declared dependencies (for blackboard read tests).
+fn agent_node_with_deps(id: &str, agent: &str, input: &str, deps: Vec<Dep>) -> Node {
+    Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::Agent {
+            agent: AgentRef(agent.into()),
+            input: serde_json::json!(input),
+        },
+        deps,
+    }
+}
+
+/// Acceptance §8.3 — cross-role handoff: in A(agent) → B(agent, hard-dep A), B's
+/// assembled system prompt (echoed back by the gateway) contains A's blackboard
+/// output, proving B read A's context. The gateway echoes each agent's SYSTEM, so
+/// A's output text is its distinct system marker ("PLANNER_SYS"); its appearance
+/// in B's prompt can ONLY come from B reading A off the blackboard.
+#[tokio::test]
+async fn agent_prompt_includes_its_dependency_output_from_the_blackboard() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gw, _c) = echo_system_gateway().await;
+    let mk = |name: &str, sys: &str| AgentDefinition {
+        name: name.into(),
+        area: "research".into(),
+        kind: "reasoning".into(),
+        chain: "c".into(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: sys.into(),
+    };
+    let registry = Arc::new(
+        Registry::default()
+            .with_agent(mk("planner", "PLANNER_SYS"))
+            .with_agent(mk("refiner", "REFINER_SYS")),
+    );
+    let graph = Graph {
+        nodes: vec![
+            agent_node("A", "planner", "plan it"),
+            agent_node_with_deps("B", "refiner", "refine", vec![Dep::hard("A")]),
+        ],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry)
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    let b_text = out.outputs[&NodeId("B".into())]["text"]
+        .as_str()
+        .expect("B has text");
+    assert!(
+        b_text.starts_with("REFINER_SYS"),
+        "B's prompt starts with its own system: {b_text}"
+    );
+    assert!(
+        b_text.contains("## Context") && b_text.contains("### A"),
+        "B's prompt has a Context section keyed by its dependency A: {b_text}"
+    );
+    assert!(
+        b_text.contains("PLANNER_SYS"),
+        "B read A's blackboard output (A's system marker) into its prompt: {b_text}"
     );
 }

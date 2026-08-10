@@ -468,3 +468,53 @@ pub async fn demo_reference_tool_gateway() -> (Gateway, CallLog) {
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     (Gateway::new(config, adapters, cb), calls)
 }
+
+/// A chat adapter that echoes the request's **system** prompt back as its answer
+/// (no tool calls). Lets a test assert what an agent's assembled system prompt
+/// contained — e.g. a dependency's output injected from the blackboard. `id`
+/// `"r"` binds it to the single-chain harness config.
+pub struct EchoSystemAdapter {
+    calls: CallLog,
+}
+
+impl Model for EchoSystemAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for EchoSystemAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let system = req.system.clone().unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), system.clone()));
+        Ok(ChatResponse {
+            content: Some(system),
+            tool_calls: Vec::new(),
+            usage: None,
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A single-chain gateway whose adapter echoes the system prompt back — the
+/// blackboard read-path fixture.
+pub async fn echo_system_gateway() -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(EchoSystemAdapter {
+            calls: calls.clone(),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
+}
