@@ -359,7 +359,21 @@ impl Executor {
                         // Compaction (§5.3): once a Consolidate completes, its Map's
                         // children are all terminal — collapse their per-child
                         // records to a digest manifest, off the hot fold path.
-                        if let NodeKind::Consolidate { over, .. } = &node.kind {
+                        // Restricted to `ModelCall`-body Maps (single effect per
+                        // child); an `Agent` child is multi-effect, so compacting
+                        // it is deferred.
+                        if let NodeKind::Consolidate { over, .. } = &node.kind
+                            && graph.nodes.iter().any(|n| {
+                                &n.id == over
+                                    && matches!(
+                                        &n.kind,
+                                        NodeKind::Map {
+                                            body: MapBody::ModelCall { .. },
+                                            ..
+                                        }
+                                    )
+                            })
+                        {
                             self.compact_map(run, over, &outcome).await?;
                         }
                     }
@@ -671,7 +685,7 @@ impl Executor {
                 }
             }
             NodeKind::Agent { agent, input } => {
-                match self.drive_agent(run, node, agent, input, fold).await? {
+                match self.drive_agent(run, &node.id, agent, input, fold).await? {
                     AgentStep::Completed(output) => Ok(NodeExec::Completed(output)),
                     AgentStep::Failed(message) => Ok(NodeExec::Failed {
                         message,
@@ -752,29 +766,33 @@ impl Executor {
             });
         }
 
-        // Run `body` once over the survivors. The structural effect id nests
-        // under this node's own path (`effect_id(node, 0, 0)`), so a resume
-        // memoizes the synthesis without re-spending. `NodeStarted`/`NodeCompleted`
-        // are guarded via the fold (resume-safe, like `run_map`/`drive_agent`).
-        if !fold.started.contains(&node.id) {
-            self.append(
-                run,
-                JournalEvent::NodeStarted {
-                    node: node.id.clone(),
-                },
-            )
-            .await?;
-        }
+        // Run `body` once over the survivors. A `ModelCall` body journals its own
+        // `NodeStarted`/synthesis effect/`NodeCompleted` (all fold-guarded,
+        // resume-safe); an `Agent` body delegates to `drive_agent`, which owns
+        // the node's `NodeStarted`/turns/`NodeCompleted` — so `run_consolidate`
+        // must not double-journal them.
         let input = serde_json::json!({ "results": survivors });
-        let output = match body {
+        match body {
             MapBody::ModelCall { chain } => {
+                if !fold.started.contains(&node.id) {
+                    self.append(
+                        run,
+                        JournalEvent::NodeStarted {
+                            node: node.id.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                // The structural effect id nests under this node's own path
+                // (`effect_id(node, 0, 0)`), so a resume memoizes the synthesis
+                // without re-spending.
                 let eid = effect_id(&node.id.0, 0, 0);
                 let payload = serde_json::json!({ "prompt": input.to_string() });
                 let ih = input_hash(chain, &payload)?;
 
                 // Memoized on resume: replay the recorded synthesis — no gateway
                 // call, no re-append. A hash mismatch is a determinism violation.
-                if let Some((recorded_ih, recorded)) = fold.memo.get(&eid) {
+                let output = if let Some((recorded_ih, recorded)) = fold.memo.get(&eid) {
                     if recorded_ih != &ih {
                         return Err(OrchestratorError::DeterminismViolation {
                             node: node.id.clone(),
@@ -821,19 +839,31 @@ impl Executor {
                             });
                         }
                     }
+                };
+                if !fold.completed.contains(&node.id) {
+                    self.append(
+                        run,
+                        JournalEvent::NodeCompleted {
+                            node: node.id.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                Ok(NodeExec::Completed(output))
+            }
+            MapBody::Agent(agent_ref) => {
+                match self
+                    .drive_agent(run, &node.id, agent_ref, &input, fold)
+                    .await?
+                {
+                    AgentStep::Completed(output) => Ok(NodeExec::Completed(output)),
+                    AgentStep::Failed(message) => Ok(NodeExec::Failed {
+                        message,
+                        output: None,
+                    }),
                 }
             }
-        };
-        if !fold.completed.contains(&node.id) {
-            self.append(
-                run,
-                JournalEvent::NodeCompleted {
-                    node: node.id.clone(),
-                },
-            )
-            .await?;
         }
-        Ok(NodeExec::Completed(output))
     }
 
     /// Run a `Map` node's internal bounded fan-out (§3.4). Journals
@@ -897,6 +927,19 @@ impl Executor {
                     MapBody::ModelCall { chain } => {
                         self.run_map_child_modelcall(run, &path, chain, item, fold)
                             .await
+                    }
+                    // An Agent child is a per-item ReAct sub-run at the child
+                    // path; its outer error is fatal, its `Failed` becomes the
+                    // child's manifest error, its `Completed` the child's value.
+                    MapBody::Agent(agent_ref) => {
+                        match self
+                            .drive_agent(run, &NodeId(path.clone()), agent_ref, item, fold)
+                            .await
+                        {
+                            Ok(AgentStep::Completed(output)) => Ok(Ok(output)),
+                            Ok(AgentStep::Failed(message)) => Ok(Err(message)),
+                            Err(fatal) => Err(fatal),
+                        }
                     }
                 };
                 (i, result)
@@ -1113,15 +1156,18 @@ enum NodeExec {
 }
 
 impl Executor {
-    /// Run one `Agent` node's ReAct loop. Each turn is a Pure `ModelCall` effect
-    /// (iteration-aware id `effect_id(node.id, turn, 0)`); each Pure tool call is a
-    /// Pure effect (`effect_id(node.id, turn, k+1)`). Memoized turns/tools replay
-    /// from the journal with no gateway call and no re-execution (resume without
-    /// re-spend); an input-hash mismatch halts with `DeterminismViolation`.
+    /// Run one agent ReAct loop against `node_id` — a top-level `Agent` node's id,
+    /// or a `Map`/`Consolidate` child path (`"{map}/{i}"`); the id is the only
+    /// thing the loop needs, so the same driver serves both. Each turn is a Pure
+    /// `ModelCall` effect (iteration-aware id `effect_id(node_id, turn, 0)`); each
+    /// Pure tool call is a Pure effect (`effect_id(node_id, turn, k+1)`). Memoized
+    /// turns/tools replay from the journal with no gateway call and no
+    /// re-execution (resume without re-spend); an input-hash mismatch halts with
+    /// `DeterminismViolation`.
     async fn drive_agent(
         &self,
         run: RunId,
-        node: &orchestrator_core::Node,
+        node_id: &NodeId,
         agent_ref: &AgentRef,
         input: &serde_json::Value,
         fold: &Fold,
@@ -1136,17 +1182,17 @@ impl Executor {
 
         let mut messages: Vec<Message> =
             vec![Message::text(MessageRole::User, render_input(input))];
-        let mut node_started = fold.started.contains(&node.id);
+        let mut node_started = fold.started.contains(node_id);
 
         for turn in 0..self.max_steps {
-            let eid = effect_id(&node.id.0, turn as u64, 0);
+            let eid = effect_id(&node_id.0, turn as u64, 0);
             let ih = agent_input_hash(&chain, &system, &messages, &tools)?;
 
             // Reuse a memoized turn (resume): no gateway call, no re-append.
             let turn_output = if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
                 if recorded_ih != &ih {
                     return Err(OrchestratorError::DeterminismViolation {
-                        node: node.id.clone(),
+                        node: node_id.clone(),
                         effect_id: eid,
                     });
                 }
@@ -1156,7 +1202,7 @@ impl Executor {
                 if over_budget(min_win, &system, &messages, &tools) {
                     let est = est_prompt_tokens(&system, &messages, &tools);
                     let err = OrchestratorError::PromptOverBudget {
-                        node: node.id.clone(),
+                        node: node_id.clone(),
                         turn,
                         est,
                         min_win: min_win.unwrap_or(0),
@@ -1165,7 +1211,7 @@ impl Executor {
                     self.append(
                         run,
                         JournalEvent::NodeFailed {
-                            node: node.id.clone(),
+                            node: node_id.clone(),
                             error: message.clone(),
                         },
                     )
@@ -1176,7 +1222,7 @@ impl Executor {
                     self.append(
                         run,
                         JournalEvent::NodeStarted {
-                            node: node.id.clone(),
+                            node: node_id.clone(),
                         },
                     )
                     .await?;
@@ -1194,7 +1240,7 @@ impl Executor {
                         self.append(
                             run,
                             JournalEvent::EffectRecorded {
-                                node: node.id.clone(),
+                                node: node_id.clone(),
                                 effect_id: eid,
                                 class: EffectClass::Pure,
                                 input_hash: ih,
@@ -1210,7 +1256,7 @@ impl Executor {
                         self.append(
                             run,
                             JournalEvent::NodeFailed {
-                                node: node.id.clone(),
+                                node: node_id.clone(),
                                 error: message.clone(),
                             },
                         )
@@ -1228,11 +1274,11 @@ impl Executor {
             )?;
             if tool_calls.is_empty() {
                 // Final answer.
-                if !fold.completed.contains(&node.id) {
+                if !fold.completed.contains(node_id) {
                     self.append(
                         run,
                         JournalEvent::NodeCompleted {
-                            node: node.id.clone(),
+                            node: node_id.clone(),
                         },
                     )
                     .await?;
@@ -1262,14 +1308,14 @@ impl Executor {
                 attachments: Vec::new(),
             });
             for (k, call) in tool_calls.iter().enumerate() {
-                let teid = effect_id(&node.id.0, turn as u64, k + 1);
+                let teid = effect_id(&node_id.0, turn as u64, k + 1);
                 let args: serde_json::Value =
                     serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
                 let tih = tool_input_hash(&call.name, &call.arguments);
                 let result = if let Some((recorded_ih, output)) = fold.memo.get(&teid) {
                     if recorded_ih != &tih {
                         return Err(OrchestratorError::DeterminismViolation {
-                            node: node.id.clone(),
+                            node: node_id.clone(),
                             effect_id: teid,
                         });
                     }
@@ -1281,7 +1327,7 @@ impl Executor {
                             self.append(
                                 run,
                                 JournalEvent::EffectRecorded {
-                                    node: node.id.clone(),
+                                    node: node_id.clone(),
                                     effect_id: teid,
                                     class: EffectClass::Pure,
                                     input_hash: tih,
@@ -1297,7 +1343,7 @@ impl Executor {
                             self.append(
                                 run,
                                 JournalEvent::NodeFailed {
-                                    node: node.id.clone(),
+                                    node: node_id.clone(),
                                     error: message.clone(),
                                 },
                             )
@@ -1312,13 +1358,13 @@ impl Executor {
 
         // Ran out of steps without a final answer.
         let err = OrchestratorError::AgentMaxStepsExceeded {
-            node: node.id.clone(),
+            node: node_id.clone(),
         };
         let message = err.to_string();
         self.append(
             run,
             JournalEvent::NodeFailed {
-                node: node.id.clone(),
+                node: node_id.clone(),
                 error: message.clone(),
             },
         )
@@ -3329,5 +3375,116 @@ mod tests {
             1,
             "resume re-called the gateway only for the tail n3: {recorded2:?}"
         );
+    }
+
+    /// Acceptance 10 (real e2e) — a `Map { body: Agent("researcher"), over: [3] }`
+    /// → `Consolidate { body: Agent("synthesizer") }` drives the REAL gateway
+    /// assembled from the demo catalog over the reference chain `research.bulk`.
+    /// Each child agent AND the synthesis agent fall over the credential-gated
+    /// cloud entries to `llama3.1-local`. Proves fan-out of real agents through a
+    /// real reference chain, consolidated, end-to-end.
+    #[tokio::test]
+    async fn map_of_agents_then_consolidate_drives_the_real_reference_chain_to_local_fallover() {
+        let (gateway, calls) = demo_reference_gateway().await;
+        let journal = InMemoryJournal::new();
+        let mk_agent = |name: &str| AgentDefinition {
+            name: name.into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: "research.bulk".into(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "Work carefully.".into(),
+        };
+        let registry = Arc::new(
+            Registry::default()
+                .with_agent(mk_agent("researcher"))
+                .with_agent(mk_agent("synthesizer")),
+        );
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_tools(Arc::new(ToolRegistry::default()));
+
+        let m = NodeId("m".into());
+        let cons = NodeId("cons".into());
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: m.clone(),
+                    kind: NodeKind::Map {
+                        body: MapBody::Agent(AgentRef("researcher".into())),
+                        over: vec![
+                            serde_json::json!("topic-0"),
+                            serde_json::json!("topic-1"),
+                            serde_json::json!("topic-2"),
+                        ],
+                        concurrency: 4,
+                        aggregation: Aggregation::BestEffort,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: cons.clone(),
+                    kind: NodeKind::Consolidate {
+                        over: m.clone(),
+                        min_viable: 1,
+                        body: MapBody::Agent(AgentRef("synthesizer".into())),
+                    },
+                    deps: vec![Dep::soft("m")],
+                },
+            ],
+        };
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = exec.run(run, &graph).await.expect("e2e run");
+
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+        assert!(
+            outcome.completed.contains(&m) && outcome.completed.contains(&cons),
+            "the Map and the Consolidate both completed: {:?}",
+            outcome.completed
+        );
+
+        // All 3 child agents succeeded, each served by the local fallover model.
+        assert_eq!(outcome.outputs[&m]["manifest"]["ok"], 3);
+        let results = outcome.outputs[&m]["results"].as_array().expect("results");
+        assert_eq!(results.len(), 3);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(
+                r["ok"]["model"], "llama3.1-local",
+                "child {i} fell over to the local model: {r}"
+            );
+        }
+        // The synthesis agent also ran on the reference chain and fell over local.
+        assert_eq!(
+            outcome.outputs[&cons]["model"], "llama3.1-local",
+            "the Consolidate's agent synthesized via the local fallover: {:?}",
+            outcome.outputs[&cons]
+        );
+
+        // The chain genuinely reached the local adapter once per agent turn:
+        // 3 child agents (one no-tool turn each) + 1 synthesis agent = 4 calls.
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            4,
+            "3 fanned-out agents + 1 synthesis agent each hit the local adapter once"
+        );
+
+        // The children ran as AGENT sub-runs (a ReAct node lifecycle at the child
+        // path), not bare ModelCalls — each journals its own NodeStarted/Completed.
+        let labels: Vec<String> = journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| label(e))
+            .collect();
+        for i in 0..3 {
+            assert!(
+                labels.contains(&format!("NodeStarted(m/{i})"))
+                    && labels.contains(&format!("NodeCompleted(m/{i})")),
+                "child {i} ran as an agent sub-run (has its own node lifecycle): {labels:?}"
+            );
+        }
     }
 }

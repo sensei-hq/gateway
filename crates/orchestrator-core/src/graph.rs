@@ -38,12 +38,14 @@ pub enum NodeKind {
     },
 }
 
-/// What a `Map` runs per item. Slice 3 ships `ModelCall` children (one Pure
-/// effect each); an `Agent` body (a per-item ReAct sub-run) arrives with
-/// `Consolidate`/the fan-out e2e.
+/// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure
+/// effect; an `Agent` child is a per-item ReAct sub-run (its effects nest under
+/// the child path `"{node}/{i}"`), which is how the fan-out e2e drives real
+/// agents through a reference chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MapBody {
     ModelCall { chain: String },
+    Agent(crate::registry::AgentRef),
 }
 
 /// How a `Map` folds its children's success/failure into the node's own status
