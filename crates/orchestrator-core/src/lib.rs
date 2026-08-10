@@ -10,6 +10,7 @@ pub mod error;
 pub mod graph;
 pub mod ids;
 pub mod journal;
+pub mod reconcile;
 pub mod registry;
 
 pub use clock::{Clock, SystemClock};
@@ -22,4 +23,5 @@ pub use ids::{NodeId, RunId, Seq};
 pub use journal::{
     ChildStatus, CompactChild, ExecutionJournal, JournalEvent, ObservationMeta, Snapshot,
 };
+pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use registry::{AgentDefinition, AgentRef, Registry, SkillDef, ToolSpec};
