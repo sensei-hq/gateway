@@ -10,9 +10,9 @@ use kernel::types::request::{
     InferenceRequest, Message, MessageContent, MessageRole, Payload, ToolCall, ToolDefinition,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, Aggregation, ContentRef, ContentStore, EffectClass, EffectId,
-    EffectOutput, ExecutionJournal, Graph, JournalEvent, MapBody, NodeId, NodeKind,
-    OrchestratorError, Registry, RunId, Seq, Snapshot, effect_id,
+    AgentDefinition, AgentRef, Aggregation, ChildStatus, CompactChild, ContentRef, ContentStore,
+    EffectClass, EffectId, EffectOutput, ExecutionJournal, Graph, JournalEvent, MapBody, NodeId,
+    NodeKind, OrchestratorError, Registry, RunId, Seq, Snapshot, effect_id,
 };
 use sha2::{Digest, Sha256};
 
@@ -217,6 +217,28 @@ impl Executor {
                     fold.completed.insert(node.clone());
                     outcome.completed.push(node.clone());
                 }
+                // A compacted Map's children were dropped from the log; rebuild
+                // their memo entries from the manifest (as content refs) so the
+                // Map replays on resume without re-spending (§5.3).
+                JournalEvent::MapCompacted { node, children } => {
+                    for c in children {
+                        if c.status == ChildStatus::Ok
+                            && let (Some(digest), Some(input_hash)) = (&c.digest, &c.input_hash)
+                        {
+                            let child = NodeId(format!("{}/{}", node.0, c.index));
+                            let output = EffectOutput::Ref(ContentRef {
+                                digest: digest.clone(),
+                                size: 0,
+                                summary: None,
+                            });
+                            fold.memo.insert(
+                                effect_id(&child.0, 0, 0),
+                                (input_hash.clone(), output.clone()),
+                            );
+                            node_last_output.insert(child, output);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -334,6 +356,12 @@ impl Executor {
                         outcome.completed.push(node.id.clone());
                         completed.insert(node.id.clone());
                         terminal.insert(node.id.clone());
+                        // Compaction (§5.3): once a Consolidate completes, its Map's
+                        // children are all terminal — collapse their per-child
+                        // records to a digest manifest, off the hot fold path.
+                        if let NodeKind::Consolidate { over, .. } = &node.kind {
+                            self.compact_map(run, over, &outcome).await?;
+                        }
                     }
                     NodeExec::Failed { message, output } => {
                         // Carry a node's failure output (a Map's manifest) into
@@ -369,6 +397,105 @@ impl Executor {
             self.append(run, JournalEvent::RunCompleted).await?;
         }
         Ok(outcome)
+    }
+
+    /// Compact a completed `Map`'s per-child journal records (§5.3): collect its
+    /// children's `EffectRecorded` (structural path `"{map}/{i}"`), ensure each
+    /// output is addressable in the CAS (an inline one is `put` to obtain its
+    /// digest; a ref already has one), then `compact` the journal — drop those
+    /// child records and append a `MapCompacted` manifest of `{index, status,
+    /// digest, input_hash}`. Failed children (which journaled no output) are
+    /// recorded from the Map's result manifest as `Failed`. A no-CAS executor
+    /// skips compaction (nowhere to keep the content addressable).
+    async fn compact_map(
+        &self,
+        run: RunId,
+        map: &NodeId,
+        outcome: &RunOutcome,
+    ) -> Result<(), OrchestratorError> {
+        let Some(content) = &self.content else {
+            return Ok(());
+        };
+        let events = self
+            .journal
+            .load(run)
+            .await
+            .map_err(OrchestratorError::Journal)?;
+        let prefix = format!("{}/", map.0);
+
+        let mut remove_seqs = Vec::new();
+        let mut children = Vec::new();
+        for (seq, event) in &events {
+            let JournalEvent::EffectRecorded {
+                node,
+                input_hash,
+                output,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let Some(index) = node
+                .0
+                .strip_prefix(&prefix)
+                .and_then(|i| i.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            remove_seqs.push(*seq);
+            // Materialize the child's content address: a ref already has one; an
+            // inline value is put into the CAS (same bytes `split_output` would
+            // have written, so the digest is stable).
+            let digest = match output {
+                EffectOutput::Ref(r) => r.digest.clone(),
+                EffectOutput::Inline(value) => content.put(&serde_json::to_vec(value)?).await?,
+            };
+            children.push(CompactChild {
+                index,
+                status: ChildStatus::Ok,
+                digest: Some(digest),
+                input_hash: Some(input_hash.clone()),
+            });
+        }
+
+        if remove_seqs.is_empty() {
+            return Ok(()); // already compacted, or a body kind with no child records
+        }
+
+        // Record the failed children (no journal record to drop) from the Map's
+        // result manifest, so the compacted manifest describes the whole fan-out.
+        if let Some(results) = outcome
+            .outputs
+            .get(map)
+            .and_then(|o| o.get("results"))
+            .and_then(|r| r.as_array())
+        {
+            for r in results {
+                if r.get("error").is_some()
+                    && let Some(index) = r.get("index").and_then(|i| i.as_u64())
+                {
+                    children.push(CompactChild {
+                        index: index as usize,
+                        status: ChildStatus::Failed,
+                        digest: None,
+                        input_hash: None,
+                    });
+                }
+            }
+        }
+        children.sort_by_key(|c| c.index);
+
+        self.journal
+            .compact(
+                run,
+                &remove_seqs,
+                JournalEvent::MapCompacted {
+                    node: map.clone(),
+                    children,
+                },
+            )
+            .await
+            .map_err(OrchestratorError::Journal)
     }
 
     /// Write a round-boundary [`Snapshot`] of the current outcome to the journal's
@@ -3034,6 +3161,173 @@ mod tests {
         assert_eq!(
             body_count, 1,
             "the Consolidate body effect recorded exactly once"
+        );
+    }
+
+    /// Acceptance 9 (compaction) — once a `Map`'s `Consolidate` completes, the
+    /// Map's per-child `EffectRecorded` records collapse to a `MapCompacted`
+    /// manifest of `{index, status, digest}`; the child content stays fetchable
+    /// from the CAS by digest (never dropped).
+    #[tokio::test]
+    async fn compaction_collapses_a_consolidated_maps_child_records_to_digests() {
+        use orchestrator_store::InMemoryContentStore;
+        let (gateway, _calls) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let content = Arc::new(InMemoryContentStore::new());
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+            .with_content_store(content.clone())
+            .with_cas_threshold(8); // child outputs (~38 bytes) split into the CAS
+        let m = NodeId("m".into());
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: m.clone(),
+                    kind: NodeKind::Map {
+                        body: MapBody::ModelCall { chain: "c".into() },
+                        over: map_items(["i0", "i1", "i2"]),
+                        concurrency: 4,
+                        aggregation: Aggregation::BestEffort,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("cons".into()),
+                    kind: NodeKind::Consolidate {
+                        over: m.clone(),
+                        min_viable: 1,
+                        body: MapBody::ModelCall { chain: "c".into() },
+                    },
+                    deps: vec![Dep::soft("m")],
+                },
+            ],
+        };
+        let run = RunId(uuid::Uuid::new_v4());
+        let out = exec.run(run, &graph).await.expect("run");
+        assert!(out.failed.is_none(), "{:?}", out.failed);
+
+        let events = journal.load(run).await.unwrap();
+        // The Map's per-child EffectRecorded are gone (collapsed).
+        let child_records = events
+            .iter()
+            .filter(|(_, e)| {
+                matches!(e, JournalEvent::EffectRecorded { node, .. } if node.0.starts_with("m/"))
+            })
+            .count();
+        assert_eq!(
+            child_records, 0,
+            "the Map's child records are compacted away"
+        );
+
+        // A MapCompacted manifest carries {index,status,digest} for all 3 children.
+        let manifest = events
+            .iter()
+            .find_map(|(_, e)| match e {
+                JournalEvent::MapCompacted { node, children } if node == &m => {
+                    Some(children.clone())
+                }
+                _ => None,
+            })
+            .expect("MapCompacted manifest present");
+        assert_eq!(manifest.len(), 3, "one record per child");
+        for c in &manifest {
+            assert_eq!(c.status, ChildStatus::Ok);
+            let digest = c.digest.clone().expect("an ok child carries a digest");
+            // The child content is still fetchable from the CAS by digest.
+            let bytes = content
+                .get(&digest)
+                .await
+                .expect("child content fetchable from the CAS");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["text"], "canned-response");
+        }
+    }
+
+    /// Acceptance 9 (resume after compaction) — a Map whose child records were
+    /// compacted still replays on resume with ZERO re-spend: the fold rebuilds the
+    /// children's memo (as content refs) from the `MapCompacted` manifest, so a
+    /// replay materializes them from the shared CAS instead of re-dispatching.
+    #[tokio::test]
+    async fn resume_after_compaction_replays_the_map_from_the_cas_without_respending() {
+        use orchestrator_store::InMemoryContentStore;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        // The CAS is SHARED across runs — the compacted refs point into it.
+        let content = Arc::new(InMemoryContentStore::new());
+        let cons = NodeId("cons".into());
+        let n3 = NodeId("n3".into());
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("m".into()),
+                    kind: NodeKind::Map {
+                        body: MapBody::ModelCall { chain: "c".into() },
+                        over: map_items(["i0", "i1", "i2"]),
+                        concurrency: 4,
+                        aggregation: Aggregation::BestEffort,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: cons.clone(),
+                    kind: NodeKind::Consolidate {
+                        over: NodeId("m".into()),
+                        min_viable: 1,
+                        body: MapBody::ModelCall { chain: "c".into() },
+                    },
+                    deps: vec![Dep::soft("m")],
+                },
+                Node {
+                    id: n3.clone(),
+                    kind: model_call("c", "tail"),
+                    deps: vec![Dep::hard("cons")],
+                },
+            ],
+        };
+
+        // Run 1: 3 children (1–3) + cons body (4) succeed; cons completes and
+        // compacts the Map; n3 fails (5) → no RunCompleted.
+        let (gw1, calls1) = failing_after_gateway(4).await;
+        let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+            .with_content_store(content.clone())
+            .with_cas_threshold(8);
+        let out1 = exec1
+            .run(run, &graph)
+            .await
+            .expect("run 1 yields an outcome");
+        assert!(out1.failed.is_some(), "n3 fails in run 1");
+        assert_eq!(calls1.lock().unwrap().len(), 5);
+        // The Map was compacted in run 1.
+        assert!(
+            journal
+                .load(run)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, e)| matches!(e, JournalEvent::MapCompacted { .. })),
+            "the Map was compacted after the Consolidate completed"
+        );
+
+        // Run 2: resume on a FRESH gateway + the SHARED CAS.
+        let (gw2, calls2) = recording_gateway().await;
+        let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+            .with_content_store(content.clone())
+            .with_cas_threshold(8);
+        let out2 = exec2.start(run, &graph).await.expect("resume completes");
+        assert!(out2.failed.is_none(), "{:?}", out2.failed);
+        assert!(out2.completed.contains(&cons) && out2.completed.contains(&n3));
+        assert_eq!(
+            out2.outputs[&NodeId("m".into())]["manifest"]["ok"],
+            3,
+            "the compacted Map's output is reconstructed from the CAS"
+        );
+
+        // Re-spend nothing: the Map's children (compacted) and the Consolidate
+        // body replay from the CAS/memo; only the tail n3 hits the gateway.
+        let recorded2 = calls2.lock().unwrap().clone();
+        assert_eq!(
+            recorded2.len(),
+            1,
+            "resume re-called the gateway only for the tail n3: {recorded2:?}"
         );
     }
 }
