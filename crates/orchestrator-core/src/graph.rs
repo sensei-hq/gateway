@@ -26,6 +26,16 @@ pub enum NodeKind {
         concurrency: usize,
         aggregation: Aggregation,
     },
+    /// Aggregate the survivors of a `Map` (§3.5). Soft-depends on `over` (so it
+    /// runs even when the Map ended `Failed`), reads the Map's **successful**
+    /// results, and runs `body` once over them. If fewer than `min_viable`
+    /// survived, it halts loudly (`ConsolidateStarved`) rather than synthesizing
+    /// over an empty/degenerate set.
+    Consolidate {
+        over: NodeId,
+        min_viable: usize,
+        body: MapBody,
+    },
 }
 
 /// What a `Map` runs per item. Slice 3 ships `ModelCall` children (one Pure

@@ -29,12 +29,16 @@ pub struct Executor {
     concurrency: usize,
 }
 
-/// The terminal outcome of a run: the nodes that completed, the first failure
-/// (which halts the run), and each node's memoized output.
+/// The terminal outcome of a run: the nodes that completed, the first failure,
+/// the nodes cascade-skipped by a failure (across hard edges), and each node's
+/// memoized output. A run with a failure is not marked `RunCompleted` (it stays
+/// resumable), but soft-dependents of the failure still run and appear in
+/// `completed`.
 #[derive(Debug, Default)]
 pub struct RunOutcome {
     pub completed: Vec<NodeId>,
     pub failed: Option<(NodeId, String)>,
+    pub skipped: Vec<NodeId>,
     pub outputs: HashMap<NodeId, serde_json::Value>,
 }
 
@@ -235,10 +239,11 @@ impl Executor {
     /// is `terminal` (§3.2). Ready nodes in a round are dispatched in
     /// declaration order (deterministic); after the round the ready set is
     /// recomputed. A **linear** graph has exactly one ready node per round, so
-    /// this reproduces the slice-1/2 sequential order byte-for-byte. The first
-    /// node `Failed` halts the run without `RunCompleted` (resumable) — the
-    /// slice-1/2 contract; cascade-skip across hard edges arrives in a later
-    /// increment.
+    /// this reproduces the slice-1/2 sequential order byte-for-byte. A `Failed`
+    /// node cascade-skips its hard-dependents (§3.3) but does NOT halt the run —
+    /// soft-dependent branches still run; the failure suppresses `RunCompleted`,
+    /// so the run stays resumable (the slice-1/2 contract on a linear graph,
+    /// where the failure has no downstream to skip).
     async fn drive(
         &self,
         run: RunId,
@@ -271,7 +276,13 @@ impl Executor {
             }
 
             for (index, node) in ready {
-                match self.run_node(run, index, node, fold).await? {
+                // The immutable borrow of `outcome.outputs` (a Consolidate reads
+                // its Map's result from it) ends when the future resolves, before
+                // the match body mutates `outcome`.
+                let exec = self
+                    .run_node(run, index, node, fold, &outcome.outputs)
+                    .await?;
+                match exec {
                     NodeExec::Completed(output) => {
                         outcome.outputs.insert(node.id.clone(), output);
                         outcome.completed.push(node.id.clone());
@@ -280,20 +291,73 @@ impl Executor {
                     }
                     NodeExec::Failed { message, output } => {
                         // Carry a node's failure output (a Map's manifest) into
-                        // the outcome, then surface the failure and halt the run
-                        // without `RunCompleted` (resumable) — the slice-1/2
-                        // contract.
+                        // the outcome — never dropped (§3.4).
                         if let Some(output) = output {
                             outcome.outputs.insert(node.id.clone(), output);
                         }
-                        outcome.failed = Some((node.id.clone(), message));
-                        return Ok(outcome);
+                        // Record the first failure; mark the node terminal, then
+                        // cascade-skip its hard-dependents. The run does NOT halt:
+                        // soft-dependents of the failure still become ready and
+                        // run (§3.3). The failure suppresses `RunCompleted` below,
+                        // so the run stays resumable.
+                        if outcome.failed.is_none() {
+                            outcome.failed = Some((node.id.clone(), message));
+                        }
+                        terminal.insert(node.id.clone());
+                        self.cascade_skip_from(run, graph, &node.id, &mut terminal, &mut outcome)
+                            .await?;
                     }
                 }
             }
         }
-        self.append(run, JournalEvent::RunCompleted).await?;
+        // A run with any failure is not marked complete — it stays resumable
+        // (the slice-1/2 contract), even though soft-dependent branches ran.
+        if outcome.failed.is_none() {
+            self.append(run, JournalEvent::RunCompleted).await?;
+        }
         Ok(outcome)
+    }
+
+    /// Cascade-skip: mark every not-yet-terminal node that `Hard`-depends on
+    /// `origin` as `Skipped` — journaling `NodeSkipped`, adding it to the
+    /// terminal set and to `RunOutcome.skipped` — and recurse into ITS
+    /// hard-dependents (§3.3). `Soft` edges never cascade, so a soft-dependent
+    /// of a failed/skipped node is left runnable. Deterministic in graph
+    /// declaration order; each node is skipped at most once (guarded by the
+    /// terminal set).
+    async fn cascade_skip_from(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        origin: &NodeId,
+        terminal: &mut std::collections::HashSet<NodeId>,
+        outcome: &mut RunOutcome,
+    ) -> Result<(), OrchestratorError> {
+        let mut frontier = vec![origin.clone()];
+        while let Some(current) = frontier.pop() {
+            for node in &graph.nodes {
+                if terminal.contains(&node.id) {
+                    continue;
+                }
+                let hard_on_current = node
+                    .deps
+                    .iter()
+                    .any(|dep| dep.kind == orchestrator_core::EdgeKind::Hard && dep.on == current);
+                if hard_on_current {
+                    self.append(
+                        run,
+                        JournalEvent::NodeSkipped {
+                            node: node.id.clone(),
+                        },
+                    )
+                    .await?;
+                    terminal.insert(node.id.clone());
+                    outcome.skipped.push(node.id.clone());
+                    frontier.push(node.id.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute one node to a terminal result. `index` is the node's declaration
@@ -303,13 +367,16 @@ impl Executor {
     /// live one journals `NodeStarted → EffectRecorded → NodeCompleted`. An
     /// `Agent` node delegates to [`drive_agent`](Self::drive_agent), which owns
     /// its own per-turn journaling. A determinism violation propagates as `Err`
-    /// (halting the run before any gateway call).
+    /// (halting the run before any gateway call). `prior_outputs` carries the
+    /// outputs of already-completed nodes this round advances past — a
+    /// `Consolidate` reads its Map's result from it.
     async fn run_node(
         &self,
         run: RunId,
         index: usize,
         node: &orchestrator_core::Node,
         fold: &Fold,
+        prior_outputs: &HashMap<NodeId, serde_json::Value>,
     ) -> Result<NodeExec, OrchestratorError> {
         match &node.kind {
             NodeKind::ModelCall { chain, payload } => {
@@ -404,7 +471,134 @@ impl Executor {
                 self.run_map(run, node, body, over, *concurrency, aggregation, fold)
                     .await
             }
+            NodeKind::Consolidate {
+                over,
+                min_viable,
+                body,
+            } => {
+                self.run_consolidate(run, node, over, *min_viable, body, prior_outputs)
+                    .await
+            }
         }
+    }
+
+    /// Run a `Consolidate` node (§3.5): read the successful results of its `over`
+    /// Map from `prior_outputs`, gate on `min_viable` (fewer survivors ⇒
+    /// `ConsolidateStarved`, a loud halt — never a silent empty synthesis), then
+    /// run `body` **once** over the collected survivors and return its output. A
+    /// determinism violation / journal-write error aborts as `Err`.
+    async fn run_consolidate(
+        &self,
+        run: RunId,
+        node: &orchestrator_core::Node,
+        over: &NodeId,
+        min_viable: usize,
+        body: &MapBody,
+        prior_outputs: &HashMap<NodeId, serde_json::Value>,
+    ) -> Result<NodeExec, OrchestratorError> {
+        // Collect the Map's successful results (the `ok` value of each child) in
+        // item order. A missing/absent Map output yields zero survivors, which
+        // the min-viable gate turns into a loud starvation rather than a silent
+        // empty synthesis.
+        let survivors: Vec<serde_json::Value> = prior_outputs
+            .get(over)
+            .and_then(|map_out| map_out.get("results"))
+            .and_then(|results| results.as_array())
+            .map(|results| {
+                results
+                    .iter()
+                    .filter_map(|r| r.get("ok").cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if survivors.len() < min_viable {
+            let err = OrchestratorError::ConsolidateStarved {
+                node: node.id.clone(),
+                have: survivors.len(),
+                need: min_viable,
+            };
+            let message = err.to_string();
+            self.append(
+                run,
+                JournalEvent::NodeFailed {
+                    node: node.id.clone(),
+                    error: message.clone(),
+                },
+            )
+            .await?;
+            return Ok(NodeExec::Failed {
+                message,
+                output: None,
+            });
+        }
+
+        // Run `body` once over the survivors. The structural effect id nests
+        // under this node's own path (`effect_id(node, 0, 0)`), so a resume
+        // memoizes the synthesis without re-spending.
+        self.append(
+            run,
+            JournalEvent::NodeStarted {
+                node: node.id.clone(),
+            },
+        )
+        .await?;
+        let input = serde_json::json!({ "results": survivors });
+        let output = match body {
+            MapBody::ModelCall { chain } => {
+                // Structural effect id under this node's own path; resume
+                // memoization of the synthesis lands with the snapshot/resume
+                // increment (slice 3 runs it live).
+                let eid = effect_id(&node.id.0, 0, 0);
+                let payload = serde_json::json!({ "prompt": input.to_string() });
+                let ih = input_hash(chain, &payload)?;
+                let request = build_request(chain, &payload);
+                match self.gateway.execute(&request).await {
+                    Ok(response) => {
+                        let output = serde_json::json!({
+                            "model": response.model,
+                            "text": response.content.clone().unwrap_or_default(),
+                        });
+                        self.append(
+                            run,
+                            JournalEvent::EffectRecorded {
+                                node: node.id.clone(),
+                                effect_id: eid,
+                                class: EffectClass::Pure,
+                                input_hash: ih,
+                                seq: 0,
+                                output: output.clone(),
+                            },
+                        )
+                        .await?;
+                        output
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: node.id.clone(),
+                                error: message.clone(),
+                            },
+                        )
+                        .await?;
+                        return Ok(NodeExec::Failed {
+                            message,
+                            output: None,
+                        });
+                    }
+                }
+            }
+        };
+        self.append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: node.id.clone(),
+            },
+        )
+        .await?;
+        Ok(NodeExec::Completed(output))
     }
 
     /// Run a `Map` node's internal bounded fan-out (§3.4). Journals
@@ -1470,6 +1664,7 @@ mod tests {
             JournalEvent::EffectRecorded { node, .. } => format!("EffectRecorded({})", node.0),
             JournalEvent::NodeCompleted { node } => format!("NodeCompleted({})", node.0),
             JournalEvent::NodeFailed { node, .. } => format!("NodeFailed({})", node.0),
+            JournalEvent::NodeSkipped { node } => format!("NodeSkipped({})", node.0),
             JournalEvent::MapExpanded { node, child_count } => {
                 format!("MapExpanded({}x{})", node.0, child_count)
             }
@@ -1637,6 +1832,170 @@ mod tests {
             out2.outputs[&m]["manifest"]["failed"], 3,
             "the failure manifest is carried into the outcome, never dropped"
         );
+    }
+
+    /// Acceptance 4 — a failed node cascade-skips its hard-dependents
+    /// (transitively across hard edges), journaling `NodeSkipped` and surfacing
+    /// them in `RunOutcome.skipped`; a node that only *soft*-depends on the
+    /// failure still runs.
+    #[tokio::test]
+    async fn cascade_skip_hard_dependents_but_run_soft_dependents() {
+        let (gateway, _calls) = content_gated_gateway().await;
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+
+        let mc = |p: &str| NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": p }),
+        };
+        // f fails; h hard-deps f → skip; h2 hard-deps h → cascade-skip;
+        // s soft-deps f → still runs.
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("f".into()),
+                    kind: mc("FAIL"),
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("h".into()),
+                    kind: mc("h-ok"),
+                    deps: vec![Dep::hard("f")],
+                },
+                Node {
+                    id: NodeId("h2".into()),
+                    kind: mc("h2-ok"),
+                    deps: vec![Dep::hard("h")],
+                },
+                Node {
+                    id: NodeId("s".into()),
+                    kind: mc("s-ok"),
+                    deps: vec![Dep::soft("f")],
+                },
+            ],
+        };
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = exec.run(run, &graph).await.expect("run yields an outcome");
+
+        let (fnode, _) = outcome.failed.as_ref().expect("f failed");
+        assert_eq!(fnode.0, "f");
+
+        let skipped: Vec<&str> = outcome.skipped.iter().map(|n| n.0.as_str()).collect();
+        assert!(
+            skipped.contains(&"h"),
+            "h hard-depends on failed f → skipped: {skipped:?}"
+        );
+        assert!(
+            skipped.contains(&"h2"),
+            "h2 hard-depends on skipped h → cascade-skipped: {skipped:?}"
+        );
+        assert!(
+            outcome.completed.iter().any(|n| n.0 == "s"),
+            "s soft-depends on f → still runs"
+        );
+        assert!(!skipped.contains(&"s"), "s is not skipped");
+
+        // NodeSkipped is journaled for both h and h2 (no silent skip).
+        let skips: Vec<String> = journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::NodeSkipped { node } => Some(node.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(skips.contains(&"h".to_string()) && skips.contains(&"h2".to_string()));
+
+        // A failed run never writes RunCompleted (stays resumable).
+        assert!(
+            !journal
+                .load(run)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+            "a run with a failure is not marked complete"
+        );
+    }
+
+    /// A `Map`("m", BestEffort over 5 with 2 failing) → `Consolidate`("cons")
+    /// soft-depending on it, with the given `min_viable`.
+    fn consolidate_graph(min_viable: usize) -> Graph {
+        Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("m".into()),
+                    kind: NodeKind::Map {
+                        body: MapBody::ModelCall { chain: "c".into() },
+                        over: map_items(["a", "b", "c", "FAIL", "FAIL"]),
+                        concurrency: 4,
+                        aggregation: Aggregation::BestEffort,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("cons".into()),
+                    kind: NodeKind::Consolidate {
+                        over: NodeId("m".into()),
+                        min_viable,
+                        body: MapBody::ModelCall { chain: "c".into() },
+                    },
+                    deps: vec![Dep::soft("m")],
+                },
+            ],
+        }
+    }
+
+    /// Acceptance 5 — `Consolidate` synthesizes over the Map's survivors when
+    /// they meet `min_viable`, and halts loudly (`ConsolidateStarved`) when they
+    /// don't — never a silent empty synthesis.
+    #[tokio::test]
+    async fn consolidate_synthesizes_survivors_and_starves_below_min_viable() {
+        let cons = NodeId("cons".into());
+
+        // 3 survivors ≥ min_viable 3 → Consolidate runs and produces output.
+        let (g1, _c1) = content_gated_gateway().await;
+        let exec1 = Executor::new(Arc::new(g1), Arc::new(InMemoryJournal::new()), "v1");
+        let out1 = exec1
+            .run(RunId(uuid::Uuid::new_v4()), &consolidate_graph(3))
+            .await
+            .expect("runs");
+        assert!(
+            out1.failed.is_none(),
+            "3 survivors ≥ min_viable 3: {:?}",
+            out1.failed
+        );
+        assert!(
+            out1.completed.iter().any(|n| n.0 == "cons"),
+            "consolidate completed"
+        );
+        assert!(
+            out1.outputs.contains_key(&cons),
+            "consolidate produced a synthesis output"
+        );
+
+        // Only 3 survivors < min_viable 4 → ConsolidateStarved (loud halt).
+        let (g2, _c2) = content_gated_gateway().await;
+        let exec2 = Executor::new(Arc::new(g2), Arc::new(InMemoryJournal::new()), "v1");
+        let out2 = exec2
+            .run(RunId(uuid::Uuid::new_v4()), &consolidate_graph(4))
+            .await
+            .expect("runs");
+        let (fnode, msg) = out2.failed.as_ref().expect("starved below min_viable");
+        assert_eq!(fnode.0, "cons");
+        assert!(
+            msg.contains("starved") || msg.contains("viable"),
+            "loud starvation message: {msg}"
+        );
+        assert!(
+            !out2.completed.iter().any(|n| n.0 == "cons"),
+            "a starved consolidate does not complete"
+        );
+        // The Map's manifest is still carried through, never dropped.
+        assert_eq!(out2.outputs[&NodeId("m".into())]["manifest"]["ok"], 3);
     }
 
     #[tokio::test]
