@@ -1840,6 +1840,9 @@ mod tests {
             JournalEvent::MapExpanded { node, child_count } => {
                 format!("MapExpanded({}x{})", node.0, child_count)
             }
+            JournalEvent::MapCompacted { node, children } => {
+                format!("MapCompacted({}x{})", node.0, children.len())
+            }
             JournalEvent::RunCompleted => "RunCompleted".to_string(),
             JournalEvent::RunPaused { .. } => "RunPaused".to_string(),
         }
