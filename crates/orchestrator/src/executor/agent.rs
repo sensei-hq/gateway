@@ -7,7 +7,7 @@ use kernel::types::request::{
 };
 use orchestrator_core::{
     AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, ObservationMeta,
-    OrchestratorError, RunId, effect_id, idempotency_key,
+    OrchestratorError, ReconcileOutcome, RunId, effect_id, idempotency_key,
 };
 
 use super::support::{
@@ -15,6 +15,15 @@ use super::support::{
 };
 use super::{AgentStep, Executor, Fold};
 use crate::agent::prompt::{assemble_prompt, over_budget};
+
+/// The 3-way outcome of one tool effect (or one ReAct turn's tools, §7.3): a
+/// value/transcript, a node failure (already journaled `NodeFailed`), or a durable
+/// pause (`RunPaused` journaled) — an in-doubt Mutation awaiting resolution.
+enum ToolOutcome<T> {
+    Ok(T),
+    Failed(String),
+    Paused(String),
+}
 
 /// The invariant-across-turns context of one agent invocation — assembled once
 /// (agent lookup, prompt, chain, window budget) so the per-turn helpers share it
@@ -90,8 +99,9 @@ impl Executor {
             // Not a final answer → execute this turn's tool calls and extend the
             // transcript. A tool failure ends the node (already journaled).
             match self.run_agent_tools(&ar, turn, &turn_output).await? {
-                Ok(turn_messages) => messages.extend(turn_messages),
-                Err(failure) => return Ok(AgentStep::Failed(failure)),
+                ToolOutcome::Ok(turn_messages) => messages.extend(turn_messages),
+                ToolOutcome::Failed(failure) => return Ok(AgentStep::Failed(failure)),
+                ToolOutcome::Paused(reason) => return Ok(AgentStep::Paused(reason)),
             }
         }
 
@@ -209,7 +219,7 @@ impl Executor {
         ar: &AgentRun<'_>,
         turn: usize,
         turn_output: &serde_json::Value,
-    ) -> Result<Result<Vec<Message>, String>, OrchestratorError> {
+    ) -> Result<ToolOutcome<Vec<Message>>, OrchestratorError> {
         let assistant_text = turn_output
             .get("text")
             .and_then(|v| v.as_str())
@@ -231,13 +241,14 @@ impl Executor {
         }];
         for (k, call) in tool_calls.iter().enumerate() {
             let teid = effect_id(&ar.node_id.0, turn as u64, k + 1);
-            let result = match self.execute_tool_effect(ar, &teid, call).await? {
-                Ok(value) => value,
-                Err(failure) => return Ok(Err(failure)),
+            let value = match self.execute_tool_effect(ar, &teid, call).await? {
+                ToolOutcome::Ok(value) => value,
+                ToolOutcome::Failed(failure) => return Ok(ToolOutcome::Failed(failure)),
+                ToolOutcome::Paused(reason) => return Ok(ToolOutcome::Paused(reason)),
             };
-            out.push(Message::tool_result(call.id.clone(), result.to_string()));
+            out.push(Message::tool_result(call.id.clone(), value.to_string()));
         }
-        Ok(Ok(out))
+        Ok(ToolOutcome::Ok(out))
     }
 
     /// Execute (or replay) ONE tool call as a durable effect, dispatched by its
@@ -258,7 +269,7 @@ impl Executor {
         ar: &AgentRun<'_>,
         teid: &EffectId,
         call: &ToolCall,
-    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let args: serde_json::Value =
             serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
         let tih = tool_input_hash(&call.name, &call.arguments);
@@ -279,7 +290,7 @@ impl Executor {
             }
             let stale = class == EffectClass::Observation && !self.observation_fresh(ar, teid);
             if !stale {
-                return Ok(Ok(self.materialize(output).await?));
+                return Ok(ToolOutcome::Ok(self.materialize(output).await?));
             }
         }
 
@@ -303,10 +314,10 @@ impl Executor {
         }
     }
 
-    /// The live path for a Mutation effect (§7.3): journal an `EffectIntent`
-    /// (idempotency key + args hash) BEFORE the side effect, then execute and
-    /// record. On a crash between the two, resume finds the Intent without a
-    /// Recorded — the in-doubt case reconciled in slice-4 Task 9.
+    /// The live path for a Mutation effect (§7.3). A resume that finds a standing
+    /// `EffectIntent` with no `EffectRecorded` (`teid ∈ fold.intents`) is IN-DOUBT
+    /// and reconciles — never blind re-runs. Otherwise (never ran) it is two-phase:
+    /// journal an `EffectIntent` BEFORE the side effect, then execute and record.
     async fn mutation_tool_effect(
         &self,
         ar: &AgentRun<'_>,
@@ -314,7 +325,10 @@ impl Executor {
         call: &ToolCall,
         args: serde_json::Value,
         tih: &str,
-    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        if ar.fold.intents.contains(teid) {
+            return self.reconcile_in_doubt(ar, teid, call, args, tih).await;
+        }
         self.append(
             ar.run,
             JournalEvent::EffectIntent {
@@ -328,6 +342,63 @@ impl Executor {
         .await?;
         self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
             .await
+    }
+
+    /// Reconcile an in-doubt Mutation on resume (§7.3): ask the per-tool
+    /// [`ReconcileProvider`] (absent ⇒ `Indeterminate`) whether the side effect
+    /// already applied, and never guess.
+    /// - `Confirmed(output)` → record it from the provider's output; do NOT re-run.
+    /// - `NotApplied` → run the effect now (the standing Intent already covers it,
+    ///   so no second Intent is journaled).
+    /// - `Indeterminate` → journal `RunPaused` and pause loud.
+    async fn reconcile_in_doubt(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        args: serde_json::Value,
+        tih: &str,
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        let key = idempotency_key(teid, tih);
+        let verdict = match self.reconcilers.get(&call.name) {
+            Some(provider) => provider.reconcile(&key, &args).await?,
+            None => ReconcileOutcome::Indeterminate,
+        };
+        match verdict {
+            ReconcileOutcome::Confirmed(output) => {
+                let recorded = self.split_output(&output).await?;
+                self.append(
+                    ar.run,
+                    JournalEvent::EffectRecorded {
+                        node: ar.node_id.clone(),
+                        effect_id: teid.clone(),
+                        class: EffectClass::Mutation,
+                        input_hash: tih.to_string(),
+                        seq: 0,
+                        output: recorded,
+                        observation: None,
+                    },
+                )
+                .await?;
+                Ok(ToolOutcome::Ok(output))
+            }
+            ReconcileOutcome::NotApplied => {
+                self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
+                    .await
+            }
+            ReconcileOutcome::Indeterminate => {
+                let reason = format!("mutation in-doubt: {key}");
+                self.append(
+                    ar.run,
+                    JournalEvent::RunPaused {
+                        reason: reason.clone(),
+                        resume_after: None,
+                    },
+                )
+                .await?;
+                Ok(ToolOutcome::Paused(reason))
+            }
+        }
     }
 
     /// Whether a memoized `Observation` is still fresh: its recorded
@@ -356,7 +427,7 @@ impl Executor {
         args: serde_json::Value,
         tih: &str,
         record: (EffectClass, Option<ObservationMeta>),
-    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let (class, observation) = record;
         match self.tools.execute(&call.name, args) {
             Ok(result) => {
@@ -374,7 +445,7 @@ impl Executor {
                     },
                 )
                 .await?;
-                Ok(Ok(result))
+                Ok(ToolOutcome::Ok(result))
             }
             Err(err) => {
                 let message = err.to_string();
@@ -386,7 +457,7 @@ impl Executor {
                     },
                 )
                 .await?;
-                Ok(Err(message))
+                Ok(ToolOutcome::Failed(message))
             }
         }
     }

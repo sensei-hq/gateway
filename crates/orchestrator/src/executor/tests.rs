@@ -8,12 +8,27 @@ use orchestrator_core::{
 };
 use orchestrator_store::InMemoryJournal;
 
-use crate::agent::tools::{Calc, Tool, ToolRegistry};
+use crate::agent::tools::{Calc, ReconcileRegistry, Tool, ToolRegistry};
 use orchestrator_core::{
-    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, Registry, ToolSpec,
+    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, ReconcileOutcome,
+    ReconcileProvider, Registry, ToolSpec,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A reconciler returning a fixed verdict — a test double for the in-doubt
+/// Mutation path (§7.3).
+struct FixedReconciler(ReconcileOutcome);
+#[async_trait::async_trait]
+impl ReconcileProvider for FixedReconciler {
+    async fn reconcile(
+        &self,
+        _key: &str,
+        _args: &serde_json::Value,
+    ) -> Result<ReconcileOutcome, OrchestratorError> {
+        Ok(self.0.clone())
+    }
+}
 
 /// A test `Clock` pinned to a fixed instant (`at`), shared across executors via a
 /// clonable handle so a resume can be driven at a chosen point relative to an
@@ -569,6 +584,172 @@ async fn mutation_two_phase_journals_intent_then_recorded() {
         labels[intent_idx + 1],
         "EffectRecorded(n1)",
         "the Mutation's EffectRecorded immediately follows its Intent: {labels:?}"
+    );
+}
+
+/// Build a journal in the **in-doubt** state (§7.3): a real run through the
+/// two-phase Mutation, truncated to the prefix up to and including the note's
+/// `EffectIntent` — so the resume sees an Intent with no matching `EffectRecorded`.
+async fn seed_in_doubt_note() -> (InMemoryJournal, RunId) {
+    let full = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "note", "{\"text\":\"hello\"}"),
+        final_response("done"),
+    ])
+    .await;
+    Executor::new(Arc::new(gw), Arc::new(full.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(Note(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        )))))
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("seed run journaled an EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+    (seeded, run)
+}
+
+/// Resume an in-doubt run with the given reconcilers + a fresh note sink; return
+/// the outcome, the resulting journal events, and the sink (to prove re-run vs not).
+async fn resume_in_doubt(
+    journal: InMemoryJournal,
+    run: RunId,
+    reconcilers: ReconcileRegistry,
+) -> (
+    RunOutcome,
+    Vec<(Seq, JournalEvent)>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Note(sink.clone()))),
+        ))
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+    let events = journal.load(run).await.unwrap();
+    (out, events, sink)
+}
+
+/// In-doubt Mutation, reconcile `Confirmed`: the executor records the effect from
+/// the confirmed output and does NOT re-run the side effect; the run completes.
+#[tokio::test]
+async fn in_doubt_confirmed_records_without_rerunning_the_side_effect() {
+    let note_eid = effect_id("n1", 0, 1);
+    let (journal, run) = seed_in_doubt_note().await;
+    let reconcilers = ReconcileRegistry::default().with_provider(
+        "note",
+        Arc::new(FixedReconciler(ReconcileOutcome::Confirmed(
+            serde_json::json!({ "recorded": "hello" }),
+        ))),
+    );
+    let (out, events, sink) = resume_in_doubt(journal, run, reconcilers).await;
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "Confirmed completes"
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "Confirmed: the side effect is NOT re-executed"
+    );
+    let recorded = events
+        .iter()
+        .filter(|(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id: eid, .. } if *eid == note_eid))
+        .count();
+    assert_eq!(
+        recorded, 1,
+        "Confirmed appends the Mutation's EffectRecorded once"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
+
+/// In-doubt Mutation, reconcile `NotApplied`: the executor runs the effect once
+/// (the standing Intent covers it — no second Intent) and completes.
+#[tokio::test]
+async fn in_doubt_not_applied_runs_the_effect_once_under_the_standing_intent() {
+    let (journal, run) = seed_in_doubt_note().await;
+    let reconcilers = ReconcileRegistry::default().with_provider(
+        "note",
+        Arc::new(FixedReconciler(ReconcileOutcome::NotApplied)),
+    );
+    let (out, events, sink) = resume_in_doubt(journal, run, reconcilers).await;
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "NotApplied completes"
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "NotApplied: the side effect runs exactly once on resume"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+            .count(),
+        1,
+        "NotApplied re-uses the standing Intent — no second EffectIntent"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted))
+    );
+}
+
+/// In-doubt Mutation, `Indeterminate` (here: no provider registered): the executor
+/// pauses loud — journals `RunPaused`, sets `outcome.paused`, applies NOTHING, and
+/// does not complete.
+#[tokio::test]
+async fn in_doubt_indeterminate_pauses_without_applying() {
+    let (journal, run) = seed_in_doubt_note().await;
+    // No provider for "note" → get() is None → Indeterminate.
+    let (out, events, sink) = resume_in_doubt(journal, run, ReconcileRegistry::default()).await;
+
+    let pause = out.paused.expect("Indeterminate pauses the run");
+    assert_eq!(pause.node, NodeId("n1".into()));
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a paused run does not complete"
     );
 }
 

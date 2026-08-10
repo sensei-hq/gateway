@@ -88,7 +88,6 @@ struct Fold {
     completed: std::collections::HashSet<NodeId>,
     /// Effect ids that journaled an `EffectIntent` (§7.3). An id in `intents` but
     /// NOT in `memo` (no `EffectRecorded`) is an **in-doubt** Mutation on resume.
-    #[allow(dead_code)] // read by the in-doubt Mutation path (slice-4 Task 9)
     intents: std::collections::HashSet<EffectId>,
     /// Each `Observation` effect's recorded freshness + provenance (§7.1). A memo
     /// hit whose `fetched_at + ttl` has lapsed (per the injected `Clock`) is
@@ -565,7 +564,6 @@ impl Executor {
 enum AgentStep {
     Completed(serde_json::Value),
     Failed(String),
-    #[allow(dead_code)] // produced by drive_agent's Mutation reconcile (slice-4 Task 9)
     Paused(String),
 }
 
