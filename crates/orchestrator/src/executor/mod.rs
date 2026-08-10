@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use gateway::Gateway;
 use orchestrator_core::{
-    ContentStore, EffectClass, EffectId, EffectOutput, ExecutionJournal, Graph, JournalEvent,
-    NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, effect_id,
+    Clock, ContentStore, EffectClass, EffectId, EffectOutput, ExecutionJournal, Graph,
+    JournalEvent, NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, SystemClock,
+    effect_id,
 };
 
-use crate::agent::tools::ToolRegistry;
+use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
 
 mod agent;
 mod content;
@@ -41,6 +42,11 @@ pub struct Executor {
     /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
     /// when a `content` store is wired.
     cas_threshold: usize,
+    /// The wall-clock an Observation's TTL is checked against (default
+    /// `SystemClock`) — injected so tests can control time deterministically.
+    clock: Arc<dyn Clock>,
+    /// Reconcile providers, queried when a Mutation is in-doubt on resume.
+    reconcilers: Arc<ReconcileRegistry>,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -98,6 +104,8 @@ impl Executor {
             concurrency: 8,
             content: None,
             cas_threshold: 4096,
+            clock: Arc::new(SystemClock),
+            reconcilers: Arc::new(ReconcileRegistry::default()),
         }
     }
 
@@ -141,6 +149,18 @@ impl Executor {
     /// Override the ReAct loop's max turns (default 8).
     pub fn with_max_steps(mut self, n: usize) -> Self {
         self.max_steps = n;
+        self
+    }
+
+    /// Inject the wall-clock (default `SystemClock`) — Observation TTL reads it.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Attach reconcile providers, queried when a Mutation is in-doubt on resume.
+    pub fn with_reconcilers(mut self, reconcilers: Arc<ReconcileRegistry>) -> Self {
+        self.reconcilers = reconcilers;
         self
     }
 
