@@ -6,8 +6,8 @@ use kernel::types::request::{
     InferenceRequest, Message, MessageContent, MessageRole, ToolCall, ToolDefinition,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, OrchestratorError,
-    RunId, effect_id,
+    AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, ObservationMeta,
+    OrchestratorError, ReconcileOutcome, RunId, effect_id, idempotency_key,
 };
 
 use super::support::{
@@ -15,6 +15,15 @@ use super::support::{
 };
 use super::{AgentStep, Executor, Fold};
 use crate::agent::prompt::{assemble_prompt, over_budget};
+
+/// The 3-way outcome of one tool effect (or one ReAct turn's tools, §7.3): a
+/// value/transcript, a node failure (already journaled `NodeFailed`), or a durable
+/// pause (`RunPaused` journaled) — an in-doubt Mutation awaiting resolution.
+enum ToolOutcome<T> {
+    Ok(T),
+    Failed(String),
+    Paused(String),
+}
 
 /// The invariant-across-turns context of one agent invocation — assembled once
 /// (agent lookup, prompt, chain, window budget) so the per-turn helpers share it
@@ -90,8 +99,9 @@ impl Executor {
             // Not a final answer → execute this turn's tool calls and extend the
             // transcript. A tool failure ends the node (already journaled).
             match self.run_agent_tools(&ar, turn, &turn_output).await? {
-                Ok(turn_messages) => messages.extend(turn_messages),
-                Err(failure) => return Ok(AgentStep::Failed(failure)),
+                ToolOutcome::Ok(turn_messages) => messages.extend(turn_messages),
+                ToolOutcome::Failed(failure) => return Ok(AgentStep::Failed(failure)),
+                ToolOutcome::Paused(reason) => return Ok(AgentStep::Paused(reason)),
             }
         }
 
@@ -209,7 +219,7 @@ impl Executor {
         ar: &AgentRun<'_>,
         turn: usize,
         turn_output: &serde_json::Value,
-    ) -> Result<Result<Vec<Message>, String>, OrchestratorError> {
+    ) -> Result<ToolOutcome<Vec<Message>>, OrchestratorError> {
         let assistant_text = turn_output
             .get("text")
             .and_then(|v| v.as_str())
@@ -231,52 +241,229 @@ impl Executor {
         }];
         for (k, call) in tool_calls.iter().enumerate() {
             let teid = effect_id(&ar.node_id.0, turn as u64, k + 1);
-            let args: serde_json::Value =
-                serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
-            let tih = tool_input_hash(&call.name, &call.arguments);
-            let result = if let Some((recorded_ih, output)) = ar.fold.memo.get(&teid) {
-                if recorded_ih != &tih {
-                    return Err(OrchestratorError::DeterminismViolation {
-                        node: ar.node_id.clone(),
-                        effect_id: teid,
-                    });
-                }
-                self.materialize(output).await?
-            } else {
-                match self.tools.execute(&call.name, args) {
-                    Ok(result) => {
-                        let recorded = self.split_output(&result).await?;
-                        self.append(
-                            ar.run,
-                            JournalEvent::EffectRecorded {
-                                node: ar.node_id.clone(),
-                                effect_id: teid,
-                                class: EffectClass::Pure,
-                                input_hash: tih,
-                                seq: 0,
-                                output: recorded,
-                            },
-                        )
-                        .await?;
-                        result
-                    }
-                    Err(err) => {
-                        let message = err.to_string();
-                        self.append(
-                            ar.run,
-                            JournalEvent::NodeFailed {
-                                node: ar.node_id.clone(),
-                                error: message.clone(),
-                            },
-                        )
-                        .await?;
-                        return Ok(Err(message));
-                    }
-                }
+            let value = match self.execute_tool_effect(ar, &teid, call).await? {
+                ToolOutcome::Ok(value) => value,
+                ToolOutcome::Failed(failure) => return Ok(ToolOutcome::Failed(failure)),
+                ToolOutcome::Paused(reason) => return Ok(ToolOutcome::Paused(reason)),
             };
-            out.push(Message::tool_result(call.id.clone(), result.to_string()));
+            out.push(Message::tool_result(call.id.clone(), value.to_string()));
         }
-        Ok(Ok(out))
+        Ok(ToolOutcome::Ok(out))
+    }
+
+    /// Execute (or replay) ONE tool call as a durable effect, dispatched by its
+    /// [`EffectClass`] (§7.1). The outer `Result` is a fatal journal/CAS/
+    /// determinism error; the inner `Result` is the tool's output value, or its
+    /// failure message (already journaled `NodeFailed`, same shape as a turn).
+    ///
+    /// - **Pure** — a memo hit replays (never re-executes); a miss executes and
+    ///   records `observation: None`.
+    /// - **Observation** — a memo hit replays only while FRESH (`fetched_at + ttl`
+    ///   has not lapsed per the injected `Clock`); a stale hit (or a miss) re-reads
+    ///   and appends a superseding record with fresh [`ObservationMeta`].
+    /// - **Mutation** — a memo hit (Intent+Recorded) replays; a miss executes and
+    ///   records `class: Mutation`. The two-phase Intent and in-doubt reconcile
+    ///   land in slice-4 Tasks 8–9.
+    async fn execute_tool_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        let args: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+        let tih = tool_input_hash(&call.name, &call.arguments);
+        let spec = self.tools.spec_of(&call.name);
+        let class = spec
+            .as_ref()
+            .map(|s| s.effect_class)
+            .unwrap_or(EffectClass::Pure);
+
+        // Memo hit: replay, unless it is a STALE Observation (fall through to a
+        // live re-read). The determinism fence guards every replay.
+        if let Some((recorded_ih, output)) = ar.fold.memo.get(teid) {
+            if recorded_ih != &tih {
+                return Err(OrchestratorError::DeterminismViolation {
+                    node: ar.node_id.clone(),
+                    effect_id: teid.clone(),
+                });
+            }
+            let stale = class == EffectClass::Observation && !self.observation_fresh(ar, teid);
+            if !stale {
+                return Ok(ToolOutcome::Ok(self.materialize(output).await?));
+            }
+        }
+
+        // Live path. A Mutation is two-phase (Intent → side effect → Recorded,
+        // §7.3); Pure/Observation record directly (Observations carry
+        // freshness/provenance so a later resume can decide replay-vs-re-read).
+        match class {
+            EffectClass::Mutation => self.mutation_tool_effect(ar, teid, call, args, &tih).await,
+            _ => {
+                let observation = (class == EffectClass::Observation).then(|| ObservationMeta {
+                    fetched_at: self.clock.now(),
+                    ttl_secs: spec.as_ref().and_then(|s| s.ttl_secs).unwrap_or(0),
+                    source: spec
+                        .as_ref()
+                        .and_then(|s| s.source.clone())
+                        .unwrap_or_else(|| call.name.clone()),
+                });
+                self.record_tool_effect(ar, teid, call, args, &tih, (class, observation))
+                    .await
+            }
+        }
+    }
+
+    /// The live path for a Mutation effect (§7.3). A resume that finds a standing
+    /// `EffectIntent` with no `EffectRecorded` (`teid ∈ fold.intents`) is IN-DOUBT
+    /// and reconciles — never blind re-runs. Otherwise (never ran) it is two-phase:
+    /// journal an `EffectIntent` BEFORE the side effect, then execute and record.
+    async fn mutation_tool_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        args: serde_json::Value,
+        tih: &str,
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        if ar.fold.intents.contains(teid) {
+            return self.reconcile_in_doubt(ar, teid, call, args, tih).await;
+        }
+        // The `idempotency_key` is persisted in the Intent for a reconciler that
+        // reads the journal to decide (an SP-4 real provider); this executor
+        // recomputes it deterministically in `reconcile_in_doubt` rather than
+        // reading it back, so the two are guaranteed identical.
+        self.append(
+            ar.run,
+            JournalEvent::EffectIntent {
+                node: ar.node_id.clone(),
+                effect_id: teid.clone(),
+                idempotency_key: idempotency_key(teid, tih),
+                args_hash: tih.to_string(),
+                seq: 0,
+            },
+        )
+        .await?;
+        self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
+            .await
+    }
+
+    /// Reconcile an in-doubt Mutation on resume (§7.3): ask the per-tool
+    /// [`ReconcileProvider`] (absent ⇒ `Indeterminate`) whether the side effect
+    /// already applied, and never guess.
+    /// - `Confirmed(output)` → record it from the provider's output; do NOT re-run.
+    /// - `NotApplied` → run the effect now (the standing Intent already covers it,
+    ///   so no second Intent is journaled).
+    /// - `Indeterminate` → journal `RunPaused` and pause loud.
+    async fn reconcile_in_doubt(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        args: serde_json::Value,
+        tih: &str,
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        let key = idempotency_key(teid, tih);
+        let verdict = match self.reconcilers.get(&call.name) {
+            Some(provider) => provider.reconcile(&key, &args).await?,
+            None => ReconcileOutcome::Indeterminate,
+        };
+        match verdict {
+            ReconcileOutcome::Confirmed(output) => {
+                let recorded = self.split_output(&output).await?;
+                self.append(
+                    ar.run,
+                    JournalEvent::EffectRecorded {
+                        node: ar.node_id.clone(),
+                        effect_id: teid.clone(),
+                        class: EffectClass::Mutation,
+                        input_hash: tih.to_string(),
+                        seq: 0,
+                        output: recorded,
+                        observation: None,
+                    },
+                )
+                .await?;
+                Ok(ToolOutcome::Ok(output))
+            }
+            ReconcileOutcome::NotApplied => {
+                self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
+                    .await
+            }
+            ReconcileOutcome::Indeterminate => {
+                let reason = format!("mutation in-doubt: {key}");
+                self.append(
+                    ar.run,
+                    JournalEvent::RunPaused {
+                        reason: reason.clone(),
+                        resume_after: None,
+                    },
+                )
+                .await?;
+                Ok(ToolOutcome::Paused(reason))
+            }
+        }
+    }
+
+    /// Whether a memoized `Observation` is still fresh: its recorded
+    /// `fetched_at + ttl_secs` has not lapsed per the injected `Clock`. A missing
+    /// provenance record or `ttl_secs == 0` (a `None` TTL) is never fresh — always
+    /// re-read (§7.1).
+    fn observation_fresh(&self, ar: &AgentRun<'_>, teid: &EffectId) -> bool {
+        match ar.fold.observations.get(teid) {
+            Some(meta) => {
+                meta.ttl_secs > 0
+                    && self.clock.now()
+                        <= meta.fetched_at + chrono::Duration::seconds(meta.ttl_secs as i64)
+            }
+            None => false,
+        }
+    }
+
+    /// Execute a tool live and journal its `EffectRecorded` (shared by all effect
+    /// classes). On a tool error, journal `NodeFailed` and return the failure
+    /// message. `observation` is `Some` only for Observation effects.
+    async fn record_tool_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        args: serde_json::Value,
+        tih: &str,
+        record: (EffectClass, Option<ObservationMeta>),
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        let (class, observation) = record;
+        match self.tools.execute(&call.name, args) {
+            Ok(result) => {
+                let recorded = self.split_output(&result).await?;
+                self.append(
+                    ar.run,
+                    JournalEvent::EffectRecorded {
+                        node: ar.node_id.clone(),
+                        effect_id: teid.clone(),
+                        class,
+                        input_hash: tih.to_string(),
+                        seq: 0,
+                        output: recorded,
+                        observation,
+                    },
+                )
+                .await?;
+                Ok(ToolOutcome::Ok(result))
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.append(
+                    ar.run,
+                    JournalEvent::NodeFailed {
+                        node: ar.node_id.clone(),
+                        error: message.clone(),
+                    },
+                )
+                .await?;
+                Ok(ToolOutcome::Failed(message))
+            }
+        }
     }
 
     /// Dispatch one live model turn through the gateway and journal its result:
@@ -308,6 +495,7 @@ impl Executor {
                         input_hash: ih,
                         seq: 0,
                         output: recorded,
+                        observation: None,
                     },
                 )
                 .await?;

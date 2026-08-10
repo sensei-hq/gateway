@@ -30,6 +30,15 @@ pub enum ChildStatus {
     Failed,
 }
 
+/// Provenance + freshness of an `Observation` effect (§7.1). `content_hash` (the
+/// third provenance element) is derived — the recorded output's digest — not stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservationMeta {
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub ttl_secs: u64,
+    pub source: String,
+}
+
 /// An append-only event in a run's durable journal. Folding a run's events
 /// reconstructs its state for deterministic resume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +59,19 @@ pub enum JournalEvent {
         /// content-addressed [`ContentRef`](crate::content::ContentRef) for
         /// over-threshold ones (§7.4). The fold reads this without loading blobs.
         output: EffectOutput,
+        /// Set only for `Observation` effects (§7.1): freshness + provenance so a
+        /// resume can decide replay-vs-re-read. `None` for Pure/Mutation.
+        observation: Option<ObservationMeta>,
+    },
+    /// The intent phase of a two-phase `Mutation` (§7.3), appended BEFORE the side
+    /// effect. On resume an `EffectIntent` with no matching `EffectRecorded` is
+    /// IN-DOUBT → reconcile, never blind re-run or blind memoize.
+    EffectIntent {
+        node: NodeId,
+        effect_id: EffectId,
+        idempotency_key: String,
+        args_hash: String,
+        seq: Seq,
     },
     NodeCompleted {
         node: NodeId,
@@ -168,6 +190,7 @@ pub trait ExecutionJournal: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use super::ObservationMeta;
     use crate::{EffectClass, EffectOutput, JournalEvent, NodeId, effect_id};
 
     #[test]
@@ -179,9 +202,48 @@ mod tests {
             input_hash: "abc".into(),
             seq: 1,
             output: EffectOutput::Inline(serde_json::json!({"text":"hi"})),
+            observation: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: JournalEvent = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, JournalEvent::EffectRecorded { .. }));
+    }
+
+    #[test]
+    fn effect_intent_and_observation_meta_roundtrip() {
+        let intent = JournalEvent::EffectIntent {
+            node: NodeId("n1".into()),
+            effect_id: effect_id("n1", 0, 1),
+            idempotency_key: "k".into(),
+            args_hash: "h".into(),
+            seq: 0,
+        };
+        let s = serde_json::to_string(&intent).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<JournalEvent>(&s).unwrap(),
+            JournalEvent::EffectIntent { .. }
+        ));
+
+        let obs = ObservationMeta {
+            fetched_at: chrono::Utc::now(),
+            ttl_secs: 60,
+            source: "search".into(),
+        };
+        let rec = JournalEvent::EffectRecorded {
+            node: NodeId("n1".into()),
+            effect_id: effect_id("n1", 0, 1),
+            class: EffectClass::Observation,
+            input_hash: "h".into(),
+            seq: 0,
+            output: EffectOutput::Inline(serde_json::json!({"x":1})),
+            observation: Some(obs),
+        };
+        assert!(matches!(
+            serde_json::from_str::<JournalEvent>(&serde_json::to_string(&rec).unwrap()).unwrap(),
+            JournalEvent::EffectRecorded {
+                observation: Some(_),
+                ..
+            }
+        ));
     }
 }
