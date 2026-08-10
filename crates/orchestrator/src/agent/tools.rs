@@ -1,12 +1,16 @@
-//! Pure tool runtime. Slice 2 executes ONLY Pure (deterministic, memoize-forever)
-//! tools in the orchestrator; Observation/Mutation are rejected loud (slice 4).
+//! Tool runtime. Slice 2 executed ONLY Pure (deterministic, memoize-forever)
+//! tools; slice 4 lifts that restriction — the executor now runs any effect
+//! class (Pure/Observation/Mutation), with the two-phase/TTL wrapping owned
+//! by the executor, not this runtime.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use orchestrator_core::{EffectClass, OrchestratorError, ToolSpec};
 
-/// An executable tool. `spec().effect_class` MUST be `Pure` in slice 2.
+/// An executable tool. `spec().effect_class` may be `Pure`, `Observation`, or
+/// `Mutation` (slice 4) — the executor is responsible for wrapping
+/// Observation/Mutation calls with TTL checks and two-phase intent/reconcile.
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError>;
@@ -25,8 +29,8 @@ impl ToolRegistry {
         self
     }
 
-    /// Execute a Pure tool by name. Unknown → loud; non-Pure → `ToolEffectDeferred`
-    /// (an honest slice-4 boundary, never a silent skip); a tool error is surfaced.
+    /// Execute a tool by name, any effect class (slice 4). Unknown → loud; a
+    /// tool error is surfaced.
     pub fn execute(
         &self,
         name: &str,
@@ -36,14 +40,35 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| OrchestratorError::UnknownTool(name.to_string()))?;
-        let class = tool.spec().effect_class;
-        if class != EffectClass::Pure {
-            return Err(OrchestratorError::ToolEffectDeferred {
-                tool: name.to_string(),
-                class,
-            });
-        }
         tool.call(args)
+    }
+
+    /// The spec of a registered tool by name (for the executor to read its class/ttl).
+    pub fn spec_of(&self, name: &str) -> Option<orchestrator_core::ToolSpec> {
+        self.tools.get(name).map(|t| t.spec())
+    }
+}
+
+/// Name → reconcile provider, queried when a Mutation is in-doubt on resume.
+#[derive(Default, Clone)]
+pub struct ReconcileRegistry {
+    providers:
+        std::collections::HashMap<String, std::sync::Arc<dyn orchestrator_core::ReconcileProvider>>,
+}
+impl ReconcileRegistry {
+    pub fn with_provider(
+        mut self,
+        name: impl Into<String>,
+        p: std::sync::Arc<dyn orchestrator_core::ReconcileProvider>,
+    ) -> Self {
+        self.providers.insert(name.into(), p);
+        self
+    }
+    pub fn get(
+        &self,
+        name: &str,
+    ) -> Option<&std::sync::Arc<dyn orchestrator_core::ReconcileProvider>> {
+        self.providers.get(name)
     }
 }
 
@@ -119,29 +144,28 @@ mod tests {
         ));
     }
 
-    struct Reader;
-    impl Tool for Reader {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec {
-                name: "read".into(),
-                description: None,
-                input_schema: serde_json::json!({}),
-                effect_class: EffectClass::Observation,
-                ttl_secs: None,
-                source: None,
+    #[test]
+    fn tool_registry_executes_a_non_pure_tool() {
+        struct Obs;
+        impl Tool for Obs {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "obs".into(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                    effect_class: EffectClass::Observation,
+                    ttl_secs: Some(60),
+                    source: None,
+                }
+            }
+            fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+                Ok(serde_json::json!({"ok": true}))
             }
         }
-        fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
-            Ok(serde_json::json!({}))
-        }
-    }
-
-    #[test]
-    fn non_pure_tool_is_rejected_before_execution() {
-        let reg = ToolRegistry::default().with_tool(std::sync::Arc::new(Reader));
-        assert!(matches!(
-            reg.execute("read", serde_json::json!({})),
-            Err(OrchestratorError::ToolEffectDeferred { .. })
-        ));
+        let reg = ToolRegistry::default().with_tool(std::sync::Arc::new(Obs));
+        assert_eq!(
+            reg.execute("obs", serde_json::json!({})).unwrap(),
+            serde_json::json!({"ok": true})
+        );
     }
 }

@@ -102,49 +102,6 @@ async fn agent_react_loop_executes_a_pure_tool_and_feeds_the_result_back() {
 }
 
 #[tokio::test]
-async fn agent_rejects_a_non_pure_tool_loudly() {
-    let (gateway, _calls) = scripted_gateway(vec![tool_call_response("t1", "read", "{}")]).await;
-    let journal = InMemoryJournal::new();
-    struct Reader;
-    impl crate::agent::tools::Tool for Reader {
-        fn spec(&self) -> orchestrator_core::ToolSpec {
-            orchestrator_core::ToolSpec {
-                name: "read".into(),
-                description: None,
-                input_schema: serde_json::json!({}),
-                effect_class: orchestrator_core::EffectClass::Observation,
-                ttl_secs: None,
-                source: None,
-            }
-        }
-        fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
-            Ok(serde_json::json!({}))
-        }
-    }
-    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
-        .with_registry(Arc::new(
-            Registry::default()
-                .with_agent(AgentDefinition {
-                    tools: vec!["read".into()],
-                    ..agent_def("c")
-                })
-                .with_tool(Reader.spec()),
-        ))
-        .with_tools(Arc::new(
-            ToolRegistry::default().with_tool(Arc::new(Reader)),
-        ));
-    let graph = Graph {
-        nodes: vec![agent_node("n1", "a", "read")],
-    };
-    let outcome = exec
-        .run(RunId(uuid::Uuid::new_v4()), &graph)
-        .await
-        .expect("outcome");
-    let (_, msg) = outcome.failed.expect("non-Pure tool fails the node");
-    assert!(msg.contains("slice 4"), "deferral message: {msg}");
-}
-
-#[tokio::test]
 async fn agent_halts_at_max_steps_when_the_model_never_finalizes() {
     let (gateway, calls) = scripted_gateway(vec![
         tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":1,\"b\":1}"),
