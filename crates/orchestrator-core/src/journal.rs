@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::content::EffectOutput;
 use crate::effect::{EffectClass, EffectId};
 use crate::error::JournalError;
 use crate::ids::{NodeId, RunId, Seq};
@@ -20,7 +21,10 @@ pub enum JournalEvent {
         class: EffectClass,
         input_hash: String,
         seq: Seq,
-        output: serde_json::Value,
+        /// The effect's output, carried **inline** for small payloads or as a
+        /// content-addressed [`ContentRef`](crate::content::ContentRef) for
+        /// over-threshold ones (§7.4). The fold reads this without loading blobs.
+        output: EffectOutput,
     },
     NodeCompleted {
         node: NodeId,
@@ -62,7 +66,7 @@ pub trait ExecutionJournal: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use crate::{EffectClass, JournalEvent, NodeId, effect_id};
+    use crate::{EffectClass, EffectOutput, JournalEvent, NodeId, effect_id};
 
     #[test]
     fn journal_event_roundtrips() {
@@ -72,7 +76,7 @@ mod tests {
             class: EffectClass::Pure,
             input_hash: "abc".into(),
             seq: 1,
-            output: serde_json::json!({"text":"hi"}),
+            output: EffectOutput::Inline(serde_json::json!({"text":"hi"})),
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: JournalEvent = serde_json::from_str(&s).unwrap();
