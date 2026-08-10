@@ -8,31 +8,19 @@ use orchestrator_core::{
 };
 use orchestrator_store::InMemoryJournal;
 
-use crate::agent::tools::{Calc, ReconcileRegistry, Tool, ToolRegistry};
+use crate::agent::tools::{
+    AlwaysIndeterminate, Calc, NoteReconciler, ReconcileRegistry, RecordNote, Search, Tool,
+    ToolRegistry,
+};
 use orchestrator_core::{
-    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, ReconcileOutcome,
-    ReconcileProvider, Registry, ToolSpec,
+    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, Registry,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A reconciler returning a fixed verdict — a test double for the in-doubt
-/// Mutation path (§7.3).
-struct FixedReconciler(ReconcileOutcome);
-#[async_trait::async_trait]
-impl ReconcileProvider for FixedReconciler {
-    async fn reconcile(
-        &self,
-        _key: &str,
-        _args: &serde_json::Value,
-    ) -> Result<ReconcileOutcome, OrchestratorError> {
-        Ok(self.0.clone())
-    }
-}
-
-/// A test `Clock` pinned to a fixed instant (`at`), shared across executors via a
-/// clonable handle so a resume can be driven at a chosen point relative to an
-/// Observation's `fetched_at`.
+/// A test `Clock` backed by a shared, mutable instant so a resume can be driven
+/// at a chosen point relative to an Observation's `fetched_at` (§7.1). Cloning
+/// shares the same instant; `advance` moves time forward for every clone's reads.
 #[derive(Clone)]
 struct AdvanceableClock(Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>);
 impl AdvanceableClock {
@@ -41,6 +29,11 @@ impl AdvanceableClock {
             chrono::DateTime::from_timestamp(unix_secs, 0).expect("valid timestamp"),
         )))
     }
+    /// Move the shared clock forward by `secs` — the next `now()` (on any clone)
+    /// reflects it. Used to cross an Observation's TTL between a run and its resume.
+    fn advance(&self, secs: i64) {
+        *self.0.lock().unwrap() += chrono::Duration::seconds(secs);
+    }
 }
 impl Clock for AdvanceableClock {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
@@ -48,49 +41,13 @@ impl Clock for AdvanceableClock {
     }
 }
 
-/// An Observation tool that counts its live executions, so a test can tell a
-/// memo replay (count unchanged) from a live re-read (count +1). `ttl_secs = 60`.
-struct Probe(Arc<AtomicUsize>);
-impl Tool for Probe {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "probe".into(),
-            description: None,
-            input_schema: serde_json::json!({ "type": "object" }),
-            effect_class: EffectClass::Observation,
-            ttl_secs: Some(60),
-            source: Some("probe".into()),
-        }
-    }
-    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(serde_json::json!({ "probed": true }))
-    }
-}
-
-/// A Mutation tool that appends its `text` arg to a shared sink, so a test can
-/// assert the side effect ran exactly once (two-phase Intent → effect → Recorded).
-struct Note(Arc<std::sync::Mutex<Vec<String>>>);
-impl Tool for Note {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "note".into(),
-            description: None,
-            input_schema: serde_json::json!({ "type": "object" }),
-            effect_class: EffectClass::Mutation,
-            ttl_secs: None,
-            source: None,
-        }
-    }
-    fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
-        let text = args
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        self.0.lock().unwrap().push(text.clone());
-        Ok(serde_json::json!({ "recorded": text }))
-    }
+/// Count the `EffectRecorded` events for one effect id — distinguishes a memo
+/// replay (unchanged) from a live re-read/re-record (incremented).
+fn effect_recorded_count(events: &[(Seq, JournalEvent)], eid: &EffectId) -> usize {
+    events
+        .iter()
+        .filter(|(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id: r, .. } if r == eid))
+        .count()
 }
 
 fn agent_def(chain: &str) -> AgentDefinition {
@@ -438,102 +395,132 @@ async fn agent_resume_does_not_respend_completed_turns() {
     );
 }
 
-/// Headline (Observation §7.1): a memoized Observation is REPLAYED while fresh
-/// (no re-execution) but RE-READ once its TTL lapses. Two independent partial
-/// runs record the same `probe` Observation at `T0` (ttl=60); one resumes within
-/// the TTL (replay — probe not re-run), the other past it (re-read — probe runs
-/// once more and a second `EffectRecorded` supersedes).
+const OBS_T0: i64 = 1_000_000_000;
+
+/// Seed a partial agent run that reads the `search` Observation (`ttl=60`,
+/// `fetched_at` = the clock's instant) then dies at turn 1 (script exhausted) —
+/// no `RunCompleted`. The counter reflects the one live read (`== 1`).
+async fn seed_observation(
+    counter: Arc<AtomicUsize>,
+    clock: AdvanceableClock,
+) -> (InMemoryJournal, RunId) {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "search it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "search",
+        "{\"query\":\"rust\"}",
+    )])
+    .await;
+    let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter))),
+        ))
+        .with_clock(Arc::new(clock))
+        .run(run, &graph)
+        .await
+        .expect("seed run yields an outcome");
+    assert!(o.failed.is_some(), "seed dies at turn 1 (script exhausted)");
+    (journal, run)
+}
+
+/// Resume the seeded Observation run at the clock's current instant; return the
+/// journal events after it completes.
+async fn resume_observation(
+    journal: InMemoryJournal,
+    run: RunId,
+    counter: Arc<AtomicUsize>,
+    clock: AdvanceableClock,
+) -> Vec<(Seq, JournalEvent)> {
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "search it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+    Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter))),
+        ))
+        .with_clock(Arc::new(clock))
+        .start(run, &graph)
+        .await
+        .expect("resume completes");
+    journal.load(run).await.unwrap()
+}
+
+/// Acceptance §8.1 — within TTL, a resume REPLAYS the memoized Observation: the
+/// live `search` is not re-executed and no second `EffectRecorded` is appended.
 #[tokio::test]
-async fn observation_replays_within_ttl_and_rereads_when_stale() {
-    const T0: i64 = 1_000_000_000;
-    let probe_eid = effect_id("n1", 0, 1);
+async fn observation_within_ttl_replays_without_reexecuting() {
+    let search_eid = effect_id("n1", 0, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let clock = AdvanceableClock::at(OBS_T0);
+    let (j, run) = seed_observation(counter.clone(), clock.clone()).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "seed read search once");
 
-    // Record `probe` (Observation, fetched_at=T0) in a partial run that dies at
-    // turn 1 (script exhausted). Returns the journal, run id, and live-call
-    // counter (== 1 after this).
-    async fn seed(counter: Arc<AtomicUsize>) -> (InMemoryJournal, RunId) {
-        let journal = InMemoryJournal::new();
-        let run = RunId(uuid::Uuid::new_v4());
-        let graph = Graph {
-            nodes: vec![agent_node("n1", "a", "probe it")],
-        };
-        let (gw, _c) = scripted_gateway(vec![tool_call_response("t1", "probe", "{}")]).await;
-        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
-            .with_registry(agent_registry("c"))
-            .with_tools(Arc::new(
-                ToolRegistry::default().with_tool(Arc::new(Probe(counter))),
-            ))
-            .with_clock(Arc::new(AdvanceableClock::at(T0)));
-        let o = exec
-            .run(run, &graph)
-            .await
-            .expect("seed run yields an outcome");
-        assert!(
-            o.failed.is_some(),
-            "seed run fails at turn 1 (script exhausted)"
-        );
-        (journal, run)
-    }
+    clock.advance(30); // < ttl (60)
+    let events = resume_observation(j, run, counter.clone(), clock).await;
 
-    let recorded_count = |events: &[(Seq, JournalEvent)], eid: &EffectId| {
-        events
-            .iter()
-            .filter(
-                |(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id: r, .. } if r == eid),
-            )
-            .count()
-    };
-    let resume = |journal: InMemoryJournal, run: RunId, counter: Arc<AtomicUsize>, at: i64| async move {
-        let graph = Graph {
-            nodes: vec![agent_node("n1", "a", "probe it")],
-        };
-        let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
-        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
-            .with_registry(agent_registry("c"))
-            .with_tools(Arc::new(
-                ToolRegistry::default().with_tool(Arc::new(Probe(counter))),
-            ))
-            .with_clock(Arc::new(AdvanceableClock::at(at)))
-            .start(run, &graph)
-            .await
-            .expect("resume completes");
-        journal.load(run).await.unwrap()
-    };
-
-    // Fresh (T0 + 30s < TTL): replay — probe is NOT re-run, no second record.
-    let fresh = Arc::new(AtomicUsize::new(0));
-    let (j, run) = seed(fresh.clone()).await;
-    assert_eq!(fresh.load(Ordering::SeqCst), 1, "seed ran probe once");
-    let events = resume(j, run, fresh.clone(), T0 + 30).await;
     assert_eq!(
-        fresh.load(Ordering::SeqCst),
+        counter.load(Ordering::SeqCst),
         1,
-        "within TTL the Observation replays from the memo — probe NOT re-executed"
+        "within TTL the Observation replays from the memo — search NOT re-executed"
     );
     assert_eq!(
-        recorded_count(&events, &probe_eid),
+        effect_recorded_count(&events, &search_eid),
         1,
         "a fresh Observation is not re-recorded on resume"
     );
+}
 
-    // Stale (T0 + 90s > TTL): re-read — probe runs once more, a second record supersedes.
-    let stale = Arc::new(AtomicUsize::new(0));
-    let (j2, run2) = seed(stale.clone()).await;
-    let events2 = resume(j2, run2, stale.clone(), T0 + 90).await;
+/// Acceptance §8.2 — past TTL, a resume RE-READS the Observation: the live
+/// `search` runs once more, and a second `EffectRecorded` (fresh provenance)
+/// supersedes the stale one.
+#[tokio::test]
+async fn observation_past_ttl_rereads_and_supersedes() {
+    let search_eid = effect_id("n1", 0, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let clock = AdvanceableClock::at(OBS_T0);
+    let (j, run) = seed_observation(counter.clone(), clock.clone()).await;
+
+    clock.advance(90); // > ttl (60)
+    let events = resume_observation(j, run, counter.clone(), clock).await;
+
     assert_eq!(
-        stale.load(Ordering::SeqCst),
+        counter.load(Ordering::SeqCst),
         2,
-        "past TTL the Observation is re-read — probe executed once more"
+        "past TTL the Observation is re-read — search executed once more"
     );
     assert_eq!(
-        recorded_count(&events2, &probe_eid),
+        effect_recorded_count(&events, &search_eid),
         2,
-        "a stale re-read appends a second EffectRecorded (supersedes)"
+        "a stale re-read appends a second, superseding EffectRecorded"
+    );
+    // Every record for the effect carries fresh Observation provenance (§7.1).
+    let sources: Vec<String> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded {
+                effect_id: r,
+                observation: Some(m),
+                ..
+            } if r == &search_eid => Some(m.source.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        vec!["search".to_string(), "search".to_string()],
+        "both the original read and the re-read journal Observation provenance"
     );
 }
 
-/// Headline (Mutation §7.3): a live Mutation is two-phase — it journals an
-/// `EffectIntent` (before the side effect) then an `EffectRecorded` (after), in
+/// Acceptance §8.3 (happy path, live): a live Mutation is two-phase — it journals
+/// an `EffectIntent` (before the side effect) then an `EffectRecorded` (after), in
 /// that order, and applies the side effect exactly once.
 #[tokio::test]
 async fn mutation_two_phase_journals_intent_then_recorded() {
@@ -544,14 +531,14 @@ async fn mutation_two_phase_journals_intent_then_recorded() {
         nodes: vec![agent_node("n1", "a", "note it")],
     };
     let (gw, _c) = scripted_gateway(vec![
-        tool_call_response("t1", "note", "{\"text\":\"hello\"}"),
+        tool_call_response("t1", "record_note", "{\"note\":\"hello\"}"),
         final_response("done"),
     ])
     .await;
     let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
         .with_registry(agent_registry("c"))
         .with_tools(Arc::new(
-            ToolRegistry::default().with_tool(Arc::new(Note(sink.clone()))),
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink.clone()))),
         ));
     let o = exec.run(run, &graph).await.expect("run completes");
     assert!(o.failed.is_none(), "{:?}", o.failed);
@@ -587,6 +574,64 @@ async fn mutation_two_phase_journals_intent_then_recorded() {
     );
 }
 
+/// Acceptance §8.3 (happy path, resume): a completed Mutation (Intent+Recorded
+/// journaled) is MEMOIZED on resume — replayed from the journal, never re-applied.
+/// The shared sink proves the side effect lands exactly once across both runs.
+#[tokio::test]
+async fn mutation_resume_memoizes_completed_effect_without_reapplying() {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+
+    // Seed: turn 0 records the Mutation (Intent+Recorded); turn 1 script-exhausted
+    // → fails → no RunCompleted. The one live application lands in the sink.
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "record_note",
+        "{\"note\":\"hello\"}",
+    )])
+    .await;
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink.clone()))),
+        ))
+        .run(run, &graph)
+        .await
+        .expect("seed yields an outcome");
+    assert!(o1.failed.is_some(), "seed dies at turn 1");
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "seed applied the mutation once"
+    );
+
+    // Resume on the SAME sink: the Mutation memo-hits (Recorded present) → replayed,
+    // NOT re-applied → the sink is unchanged and the run completes.
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink.clone()))),
+        ))
+        .start(run, &graph)
+        .await
+        .expect("resume completes");
+    assert!(
+        o2.failed.is_none() && o2.paused.is_none(),
+        "{:?}",
+        o2.failed
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "resume memoized the completed Mutation — side effect applied exactly once total"
+    );
+}
+
 /// Build a journal in the **in-doubt** state (§7.3): a real run through the
 /// two-phase Mutation, truncated to the prefix up to and including the note's
 /// `EffectIntent` — so the resume sees an Intent with no matching `EffectRecorded`.
@@ -597,15 +642,15 @@ async fn seed_in_doubt_note() -> (InMemoryJournal, RunId) {
         nodes: vec![agent_node("n1", "a", "note it")],
     };
     let (gw, _c) = scripted_gateway(vec![
-        tool_call_response("t1", "note", "{\"text\":\"hello\"}"),
+        tool_call_response("t1", "record_note", "{\"note\":\"hello\"}"),
         final_response("done"),
     ])
     .await;
     Executor::new(Arc::new(gw), Arc::new(full.clone()), "v1")
         .with_registry(agent_registry("c"))
-        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(Note(
-            Arc::new(std::sync::Mutex::new(Vec::new())),
-        )))))
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+            RecordNote::new(Arc::new(std::sync::Mutex::new(Vec::new()))),
+        ))))
         .run(run, &graph)
         .await
         .expect("seed run completes");
@@ -622,18 +667,15 @@ async fn seed_in_doubt_note() -> (InMemoryJournal, RunId) {
     (seeded, run)
 }
 
-/// Resume an in-doubt run with the given reconcilers + a fresh note sink; return
-/// the outcome, the resulting journal events, and the sink (to prove re-run vs not).
+/// Resume an in-doubt run with a caller-owned note `sink` (its contents model
+/// whether the side effect applied before the crash) + reconcilers; return the
+/// outcome and journal events.
 async fn resume_in_doubt(
     journal: InMemoryJournal,
     run: RunId,
+    sink: Arc<std::sync::Mutex<Vec<String>>>,
     reconcilers: ReconcileRegistry,
-) -> (
-    RunOutcome,
-    Vec<(Seq, JournalEvent)>,
-    Arc<std::sync::Mutex<Vec<String>>>,
-) {
-    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+) -> (RunOutcome, Vec<(Seq, JournalEvent)>) {
     let graph = Graph {
         nodes: vec![agent_node("n1", "a", "note it")],
     };
@@ -641,44 +683,41 @@ async fn resume_in_doubt(
     let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
         .with_registry(agent_registry("c"))
         .with_tools(Arc::new(
-            ToolRegistry::default().with_tool(Arc::new(Note(sink.clone()))),
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink))),
         ))
         .with_reconcilers(Arc::new(reconcilers))
         .start(run, &graph)
         .await
         .expect("resume yields an outcome");
     let events = journal.load(run).await.unwrap();
-    (out, events, sink)
+    (out, events)
 }
 
-/// In-doubt Mutation, reconcile `Confirmed`: the executor records the effect from
-/// the confirmed output and does NOT re-run the side effect; the run completes.
+/// Acceptance §8.4 — in-doubt Mutation, reconcile `Confirmed`: the world already
+/// holds the note (the side effect applied before the crash), so the real
+/// `NoteReconciler` confirms it — the executor records without re-running, and the
+/// sink keeps exactly one copy. The run completes.
 #[tokio::test]
 async fn in_doubt_confirmed_records_without_rerunning_the_side_effect() {
     let note_eid = effect_id("n1", 0, 1);
     let (journal, run) = seed_in_doubt_note().await;
-    let reconcilers = ReconcileRegistry::default().with_provider(
-        "note",
-        Arc::new(FixedReconciler(ReconcileOutcome::Confirmed(
-            serde_json::json!({ "recorded": "hello" }),
-        ))),
-    );
-    let (out, events, sink) = resume_in_doubt(journal, run, reconcilers).await;
+    let sink = Arc::new(std::sync::Mutex::new(vec!["hello".to_string()]));
+    let reconcilers = ReconcileRegistry::default()
+        .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone())));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
 
     assert!(
         out.failed.is_none() && out.paused.is_none(),
         "Confirmed completes"
     );
-    assert!(
-        sink.lock().unwrap().is_empty(),
-        "Confirmed: the side effect is NOT re-executed"
-    );
-    let recorded = events
-        .iter()
-        .filter(|(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id: eid, .. } if *eid == note_eid))
-        .count();
     assert_eq!(
-        recorded, 1,
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "Confirmed: the side effect is NOT repeated — the sink still holds exactly one note"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &note_eid),
+        1,
         "Confirmed appends the Mutation's EffectRecorded once"
     );
     assert!(
@@ -689,16 +728,17 @@ async fn in_doubt_confirmed_records_without_rerunning_the_side_effect() {
     );
 }
 
-/// In-doubt Mutation, reconcile `NotApplied`: the executor runs the effect once
-/// (the standing Intent covers it — no second Intent) and completes.
+/// Acceptance §8.5 — in-doubt Mutation, reconcile `NotApplied`: the world does NOT
+/// hold the note (the crash was before the side effect), so the real
+/// `NoteReconciler` says NotApplied and the effect runs now — exactly once, under
+/// the standing Intent (no second Intent). The run completes.
 #[tokio::test]
 async fn in_doubt_not_applied_runs_the_effect_once_under_the_standing_intent() {
     let (journal, run) = seed_in_doubt_note().await;
-    let reconcilers = ReconcileRegistry::default().with_provider(
-        "note",
-        Arc::new(FixedReconciler(ReconcileOutcome::NotApplied)),
-    );
-    let (out, events, sink) = resume_in_doubt(journal, run, reconcilers).await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers = ReconcileRegistry::default()
+        .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone())));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
 
     assert!(
         out.failed.is_none() && out.paused.is_none(),
@@ -724,14 +764,16 @@ async fn in_doubt_not_applied_runs_the_effect_once_under_the_standing_intent() {
     );
 }
 
-/// In-doubt Mutation, `Indeterminate` (here: no provider registered): the executor
-/// pauses loud — journals `RunPaused`, sets `outcome.paused`, applies NOTHING, and
-/// does not complete.
+/// Acceptance §8.6 — in-doubt Mutation, `Indeterminate` (an `AlwaysIndeterminate`
+/// provider that cannot decide): the executor pauses loud — journals `RunPaused`,
+/// sets `outcome.paused`, applies NOTHING, and does not complete.
 #[tokio::test]
 async fn in_doubt_indeterminate_pauses_without_applying() {
     let (journal, run) = seed_in_doubt_note().await;
-    // No provider for "note" → get() is None → Indeterminate.
-    let (out, events, sink) = resume_in_doubt(journal, run, ReconcileRegistry::default()).await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
 
     let pause = out.paused.expect("Indeterminate pauses the run");
     assert_eq!(pause.node, NodeId("n1".into()));
@@ -750,6 +792,101 @@ async fn in_doubt_indeterminate_pauses_without_applying() {
             .iter()
             .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
         "a paused run does not complete"
+    );
+}
+
+/// Acceptance §8.7 (no silent failure) — if a tool effect's recorded input hash
+/// no longer matches the (replayed) tool call on resume, the executor halts loud
+/// with a `DeterminismViolation` on that effect — it never silently re-runs or
+/// re-memoizes, never re-executes the tool, and never touches the gateway.
+#[tokio::test]
+async fn changed_tool_input_on_resume_halts_with_determinism_violation() {
+    let tool_eid = effect_id("n1", 0, 1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "search it")],
+    };
+
+    // Seed a consistent partial run: turn 0 records the model + the search
+    // Observation (n1,0,1); turn 1 script-exhausted → fails → no RunCompleted.
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "search",
+        "{\"query\":\"rust\"}",
+    )])
+    .await;
+    Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter.clone()))),
+        ))
+        .with_clock(Arc::new(AdvanceableClock::at(OBS_T0)))
+        .run(run, &graph)
+        .await
+        .expect("seed yields an outcome");
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "seed read search once");
+
+    // Tamper: copy the journal into a fresh one, rewriting ONLY the search effect's
+    // recorded input_hash. The model turn is left untouched, so it replays cleanly
+    // and the TOOL fence is what trips.
+    let tampered = InMemoryJournal::new();
+    for (_, e) in journal.load(run).await.unwrap() {
+        let e = match e {
+            JournalEvent::EffectRecorded {
+                effect_id,
+                node,
+                class,
+                seq,
+                output,
+                observation,
+                ..
+            } if effect_id == tool_eid => JournalEvent::EffectRecorded {
+                node,
+                effect_id,
+                class,
+                seq,
+                output,
+                observation,
+                input_hash: "TAMPERED".into(),
+            },
+            other => other,
+        };
+        tampered.append(run, e).await.unwrap();
+    }
+
+    // Resume: turn 0 model memo-hits and replays the search tool call; the tool
+    // effect's memoized input_hash ("TAMPERED") ≠ the replayed call's hash → halt.
+    let (gw2, calls2) = recording_gateway().await;
+    let err = Executor::new(Arc::new(gw2), Arc::new(tampered.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Search::new(counter.clone()))),
+        ))
+        .with_clock(Arc::new(AdvanceableClock::at(OBS_T0)))
+        .start(run, &graph)
+        .await
+        .expect_err("a changed tool input halts the resume");
+    match err {
+        OrchestratorError::DeterminismViolation { node, effect_id } => {
+            assert_eq!(node, NodeId("n1".into()));
+            assert_eq!(
+                effect_id, tool_eid,
+                "the violation is on the tampered tool effect"
+            );
+        }
+        other => panic!("expected DeterminismViolation, got {other:?}"),
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "the tool was never re-executed"
+    );
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        0,
+        "a determinism violation never touches the gateway"
     );
 }
 
