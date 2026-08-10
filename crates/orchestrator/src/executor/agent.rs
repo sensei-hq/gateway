@@ -329,6 +329,10 @@ impl Executor {
         if ar.fold.intents.contains(teid) {
             return self.reconcile_in_doubt(ar, teid, call, args, tih).await;
         }
+        // The `idempotency_key` is persisted in the Intent for a reconciler that
+        // reads the journal to decide (an SP-4 real provider); this executor
+        // recomputes it deterministically in `reconcile_in_doubt` rather than
+        // reading it back, so the two are guaranteed identical.
         self.append(
             ar.run,
             JournalEvent::EffectIntent {

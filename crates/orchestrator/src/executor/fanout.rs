@@ -252,14 +252,20 @@ impl Executor {
                         {
                             Ok(AgentStep::Completed(output)) => Ok(Ok(output)),
                             Ok(AgentStep::Failed(message)) => Ok(Err(message)),
-                            // A Mutation pause inside a fanned-out Map child is out
-                            // of slice-4 scope (the demo places Mutations at the
-                            // top level / Consolidate, never in Map children):
-                            // surface it as the child's manifest error rather than
-                            // threading a pause out of `join_all`. Whole-Map pause
-                            // propagation lands with agent-child Mutations later.
+                            // An in-doubt Mutation in a fanned-out Map child paused
+                            // (its `RunPaused` is already journaled). Slice 4 cannot
+                            // partially-complete a Map around an unresolved Intent,
+                            // so carry the pause OUT of `join_all` as a distinct
+                            // error and let `run_map` pause the WHOLE Map — never
+                            // swallow it into the manifest and let the Map complete
+                            // (that would journal `RunCompleted` over an unresolved
+                            // Intent — a silent failure). Per-child partial-pause
+                            // resumption lands with agent-child Mutations later.
                             Ok(AgentStep::Paused(reason)) => {
-                                Ok(Err(format!("paused (unsupported in map child): {reason}")))
+                                Err(OrchestratorError::MapChildPaused {
+                                    node: NodeId(path.clone()),
+                                    reason,
+                                })
                             }
                             Err(fatal) => Err(fatal),
                         }
@@ -273,21 +279,35 @@ impl Executor {
         // deterministic-ordering guarantee explicit and completion-order-proof.
         collected.sort_by_key(|(i, _)| *i);
 
-        // Fold children into the manifest, propagating any fatal error.
+        // Fold children into the manifest, propagating any fatal error. A child
+        // that PAUSED (in-doubt Mutation) pauses the whole Map — loud + resumable,
+        // never a `RunCompleted` over an unresolved Intent (§7.3 no-silent-failure).
         let mut results = Vec::with_capacity(over.len());
         let mut ok = 0usize;
         let mut failed = 0usize;
+        let mut paused: Option<String> = None;
         for (i, child) in collected {
-            match child? {
-                Ok(value) => {
+            match child {
+                Ok(Ok(value)) => {
                     ok += 1;
                     results.push(serde_json::json!({ "index": i, "ok": value }));
                 }
-                Err(message) => {
+                Ok(Err(message)) => {
                     failed += 1;
                     results.push(serde_json::json!({ "index": i, "error": message }));
                 }
+                Err(OrchestratorError::MapChildPaused { reason, .. }) => {
+                    paused.get_or_insert(reason);
+                }
+                Err(fatal) => return Err(fatal),
             }
+        }
+        // A paused child means the Map cannot complete this round: return `Paused`
+        // (marks the Map terminal-for-now + sets `RunOutcome.paused`, suppressing
+        // `RunCompleted`). Completed siblings stay memoized; a resume re-drives the
+        // Map, replays them, and re-reconciles the in-doubt child.
+        if let Some(reason) = paused {
+            return Ok(NodeExec::Paused { reason });
         }
         let total = over.len();
         let output = serde_json::json!({

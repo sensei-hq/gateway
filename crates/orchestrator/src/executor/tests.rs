@@ -2629,3 +2629,150 @@ async fn e2e_map_observation_agents_plus_mutation_agent_through_the_real_gateway
         outcome.outputs[&cons]
     );
 }
+
+/// Regression (no-silent-failure §7.3): an in-doubt Mutation inside a fanned-out
+/// Map CHILD pauses the WHOLE run loud — it must NEVER journal `RunCompleted` over
+/// the unresolved Intent (which would silently abandon the side effect). Seed a
+/// `Map{Agent("recorder")}` child through its `record_note` Mutation, truncate to
+/// the child's `EffectIntent`, then resume with an Indeterminate reconciler → the
+/// Map (and run) pause; `RunPaused` is journaled, `RunCompleted` is NOT, and no
+/// side effect is applied.
+#[tokio::test]
+async fn in_doubt_mutation_in_a_map_child_pauses_the_whole_run() {
+    let run = RunId(uuid::Uuid::new_v4());
+    let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
+        let recorder = AgentDefinition {
+            name: "recorder".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: "research.bulk".into(),
+            tools: vec!["record_note".into()],
+            skills: vec![],
+            system_prompt: "Record.".into(),
+        };
+        (
+            Arc::new(
+                Registry::default()
+                    .with_agent(recorder)
+                    .with_tool(RecordNote::new(sink.clone()).spec()),
+            ),
+            Arc::new(ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink)))),
+        )
+    };
+    let map_graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("m".into()),
+            kind: NodeKind::Map {
+                body: MapBody::Agent(AgentRef("recorder".into())),
+                over: vec![serde_json::json!("item-0")],
+                concurrency: 1,
+                aggregation: Aggregation::BestEffort,
+            },
+            deps: vec![],
+        }],
+    };
+
+    // Seed: run the Map to completion, then truncate to the child's EffectIntent
+    // (drops its record_note EffectRecorded) → the child is in-doubt on resume.
+    let full = InMemoryJournal::new();
+    let (seed_reg, seed_tools) = mk_recorder(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let (gw_s, _c) = demo_reference_tool_gateway().await;
+    Executor::new(Arc::new(gw_s), Arc::new(full.clone()), "v1")
+        .with_registry(seed_reg)
+        .with_tools(seed_tools)
+        .run(run, &map_graph)
+        .await
+        .expect("seed Map run completes");
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("the child journaled a record_note EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // Resume with an Indeterminate reconciler + a FRESH empty sink → the child's
+    // Mutation is in-doubt → it pauses → the whole Map pauses.
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (reg, tools) = mk_recorder(sink.clone());
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (gw_r, _c2) = demo_reference_tool_gateway().await;
+    let outcome = Executor::new(Arc::new(gw_r), Arc::new(seeded.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(tools)
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &map_graph)
+        .await
+        .expect("resume yields an outcome");
+
+    let pause = outcome
+        .paused
+        .expect("the in-doubt Map child pauses the whole run");
+    assert_eq!(
+        pause.node,
+        NodeId("m".into()),
+        "the Map node is the pause point"
+    );
+    let resumed = seeded.load(run).await.unwrap();
+    assert!(
+        resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run must NOT complete over an unresolved in-doubt Intent (no silent failure)"
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+}
+
+/// The pause is re-entrant: a run paused on an in-doubt Mutation (Indeterminate)
+/// resumes to COMPLETION once its reconciler becomes decisive, and the standing
+/// Intent still bounds the side effect to exactly one application.
+#[tokio::test]
+async fn a_paused_in_doubt_run_resumes_to_completion_when_the_reconciler_decides() {
+    let (journal, run) = seed_in_doubt_note().await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    // First resume: Indeterminate → paused, nothing applied.
+    let indeterminate =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (out1, _e1) = resume_in_doubt(journal.clone(), run, sink.clone(), indeterminate).await;
+    assert!(out1.paused.is_some(), "first resume pauses (Indeterminate)");
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "nothing applied while paused"
+    );
+
+    // Second resume of the SAME journal (now carrying RunPaused, which the fold
+    // ignores so the Mutation stays in-doubt): the reconciler now says NotApplied
+    // → the effect runs exactly once and the run completes.
+    let decisive = ReconcileRegistry::default()
+        .with_provider("record_note", Arc::new(NoteReconciler::new(sink.clone())));
+    let (out2, events2) = resume_in_doubt(journal, run, sink.clone(), decisive).await;
+    assert!(
+        out2.failed.is_none() && out2.paused.is_none(),
+        "second resume completes: {:?}",
+        out2.paused
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "the mutation applied exactly once across both resumes"
+    );
+    assert!(
+        events2
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
