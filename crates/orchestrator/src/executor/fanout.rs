@@ -161,7 +161,7 @@ impl Executor {
             }
             MapBody::Agent(agent_ref) => {
                 match self
-                    .drive_agent(run, &node.id, agent_ref, &input, fold)
+                    .drive_agent(run, &node.id, agent_ref, &input, &[], fold)
                     .await?
                 {
                     AgentStep::Completed(output) => Ok(NodeExec::Completed(output)),
@@ -247,7 +247,7 @@ impl Executor {
                     // child's manifest error, its `Completed` the child's value.
                     MapBody::Agent(agent_ref) => {
                         match self
-                            .drive_agent(run, &NodeId(path.clone()), agent_ref, item, fold)
+                            .drive_agent(run, &NodeId(path.clone()), agent_ref, item, &[], fold)
                             .await
                         {
                             Ok(AgentStep::Completed(output)) => Ok(Ok(output)),

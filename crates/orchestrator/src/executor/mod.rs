@@ -559,7 +559,11 @@ impl Executor {
                 }
             }
             NodeKind::Agent { agent, input } => {
-                match self.drive_agent(run, &node.id, agent, input, fold).await? {
+                let context = self.resolve_context(node).await?;
+                match self
+                    .drive_agent(run, &node.id, agent, input, &context, fold)
+                    .await?
+                {
                     AgentStep::Completed(output) => Ok(NodeExec::Completed(output)),
                     AgentStep::Failed(message) => Ok(NodeExec::Failed {
                         message,
@@ -630,6 +634,30 @@ impl Executor {
             ctx.insert_ref(r.clone()).await?;
         }
         Ok(())
+    }
+
+    /// Resolve a node's dependency context from the blackboard (§8, D2): the
+    /// Run-scoped output of each DECLARED dependency, in declared order. Reads are
+    /// dependency-scoped (not all-Run) so a resume is replay-stable — every dep's
+    /// `ContextWrite` is journaled before this node runs, so the resolved context
+    /// (and thus the agent prompt) is byte-identical on resume. A dependency with
+    /// no entry (e.g. a soft dep that did not complete) is omitted. No store ⇒
+    /// empty.
+    async fn resolve_context(
+        &self,
+        node: &orchestrator_core::Node,
+    ) -> Result<Vec<(ContextKey, serde_json::Value)>, OrchestratorError> {
+        let Some(ctx) = &self.context else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for dep in &node.deps {
+            let key = ContextKey(dep.on.0.clone());
+            if let Some(r) = ctx.get(Scope::Run, key.clone()).await? {
+                out.push((key, ctx.load(&r).await?));
+            }
+        }
+        Ok(out)
     }
 }
 
