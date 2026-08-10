@@ -185,97 +185,30 @@ impl Executor {
             });
         }
 
-        // Fold the journal in `Seq` order: memoize every recorded effect and, for
-        // an already-terminal run, reconstruct the completed outcome.
+        // Fold the journal into resume state (memo + started/completed sets +
+        // each node's last output as a ref, no blob loaded).
         let terminal = events
             .iter()
             .any(|(_, e)| matches!(e, JournalEvent::RunCompleted));
-        let mut fold = Fold::default();
-        let mut outcome = RunOutcome::default();
-        // The last recorded output per node, kept as a **ref** (never loaded) —
-        // the fold reads refs without deserializing blobs (§7.4). Only a terminal
-        // resume materializes these, lazily and bounded (one per node); the
-        // non-terminal path re-materializes on demand while `drive` replays.
-        let mut node_last_output: HashMap<NodeId, EffectOutput> = HashMap::new();
-        for (_, event) in &events {
-            match event {
-                JournalEvent::EffectRecorded {
-                    node,
-                    effect_id,
-                    input_hash,
-                    output,
-                    ..
-                } => {
-                    fold.memo
-                        .insert(effect_id.clone(), (input_hash.clone(), output.clone()));
-                    node_last_output.insert(node.clone(), output.clone());
-                }
-                JournalEvent::NodeStarted { node } => {
-                    fold.started.insert(node.clone());
-                }
-                JournalEvent::NodeCompleted { node } => {
-                    fold.completed.insert(node.clone());
-                    outcome.completed.push(node.clone());
-                }
-                // A compacted Map's children were dropped from the log; rebuild
-                // their memo entries from the manifest (as content refs) so the
-                // Map replays on resume without re-spending (§5.3).
-                JournalEvent::MapCompacted { node, children } => {
-                    for c in children {
-                        if c.status == ChildStatus::Ok
-                            && let (Some(digest), Some(input_hash)) = (&c.digest, &c.input_hash)
-                        {
-                            let child = NodeId(format!("{}/{}", node.0, c.index));
-                            let output = EffectOutput::Ref(ContentRef {
-                                digest: digest.clone(),
-                                size: 0,
-                                summary: None,
-                            });
-                            fold.memo.insert(
-                                effect_id(&child.0, 0, 0),
-                                (input_hash.clone(), output.clone()),
-                            );
-                            node_last_output.insert(child, output);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let (fold, node_last_output, completed) = fold_journal(&events);
 
         if terminal {
-            // Already done: return the folded outcome; do NOT re-drive (which
+            // Already done: return the folded outcome WITHOUT re-driving (which
             // would append a second `RunCompleted`). Materialize each node's final
             // output lazily from its folded ref (inline value, or a CAS blob) —
             // the only place the terminal fold touches content, bounded to one
-            // read per node.
+            // read per node — then project each Agent node's raw output down to its
+            // canonical `{model, text}` shape.
+            let mut outcome = RunOutcome {
+                completed,
+                ..RunOutcome::default()
+            };
             for (node, output) in &node_last_output {
-                let value = self.materialize(output).await?;
-                outcome.outputs.insert(node.clone(), value);
+                outcome
+                    .outputs
+                    .insert(node.clone(), self.materialize(output).await?);
             }
-            // Then project each Agent node's folded output — the RAW final
-            // model-turn effect (`{model, text, tool_calls}`) — down to the
-            // canonical `{model, text}` that a fresh `run` and a non-terminal
-            // resume return from `AgentStep::Completed`, so a completed Agent node
-            // yields an identical JSON shape on every completion path (design §4).
-            // This is a pure projection of the already-materialized outputs — no
-            // re-drive, no append. `ModelCall` nodes already store the canonical
-            // shape and are left untouched.
-            for node in &graph.nodes {
-                if let NodeKind::Agent { .. } = &node.kind
-                    && let Some(output) = outcome.outputs.get(&node.id).cloned()
-                {
-                    let model = output
-                        .get("model")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    let text = output.get("text").cloned().unwrap_or_default();
-                    outcome.outputs.insert(
-                        node.id.clone(),
-                        serde_json::json!({ "model": model, "text": text }),
-                    );
-                }
-            }
+            project_agent_outputs(graph, &mut outcome.outputs);
             return Ok(outcome);
         }
 
@@ -325,20 +258,7 @@ impl Executor {
         let mut terminal: HashSet<NodeId> = HashSet::new();
 
         loop {
-            // Ready = not-yet-terminal nodes whose Hard deps have completed and
-            // Soft deps are terminal, in declaration order (deterministic).
-            let ready: Vec<(usize, &orchestrator_core::Node)> = graph
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| !terminal.contains(&node.id))
-                .filter(|(_, node)| {
-                    node.deps.iter().all(|dep| match dep.kind {
-                        orchestrator_core::EdgeKind::Hard => completed.contains(&dep.on),
-                        orchestrator_core::EdgeKind::Soft => terminal.contains(&dep.on),
-                    })
-                })
-                .collect();
+            let ready = ready_nodes(graph, &completed, &terminal);
             if ready.is_empty() {
                 break;
             }
@@ -356,24 +276,10 @@ impl Executor {
                         outcome.completed.push(node.id.clone());
                         completed.insert(node.id.clone());
                         terminal.insert(node.id.clone());
-                        // Compaction (§5.3): once a Consolidate completes, its Map's
-                        // children are all terminal — collapse their per-child
-                        // records to a digest manifest, off the hot fold path.
-                        // Restricted to `ModelCall`-body Maps (single effect per
-                        // child); an `Agent` child is multi-effect, so compacting
-                        // it is deferred.
-                        if let NodeKind::Consolidate { over, .. } = &node.kind
-                            && graph.nodes.iter().any(|n| {
-                                &n.id == over
-                                    && matches!(
-                                        &n.kind,
-                                        NodeKind::Map {
-                                            body: MapBody::ModelCall { .. },
-                                            ..
-                                        }
-                                    )
-                            })
-                        {
+                        // Compaction (§5.3): once a Consolidate over a ModelCall Map
+                        // completes, collapse the Map's per-child records off the
+                        // hot fold path.
+                        if let Some(over) = consolidate_compaction_target(graph, node) {
                             self.compact_map(run, over, &outcome).await?;
                         }
                     }
@@ -693,22 +599,9 @@ impl Executor {
                     }),
                 }
             }
-            NodeKind::Map {
-                body,
-                over,
-                concurrency,
-                aggregation,
-            } => {
-                self.run_map(run, node, body, over, *concurrency, aggregation, fold)
-                    .await
-            }
-            NodeKind::Consolidate {
-                over,
-                min_viable,
-                body,
-            } => {
-                self.run_consolidate(run, node, over, *min_viable, body, prior_outputs, fold)
-                    .await
+            NodeKind::Map { .. } => self.run_map(run, node, fold).await,
+            NodeKind::Consolidate { .. } => {
+                self.run_consolidate(run, node, prior_outputs, fold).await
             }
         }
     }
@@ -718,17 +611,22 @@ impl Executor {
     /// `ConsolidateStarved`, a loud halt — never a silent empty synthesis), then
     /// run `body` **once** over the collected survivors and return its output. A
     /// determinism violation / journal-write error aborts as `Err`.
-    #[allow(clippy::too_many_arguments)]
     async fn run_consolidate(
         &self,
         run: RunId,
         node: &orchestrator_core::Node,
-        over: &NodeId,
-        min_viable: usize,
-        body: &MapBody,
         prior_outputs: &HashMap<NodeId, serde_json::Value>,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
+        let NodeKind::Consolidate {
+            over,
+            min_viable,
+            body,
+        } = &node.kind
+        else {
+            unreachable!("run_consolidate is only dispatched for a Consolidate node");
+        };
+        let min_viable = *min_viable;
         // Collect the Map's successful results (the `ok` value of each child) in
         // item order. A missing/absent Map output yields zero survivors, which
         // the min-viable gate turns into a loud starvation rather than a silent
@@ -876,17 +774,22 @@ impl Executor {
     /// journals `NodeFailed` and still carries the manifest out via
     /// [`NodeExec::Failed`]`.output`. A fatal error (journal write / determinism)
     /// aborts as `Err`.
-    #[allow(clippy::too_many_arguments)]
     async fn run_map(
         &self,
         run: RunId,
         map_node: &orchestrator_core::Node,
-        body: &MapBody,
-        over: &[serde_json::Value],
-        concurrency: usize,
-        aggregation: &Aggregation,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
+        let NodeKind::Map {
+            body,
+            over,
+            concurrency,
+            aggregation,
+        } = &map_node.kind
+        else {
+            unreachable!("run_map is only dispatched for a Map node");
+        };
+        let concurrency = *concurrency;
         // Resume-safety: a Map replayed on resume (its children memoized) must NOT
         // re-append its `NodeStarted`/`MapExpanded`/`NodeCompleted` — those are
         // already journaled. Guarded via the fold, exactly like `drive_agent`.
@@ -1293,66 +1196,14 @@ impl Executor {
                 ));
             }
 
-            // Execute (or replay) each tool call, then extend the transcript.
-            let assistant_text = turn_output
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            messages.push(Message {
-                role: MessageRole::Assistant,
-                content: MessageContent::Text {
-                    text: assistant_text,
-                },
-                tool_calls: tool_calls.clone(),
-                attachments: Vec::new(),
-            });
-            for (k, call) in tool_calls.iter().enumerate() {
-                let teid = effect_id(&node_id.0, turn as u64, k + 1);
-                let args: serde_json::Value =
-                    serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
-                let tih = tool_input_hash(&call.name, &call.arguments);
-                let result = if let Some((recorded_ih, output)) = fold.memo.get(&teid) {
-                    if recorded_ih != &tih {
-                        return Err(OrchestratorError::DeterminismViolation {
-                            node: node_id.clone(),
-                            effect_id: teid,
-                        });
-                    }
-                    self.materialize(output).await?
-                } else {
-                    match self.tools.execute(&call.name, args) {
-                        Ok(result) => {
-                            let recorded = self.split_output(&result).await?;
-                            self.append(
-                                run,
-                                JournalEvent::EffectRecorded {
-                                    node: node_id.clone(),
-                                    effect_id: teid,
-                                    class: EffectClass::Pure,
-                                    input_hash: tih,
-                                    seq: 0,
-                                    output: recorded,
-                                },
-                            )
-                            .await?;
-                            result
-                        }
-                        Err(err) => {
-                            let message = err.to_string();
-                            self.append(
-                                run,
-                                JournalEvent::NodeFailed {
-                                    node: node_id.clone(),
-                                    error: message.clone(),
-                                },
-                            )
-                            .await?;
-                            return Ok(AgentStep::Failed(message));
-                        }
-                    }
-                };
-                messages.push(Message::tool_result(call.id.clone(), result.to_string()));
+            // Not a final answer → execute this turn's tool calls and extend the
+            // transcript. A tool failure ends the node (already journaled).
+            match self
+                .run_agent_tools(run, node_id, turn, &turn_output, fold)
+                .await?
+            {
+                Ok(turn_messages) => messages.extend(turn_messages),
+                Err(failure) => return Ok(AgentStep::Failed(failure)),
             }
         }
 
@@ -1370,6 +1221,213 @@ impl Executor {
         )
         .await?;
         Ok(AgentStep::Failed(message))
+    }
+
+    /// Execute (or replay) one ReAct turn's tool calls and return the transcript
+    /// messages to append (the assistant turn + each tool result). Each Pure tool
+    /// call is a Pure effect `effect_id(node_id, turn, k+1)`: a memo hit replays it
+    /// (no re-execution), a hash mismatch is a `DeterminismViolation` (fatal outer
+    /// `Err`). The inner `Result` is the turn's messages, or a tool's failure
+    /// message (already journaled `NodeFailed`) — the same shape as a Map child.
+    async fn run_agent_tools(
+        &self,
+        run: RunId,
+        node_id: &NodeId,
+        turn: usize,
+        turn_output: &serde_json::Value,
+        fold: &Fold,
+    ) -> Result<Result<Vec<Message>, String>, OrchestratorError> {
+        let assistant_text = turn_output
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let tool_calls: Vec<ToolCall> = serde_json::from_value(
+            turn_output
+                .get("tool_calls")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )?;
+        let mut out = vec![Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text {
+                text: assistant_text,
+            },
+            tool_calls: tool_calls.clone(),
+            attachments: Vec::new(),
+        }];
+        for (k, call) in tool_calls.iter().enumerate() {
+            let teid = effect_id(&node_id.0, turn as u64, k + 1);
+            let args: serde_json::Value =
+                serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+            let tih = tool_input_hash(&call.name, &call.arguments);
+            let result = if let Some((recorded_ih, output)) = fold.memo.get(&teid) {
+                if recorded_ih != &tih {
+                    return Err(OrchestratorError::DeterminismViolation {
+                        node: node_id.clone(),
+                        effect_id: teid,
+                    });
+                }
+                self.materialize(output).await?
+            } else {
+                match self.tools.execute(&call.name, args) {
+                    Ok(result) => {
+                        let recorded = self.split_output(&result).await?;
+                        self.append(
+                            run,
+                            JournalEvent::EffectRecorded {
+                                node: node_id.clone(),
+                                effect_id: teid,
+                                class: EffectClass::Pure,
+                                input_hash: tih,
+                                seq: 0,
+                                output: recorded,
+                            },
+                        )
+                        .await?;
+                        result
+                    }
+                    Err(err) => {
+                        let message = err.to_string();
+                        self.append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: node_id.clone(),
+                                error: message.clone(),
+                            },
+                        )
+                        .await?;
+                        return Ok(Err(message));
+                    }
+                }
+            };
+            out.push(Message::tool_result(call.id.clone(), result.to_string()));
+        }
+        Ok(Ok(out))
+    }
+}
+
+/// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
+/// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
+/// declaration order (deterministic). A linear graph yields exactly one.
+fn ready_nodes<'g>(
+    graph: &'g Graph,
+    completed: &std::collections::HashSet<NodeId>,
+    terminal: &std::collections::HashSet<NodeId>,
+) -> Vec<(usize, &'g orchestrator_core::Node)> {
+    graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| !terminal.contains(&node.id))
+        .filter(|(_, node)| {
+            node.deps.iter().all(|dep| match dep.kind {
+                orchestrator_core::EdgeKind::Hard => completed.contains(&dep.on),
+                orchestrator_core::EdgeKind::Soft => terminal.contains(&dep.on),
+            })
+        })
+        .collect()
+}
+
+/// If `node` is a `Consolidate` over a `ModelCall`-body `Map`, return that Map's
+/// id — the Map whose per-child records become compactable once the Consolidate
+/// completes (§5.3). `Agent`-body Maps are multi-effect and are not compacted.
+fn consolidate_compaction_target<'g>(
+    graph: &'g Graph,
+    node: &'g orchestrator_core::Node,
+) -> Option<&'g NodeId> {
+    let NodeKind::Consolidate { over, .. } = &node.kind else {
+        return None;
+    };
+    let over_is_modelcall_map = graph.nodes.iter().any(|n| {
+        &n.id == over
+            && matches!(
+                &n.kind,
+                NodeKind::Map {
+                    body: MapBody::ModelCall { .. },
+                    ..
+                }
+            )
+    });
+    over_is_modelcall_map.then_some(over)
+}
+
+/// Fold a run's journal into resume state: the effect memo, the started/
+/// completed sets, each node's **last output as a ref** (no blob loaded — §7.4),
+/// and the completed-node order (used only to reconstruct a terminal outcome). A
+/// `MapCompacted` manifest rebuilds its children's memo entries as content refs
+/// (§5.3), so a compacted Map replays without re-spending.
+fn fold_journal(
+    events: &[(Seq, JournalEvent)],
+) -> (Fold, HashMap<NodeId, EffectOutput>, Vec<NodeId>) {
+    let mut fold = Fold::default();
+    let mut node_last_output: HashMap<NodeId, EffectOutput> = HashMap::new();
+    let mut completed: Vec<NodeId> = Vec::new();
+    for (_, event) in events {
+        match event {
+            JournalEvent::EffectRecorded {
+                node,
+                effect_id,
+                input_hash,
+                output,
+                ..
+            } => {
+                fold.memo
+                    .insert(effect_id.clone(), (input_hash.clone(), output.clone()));
+                node_last_output.insert(node.clone(), output.clone());
+            }
+            JournalEvent::NodeStarted { node } => {
+                fold.started.insert(node.clone());
+            }
+            JournalEvent::NodeCompleted { node } => {
+                fold.completed.insert(node.clone());
+                completed.push(node.clone());
+            }
+            JournalEvent::MapCompacted { node, children } => {
+                for c in children {
+                    if c.status == ChildStatus::Ok
+                        && let (Some(digest), Some(input_hash)) = (&c.digest, &c.input_hash)
+                    {
+                        let child = NodeId(format!("{}/{}", node.0, c.index));
+                        let output = EffectOutput::Ref(ContentRef {
+                            digest: digest.clone(),
+                            size: 0,
+                            summary: None,
+                        });
+                        fold.memo.insert(
+                            effect_id(&child.0, 0, 0),
+                            (input_hash.clone(), output.clone()),
+                        );
+                        node_last_output.insert(child, output);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (fold, node_last_output, completed)
+}
+
+/// Project each Agent node's raw final model-turn output (`{model, text,
+/// tool_calls}`) down to the canonical `{model, text}` a fresh `run` returns from
+/// `AgentStep::Completed` (design §4) — so a completed Agent node yields an
+/// identical shape on every completion path. Pure over already-materialized
+/// outputs; `ModelCall` nodes already store the canonical shape and are untouched.
+fn project_agent_outputs(graph: &Graph, outputs: &mut HashMap<NodeId, serde_json::Value>) {
+    for node in &graph.nodes {
+        if let NodeKind::Agent { .. } = &node.kind
+            && let Some(output) = outputs.get(&node.id).cloned()
+        {
+            let model = output
+                .get("model")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let text = output.get("text").cloned().unwrap_or_default();
+            outputs.insert(
+                node.id.clone(),
+                serde_json::json!({ "model": model, "text": text }),
+            );
+        }
     }
 }
 
@@ -2297,6 +2355,41 @@ mod tests {
         }
     }
 
+    /// A 3-node graph — `Map m` (3 items, BestEffort) → `Consolidate cons`
+    /// (min_viable 1) → `ModelCall n3` ("tail") — the shared fixture for the
+    /// resume/compaction tests where the Map + Consolidate complete but a
+    /// hard-dependent tail node fails.
+    fn map_consolidate_tail_graph() -> Graph {
+        Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("m".into()),
+                    kind: NodeKind::Map {
+                        body: MapBody::ModelCall { chain: "c".into() },
+                        over: map_items(["i0", "i1", "i2"]),
+                        concurrency: 4,
+                        aggregation: Aggregation::BestEffort,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("cons".into()),
+                    kind: NodeKind::Consolidate {
+                        over: NodeId("m".into()),
+                        min_viable: 1,
+                        body: MapBody::ModelCall { chain: "c".into() },
+                    },
+                    deps: vec![Dep::soft("m")],
+                },
+                Node {
+                    id: NodeId("n3".into()),
+                    kind: model_call("c", "tail"),
+                    deps: vec![Dep::hard("cons")],
+                },
+            ],
+        }
+    }
+
     /// Acceptance 5 — `Consolidate` synthesizes over the Map's survivors when
     /// they meet `min_viable`, and halts loudly (`ConsolidateStarved`) when they
     /// don't — never a silent empty synthesis.
@@ -3127,34 +3220,7 @@ mod tests {
         let cons = NodeId("cons".into());
         let n3 = NodeId("n3".into());
         // Map m (3 ok) → Consolidate cons (soft m) → ModelCall n3 (hard cons).
-        let graph = Graph {
-            nodes: vec![
-                Node {
-                    id: NodeId("m".into()),
-                    kind: NodeKind::Map {
-                        body: MapBody::ModelCall { chain: "c".into() },
-                        over: map_items(["i0", "i1", "i2"]),
-                        concurrency: 4,
-                        aggregation: Aggregation::BestEffort,
-                    },
-                    deps: vec![],
-                },
-                Node {
-                    id: cons.clone(),
-                    kind: NodeKind::Consolidate {
-                        over: NodeId("m".into()),
-                        min_viable: 1,
-                        body: MapBody::ModelCall { chain: "c".into() },
-                    },
-                    deps: vec![Dep::soft("m")],
-                },
-                Node {
-                    id: n3.clone(),
-                    kind: model_call("c", "tail"),
-                    deps: vec![Dep::hard("cons")],
-                },
-            ],
-        };
+        let graph = map_consolidate_tail_graph();
 
         // Run 1: 3 children (calls 1–3) + cons body (call 4) succeed, n3 fails
         // (call 5) → no RunCompleted.
@@ -3301,34 +3367,7 @@ mod tests {
         let content = Arc::new(InMemoryContentStore::new());
         let cons = NodeId("cons".into());
         let n3 = NodeId("n3".into());
-        let graph = Graph {
-            nodes: vec![
-                Node {
-                    id: NodeId("m".into()),
-                    kind: NodeKind::Map {
-                        body: MapBody::ModelCall { chain: "c".into() },
-                        over: map_items(["i0", "i1", "i2"]),
-                        concurrency: 4,
-                        aggregation: Aggregation::BestEffort,
-                    },
-                    deps: vec![],
-                },
-                Node {
-                    id: cons.clone(),
-                    kind: NodeKind::Consolidate {
-                        over: NodeId("m".into()),
-                        min_viable: 1,
-                        body: MapBody::ModelCall { chain: "c".into() },
-                    },
-                    deps: vec![Dep::soft("m")],
-                },
-                Node {
-                    id: n3.clone(),
-                    kind: model_call("c", "tail"),
-                    deps: vec![Dep::hard("cons")],
-                },
-            ],
-        };
+        let graph = map_consolidate_tail_graph();
 
         // Run 1: 3 children (1–3) + cons body (4) succeed; cons completes and
         // compacts the Map; n3 fails (5) → no RunCompleted.
