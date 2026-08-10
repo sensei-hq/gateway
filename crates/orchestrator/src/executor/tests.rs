@@ -9,8 +9,49 @@ use orchestrator_core::{
 use orchestrator_store::InMemoryJournal;
 
 use crate::agent::tools::{Calc, Tool, ToolRegistry};
-use orchestrator_core::{AgentDefinition, AgentRef, Registry};
+use orchestrator_core::{
+    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, Registry, ToolSpec,
+};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A test `Clock` pinned to a fixed instant (`at`), shared across executors via a
+/// clonable handle so a resume can be driven at a chosen point relative to an
+/// Observation's `fetched_at`.
+#[derive(Clone)]
+struct AdvanceableClock(Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>);
+impl AdvanceableClock {
+    fn at(unix_secs: i64) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(
+            chrono::DateTime::from_timestamp(unix_secs, 0).expect("valid timestamp"),
+        )))
+    }
+}
+impl Clock for AdvanceableClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// An Observation tool that counts its live executions, so a test can tell a
+/// memo replay (count unchanged) from a live re-read (count +1). `ttl_secs = 60`.
+struct Probe(Arc<AtomicUsize>);
+impl Tool for Probe {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "probe".into(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            effect_class: EffectClass::Observation,
+            ttl_secs: Some(60),
+            source: Some("probe".into()),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({ "probed": true }))
+    }
+}
 
 fn agent_def(chain: &str) -> AgentDefinition {
     AgentDefinition {
@@ -354,6 +395,100 @@ async fn agent_resume_does_not_respend_completed_turns() {
         recorded_count(&effect_id("n1", 0, 1)),
         1,
         "turn 0's calc tool was memoized on resume, not re-executed/re-recorded"
+    );
+}
+
+/// Headline (Observation §7.1): a memoized Observation is REPLAYED while fresh
+/// (no re-execution) but RE-READ once its TTL lapses. Two independent partial
+/// runs record the same `probe` Observation at `T0` (ttl=60); one resumes within
+/// the TTL (replay — probe not re-run), the other past it (re-read — probe runs
+/// once more and a second `EffectRecorded` supersedes).
+#[tokio::test]
+async fn observation_replays_within_ttl_and_rereads_when_stale() {
+    const T0: i64 = 1_000_000_000;
+    let probe_eid = effect_id("n1", 0, 1);
+
+    // Record `probe` (Observation, fetched_at=T0) in a partial run that dies at
+    // turn 1 (script exhausted). Returns the journal, run id, and live-call
+    // counter (== 1 after this).
+    async fn seed(counter: Arc<AtomicUsize>) -> (InMemoryJournal, RunId) {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "probe it")],
+        };
+        let (gw, _c) = scripted_gateway(vec![tool_call_response("t1", "probe", "{}")]).await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(agent_registry("c"))
+            .with_tools(Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(Probe(counter))),
+            ))
+            .with_clock(Arc::new(AdvanceableClock::at(T0)));
+        let o = exec
+            .run(run, &graph)
+            .await
+            .expect("seed run yields an outcome");
+        assert!(
+            o.failed.is_some(),
+            "seed run fails at turn 1 (script exhausted)"
+        );
+        (journal, run)
+    }
+
+    let recorded_count = |events: &[(Seq, JournalEvent)], eid: &EffectId| {
+        events
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id: r, .. } if r == eid),
+            )
+            .count()
+    };
+    let resume = |journal: InMemoryJournal, run: RunId, counter: Arc<AtomicUsize>, at: i64| async move {
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "probe it")],
+        };
+        let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(agent_registry("c"))
+            .with_tools(Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(Probe(counter))),
+            ))
+            .with_clock(Arc::new(AdvanceableClock::at(at)))
+            .start(run, &graph)
+            .await
+            .expect("resume completes");
+        journal.load(run).await.unwrap()
+    };
+
+    // Fresh (T0 + 30s < TTL): replay — probe is NOT re-run, no second record.
+    let fresh = Arc::new(AtomicUsize::new(0));
+    let (j, run) = seed(fresh.clone()).await;
+    assert_eq!(fresh.load(Ordering::SeqCst), 1, "seed ran probe once");
+    let events = resume(j, run, fresh.clone(), T0 + 30).await;
+    assert_eq!(
+        fresh.load(Ordering::SeqCst),
+        1,
+        "within TTL the Observation replays from the memo — probe NOT re-executed"
+    );
+    assert_eq!(
+        recorded_count(&events, &probe_eid),
+        1,
+        "a fresh Observation is not re-recorded on resume"
+    );
+
+    // Stale (T0 + 90s > TTL): re-read — probe runs once more, a second record supersedes.
+    let stale = Arc::new(AtomicUsize::new(0));
+    let (j2, run2) = seed(stale.clone()).await;
+    let events2 = resume(j2, run2, stale.clone(), T0 + 90).await;
+    assert_eq!(
+        stale.load(Ordering::SeqCst),
+        2,
+        "past TTL the Observation is re-read — probe executed once more"
+    );
+    assert_eq!(
+        recorded_count(&events2, &probe_eid),
+        2,
+        "a stale re-read appends a second EffectRecorded (supersedes)"
     );
 }
 

@@ -78,11 +78,17 @@ pub(crate) fn fold_journal(
                 effect_id,
                 input_hash,
                 output,
+                observation,
                 ..
             } => {
                 fold.memo
                     .insert(effect_id.clone(), (input_hash.clone(), output.clone()));
                 node_last_output.insert(node.clone(), output.clone());
+                // §7.1: an Observation's latest record wins its freshness slot, so
+                // a stale re-read (which appends a fresh record) supersedes.
+                if let Some(meta) = observation {
+                    fold.observations.insert(effect_id.clone(), meta.clone());
+                }
             }
             JournalEvent::NodeStarted { node } => {
                 fold.started.insert(node.clone());
@@ -246,15 +252,6 @@ pub(crate) fn agent_input_hash(
 pub(crate) fn tool_input_hash(name: &str, arguments: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{name}|{arguments}").as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// The `content_hash` element of an Observation's provenance (§7.1): the sha256
-/// hex of the recorded output's serialized bytes.
-#[allow(dead_code)] // used by the Observation path (slice-4 Task 7)
-pub(crate) fn content_hash(value: &serde_json::Value) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(value).unwrap_or_default());
     format!("{:x}", hasher.finalize())
 }
 
