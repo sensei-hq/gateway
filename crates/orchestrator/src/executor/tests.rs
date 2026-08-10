@@ -2777,3 +2777,18 @@ async fn a_paused_in_doubt_run_resumes_to_completion_when_the_reconciler_decides
         "the run completes"
     );
 }
+
+// ============================ SP-1 blackboard wiring ============================
+
+/// The `with_context_store` seam exists and composes; behavior lands in later
+/// tasks. Pins the builder is wired.
+#[tokio::test]
+async fn with_context_store_builder_is_wired() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let ctx = Arc::new(InMemoryContextStore::new(Arc::new(
+        InMemoryContentStore::new(),
+    )));
+    let (gw, _c) = recording_gateway().await;
+    let _exec =
+        Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1").with_context_store(ctx);
+}

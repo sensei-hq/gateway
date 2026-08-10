@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use gateway::Gateway;
 use orchestrator_core::{
-    Clock, ContentStore, EffectClass, EffectId, EffectOutput, ExecutionJournal, Graph,
-    JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError, Registry, RunId, Seq,
-    SystemClock, effect_id,
+    Clock, ContentStore, ContextStore, EffectClass, EffectId, EffectOutput, ExecutionJournal,
+    Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError, Registry, RunId,
+    Seq, SystemClock, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -47,6 +47,10 @@ pub struct Executor {
     clock: Arc<dyn Clock>,
     /// Reconcile providers, queried when a Mutation is in-doubt on resume.
     reconcilers: Arc<ReconcileRegistry>,
+    /// The scoped blackboard (§8) node outputs publish to and agent prompts read
+    /// dependency context from. Optional/injected — no store wired ⇒ every
+    /// blackboard step is a no-op (slice-4 behavior byte-identical).
+    context: Option<Arc<dyn ContextStore>>,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -125,6 +129,7 @@ impl Executor {
             cas_threshold: 4096,
             clock: Arc::new(SystemClock),
             reconcilers: Arc::new(ReconcileRegistry::default()),
+            context: None,
         }
     }
 
@@ -180,6 +185,16 @@ impl Executor {
     /// Attach reconcile providers, queried when a Mutation is in-doubt on resume.
     pub fn with_reconcilers(mut self, reconcilers: Arc<ReconcileRegistry>) -> Self {
         self.reconcilers = reconcilers;
+        self
+    }
+
+    /// Wire the scoped blackboard (§8): completed node outputs publish to it, and
+    /// an `Agent` node's prompt is assembled with its dependencies' outputs read
+    /// from it. Injected (shared across the crash/resume seam). Requires a
+    /// `ContentStore` (entries are CAS refs). No store ⇒ every blackboard step is
+    /// a no-op, so behavior stays byte-identical.
+    pub fn with_context_store(mut self, context: Arc<dyn ContextStore>) -> Self {
+        self.context = Some(context);
         self
     }
 
