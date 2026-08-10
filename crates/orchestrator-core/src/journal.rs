@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::content::{Digest, EffectOutput};
+use crate::content::{ContentRef, Digest, EffectOutput};
 use crate::effect::{EffectClass, EffectId};
 use crate::error::JournalError;
 use crate::ids::{NodeId, RunId, Seq};
@@ -102,6 +102,17 @@ pub enum JournalEvent {
     MapCompacted {
         node: NodeId,
         children: Vec<CompactChild>,
+    },
+    /// A shared-scope blackboard publish (§8). Journaled so a resume rebuilds the
+    /// `ContextStore` (as refs, no blob load) via
+    /// [`ContextStore::insert_ref`](crate::context::ContextStore::insert_ref). The
+    /// `content` is a CAS ref — never an inline blob.
+    ContextWrite {
+        scope: crate::context::Scope,
+        key: crate::context::ContextKey,
+        content: ContentRef,
+        summary: Option<String>,
+        seq: Seq,
     },
     RunCompleted,
     RunPaused {
@@ -244,6 +255,28 @@ mod tests {
                 observation: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn context_write_event_roundtrips() {
+        use crate::content::{ContentRef, Digest};
+        use crate::context::{ContextKey, Scope};
+        let e = JournalEvent::ContextWrite {
+            scope: Scope::Run,
+            key: ContextKey("n1".into()),
+            content: ContentRef {
+                digest: Digest("d".into()),
+                size: 3,
+                summary: None,
+            },
+            summary: None,
+            seq: 0,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<JournalEvent>(&s).unwrap(),
+            JournalEvent::ContextWrite { .. }
         ));
     }
 }

@@ -1019,6 +1019,7 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::MapCompacted { node, children } => {
             format!("MapCompacted({}x{})", node.0, children.len())
         }
+        JournalEvent::ContextWrite { key, .. } => format!("ContextWrite({})", key.0),
         JournalEvent::RunCompleted => "RunCompleted".to_string(),
         JournalEvent::RunPaused { .. } => "RunPaused".to_string(),
     }
