@@ -49,7 +49,7 @@ use futures::Stream;
 use kernel::registry::{ModelEntry, ModelSource};
 use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
-use kernel::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use kernel::types::io::{ChatRequest, ChatResponse};
 use kernel::types::request::{Message, MessageRole, StreamChunk};
 use llama_cpp_2::{
     context::{
@@ -639,14 +639,11 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
         _cfg: &RouterConfig,
         req: &ChatRequest,
     ) -> Result<ChatResponse, GatewayError> {
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
+        super::reject_model_mismatch(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+        )?;
 
         let content = self.generate(
             &req.messages,
@@ -672,14 +669,11 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
         req: &ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>, GatewayError>
     {
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
+        super::reject_model_mismatch(
+            &self.config.adapter_id,
+            &self.config.model_id,
+            req.model.as_deref(),
+        )?;
 
         // Resolve generation settings (mode-checked).
         let (default_max, default_temp, seed) = match self.config.mode {
@@ -732,11 +726,13 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
         tokio::task::spawn_blocking(move || {
             run_streaming_generation(
                 inner,
-                adapter_id,
-                prompt_tokens,
-                max_new,
-                temperature,
-                seed,
+                StreamingGenerationRequest {
+                    adapter_id,
+                    prompt_tokens,
+                    max_new,
+                    temperature,
+                    seed,
+                },
                 tx,
             );
         });
@@ -745,32 +741,8 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
     }
 }
 
-#[async_trait]
-impl kernel::adapters::capability::EmbedModel for LlamaCppAdapter {
-    async fn embed(
-        &self,
-        _cfg: &RouterConfig,
-        req: &EmbedRequest,
-    ) -> Result<EmbedResponse, GatewayError> {
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
-
-        // Inherent `LlamaCppAdapter::embed` (the trait is referenced by full
-        // path, not `use`d, so this method call binds to the inherent one).
-        let embeddings = self.embed(&req.texts)?;
-        Ok(EmbedResponse {
-            embeddings,
-            usage: None,
-            degraded: false,
-        })
-    }
-}
+// Embed-only, delegating to the inherent `LlamaCppAdapter::embed` via the shared macro.
+crate::impl_embed_via_inherent!(LlamaCppAdapter);
 
 #[async_trait]
 impl kernel::adapters::RegisterInto for LlamaCppAdapter {
@@ -778,6 +750,17 @@ impl kernel::adapters::RegisterInto for LlamaCppAdapter {
         reg.register_chat(self.clone()).await;
         reg.register_embed(self).await;
     }
+}
+
+/// Bundled inputs to [`run_streaming_generation`] — grouped into one value so
+/// the `spawn_blocking` worker call site doesn't carry five independent
+/// fields alongside `inner` and `tx`.
+struct StreamingGenerationRequest {
+    adapter_id: String,
+    prompt_tokens: Vec<LlamaToken>,
+    max_new: u32,
+    temperature: f32,
+    seed: u32,
 }
 
 /// Streaming generation body — runs in a `spawn_blocking` worker.
@@ -794,140 +777,233 @@ impl kernel::adapters::RegisterInto for LlamaCppAdapter {
 /// original text exactly.
 fn run_streaming_generation(
     inner: Arc<Inner>,
-    adapter_id: String,
-    prompt_tokens: Vec<LlamaToken>,
-    max_new: u32,
-    temperature: f32,
-    seed: u32,
+    request: StreamingGenerationRequest,
     tx: tokio::sync::mpsc::Sender<Result<StreamChunk, GatewayError>>,
 ) {
-    let err = |message: String| GatewayError::ProviderError {
-        adapter: adapter_id.clone(),
+    // `stream_tokens` runs setup → loop → flush and returns the finish reason
+    // on a clean run. On any early exit it has already sent the error (or
+    // stopped silently on receiver-dropped cancellation) and returns
+    // `Err(())`, so the terminal chunk below is skipped — matching each of the
+    // original seven `return`s exactly.
+    if let Ok(finish_reason) = stream_tokens(&inner, &request, &tx) {
+        let _ = tx.blocking_send(Ok(StreamChunk {
+            content: String::new(),
+            finish_reason: Some(finish_reason.into()),
+            usage: None,
+            tool_calls: Vec::new(),
+        }));
+    }
+}
+
+/// Build a `ProviderError` for the streaming adapter.
+fn stream_error(adapter_id: &str, message: String) -> GatewayError {
+    GatewayError::ProviderError {
+        adapter: adapter_id.into(),
         message,
         status: None,
-    };
+    }
+}
 
-    // Lock the context for the duration of this generation. Other
-    // concurrent calls on the same adapter will queue; this matches
-    // the non-streaming generate() path.
-    let mut guard = match inner.context.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            let _ = tx.blocking_send(Err(err("context mutex poisoned".into())));
-            return;
+/// Send an `Err` chunk and yield the `()` sentinel that the `?` operator
+/// propagates. Every fallible step early-exits through this single path
+/// (`.map_err(|e| emit_err(tx, stream_error(..)))?`), which is what collapses
+/// the original seven hand-written `return`s into one. The send result is
+/// ignored: the receiver may already be gone.
+fn emit_err(tx: &tokio::sync::mpsc::Sender<Result<StreamChunk, GatewayError>>, e: GatewayError) {
+    let _ = tx.blocking_send(Err(e));
+}
+
+/// Length of the longest valid UTF-8 prefix of `bytes`. Lets the streaming
+/// loop ship only complete codepoints when a multi-byte character straddles
+/// two tokens (common in CJK / emoji / non-Latin scripts).
+fn valid_utf8_end(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => e.valid_up_to(),
+    }
+}
+
+/// Outcome of decoding one token in the streaming loop. `Emitted` means a
+/// token was produced (and any now-complete UTF-8 text shipped) and the loop
+/// should keep decoding; `EndOfGeneration` means an EOG token was sampled, so
+/// the loop stops with `finish_reason = "stop"`.
+enum StreamStep {
+    Emitted,
+    EndOfGeneration,
+}
+
+/// Mutable per-generation decode state threaded through each [`decode_step`].
+/// Bundled into one value so the step helper stays within a sane argument
+/// count and the loop and the trailing flush share one owner for the UTF-8
+/// buffer. `ctx` borrows the locked context guard for the run's duration.
+struct StreamDecode<'ctx> {
+    ctx: &'ctx mut LlamaContext<'static>,
+    sampler: LlamaSampler,
+    batch: LlamaBatch<'static>,
+    /// Raw generated bytes; may end mid-codepoint between steps.
+    buf: Vec<u8>,
+    /// How many bytes of `buf` have already been shipped as chunks.
+    emitted: usize,
+}
+
+/// Decode one token: sample, ship any now-complete UTF-8 text, then feed the
+/// token back in for the next step. Returns `EndOfGeneration` on an EOG token
+/// so the loop can stop with `finish_reason = "stop"`. Bubbles `Err(())` after
+/// `emit_err` has already sent the error — or silently, on receiver-dropped
+/// cancellation — so the caller stops without emitting a terminal chunk.
+fn decode_step(
+    state: &mut StreamDecode<'_>,
+    model: &LlamaModel,
+    tx: &tokio::sync::mpsc::Sender<Result<StreamChunk, GatewayError>>,
+    adapter_id: &str,
+    next_pos: i32,
+) -> Result<StreamStep, ()> {
+    let token = state.sampler.sample(state.ctx, state.batch.n_tokens() - 1);
+    state.sampler.accept(token);
+
+    if model.is_eog_token(token) {
+        return Ok(StreamStep::EndOfGeneration);
+    }
+
+    let bytes = model
+        .token_to_piece_bytes(token, 32, false, None)
+        .map_err(|e| {
+            emit_err(
+                tx,
+                stream_error(adapter_id, format!("token_to_piece_bytes: {e}")),
+            )
+        })?;
+    state.buf.extend_from_slice(&bytes);
+
+    // Ship the longest newly-valid UTF-8 prefix beyond `emitted`.
+    let valid_end = valid_utf8_end(&state.buf);
+    if valid_end > state.emitted {
+        // Safety: [0..valid_end] was just confirmed to be valid UTF-8.
+        let new_text = std::str::from_utf8(&state.buf[state.emitted..valid_end])
+            .expect("valid prefix")
+            .to_string();
+        state.emitted = valid_end;
+        if tx
+            .blocking_send(Ok(StreamChunk {
+                content: new_text,
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            }))
+            .is_err()
+        {
+            // Receiver dropped — caller cancelled the stream. Stop early.
+            return Err(());
         }
-    };
+    }
+
+    state.batch.clear();
+    state.batch.add(token, next_pos, &[0], true).map_err(|e| {
+        emit_err(
+            tx,
+            stream_error(adapter_id, format!("batch.add (step): {e}")),
+        )
+    })?;
+    state
+        .ctx
+        .decode(&mut state.batch)
+        .map_err(|e| emit_err(tx, stream_error(adapter_id, format!("decode (step): {e}"))))?;
+    Ok(StreamStep::Emitted)
+}
+
+/// Setup → loop { [`decode_step`] } → flush. Returns the finish reason
+/// (`"stop"` on EOG, `"length"` on hitting `max_new`) on a clean run; every
+/// early exit returns `Err(())` after `emit_err` has sent the error (or
+/// silently on cancellation), so the caller skips the terminal chunk.
+fn stream_tokens(
+    inner: &Inner,
+    request: &StreamingGenerationRequest,
+    tx: &tokio::sync::mpsc::Sender<Result<StreamChunk, GatewayError>>,
+) -> Result<&'static str, ()> {
+    let adapter_id = request.adapter_id.as_str();
+    let prompt_tokens = &request.prompt_tokens;
+
+    // Lock the context for the duration of this generation. Other concurrent
+    // calls on the same adapter queue behind this lock; this matches the
+    // non-streaming generate() path.
+    let mut guard = inner.context.lock().map_err(|_| {
+        emit_err(
+            tx,
+            stream_error(adapter_id, "context mutex poisoned".into()),
+        )
+    })?;
     let ctx = &mut guard.0;
     ctx.clear_kv_cache();
 
+    // Feed the prompt: mark only the last token for logits.
     let mut batch = LlamaBatch::new(prompt_tokens.len().max(1), 1);
     let last_prompt = prompt_tokens.len().saturating_sub(1);
     for (pos, &token) in prompt_tokens.iter().enumerate() {
-        if let Err(e) = batch.add(token, pos as i32, &[0], pos == last_prompt) {
-            let _ = tx.blocking_send(Err(err(format!("batch.add (prompt): {e}"))));
-            return;
-        }
+        batch
+            .add(token, pos as i32, &[0], pos == last_prompt)
+            .map_err(|e| {
+                emit_err(
+                    tx,
+                    stream_error(adapter_id, format!("batch.add (prompt): {e}")),
+                )
+            })?;
     }
-    if let Err(e) = ctx.decode(&mut batch) {
-        let _ = tx.blocking_send(Err(err(format!("decode (prompt): {e}"))));
-        return;
-    }
+    ctx.decode(&mut batch).map_err(|e| {
+        emit_err(
+            tx,
+            stream_error(adapter_id, format!("decode (prompt): {e}")),
+        )
+    })?;
 
-    let mut sampler = if temperature <= 0.0 {
+    let sampler = if request.temperature <= 0.0 {
         LlamaSampler::greedy()
     } else {
-        LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(seed)])
+        LlamaSampler::chain_simple([
+            LlamaSampler::temp(request.temperature),
+            LlamaSampler::dist(request.seed),
+        ])
     };
 
-    // UTF-8-safe streaming buffer. `emitted` tracks how many bytes
-    // have already been shipped as chunks; we only ship bytes that
-    // form a valid UTF-8 prefix.
-    let mut buf: Vec<u8> = Vec::new();
-    let mut emitted: usize = 0;
+    // UTF-8-safe streaming buffer. `emitted` tracks how many bytes have
+    // already been shipped as chunks; we only ship bytes that form a valid
+    // UTF-8 prefix.
     let start_pos = prompt_tokens.len() as i32;
+    let mut state = StreamDecode {
+        ctx,
+        sampler,
+        batch,
+        buf: Vec::new(),
+        emitted: 0,
+    };
     let mut finish_reason = "length";
 
-    for (offset, _) in (0..max_new).enumerate() {
+    for offset in 0..request.max_new {
         let next_pos = start_pos + offset as i32;
-        let token = sampler.sample(ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-
-        if inner.model.is_eog_token(token) {
-            finish_reason = "stop";
-            break;
-        }
-
-        let bytes = match inner.model.token_to_piece_bytes(token, 32, false, None) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(err(format!("token_to_piece_bytes: {e}"))));
-                return;
+        match decode_step(&mut state, &inner.model, tx, adapter_id, next_pos)? {
+            StreamStep::Emitted => {}
+            StreamStep::EndOfGeneration => {
+                finish_reason = "stop";
+                break;
             }
-        };
-        buf.extend_from_slice(&bytes);
-
-        // Find the longest valid UTF-8 prefix beyond `emitted`.
-        let valid_end = match std::str::from_utf8(&buf) {
-            Ok(_) => buf.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        if valid_end > emitted {
-            // Safety: we just confirmed [0..valid_end] is valid UTF-8.
-            let new_text = std::str::from_utf8(&buf[emitted..valid_end])
-                .expect("valid prefix")
-                .to_string();
-            emitted = valid_end;
-            if tx
-                .blocking_send(Ok(StreamChunk {
-                    content: new_text,
-                    finish_reason: None,
-                    usage: None,
-                    tool_calls: Vec::new(),
-                }))
-                .is_err()
-            {
-                // Receiver dropped — caller cancelled the stream. Stop early.
-                return;
-            }
-        }
-
-        batch.clear();
-        if let Err(e) = batch.add(token, next_pos, &[0], true) {
-            let _ = tx.blocking_send(Err(err(format!("batch.add (step): {e}"))));
-            return;
-        }
-        if let Err(e) = ctx.decode(&mut batch) {
-            let _ = tx.blocking_send(Err(err(format!("decode (step): {e}"))));
-            return;
         }
     }
 
-    // Flush any trailing valid bytes the loop didn't emit (rare —
-    // would only happen if the final iteration appended bytes that
-    // sat past `emitted` but were valid prefix).
-    let valid_end = match std::str::from_utf8(&buf) {
-        Ok(_) => buf.len(),
-        Err(e) => e.valid_up_to(),
-    };
-    if valid_end > emitted
-        && let Ok(s) = std::str::from_utf8(&buf[emitted..valid_end])
+    // Flush any trailing valid bytes the loop didn't emit (rare — would only
+    // happen if the final iteration appended bytes that sat past `emitted` but
+    // were a valid prefix).
+    let valid_end = valid_utf8_end(&state.buf);
+    if valid_end > state.emitted
+        && let Ok(text) = std::str::from_utf8(&state.buf[state.emitted..valid_end])
     {
         let _ = tx.blocking_send(Ok(StreamChunk {
-            content: s.to_string(),
+            content: text.to_string(),
             finish_reason: None,
             usage: None,
             tool_calls: Vec::new(),
         }));
     }
 
-    // Final chunk carries finish_reason. Empty content keeps the
-    // contract that all real text was already streamed.
-    let _ = tx.blocking_send(Ok(StreamChunk {
-        content: String::new(),
-        finish_reason: Some(finish_reason.into()),
-        usage: None,
-        tool_calls: Vec::new(),
-    }));
+    Ok(finish_reason)
 }
 
 #[cfg(test)]
@@ -1230,5 +1306,195 @@ mod tests {
             !accumulated.is_empty() && accumulated.len() < 256,
             "expected short non-empty accumulated content, got {accumulated:?}"
         );
+    }
+
+    /// One recorded item from a streaming `chat_stream` run — either a
+    /// [`StreamChunk`] (flattened to the two fields that carry semantics)
+    /// or an error. Ordering across the `Vec` is the emitted-event order.
+    #[derive(Debug)]
+    enum RecordedEvent {
+        Chunk {
+            content: String,
+            finish_reason: Option<String>,
+        },
+        Err(String),
+    }
+
+    /// Drain a stream to completion, recording every item in order. This is
+    /// the observation point for the streaming behaviour contract: the exact
+    /// ordered `Vec<RecordedEvent>` is what a behaviour-preserving refactor
+    /// must not change.
+    async fn record_stream(
+        stream: &mut Pin<Box<dyn Stream<Item = Result<StreamChunk, GatewayError>> + Send>>,
+    ) -> Vec<RecordedEvent> {
+        use futures::StreamExt;
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => events.push(RecordedEvent::Chunk {
+                    content: chunk.content,
+                    finish_reason: chunk.finish_reason,
+                }),
+                Err(e) => events.push(RecordedEvent::Err(format!("{e:?}"))),
+            }
+        }
+        events
+    }
+
+    fn chat_request(model: &str) -> kernel::types::io::ChatRequest {
+        kernel::types::io::ChatRequest {
+            model: Some(model.into()),
+            messages: vec![Message::text(
+                MessageRole::User,
+                "Reply with the single word: pong.".to_string(),
+            )],
+            system: None,
+            max_tokens: Some(16),
+            temperature: Some(0.0),
+            tools: Vec::new(),
+        }
+    }
+
+    fn embedded_router_cfg() -> RouterConfig {
+        RouterConfig {
+            url: "embedded://llama-cpp".into(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn load_chat_adapter() -> LlamaCppAdapter {
+        let path = std::env::var("LLAMA_TEST_CHAT_GGUF")
+            .expect("LLAMA_TEST_CHAT_GGUF must point at a generative GGUF");
+        let entry = external_entry(path);
+        let backend = shared_backend();
+        let mut cfg = LlamaCppConfig::chat("test-chat-model");
+        if let LlamaCppMode::Generation {
+            default_max_tokens, ..
+        } = &mut cfg.mode
+        {
+            *default_max_tokens = 16;
+        }
+        LlamaCppAdapter::load(backend, &entry, cfg).expect("load model")
+    }
+
+    /// Behaviour pin (happy path): records the FULL ordered StreamEvent
+    /// sequence from the streaming decode loop. With greedy decoding
+    /// (temperature 0.0, fixed seed) the token stream is deterministic, so
+    /// the exact `(content, finish_reason)` sequence is reproducible run to
+    /// run. Prints a canonical `STREAM_SEQUENCE:` line so the sequence can be
+    /// diffed before vs after a refactor, and asserts the ordering contract:
+    /// only the terminal chunk carries a `finish_reason` (paired with empty
+    /// content), and at least one non-empty content chunk precedes it.
+    /// Ignored + gated on the same GGUF env var as the other streaming tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires LLAMA_TEST_CHAT_GGUF env var pointing at a generative GGUF with a chat template"]
+    async fn stream_records_ordered_event_sequence() {
+        use kernel::adapters::capability::ChatModel;
+
+        let adapter = load_chat_adapter();
+        let mut stream = adapter
+            .chat_stream(&embedded_router_cfg(), &chat_request("test-chat-model"))
+            .await
+            .expect("stream handle");
+        let events = record_stream(&mut stream).await;
+
+        // Canonical serialisation for before/after diffing.
+        println!("STREAM_SEQUENCE: {events:?}");
+
+        assert!(
+            events.len() >= 2,
+            "expected content chunk(s) + terminal chunk, got {events:?}"
+        );
+        let (terminal, leading) = events.split_last().unwrap();
+        match terminal {
+            RecordedEvent::Chunk {
+                content,
+                finish_reason,
+            } => {
+                assert!(
+                    content.is_empty(),
+                    "terminal chunk content must be empty, got {content:?}"
+                );
+                let reason = finish_reason.as_deref();
+                assert!(
+                    reason == Some("stop") || reason == Some("length"),
+                    "terminal finish_reason must be stop|length, got {finish_reason:?}"
+                );
+            }
+            other => panic!("expected terminal Chunk, got {other:?}"),
+        }
+
+        let mut saw_content = false;
+        for event in leading {
+            match event {
+                RecordedEvent::Chunk {
+                    content,
+                    finish_reason,
+                } => {
+                    assert!(
+                        finish_reason.is_none(),
+                        "non-terminal chunk must not carry finish_reason: {event:?}"
+                    );
+                    saw_content |= !content.is_empty();
+                }
+                other => panic!("unexpected non-terminal event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_content,
+            "expected at least one non-empty content chunk before the terminal"
+        );
+    }
+
+    /// Behaviour pin (error path): a poisoned context mutex makes the
+    /// streaming worker emit exactly one `Err` ("context mutex poisoned")
+    /// and NO terminal finish chunk — the first of the seven original
+    /// early-returns. Poison is induced by panicking a thread while it holds
+    /// the context lock. Gated on the chat GGUF because poisoning the mutex
+    /// still requires a fully-loaded adapter (a real `Inner`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires LLAMA_TEST_CHAT_GGUF env var pointing at a generative GGUF with a chat template"]
+    async fn stream_error_path_emits_single_error_without_terminal() {
+        use kernel::adapters::capability::ChatModel;
+
+        let adapter = load_chat_adapter();
+
+        // Poison the context mutex: a thread panics while holding the guard.
+        {
+            let inner = Arc::clone(&adapter.inner);
+            let handle = std::thread::spawn(move || {
+                let _guard = inner.context.lock().expect("acquire lock to poison");
+                panic!("intentional panic to poison the context mutex");
+            });
+            assert!(
+                handle.join().is_err(),
+                "poisoning thread should have panicked"
+            );
+        }
+
+        let mut stream = adapter
+            .chat_stream(&embedded_router_cfg(), &chat_request("test-chat-model"))
+            .await
+            .expect("stream handle");
+        let events = record_stream(&mut stream).await;
+
+        println!("STREAM_SEQUENCE_ERR: {events:?}");
+
+        assert_eq!(
+            events.len(),
+            1,
+            "poisoned mutex must yield exactly one (error) event, got {events:?}"
+        );
+        match &events[0] {
+            RecordedEvent::Err(message) => assert!(
+                message.contains("context mutex poisoned"),
+                "expected poisoned-mutex error, got {message}"
+            ),
+            other => panic!("expected a single Err event, got {other:?}"),
+        }
     }
 }

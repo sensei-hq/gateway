@@ -1,0 +1,314 @@
+use serde::{Deserialize, Serialize};
+
+use crate::error::OrchestratorError;
+use crate::ids::NodeId;
+
+/// The kind of work a node performs. Two variants: a raw `ModelCall` that
+/// compiles directly into an `InferenceRequest` (slice 1), and an `Agent` node
+/// that runs a durable ReAct loop over a named agent (slice 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NodeKind {
+    ModelCall {
+        chain: String,
+        payload: serde_json::Value,
+    },
+    Agent {
+        agent: crate::registry::AgentRef,
+        input: serde_json::Value,
+    },
+    /// A single DAG node that fans out INTERNALLY over `over`, running `body`
+    /// once per item concurrently (bounded by `concurrency`), then folding the
+    /// children into one result under `aggregation` (§3.4). Graph-splicing the
+    /// children as first-class nodes is deferred.
+    Map {
+        body: MapBody,
+        over: Vec<serde_json::Value>,
+        concurrency: usize,
+        aggregation: Aggregation,
+    },
+    /// Aggregate the survivors of a `Map` (§3.5). Soft-depends on `over` (so it
+    /// runs even when the Map ended `Failed`), reads the Map's **successful**
+    /// results, and runs `body` once over them. If fewer than `min_viable`
+    /// survived, it halts loudly (`ConsolidateStarved`) rather than synthesizing
+    /// over an empty/degenerate set.
+    Consolidate {
+        over: NodeId,
+        min_viable: usize,
+        body: MapBody,
+    },
+}
+
+/// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure
+/// effect; an `Agent` child is a per-item ReAct sub-run (its effects nest under
+/// the child path `"{node}/{i}"`), which is how the fan-out e2e drives real
+/// agents through a reference chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MapBody {
+    ModelCall { chain: String },
+    Agent(crate::registry::AgentRef),
+}
+
+/// How a `Map` folds its children's success/failure into the node's own status
+/// (§3.4). The per-child manifest is always produced; `aggregation` only decides
+/// whether the Map node itself is `Completed` or `Failed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Aggregation {
+    /// The first child failure fails the Map (all children still recorded).
+    FailFast,
+    /// The Map always completes; failures live in the manifest.
+    BestEffort,
+    /// The Map completes iff the successful children clear the given
+    /// threshold(s) — both must hold when both are set — else it fails (loud,
+    /// manifest attached).
+    Quorum {
+        min_count: Option<usize>,
+        min_fraction: Option<f64>,
+    },
+}
+
+/// The strength of a dependency edge. A `Hard` edge means the dependent needs
+/// its upstream to have *succeeded* (a failed/skipped upstream cascade-skips the
+/// dependent); a `Soft` edge only needs the upstream to be *terminal* (completed
+/// **or** failed/skipped), so a dependent still runs over whatever survived.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EdgeKind {
+    Hard,
+    Soft,
+}
+
+/// A typed dependency edge: the upstream node this one depends on, and how
+/// strongly (see [`EdgeKind`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Dep {
+    pub on: NodeId,
+    pub kind: EdgeKind,
+}
+
+impl Dep {
+    /// A hard dependency on `on` — cascade-skips this node if `on` fails/skips.
+    pub fn hard(on: impl Into<NodeId>) -> Self {
+        Self {
+            on: on.into(),
+            kind: EdgeKind::Hard,
+        }
+    }
+
+    /// A soft dependency on `on` — this node still runs when `on` is terminal,
+    /// whatever its outcome.
+    pub fn soft(on: impl Into<NodeId>) -> Self {
+        Self {
+            on: on.into(),
+            kind: EdgeKind::Soft,
+        }
+    }
+}
+
+/// A single node in the execution graph, with its explicit typed dependencies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Node {
+    pub id: NodeId,
+    pub kind: NodeKind,
+    pub deps: Vec<Dep>,
+}
+
+/// An execution graph. Slice 1 validates that graphs are strictly linear.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Graph {
+    pub nodes: Vec<Node>,
+}
+
+impl Graph {
+    /// Validate that the graph is strictly linear: node ids are distinct, the
+    /// first node has no dependencies, and every subsequent node depends on
+    /// exactly the immediately-prior node.
+    pub fn validate_linear(&self) -> Result<(), OrchestratorError> {
+        let mut seen = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if !seen.insert(&node.id) {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "duplicate node id: {:?}",
+                    node.id
+                )));
+            }
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            if i == 0 {
+                if !node.deps.is_empty() {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "first node {:?} must have no dependencies",
+                        node.id
+                    )));
+                }
+            } else {
+                let prior = &self.nodes[i - 1].id;
+                if node.deps.len() != 1 || &node.deps[0].on != prior {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "node {:?} must depend on exactly the prior node {:?}",
+                        node.id, prior
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate that the graph is a well-formed DAG: node ids are distinct,
+    /// every `Dep.on` references a declared node, and the combined hard+soft
+    /// dependency graph is acyclic (a topological order exists). A linear line
+    /// is the trivial DAG that [`validate_linear`](Self::validate_linear) also
+    /// accepts.
+    pub fn validate_dag(&self) -> Result<(), OrchestratorError> {
+        use std::collections::{HashMap, HashSet};
+
+        // 1. Distinct node ids.
+        let mut ids: HashSet<&NodeId> = HashSet::new();
+        for node in &self.nodes {
+            if !ids.insert(&node.id) {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "duplicate node id: {:?}",
+                    node.id
+                )));
+            }
+        }
+
+        // 2. Every dependency references a declared node.
+        for node in &self.nodes {
+            for dep in &node.deps {
+                if !ids.contains(&dep.on) {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "node {:?} depends on undeclared node {:?}",
+                        node.id, dep.on
+                    )));
+                }
+            }
+        }
+
+        // 3. Acyclic — Kahn's algorithm. `in_degree` counts each node's deps
+        // (edges point dep.on → node); repeatedly retire zero-in-degree nodes.
+        // If any remain, a cycle exists (no topological order).
+        let mut in_degree: HashMap<&NodeId, usize> =
+            self.nodes.iter().map(|n| (&n.id, n.deps.len())).collect();
+        let mut dependents: HashMap<&NodeId, Vec<&NodeId>> = HashMap::new();
+        for node in &self.nodes {
+            for dep in &node.deps {
+                dependents.entry(&dep.on).or_default().push(&node.id);
+            }
+        }
+
+        let mut ready: Vec<&NodeId> = in_degree
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut retired = 0usize;
+        while let Some(id) = ready.pop() {
+            retired += 1;
+            if let Some(downstream) = dependents.get(id) {
+                for dep_node in downstream {
+                    let d = in_degree.get_mut(*dep_node).expect("declared node");
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.push(dep_node);
+                    }
+                }
+            }
+        }
+        if retired != self.nodes.len() {
+            return Err(OrchestratorError::InvalidGraph(
+                "dependency cycle: no topological order exists".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal node carrying a throwaway `ModelCall` kind — `validate_dag`
+    /// inspects only ids + deps, never the kind.
+    fn node(id: &str, deps: Vec<Dep>) -> Node {
+        Node {
+            id: NodeId(id.into()),
+            kind: NodeKind::ModelCall {
+                chain: "c".into(),
+                payload: serde_json::json!({}),
+            },
+            deps,
+        }
+    }
+
+    #[test]
+    fn validate_dag_accepts_a_linear_line() {
+        // a → b → c: a line is a valid DAG.
+        let g = Graph {
+            nodes: vec![
+                node("a", vec![]),
+                node("b", vec![Dep::hard("a")]),
+                node("c", vec![Dep::hard("b")]),
+            ],
+        };
+        assert!(g.validate_dag().is_ok());
+    }
+
+    #[test]
+    fn validate_dag_accepts_a_diamond_with_mixed_edges() {
+        // a → {b, c} → d, where d soft-depends on c and hard-depends on b.
+        let g = Graph {
+            nodes: vec![
+                node("a", vec![]),
+                node("b", vec![Dep::hard("a")]),
+                node("c", vec![Dep::hard("a")]),
+                node("d", vec![Dep::hard("b"), Dep::soft("c")]),
+            ],
+        };
+        assert!(g.validate_dag().is_ok(), "a diamond is acyclic");
+    }
+
+    #[test]
+    fn validate_dag_rejects_a_cycle() {
+        // a → b → a: no topological order exists.
+        let g = Graph {
+            nodes: vec![
+                node("a", vec![Dep::hard("b")]),
+                node("b", vec![Dep::hard("a")]),
+            ],
+        };
+        let err = g.validate_dag().expect_err("a cycle has no topo order");
+        assert!(matches!(err, OrchestratorError::InvalidGraph(_)), "{err:?}");
+    }
+
+    #[test]
+    fn validate_dag_rejects_a_dep_on_an_undeclared_node() {
+        let g = Graph {
+            nodes: vec![node("a", vec![Dep::hard("ghost")])],
+        };
+        let err = g
+            .validate_dag()
+            .expect_err("a dep must reference a declared node");
+        assert!(matches!(err, OrchestratorError::InvalidGraph(_)), "{err:?}");
+    }
+
+    #[test]
+    fn validate_dag_rejects_duplicate_node_ids() {
+        let g = Graph {
+            nodes: vec![node("a", vec![]), node("a", vec![])],
+        };
+        let err = g.validate_dag().expect_err("node ids must be distinct");
+        assert!(matches!(err, OrchestratorError::InvalidGraph(_)), "{err:?}");
+    }
+
+    #[test]
+    fn validate_dag_accepts_a_soft_self_free_multi_root() {
+        // Two independent roots feeding one sink — still a DAG.
+        let g = Graph {
+            nodes: vec![
+                node("a", vec![]),
+                node("b", vec![]),
+                node("sink", vec![Dep::soft("a"), Dep::soft("b")]),
+            ],
+        };
+        assert!(g.validate_dag().is_ok());
+    }
+}

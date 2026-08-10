@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Eyebrow from '$lib/components/Eyebrow.svelte';
 	import Seo from '$lib/components/Seo.svelte';
+	import CodeFrame from '$lib/components/CodeFrame.svelte';
 	import { pages } from '$lib/docs';
 </script>
 
@@ -19,6 +20,22 @@
 			<a href="/llms.txt" class="text-primary hover:underline">/llms.txt</a> and
 			<a href="/llms-full.txt" class="text-primary hover:underline">/llms-full.txt</a>.
 		</p>
+	</div>
+
+	<div class="mt-8 rounded-xl border border-paper-edge bg-paper-mute p-6">
+		<div class="font-display font-semibold text-lg text-ink">Using a coding agent?</div>
+		<p class="mt-1 max-w-2xl text-sm text-ink-mute text-pretty">
+			Install the
+			<a href="/skills/using-gateway/SKILL.md" class="text-primary hover:underline">using-gateway</a>
+			skill so your agent knows how to add the crates, call them by capability, run local models,
+			and report issues. Re-run the command any time to update.
+		</p>
+		<div class="mt-4 max-w-xl">
+			<CodeFrame
+				filename="install the gateway skill"
+				code="curl -fsSL https://gateway.sensei-hq.com/skills/install.sh | sh"
+			/>
+		</div>
 	</div>
 
 	<div class="mt-12 grid gap-4 sm:grid-cols-2">

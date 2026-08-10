@@ -380,13 +380,11 @@ mod tests {
     use crate::adapters::noop::NoopAdapter;
     use crate::adapters::{AdapterRegistry, RegisterInto};
     use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
-    use crate::types::config::{
-        ChainEntry, FallbackChainConfig, FallbackTrigger, GatewayConfig, ModelConfig, RouterConfig,
-    };
+    use crate::test_support::noop_chat_chain;
+    use crate::types::config::{GatewayConfig, ModelConfig, RouterConfig};
     use crate::types::cost::Cost;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
 
     // -- helpers -----------------------------------------------------------
 
@@ -421,28 +419,12 @@ mod tests {
                 context_window: 4096,
                 max_output_tokens: 1024,
                 pricing: None,
+                catalog: None,
             },
         );
 
         let mut chains = HashMap::new();
-        chains.insert(
-            "chat_chain".to_string(),
-            FallbackChainConfig {
-                id: "chat_chain".to_string(),
-                capability: Capability::TextChat,
-                models: vec![ChainEntry {
-                    model: "noop".to_string(),
-                    router: Some("noop".to_string()),
-                    api_model_id: None,
-                    priority: 1,
-                }],
-                fallback_triggers: vec![
-                    FallbackTrigger::RateLimit,
-                    FallbackTrigger::Timeout,
-                    FallbackTrigger::ProviderError,
-                ],
-            },
-        );
+        chains.insert("chat_chain".to_string(), noop_chat_chain());
 
         GatewayConfig {
             routers,
@@ -457,11 +439,7 @@ mod tests {
     async fn noop_gateway() -> Gateway {
         let config = noop_gateway_config();
         let adapters = AdapterRegistry::new();
-        let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        });
+        let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
 
         let gw = Gateway::new(config, adapters, cb);
         Arc::new(NoopAdapter).register_into(&gw.adapters).await;

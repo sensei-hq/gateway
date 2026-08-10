@@ -1,7 +1,19 @@
 use crate::circuit_breaker::CircuitBreakerManager;
+use crate::gates::budget::BudgetGate;
+use crate::gates::capability::CapabilityGate;
+use crate::gates::circuit_breaker_gate::CircuitBreakerGate;
+use crate::gates::cooldown::ConnectionCooldownGate;
+use crate::gates::{
+    AdmissionGate, CandidateView, EndpointHealthRead, GateVerdict, RouterHealthRead, SelectionCtx,
+};
+use crate::skip_reason::SkipReason;
+use crate::strategy::{PriorityStrategy, RoutingStrategy};
 use crate::types::capability::Capability;
-use crate::types::config::{FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig};
+use crate::types::config::{
+    ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
+};
 use crate::types::cost::CostEstimate;
+use std::time::Instant;
 
 /// Criteria used to resolve which model(s) to try.
 #[derive(Debug, Clone)]
@@ -31,7 +43,7 @@ pub struct SelectedModel {
 pub struct SkippedCandidate {
     pub model: String,
     pub router: String,
-    pub reason: String,
+    pub reason: SkipReason,
 }
 
 /// The result of model selection, containing the chosen model plus diagnostics.
@@ -44,17 +56,44 @@ pub struct SelectionResult {
 }
 
 /// Resolves which model(s) to use for a given request via 3-tier resolution
-/// (direct, named chain, capability) with a validation pipeline per candidate.
+/// (direct, named chain, capability). Structural resolution (router/model
+/// lookup) happens per path; the shared admission pipeline then runs the
+/// ordered [`AdmissionGate`]s (capability, connection cooldown, circuit breaker, budget) and the
+/// [`RoutingStrategy`] orders the admitted candidates.
 pub struct ModelSelectionService<'a> {
     config: &'a GatewayConfig,
-    circuit_breaker: &'a CircuitBreakerManager,
+    /// Ordered admission gates: capability, connection cooldown, circuit breaker, budget.
+    gates: Vec<Box<dyn AdmissionGate>>,
+    /// Endpoint health read port (the circuit breaker implements it).
+    health: &'a dyn EndpointHealthRead,
+    /// Router health read port (the connection cooldown store implements it).
+    router_health: &'a dyn RouterHealthRead,
+    /// Endpoint model-lockout read port (the model-lockout store implements it).
+    model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
+    /// Orders admitted candidates (SP-0: priority ascending, stable).
+    strategy: Box<dyn RoutingStrategy>,
 }
 
 impl<'a> ModelSelectionService<'a> {
-    pub fn new(config: &'a GatewayConfig, circuit_breaker: &'a CircuitBreakerManager) -> Self {
+    pub fn new(
+        config: &'a GatewayConfig,
+        circuit_breaker: &'a CircuitBreakerManager,
+        router_health: &'a dyn RouterHealthRead,
+        model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
+    ) -> Self {
         Self {
             config,
-            circuit_breaker,
+            gates: vec![
+                Box::new(CapabilityGate),
+                Box::new(ConnectionCooldownGate),
+                Box::new(CircuitBreakerGate),
+                Box::new(crate::gates::lockout::ModelLockoutGate),
+                Box::new(BudgetGate),
+            ],
+            health: circuit_breaker,
+            router_health,
+            model_lockout,
+            strategy: Box::new(PriorityStrategy),
         }
     }
 
@@ -95,6 +134,45 @@ impl<'a> ModelSelectionService<'a> {
         })
     }
 
+    /// Shared admission path: run each gate in order over a structurally
+    /// resolved candidate. On the first `Skip(reason)` return the reason; on
+    /// all-Admit build the `SelectedModel`, attaching the full `CostEstimate`
+    /// (the `BudgetGate` independently computes an f64 from the same formula).
+    fn admit(
+        &self,
+        cand: CandidateView<'_>,
+        api_model_id: String,
+        priority: u8,
+        criteria: &SelectionCriteria,
+    ) -> Result<SelectedModel, SkipReason> {
+        let ctx = SelectionCtx {
+            capability: criteria.capability.clone(),
+            budget: criteria.budget,
+            input_tokens: criteria.input_tokens,
+            health: self.health,
+            now: Instant::now(),
+            config: self.config,
+            router_health: self.router_health,
+            model_lockout: self.model_lockout,
+        };
+        for gate in &self.gates {
+            if let GateVerdict::Skip(reason) = gate.evaluate(&cand, &ctx) {
+                return Err(reason);
+            }
+        }
+
+        let cost_estimate = self.estimate_cost(cand.model_config, criteria);
+        Ok(SelectedModel {
+            model: cand.model.to_string(),
+            router: cand.router.to_string(),
+            router_config: cand.router_config.clone(),
+            model_config: cand.model_config.clone(),
+            api_model_id,
+            priority,
+            cost_estimate,
+        })
+    }
+
     /// Core resolution: determine candidates based on the 3-tier strategy,
     /// then validate each one through the pipeline.
     fn resolve_candidates(&self, criteria: &SelectionCriteria) -> SelectionResult {
@@ -122,136 +200,77 @@ impl<'a> ModelSelectionService<'a> {
 
     /// Tier 1: Direct resolution — validate a single router+model pair.
     fn resolve_direct(&self, criteria: &SelectionCriteria) -> SelectionResult {
-        let mut skipped = Vec::new();
-
         let router_name = criteria.router.clone().unwrap_or_default();
         let model_name = criteria.model.clone().unwrap_or_default();
 
-        // Validate router exists and is enabled
-        let router_config = match self.config.routers.get(&router_name) {
-            Some(rc) => rc,
-            None => {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name.clone(),
-                    reason: "router not found".to_string(),
-                });
-                return SelectionResult {
-                    selected: None,
-                    all_candidates: vec![],
-                    skipped,
-                    chain: None,
-                };
-            }
-        };
+        match self.validate_direct(&router_name, &model_name, criteria) {
+            Ok(selected) => SelectionResult {
+                selected: None, // filled by caller
+                all_candidates: vec![selected],
+                skipped: vec![],
+                chain: None,
+            },
+            Err(reason) => SelectionResult {
+                selected: None,
+                all_candidates: vec![],
+                skipped: vec![SkippedCandidate {
+                    model: model_name,
+                    router: router_name,
+                    reason,
+                }],
+                chain: None,
+            },
+        }
+    }
 
+    /// Structural resolution for tier 1: router-first. Look up the router
+    /// BEFORE the model (empty/missing → `RouterNotFound`, disabled →
+    /// `RouterDisabled`), then the model (missing → `ModelNotFound`). No
+    /// provider fallback. `priority = 1`; `api_model_id` is 2-level
+    /// (model_config override else model id). The shared gate pipeline
+    /// (capability, connection cooldown, circuit breaker, budget) runs in [`Self::admit`].
+    fn validate_direct(
+        &self,
+        router_name: &str,
+        model_name: &str,
+        criteria: &SelectionCriteria,
+    ) -> Result<SelectedModel, SkipReason> {
+        // Validate router exists and is enabled (router-first).
+        let router_config = self
+            .config
+            .routers
+            .get(router_name)
+            .ok_or(SkipReason::RouterNotFound)?;
         if !router_config.enabled {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: "router disabled".to_string(),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
+            return Err(SkipReason::RouterDisabled);
         }
 
-        // Validate model exists and supports capability
-        let model_config = match self.config.models.get(&model_name) {
-            Some(mc) => mc,
-            None => {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name.clone(),
-                    reason: "model not found".to_string(),
-                });
-                return SelectionResult {
-                    selected: None,
-                    all_candidates: vec![],
-                    skipped,
-                    chain: None,
-                };
-            }
-        };
-
-        if !model_config.capabilities.contains(&criteria.capability) {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: format!("does not support {:?}", criteria.capability),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
-        }
-
-        // Circuit breaker check
-        let endpoint = format!("{}:{}", router_name, model_name);
-        if !self.circuit_breaker.can_execute(&endpoint) {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: "circuit breaker open".to_string(),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
-        }
-
-        // Cost estimation and budget check
-        let cost_estimate = self.estimate_cost(model_config, criteria);
-        if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
-            && est.estimated > budget
-        {
-            skipped.push(SkippedCandidate {
-                model: model_name.clone(),
-                router: router_name.clone(),
-                reason: format!(
-                    "over budget (estimated {:.4}, budget {:.4})",
-                    est.estimated, budget
-                ),
-            });
-            return SelectionResult {
-                selected: None,
-                all_candidates: vec![],
-                skipped,
-                chain: None,
-            };
-        }
+        // Validate model exists.
+        let model_config = self
+            .config
+            .models
+            .get(model_name)
+            .ok_or(SkipReason::ModelNotFound)?;
 
         let api_model_id = model_config
             .api_model_id
             .clone()
-            .unwrap_or_else(|| model_name.clone());
+            .unwrap_or_else(|| model_name.to_string());
 
-        let selected = SelectedModel {
+        let cand = CandidateView {
             model: model_name,
             router: router_name,
-            router_config: router_config.clone(),
-            model_config: model_config.clone(),
-            api_model_id,
-            priority: 1,
-            cost_estimate,
+            endpoint: format!("{router_name}:{model_name}"),
+            model_config,
+            router_config,
         };
-
-        SelectionResult {
-            selected: None, // filled by caller
-            all_candidates: vec![selected],
-            skipped,
-            chain: None,
-        }
+        self.admit(cand, api_model_id, 1, criteria)
     }
 
-    /// Tier 2/3: Walk chain entries sorted by priority, validating each.
+    /// Tier 2/3: Walk chain entries, structurally resolving + gating each, then
+    /// order the admitted candidates via the strategy (SP-0: priority
+    /// ascending, stable — identical to the previous hardcoded entry sort,
+    /// since a stable sort of the admitted subset preserves the same order).
     fn resolve_chain(
         &self,
         chain: &FallbackChainConfig,
@@ -260,112 +279,14 @@ impl<'a> ModelSelectionService<'a> {
         let mut all_candidates = Vec::new();
         let mut skipped = Vec::new();
 
-        // Sort entries by priority
-        let mut entries = chain.models.clone();
-        entries.sort_by_key(|e| e.priority);
-
-        for entry in &entries {
-            let model_name = &entry.model;
-
-            // Look up the model config
-            let model_config = match self.config.models.get(model_name) {
-                Some(mc) => mc,
-                None => {
-                    let router_name = entry
-                        .router
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    skipped.push(SkippedCandidate {
-                        model: model_name.clone(),
-                        router: router_name,
-                        reason: "model not found".to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            // Resolve router: chain entry router, else model's provider
-            let router_name = entry
-                .router
-                .clone()
-                .unwrap_or_else(|| model_config.provider.clone());
-
-            // Validate router exists and is enabled
-            let router_config = match self.config.routers.get(&router_name) {
-                Some(rc) => rc,
-                None => {
-                    skipped.push(SkippedCandidate {
-                        model: model_name.clone(),
-                        router: router_name,
-                        reason: "router not found".to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            if !router_config.enabled {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: "router disabled".to_string(),
-                });
-                continue;
+        for entry in &chain.models {
+            match self.validate_chain_entry(entry, criteria) {
+                Ok(candidate) => all_candidates.push(candidate),
+                Err(candidate) => skipped.push(candidate),
             }
-
-            // Validate capability
-            if !model_config.capabilities.contains(&criteria.capability) {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: format!("does not support {:?}", criteria.capability),
-                });
-                continue;
-            }
-
-            // Circuit breaker check
-            let endpoint = format!("{}:{}", router_name, model_name);
-            if !self.circuit_breaker.can_execute(&endpoint) {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: "circuit breaker open".to_string(),
-                });
-                continue;
-            }
-
-            // Cost estimation and budget check
-            let cost_estimate = self.estimate_cost(model_config, criteria);
-            if let (Some(budget), Some(est)) = (criteria.budget, &cost_estimate)
-                && est.estimated > budget
-            {
-                skipped.push(SkippedCandidate {
-                    model: model_name.clone(),
-                    router: router_name,
-                    reason: format!(
-                        "over budget (estimated {:.4}, budget {:.4})",
-                        est.estimated, budget
-                    ),
-                });
-                continue;
-            }
-
-            // Resolve API model ID: chain entry override, else model config, else model id
-            let api_model_id = entry
-                .api_model_id
-                .clone()
-                .or_else(|| model_config.api_model_id.clone())
-                .unwrap_or_else(|| model_name.clone());
-
-            all_candidates.push(SelectedModel {
-                model: model_name.clone(),
-                router: router_name,
-                router_config: router_config.clone(),
-                model_config: model_config.clone(),
-                api_model_id,
-                priority: entry.priority,
-                cost_estimate,
-            });
         }
+
+        self.strategy.order(&mut all_candidates);
 
         SelectionResult {
             selected: None, // filled by caller
@@ -373,6 +294,80 @@ impl<'a> ModelSelectionService<'a> {
             skipped,
             chain: Some(chain.clone()),
         }
+    }
+
+    /// Structural resolution for a single chain entry: model-first. Look up the
+    /// model (missing → `ModelNotFound`), resolve the router from the entry
+    /// (falling back to the model's provider), then validate it (missing →
+    /// `RouterNotFound`, disabled → `RouterDisabled`). `priority = entry.priority`;
+    /// `api_model_id` is 3-level (entry override → model_config → model id). The
+    /// shared gate pipeline (capability, connection cooldown, circuit breaker, budget) runs in
+    /// [`Self::admit`].
+    fn validate_chain_entry(
+        &self,
+        entry: &ChainEntry,
+        criteria: &SelectionCriteria,
+    ) -> Result<SelectedModel, SkippedCandidate> {
+        let model_name = &entry.model;
+
+        // Look up the model config (model-first).
+        let model_config = self.config.models.get(model_name).ok_or_else(|| {
+            let router_name = entry
+                .router
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name,
+                reason: SkipReason::ModelNotFound,
+            }
+        })?;
+
+        // Resolve router: chain entry router, else model's provider.
+        let router_name = entry
+            .router
+            .clone()
+            .unwrap_or_else(|| model_config.provider.clone());
+
+        // Validate router exists and is enabled.
+        let router_config =
+            self.config
+                .routers
+                .get(&router_name)
+                .ok_or_else(|| SkippedCandidate {
+                    model: model_name.clone(),
+                    router: router_name.clone(),
+                    reason: SkipReason::RouterNotFound,
+                })?;
+
+        if !router_config.enabled {
+            return Err(SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name,
+                reason: SkipReason::RouterDisabled,
+            });
+        }
+
+        // Resolve API model ID: chain entry override, else model config, else model id.
+        let api_model_id = entry
+            .api_model_id
+            .clone()
+            .or_else(|| model_config.api_model_id.clone())
+            .unwrap_or_else(|| model_name.clone());
+
+        let cand = CandidateView {
+            model: model_name,
+            router: &router_name,
+            endpoint: format!("{router_name}:{model_name}"),
+            model_config,
+            router_config,
+        };
+        self.admit(cand, api_model_id, entry.priority, criteria)
+            .map_err(|reason| SkippedCandidate {
+                model: model_name.clone(),
+                router: router_name.clone(),
+                reason,
+            })
     }
 
     /// Tier 3: resolve by capability when the caller pinned neither a model
@@ -412,7 +407,6 @@ mod tests {
         ChainEntry, FallbackChainConfig, FallbackTrigger, ModelConfig, ModelPricing, RouterConfig,
     };
     use std::collections::HashMap;
-    use std::time::Duration;
 
     fn test_config() -> GatewayConfig {
         let mut routers = HashMap::new();
@@ -455,6 +449,7 @@ mod tests {
                 context_window: 128000,
                 max_output_tokens: 8192,
                 pricing: None,
+                catalog: None,
             },
         );
         models.insert(
@@ -468,6 +463,7 @@ mod tests {
                 context_window: 512,
                 max_output_tokens: 0,
                 pricing: None,
+                catalog: None,
             },
         );
         models.insert(
@@ -485,6 +481,7 @@ mod tests {
                     output_per_1k: 0.004,
                     per_request: None,
                 }),
+                catalog: None,
             },
         );
 
@@ -537,18 +534,16 @@ mod tests {
     }
 
     fn test_cb() -> CircuitBreakerManager {
-        CircuitBreakerManager::new(CircuitBreakerConfig {
-            threshold: 5,
-            timeout: Duration::from_secs(300),
-            half_open_max_requests: 3,
-        })
+        CircuitBreakerManager::new(CircuitBreakerConfig::default())
     }
 
     #[test]
     fn tier1_direct_selection() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -569,7 +564,9 @@ mod tests {
     fn tier1_direct_unknown_router() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -582,14 +579,19 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("router not found"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterNotFound
+        ));
     }
 
     #[test]
     fn tier2_chain_selection() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -612,7 +614,9 @@ mod tests {
     fn tier3_capability_selection() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextEmbed,
@@ -649,7 +653,9 @@ mod tests {
             },
         );
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
         // Run several times: a HashMap-order bug would flake; min_by is stable.
         for _ in 0..10 {
             let result = svc.select(&SelectionCriteria {
@@ -669,7 +675,9 @@ mod tests {
         let mut config = test_config();
         config.routers.get_mut("ollama").unwrap().enabled = false;
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -684,7 +692,10 @@ mod tests {
         let selected = result.selected.unwrap();
         assert_eq!(selected.model, "claude-haiku");
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("router disabled"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterDisabled
+        ));
         assert_eq!(result.skipped[0].model, "gemma3:27b");
     }
 
@@ -692,7 +703,9 @@ mod tests {
     fn skips_wrong_capability() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::AudioTranscribe,
@@ -705,13 +718,18 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("does not support"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::UnsupportedCapability(_)
+        ));
     }
 
     #[test]
     fn skips_circuit_breaker_open() {
         let config = test_config();
         let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
 
         // Open the circuit breaker for ollama:gemma3:27b
         let endpoint = "ollama:gemma3:27b";
@@ -721,7 +739,7 @@ mod tests {
         }
         assert!(!cb.can_execute(endpoint)); // confirm open
 
-        let svc = ModelSelectionService::new(&config, &cb);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -739,7 +757,8 @@ mod tests {
             result
                 .skipped
                 .iter()
-                .any(|s| s.model == "gemma3:27b" && s.reason.contains("circuit breaker"))
+                .any(|s| s.model == "gemma3:27b"
+                    && matches!(s.reason, SkipReason::CircuitOpen { .. }))
         );
     }
 
@@ -747,7 +766,9 @@ mod tests {
     fn skips_over_budget() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -767,19 +788,18 @@ mod tests {
                 .iter()
                 .any(|c| c.model == "gemma3:27b")
         );
-        assert!(
-            result
-                .skipped
-                .iter()
-                .any(|s| s.model == "claude-haiku" && s.reason.contains("over budget"))
-        );
+        assert!(result.skipped.iter().any(
+            |s| s.model == "claude-haiku" && matches!(s.reason, SkipReason::OverBudget { .. })
+        ));
     }
 
     #[test]
     fn api_model_id_override() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -799,7 +819,9 @@ mod tests {
     fn no_chain_for_capability() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::AudioTranscribe,
@@ -818,7 +840,9 @@ mod tests {
     fn chain_not_found() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -838,7 +862,9 @@ mod tests {
     fn direct_model_not_found() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -851,14 +877,19 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("model not found"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::ModelNotFound
+        ));
     }
 
     #[test]
     fn direct_model_wrong_capability() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         // all-minilm only supports TextEmbed, not AudioTranscribe
         let result = svc.select(&SelectionCriteria {
@@ -872,13 +903,18 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("does not support"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::UnsupportedCapability(_)
+        ));
     }
 
     #[test]
     fn direct_circuit_breaker_open() {
         let config = test_config();
         let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
 
         // Open the breaker for this direct endpoint
         let endpoint = "ollama:gemma3:27b";
@@ -888,7 +924,7 @@ mod tests {
         }
         assert!(!cb.can_execute(endpoint));
 
-        let svc = ModelSelectionService::new(&config, &cb);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -901,14 +937,19 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("circuit breaker"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::CircuitOpen { .. }
+        ));
     }
 
     #[test]
     fn direct_over_budget() {
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         // claude-haiku has pricing, set budget very low
         let result = svc.select(&SelectionCriteria {
@@ -922,7 +963,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("over budget"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::OverBudget { .. }
+        ));
     }
 
     #[test]
@@ -930,7 +974,9 @@ mod tests {
         let mut config = test_config();
         config.routers.get_mut("ollama").unwrap().enabled = false;
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -943,7 +989,10 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("router disabled"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterDisabled
+        ));
     }
 
     #[test]
@@ -952,7 +1001,9 @@ mod tests {
         // to model.provider ("ollama")
         let config = test_config();
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextEmbed,
@@ -995,7 +1046,9 @@ mod tests {
             },
         );
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -1010,7 +1063,10 @@ mod tests {
         assert_eq!(result.all_candidates.len(), 1);
         assert_eq!(result.all_candidates[0].model, "gemma3:27b");
         assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].reason.contains("model not found"));
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::ModelNotFound
+        ));
     }
 
     #[test]
@@ -1040,7 +1096,9 @@ mod tests {
             },
         );
         let cb = test_cb();
-        let svc = ModelSelectionService::new(&config, &cb);
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
 
         let result = svc.select_all(&SelectionCriteria {
             capability: Capability::TextChat,
@@ -1056,10 +1114,55 @@ mod tests {
             result
                 .skipped
                 .iter()
-                .any(|s| s.model == "gemma3:27b" && s.reason.contains("router not found"))
+                .any(|s| s.model == "gemma3:27b" && matches!(s.reason, SkipReason::RouterNotFound))
         );
         // claude-haiku should still be available
         assert_eq!(result.all_candidates.len(), 1);
         assert_eq!(result.all_candidates[0].model, "claude-haiku");
+    }
+
+    #[test]
+    fn direct_both_router_and_model_unknown_reports_router_first() {
+        let config = test_config();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+        let result = svc.select(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: Some("ghost".into()),
+            router: Some("nope".into()),
+            chain: None,
+            budget: None,
+            input_tokens: None,
+        });
+        // Current behavior: direct validates the router first.
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterNotFound
+        ));
+    }
+
+    #[test]
+    fn direct_model_only_no_router_is_router_not_found_today() {
+        let config = test_config();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+        let result = svc.select(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: Some("gemma3:27b".into()),
+            router: None,
+            chain: None,
+            budget: None,
+            input_tokens: None,
+        });
+        // Direct does NOT provider-fallback today → empty router → "router not found".
+        assert!(result.selected.is_none());
+        assert!(matches!(
+            result.skipped[0].reason,
+            SkipReason::RouterNotFound
+        ));
     }
 }

@@ -52,6 +52,95 @@ pub struct ModelPricing {
     pub per_request: Option<f64>,
 }
 
+/// Optional catalog metadata for a model: free-tier terms plus attribute tags
+/// (auth mechanism, cost band, locality). Absent ⇒ `None` ⇒ today's behaviour
+/// (no free-tier accounting, no attribute-derived tiering). Pure config; not
+/// persisted. See `docs/superpowers/specs/2026-08-07-sp-cat-catalog-design.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CatalogMeta {
+    /// Free-tier terms, when the model offers a free allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free: Option<FreeTier>,
+    /// How the model is authenticated (API key, OAuth CLI, keyless).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<AuthType>,
+    /// Explicit cost band; when absent it is derived from `pricing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_band: Option<CostBand>,
+    /// Where the model runs (local vs cloud).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<Locality>,
+    /// Arbitrary attribute labels (e.g. `"reasoning"`, `"frontier"`) used by
+    /// tier predicates to derive membership on labels beyond the fixed
+    /// attributes above. Absent ⇒ `[]` (backward-compatible; no tag-derived
+    /// tiering).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// Free-tier terms for a model: the recurrence shape, any token allowances, an
+/// optional shared-pool key (models that draw from one provider allowance
+/// dedupe by this key), ToS clarity, and whether prompts train the provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FreeTier {
+    pub free_type: FreeType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_tokens: Option<u64>,
+    /// Shared-allowance key: models sharing a provider free pool carry the same
+    /// `pool_key` so budget audits count the pool once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_key: Option<String>,
+    pub tos: TosVerdict,
+    #[serde(default)]
+    pub trains_on_prompts: bool,
+}
+
+/// The recurrence/shape of a free allowance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FreeType {
+    RecurringDaily,
+    RecurringMonthly,
+    RecurringCredit,
+    RecurringUncapped,
+    OneTimeInitial,
+    Keyless,
+    Discontinued,
+}
+
+/// How clear the provider's terms of service are about free-tier use.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TosVerdict {
+    Ok,
+    Caution,
+    Ambiguous,
+}
+
+/// How a model is authenticated.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AuthType {
+    ApiKey,
+    OauthCli,
+    Keyless,
+}
+
+/// Coarse blended cost band (derived from pricing unless overridden).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CostBand {
+    Free,
+    Low,
+    Mid,
+    High,
+}
+
+/// Where the model executes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Locality {
+    Local,
+    Cloud,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub id: String,
@@ -70,6 +159,11 @@ pub struct ModelConfig {
     /// `distinct_by: family` panel checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
+    /// Optional catalog metadata (free-tier terms + attribute tags). Absent ⇒
+    /// `None` ⇒ today's behaviour; kept serde-defaulted so existing configs
+    /// deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<CatalogMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -332,6 +426,55 @@ mod tests {
     }
 
     #[test]
+    fn model_config_catalog_defaults_absent_and_roundtrips() {
+        let json = r#"{"id":"m","provider":"p","capabilities":["text_chat"],"context_window":8000,"max_output_tokens":1000}"#;
+        let m: ModelConfig = serde_json::from_str(json).unwrap();
+        assert!(m.catalog.is_none()); // backward-compatible: existing configs deserialize unchanged
+        let meta = CatalogMeta {
+            free: Some(FreeTier {
+                free_type: FreeType::RecurringDaily,
+                monthly_tokens: Some(60_000_000),
+                credit_tokens: None,
+                pool_key: Some("gemini-flash".into()),
+                tos: TosVerdict::Ok,
+                trains_on_prompts: true,
+            }),
+            auth_type: Some(AuthType::ApiKey),
+            cost_band: None,
+            locality: Some(Locality::Cloud),
+            tags: vec![],
+        };
+        let m2 = ModelConfig {
+            catalog: Some(meta),
+            ..m.clone()
+        };
+        let s = serde_json::to_string(&m2).unwrap();
+        let back: ModelConfig = serde_json::from_str(&s).unwrap();
+        let f = back.catalog.as_ref().unwrap().free.as_ref().unwrap();
+        assert_eq!(f.pool_key.as_deref(), Some("gemini-flash"));
+        assert!(matches!(f.free_type, FreeType::RecurringDaily));
+        assert_eq!(
+            back.catalog.as_ref().unwrap().auth_type,
+            Some(AuthType::ApiKey)
+        );
+    }
+
+    #[test]
+    fn catalog_meta_tags_default_absent_and_roundtrip() {
+        // Backward-compatible: a CatalogMeta JSON without `tags` deserializes to
+        // an empty tag list (absent ⇒ []), so existing catalogs keep working.
+        let meta: CatalogMeta = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(meta.tags, Vec::<String>::new());
+
+        // A JSON carrying tags roundtrips faithfully.
+        let meta: CatalogMeta = serde_json::from_str(r#"{"tags":["reasoning"]}"#).unwrap();
+        assert_eq!(meta.tags, vec!["reasoning".to_string()]);
+        let s = serde_json::to_string(&meta).unwrap();
+        let back: CatalogMeta = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tags, vec!["reasoning".to_string()]);
+    }
+
+    #[test]
     fn model_config_serde_roundtrip() {
         let config = ModelConfig {
             id: "claude-sonnet".to_string(),
@@ -346,6 +489,7 @@ mod tests {
                 output_per_1k: 0.015,
                 per_request: None,
             }),
+            catalog: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();

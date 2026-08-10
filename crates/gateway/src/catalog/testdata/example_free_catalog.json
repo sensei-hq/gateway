@@ -1,0 +1,73 @@
+[
+  {
+    "id": "gemini-flash-a",
+    "provider": "google",
+    "capabilities": ["text_chat"],
+    "context_window": 1000000,
+    "max_output_tokens": 8192,
+    "catalog": {
+      "free": {
+        "free_type": "RecurringDaily",
+        "monthly_tokens": 50000000,
+        "pool_key": "gemini-flash",
+        "tos": "Ok"
+      }
+    }
+  },
+  {
+    "id": "gemini-flash-b",
+    "provider": "google",
+    "capabilities": ["text_chat"],
+    "context_window": 1000000,
+    "max_output_tokens": 8192,
+    "catalog": {
+      "free": {
+        "free_type": "RecurringMonthly",
+        "monthly_tokens": 40000000,
+        "pool_key": "gemini-flash",
+        "tos": "Ok"
+      }
+    }
+  },
+  {
+    "id": "solo-daily",
+    "provider": "openrouter",
+    "capabilities": ["text_chat"],
+    "context_window": 32768,
+    "max_output_tokens": 4096,
+    "catalog": {
+      "free": {
+        "free_type": "RecurringDaily",
+        "monthly_tokens": 20000000,
+        "tos": "Ok"
+      }
+    }
+  },
+  {
+    "id": "signup-credit",
+    "provider": "someprovider",
+    "capabilities": ["text_chat"],
+    "context_window": 128000,
+    "max_output_tokens": 4096,
+    "catalog": {
+      "free": {
+        "free_type": "OneTimeInitial",
+        "credit_tokens": 25000000,
+        "tos": "Caution"
+      }
+    }
+  },
+  {
+    "id": "uncapped-pro",
+    "provider": "localhost",
+    "capabilities": ["text_chat"],
+    "context_window": 8192,
+    "max_output_tokens": 2048,
+    "catalog": {
+      "free": {
+        "free_type": "RecurringUncapped",
+        "tos": "Ok"
+      }
+    }
+  }
+]

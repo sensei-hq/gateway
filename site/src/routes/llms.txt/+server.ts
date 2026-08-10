@@ -9,9 +9,11 @@ export function GET() {
 	const lines = [
 		'# gateway',
 		'',
-		'> Shared LLM inference routing engine for Rust — fallback chains, per-endpoint',
-		'> circuit breaker, budget management and request tracing across ~16 cloud',
-		'> providers plus in-process local models, behind one trait-based config.',
+		'> Provider-agnostic multimodal inference routing engine for Rust — routes chat,',
+		'> embeddings, image, video and speech across ~16 cloud providers plus in-process',
+		'> local models. Fallback chains, per-endpoint circuit breaker, budget management,',
+		'> multi-model consensus/panels, request tracing and BYOK credentials (API key or',
+		'> OAuth/bearer), behind one trait-based config.',
 		'',
 		'## Docs',
 		''
@@ -20,6 +22,11 @@ export function GET() {
 		lines.push(`- [${p.title}](${SITE_URL}/docs/${p.slug}): ${p.description}`);
 	}
 	lines.push(
+		'',
+		'## Agent skill',
+		'',
+		`- [using-gateway skill](${SITE_URL}/skills/using-gateway/SKILL.md): drop-in guide to add + use the crates in your repo`,
+		`- Install: \`curl -fsSL ${SITE_URL}/skills/install.sh | sh\` (writes .claude/skills/using-gateway/SKILL.md)`,
 		'',
 		'## Full text',
 		'',

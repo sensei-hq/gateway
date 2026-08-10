@@ -37,9 +37,7 @@ use ::ort::{
     value::Tensor,
 };
 use async_trait::async_trait;
-use kernel::types::config::RouterConfig;
 use kernel::types::error::GatewayError;
-use kernel::types::io::{EmbedRequest, EmbedResponse};
 use std::path::Path;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
@@ -311,34 +309,9 @@ impl kernel::adapters::capability::Model for OrtAdapter {
     }
 }
 
-#[async_trait]
-impl kernel::adapters::capability::EmbedModel for OrtAdapter {
-    async fn embed(
-        &self,
-        _config: &RouterConfig,
-        req: &EmbedRequest,
-    ) -> Result<EmbedResponse, GatewayError> {
-        // Model resolution mirrors the `Payload::Embed` arm of `execute`:
-        // an explicit, non-matching model name is rejected up front.
-        if let Some(requested) = &req.model
-            && requested != &self.config.model_id
-        {
-            return Err(GatewayError::ModelUnavailable {
-                adapter: self.config.adapter_id.clone(),
-                model: requested.clone(),
-            });
-        }
-
-        // Inherent `OrtAdapter::embed(&[String])` wins method resolution over
-        // this trait method, preserving the ONNX session + tokenizer path.
-        let embeddings = self.embed(&req.texts)?;
-        Ok(EmbedResponse {
-            embeddings,
-            usage: None,
-            degraded: false,
-        })
-    }
-}
+// Embed-only, delegating to the inherent `OrtAdapter::embed` (ONNX session + tokenizer
+// path) via the shared macro.
+crate::impl_embed_via_inherent!(OrtAdapter);
 
 #[async_trait]
 impl kernel::adapters::RegisterInto for OrtAdapter {

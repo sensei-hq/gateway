@@ -13,8 +13,8 @@
 	import { vibe } from '@rokkit/states';
 	import { themable } from '@rokkit/actions';
 	import { browser } from '$app/environment';
-	import Nav from '$lib/components/Nav.svelte';
-	import Footer from '$lib/components/Footer.svelte';
+	import SiteHeader from '$lib/components/SiteHeader.svelte';
+	import SiteFooter from '$lib/components/SiteFooter.svelte';
 
 	let { children } = $props();
 
@@ -33,9 +33,9 @@
 <svelte:body use:themable={{ theme: vibe, storageKey: 'gateway-theme' }} />
 
 <div class="flex min-h-screen flex-col">
-	<Nav />
+	<SiteHeader />
 	<main class="flex-1">
 		{@render children()}
 	</main>
-	<Footer />
+	<SiteFooter />
 </div>

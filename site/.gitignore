@@ -3,6 +3,8 @@ node_modules
 /.svelte-kit
 # docs content is synced from ../docs/llms at build (single source of truth)
 /src/lib/content
+# agent skills synced from ../docs/skills at build (served for download)
+/static/skills
 /package
 .env
 .env.*
@@ -11,3 +13,6 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .wrangler
 .DS_Store
+# Vitest browser-mode failure artifacts (screenshots + attachments)
+.vitest-attachments
+**/__screenshots__

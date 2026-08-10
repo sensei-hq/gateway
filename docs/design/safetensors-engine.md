@@ -1,3 +1,13 @@
+---
+title: Safetensors Engine
+doctype: design
+module: local
+status: implemented
+feature:
+  - ../features/local/embedded-inference.md
+source: crates/local-providers/src
+---
+
 # Sketch: safetensors "HF as a separate engine" (Metal / candle)
 
 - **Status:** Sketch — future track, not scheduled

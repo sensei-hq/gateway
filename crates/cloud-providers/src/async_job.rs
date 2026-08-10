@@ -60,6 +60,17 @@ impl JobConfig {
     }
 }
 
+/// A polled async-job status that decides its own terminal outcome: `Ok(Some(self))` when the
+/// job has succeeded, `Err(..)` when it terminally failed, `Ok(None)` while still running —
+/// exactly the shape [`poll_until_complete`] expects. Implementing this on each provider's
+/// status type keeps the terminal-state vocabulary that genuinely differs per provider (the
+/// status field name, the success/failure tokens, the failure message) on the type, while the
+/// poll-loop plumbing stays shared and each adapter's poll closure is a uniform two lines.
+pub trait JobStatus: Sized {
+    /// `adapter` names the provider for the `ProviderError` raised on terminal failure.
+    fn terminal_outcome(self, adapter: &str) -> Result<Option<Self>, GatewayError>;
+}
+
 /// Poll a job until completion or timeout.
 ///
 /// `check_status` returns `Ok(Some(result))` when done, `Ok(None)` when still

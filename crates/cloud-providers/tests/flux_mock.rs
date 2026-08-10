@@ -8,10 +8,6 @@
 //! returns "still processing", every mocked poll endpoint here returns a
 //! terminal status on its FIRST response so the tests stay sub-second.
 
-use std::collections::HashMap;
-
-use kernel::types::config::RouterConfig;
-use kernel::types::error::GatewayError;
 use kernel::types::io::ImageRequest;
 
 use cloud_providers::flux::FluxAdapter;
@@ -20,23 +16,16 @@ use kernel::adapters::capability::ImageModel;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
+mod common;
+use common::{assert_is_provider_error, router_config};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const SAMPLE_URL: &str = "https://bfl.ai/output/generated-image.png";
 const DEFAULT_MODEL: &str = "flux-pro-1.1";
-
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn image_request() -> ImageRequest {
     ImageRequest {
@@ -91,97 +80,24 @@ async fn flux_generate_image_happy_path() {
 }
 
 // ---------------------------------------------------------------------------
-// Submit error mappings
+// Submit error mappings — FLUX maps 401 → Authentication, 429 → RateLimit,
+// and every other code (including 403) → ProviderError carrying the status
+// (unlike the fal/kling/luma/runway/replicate adapters, which route every
+// submit status through ProviderError including 401).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn flux_submit_401_maps_to_authentication() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn flux_submit_403_maps_to_authentication() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
-        .mount(&server)
-        .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn flux_submit_429_maps_to_rate_limit() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&server)
-        .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::RateLimit { .. }),
-        "expected RateLimit error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn flux_submit_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path(format!("/{DEFAULT_MODEL}")))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
-        .mount(&server)
-        .await;
-
-    let adapter = FluxAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-    let request = image_request();
-
-    let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+http_error_tests! {
+    call: |config| async move {
+        FluxAdapter::new().unwrap().generate_image(&config, &image_request()).await
+    },
+    method: "POST",
+    path: format!("/{DEFAULT_MODEL}"),
+    cases: {
+        flux_submit_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
+        flux_submit_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
+        flux_submit_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
+        flux_submit_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,10 +132,7 @@ async fn flux_poll_error_status_maps_to_provider_error() {
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from failed poll, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }
 
 #[tokio::test]
@@ -249,8 +162,5 @@ async fn flux_poll_failed_status_maps_to_provider_error() {
     let request = image_request();
 
     let err = adapter.generate_image(&config, &request).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::ProviderError { .. }),
-        "expected ProviderError from failed poll, got: {err:?}",
-    );
+    assert_is_provider_error(&err);
 }

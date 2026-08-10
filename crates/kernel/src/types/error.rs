@@ -1,6 +1,20 @@
 use super::capability::Capability;
 use super::config::{FallbackTrigger, MeterUnit, Window};
 
+/// A caller-actionable remedy attached to a terminal `AllGated` when no candidate
+/// has a timed retry (all locks are terminal / all over budget). Guides the
+/// caller — the gateway never acts on it (tenant-agnostic; the caller owns
+/// credentials/budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HumanAction {
+    /// Provider credits/billing exhausted — top up.
+    TopUpCredits,
+    /// Auth failed / credential invalid — rotate the key.
+    RotateCredential,
+    /// Every candidate was over budget — raise the budget.
+    RaiseBudget,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error("authentication failed for adapter '{adapter}': {message}")]
@@ -63,6 +77,20 @@ pub enum GatewayError {
         attempts_detail: Vec<crate::types::trace::Attempt>,
     },
 
+    /// Every candidate was gated (health-locked / cooling / breaker-open / over
+    /// budget) — none was attemptable. `resume_after` is the **wall-clock**
+    /// earliest eligibility (min over timed gates); `None` ⇒ all gates are
+    /// terminal ⇒ `human_action` carries the remedy and the caller must not pause
+    /// forever. `skipped` is human-readable diagnostics. Distinct from
+    /// `AllAttemptsFailed` (a candidate genuinely failed) and `NoCandidates`
+    /// (nothing configured/eligible). Never triggers fallback.
+    #[error("all candidates gated{}", resume_after.map(|t| format!(", resume after {t}")).unwrap_or_else(|| ", human action required".into()))]
+    AllGated {
+        resume_after: Option<chrono::DateTime<chrono::Utc>>,
+        skipped: Vec<String>,
+        human_action: Option<HumanAction>,
+    },
+
     /// A model in the resolved chain is still provisioning (pulling / loading)
     /// and no ready fallback candidate exists. Terminal for this request — the
     /// caller retries once the supervisor reports the model ready. Never
@@ -121,6 +149,7 @@ impl GatewayError {
             | GatewayError::NoCandidates { .. }
             | GatewayError::QuotaExceeded { .. }
             | GatewayError::ModelNotReady { .. }
+            | GatewayError::AllGated { .. }
             | GatewayError::NotConfigured
             | GatewayError::InvalidConfig(_)
             | GatewayError::Network(_)
@@ -368,6 +397,25 @@ mod tests {
         };
         assert!(!e.should_trigger_fallback(&all_triggers));
         assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn all_gated_is_terminal_and_displays() {
+        let all_triggers = vec![
+            FallbackTrigger::RateLimit,
+            FallbackTrigger::Timeout,
+            FallbackTrigger::ProviderError,
+            FallbackTrigger::ModelUnavailable,
+            FallbackTrigger::BudgetExceeded,
+        ];
+        let e = GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec!["r:m — model locked out (Auth)".to_string()],
+            human_action: Some(HumanAction::TopUpCredits),
+        };
+        assert!(!e.should_trigger_fallback(&all_triggers)); // terminal — never falls over
+        assert!(!e.is_retryable()); // a durable pause, not an immediate retry
+        assert!(e.to_string().contains("all candidates gated"));
     }
 
     #[test]

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="stylesheet" href="./fonts.css">
+<script src="./content.js"></script>
+<script src="./uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime/uno.global.js"></script>
+</helmet>
+<section class="shell py-section">
+  <dc-import name="SectionHead" eyebrow="{{ eyebrow }}" title="{{ title }}" body="{{ body }}" width="lede" hint-size="100%,190px"></dc-import>
+  <div class="grid grid-cols-2 gap-6 mt-9 lt-md:grid-cols-1">
+    <sc-for list="{{ items }}" as="c" hint-placeholder-count="2">
+      <a href="{{ c.href }}" class="card card-lift p-7 flex items-center gap-4">
+        <span class="w-11 h-11 shrink-0 rounded-control bg-accent-wash border border-accent-line text-accent font-mono font-semibold text-subhead flex items-center justify-center">{{ c.mark }}</span>
+        <span class="flex flex-col gap-1">
+          <span class="font-display font-semibold text-title tracking-title text-fg">{{ c.name }}</span>
+          <span class="meta">{{ c.repo }}</span>
+        </span>
+      </a>
+    </sc-for>
+  </div>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  content() { return (typeof window !== 'undefined' && window.__GATEWAY_CONTENT) || {}; }
+  componentDidMount() { this.awaitContent(); }
+  awaitContent() {
+    if (typeof window === 'undefined' || window.__GATEWAY_CONTENT) return;
+    clearTimeout(this.__ct);
+    this.__ct = setTimeout(() => { this.awaitContent(); this.forceUpdate(); }, 100);
+  }
+  renderVals() {
+    const c = this.content().consumers || {};
+    return { eyebrow: c.eyebrow || '', title: c.title || '', body: c.body || '', items: c.items || [] };
+  }
+}
+</script>
+</body>
+</html>

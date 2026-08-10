@@ -1,0 +1,18 @@
+[package]
+name = "sensei-orchestrator-store"
+version = "0.1.0"
+edition = "2024"
+description = "Journal stores for the sensei orchestrator (slice 1: InMemoryJournal)"
+license = "MIT"
+
+[lib]
+name = "orchestrator_store"
+
+[dependencies]
+orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }
+async-trait = "0.1"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+uuid = { version = "1", features = ["v4"] }

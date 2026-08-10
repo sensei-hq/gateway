@@ -1,12 +1,14 @@
 /**
- * Prebuild step: sync the LLM/usage guides into the site.
+ * Prebuild step: sync repo content into the site.
  *
  *   ../docs/llms/*.md → src/lib/content/docs/  (rendered at /docs/<slug>,
  *                       and served raw at /llms-full.txt)
+ *   ../docs/skills/**  → static/skills/         (served for download at
+ *                       /skills/<name>/SKILL.md, installed into a consumer repo)
  *
- * Keeps a single source of truth in docs/llms — the site never forks the content.
+ * Keeps a single source of truth in docs/ — the site never forks the content.
  */
-import { mkdirSync, copyFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, copyFileSync, readdirSync, existsSync, rmSync, cpSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,4 +28,14 @@ if (existsSync(src)) {
 } else {
 	console.warn(`  ! missing ${src} — /docs will be empty`);
 }
+
+// Sync agent skills into static/ so they're downloadable from the deployed site.
+const skillsSrc = join(repo, 'docs', 'skills'); // gateway/docs/skills
+const skillsDest = join(here, '..', 'static', 'skills');
+rmSync(skillsDest, { recursive: true, force: true });
+if (existsSync(skillsSrc)) {
+	cpSync(skillsSrc, skillsDest, { recursive: true });
+	console.log('  copied docs/skills → static/skills');
+}
+
 console.log('docs sync complete.');

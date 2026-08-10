@@ -19,9 +19,9 @@ const META: Record<string, { slug: string; title: string; order: number }> = {
 	quickstart: { slug: 'quickstart', title: 'Quickstart', order: 1 },
 	configuration: { slug: 'configuration', title: 'Configuration', order: 2 },
 	recipes: { slug: 'recipes', title: 'Recipes', order: 3 },
-	'embedded-and-hf': { slug: 'embedded-and-hf', title: 'Embedded & HF download', order: 4 },
+	local: { slug: 'local', title: 'Local', order: 4 },
 	'custom-adapters': { slug: 'custom-adapters', title: 'Custom adapters', order: 5 },
-	'upgrade-0.2-to-0.3': { slug: 'upgrade-0.2-to-0.3', title: 'Upgrade 0.2 → 0.3', order: 6 }
+	upgrading: { slug: 'upgrading', title: 'Upgrading', order: 6 }
 };
 
 /** Map a bare guide filename (no dir, no .md) to its site slug, if it's a doc. */

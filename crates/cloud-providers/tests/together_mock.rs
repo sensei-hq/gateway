@@ -11,8 +11,8 @@
 //! `chat_stream()` opens a real SSE stream against `{base}/chat/completions`,
 //! yielding `data: ` chunks.
 //!
-//! Status mappings for both endpoints: 401/403 -> Authentication,
-//! 429 -> RateLimit, everything else -> ProviderError.
+//! Status mappings for both endpoints: 401 -> Authentication,
+//! 429 -> RateLimit, everything else (including 403) -> ProviderError.
 //!
 //! `base_url()` trims a trailing `/` from `config.url`; `server.uri()`
 //! has no trailing slash, so the mocked paths are exactly
@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use futures::StreamExt;
 
 use kernel::types::config::RouterConfig;
-use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ImageRequest};
 use kernel::types::request::{Message, MessageRole};
 
@@ -33,20 +32,15 @@ use kernel::adapters::capability::{ChatModel, ImageModel};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[macro_use]
+mod common;
+use common::{
+    assert_authentication_error, assert_provider_error_status, mount_status, router_config,
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn router_config(url: &str) -> RouterConfig {
-    RouterConfig {
-        url: url.to_string(),
-        api_key: Some("test-key".into()),
-        api_key_env: None,
-        enabled: true,
-        timeout_ms: Some(5000),
-        headers: HashMap::new(),
-    }
-}
 
 fn chat_request() -> ChatRequest {
     ChatRequest {
@@ -157,90 +151,18 @@ async fn together_chat_default_model_and_no_usage() {
 // Chat error mappings
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn together_chat_401_maps_to_authentication() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
-
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn together_chat_403_maps_to_authentication() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
-        .mount(&server)
-        .await;
-
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn together_chat_429_maps_to_rate_limit() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&server)
-        .await;
-
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::RateLimit { .. }),
-        "expected RateLimit error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn together_chat_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
-        .mount(&server)
-        .await;
-
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+http_error_tests! {
+    call: |config| async move {
+        TogetherAdapter::new().unwrap().chat(&config, &chat_request()).await
+    },
+    method: "POST",
+    path: "/v1/chat/completions",
+    cases: {
+        together_chat_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
+        together_chat_403_maps_to_provider_error => (403, "forbidden", common::ErrKind::Provider(Some(403))),
+        together_chat_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
+        together_chat_500_maps_to_provider_error => (500, "internal server error", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // A 200 response whose body is not valid chat JSON exercises the
@@ -248,27 +170,13 @@ async fn together_chat_500_maps_to_provider_error() {
 #[tokio::test]
 async fn together_chat_bad_json_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/v1/chat/completions", 200, "not json").await;
 
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
 
     let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(200),
-                ..
-            }
-        ),
-        "expected ProviderError from parse failure, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(200));
 }
 
 // ---------------------------------------------------------------------------
@@ -340,79 +248,17 @@ async fn together_image_b64_json_variant() {
     assert_eq!(images[0].b64_json.as_deref(), Some("aGVsbG8="));
 }
 
-#[tokio::test]
-async fn together_image_401_maps_to_authentication() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/images/generations"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
-
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter
-        .generate_image(&config, &image_request())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn together_image_429_maps_to_rate_limit() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/images/generations"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&server)
-        .await;
-
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter
-        .generate_image(&config, &image_request())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, GatewayError::RateLimit { .. }),
-        "expected RateLimit error, got: {err:?}",
-    );
-}
-
-#[tokio::test]
-async fn together_image_500_maps_to_provider_error() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/images/generations"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server)
-        .await;
-
-    let adapter = TogetherAdapter::new().unwrap();
-    let config = router_config(&server.uri());
-
-    let err = adapter
-        .generate_image(&config, &image_request())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(500),
-                ..
-            }
-        ),
-        "expected ProviderError with status 500, got: {err:?}",
-    );
+http_error_tests! {
+    call: |config| async move {
+        TogetherAdapter::new().unwrap().generate_image(&config, &image_request()).await
+    },
+    method: "POST",
+    path: "/v1/images/generations",
+    cases: {
+        together_image_401_maps_to_authentication => (401, "invalid api key", common::ErrKind::Auth),
+        together_image_429_maps_to_rate_limit => (429, "rate limited", common::ErrKind::RateLimit),
+        together_image_500_maps_to_provider_error => (500, "boom", common::ErrKind::Provider(Some(500))),
+    }
 }
 
 // A 200 image response with an unparseable body hits the image
@@ -420,12 +266,7 @@ async fn together_image_500_maps_to_provider_error() {
 #[tokio::test]
 async fn together_image_bad_json_maps_to_provider_error() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/images/generations"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-        .mount(&server)
-        .await;
+    mount_status(&server, "POST", "/v1/images/generations", 200, "not json").await;
 
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
@@ -434,16 +275,7 @@ async fn together_image_bad_json_maps_to_provider_error() {
         .generate_image(&config, &image_request())
         .await
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            GatewayError::ProviderError {
-                status: Some(200),
-                ..
-            }
-        ),
-        "expected ProviderError from image parse failure, got: {err:?}",
-    );
+    assert_provider_error_status(&err, Some(200));
 }
 
 // ---------------------------------------------------------------------------
@@ -467,10 +299,7 @@ async fn together_missing_api_key_returns_authentication() {
     let adapter = TogetherAdapter::new().unwrap();
 
     let err = adapter.chat(&config, &chat_request()).await.unwrap_err();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error for missing key, got: {err:?}",
-    );
+    assert_authentication_error(&err);
 }
 
 // ---------------------------------------------------------------------------
@@ -549,12 +378,14 @@ async fn together_stream_happy_path() {
 #[tokio::test]
 async fn together_stream_401_maps_to_authentication() {
     let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
+    mount_status(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        401,
+        "invalid api key",
+    )
+    .await;
 
     let adapter = TogetherAdapter::new().unwrap();
     let config = router_config(&server.uri());
@@ -562,8 +393,5 @@ async fn together_stream_401_maps_to_authentication() {
     let result = adapter.chat_stream(&config, &chat_request()).await;
     assert!(result.is_err(), "chat_stream() must surface auth failure");
     let err = result.err().unwrap();
-    assert!(
-        matches!(err, GatewayError::Authentication { .. }),
-        "expected Authentication error from chat_stream(), got: {err:?}",
-    );
+    assert_authentication_error(&err);
 }
