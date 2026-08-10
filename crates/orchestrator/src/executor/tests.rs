@@ -53,6 +53,31 @@ impl Tool for Probe {
     }
 }
 
+/// A Mutation tool that appends its `text` arg to a shared sink, so a test can
+/// assert the side effect ran exactly once (two-phase Intent → effect → Recorded).
+struct Note(Arc<std::sync::Mutex<Vec<String>>>);
+impl Tool for Note {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "note".into(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            effect_class: EffectClass::Mutation,
+            ttl_secs: None,
+            source: None,
+        }
+    }
+    fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.0.lock().unwrap().push(text.clone());
+        Ok(serde_json::json!({ "recorded": text }))
+    }
+}
+
 fn agent_def(chain: &str) -> AgentDefinition {
     AgentDefinition {
         name: "a".into(),
@@ -489,6 +514,61 @@ async fn observation_replays_within_ttl_and_rereads_when_stale() {
         recorded_count(&events2, &probe_eid),
         2,
         "a stale re-read appends a second EffectRecorded (supersedes)"
+    );
+}
+
+/// Headline (Mutation §7.3): a live Mutation is two-phase — it journals an
+/// `EffectIntent` (before the side effect) then an `EffectRecorded` (after), in
+/// that order, and applies the side effect exactly once.
+#[tokio::test]
+async fn mutation_two_phase_journals_intent_then_recorded() {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "note", "{\"text\":\"hello\"}"),
+        final_response("done"),
+    ])
+    .await;
+    let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(Note(sink.clone()))),
+        ));
+    let o = exec.run(run, &graph).await.expect("run completes");
+    assert!(o.failed.is_none(), "{:?}", o.failed);
+
+    // The side effect ran exactly once.
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "the note sink saw the mutation exactly once"
+    );
+
+    // The tool effect's Intent immediately precedes its Recorded.
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert_eq!(
+        labels.iter().filter(|l| *l == "EffectIntent(n1)").count(),
+        1,
+        "exactly one EffectIntent for the single Mutation: {labels:?}"
+    );
+    let intent_idx = labels
+        .iter()
+        .position(|l| l == "EffectIntent(n1)")
+        .expect("an EffectIntent was journaled before the side effect");
+    assert_eq!(
+        labels[intent_idx + 1],
+        "EffectRecorded(n1)",
+        "the Mutation's EffectRecorded immediately follows its Intent: {labels:?}"
     );
 }
 

@@ -7,7 +7,7 @@ use kernel::types::request::{
 };
 use orchestrator_core::{
     AgentDefinition, AgentRef, EffectClass, EffectId, JournalEvent, NodeId, ObservationMeta,
-    OrchestratorError, RunId, effect_id,
+    OrchestratorError, RunId, effect_id, idempotency_key,
 };
 
 use super::support::{
@@ -283,17 +283,50 @@ impl Executor {
             }
         }
 
-        // Live path: execute the tool and journal its record. Observations carry
-        // freshness/provenance so a later resume can decide replay-vs-re-read.
-        let observation = (class == EffectClass::Observation).then(|| ObservationMeta {
-            fetched_at: self.clock.now(),
-            ttl_secs: spec.as_ref().and_then(|s| s.ttl_secs).unwrap_or(0),
-            source: spec
-                .as_ref()
-                .and_then(|s| s.source.clone())
-                .unwrap_or_else(|| call.name.clone()),
-        });
-        self.record_tool_effect(ar, teid, call, args, &tih, (class, observation))
+        // Live path. A Mutation is two-phase (Intent → side effect → Recorded,
+        // §7.3); Pure/Observation record directly (Observations carry
+        // freshness/provenance so a later resume can decide replay-vs-re-read).
+        match class {
+            EffectClass::Mutation => self.mutation_tool_effect(ar, teid, call, args, &tih).await,
+            _ => {
+                let observation = (class == EffectClass::Observation).then(|| ObservationMeta {
+                    fetched_at: self.clock.now(),
+                    ttl_secs: spec.as_ref().and_then(|s| s.ttl_secs).unwrap_or(0),
+                    source: spec
+                        .as_ref()
+                        .and_then(|s| s.source.clone())
+                        .unwrap_or_else(|| call.name.clone()),
+                });
+                self.record_tool_effect(ar, teid, call, args, &tih, (class, observation))
+                    .await
+            }
+        }
+    }
+
+    /// The live path for a Mutation effect (§7.3): journal an `EffectIntent`
+    /// (idempotency key + args hash) BEFORE the side effect, then execute and
+    /// record. On a crash between the two, resume finds the Intent without a
+    /// Recorded — the in-doubt case reconciled in slice-4 Task 9.
+    async fn mutation_tool_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        args: serde_json::Value,
+        tih: &str,
+    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+        self.append(
+            ar.run,
+            JournalEvent::EffectIntent {
+                node: ar.node_id.clone(),
+                effect_id: teid.clone(),
+                idempotency_key: idempotency_key(teid, tih),
+                args_hash: tih.to_string(),
+                seq: 0,
+            },
+        )
+        .await?;
+        self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
             .await
     }
 
