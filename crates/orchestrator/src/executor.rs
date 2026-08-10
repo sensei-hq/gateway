@@ -10,8 +10,8 @@ use kernel::types::request::{
     InferenceRequest, Message, MessageContent, MessageRole, Payload, ToolCall, ToolDefinition,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, EffectClass, EffectId, ExecutionJournal, Graph, JournalEvent,
-    NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, effect_id,
+    AgentDefinition, AgentRef, Aggregation, EffectClass, EffectId, ExecutionJournal, Graph,
+    JournalEvent, MapBody, NodeId, NodeKind, OrchestratorError, Registry, RunId, Seq, effect_id,
 };
 use sha2::{Digest, Sha256};
 
@@ -26,6 +26,7 @@ pub struct Executor {
     registry: Arc<Registry>,
     tools: Arc<ToolRegistry>,
     max_steps: usize,
+    concurrency: usize,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure
@@ -62,7 +63,16 @@ impl Executor {
             registry: Arc::new(Registry::default()),
             tools: Arc::new(ToolRegistry::default()),
             max_steps: 8,
+            concurrency: 8,
         }
+    }
+
+    /// Override the global fan-out concurrency cap (default 8) — the ceiling on
+    /// how many `Map` children run at once (bounded by `min(map.concurrency,
+    /// executor.concurrency)`).
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n.max(1);
+        self
     }
 
     /// Attach the agent registry an `Agent` node resolves its definition against.
@@ -86,7 +96,7 @@ impl Executor {
     /// Execute a fresh linear graph end-to-end: journal `RunStarted`, then drive
     /// every node with an empty memo (nothing has run yet).
     pub async fn run(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
-        graph.validate_linear()?;
+        graph.validate_dag()?;
         self.append(
             run,
             JournalEvent::RunStarted {
@@ -114,7 +124,7 @@ impl Executor {
     ///
     /// [`VersionFenceMismatch`]: OrchestratorError::VersionFenceMismatch
     pub async fn start(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
-        graph.validate_linear()?;
+        graph.validate_dag()?;
         let events = self
             .journal
             .load(run)
@@ -218,108 +228,364 @@ impl Executor {
     ///
     /// For a fresh `run` the fold is empty, so every node executes; the memo
     /// branches exist for Task 4's resume and are reachable code.
+    ///
+    /// **Scheduling (slice 3):** instead of iterating nodes in declaration
+    /// order, the executor advances the graph in **rounds** of *ready* nodes. A
+    /// node is ready when every `Hard` dep has `Completed` and every `Soft` dep
+    /// is `terminal` (§3.2). Ready nodes in a round are dispatched in
+    /// declaration order (deterministic); after the round the ready set is
+    /// recomputed. A **linear** graph has exactly one ready node per round, so
+    /// this reproduces the slice-1/2 sequential order byte-for-byte. The first
+    /// node `Failed` halts the run without `RunCompleted` (resumable) — the
+    /// slice-1/2 contract; cascade-skip across hard edges arrives in a later
+    /// increment.
     async fn drive(
         &self,
         run: RunId,
         graph: &Graph,
         fold: &Fold,
     ) -> Result<RunOutcome, OrchestratorError> {
+        use std::collections::HashSet;
+
         let mut outcome = RunOutcome::default();
-        for (index, node) in graph.nodes.iter().enumerate() {
-            match &node.kind {
-                NodeKind::ModelCall { chain, payload } => {
-                    let eid = effect_id("", 0, index);
-                    let ih = input_hash(chain, payload)?;
+        let mut completed: HashSet<NodeId> = HashSet::new();
+        let mut terminal: HashSet<NodeId> = HashSet::new();
 
-                    if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
-                        if recorded_ih != &ih {
-                            return Err(OrchestratorError::DeterminismViolation {
-                                node: node.id.clone(),
-                                effect_id: eid,
-                            });
-                        }
-                        // Memoized: replay the recorded output — no gateway call, no
-                        // new `EffectRecorded` (it is already in the journal).
-                        outcome.outputs.insert(node.id.clone(), output.clone());
+        loop {
+            // Ready = not-yet-terminal nodes whose Hard deps have completed and
+            // Soft deps are terminal, in declaration order (deterministic).
+            let ready: Vec<(usize, &orchestrator_core::Node)> = graph
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| !terminal.contains(&node.id))
+                .filter(|(_, node)| {
+                    node.deps.iter().all(|dep| match dep.kind {
+                        orchestrator_core::EdgeKind::Hard => completed.contains(&dep.on),
+                        orchestrator_core::EdgeKind::Soft => terminal.contains(&dep.on),
+                    })
+                })
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+
+            for (index, node) in ready {
+                match self.run_node(run, index, node, fold).await? {
+                    NodeExec::Completed(output) => {
+                        outcome.outputs.insert(node.id.clone(), output);
                         outcome.completed.push(node.id.clone());
-                        continue;
+                        completed.insert(node.id.clone());
+                        terminal.insert(node.id.clone());
                     }
-
-                    self.append(
-                        run,
-                        JournalEvent::NodeStarted {
-                            node: node.id.clone(),
-                        },
-                    )
-                    .await?;
-
-                    let request = build_request(chain, payload);
-                    match self.gateway.execute(&request).await {
-                        Ok(response) => {
-                            let output = serde_json::json!({
-                                "model": response.model,
-                                "text": response.content.clone().unwrap_or_default(),
-                            });
-                            // `EffectRecorded.seq` is advisory: `append` assigns the
-                            // authoritative outer `Seq`, and the Task 4 resume fold
-                            // orders events by that outer `(Seq, event)` from `load` —
-                            // never by this in-event field — so it is set to 0 rather
-                            // than the (circular) value `append` would return.
-                            self.append(
-                                run,
-                                JournalEvent::EffectRecorded {
-                                    node: node.id.clone(),
-                                    effect_id: eid,
-                                    class: EffectClass::Pure,
-                                    input_hash: ih,
-                                    seq: 0,
-                                    output: output.clone(),
-                                },
-                            )
-                            .await?;
-                            self.append(
-                                run,
-                                JournalEvent::NodeCompleted {
-                                    node: node.id.clone(),
-                                },
-                            )
-                            .await?;
+                    NodeExec::Failed { message, output } => {
+                        // Carry a node's failure output (a Map's manifest) into
+                        // the outcome, then surface the failure and halt the run
+                        // without `RunCompleted` (resumable) — the slice-1/2
+                        // contract.
+                        if let Some(output) = output {
                             outcome.outputs.insert(node.id.clone(), output);
-                            outcome.completed.push(node.id.clone());
                         }
-                        Err(error) => {
-                            let message = error.to_string();
-                            self.append(
-                                run,
-                                JournalEvent::NodeFailed {
-                                    node: node.id.clone(),
-                                    error: message.clone(),
-                                },
-                            )
-                            .await?;
-                            // Surface the failure in the outcome and stop the run — the
-                            // failure is reported, not swallowed.
-                            outcome.failed = Some((node.id.clone(), message));
-                            return Ok(outcome);
-                        }
-                    }
-                }
-                NodeKind::Agent { agent, input } => {
-                    match self.drive_agent(run, node, agent, input, fold).await? {
-                        AgentStep::Completed(output) => {
-                            outcome.outputs.insert(node.id.clone(), output);
-                            outcome.completed.push(node.id.clone());
-                        }
-                        AgentStep::Failed(message) => {
-                            outcome.failed = Some((node.id.clone(), message));
-                            return Ok(outcome);
-                        }
+                        outcome.failed = Some((node.id.clone(), message));
+                        return Ok(outcome);
                     }
                 }
             }
         }
         self.append(run, JournalEvent::RunCompleted).await?;
         Ok(outcome)
+    }
+
+    /// Execute one node to a terminal result. `index` is the node's declaration
+    /// position, which keys a `ModelCall`'s structural effect id
+    /// (`effect_id("", 0, index)` — the slice-1 scheme, preserved). A memoized
+    /// `ModelCall` replays with no gateway call and no new journal event; a
+    /// live one journals `NodeStarted → EffectRecorded → NodeCompleted`. An
+    /// `Agent` node delegates to [`drive_agent`](Self::drive_agent), which owns
+    /// its own per-turn journaling. A determinism violation propagates as `Err`
+    /// (halting the run before any gateway call).
+    async fn run_node(
+        &self,
+        run: RunId,
+        index: usize,
+        node: &orchestrator_core::Node,
+        fold: &Fold,
+    ) -> Result<NodeExec, OrchestratorError> {
+        match &node.kind {
+            NodeKind::ModelCall { chain, payload } => {
+                let eid = effect_id("", 0, index);
+                let ih = input_hash(chain, payload)?;
+
+                if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
+                    if recorded_ih != &ih {
+                        return Err(OrchestratorError::DeterminismViolation {
+                            node: node.id.clone(),
+                            effect_id: eid,
+                        });
+                    }
+                    // Memoized: replay the recorded output — no gateway call, no
+                    // new `EffectRecorded` (it is already in the journal).
+                    return Ok(NodeExec::Completed(output.clone()));
+                }
+
+                self.append(
+                    run,
+                    JournalEvent::NodeStarted {
+                        node: node.id.clone(),
+                    },
+                )
+                .await?;
+
+                let request = build_request(chain, payload);
+                match self.gateway.execute(&request).await {
+                    Ok(response) => {
+                        let output = serde_json::json!({
+                            "model": response.model,
+                            "text": response.content.clone().unwrap_or_default(),
+                        });
+                        // `EffectRecorded.seq` is advisory: `append` assigns the
+                        // authoritative outer `Seq`, and the resume fold orders
+                        // events by that outer `(Seq, event)` from `load` — never by
+                        // this in-event field — so it is set to 0 rather than the
+                        // (circular) value `append` would return.
+                        self.append(
+                            run,
+                            JournalEvent::EffectRecorded {
+                                node: node.id.clone(),
+                                effect_id: eid,
+                                class: EffectClass::Pure,
+                                input_hash: ih,
+                                seq: 0,
+                                output: output.clone(),
+                            },
+                        )
+                        .await?;
+                        self.append(
+                            run,
+                            JournalEvent::NodeCompleted {
+                                node: node.id.clone(),
+                            },
+                        )
+                        .await?;
+                        Ok(NodeExec::Completed(output))
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: node.id.clone(),
+                                error: message.clone(),
+                            },
+                        )
+                        .await?;
+                        Ok(NodeExec::Failed {
+                            message,
+                            output: None,
+                        })
+                    }
+                }
+            }
+            NodeKind::Agent { agent, input } => {
+                match self.drive_agent(run, node, agent, input, fold).await? {
+                    AgentStep::Completed(output) => Ok(NodeExec::Completed(output)),
+                    AgentStep::Failed(message) => Ok(NodeExec::Failed {
+                        message,
+                        output: None,
+                    }),
+                }
+            }
+            NodeKind::Map {
+                body,
+                over,
+                concurrency,
+                aggregation,
+            } => {
+                self.run_map(run, node, body, over, *concurrency, aggregation, fold)
+                    .await
+            }
+        }
+    }
+
+    /// Run a `Map` node's internal bounded fan-out (§3.4). Journals
+    /// `NodeStarted → MapExpanded`, runs `body` once per item in `over`
+    /// concurrently (capped by `min(map.concurrency, executor.concurrency)`,
+    /// each item at the structural path `"{map}/{i}"`), then folds the children
+    /// into `{ results, manifest }` — results **indexed by item order**
+    /// regardless of completion order — and decides the Map's own status by
+    /// `aggregation`. A completed Map journals `NodeCompleted`; a failed one
+    /// journals `NodeFailed` and still carries the manifest out via
+    /// [`NodeExec::Failed`]`.output`. A fatal error (journal write / determinism)
+    /// aborts as `Err`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_map(
+        &self,
+        run: RunId,
+        map_node: &orchestrator_core::Node,
+        body: &MapBody,
+        over: &[serde_json::Value],
+        concurrency: usize,
+        aggregation: &Aggregation,
+        fold: &Fold,
+    ) -> Result<NodeExec, OrchestratorError> {
+        self.append(
+            run,
+            JournalEvent::NodeStarted {
+                node: map_node.id.clone(),
+            },
+        )
+        .await?;
+        self.append(
+            run,
+            JournalEvent::MapExpanded {
+                node: map_node.id.clone(),
+                child_count: over.len(),
+            },
+        )
+        .await?;
+
+        // Bounded concurrent fan-out. The semaphore caps how many children hold
+        // a permit (i.e. are dispatching a gateway call) at once; `join_all`
+        // polls them cooperatively on this task, so concurrency is realized at
+        // the children's `.await` points (the gateway I/O).
+        let cap = concurrency.min(self.concurrency).max(1);
+        let sem = Arc::new(tokio::sync::Semaphore::new(cap));
+        let child_futures = over.iter().enumerate().map(|(i, item)| {
+            let sem = sem.clone();
+            let map_id = map_node.id.0.clone();
+            async move {
+                let _permit = sem.acquire().await.expect("semaphore is never closed");
+                let path = format!("{map_id}/{i}");
+                let result = match body {
+                    MapBody::ModelCall { chain } => {
+                        self.run_map_child_modelcall(run, &path, chain, item, fold)
+                            .await
+                    }
+                };
+                (i, result)
+            }
+        });
+        let mut collected = futures::future::join_all(child_futures).await;
+        // `join_all` preserves input order, but sort by index to make the
+        // deterministic-ordering guarantee explicit and completion-order-proof.
+        collected.sort_by_key(|(i, _)| *i);
+
+        // Fold children into the manifest, propagating any fatal error.
+        let mut results = Vec::with_capacity(over.len());
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        for (i, child) in collected {
+            match child? {
+                Ok(value) => {
+                    ok += 1;
+                    results.push(serde_json::json!({ "index": i, "ok": value }));
+                }
+                Err(message) => {
+                    failed += 1;
+                    results.push(serde_json::json!({ "index": i, "error": message }));
+                }
+            }
+        }
+        let total = over.len();
+        let output = serde_json::json!({
+            "results": results,
+            "manifest": { "ok": ok, "failed": failed },
+        });
+
+        let satisfied = match aggregation {
+            Aggregation::BestEffort => true,
+            Aggregation::FailFast => failed == 0,
+            Aggregation::Quorum {
+                min_count,
+                min_fraction,
+            } => {
+                let count_ok = min_count.is_none_or(|m| ok >= m);
+                let frac_ok =
+                    min_fraction.is_none_or(|f| total > 0 && (ok as f64 / total as f64) >= f);
+                count_ok && frac_ok
+            }
+        };
+
+        if satisfied {
+            self.append(
+                run,
+                JournalEvent::NodeCompleted {
+                    node: map_node.id.clone(),
+                },
+            )
+            .await?;
+            Ok(NodeExec::Completed(output))
+        } else {
+            let message = format!(
+                "map {:?} aggregation not satisfied: {ok}/{total} succeeded, {failed} failed",
+                map_node.id
+            );
+            self.append(
+                run,
+                JournalEvent::NodeFailed {
+                    node: map_node.id.clone(),
+                    error: message.clone(),
+                },
+            )
+            .await?;
+            Ok(NodeExec::Failed {
+                message,
+                output: Some(output),
+            })
+        }
+    }
+
+    /// Run one `MapBody::ModelCall` child at structural path `path` — a single
+    /// Pure effect `effect_id(path, 0, 0)` with `item` as the request payload.
+    /// The outer `Result` is fatal (journal write / determinism) and aborts the
+    /// run; the inner `Result` is the child's own success value or failure
+    /// message, which lands in the Map's manifest. A memoized child replays with
+    /// no gateway call (resume); a live one journals its `EffectRecorded`. A
+    /// failed child records nothing durable, so a resume re-dispatches it.
+    async fn run_map_child_modelcall(
+        &self,
+        run: RunId,
+        path: &str,
+        chain: &str,
+        item: &serde_json::Value,
+        fold: &Fold,
+    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+        let eid = effect_id(path, 0, 0);
+        let ih = input_hash(chain, item)?;
+
+        if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
+            if recorded_ih != &ih {
+                return Err(OrchestratorError::DeterminismViolation {
+                    node: NodeId(path.to_string()),
+                    effect_id: eid,
+                });
+            }
+            return Ok(Ok(output.clone()));
+        }
+
+        let request = build_request(chain, item);
+        match self.gateway.execute(&request).await {
+            Ok(response) => {
+                let output = serde_json::json!({
+                    "model": response.model,
+                    "text": response.content.clone().unwrap_or_default(),
+                });
+                self.append(
+                    run,
+                    JournalEvent::EffectRecorded {
+                        node: NodeId(path.to_string()),
+                        effect_id: eid,
+                        class: EffectClass::Pure,
+                        input_hash: ih,
+                        seq: 0,
+                        output: output.clone(),
+                    },
+                )
+                .await?;
+                Ok(Ok(output))
+            }
+            Err(error) => Ok(Err(error.to_string())),
+        }
     }
 
     /// Append one event, mapping a journal-backend error to a fatal
@@ -338,6 +604,21 @@ impl Executor {
 enum AgentStep {
     Completed(serde_json::Value),
     Failed(String),
+}
+
+/// The terminal result of one scheduled node (any kind): its completed output,
+/// or a node-level failure already journaled as `NodeFailed`. A determinism
+/// violation is not a `NodeExec` — it propagates as `Err` and halts the run.
+///
+/// `Failed.output` carries a node's result even on failure — a `Map` that fails
+/// its aggregation still attaches its failure manifest so it reaches
+/// `RunOutcome`, never dropped (§3.4). `ModelCall`/`Agent` failures carry `None`.
+enum NodeExec {
+    Completed(serde_json::Value),
+    Failed {
+        message: String,
+        output: Option<serde_json::Value>,
+    },
 }
 
 impl Executor {
@@ -671,10 +952,10 @@ fn est_prompt_tokens(system: &str, messages: &[Message], tools: &[ToolDefinition
 mod tests {
     use super::*;
     use crate::test_support::{
-        demo_reference_gateway, failing_after_gateway, final_response, recording_gateway,
-        scripted_gateway, tool_call_response,
+        content_gated_gateway, demo_reference_gateway, failing_after_gateway, final_response,
+        recording_gateway, scripted_gateway, tool_call_response,
     };
-    use orchestrator_core::{Graph, JournalError, Node, NodeId, NodeKind};
+    use orchestrator_core::{Dep, Graph, JournalError, Node, NodeId, NodeKind};
     use orchestrator_store::InMemoryJournal;
 
     use crate::agent::tools::{Calc, Tool, ToolRegistry};
@@ -1101,7 +1382,7 @@ mod tests {
                 Node {
                     id: NodeId("n2".into()),
                     kind: model_call("c", "b"),
-                    deps: vec![NodeId("n1".into())],
+                    deps: vec![Dep::hard("n1")],
                 },
             ],
         };
@@ -1159,7 +1440,7 @@ mod tests {
                 Node {
                     id: n2.clone(),
                     kind: model_call("c", p2),
-                    deps: vec![n1.clone()],
+                    deps: vec![Dep::hard(n1.clone())],
                 },
             ],
         };
@@ -1189,9 +1470,173 @@ mod tests {
             JournalEvent::EffectRecorded { node, .. } => format!("EffectRecorded({})", node.0),
             JournalEvent::NodeCompleted { node } => format!("NodeCompleted({})", node.0),
             JournalEvent::NodeFailed { node, .. } => format!("NodeFailed({})", node.0),
+            JournalEvent::MapExpanded { node, child_count } => {
+                format!("MapExpanded({}x{})", node.0, child_count)
+            }
             JournalEvent::RunCompleted => "RunCompleted".to_string(),
             JournalEvent::RunPaused { .. } => "RunPaused".to_string(),
         }
+    }
+
+    /// The DAG scheduler runs a diamond (`a → {b, c} → d`) declared OUT of
+    /// topological order, scheduling each node only once its dependencies have
+    /// completed. The old linear drive rejected this graph outright
+    /// (`validate_linear`); the scheduler runs it and completes in a valid
+    /// topological order (`a` first, `d` last, `b`/`c` before `d`).
+    #[tokio::test]
+    async fn scheduler_runs_a_diamond_dag_in_topological_order() {
+        let (gateway, _calls) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+
+        // Declared out of order: [d, b, c, a]. d hard-deps b & c; b, c hard-dep a.
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("d".into()),
+                    kind: model_call("c", "pd"),
+                    deps: vec![Dep::hard("b"), Dep::hard("c")],
+                },
+                Node {
+                    id: NodeId("b".into()),
+                    kind: model_call("c", "pb"),
+                    deps: vec![Dep::hard("a")],
+                },
+                Node {
+                    id: NodeId("c".into()),
+                    kind: model_call("c", "pc"),
+                    deps: vec![Dep::hard("a")],
+                },
+                Node {
+                    id: NodeId("a".into()),
+                    kind: model_call("c", "pa"),
+                    deps: vec![],
+                },
+            ],
+        };
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let outcome = exec.run(run, &graph).await.expect("diamond DAG runs");
+
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+        assert_eq!(outcome.completed.len(), 4, "all four nodes completed");
+        let pos = |id: &str| {
+            outcome
+                .completed
+                .iter()
+                .position(|n| n.0 == id)
+                .unwrap_or_else(|| panic!("{id} completed"))
+        };
+        assert_eq!(outcome.completed.first().unwrap().0, "a", "root first");
+        assert_eq!(outcome.completed.last().unwrap().0, "d", "sink last");
+        assert!(pos("a") < pos("b") && pos("a") < pos("c"), "a before b,c");
+        assert!(pos("b") < pos("d") && pos("c") < pos("d"), "b,c before d");
+    }
+
+    /// Map items as `{prompt}` payloads for `MapBody::ModelCall`; a prompt
+    /// containing `"FAIL"` fails under the content-gated gateway.
+    fn map_items<const N: usize>(prompts: [&str; N]) -> Vec<serde_json::Value> {
+        prompts
+            .iter()
+            .map(|p| serde_json::json!({ "prompt": p }))
+            .collect()
+    }
+
+    /// A single-node graph holding one `Map` over `over` with the given aggregation.
+    fn map_graph(id: &str, over: Vec<serde_json::Value>, aggregation: Aggregation) -> Graph {
+        Graph {
+            nodes: vec![Node {
+                id: NodeId(id.into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over,
+                    concurrency: 4,
+                    aggregation,
+                },
+                deps: vec![],
+            }],
+        }
+    }
+
+    /// Acceptance 2 — a `BestEffort` Map with two failing children completes,
+    /// carrying a `{ok:3, failed:2}` manifest and results indexed by item order.
+    #[tokio::test]
+    async fn map_best_effort_completes_with_a_failure_manifest() {
+        let (gateway, _calls) = content_gated_gateway().await;
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+
+        let over = map_items(["a-0", "b-1", "c-2", "FAIL-3", "FAIL-4"]);
+        let graph = map_graph("m", over, Aggregation::BestEffort);
+        let m = NodeId("m".into());
+
+        let outcome = exec
+            .run(RunId(uuid::Uuid::new_v4()), &graph)
+            .await
+            .expect("map runs");
+
+        assert!(
+            outcome.failed.is_none(),
+            "BestEffort never fails the run: {:?}",
+            outcome.failed
+        );
+        assert_eq!(outcome.completed, vec![m.clone()], "the Map node completed");
+        let out = &outcome.outputs[&m];
+        assert_eq!(out["manifest"]["ok"], 3, "manifest: {out}");
+        assert_eq!(out["manifest"]["failed"], 2, "manifest: {out}");
+
+        let results = out["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 5, "one result per item");
+        // Deterministic index order regardless of concurrent completion order.
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r["index"], i as i64, "result {i} carries its index");
+        }
+        assert!(results[0].get("ok").is_some(), "child 0 succeeded");
+        assert!(results[2].get("ok").is_some(), "child 2 succeeded");
+        assert!(results[3].get("error").is_some(), "child 3 failed");
+        assert!(results[4].get("error").is_some(), "child 4 failed");
+    }
+
+    /// Acceptance 3 — `Quorum{min_fraction:0.6}` over 5: with 2 failures (3/5 =
+    /// 0.6) the Map completes; with 3 failures (2/5 = 0.4) it fails loudly, with
+    /// the manifest still attached to the outcome.
+    #[tokio::test]
+    async fn map_quorum_completes_at_threshold_and_fails_below_it() {
+        let quorum = || Aggregation::Quorum {
+            min_count: None,
+            min_fraction: Some(0.6),
+        };
+        let m = NodeId("m".into());
+
+        // 3 ok / 5 == 0.6 → meets quorum → Completed.
+        let (g1, _c1) = content_gated_gateway().await;
+        let exec1 = Executor::new(Arc::new(g1), Arc::new(InMemoryJournal::new()), "v1");
+        let graph1 = map_graph("m", map_items(["a", "b", "c", "FAIL", "FAIL"]), quorum());
+        let out1 = exec1
+            .run(RunId(uuid::Uuid::new_v4()), &graph1)
+            .await
+            .expect("runs");
+        assert!(
+            out1.failed.is_none(),
+            "3/5 == 0.6 meets quorum: {:?}",
+            out1.failed
+        );
+        assert_eq!(out1.outputs[&m]["manifest"]["ok"], 3);
+
+        // 2 ok / 5 == 0.4 → below quorum → Failed, manifest attached.
+        let (g2, _c2) = content_gated_gateway().await;
+        let exec2 = Executor::new(Arc::new(g2), Arc::new(InMemoryJournal::new()), "v1");
+        let graph2 = map_graph("m", map_items(["a", "b", "FAIL", "FAIL", "FAIL"]), quorum());
+        let out2 = exec2
+            .run(RunId(uuid::Uuid::new_v4()), &graph2)
+            .await
+            .expect("runs");
+        let (fnode, _msg) = out2.failed.as_ref().expect("2/5 < 0.6 fails quorum");
+        assert_eq!(fnode.0, "m", "the Map node is the failure");
+        assert_eq!(
+            out2.outputs[&m]["manifest"]["failed"], 3,
+            "the failure manifest is carried into the outcome, never dropped"
+        );
     }
 
     #[tokio::test]
@@ -1212,7 +1657,7 @@ mod tests {
                 Node {
                     id: n2.clone(),
                     kind: model_call("c", "b"),
-                    deps: vec![n1.clone()],
+                    deps: vec![Dep::hard(n1.clone())],
                 },
             ],
         };

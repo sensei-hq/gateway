@@ -29,6 +29,14 @@ pub enum JournalEvent {
         node: NodeId,
         error: String,
     },
+    /// A `Map` node fanned out over `child_count` items (§3.4). The child
+    /// manifest is fixed by the node's `over`, so this is deterministic and
+    /// order-independent; each child's own effects follow under the structural
+    /// path `"{node}/{i}"`.
+    MapExpanded {
+        node: NodeId,
+        child_count: usize,
+    },
     RunCompleted,
     RunPaused {
         reason: String,
