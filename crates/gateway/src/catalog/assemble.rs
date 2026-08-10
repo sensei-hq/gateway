@@ -71,61 +71,20 @@ pub fn assemble(catalog: CatalogConfig) -> Result<GatewayConfig, Vec<AssembleErr
     for chain_id in chain_ids {
         let tc = &catalog.chains[chain_id];
         let mut entries: Vec<ChainEntry> = Vec::new();
-
+        // Resolve each ref; a bad ref records ONE error and contributes no
+        // entries (assemble collects all errors — never early-returns).
         for r in &tc.refs {
-            match r {
-                ChainRef::Tier(tier_id) => match catalog.tiers.get(tier_id) {
-                    None => errors.push(AssembleError::UnknownTierRef(tier_id.clone())),
-                    Some(tier) => match tier_members(tier_id, tier, &catalog.models) {
-                        Err(e) => errors.push(e),
-                        Ok(members) => {
-                            let ordered = order_members(members, &catalog.models, tier.strategy);
-                            if ordered.is_empty() {
-                                errors
-                                    .push(AssembleError::EmptyTierAfterResolution(tier_id.clone()));
-                            } else {
-                                for model_id in ordered {
-                                    entries.push(ChainEntry {
-                                        model: model_id,
-                                        router: None,
-                                        api_model_id: None,
-                                        priority: 0, // reassigned by position below
-                                    });
-                                }
-                            }
-                        }
-                    },
-                },
-                ChainRef::Model(entry) => {
-                    if catalog.models.contains_key(&entry.model) {
-                        entries.push(entry.clone());
-                    } else {
-                        errors.push(AssembleError::UnknownModelRef(entry.model.clone()));
-                    }
-                }
+            match resolve_ref(&catalog, r) {
+                Ok(mut resolved) => entries.append(&mut resolved),
+                Err(e) => errors.push(e),
             }
         }
-
-        // Dedup by model id (first occurrence wins), then assign ascending
-        // 1-based priority by final position (saturating so a >255-entry chain
-        // degrades gracefully rather than wrapping).
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut models: Vec<ChainEntry> = Vec::new();
-        for entry in entries {
-            if seen.insert(entry.model.clone()) {
-                models.push(entry);
-            }
-        }
-        for (pos, entry) in models.iter_mut().enumerate() {
-            entry.priority = u8::try_from(pos + 1).unwrap_or(u8::MAX);
-        }
-
         chains.insert(
             chain_id.clone(),
             FallbackChainConfig {
                 id: chain_id.clone(),
                 capability: tc.capability.clone(),
-                models,
+                models: dedup_and_prioritize(entries),
                 fallback_triggers: tc.fallback_triggers.clone(),
             },
         );
@@ -143,6 +102,58 @@ pub fn assemble(catalog: CatalogConfig) -> Result<GatewayConfig, Vec<AssembleErr
         panels: Default::default(),
         consensus: Default::default(),
     })
+}
+
+/// Resolve one [`ChainRef`] into its concrete [`ChainEntry`] list, or the single
+/// [`AssembleError`] it triggers. A `Tier` expands to its ordered membership
+/// (unknown tier / bad curated member / empty-after-resolution each fail loud); a
+/// `Model` passes through if it exists in the catalog. Entry `priority` is left 0
+/// here — [`assemble`] reassigns it by final position.
+fn resolve_ref(catalog: &CatalogConfig, r: &ChainRef) -> Result<Vec<ChainEntry>, AssembleError> {
+    match r {
+        ChainRef::Model(entry) => {
+            if catalog.models.contains_key(&entry.model) {
+                Ok(vec![entry.clone()])
+            } else {
+                Err(AssembleError::UnknownModelRef(entry.model.clone()))
+            }
+        }
+        ChainRef::Tier(tier_id) => {
+            let tier = catalog
+                .tiers
+                .get(tier_id)
+                .ok_or_else(|| AssembleError::UnknownTierRef(tier_id.clone()))?;
+            let members = tier_members(tier_id, tier, &catalog.models)?;
+            let ordered = order_members(members, &catalog.models, tier.strategy);
+            if ordered.is_empty() {
+                return Err(AssembleError::EmptyTierAfterResolution(tier_id.clone()));
+            }
+            Ok(ordered
+                .into_iter()
+                .map(|model_id| ChainEntry {
+                    model: model_id,
+                    router: None,
+                    api_model_id: None,
+                    priority: 0, // reassigned by position in `dedup_and_prioritize`
+                })
+                .collect())
+        }
+    }
+}
+
+/// Dedup a chain's entries by model id (first occurrence wins), then assign
+/// ascending 1-based `priority` by final position (saturating, so a >255-entry
+/// chain degrades gracefully rather than wrapping).
+fn dedup_and_prioritize(entries: Vec<ChainEntry>) -> Vec<ChainEntry> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut models: Vec<ChainEntry> = entries
+        .into_iter()
+        .filter(|entry| seen.insert(entry.model.clone()))
+        .collect();
+    for (pos, entry) in models.iter_mut().enumerate() {
+        entry.priority = u8::try_from(pos + 1).unwrap_or(u8::MAX);
+    }
+    models
 }
 
 #[cfg(test)]
