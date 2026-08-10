@@ -566,7 +566,7 @@ impl Executor {
                 min_viable,
                 body,
             } => {
-                self.run_consolidate(run, node, over, *min_viable, body, prior_outputs)
+                self.run_consolidate(run, node, over, *min_viable, body, prior_outputs, fold)
                     .await
             }
         }
@@ -577,6 +577,7 @@ impl Executor {
     /// `ConsolidateStarved`, a loud halt — never a silent empty synthesis), then
     /// run `body` **once** over the collected survivors and return its output. A
     /// determinism violation / journal-write error aborts as `Err`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_consolidate(
         &self,
         run: RunId,
@@ -585,6 +586,7 @@ impl Executor {
         min_viable: usize,
         body: &MapBody,
         prior_outputs: &HashMap<NodeId, serde_json::Value>,
+        fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
         // Collect the Map's successful results (the `ok` value of each child) in
         // item order. A missing/absent Map output yields zero survivors, which
@@ -625,70 +627,85 @@ impl Executor {
 
         // Run `body` once over the survivors. The structural effect id nests
         // under this node's own path (`effect_id(node, 0, 0)`), so a resume
-        // memoizes the synthesis without re-spending.
-        self.append(
-            run,
-            JournalEvent::NodeStarted {
-                node: node.id.clone(),
-            },
-        )
-        .await?;
+        // memoizes the synthesis without re-spending. `NodeStarted`/`NodeCompleted`
+        // are guarded via the fold (resume-safe, like `run_map`/`drive_agent`).
+        if !fold.started.contains(&node.id) {
+            self.append(
+                run,
+                JournalEvent::NodeStarted {
+                    node: node.id.clone(),
+                },
+            )
+            .await?;
+        }
         let input = serde_json::json!({ "results": survivors });
         let output = match body {
             MapBody::ModelCall { chain } => {
-                // Structural effect id under this node's own path; resume
-                // memoization of the synthesis lands with the snapshot/resume
-                // increment (slice 3 runs it live).
                 let eid = effect_id(&node.id.0, 0, 0);
                 let payload = serde_json::json!({ "prompt": input.to_string() });
                 let ih = input_hash(chain, &payload)?;
-                let request = build_request(chain, &payload);
-                match self.gateway.execute(&request).await {
-                    Ok(response) => {
-                        let output = serde_json::json!({
-                            "model": response.model,
-                            "text": response.content.clone().unwrap_or_default(),
+
+                // Memoized on resume: replay the recorded synthesis — no gateway
+                // call, no re-append. A hash mismatch is a determinism violation.
+                if let Some((recorded_ih, recorded)) = fold.memo.get(&eid) {
+                    if recorded_ih != &ih {
+                        return Err(OrchestratorError::DeterminismViolation {
+                            node: node.id.clone(),
+                            effect_id: eid,
                         });
-                        let recorded = self.split_output(&output).await?;
-                        self.append(
-                            run,
-                            JournalEvent::EffectRecorded {
-                                node: node.id.clone(),
-                                effect_id: eid,
-                                class: EffectClass::Pure,
-                                input_hash: ih,
-                                seq: 0,
-                                output: recorded,
-                            },
-                        )
-                        .await?;
-                        output
                     }
-                    Err(error) => {
-                        let message = error.to_string();
-                        self.append(
-                            run,
-                            JournalEvent::NodeFailed {
-                                node: node.id.clone(),
-                                error: message.clone(),
-                            },
-                        )
-                        .await?;
-                        return Ok(NodeExec::Failed {
-                            message,
-                            output: None,
-                        });
+                    self.materialize(recorded).await?
+                } else {
+                    let request = build_request(chain, &payload);
+                    match self.gateway.execute(&request).await {
+                        Ok(response) => {
+                            let output = serde_json::json!({
+                                "model": response.model,
+                                "text": response.content.clone().unwrap_or_default(),
+                            });
+                            let recorded = self.split_output(&output).await?;
+                            self.append(
+                                run,
+                                JournalEvent::EffectRecorded {
+                                    node: node.id.clone(),
+                                    effect_id: eid,
+                                    class: EffectClass::Pure,
+                                    input_hash: ih,
+                                    seq: 0,
+                                    output: recorded,
+                                },
+                            )
+                            .await?;
+                            output
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.append(
+                                run,
+                                JournalEvent::NodeFailed {
+                                    node: node.id.clone(),
+                                    error: message.clone(),
+                                },
+                            )
+                            .await?;
+                            return Ok(NodeExec::Failed {
+                                message,
+                                output: None,
+                            });
+                        }
                     }
                 }
             }
         };
-        self.append(
-            run,
-            JournalEvent::NodeCompleted {
-                node: node.id.clone(),
-            },
-        )
-        .await?;
+        if !fold.completed.contains(&node.id) {
+            self.append(
+                run,
+                JournalEvent::NodeCompleted {
+                    node: node.id.clone(),
+                },
+            )
+            .await?;
+        }
         Ok(NodeExec::Completed(output))
     }
 
@@ -713,21 +730,29 @@ impl Executor {
         aggregation: &Aggregation,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        self.append(
-            run,
-            JournalEvent::NodeStarted {
-                node: map_node.id.clone(),
-            },
-        )
-        .await?;
-        self.append(
-            run,
-            JournalEvent::MapExpanded {
-                node: map_node.id.clone(),
-                child_count: over.len(),
-            },
-        )
-        .await?;
+        // Resume-safety: a Map replayed on resume (its children memoized) must NOT
+        // re-append its `NodeStarted`/`MapExpanded`/`NodeCompleted` — those are
+        // already journaled. Guarded via the fold, exactly like `drive_agent`.
+        // (Slice 3 runs a Map atomically per round, so its start and completion
+        // are journaled together; the guards make a resumed replay idempotent.)
+        let already_started = fold.started.contains(&map_node.id);
+        if !already_started {
+            self.append(
+                run,
+                JournalEvent::NodeStarted {
+                    node: map_node.id.clone(),
+                },
+            )
+            .await?;
+            self.append(
+                run,
+                JournalEvent::MapExpanded {
+                    node: map_node.id.clone(),
+                    child_count: over.len(),
+                },
+            )
+            .await?;
+        }
 
         // Bounded concurrent fan-out. The semaphore caps how many children hold
         // a permit (i.e. are dispatching a gateway call) at once; `join_all`
@@ -792,13 +817,17 @@ impl Executor {
         };
 
         if satisfied {
-            self.append(
-                run,
-                JournalEvent::NodeCompleted {
-                    node: map_node.id.clone(),
-                },
-            )
-            .await?;
+            // Guard the completion append too — a replayed completed Map must not
+            // re-journal `NodeCompleted` (it is already recorded).
+            if !fold.completed.contains(&map_node.id) {
+                self.append(
+                    run,
+                    JournalEvent::NodeCompleted {
+                        node: map_node.id.clone(),
+                    },
+                )
+                .await?;
+            }
             Ok(NodeExec::Completed(output))
         } else {
             let message = format!(
@@ -2815,6 +2844,193 @@ mod tests {
                 "NodeCompleted(n2)",
                 "RunCompleted",
             ],
+        );
+    }
+
+    /// Acceptance 8 (headline) — a run that dies after a `Map` completed but
+    /// before its dependent finished resumes and **re-spends nothing** for the
+    /// Map's children: the completed Map is replayed from the journal memo (no
+    /// gateway calls, its aggregated output reconstructed) and is NOT re-journaled
+    /// (no duplicate `NodeStarted`/`MapExpanded`/`NodeCompleted`), so each child's
+    /// effect stays exactly-once. Only the unfinished tail node runs live.
+    #[tokio::test]
+    async fn resume_replays_a_completed_map_with_no_respend_and_no_reappend() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let m = NodeId("m".into());
+        let n2 = NodeId("n2".into());
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: m.clone(),
+                    kind: NodeKind::Map {
+                        body: MapBody::ModelCall { chain: "c".into() },
+                        over: map_items(["i0", "i1", "i2"]),
+                        concurrency: 4,
+                        aggregation: Aggregation::BestEffort,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: n2.clone(),
+                    kind: model_call("c", "tail"),
+                    deps: vec![Dep::hard("m")],
+                },
+            ],
+        };
+
+        // Run 1: the 3 Map children succeed (gateway calls 1–3), then n2 fails
+        // (call 4) → no RunCompleted. The Map is fully journaled + completed.
+        let (gw1, calls1) = failing_after_gateway(3).await;
+        let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1");
+        let out1 = exec1
+            .run(run, &graph)
+            .await
+            .expect("run 1 yields an outcome");
+        assert!(out1.failed.is_some(), "n2 fails in run 1");
+        assert_eq!(
+            calls1.lock().unwrap().len(),
+            4,
+            "run 1: 3 Map children + the failing n2"
+        );
+        let before = journal.load(run).await.unwrap().len();
+
+        // Run 2: resume on a FRESH gateway. n2 succeeds; the Map replays.
+        let (gw2, calls2) = recording_gateway().await;
+        let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1");
+        let out2 = exec2.start(run, &graph).await.expect("resume completes");
+        assert!(out2.failed.is_none(), "{:?}", out2.failed);
+        assert!(
+            out2.completed.contains(&m) && out2.completed.contains(&n2),
+            "both nodes completed after resume: {:?}",
+            out2.completed
+        );
+        assert_eq!(
+            out2.outputs[&m]["manifest"]["ok"], 3,
+            "the Map's aggregated output is reconstructed on resume"
+        );
+
+        // Re-spend nothing for the children: run-2 gateway called ONLY for n2.
+        let recorded2 = calls2.lock().unwrap().clone();
+        assert_eq!(
+            recorded2.len(),
+            1,
+            "resume re-called the gateway only for the tail n2: {recorded2:?}"
+        );
+        assert_eq!(recorded2[0].1, "tail");
+
+        // The completed Map is NOT re-journaled on resume.
+        let all = journal.load(run).await.unwrap();
+        let run2_labels: Vec<String> = all[before..].iter().map(|(_, e)| label(e)).collect();
+        assert!(
+            !run2_labels.iter().any(|l| l == "NodeStarted(m)"
+                || l == "NodeCompleted(m)"
+                || l.starts_with("MapExpanded(m")),
+            "the completed Map is not re-journaled on resume: {run2_labels:?}"
+        );
+        // Each child's effect appears in exactly ONE EffectRecorded across BOTH runs.
+        for i in 0..3 {
+            let eid = effect_id(&format!("m/{i}"), 0, 0);
+            let count = all
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(e, JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &eid)
+                })
+                .count();
+            assert_eq!(count, 1, "child {i}'s effect recorded exactly once");
+        }
+    }
+
+    /// Acceptance 8 (Consolidate) — a completed `Consolidate` replays on resume
+    /// WITHOUT re-spending its synthesis body: its body effect is memoized (no
+    /// gateway call) and it is not re-journaled. Only the unfinished tail runs.
+    #[tokio::test]
+    async fn resume_replays_a_completed_consolidate_without_respending_its_body() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let cons = NodeId("cons".into());
+        let n3 = NodeId("n3".into());
+        // Map m (3 ok) → Consolidate cons (soft m) → ModelCall n3 (hard cons).
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("m".into()),
+                    kind: NodeKind::Map {
+                        body: MapBody::ModelCall { chain: "c".into() },
+                        over: map_items(["i0", "i1", "i2"]),
+                        concurrency: 4,
+                        aggregation: Aggregation::BestEffort,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: cons.clone(),
+                    kind: NodeKind::Consolidate {
+                        over: NodeId("m".into()),
+                        min_viable: 1,
+                        body: MapBody::ModelCall { chain: "c".into() },
+                    },
+                    deps: vec![Dep::soft("m")],
+                },
+                Node {
+                    id: n3.clone(),
+                    kind: model_call("c", "tail"),
+                    deps: vec![Dep::hard("cons")],
+                },
+            ],
+        };
+
+        // Run 1: 3 children (calls 1–3) + cons body (call 4) succeed, n3 fails
+        // (call 5) → no RunCompleted.
+        let (gw1, calls1) = failing_after_gateway(4).await;
+        let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1");
+        let out1 = exec1
+            .run(run, &graph)
+            .await
+            .expect("run 1 yields an outcome");
+        assert!(out1.failed.is_some(), "n3 fails in run 1");
+        assert_eq!(
+            calls1.lock().unwrap().len(),
+            5,
+            "run 1: 3 children + cons body + failing n3"
+        );
+        let before = journal.load(run).await.unwrap().len();
+
+        // Run 2: resume on a fresh gateway → only n3 runs live.
+        let (gw2, calls2) = recording_gateway().await;
+        let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1");
+        let out2 = exec2.start(run, &graph).await.expect("resume completes");
+        assert!(out2.failed.is_none(), "{:?}", out2.failed);
+        assert!(out2.completed.contains(&cons) && out2.completed.contains(&n3));
+
+        // Re-spend nothing: the run-2 gateway is called only for the tail n3 —
+        // NOT for the Map's children and NOT for the Consolidate's body.
+        let recorded2 = calls2.lock().unwrap().clone();
+        assert_eq!(
+            recorded2.len(),
+            1,
+            "resume re-called the gateway only for n3: {recorded2:?}"
+        );
+
+        // The Consolidate is not re-journaled, and its body effect stays exactly-once.
+        let all = journal.load(run).await.unwrap();
+        let run2_labels: Vec<String> = all[before..].iter().map(|(_, e)| label(e)).collect();
+        assert!(
+            !run2_labels
+                .iter()
+                .any(|l| l == "NodeStarted(cons)" || l == "NodeCompleted(cons)"),
+            "the completed Consolidate is not re-journaled on resume: {run2_labels:?}"
+        );
+        let cons_eid = effect_id("cons", 0, 0);
+        let body_count = all
+            .iter()
+            .filter(
+                |(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &cons_eid),
+            )
+            .count();
+        assert_eq!(
+            body_count, 1,
+            "the Consolidate body effect recorded exactly once"
         );
     }
 }
