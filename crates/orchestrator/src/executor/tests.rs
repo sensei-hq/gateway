@@ -517,6 +517,7 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::RunStarted { .. } => "RunStarted".to_string(),
         JournalEvent::NodeStarted { node } => format!("NodeStarted({})", node.0),
         JournalEvent::EffectRecorded { node, .. } => format!("EffectRecorded({})", node.0),
+        JournalEvent::EffectIntent { node, .. } => format!("EffectIntent({})", node.0),
         JournalEvent::NodeCompleted { node } => format!("NodeCompleted({})", node.0),
         JournalEvent::NodeFailed { node, .. } => format!("NodeFailed({})", node.0),
         JournalEvent::NodeSkipped { node } => format!("NodeSkipped({})", node.0),
@@ -1070,6 +1071,7 @@ async fn start_halts_on_determinism_violation_without_calling_gateway() {
                 output: EffectOutput::Inline(
                     serde_json::json!({ "model": "m", "text": "canned-response" }),
                 ),
+                observation: None,
             },
         )
         .await

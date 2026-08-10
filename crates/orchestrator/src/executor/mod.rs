@@ -447,6 +447,7 @@ impl Executor {
                                 input_hash: ih,
                                 seq: 0,
                                 output: recorded,
+                                observation: None,
                             },
                         )
                         .await?;
