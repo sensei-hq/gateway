@@ -446,7 +446,20 @@ impl Executor {
                 converged = true;
                 break;
             }
-            current_input = output; // refine: feed this iteration's output forward
+            // Refine: feed this iteration's answer TEXT forward, in the shape the
+            // body reads it — a `ModelCall` body's request is `payload["prompt"]`
+            // (so wrap as `{prompt: text}`), an `Agent` body renders its input
+            // directly (so pass the text string). Threading the raw `{model, text}`
+            // object instead would leave a ModelCall body with no `prompt` (an
+            // empty request every iteration) — a silent no-op refine.
+            let text = output
+                .get("text")
+                .cloned()
+                .unwrap_or_else(|| output.clone());
+            current_input = match body {
+                MapBody::ModelCall { .. } => serde_json::json!({ "prompt": text }),
+                MapBody::Agent(_) => text,
+            };
         }
 
         let out = serde_json::json!({
