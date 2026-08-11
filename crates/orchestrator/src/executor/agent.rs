@@ -77,6 +77,14 @@ impl Executor {
             vec![Message::text(MessageRole::User, render_input(input))];
         let mut node_started = fold.started.contains(node_id);
 
+        // Best-effort hook (§15): fire `on_agent_started` once, gated on the same
+        // `!node_started` condition that guards the `NodeStarted` append — so a
+        // resume replay of an already-started agent node does not re-fire it.
+        if !node_started && let Some(h) = &self.hooks {
+            h.on_agent_started(run, node_id, &agent_ref.0, &ar.chain)
+                .await;
+        }
+
         for turn in 0..self.max_steps {
             // Produce this turn's model output — memoized replay or a live call.
             let turn_output = match self
@@ -176,6 +184,12 @@ impl Executor {
             )
             .await?;
             *node_started = true;
+        }
+        // Best-effort hook (§15): a LIVE turn about to dispatch (a memoized replay
+        // returned above, and an over-budget turn already halted) — so a resume
+        // never re-fires a replayed turn.
+        if let Some(h) = &self.hooks {
+            h.on_agent_turn(ar.run, ar.node_id, turn).await;
         }
         let request =
             build_chat_request(&ar.chain, &ar.system, messages.to_vec(), ar.tools.clone());
@@ -434,6 +448,11 @@ impl Executor {
         record: (EffectClass, Option<ObservationMeta>),
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let (class, observation) = record;
+        // Best-effort hook (§15): a LIVE tool execution (a memoized tool replays via
+        // `materialize` and never reaches here), so a resume never re-fires it.
+        if let Some(h) = &self.hooks {
+            h.on_agent_tool_call(ar.run, ar.node_id, &call.name).await;
+        }
         match self.tools.execute(&call.name, args) {
             Ok(result) => {
                 let recorded = self.split_output(&result).await?;
