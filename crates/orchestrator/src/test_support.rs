@@ -518,3 +518,36 @@ pub async fn echo_system_gateway() -> (Gateway, CallLog) {
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     (Gateway::new(single_chain_config(), adapters, cb), calls)
 }
+
+/// A chat adapter (`id = "r"`) that always times out — a transport fault that
+/// cools its router. Warm-gating a single-candidate chain (one `execute`) makes
+/// the NEXT `execute` return `AllGated{resume_after: Some(_)}`.
+pub struct TimeoutAdapter;
+impl Model for TimeoutAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+#[async_trait]
+impl ChatModel for TimeoutAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        Err(GatewayError::Timeout {
+            adapter: "r".into(),
+            model: "m".into(),
+            duration_ms: 1,
+        })
+    }
+}
+
+/// A single-candidate gateway whose only router times out. One warm-up `execute`
+/// cools it; the next `execute` finds the sole candidate gated → `AllGated`.
+pub async fn timeout_gateway() -> Gateway {
+    let adapters = AdapterRegistry::new();
+    adapters.register_chat(Arc::new(TimeoutAdapter)).await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    Gateway::new(single_chain_config(), adapters, cb)
+}
