@@ -274,6 +274,37 @@ pub(crate) fn tool_input_hash(name: &str, arguments: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// How the executor should treat a gateway error (§11.2): a timed chain-gate is a
+/// durable pause; everything else fails (a terminal gate carries its human-action
+/// hint in the message).
+#[derive(Debug)]
+pub(crate) enum GatewayDisposition {
+    Pause {
+        resume_after: chrono::DateTime<chrono::Utc>,
+        reason: String,
+    },
+    Fail(String),
+}
+
+/// Classify a gateway error: only `AllGated{resume_after: Some(t)}` (every
+/// candidate gated, with a timed re-eligibility) pauses — to `t`. Every other
+/// error, including `AllGated{None}` (all gates terminal), fails; its `Display`
+/// carries the reason / human-action hint.
+pub(crate) fn classify_gateway_error(
+    err: &kernel::types::error::GatewayError,
+) -> GatewayDisposition {
+    match err {
+        kernel::types::error::GatewayError::AllGated {
+            resume_after: Some(t),
+            ..
+        } => GatewayDisposition::Pause {
+            resume_after: *t,
+            reason: format!("all candidates gated; resume after {t}"),
+        },
+        other => GatewayDisposition::Fail(other.to_string()),
+    }
+}
+
 /// Estimate a prompt's tokens (for the over-budget diagnostic's `est`).
 pub(crate) fn est_prompt_tokens(
     system: &str,
@@ -291,4 +322,49 @@ pub(crate) fn est_prompt_tokens(
             + est_tokens(&t.input_schema.to_string());
     }
     est
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_gateway_error_pauses_only_on_timed_allgated() {
+        use kernel::types::error::{GatewayError, HumanAction};
+        let t = chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap();
+        // Timed AllGated → Pause (reason names the instant).
+        match classify_gateway_error(&GatewayError::AllGated {
+            resume_after: Some(t),
+            skipped: vec![],
+            human_action: None,
+        }) {
+            GatewayDisposition::Pause {
+                resume_after,
+                reason,
+            } => {
+                assert_eq!(resume_after, t);
+                assert!(reason.contains(&t.to_string()), "reason names t: {reason}");
+            }
+            d => panic!("expected Pause, got {d:?}"),
+        }
+        // Terminal AllGated → Fail (message carries the human-action hint).
+        let none = GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec![],
+            human_action: Some(HumanAction::TopUpCredits),
+        };
+        let none_msg = none.to_string();
+        assert!(
+            matches!(classify_gateway_error(&none), GatewayDisposition::Fail(m) if m == none_msg)
+        );
+        // Other errors → Fail.
+        let budget = GatewayError::BudgetExceeded {
+            estimated: 1.0,
+            remaining: 0.0,
+        };
+        assert!(matches!(
+            classify_gateway_error(&budget),
+            GatewayDisposition::Fail(_)
+        ));
+    }
 }
