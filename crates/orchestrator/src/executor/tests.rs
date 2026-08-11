@@ -3326,13 +3326,45 @@ async fn loop_threads_each_iterations_output_into_the_next() {
     let l = &out.outputs[&NodeId("L".into())];
     assert_eq!(l["iterations"], 2);
     let final_text = l["output"]["text"].as_str().expect("final text");
-    // Non-vacuous: iteration 1's input was iteration 0's *output object* (not the
-    // original "start"), so the final text embeds the serialized prior output —
-    // `ok:{"model":…,"text":"ok:start"}`. Without threading it would be exactly
-    // "ok:start" (no nested `"text":"ok:start"`), so this distinguishes the two.
-    assert!(
-        final_text.contains(r#""text":"ok:start""#),
-        "iteration 1's output embeds iteration 0's full output object (refine thread): {final_text}"
+    // Non-vacuous: iteration 1's input is iteration 0's answer TEXT ("ok:start"),
+    // so the echoing gateway returns "ok:ok:start". Without threading, iteration 1
+    // would see the original "start" and return "ok:start" — so the extra "ok:"
+    // prefix distinguishes the refine thread from no-threading.
+    assert_eq!(
+        final_text, "ok:ok:start",
+        "iteration 1 received iteration 0's answer text as input (refine thread): {final_text}"
+    );
+}
+
+/// Acceptance §9.3 (ModelCall body, review Finding 1) — the refine thread also
+/// works for a `ModelCall` body: iteration 1's PROMPT is iteration 0's answer
+/// text, so the echoing chain returns "ok:ok:start" (not the empty-prompt "ok:").
+#[tokio::test]
+async fn loop_threads_the_prior_answer_into_a_modelcall_bodys_prompt() {
+    let (gw, _c) = content_gated_gateway().await; // returns "ok:{prompt}"
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("L".into()),
+            kind: NodeKind::Loop {
+                body: MapBody::ModelCall { chain: "c".into() },
+                input: serde_json::json!({ "prompt": "start" }),
+                gate: LoopGate::TextContains("NEVER".into()),
+                max_iters: 2,
+            },
+            deps: vec![],
+        }],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    let final_text = out.outputs[&NodeId("L".into())]["output"]["text"]
+        .as_str()
+        .expect("final text");
+    assert_eq!(
+        final_text, "ok:ok:start",
+        "iteration 1's prompt was iteration 0's answer text, not an empty prompt: {final_text}"
     );
 }
 
@@ -3386,6 +3418,25 @@ async fn loop_resume_replays_completed_iterations_without_respending() {
         calls2.lock().unwrap().len(),
         1,
         "resume re-spent only n2 (L's iterations memoized)"
+    );
+    // The Loop's own control events are fold-guarded: exactly one across both runs,
+    // never re-journaled on the resumed replay of the completed Loop.
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert_eq!(
+        labels.iter().filter(|l| *l == "NodeStarted(L)").count(),
+        1,
+        "one NodeStarted(L) across both runs: {labels:?}"
+    );
+    assert_eq!(
+        labels.iter().filter(|l| *l == "NodeCompleted(L)").count(),
+        1,
+        "one NodeCompleted(L) across both runs (fold-guarded replay): {labels:?}"
     );
 }
 
