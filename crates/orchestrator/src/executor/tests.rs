@@ -3687,3 +3687,40 @@ async fn hooks_unwired_is_byte_identical() {
         .collect();
     assert_eq!(l1, l2, "hooks change no journaled event");
 }
+
+/// Acceptance §9.2 — agent lifecycle: an Agent node that makes one tool call then
+/// finishes fires agent_started, agent_turn(0), agent_tool_call, agent_turn(1),
+/// plus the generic node_started/node_completed.
+#[tokio::test]
+async fn hooks_fire_agent_lifecycle() {
+    let hooks = RecordingHooks::default();
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}"),
+        final_response("the answer is 5"),
+    ])
+    .await;
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "add 2 and 3")],
+    };
+    Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_hooks(Arc::new(hooks.clone()))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    let log = hooks.log();
+    for expected in [
+        "node_started(n1)",
+        "agent_started(n1,a,c)",
+        "agent_turn(n1,0)",
+        "agent_tool_call(n1,calc)",
+        "agent_turn(n1,1)",
+        "node_completed(n1)",
+    ] {
+        assert!(
+            log.contains(&expected.to_string()),
+            "missing {expected}: {log:?}"
+        );
+    }
+}
