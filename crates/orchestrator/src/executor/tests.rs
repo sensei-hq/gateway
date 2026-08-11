@@ -3335,3 +3335,112 @@ async fn loop_threads_each_iterations_output_into_the_next() {
         "iteration 1's output embeds iteration 0's full output object (refine thread): {final_text}"
     );
 }
+
+/// A `Loop L → ModelCall n2` graph where the loop never converges (caps at 2).
+fn loop_then_modelcall_graph() -> Graph {
+    Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("L".into()),
+                kind: NodeKind::Loop {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({ "prompt": "go" }),
+                    gate: LoopGate::TextContains("STOP".into()), // never fires → cap at 2
+                    max_iters: 2,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("n2".into()),
+                kind: model_call("c", "after"),
+                deps: vec![Dep::hard("L")],
+            },
+        ],
+    }
+}
+
+/// Acceptance §9.5 — resume replays completed iterations without re-spending.
+/// Seed: L's 2 iterations succeed, n2 fails (no RunCompleted). Resume: L's
+/// iterations memo-hit (0 gateway calls), n2 runs live → exactly 1 call.
+#[tokio::test]
+async fn loop_resume_replays_completed_iterations_without_respending() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = loop_then_modelcall_graph();
+    let (gw1, _c1) = failing_after_gateway(2).await; // L iters 1,2 ok; n2 (call 3) fails
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("seed");
+    assert!(
+        o1.failed.is_some(),
+        "n2 fails, L completed → no RunCompleted"
+    );
+    let (gw2, calls2) = recording_gateway().await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .start(run, &graph)
+        .await
+        .expect("resume");
+    assert!(o2.failed.is_none(), "{:?}", o2.failed);
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        1,
+        "resume re-spent only n2 (L's iterations memoized)"
+    );
+}
+
+/// Acceptance §9.6 — a tampered completed iteration halts loud on resume. Rewrite
+/// iteration 0's body effect input_hash; resume → L replays iteration 0 → memo
+/// mismatch → DeterminismViolation, gateway untouched.
+#[tokio::test]
+async fn loop_resume_halts_on_a_tampered_iteration() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = loop_then_modelcall_graph();
+    let (gw1, _c1) = failing_after_gateway(2).await;
+    Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("seed");
+
+    let target = effect_id("L/0", 0, 0);
+    let tampered = InMemoryJournal::new();
+    for (_, e) in journal.load(run).await.unwrap() {
+        let e = match e {
+            JournalEvent::EffectRecorded {
+                effect_id,
+                node,
+                class,
+                seq,
+                output,
+                observation,
+                ..
+            } if effect_id == target => JournalEvent::EffectRecorded {
+                effect_id,
+                node,
+                class,
+                seq,
+                output,
+                observation,
+                input_hash: "TAMPERED".into(),
+            },
+            other => other,
+        };
+        tampered.append(run, e).await.unwrap();
+    }
+
+    let (gw2, calls2) = recording_gateway().await;
+    let err = Executor::new(Arc::new(gw2), Arc::new(tampered.clone()), "v1")
+        .start(run, &graph)
+        .await
+        .expect_err("tampered iteration halts the resume");
+    assert!(
+        matches!(&err, OrchestratorError::DeterminismViolation { node, .. } if node.0 == "L/0"),
+        "got {err:?}"
+    );
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        0,
+        "a determinism violation never touches the gateway"
+    );
+}
