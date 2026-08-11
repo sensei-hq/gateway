@@ -91,8 +91,9 @@ impl Executor {
                 .agent_turn_output(&ar, turn, &messages, &mut node_started)
                 .await?
             {
-                Ok(output) => output,
-                Err(failure) => return Ok(AgentStep::Failed(failure)),
+                ToolOutcome::Ok(output) => output,
+                ToolOutcome::Failed(failure) => return Ok(AgentStep::Failed(failure)),
+                ToolOutcome::Paused(reason) => return Ok(AgentStep::Paused(reason)),
             };
 
             let tool_calls: Vec<ToolCall> = serde_json::from_value(
@@ -142,7 +143,7 @@ impl Executor {
         turn: usize,
         messages: &[Message],
         node_started: &mut bool,
-    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let eid = effect_id(&ar.node_id.0, turn as u64, 0);
         let ih = agent_input_hash(&ar.chain, &ar.system, messages, &ar.tools)?;
 
@@ -153,7 +154,7 @@ impl Executor {
                     effect_id: eid,
                 });
             }
-            return Ok(Ok(self.materialize(output).await?));
+            return Ok(ToolOutcome::Ok(self.materialize(output).await?));
         }
 
         // Live turn. Budget-gate before spending; halt loud if over.
@@ -173,7 +174,7 @@ impl Executor {
                 },
             )
             .await?;
-            return Ok(Err(message));
+            return Ok(ToolOutcome::Failed(message));
         }
         if !*node_started {
             self.append(
@@ -497,7 +498,7 @@ impl Executor {
         eid: EffectId,
         ih: String,
         request: InferenceRequest,
-    ) -> Result<Result<serde_json::Value, String>, OrchestratorError> {
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         match self.gateway.execute(&request).await {
             Ok(response) => {
                 let output = serde_json::json!({
@@ -519,20 +520,38 @@ impl Executor {
                     },
                 )
                 .await?;
-                Ok(Ok(output))
+                Ok(ToolOutcome::Ok(output))
             }
-            Err(error) => {
-                let message = error.to_string();
-                self.append(
-                    run,
-                    JournalEvent::NodeFailed {
-                        node: node_id.clone(),
-                        error: message.clone(),
-                    },
-                )
-                .await?;
-                Ok(Err(message))
-            }
+            // A fully-gated chain with a timed re-eligibility (§11.2) is a durable
+            // pause (resumable) — on resume the turn re-attempts (no `EffectRecorded`
+            // was journaled). Every other gateway error fails the node.
+            Err(error) => match crate::executor::support::classify_gateway_error(&error) {
+                crate::executor::support::GatewayDisposition::Pause {
+                    resume_after,
+                    reason,
+                } => {
+                    self.append(
+                        run,
+                        JournalEvent::RunPaused {
+                            reason: reason.clone(),
+                            resume_after: Some(resume_after),
+                        },
+                    )
+                    .await?;
+                    Ok(ToolOutcome::Paused(reason))
+                }
+                crate::executor::support::GatewayDisposition::Fail(message) => {
+                    self.append(
+                        run,
+                        JournalEvent::NodeFailed {
+                            node: node_id.clone(),
+                            error: message.clone(),
+                        },
+                    )
+                    .await?;
+                    Ok(ToolOutcome::Failed(message))
+                }
+            },
         }
     }
 }

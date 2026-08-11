@@ -3953,3 +3953,27 @@ async fn modelcall_node_pauses_on_a_timed_gate() {
         hooks.log()
     );
 }
+
+/// Acceptance §6.4 — an Agent node whose turn is all-gated (timed) pauses (not fails).
+#[tokio::test]
+async fn agent_node_pauses_on_a_timed_gate() {
+    use crate::test_support::timeout_gateway;
+    let gw = timeout_gateway().await;
+    let req = support::build_request("c", &serde_json::json!({ "prompt": "warm" }));
+    let _ = gw.execute(&req).await; // warm-up cools router "r"
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "go")],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run yields an outcome");
+    assert!(
+        out.paused.is_some(),
+        "the agent's gated turn pauses: {:?}",
+        out.failed
+    );
+    assert!(out.failed.is_none());
+}
