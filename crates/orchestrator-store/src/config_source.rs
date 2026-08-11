@@ -52,10 +52,16 @@ fn read_dir_files(
             )));
         }
     };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some(ext))
-        .collect();
+    // Propagate per-entry errors loudly (never silently drop a config file mid-scan).
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| OrchestratorError::RegistryLoad(format!("read {}: {e}", dir.display())))?;
+        let p = entry.path();
+        if p.extension().and_then(|x| x.to_str()) == Some(ext) {
+            paths.push(p);
+        }
+    }
     paths.sort();
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
@@ -81,11 +87,17 @@ impl ConfigSource for FilesystemConfigSource {
             )));
         }
         let mut cfg = RegistryConfig::default();
-        for (_, md) in read_dir_files(&self.root, "agents", "md")? {
-            cfg.agents.push(AgentDefinition::from_frontmatter(&md)?);
+        for (file, md) in read_dir_files(&self.root, "agents", "md")? {
+            cfg.agents
+                .push(AgentDefinition::from_frontmatter(&md).map_err(|e| {
+                    OrchestratorError::RegistryLoad(format!("parse agent {file}: {e}"))
+                })?);
         }
-        for (_, md) in read_dir_files(&self.root, "skills", "md")? {
-            cfg.skills.push(SkillDef::from_frontmatter(&md)?);
+        for (file, md) in read_dir_files(&self.root, "skills", "md")? {
+            cfg.skills
+                .push(SkillDef::from_frontmatter(&md).map_err(|e| {
+                    OrchestratorError::RegistryLoad(format!("parse skill {file}: {e}"))
+                })?);
         }
         for (file, json) in read_dir_files(&self.root, "tools", "json")? {
             cfg.tools.push(
@@ -197,6 +209,23 @@ mod tests {
         assert!(
             matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("bad.json")),
             "got {err:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_agent_md_error_names_the_file() {
+        let root = temp_config_root();
+        // Missing the required `chain:` key → a parse error that must name the file.
+        write(
+            &root.join("agents"),
+            "broken.md",
+            "---\nname: x\narea: a\nkind: k\n---\nb\n",
+        );
+        let err = FilesystemConfigSource::new(&root).load().await;
+        assert!(
+            matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("broken.md")),
+            "a malformed agent .md error names the offending file: {err:?}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
