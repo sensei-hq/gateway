@@ -3444,3 +3444,43 @@ async fn loop_resume_halts_on_a_tampered_iteration() {
         "a determinism violation never touches the gateway"
     );
 }
+
+/// Acceptance §9 (real-gateway e2e) — a `Loop { body: ModelCall(research.bulk) }`
+/// drives the REAL demo-catalog gateway each iteration, falling over the
+/// credential-gated cloud entries to `llama3.1-local`; the gate never fires, so it
+/// caps at 2 and completes `converged: false` after 2 local calls.
+#[tokio::test]
+async fn loop_drives_the_real_reference_chain_each_iteration() {
+    let (gw, calls) = demo_reference_gateway().await;
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("L".into()),
+            kind: NodeKind::Loop {
+                body: MapBody::ModelCall {
+                    chain: "research.bulk".into(),
+                },
+                input: serde_json::json!({ "prompt": "iterate" }),
+                gate: LoopGate::TextContains("NEVER".into()),
+                max_iters: 2,
+            },
+            deps: vec![],
+        }],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("e2e run");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    let l = &out.outputs[&NodeId("L".into())];
+    assert_eq!(l["iterations"], 2);
+    assert_eq!(l["converged"], false);
+    assert_eq!(
+        l["output"]["model"], "llama3.1-local",
+        "each iteration fell over to the local model: {l}"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "2 iterations each hit the local adapter once"
+    );
+}
