@@ -3948,6 +3948,12 @@ async fn modelcall_node_pauses_on_a_timed_gate() {
         "a paused run does not complete"
     );
     assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::NodeFailed { .. })),
+        "a paused node is NOT also failed (RunPaused and NodeFailed are mutually exclusive)"
+    );
+    assert!(
         hooks.log().iter().any(|l| l.starts_with("run_paused(")),
         "on_run_paused fired: {:?}",
         hooks.log()
@@ -3961,13 +3967,15 @@ async fn agent_node_pauses_on_a_timed_gate() {
     let gw = timeout_gateway().await;
     let req = support::build_request("c", &serde_json::json!({ "prompt": "warm" }));
     let _ = gw.execute(&req).await; // warm-up cools router "r"
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
     let graph = Graph {
         nodes: vec![agent_node("n1", "a", "go")],
     };
-    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
         .with_registry(agent_registry("c"))
         .with_tools(Arc::new(ToolRegistry::default()))
-        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .run(run, &graph)
         .await
         .expect("run yields an outcome");
     assert!(
@@ -3976,6 +3984,23 @@ async fn agent_node_pauses_on_a_timed_gate() {
         out.failed
     );
     assert!(out.failed.is_none());
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        events.iter().any(|(_, e)| matches!(
+            e,
+            JournalEvent::RunPaused {
+                resume_after: Some(_),
+                ..
+            }
+        )),
+        "the agent journals RunPaused with a timed resume_after"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::NodeFailed { .. })),
+        "a paused agent turn is NOT also failed"
+    );
 }
 
 /// Acceptance §6.6 — a run paused on a timed gate RE-ATTEMPTS on resume: resuming

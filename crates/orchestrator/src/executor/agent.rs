@@ -11,7 +11,8 @@ use orchestrator_core::{
 };
 
 use super::support::{
-    agent_input_hash, build_chat_request, est_prompt_tokens, render_input, tool_input_hash,
+    GatewayDisposition, agent_input_hash, build_chat_request, classify_gateway_error,
+    est_prompt_tokens, render_input, tool_input_hash,
 };
 use super::{AgentStep, Executor, Fold};
 use crate::agent::prompt::{assemble_prompt, over_budget};
@@ -525,8 +526,8 @@ impl Executor {
             // A fully-gated chain with a timed re-eligibility (§11.2) is a durable
             // pause (resumable) — on resume the turn re-attempts (no `EffectRecorded`
             // was journaled). Every other gateway error fails the node.
-            Err(error) => match crate::executor::support::classify_gateway_error(&error) {
-                crate::executor::support::GatewayDisposition::Pause {
+            Err(error) => match classify_gateway_error(&error) {
+                GatewayDisposition::Pause {
                     resume_after,
                     reason,
                 } => {
@@ -540,7 +541,7 @@ impl Executor {
                     .await?;
                     Ok(ToolOutcome::Paused(reason))
                 }
-                crate::executor::support::GatewayDisposition::Fail(message) => {
+                GatewayDisposition::Fail(message) => {
                     self.append(
                         run,
                         JournalEvent::NodeFailed {
