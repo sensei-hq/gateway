@@ -86,8 +86,8 @@ hooks into the pure `fold_journal`.
 - `on_agent_started(node, agent, chain)` — once, gated on the same
   `!node_started` condition that guards the `NodeStarted` append (so a resume
   replay doesn't re-fire it).
-- `on_agent_turn(node, turn)` — in the live model-dispatch path
-  (`dispatch_model_turn`), NOT on a memoized-turn replay.
+- `on_agent_turn(node, turn)` — in `agent_turn_output` on the live path (after the
+  memo-miss + budget gate, just before dispatch), NOT on a memoized-turn replay.
 - `on_agent_tool_call(node, tool)` — when a tool is **live-executed**
   (`record_tool_effect`), NOT on a memo replay.
 
