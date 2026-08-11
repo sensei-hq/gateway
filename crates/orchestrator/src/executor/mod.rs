@@ -579,6 +579,7 @@ impl Executor {
             NodeKind::Consolidate { .. } => {
                 self.run_consolidate(run, node, prior_outputs, fold).await
             }
+            NodeKind::Loop { .. } => self.run_loop(run, node, fold).await,
         }
     }
 
