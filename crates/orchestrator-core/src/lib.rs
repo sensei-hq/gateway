@@ -26,4 +26,6 @@ pub use journal::{
     ChildStatus, CompactChild, ExecutionJournal, JournalEvent, ObservationMeta, Snapshot,
 };
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
-pub use registry::{AgentDefinition, AgentRef, Registry, SkillDef, ToolSpec};
+pub use registry::{
+    AgentDefinition, AgentRef, ConfigSource, Registry, RegistryConfig, SkillDef, ToolSpec,
+};
