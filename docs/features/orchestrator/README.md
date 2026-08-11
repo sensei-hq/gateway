@@ -21,7 +21,7 @@ re-spending tokens and with no silent failures. Full design in
 | [Durable journal](durable-journal.md) | Planned (Phase 3 · SP-1) | `orchestrator-core` | effect classes · two-phase + in-doubt · replay/resume |
 | [Agents · skills · tools](agents-skills-tools.md) | Partial (Phase 3 · SP-1 slice 2) | `orchestrator` | in-memory registry (frontmatter subset) · prompt assembly + per-turn window budget · Pure-only ReAct loop · resume-without-re-spend inside the loop |
 | [Shared context](shared-context.md) | Partial (Phase 3 · SP-1) | `crates/orchestrator*` | scoped blackboard wired · node outputs publish to Run · agents read dependency context (dependency-scoped, deterministic) · refs-not-blobs · resume-rehydrated |
-| [Hooks](hooks.md) | Planned (Phase 3 · SP-1) | `orchestrator-core` | per-agent progress · attempts bubbling · replay suppression |
+| [Hooks](hooks.md) | Partial (Phase 3 · SP-1) | `crates/orchestrator*` | `OrchestratorHooks` (no-op defaults) · run/node/agent/context lifecycle · fired from `append` (can't-miss, replay-suppressed) · opt-in byte-identical · attempts-bubbling/stream/HookError-channel deferred |
 
 ## Notes
 
