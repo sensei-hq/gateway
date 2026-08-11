@@ -3874,3 +3874,27 @@ async fn agent_hooks_do_not_refire_for_a_replayed_prefix_on_resume() {
     );
     assert!(log.contains(&"node_completed(n1)".to_string()), "{log:?}");
 }
+
+// ============================= SP-1 quota→pause ===============================
+
+/// Acceptance §6.1 — the warm-up fixture yields a genuine AllGated: a first
+/// (warm-up) execute times out and cools the sole router; the second execute is
+/// all-gated with a timed resume_after.
+#[tokio::test]
+async fn warmup_gateway_yields_allgated_with_resume_after() {
+    use crate::test_support::timeout_gateway;
+    let gw = timeout_gateway().await;
+    let req = support::build_request("c", &serde_json::json!({ "prompt": "x" }));
+    let _warm = gw.execute(&req).await; // times out → cools router "r"
+    let second = gw.execute(&req).await;
+    assert!(
+        matches!(
+            second,
+            Err(kernel::types::error::GatewayError::AllGated {
+                resume_after: Some(_),
+                ..
+            })
+        ),
+        "second execute is AllGated with a timed resume_after: {second:?}"
+    );
+}
