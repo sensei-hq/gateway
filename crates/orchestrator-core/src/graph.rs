@@ -218,6 +218,18 @@ impl Graph {
             }
         }
 
+        // 2b. Per-node-kind sanity: a `Loop` needs at least one iteration — a
+        // `max_iters == 0` Loop would complete degenerately with a null output, a
+        // quiet degenerate path. Reject it loudly up front.
+        for node in &self.nodes {
+            if let NodeKind::Loop { max_iters: 0, .. } = &node.kind {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "loop node {:?} has max_iters == 0 (must be >= 1)",
+                    node.id
+                )));
+            }
+        }
+
         // 3. Acyclic — Kahn's algorithm. `in_degree` counts each node's deps
         // (edges point dep.on → node); repeatedly retire zero-in-degree nodes.
         // If any remain, a cycle exists (no topological order).
@@ -260,6 +272,26 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_dag_rejects_a_zero_iteration_loop() {
+        let graph = Graph {
+            nodes: vec![Node {
+                id: NodeId("L".into()),
+                kind: NodeKind::Loop {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({}),
+                    gate: LoopGate::TextContains("x".into()),
+                    max_iters: 0,
+                },
+                deps: vec![],
+            }],
+        };
+        assert!(matches!(
+            graph.validate_dag(),
+            Err(OrchestratorError::InvalidGraph(_))
+        ));
+    }
 
     #[test]
     fn loop_gate_should_stop_is_pure_over_output() {
