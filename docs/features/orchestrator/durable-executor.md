@@ -141,6 +141,25 @@ Feature: Durable executor (spine)
     And the run completes with the node's output model recorded as "llama3.1-local"
 ```
 
+## Gateway error → pause vs fail (§11.2)
+
+When `Gateway::execute` returns a terminal error, `classify_gateway_error` decides:
+a **fully-gated chain with a timed re-eligibility** (`GatewayError::AllGated
+{ resume_after: Some(t) }` — every candidate health-locked/cooling/breaker-open/
+over-budget, with a min wall-clock retry) becomes a **durable pause**: journal
+`RunPaused { reason, resume_after: Some(t) }`, set `RunOutcome.paused`, suppress
+`RunCompleted` — the run stays resumable. A gated call journals **no**
+`EffectRecorded`, so a **resume simply re-attempts** the node (the quota window may
+have reset → it succeeds and records; still gated → it pauses again) — no memo, no
+determinism fence. `AllGated { resume_after: None }` (all gates terminal) and every
+other gateway error **fail-fast** (the `Display` carries the human-action hint:
+top-up credits / rotate credential / raise budget) — never a pause-forever. Wired
+at the top-level `ModelCall` node and every agent turn (`dispatch_model_turn`);
+agent children of a `Map`/`Loop` pause the whole Map/Loop via `MapChildPaused`.
+**Deferred:** ModelCall *bodies* inside `Map`/`Consolidate`/`Loop` pausing on a
+gate (they fail); the durable scheduler that re-arms at `resume_after` (SP-DATA);
+`RateLimit`→journaled-`Timer` backoff.
+
 ## Deferred
 
 Held off to later SP-1 slices (and beyond); slice 1 ships none of these:
@@ -157,7 +176,11 @@ Held off to later SP-1 slices (and beyond); slice 1 ships none of these:
     (`Search`/`RecordNote`) and a sink-backed test reconciler only.
   - **SP-6** — `AwaitSignal`/`HumanGate` + signal delivery + pause-expiry; slice 4
     emits a durable `RunPaused` resolved out-of-band, with no re-arm mechanism yet.
-- **Later** — planner / loops, streaming, hooks (best-effort progress), and a
+- ~~`Loop` (loops of graphs)~~ **Done** (deterministic gate + `max_iters`; see
+  [execution-graph](execution-graph.md)). ~~`OrchestratorHooks`~~ **Done** (see
+  [hooks](hooks.md)). ~~quota→pause~~ **Done** (see [gateway-error mapping](#gateway-error--pause-vs-fail-112)).
+  This **completes the SP-1 walking skeleton**.
+- **Later** — planner, runtime `PlanDelta`/`Subgraph`/`Branch`, streaming, and a
   `PostgresJournal`. There is **no persistence beyond the in-memory journal** yet;
   `ExecutionJournal` is the seam a durable store implements later. The two-phase
   `EffectIntent` fsync is in-memory here (**SP-DATA**).
