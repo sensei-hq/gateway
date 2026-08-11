@@ -5,7 +5,7 @@ use crate::test_support::{
     scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
-    Aggregation, ChildStatus, Dep, Graph, JournalError, MapBody, Node, NodeId, NodeKind,
+    Aggregation, ChildStatus, Dep, Graph, JournalError, LoopGate, MapBody, Node, NodeId, NodeKind,
 };
 use orchestrator_store::InMemoryJournal;
 
@@ -3193,5 +3193,107 @@ async fn a_soft_dependency_is_not_read_so_a_flip_across_resume_is_safe() {
         o2.failed.is_none() && o2.paused.is_none(),
         "resume completes: {:?}",
         o2.failed
+    );
+}
+
+// ================================ SP-1 Loop node ================================
+
+/// Acceptance §9.1 — stop on gate: a Loop whose body emits the marker at
+/// iteration 1 completes with iterations=2, converged=true, and ran the body twice.
+#[tokio::test]
+async fn loop_stops_when_the_gate_fires() {
+    let (gw, calls) = scripted_gateway(vec![
+        final_response("keep going"),
+        final_response("we are DONE"),
+    ])
+    .await;
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("L".into()),
+            kind: NodeKind::Loop {
+                body: MapBody::ModelCall { chain: "c".into() },
+                input: serde_json::json!({ "prompt": "start" }),
+                gate: LoopGate::TextContains("DONE".into()),
+                max_iters: 5,
+            },
+            deps: vec![],
+        }],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    let l = &out.outputs[&NodeId("L".into())];
+    assert_eq!(l["iterations"], 2, "stopped at the 2nd iteration");
+    assert_eq!(l["converged"], true);
+    assert_eq!(l["output"]["text"], "we are DONE");
+    assert_eq!(calls.lock().unwrap().len(), 2, "body ran exactly twice");
+}
+
+/// Acceptance §9.2 — cap without stop: the gate never fires, so the Loop runs
+/// exactly max_iters and completes best-effort with converged=false (NOT failed).
+#[tokio::test]
+async fn loop_caps_at_max_iters_and_completes_unconverged() {
+    let (gw, calls) = recording_gateway().await; // always "canned-response", never "STOP"
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("L".into()),
+            kind: NodeKind::Loop {
+                body: MapBody::ModelCall { chain: "c".into() },
+                input: serde_json::json!({ "prompt": "go" }),
+                gate: LoopGate::TextContains("STOP".into()),
+                max_iters: 3,
+            },
+            deps: vec![],
+        }],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        out.failed.is_none(),
+        "cap is best-effort, not a failure: {:?}",
+        out.failed
+    );
+    let l = &out.outputs[&NodeId("L".into())];
+    assert_eq!(l["iterations"], 3);
+    assert_eq!(l["converged"], false, "hit the cap without converging");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "ran exactly max_iters times"
+    );
+}
+
+/// Acceptance §9.4 — a body failure fails the whole Loop (no silent finalize).
+#[tokio::test]
+async fn loop_body_failure_fails_the_loop() {
+    let (gw, _c) = content_gated_gateway().await; // fails any prompt containing FAIL
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("L".into()),
+            kind: NodeKind::Loop {
+                body: MapBody::ModelCall { chain: "c".into() },
+                input: serde_json::json!({ "prompt": "FAIL" }),
+                gate: LoopGate::TextContains("never".into()),
+                max_iters: 3,
+            },
+            deps: vec![],
+        }],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run yields an outcome");
+    let (node, msg) = out
+        .failed
+        .as_ref()
+        .expect("the loop fails on a body failure");
+    assert_eq!(node.0, "L");
+    assert!(
+        msg.contains("iteration 0"),
+        "names the failing iteration: {msg}"
     );
 }

@@ -362,6 +362,110 @@ impl Executor {
         }
     }
 
+    /// Run a `Loop` node (§10.3): iterate `body` at `"{loop}/{i}"`, threading each
+    /// iteration's output into the next as input (refine), until `gate` says Stop
+    /// or `max_iters` is reached. Cap-without-Stop completes best-effort
+    /// (`converged: false`), never a bare fail; a body failure fails the Loop; an
+    /// Agent-body pause pauses the Loop. Resume replays completed iterations
+    /// (memo-hit, no re-spend) and recomputes the (pure) gate, so it stops at the
+    /// same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are fold-guarded
+    /// (like `run_map`) so a replayed completed Loop does not re-journal them.
+    pub(super) async fn run_loop(
+        &self,
+        run: RunId,
+        loop_node: &orchestrator_core::Node,
+        fold: &Fold,
+    ) -> Result<NodeExec, OrchestratorError> {
+        let NodeKind::Loop {
+            body,
+            input,
+            gate,
+            max_iters,
+        } = &loop_node.kind
+        else {
+            unreachable!("run_loop is only dispatched for a Loop node");
+        };
+        if !fold.started.contains(&loop_node.id) {
+            self.append(
+                run,
+                JournalEvent::NodeStarted {
+                    node: loop_node.id.clone(),
+                },
+            )
+            .await?;
+        }
+
+        let mut current_input = input.clone();
+        let mut last_output = serde_json::Value::Null;
+        let mut converged = false;
+        let mut ran = 0usize;
+        for i in 0..*max_iters {
+            let path = format!("{}/{}", loop_node.id.0, i);
+            let result = match body {
+                MapBody::ModelCall { chain } => {
+                    self.run_map_child_modelcall(run, &path, chain, &current_input, fold)
+                        .await?
+                }
+                MapBody::Agent(agent_ref) => match self
+                    .drive_agent(
+                        run,
+                        &NodeId(path.clone()),
+                        agent_ref,
+                        &current_input,
+                        &[],
+                        fold,
+                    )
+                    .await?
+                {
+                    AgentStep::Completed(o) => Ok(o),
+                    AgentStep::Failed(m) => Err(m),
+                    AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
+                },
+            };
+            let output = match result {
+                Ok(o) => o,
+                Err(message) => {
+                    let msg = format!("loop {:?} failed at iteration {i}: {message}", loop_node.id);
+                    self.append(
+                        run,
+                        JournalEvent::NodeFailed {
+                            node: loop_node.id.clone(),
+                            error: msg.clone(),
+                        },
+                    )
+                    .await?;
+                    return Ok(NodeExec::Failed {
+                        message: msg,
+                        output: None,
+                    });
+                }
+            };
+            ran = i + 1;
+            last_output = output.clone();
+            if gate.should_stop(&output) {
+                converged = true;
+                break;
+            }
+            current_input = output; // refine: feed this iteration's output forward
+        }
+
+        let out = serde_json::json!({
+            "iterations": ran,
+            "converged": converged,
+            "output": last_output,
+        });
+        if !fold.completed.contains(&loop_node.id) {
+            self.append(
+                run,
+                JournalEvent::NodeCompleted {
+                    node: loop_node.id.clone(),
+                },
+            )
+            .await?;
+        }
+        Ok(NodeExec::Completed(out))
+    }
+
     /// Run one `MapBody::ModelCall` child at structural path `path` — a single
     /// Pure effect `effect_id(path, 0, 0)` with `item` as the request payload.
     /// The outer `Result` is fatal (journal write / determinism) and aborts the

@@ -18,7 +18,7 @@ pub use content::{ContentRef, ContentStore, Digest, EffectOutput, digest_of};
 pub use context::{ContextKey, ContextRef, ContextStore, Scope};
 pub use effect::{EffectClass, EffectId, effect_id};
 pub use error::{JournalError, OrchestratorError};
-pub use graph::{Aggregation, Dep, EdgeKind, Graph, MapBody, Node, NodeKind};
+pub use graph::{Aggregation, Dep, EdgeKind, Graph, LoopGate, MapBody, Node, NodeKind};
 pub use ids::{NodeId, RunId, Seq};
 pub use journal::{
     ChildStatus, CompactChild, ExecutionJournal, JournalEvent, ObservationMeta, Snapshot,
