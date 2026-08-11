@@ -19,8 +19,8 @@ mod durability;
 mod fanout;
 mod support;
 use support::{
-    build_request, consolidate_compaction_target, fold_journal, input_hash, project_agent_outputs,
-    ready_nodes,
+    GatewayDisposition, build_request, classify_gateway_error, consolidate_compaction_target,
+    fold_journal, input_hash, project_agent_outputs, ready_nodes,
 };
 
 /// The deterministic executor over a durable journal, wired to the gateway.
@@ -555,21 +555,39 @@ impl Executor {
                         .await?;
                         Ok(NodeExec::Completed(output))
                     }
-                    Err(error) => {
-                        let message = error.to_string();
-                        self.append(
-                            run,
-                            JournalEvent::NodeFailed {
-                                node: node.id.clone(),
-                                error: message.clone(),
-                            },
-                        )
-                        .await?;
-                        Ok(NodeExec::Failed {
-                            message,
-                            output: None,
-                        })
-                    }
+                    Err(error) => match classify_gateway_error(&error) {
+                        // A fully-gated chain with a timed re-eligibility (§11.2):
+                        // durable pause (resumable), never a bare fail. On resume
+                        // the node re-attempts (no `EffectRecorded` was journaled).
+                        GatewayDisposition::Pause {
+                            resume_after,
+                            reason,
+                        } => {
+                            self.append(
+                                run,
+                                JournalEvent::RunPaused {
+                                    reason: reason.clone(),
+                                    resume_after: Some(resume_after),
+                                },
+                            )
+                            .await?;
+                            Ok(NodeExec::Paused { reason })
+                        }
+                        GatewayDisposition::Fail(message) => {
+                            self.append(
+                                run,
+                                JournalEvent::NodeFailed {
+                                    node: node.id.clone(),
+                                    error: message.clone(),
+                                },
+                            )
+                            .await?;
+                            Ok(NodeExec::Failed {
+                                message,
+                                output: None,
+                            })
+                        }
+                    },
                 }
             }
             NodeKind::Agent { agent, input } => {

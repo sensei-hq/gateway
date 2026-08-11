@@ -3898,3 +3898,58 @@ async fn warmup_gateway_yields_allgated_with_resume_after() {
         "second execute is AllGated with a timed resume_after: {second:?}"
     );
 }
+
+/// Acceptance §6.3 — a top-level ModelCall node whose chain is all-gated (timed)
+/// PAUSES: RunOutcome.paused set, RunPaused{resume_after:Some} journaled, no
+/// RunCompleted, and on_run_paused fires.
+#[tokio::test]
+async fn modelcall_node_pauses_on_a_timed_gate() {
+    use crate::test_support::timeout_gateway;
+    let hooks = RecordingHooks::default();
+    let gw = timeout_gateway().await;
+    let req = support::build_request("c", &serde_json::json!({ "prompt": "warm" }));
+    let _ = gw.execute(&req).await; // warm-up cools router "r"
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", "go"),
+            deps: vec![],
+        }],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_hooks(Arc::new(hooks.clone()))
+        .run(run, &graph)
+        .await
+        .expect("run yields an outcome");
+    let pause = out.paused.expect("the all-gated node pauses");
+    assert_eq!(pause.node, NodeId("n1".into()));
+    assert!(
+        out.failed.is_none(),
+        "a timed gate pauses, does not fail: {:?}",
+        out.failed
+    );
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        events.iter().any(|(_, e)| matches!(
+            e,
+            JournalEvent::RunPaused {
+                resume_after: Some(_),
+                ..
+            }
+        )),
+        "RunPaused with a timed resume_after is journaled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a paused run does not complete"
+    );
+    assert!(
+        hooks.log().iter().any(|l| l.starts_with("run_paused(")),
+        "on_run_paused fired: {:?}",
+        hooks.log()
+    );
+}
