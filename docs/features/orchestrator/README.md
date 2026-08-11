@@ -17,7 +17,7 @@ re-spending tokens and with no silent failures. Full design in
 | Feature | Status | Source | Notes |
 |---|---|---|---|
 | [Durable executor (spine)](durable-executor.md) | Partial (SP-1 slice 1) | `crates/orchestrator*` | linear `ModelCall` (Pure) graph · effect-id + input-hash memoization · resume/fold · version fence · real reference-chain e2e |
-| [Execution graph](execution-graph.md) | Planned (Phase 3 · SP-1/3) | `orchestrator` (new crate) | nodes · typed edges · aggregation · runtime `PlanDelta` |
+| [Execution graph](execution-graph.md) | Partial (Phase 3 · SP-1/3) | `crates/orchestrator*` | `ModelCall`/`Agent`/`Map`/`Consolidate`/`Loop` · typed edges + `validate_dag` · ready-node scheduler · aggregation · gated iteration (deterministic gate, `converged` finalize, resume-replay) · `Subgraph`/`Branch`/`PlanDelta` deferred |
 | [Durable journal](durable-journal.md) | Planned (Phase 3 · SP-1) | `orchestrator-core` | effect classes · two-phase + in-doubt · replay/resume |
 | [Agents · skills · tools](agents-skills-tools.md) | Partial (Phase 3 · SP-1 slice 2) | `orchestrator` | in-memory registry (frontmatter subset) · prompt assembly + per-turn window budget · Pure-only ReAct loop · resume-without-re-spend inside the loop |
 | [Shared context](shared-context.md) | Partial (Phase 3 · SP-1) | `crates/orchestrator*` | scoped blackboard wired · node outputs publish to Run · agents read dependency context (dependency-scoped, deterministic) · refs-not-blobs · resume-rehydrated |
