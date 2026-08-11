@@ -12,7 +12,7 @@ use orchestrator_core::{ExecutionJournal, JournalError, JournalEvent, RunId, Seq
 
 mod config_source;
 mod stores;
-pub use config_source::InMemoryConfigSource;
+pub use config_source::{FilesystemConfigSource, InMemoryConfigSource};
 pub use stores::{InMemoryContentStore, InMemoryContextStore};
 
 /// The shared, `Seq`-stamped event log keyed by run, guarded for concurrent
