@@ -5,12 +5,29 @@ module: orchestrator
 status: partial
 phase: 3
 spec: SP-1, SP-2
-source: orchestrator (new)
+source: crates/orchestrator*
 ---
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2).** Design §6/§9.
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1).** Design §6/§9;
+> config-source design
+> [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
+> **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
+> backend-agnostic **`ConfigSource`** seam (`load() -> RegistryConfig` of domain
+> objects — no serialization format in the contract). `Registry::from_config`
+> assembles + **rejects duplicate names** + `validate`s (the single, shared
+> assembly point). Backends: **`FilesystemConfigSource`** (`<root>/agents/*.md` +
+> `<root>/skills/*.md` via `from_frontmatter`, `<root>/tools/*.json` via serde —
+> ALL md/JSON parsing isolated here; missing subdir ⇒ empty, missing root / bad
+> file ⇒ loud `RegistryLoad`) and **`InMemoryConfigSource`**. `ConfigSource` is
+> the **extension seam** (`PostgresConfigSource`/`ConvexConfigSource`/`HttpConfigSource`
+> impl it later, reusing `from_config` unchanged); `Registry` is the uniform
+> assembled result. The in-memory `.with_*` builders + `from_frontmatter` stay.
+> Tool **executors** still bind via `ToolRegistry` (a disk `ToolSpec` with no code
+> executor loads/validates but is a loud `UnknownTool` at execution — MCP bridge
+> deferred). **Deferred (later SP-2 slices):** role→chain resolution, tool
+> permission declarations, activation policy (Q4), hot-reload.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
