@@ -4060,3 +4060,42 @@ async fn a_paused_gated_run_reattempts_and_completes_on_resume() {
     );
     assert_eq!(o2.outputs[&NodeId("n1".into())]["text"], "canned-response");
 }
+
+// ============================= SP-2 config-source =============================
+
+/// SP-2 e2e — a registry loaded from a filesystem ConfigSource drives an agent
+/// node end-to-end (disk config → Registry::from_config → with_registry → run).
+#[tokio::test]
+async fn agent_runs_from_a_filesystem_loaded_registry() {
+    use orchestrator_core::{ConfigSource, Registry};
+    use orchestrator_store::FilesystemConfigSource;
+    // A temp config dir with one no-tool agent "a" on chain "c".
+    let root = std::env::temp_dir().join(format!("sp2-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("agents")).unwrap();
+    std::fs::write(
+        root.join("agents").join("a.md"),
+        "---\nname: a\narea: research\nkind: reasoning\nchain: c\n---\nBe helpful.\n",
+    )
+    .unwrap();
+    let registry = Registry::from_config(
+        FilesystemConfigSource::new(&root)
+            .load()
+            .await
+            .expect("load"),
+    )
+    .expect("validate");
+
+    let (gw, _c) = recording_gateway().await;
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "hi")],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(Arc::new(registry))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    assert_eq!(out.outputs[&NodeId("n1".into())]["text"], "canned-response");
+    std::fs::remove_dir_all(&root).ok();
+}
