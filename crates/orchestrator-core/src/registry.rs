@@ -413,6 +413,39 @@ mod tests {
             Registry::from_config(dup),
             Err(OrchestratorError::RegistryLoad(m)) if m.contains("duplicate") && m.contains("researcher")
         ));
+
+        // Duplicate SKILL name → loud (each collection is checked independently).
+        let dup_skill = RegistryConfig {
+            agents: vec![],
+            skills: vec![
+                SkillDef {
+                    name: "s".into(),
+                    description: None,
+                    body: "b".into(),
+                },
+                SkillDef {
+                    name: "s".into(),
+                    description: None,
+                    body: "b2".into(),
+                },
+            ],
+            tools: vec![],
+        };
+        assert!(matches!(
+            Registry::from_config(dup_skill),
+            Err(OrchestratorError::RegistryLoad(m)) if m.contains("duplicate skill") && m.contains('s')
+        ));
+
+        // Duplicate TOOL name → loud.
+        let dup_tool = RegistryConfig {
+            agents: vec![],
+            skills: vec![],
+            tools: vec![tool_spec("calc"), tool_spec("calc")],
+        };
+        assert!(matches!(
+            Registry::from_config(dup_tool),
+            Err(OrchestratorError::RegistryLoad(m)) if m.contains("duplicate tool") && m.contains("calc")
+        ));
     }
 
     #[test]
