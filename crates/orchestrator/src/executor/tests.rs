@@ -3724,3 +3724,96 @@ async fn hooks_fire_agent_lifecycle() {
         );
     }
 }
+
+/// Acceptance §9.6 (headline) — hooks do NOT re-fire for the replayed prefix on
+/// resume. Seed n1 ok / n2 failed (no RunCompleted); a spy attached to the RESUME
+/// sees only n2's tail — n1 (replayed from the memo) fires no hook.
+#[tokio::test]
+async fn hooks_do_not_refire_for_the_replayed_prefix_on_resume() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, _n1, _n2) = two_node_graph("a", "b");
+    let (gw1, _c1) = failing_after_gateway(1).await; // n1 ok, n2 fails
+    Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("seed");
+    let hooks = RecordingHooks::default();
+    let (gw2, _c2) = recording_gateway().await;
+    Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_hooks(Arc::new(hooks.clone()))
+        .start(run, &graph)
+        .await
+        .expect("resume");
+    let log = hooks.log();
+    assert!(
+        !log.iter().any(|l| l.contains("(n1)")),
+        "n1 (replayed) fires no hook on resume: {log:?}"
+    );
+    assert!(
+        log.contains(&"node_started(n2)".to_string())
+            && log.contains(&"node_completed(n2)".to_string()),
+        "n2's tail fires: {log:?}"
+    );
+    assert!(log.contains(&"run_completed".to_string()));
+}
+
+/// Acceptance §9.4 — an in-doubt Mutation resume that pauses fires on_run_paused
+/// and NOT on_run_completed.
+#[tokio::test]
+async fn hooks_fire_run_paused_on_an_in_doubt_pause() {
+    let (journal, run) = seed_in_doubt_note().await;
+    let hooks = RecordingHooks::default();
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink))),
+        ))
+        .with_reconcilers(Arc::new(reconcilers))
+        .with_hooks(Arc::new(hooks.clone()))
+        .start(run, &graph_note_it())
+        .await
+        .expect("resume yields an outcome");
+    assert!(out.paused.is_some(), "the run paused");
+    let log = hooks.log();
+    assert!(
+        log.iter().any(|l| l.starts_with("run_paused(")),
+        "on_run_paused fired: {log:?}"
+    );
+    assert!(
+        !log.contains(&"run_completed".to_string()),
+        "a paused run does not complete: {log:?}"
+    );
+}
+
+/// The single-`note` agent graph the in-doubt seed/resume share.
+fn graph_note_it() -> Graph {
+    Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    }
+}
+
+/// Acceptance §9.5 — a completed node's blackboard publish fires on_context_write.
+#[tokio::test]
+async fn hooks_fire_on_context_write() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let hooks = RecordingHooks::default();
+    let (gw, _c) = recording_gateway().await;
+    let (graph, _n1, _n2) = two_node_graph("a", "b");
+    Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .with_hooks(Arc::new(hooks.clone()))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    let log = hooks.log();
+    assert!(log.contains(&"context_write(n1)".to_string()), "{log:?}");
+    assert!(log.contains(&"context_write(n2)".to_string()), "{log:?}");
+}
