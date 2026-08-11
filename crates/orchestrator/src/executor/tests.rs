@@ -3297,3 +3297,41 @@ async fn loop_body_failure_fails_the_loop() {
         "names the failing iteration: {msg}"
     );
 }
+
+/// Acceptance §9.3 — refine thread: iteration i>0 receives i-1's output as its
+/// input. With an Agent body on the content-gated chain (echoes `ok:{input}`),
+/// iteration 1's output text embeds iteration 0's output ("ok:start").
+#[tokio::test]
+async fn loop_threads_each_iterations_output_into_the_next() {
+    let (gw, _c) = content_gated_gateway().await; // returns "ok:{first user message}"
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("L".into()),
+            kind: NodeKind::Loop {
+                body: MapBody::Agent(AgentRef("a".into())),
+                input: serde_json::json!("start"),
+                gate: LoopGate::TextContains("NEVER".into()),
+                max_iters: 2,
+            },
+            deps: vec![],
+        }],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    let l = &out.outputs[&NodeId("L".into())];
+    assert_eq!(l["iterations"], 2);
+    let final_text = l["output"]["text"].as_str().expect("final text");
+    // Non-vacuous: iteration 1's input was iteration 0's *output object* (not the
+    // original "start"), so the final text embeds the serialized prior output —
+    // `ok:{"model":…,"text":"ok:start"}`. Without threading it would be exactly
+    // "ok:start" (no nested `"text":"ok:start"`), so this distinguishes the two.
+    assert!(
+        final_text.contains(r#""text":"ok:start""#),
+        "iteration 1's output embeds iteration 0's full output object (refine thread): {final_text}"
+    );
+}
