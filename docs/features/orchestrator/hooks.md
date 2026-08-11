@@ -62,3 +62,12 @@ Feature: Progress hooks
 ## Notes
 
 - Anything execution depends on (e.g. a HITL notification) is a durable outbox effect, not a best-effort hook.
+- **Ordering:** for an `Agent` node, `on_agent_started` fires at the start of the
+  ReAct loop, *before* the node's `on_node_started` (which fires when the first
+  live turn journals `NodeStarted`). A UI keying agent detail under a node row
+  must tolerate the agent event arriving first.
+- **`on_node_started` is at-least-once** for a node that crashed mid-execution: a
+  `ModelCall` node that journaled `NodeStarted` but not its `EffectRecorded`
+  genuinely re-executes on resume and re-fires `on_node_started`. Replay-
+  suppression covers the *completed* prefix (a fully-recorded node/turn), not a
+  node that never finished. Consumers should treat node-start as at-least-once.

@@ -3817,3 +3817,60 @@ async fn hooks_fire_on_context_write() {
     assert!(log.contains(&"context_write(n1)".to_string()), "{log:?}");
     assert!(log.contains(&"context_write(n2)".to_string()), "{log:?}");
 }
+
+/// Acceptance §9.6 (agent path, review Finding 1) — agent hooks do NOT re-fire for
+/// a replayed completed prefix on resume. Seed an agent whose turn 0 (a calc tool
+/// call) completes but turn 1 fails; resume with a spy: turn 0's memoized
+/// model+tool replay fires NO agent_started/agent_turn(0)/agent_tool_call/
+/// node_started, only the live tail (agent_turn(1) + node_completed).
+#[tokio::test]
+async fn agent_hooks_do_not_refire_for_a_replayed_prefix_on_resume() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "add 2 and 3")],
+    };
+    // Seed: turn 0 (calc) records; turn 1 script-exhausted → fails → no RunCompleted.
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "calc",
+        "{\"op\":\"add\",\"a\":2,\"b\":3}",
+    )])
+    .await;
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .run(run, &graph)
+        .await
+        .expect("seed");
+    assert!(o1.failed.is_some(), "seed fails at turn 1");
+
+    // Resume with a spy: only the live tail fires.
+    let hooks = RecordingHooks::default();
+    let (gw2, _c2) = scripted_gateway(vec![final_response("the answer is 5")]).await;
+    Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_hooks(Arc::new(hooks.clone()))
+        .start(run, &graph)
+        .await
+        .expect("resume");
+    let log = hooks.log();
+    for suppressed in [
+        "agent_started(n1,a,c)",
+        "agent_turn(n1,0)",
+        "agent_tool_call(n1,calc)",
+        "node_started(n1)",
+    ] {
+        assert!(
+            !log.contains(&suppressed.to_string()),
+            "replayed prefix must not re-fire {suppressed}: {log:?}"
+        );
+    }
+    // The live tail (turn 1) + completion DO fire.
+    assert!(
+        log.contains(&"agent_turn(n1,1)".to_string()),
+        "live tail turn fires: {log:?}"
+    );
+    assert!(log.contains(&"node_completed(n1)".to_string()), "{log:?}");
+}
