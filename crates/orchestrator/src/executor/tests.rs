@@ -3977,3 +3977,61 @@ async fn agent_node_pauses_on_a_timed_gate() {
     );
     assert!(out.failed.is_none());
 }
+
+/// Acceptance §6.6 — a run paused on a timed gate RE-ATTEMPTS on resume: resuming
+/// with a fresh, un-gated gateway (same journal) re-runs the node, which now
+/// succeeds, and the run completes — no DeterminismViolation (the gated call
+/// journaled no EffectRecorded, so there is nothing to replay/fence).
+#[tokio::test]
+async fn a_paused_gated_run_reattempts_and_completes_on_resume() {
+    use crate::test_support::timeout_gateway;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", "go"),
+            deps: vec![],
+        }],
+    };
+    // Pause: warm-up cools the sole router → the node is all-gated → paused.
+    let gw = timeout_gateway().await;
+    let req = support::build_request("c", &serde_json::json!({ "prompt": "warm" }));
+    let _ = gw.execute(&req).await;
+    let o1 = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("first run");
+    assert!(o1.paused.is_some(), "first run pauses");
+    assert!(
+        !journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "paused run is not complete"
+    );
+    // Resume on a fresh, un-gated gateway → n1 re-attempts, succeeds, completes.
+    let (gw2, _c2) = recording_gateway().await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .start(run, &graph)
+        .await
+        .expect("resume");
+    assert!(
+        o2.failed.is_none() && o2.paused.is_none(),
+        "resume completes: {:?} / {:?}",
+        o2.failed,
+        o2.paused
+    );
+    assert!(
+        journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the resumed run completes"
+    );
+    assert_eq!(o2.outputs[&NodeId("n1".into())]["text"], "canned-response");
+}
