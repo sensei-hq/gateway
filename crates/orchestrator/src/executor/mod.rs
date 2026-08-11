@@ -8,7 +8,7 @@ use gateway::Gateway;
 use orchestrator_core::{
     Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId, EffectOutput,
     ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError,
-    Registry, RunId, Scope, Seq, SystemClock, effect_id,
+    OrchestratorHooks, Registry, RunId, Scope, Seq, SystemClock, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -51,6 +51,8 @@ pub struct Executor {
     /// dependency context from. Optional/injected — no store wired ⇒ every
     /// blackboard step is a no-op (slice-4 behavior byte-identical).
     context: Option<Arc<dyn ContextStore>>,
+    /// Best-effort observability hooks (§15). `None` ⇒ no firing (byte-identical).
+    hooks: Option<Arc<dyn OrchestratorHooks>>,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -135,6 +137,7 @@ impl Executor {
             clock: Arc::new(SystemClock),
             reconcilers: Arc::new(ReconcileRegistry::default()),
             context: None,
+            hooks: None,
         }
     }
 
@@ -203,6 +206,14 @@ impl Executor {
     /// stays byte-identical.
     pub fn with_context_store(mut self, context: Arc<dyn ContextStore>) -> Self {
         self.context = Some(context);
+        self
+    }
+
+    /// Attach best-effort observability hooks (§15): fired at run/node/agent/
+    /// context lifecycle points, they never affect execution or determinism, and
+    /// do not double-count on resume. No hooks wired ⇒ zero firing (byte-identical).
+    pub fn with_hooks(mut self, hooks: Arc<dyn OrchestratorHooks>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -587,10 +598,36 @@ impl Executor {
     /// `OrchestratorError::Journal` (strict — a journal write failure aborts the
     /// run; it is never swallowed). Returns the authoritative `Seq`.
     async fn append(&self, run: RunId, event: JournalEvent) -> Result<Seq, OrchestratorError> {
-        self.journal
+        // Clone for the post-journal hook match ONLY when hooks are wired, so the
+        // no-hooks path stays allocation-free and byte-identical.
+        let hook_event = self.hooks.as_ref().map(|_| event.clone());
+        let seq = self
+            .journal
             .append(run, event)
             .await
-            .map_err(OrchestratorError::Journal)
+            .map_err(OrchestratorError::Journal)?;
+        // Best-effort observability (§15). Fired AFTER a successful journal write
+        // (a failed write surfaces its error and fires nothing). Because these fire
+        // at the append site — which a resumed completed prefix does NOT re-hit
+        // (fold-guarded) — hooks are replay-suppressed for free.
+        if let (Some(h), Some(ev)) = (&self.hooks, &hook_event) {
+            match ev {
+                JournalEvent::RunStarted { .. } => h.on_run_started(run).await,
+                JournalEvent::RunCompleted => h.on_run_completed(run).await,
+                JournalEvent::RunPaused { reason, .. } => h.on_run_paused(run, reason).await,
+                JournalEvent::NodeStarted { node } => h.on_node_started(run, node).await,
+                JournalEvent::NodeCompleted { node } => h.on_node_completed(run, node).await,
+                JournalEvent::NodeFailed { node, error } => {
+                    h.on_node_failed(run, node, error).await
+                }
+                JournalEvent::NodeSkipped { node } => h.on_node_skipped(run, node).await,
+                JournalEvent::ContextWrite { scope, key, .. } => {
+                    h.on_context_write(run, scope, key).await
+                }
+                _ => {}
+            }
+        }
+        Ok(seq)
     }
 
     /// Publish a completed node's output to the blackboard (§8): `put` it under

@@ -14,7 +14,7 @@ use crate::agent::tools::{
     ToolRegistry,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, Registry,
+    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, OrchestratorHooks, Registry,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3534,4 +3534,156 @@ async fn loop_drives_the_real_reference_chain_each_iteration() {
         2,
         "2 iterations each hit the local adapter once"
     );
+}
+
+// ============================= SP-1 OrchestratorHooks ==========================
+
+/// A hooks spy: each fired hook appends a "label(args)" string.
+#[derive(Clone, Default)]
+struct RecordingHooks(Arc<std::sync::Mutex<Vec<String>>>);
+impl RecordingHooks {
+    fn log(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn push(&self, s: String) {
+        self.0.lock().unwrap().push(s);
+    }
+}
+#[async_trait::async_trait]
+impl OrchestratorHooks for RecordingHooks {
+    async fn on_run_started(&self, _r: RunId) {
+        self.push("run_started".into());
+    }
+    async fn on_run_completed(&self, _r: RunId) {
+        self.push("run_completed".into());
+    }
+    async fn on_run_paused(&self, _r: RunId, reason: &str) {
+        self.push(format!("run_paused({reason})"));
+    }
+    async fn on_node_started(&self, _r: RunId, n: &NodeId) {
+        self.push(format!("node_started({})", n.0));
+    }
+    async fn on_node_completed(&self, _r: RunId, n: &NodeId) {
+        self.push(format!("node_completed({})", n.0));
+    }
+    async fn on_node_failed(&self, _r: RunId, n: &NodeId, _e: &str) {
+        self.push(format!("node_failed({})", n.0));
+    }
+    async fn on_node_skipped(&self, _r: RunId, n: &NodeId) {
+        self.push(format!("node_skipped({})", n.0));
+    }
+    async fn on_agent_started(&self, _r: RunId, n: &NodeId, agent: &str, chain: &str) {
+        self.push(format!("agent_started({},{agent},{chain})", n.0));
+    }
+    async fn on_agent_turn(&self, _r: RunId, n: &NodeId, turn: usize) {
+        self.push(format!("agent_turn({},{turn})", n.0));
+    }
+    async fn on_agent_tool_call(&self, _r: RunId, n: &NodeId, tool: &str) {
+        self.push(format!("agent_tool_call({},{tool})", n.0));
+    }
+    async fn on_context_write(
+        &self,
+        _r: RunId,
+        _s: &orchestrator_core::Scope,
+        k: &orchestrator_core::ContextKey,
+    ) {
+        self.push(format!("context_write({})", k.0));
+    }
+}
+
+/// Acceptance §9.1 — run + node lifecycle fires in order.
+#[tokio::test]
+async fn hooks_fire_run_and_node_lifecycle_in_order() {
+    let hooks = RecordingHooks::default();
+    let (gw, _c) = recording_gateway().await;
+    let (graph, _n1, _n2) = two_node_graph("a", "b");
+    Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_hooks(Arc::new(hooks.clone()))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert_eq!(
+        hooks.log(),
+        vec![
+            "run_started",
+            "node_started(n1)",
+            "node_completed(n1)",
+            "node_started(n2)",
+            "node_completed(n2)",
+            "run_completed",
+        ]
+    );
+}
+
+/// Acceptance §9.3 — a failed node fires on_node_failed; a hard-dependent fires
+/// on_node_skipped; a failed run does not fire run_completed.
+#[tokio::test]
+async fn hooks_fire_failure_and_cascade_skip() {
+    let hooks = RecordingHooks::default();
+    let (gw, _c) = content_gated_gateway().await;
+    let mc = |p: &str| NodeKind::ModelCall {
+        chain: "c".into(),
+        payload: serde_json::json!({ "prompt": p }),
+    };
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("f".into()),
+                kind: mc("FAIL"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("h".into()),
+                kind: mc("ok"),
+                deps: vec![Dep::hard("f")],
+            },
+        ],
+    };
+    Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_hooks(Arc::new(hooks.clone()))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run yields an outcome");
+    let log = hooks.log();
+    assert!(log.contains(&"node_failed(f)".to_string()), "{log:?}");
+    assert!(log.contains(&"node_skipped(h)".to_string()), "{log:?}");
+    assert!(
+        !log.contains(&"run_completed".to_string()),
+        "a failed run does not complete: {log:?}"
+    );
+}
+
+/// Acceptance §9.7 — no hooks wired ⇒ identical journal (hooks change nothing).
+#[tokio::test]
+async fn hooks_unwired_is_byte_identical() {
+    let (graph, _n1, _n2) = two_node_graph("a", "b");
+    let run = RunId(uuid::Uuid::new_v4());
+    let (gw1, _c1) = recording_gateway().await;
+    let j1 = InMemoryJournal::new();
+    Executor::new(Arc::new(gw1), Arc::new(j1.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .unwrap();
+    let (gw2, _c2) = recording_gateway().await;
+    let j2 = InMemoryJournal::new();
+    Executor::new(Arc::new(gw2), Arc::new(j2.clone()), "v1")
+        .with_hooks(Arc::new(RecordingHooks::default()))
+        .run(run, &graph)
+        .await
+        .unwrap();
+    let l1: Vec<String> = j1
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    let l2: Vec<String> = j2
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert_eq!(l1, l2, "hooks change no journaled event");
 }
