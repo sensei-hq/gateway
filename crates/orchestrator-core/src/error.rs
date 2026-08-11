@@ -68,4 +68,6 @@ pub enum OrchestratorError {
     ContextKeyCollision { scope: String, key: String },
     #[error("content-store digest miss: {0} — content is not addressable")]
     ContentDigestMiss(String),
+    #[error("registry load error: {0}")]
+    RegistryLoad(String),
 }

@@ -47,6 +47,27 @@ pub struct ToolSpec {
     pub source: Option<String>,
 }
 
+/// The registry's config as domain objects — the backend-agnostic payload a
+/// [`ConfigSource`] yields (no serialization format in the contract, so a DB /
+/// HTTP backend maps its own representation → these directly).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistryConfig {
+    pub agents: Vec<AgentDefinition>,
+    pub skills: Vec<SkillDef>,
+    pub tools: Vec<ToolSpec>,
+}
+
+/// A pluggable source of registry config (SP-2). **This is the extension seam**
+/// future backends implement — a filesystem source now, `PostgresConfigSource` /
+/// `ConvexConfigSource` later — while [`Registry`] itself is the uniform,
+/// backend-agnostic *assembled result* (built + validated by
+/// [`Registry::from_config`]), NOT an extension point.
+#[async_trait::async_trait]
+pub trait ConfigSource: Send + Sync {
+    /// Load the whole registry config (a one-shot snapshot; hot-reload re-calls it).
+    async fn load(&self) -> Result<RegistryConfig, OrchestratorError>;
+}
+
 /// In-memory registry of agents/skills/tool-specs, built by a demo/preset
 /// builder or from parsed frontmatter. Pure config: no I/O, no persistence.
 #[derive(Debug, Clone, Default)]
@@ -77,6 +98,44 @@ impl Registry {
     }
     pub fn tool(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.get(name)
+    }
+
+    /// Assemble + validate a `Registry` from already-parsed [`RegistryConfig`].
+    /// Rejects a duplicate agent/skill/tool `name` loudly — `with_*` alone would
+    /// silently last-wins, and `validate` can't see dupes once the HashMap has
+    /// collapsed them — then runs the dangling-ref [`validate`](Self::validate).
+    /// The single, format-agnostic assembly point every `ConfigSource` reuses.
+    pub fn from_config(cfg: RegistryConfig) -> Result<Registry, OrchestratorError> {
+        let mut reg = Registry::default();
+        for a in cfg.agents {
+            if reg.agent(&a.name).is_some() {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "duplicate agent: {}",
+                    a.name
+                )));
+            }
+            reg = reg.with_agent(a);
+        }
+        for s in cfg.skills {
+            if reg.skill(&s.name).is_some() {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "duplicate skill: {}",
+                    s.name
+                )));
+            }
+            reg = reg.with_skill(s);
+        }
+        for t in cfg.tools {
+            if reg.tool(&t.name).is_some() {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "duplicate tool: {}",
+                    t.name
+                )));
+            }
+            reg = reg.with_tool(t);
+        }
+        reg.validate()?;
+        Ok(reg)
     }
 
     /// Fail loud if any agent references a skill/tool the registry doesn't hold.
@@ -311,6 +370,49 @@ mod tests {
             ttl_secs: None,
             source: None,
         }
+    }
+
+    #[test]
+    fn from_config_assembles_validates_and_rejects_duplicates() {
+        let agent = AgentDefinition::from_frontmatter(AGENT_MD).unwrap(); // researcher, tools:[calc], skills:[concise]
+        let cfg = RegistryConfig {
+            agents: vec![agent.clone()],
+            skills: vec![SkillDef {
+                name: "concise".into(),
+                description: None,
+                body: "b".into(),
+            }],
+            tools: vec![tool_spec("calc")],
+        };
+        let reg = Registry::from_config(cfg).expect("assembles + validates");
+        assert!(reg.agent("researcher").is_some() && reg.tool("calc").is_some());
+
+        // Dangling ref → validate error.
+        let dangling = RegistryConfig {
+            agents: vec![agent.clone()],
+            skills: vec![],
+            tools: vec![],
+        };
+        assert!(matches!(
+            Registry::from_config(dangling),
+            Err(OrchestratorError::UnknownToolRef { .. })
+                | Err(OrchestratorError::UnknownSkillRef { .. })
+        ));
+
+        // Duplicate name → loud RegistryLoad (never a silent last-wins).
+        let dup = RegistryConfig {
+            agents: vec![agent.clone(), agent],
+            skills: vec![SkillDef {
+                name: "concise".into(),
+                description: None,
+                body: "b".into(),
+            }],
+            tools: vec![tool_spec("calc")],
+        };
+        assert!(matches!(
+            Registry::from_config(dup),
+            Err(OrchestratorError::RegistryLoad(m)) if m.contains("duplicate") && m.contains("researcher")
+        ));
     }
 
     #[test]
