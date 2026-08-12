@@ -27,6 +27,6 @@ pub use journal::{
 };
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use registry::{
-    AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions, Registry,
-    RegistryConfig, ResourceCaps, SkillDef, ToolSpec,
+    Activation, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions,
+    Registry, RegistryConfig, ResourceCaps, SkillDef, ToolSpec,
 };
