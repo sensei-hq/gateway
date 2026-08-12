@@ -407,12 +407,12 @@ impl Executor {
             if ready.is_empty() {
                 break;
             }
-            for (index, node) in ready {
+            for node in ready {
                 // The immutable borrow of `state.outcome.outputs` (a Consolidate
                 // reads its Map's result from it) ends when the future resolves,
                 // before `apply_node_result` mutates `state`.
                 let result = self
-                    .run_node(run, index, node, fold, &state.outcome.outputs)
+                    .run_node(run, node, fold, &state.outcome.outputs)
                     .await?;
                 self.apply_node_result(run, graph, node, result, fold, &mut state)
                     .await?;
@@ -566,7 +566,6 @@ impl Executor {
     async fn run_node(
         &self,
         run: RunId,
-        _index: usize,
         node: &orchestrator_core::Node,
         fold: &Fold,
         prior_outputs: &HashMap<NodeId, serde_json::Value>,
