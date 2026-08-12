@@ -302,18 +302,16 @@ impl Registry {
                 }
             }
             for tool in &agent.tools {
-                let spec = match self.tools.get(tool) {
-                    Some(s) => s,
-                    None => {
-                        return Err(OrchestratorError::UnknownToolRef {
-                            agent: agent.name.clone(),
-                            tool: tool.clone(),
-                        });
-                    }
+                let Some(spec) = self.tools.get(tool) else {
+                    return Err(OrchestratorError::UnknownToolRef {
+                        agent: agent.name.clone(),
+                        tool: tool.clone(),
+                    });
                 };
                 // grant⊇need: a missing grant is treated as the (deny/empty) default,
                 // which covers a permissionless tool but not one that declares needs.
-                let grant = agent.grants.get(tool).cloned().unwrap_or_default();
+                let no_grant = Permissions::default();
+                let grant = agent.grants.get(tool).unwrap_or(&no_grant);
                 if !grant.covers(&spec.permissions) {
                     return Err(OrchestratorError::PermissionNotGranted {
                         agent: agent.name.clone(),
@@ -846,6 +844,21 @@ mod tests {
         let ag: AgentDefinition = serde_json::from_str(json).expect("deserializes without chains");
         assert!(ag.chains.is_empty());
         assert_eq!(ag.chain.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn permission_fields_deserialize_to_secure_defaults_when_absent() {
+        // A backend deserializing config without the new permission fields must
+        // default to the empty/deny `Permissions` — never error, never open.
+        let tool: ToolSpec =
+            serde_json::from_str(r#"{"name":"t","input_schema":{},"effect_class":"Pure"}"#)
+                .expect("ToolSpec without permissions");
+        assert_eq!(tool.permissions, Permissions::default());
+        let ag: AgentDefinition = serde_json::from_str(
+            r#"{"name":"a","area":"r","kind":"k","chain":"c","tools":[],"skills":[],"system_prompt":"s"}"#,
+        )
+        .expect("AgentDefinition without grants");
+        assert!(ag.grants.is_empty());
     }
 
     #[test]
