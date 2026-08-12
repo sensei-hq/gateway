@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use orchestrator_core::{
-    AgentDefinition, ChainBinding, ConfigSource, OrchestratorError, RegistryConfig, SkillDef,
-    ToolSpec,
+    AgentDefinition, ChainBinding, ConfigSource, OrchestratorError, Permissions, RegistryConfig,
+    SkillDef, ToolSpec,
 };
 
 /// A `ConfigSource` returning a fixed `RegistryConfig` — for tests + programmatic
@@ -124,6 +124,23 @@ impl ConfigSource for FilesystemConfigSource {
         if let Some(json) = read_optional_file(&self.root, "chains.json")? {
             cfg.chain_bindings = serde_json::from_str::<Vec<ChainBinding>>(&json)
                 .map_err(|e| OrchestratorError::RegistryLoad(format!("parse chains.json: {e}")))?;
+        }
+        if let Some(json) = read_optional_file(&self.root, "grants.json")? {
+            use std::collections::HashMap;
+            let all: HashMap<String, HashMap<String, Permissions>> = serde_json::from_str(&json)
+                .map_err(|e| OrchestratorError::RegistryLoad(format!("parse grants.json: {e}")))?;
+            for (agent_name, grants) in all {
+                let agent = cfg
+                    .agents
+                    .iter_mut()
+                    .find(|a| a.name == agent_name)
+                    .ok_or_else(|| {
+                        OrchestratorError::RegistryLoad(format!(
+                            "grants.json names unknown agent: {agent_name}"
+                        ))
+                    })?;
+                agent.grants = grants;
+            }
         }
         Ok(cfg)
     }
@@ -295,6 +312,65 @@ mod tests {
         let err = FilesystemConfigSource::new(&root).load().await;
         assert!(
             matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("chains.json")),
+            "got {err:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn filesystem_merges_grants_json_into_agents() {
+        use orchestrator_core::NetworkPolicy;
+        let root = temp_config_root();
+        write(
+            &root,
+            "grants.json",
+            r#"{"researcher":{"calc":{"paths":["/workspace"],"network":"Any"}}}"#,
+        );
+        let cfg = FilesystemConfigSource::new(&root)
+            .load()
+            .await
+            .expect("loads");
+        let agent = cfg
+            .agents
+            .iter()
+            .find(|a| a.name == "researcher")
+            .expect("agent");
+        let grant = agent.grants.get("calc").expect("grant for calc");
+        assert_eq!(grant.paths, vec!["/workspace".to_string()]);
+        assert_eq!(grant.network, NetworkPolicy::Any);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_grants_json_leaves_agents_ungranted() {
+        let root = temp_config_root(); // no grants.json
+        let cfg = FilesystemConfigSource::new(&root)
+            .load()
+            .await
+            .expect("loads");
+        assert!(cfg.agents.iter().all(|a| a.grants.is_empty()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_grants_json_is_a_loud_registry_load_error() {
+        let root = temp_config_root();
+        write(&root, "grants.json", "{ not json");
+        let err = FilesystemConfigSource::new(&root).load().await;
+        assert!(
+            matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("grants.json")),
+            "got {err:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn grants_for_an_unknown_agent_is_loud() {
+        let root = temp_config_root();
+        write(&root, "grants.json", r#"{"ghost":{"calc":{}}}"#);
+        let err = FilesystemConfigSource::new(&root).load().await;
+        assert!(
+            matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("ghost")),
             "got {err:?}"
         );
         std::fs::remove_dir_all(&root).ok();
