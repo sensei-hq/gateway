@@ -66,7 +66,8 @@ impl Executor {
             .registry
             .agent(&agent_ref.0)
             .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
-        let (system, tools) = assemble_prompt(&self.registry, agent, context)?;
+        let query = render_input(input);
+        let (system, tools) = assemble_prompt(&self.registry, agent, context, &query)?;
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();
         let min_win = self.gateway.min_context_window(&chain).await;
         let ar = AgentRun {
@@ -79,8 +80,7 @@ impl Executor {
             fold,
         };
 
-        let mut messages: Vec<Message> =
-            vec![Message::text(MessageRole::User, render_input(input))];
+        let mut messages: Vec<Message> = vec![Message::text(MessageRole::User, query.clone())];
         let mut node_started = fold.started.contains(node_id);
 
         // Best-effort hook (§15): fire `on_agent_started` once, gated on the same
