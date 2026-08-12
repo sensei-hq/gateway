@@ -22,6 +22,7 @@ pub struct AgentDefinition {
     /// `(area,kind)` binding table. See [`Registry::resolve_chain`].
     pub chain: Option<String>,
     /// Per-phase chain overrides (phase → chain-id); empty when unused.
+    #[serde(default)]
     pub chains: HashMap<String, String>,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
@@ -128,6 +129,9 @@ impl Registry {
     /// Order: per-phase override → explicit `chain` → `(area,kind)` binding →
     /// loud `UnknownChainRef`. A phase key the agent does not define is NOT an
     /// error — it falls through.
+    /// Per-phase `chains` are overrides *layered on* the base route (the explicit
+    /// `chain` or the `(area,kind)` binding), so [`validate`](Self::validate)
+    /// requires a base route even when per-phase overrides are present.
     pub fn resolve_chain<'a>(
         &'a self,
         agent: &'a AgentDefinition,
@@ -672,6 +676,16 @@ mod tests {
                 .chains
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn agent_definition_deserializes_without_a_chains_field() {
+        // A backend (e.g. a future DB ConfigSource) may serde-deserialize an
+        // AgentDefinition with no `chains` key — it must default to empty, not error.
+        let json = r#"{"name":"a","area":"r","kind":"k","chain":"c","tools":[],"skills":[],"system_prompt":"s"}"#;
+        let ag: AgentDefinition = serde_json::from_str(json).expect("deserializes without chains");
+        assert!(ag.chains.is_empty());
+        assert_eq!(ag.chain.as_deref(), Some("c"));
     }
 
     #[test]
