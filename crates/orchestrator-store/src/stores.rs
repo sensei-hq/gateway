@@ -128,6 +128,15 @@ impl ContextStore for InMemoryContextStore {
         let bytes = self.content.get(&r.content.digest).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
+
+    async fn insert_ref(&self, r: ContextRef) -> Result<(), OrchestratorError> {
+        // Rehydration from a journaled write: plain insert (last wins on an
+        // identical fold replay), no collision check — the journal is the source
+        // of truth. No CAS touch; the blob already lives there.
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.insert((r.scope.clone(), r.key.clone()), r);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +234,36 @@ mod tests {
                 .is_none(),
             "a Node-scoped write does not leak to Run"
         );
+    }
+
+    /// `insert_ref` rehydrates an entry from an already-journaled ref (resume
+    /// fold) without recomputing the CAS, and is idempotent (a fold replays every
+    /// write) — no collision on a repeat, unlike `put`.
+    #[tokio::test]
+    async fn insert_ref_rehydrates_an_entry_without_recomputing_the_cas() {
+        use orchestrator_core::{ContentRef, ContextRef};
+        let content = Arc::new(InMemoryContentStore::new());
+        let bytes = serde_json::to_vec(&serde_json::json!({"v":1})).unwrap();
+        let digest = content.put(&bytes).await.unwrap();
+        let r = ContextRef {
+            key: ContextKey("k".into()),
+            scope: Scope::Run,
+            content: ContentRef {
+                digest,
+                size: bytes.len(),
+                summary: None,
+            },
+            summary: None,
+        };
+        let store = InMemoryContextStore::new(content);
+        store.insert_ref(r.clone()).await.unwrap();
+        let got = store
+            .get(Scope::Run, ContextKey("k".into()))
+            .await
+            .unwrap()
+            .expect("present after insert_ref");
+        assert_eq!(store.load(&got).await.unwrap(), serde_json::json!({"v":1}));
+        // Idempotent — re-inserting the same (scope,key) does not collide.
+        store.insert_ref(r).await.unwrap();
     }
 }

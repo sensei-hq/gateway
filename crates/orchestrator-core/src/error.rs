@@ -28,6 +28,14 @@ pub enum OrchestratorError {
     UnknownSkillRef { agent: String, skill: String },
     #[error("agent {agent:?} references unknown tool {tool:?}")]
     UnknownToolRef { agent: String, tool: String },
+    #[error(
+        "agent {agent:?} has no base chain route: add an explicit `chain` or an `(area,kind)` binding (per-phase `chains` are overrides layered on a base route, so they do not by themselves make an agent routable)"
+    )]
+    UnknownChainRef { agent: String },
+    #[error(
+        "agent {agent:?} references tool {tool:?} without a grant covering its declared permissions"
+    )]
+    PermissionNotGranted { agent: String, tool: String },
     #[error("payload serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error(
@@ -60,8 +68,14 @@ pub enum OrchestratorError {
         have: usize,
         need: usize,
     },
+    #[error(
+        "map child {node:?} paused (in-doubt mutation): {reason} — carried out of the fan-out so the whole Map pauses loud"
+    )]
+    MapChildPaused { node: NodeId, reason: String },
     #[error("blackboard collision: scope {scope} already has key {key:?}")]
     ContextKeyCollision { scope: String, key: String },
     #[error("content-store digest miss: {0} — content is not addressable")]
     ContentDigestMiss(String),
+    #[error("registry load error: {0}")]
+    RegistryLoad(String),
 }
