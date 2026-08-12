@@ -10,7 +10,7 @@ source: crates/orchestrator*
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3).** Design §6/§9;
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4).** Design §6/§9;
 > config-source design
 > [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
 > **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
@@ -53,6 +53,17 @@ source: crates/orchestrator*
 > is raw string-prefix (not path-component-aware, and an empty grant path `""` = allow-all),
 > and `Hosts` matching is exact-host (no subdomain/wildcard)** — SP-4 must canonicalize
 > paths / reject empty allow-all grants / define host-wildcard semantics.
+>
+> **SP-2 slice 4 — skill/tool activation policy (Q4):** skills/tools carry a
+> definition-level `Activation` (`Always` default, or `OnKeywords`) — `SkillDef`
+> frontmatter `activate_on: [..]`, tool JSON `"activation"`. `assemble_prompt` composes
+> a skill body / tool schema only when `activation.is_active(query)` for the agent's
+> rendered input (matched once per run, case-insensitive substring ANY-of) —
+> progressive disclosure to fit the prompt budget. `Always` is byte-identical to the
+> old behavior; over-budget still halts loud (no silent truncation). Determinism-safe
+> (the query is the node input, already in `agent_input_hash`). **Deferred:** per-agent
+> override, planner-selected activation (SP-3), retrieval-ranked / semantic match (SP-7),
+> per-turn re-activation, prompt compaction (SP-7).
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
