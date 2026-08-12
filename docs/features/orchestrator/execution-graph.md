@@ -11,7 +11,8 @@ source: crates/orchestrator*
 # Execution Graph
 
 > **Status: Partial (Phase 3 · SP-1/3).** Design §10. Implemented node kinds:
-> `ModelCall`, `Agent`, `Map`, `Consolidate`, and **`Loop`** (walking skeleton).
+> `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`**, and **`Subgraph`**
+> (walking skeleton).
 > Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
 > scheduler are live. **`Loop`** (loop-node design
 > [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)):
@@ -24,10 +25,26 @@ source: crates/orchestrator*
 > Agent-body pause pauses the Loop. Resume replays completed iterations (memo-hit,
 > zero re-spend) and recomputes the pure gate, so it stops at the same iteration —
 > no gate journaling. Output: `{ iterations, converged, output }`.
-> **Deferred:** `Subgraph`/multi-node loop bodies, `Branch`, `PlanDelta` runtime
-> expansion, an LLM/fuzzy gate agent, a cost/timeout budget backstop (the budget
-> axis is dormant, so `max_iters` is the only backstop), and nested-loop/global
-> node caps.
+> **Deferred:** multi-node loop bodies (Loop-over-`Subgraph`), `Branch`, `PlanDelta`
+> runtime expansion, an LLM/fuzzy gate agent, a cost/timeout budget backstop (the
+> budget axis is dormant, so `max_iters` is the only backstop), and
+> nested-loop/global node caps.
+>
+> - **`Subgraph { graph }`** (SP-3 slice 1) — a node whose work is a nested DAG,
+>   driven under the node's path (`{node}/…`) in the same run (namespaced ids ⇒ nested
+>   effects nest via `effect_id`; resume replays inner nodes with no re-spend). Output
+>   is the **sink map** (`{sink_id: output}` for each terminal node). A nested
+>   failure/pause propagates to the node (`Failed`/`Paused`) and thus to the outer
+>   scheduler. `validate_dag` recurses into nested graphs. Nesting depth is capped by
+>   `Executor::with_max_depth` (default 8) → loud `GlobalCapExceeded`.
+>   **Known limitation:** a fresh `run` returns the synthesized sink map under the
+>   node's id, but a terminal re-`start` reconstructs `outputs` from the journal's
+>   per-node `EffectRecorded` — the **namespaced inner nodes** (`{node}/…`), not the
+>   sink map (which is never journaled). This fresh-vs-terminal asymmetry is shared
+>   with `Map`/`Loop` synthesized outputs; captured, not fixed, in this slice.
+>   **Deferred:** cross-boundary input/context (plan-scope blackboard),
+>   Loop-over-Subgraph (slice 5), runtime `PlanDelta` (slice 3), node-count/expansion
+>   caps (slice 3).
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed
