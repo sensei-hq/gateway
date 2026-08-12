@@ -62,7 +62,7 @@ impl Executor {
             .agent(&agent_ref.0)
             .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
         let (system, tools) = assemble_prompt(&self.registry, agent, context)?;
-        let chain = agent.chain.clone();
+        let chain = self.registry.resolve_chain(agent, None)?.to_string();
         let min_win = self.gateway.min_context_window(&chain).await;
         let ar = AgentRun {
             run,
