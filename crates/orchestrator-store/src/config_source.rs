@@ -252,6 +252,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_area_kind_in_chains_json_is_rejected_by_from_config() {
+        let root = temp_config_root();
+        write(
+            &root,
+            "chains.json",
+            r#"[{"area":"research","kind":"reasoning","chain":"a"},
+                {"area":"research","kind":"reasoning","chain":"b"}]"#,
+        );
+        let cfg = FilesystemConfigSource::new(&root)
+            .load()
+            .await
+            .expect("loads (dedup happens in from_config)");
+        assert_eq!(
+            cfg.chain_bindings.len(),
+            2,
+            "loader emits both rows verbatim"
+        );
+        let err = Registry::from_config(cfg);
+        assert!(
+            matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("duplicate chain binding") && m.contains("research")),
+            "from_config rejects the dup: {err:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn missing_chains_json_is_an_empty_table() {
         let root = temp_config_root(); // has no chains.json
         let cfg = FilesystemConfigSource::new(&root)
