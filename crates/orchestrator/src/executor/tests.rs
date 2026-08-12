@@ -296,6 +296,56 @@ async fn agent_routes_via_area_kind_binding_end_to_end() {
 }
 
 #[tokio::test]
+async fn phase_override_wins_over_base_route_through_from_config() {
+    use orchestrator_core::RegistryConfig;
+    // Base route is an explicit chain the gateway does NOT know ("bogus-base"), so it
+    // satisfies validate() but would fail at execution; the phase override "plan"→"c"
+    // is the only chain the harness knows. Completion proves the override won.
+    let mut chains = std::collections::HashMap::new();
+    chains.insert("plan".to_string(), "c".to_string());
+    let agent = AgentDefinition {
+        name: "a".into(),
+        area: "research".into(),
+        kind: "reasoning".into(),
+        chain: Some("bogus-base".into()),
+        chains,
+        tools: vec![],
+        skills: vec![],
+        system_prompt: "SYS".into(),
+    };
+    let cfg = RegistryConfig {
+        agents: vec![agent],
+        skills: vec![],
+        tools: vec![],
+        chain_bindings: vec![],
+    };
+    let registry = Arc::new(Registry::from_config(cfg).expect("assembles + validates"));
+    let (gateway, _calls) = recording_gateway().await; // only knows chain "c"
+    let n1 = NodeId("n1".into());
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry);
+    let node = Node {
+        id: n1.clone(),
+        kind: NodeKind::Agent {
+            agent: AgentRef("a".into()),
+            input: serde_json::json!("hi"),
+            phase: Some("plan".into()),
+        },
+        deps: vec![],
+    };
+    let outcome = exec
+        .run(RunId(uuid::Uuid::new_v4()), &Graph { nodes: vec![node] })
+        .await
+        .expect("run");
+    assert!(
+        outcome.failed.is_none(),
+        "phase override wins over base: {:?}",
+        outcome.failed
+    );
+    assert!(outcome.outputs.contains_key(&n1));
+}
+
+#[tokio::test]
 async fn agent_node_halts_over_budget_before_any_gateway_call() {
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
