@@ -5011,3 +5011,36 @@ async fn a_sibling_modelcall_and_a_subgraph_inner_modelcall_do_not_share_an_effe
         "a sibling and a nested ModelCall must not share an effect id"
     );
 }
+
+#[tokio::test]
+async fn subgraph_nesting_beyond_max_depth_halts_loud() {
+    let (gateway, _c) = recording_gateway().await;
+    // A subgraph containing a subgraph (2 levels of nesting).
+    let inner = subgraph_node("inner", vec![mc("x", None)]);
+    let graph = Graph {
+        nodes: vec![subgraph_node("outer", vec![inner])],
+    };
+    // max_depth = 1 allows one subgraph level; the second is refused loud.
+    let exec =
+        Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1").with_max_depth(1);
+    let res = exec.run(RunId(uuid::Uuid::new_v4()), &graph).await;
+    // The inner subgraph's GlobalCapExceeded surfaces either as the outer subgraph's
+    // failure OR as a top-level Err — assert the "max_depth" message appears either way.
+    let msg = match &res {
+        Ok(o) => o
+            .failed
+            .as_ref()
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default(),
+        Err(e) => format!("{e:?}"),
+    };
+    assert!(msg.contains("max_depth"), "cap halts loud: {res:?}");
+
+    // With the default (8), the same 2-level graph runs fine.
+    let (gateway2, _c2) = recording_gateway().await;
+    let ok = Executor::new(Arc::new(gateway2), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("runs within default depth");
+    assert!(ok.failed.is_none(), "{ok:?}");
+}
