@@ -4660,3 +4660,55 @@ async fn handle_wired_executor_resumes_a_partial_run_at_the_same_generation() {
         "both nodes finish on the resume"
     );
 }
+
+#[tokio::test]
+async fn a_reloaded_agent_becomes_runnable_end_to_end() {
+    use orchestrator_core::{RegistryConfig, RegistryHandle};
+    use orchestrator_store::InMemoryConfigSource;
+    // Handle starts EMPTY — agent "a" does not exist yet.
+    let handle = RegistryHandle::new(Registry::default());
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry_handle(handle.clone());
+    let n1 = NodeId("n1".into());
+
+    // Before reload: the run references unknown agent "a" → fails. An `Agent` node
+    // against an empty registry surfaces `UnknownAgent` as a top-level run error
+    // (it never resolves far enough to become an `outcome.failed`).
+    let before = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await;
+    assert!(
+        matches!(&before, Err(OrchestratorError::UnknownAgent(a)) if a == "a"),
+        "unknown agent fails before reload: {before:?}"
+    );
+
+    // Reload a config that defines agent "a" on chain "c".
+    handle
+        .reload(&InMemoryConfigSource(RegistryConfig {
+            agents: vec![agent_def("c")],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        }))
+        .await
+        .expect("reload");
+
+    // After reload: a NEW run resolves and drives agent "a".
+    let after = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("run");
+    assert!(after.failed.is_none(), "reloaded agent runs: {after:?}");
+    assert!(after.outputs.contains_key(&n1));
+}
