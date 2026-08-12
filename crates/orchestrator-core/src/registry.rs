@@ -2,6 +2,7 @@
 //! controlled md+frontmatter subset; a directory loader is deferred (SP-1 later).
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -359,6 +360,58 @@ impl Registry {
             }
         }
         Ok(())
+    }
+}
+
+/// A cheaply-clonable handle to a live, swappable [`Registry`] + a monotonic
+/// config generation. Clones share one `Arc<RwLock<…>>`, so an operator's clone
+/// and the executor's clone observe the same swaps (SP-2 hot-reload).
+#[derive(Clone)]
+pub struct RegistryHandle {
+    inner: Arc<RwLock<(Arc<Registry>, u64)>>,
+}
+
+impl RegistryHandle {
+    /// A handle over `registry` at generation 0.
+    pub fn new(registry: Registry) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new((Arc::new(registry), 0))),
+        }
+    }
+
+    /// The current registry (clones the `Arc`).
+    pub fn current(&self) -> Arc<Registry> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
+    }
+
+    /// The current config generation.
+    pub fn generation(&self) -> u64 {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    /// The atomic `(registry, generation)` pair — read together so a run pins a
+    /// consistent snapshot.
+    pub fn snapshot(&self) -> (Arc<Registry>, u64) {
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        (g.0.clone(), g.1)
+    }
+
+    /// Reload from `source`, atomically swapping in the new registry and bumping
+    /// the generation (returns the new generation). Validated + last-good: the
+    /// load + `Registry::from_config` (which validates) run BEFORE the swap, so a
+    /// failed load/validate returns `Err` with the old registry still live. The
+    /// `.await` is OUTSIDE the lock.
+    pub async fn reload(&self, source: &dyn ConfigSource) -> Result<u64, OrchestratorError> {
+        let cfg = source.load().await?;
+        let next = Registry::from_config(cfg)?;
+        let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        w.0 = Arc::new(next);
+        w.1 += 1;
+        Ok(w.1)
     }
 }
 
@@ -1136,5 +1189,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t2.activation, Activation::OnKeywords(vec!["sql".into()]));
+    }
+
+    // A minimal in-core ConfigSource for handle tests (yields a fixed config).
+    struct FixedSource(RegistryConfig);
+    #[async_trait::async_trait]
+    impl ConfigSource for FixedSource {
+        async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn cfg_with_skill(name: &str) -> RegistryConfig {
+        RegistryConfig {
+            agents: vec![],
+            skills: vec![SkillDef {
+                name: name.into(),
+                description: None,
+                body: "B".into(),
+                activation: Activation::default(),
+            }],
+            tools: vec![],
+            chain_bindings: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_handle_new_current_and_generation() {
+        let reg = Registry::from_config(cfg_with_skill("s0")).unwrap();
+        let h = RegistryHandle::new(reg);
+        assert_eq!(h.generation(), 0);
+        assert!(h.current().skill("s0").is_some());
+        let (snap_reg, snap_gen) = h.snapshot();
+        assert_eq!(snap_gen, 0);
+        assert!(snap_reg.skill("s0").is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_handle_reload_swaps_and_bumps_generation() {
+        let h = RegistryHandle::new(Registry::from_config(cfg_with_skill("s0")).unwrap());
+        let new_gen = h.reload(&FixedSource(cfg_with_skill("s1"))).await.unwrap();
+        assert_eq!(new_gen, 1);
+        assert_eq!(h.generation(), 1);
+        assert!(h.current().skill("s1").is_some(), "new config is live");
+        assert!(h.current().skill("s0").is_none(), "old config swapped out");
+    }
+
+    #[tokio::test]
+    async fn registry_handle_reload_is_validated_and_last_good() {
+        let h = RegistryHandle::new(Registry::from_config(cfg_with_skill("s0")).unwrap());
+        // A config whose agent references a missing tool → from_config validate fails.
+        let bad = RegistryConfig {
+            agents: vec![AgentDefinition {
+                name: "a".into(),
+                area: "x".into(),
+                kind: "y".into(),
+                chain: Some("c".into()),
+                chains: std::collections::HashMap::new(),
+                grants: std::collections::HashMap::new(),
+                tools: vec!["missing".into()],
+                skills: vec![],
+                system_prompt: "s".into(),
+            }],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
+        let err = h.reload(&FixedSource(bad)).await;
+        assert!(err.is_err(), "invalid config → reload errors");
+        // Last-good preserved: old registry still live, generation unchanged.
+        assert_eq!(h.generation(), 0);
+        assert!(h.current().skill("s0").is_some());
     }
 }
