@@ -17,6 +17,7 @@ mod agent;
 mod content;
 mod durability;
 mod fanout;
+mod subgraph;
 mod support;
 use support::{
     GatewayDisposition, build_request, classify_gateway_error, consolidate_compaction_target,
@@ -675,6 +676,7 @@ impl Executor {
                 self.run_consolidate(run, node, prior_outputs, fold).await
             }
             NodeKind::Loop { .. } => self.run_loop(run, node, fold).await,
+            NodeKind::Subgraph { .. } => self.run_subgraph(run, node, fold).await,
         }
     }
 

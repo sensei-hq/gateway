@@ -5,7 +5,8 @@ use crate::test_support::{
     scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
-    Aggregation, ChildStatus, Dep, Graph, JournalError, LoopGate, MapBody, Node, NodeId, NodeKind,
+    Aggregation, ChildStatus, Dep, EdgeKind, Graph, JournalError, LoopGate, MapBody, Node, NodeId,
+    NodeKind,
 };
 use orchestrator_store::InMemoryJournal;
 
@@ -4753,5 +4754,153 @@ async fn start_on_a_handle_wired_executor_freshly_runs_and_pins_the_generation()
     assert_eq!(
         recorded, "v1#cfg0",
         "start's empty-journal path pins the generation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SP-3 slice 1 — `NodeKind::Subgraph`: a node whose work is a whole nested DAG,
+// driven under the node's path in the SAME run.
+// ---------------------------------------------------------------------------
+
+fn mc(id: &str, dep: Option<&str>) -> Node {
+    Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": id }),
+        },
+        deps: dep
+            .map(|d| {
+                vec![Dep {
+                    on: NodeId(d.into()),
+                    kind: EdgeKind::Hard,
+                }]
+            })
+            .unwrap_or_default(),
+    }
+}
+fn subgraph_node(id: &str, inner: Vec<Node>) -> Node {
+    Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::Subgraph {
+            graph: Box::new(Graph { nodes: inner }),
+        },
+        deps: vec![],
+    }
+}
+
+#[tokio::test]
+async fn subgraph_executes_a_nested_line_and_returns_the_sink_map() {
+    let (gateway, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let s = NodeId("s".into());
+    let graph = Graph {
+        nodes: vec![subgraph_node(
+            "s",
+            vec![mc("n1", None), mc("n2", Some("n1"))],
+        )],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    let sub_out = &out.outputs[&s];
+    assert!(sub_out.get("n2").is_some(), "sink map has n2: {sub_out}");
+    assert!(sub_out.get("n1").is_none(), "n1 is not a sink");
+}
+
+#[tokio::test]
+async fn subgraph_diamond_returns_all_sink_outputs() {
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let s = NodeId("s".into());
+    let inner = vec![mc("a", None), mc("b", Some("a")), mc("c", Some("a"))];
+    let graph = Graph {
+        nodes: vec![subgraph_node("s", inner)],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    let sub = &out.outputs[&s];
+    assert!(
+        sub.get("b").is_some() && sub.get("c").is_some(),
+        "both sinks present: {sub}"
+    );
+    assert!(sub.get("a").is_none(), "a is not a sink");
+}
+
+/// Resume-no-respend across the subgraph boundary: run 1 dies partway *inside* the
+/// subgraph (inner `n1` completes, inner `n2` fails), so on resume the subgraph's
+/// already-completed inner node replays from the memo — the resume gateway is
+/// called only for the node that actually failed.
+///
+/// ADAPTATION (noted in the task report): the task's suggested shape — fail at an
+/// outer node `d` that hard-deps a *completed* subgraph — is infeasible with the
+/// reused `self.drive`: a fully-completing nested `drive` appends a `RunCompleted`
+/// into the SAME run's journal, which makes `start` treat the whole run as terminal
+/// prematurely (it would never resume `d`). Failing *inside* the subgraph keeps the
+/// nested drive from completing (no premature `RunCompleted`) and still proves the
+/// headline: completed inner nodes replay from the memo with no re-spend.
+#[tokio::test]
+async fn subgraph_inner_nodes_replay_from_memo_on_resume() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let s = NodeId("s".into());
+    let graph = Graph {
+        nodes: vec![subgraph_node(
+            "s",
+            vec![mc("n1", None), mc("n2", Some("n1"))],
+        )],
+    };
+
+    // Run 1: adapter succeeds on its 1st call (inner n1) and errors on its 2nd
+    // (inner n2). n1 is journaled+completed; n2 fails; the subgraph fails; NO
+    // RunCompleted is written (the nested drive did not complete).
+    let (gw1, calls1) = failing_after_gateway(1).await;
+    let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1");
+    let outcome1 = exec1
+        .run(run, &graph)
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(
+        outcome1.failed.is_some(),
+        "run 1 fails inside the subgraph: {outcome1:?}"
+    );
+    assert_eq!(
+        calls1.lock().unwrap().len(),
+        2,
+        "run 1 hit the gateway for inner n1 and the failing inner n2"
+    );
+
+    // Run 2: a FRESH always-succeeding gateway over the SAME journal. Resume folds
+    // the journal, memoizes inner n1, and re-drives only the failed inner n2.
+    let (gw2, calls2) = recording_gateway().await;
+    let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1");
+    let outcome2 = exec2.start(run, &graph).await.expect("resume completes");
+    assert!(
+        outcome2.failed.is_none(),
+        "resume completes with no failure: {:?}",
+        outcome2.failed
+    );
+    assert!(
+        outcome2.outputs[&s].get("n2").is_some(),
+        "resumed subgraph sink map has n2: {}",
+        outcome2.outputs[&s]
+    );
+
+    // The proof: run-2's gateway saw EXACTLY ONE call, carrying inner n2's prompt.
+    // Inner n1 was replayed from the memo — not re-spent.
+    let recorded2 = calls2.lock().unwrap().clone();
+    assert_eq!(
+        recorded2.len(),
+        1,
+        "resume re-called the gateway only for the failed inner node n2: {recorded2:?}"
+    );
+    assert_eq!(
+        recorded2[0].1, "n2",
+        "the single resume call carried n2's prompt"
     );
 }
