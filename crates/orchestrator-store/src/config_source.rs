@@ -126,6 +126,7 @@ mod tests {
                 body: "b".into(),
             }],
             tools: vec![],
+            chain_bindings: vec![],
         };
         let src = InMemoryConfigSource(cfg);
         let reg = Registry::from_config(src.load().await.unwrap()).unwrap();
@@ -216,11 +217,11 @@ mod tests {
     #[tokio::test]
     async fn malformed_agent_md_error_names_the_file() {
         let root = temp_config_root();
-        // Missing the required `chain:` key → a parse error that must name the file.
+        // Missing the required `name:` key → a parse error that must name the file.
         write(
             &root.join("agents"),
             "broken.md",
-            "---\nname: x\narea: a\nkind: k\n---\nb\n",
+            "---\narea: a\nkind: k\n---\nb\n",
         );
         let err = FilesystemConfigSource::new(&root).load().await;
         assert!(

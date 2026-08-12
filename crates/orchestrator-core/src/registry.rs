@@ -18,7 +18,11 @@ pub struct AgentDefinition {
     pub name: String,
     pub area: String,
     pub kind: String,
-    pub chain: String,
+    /// An explicit gateway chain-id override. `None` → resolve via the
+    /// `(area,kind)` binding table. See [`Registry::resolve_chain`].
+    pub chain: Option<String>,
+    /// Per-phase chain overrides (phase → chain-id); empty when unused.
+    pub chains: HashMap<String, String>,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub system_prompt: String,
@@ -47,6 +51,15 @@ pub struct ToolSpec {
     pub source: Option<String>,
 }
 
+/// A registry role binding: `(area, kind)` → a gateway chain-id. The policy
+/// table that lets one edit re-point every agent of that role (§122).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainBinding {
+    pub area: String,
+    pub kind: String,
+    pub chain: String,
+}
+
 /// The registry's config as domain objects — the backend-agnostic payload a
 /// [`ConfigSource`] yields (no serialization format in the contract, so a DB /
 /// HTTP backend maps its own representation → these directly).
@@ -55,6 +68,7 @@ pub struct RegistryConfig {
     pub agents: Vec<AgentDefinition>,
     pub skills: Vec<SkillDef>,
     pub tools: Vec<ToolSpec>,
+    pub chain_bindings: Vec<ChainBinding>,
 }
 
 /// A pluggable source of registry config (SP-2). **This is the extension seam**
@@ -75,6 +89,7 @@ pub struct Registry {
     agents: HashMap<String, AgentDefinition>,
     skills: HashMap<String, SkillDef>,
     tools: HashMap<String, ToolSpec>,
+    chain_bindings: HashMap<(String, String), String>,
 }
 
 impl Registry {
@@ -98,6 +113,40 @@ impl Registry {
     }
     pub fn tool(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.get(name)
+    }
+    pub fn with_chain_binding(mut self, b: ChainBinding) -> Self {
+        self.chain_bindings.insert((b.area, b.kind), b.chain);
+        self
+    }
+    pub fn chain_binding(&self, area: &str, kind: &str) -> Option<&str> {
+        self.chain_bindings
+            .get(&(area.to_string(), kind.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Resolve an agent's concrete gateway chain-id for an optional phase.
+    /// Order: per-phase override → explicit `chain` → `(area,kind)` binding →
+    /// loud `UnknownChainRef`. A phase key the agent does not define is NOT an
+    /// error — it falls through.
+    pub fn resolve_chain<'a>(
+        &'a self,
+        agent: &'a AgentDefinition,
+        phase: Option<&str>,
+    ) -> Result<&'a str, OrchestratorError> {
+        if let Some(p) = phase
+            && let Some(c) = agent.chains.get(p)
+        {
+            return Ok(c);
+        }
+        if let Some(c) = agent.chain.as_deref() {
+            return Ok(c);
+        }
+        if let Some(c) = self.chain_binding(&agent.area, &agent.kind) {
+            return Ok(c);
+        }
+        Err(OrchestratorError::UnknownChainRef {
+            agent: agent.name.clone(),
+        })
     }
 
     /// Assemble + validate a `Registry` from already-parsed [`RegistryConfig`].
@@ -134,6 +183,15 @@ impl Registry {
             }
             reg = reg.with_tool(t);
         }
+        for b in cfg.chain_bindings {
+            if reg.chain_binding(&b.area, &b.kind).is_some() {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "duplicate chain binding: {}/{}",
+                    b.area, b.kind
+                )));
+            }
+            reg = reg.with_chain_binding(b);
+        }
         reg.validate()?;
         Ok(reg)
     }
@@ -156,6 +214,11 @@ impl Registry {
                         tool: tool.clone(),
                     });
                 }
+            }
+            if agent.chain.is_none() && self.chain_binding(&agent.area, &agent.kind).is_none() {
+                return Err(OrchestratorError::UnknownChainRef {
+                    agent: agent.name.clone(),
+                });
             }
         }
         Ok(())
@@ -230,6 +293,37 @@ fn optional_list(map: &HashMap<String, FmValue>, key: &str) -> Vec<String> {
     }
 }
 
+fn optional_scalar(map: &HashMap<String, FmValue>, key: &str) -> Option<String> {
+    match map.get(key) {
+        Some(FmValue::Scalar(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Parse an inline `[k=v, k=v]` list into a map (the flat controlled subset —
+/// no nesting). A member without '=', or with an empty key/value, is loud.
+fn optional_pairs(
+    map: &HashMap<String, FmValue>,
+    key: &str,
+) -> Result<HashMap<String, String>, OrchestratorError> {
+    let mut out = HashMap::new();
+    if let Some(FmValue::List(items)) = map.get(key) {
+        for item in items {
+            let (k, v) = item.split_once('=').ok_or_else(|| {
+                OrchestratorError::FrontmatterParse(format!("{key} entry missing '=': {item}"))
+            })?;
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() || v.is_empty() {
+                return Err(OrchestratorError::FrontmatterParse(format!(
+                    "{key} entry has empty key/value: {item}"
+                )));
+            }
+            out.insert(k.to_string(), v.to_string());
+        }
+    }
+    Ok(out)
+}
+
 impl AgentDefinition {
     /// Parse an agent from the md+frontmatter subset.
     pub fn from_frontmatter(input: &str) -> Result<Self, OrchestratorError> {
@@ -239,7 +333,8 @@ impl AgentDefinition {
             name: required_scalar(&f, "name")?,
             area: required_scalar(&f, "area")?,
             kind: required_scalar(&f, "kind")?,
-            chain: required_scalar(&f, "chain")?,
+            chain: optional_scalar(&f, "chain"),
+            chains: optional_pairs(&f, "chains")?,
             tools: optional_list(&f, "tools"),
             skills: optional_list(&f, "skills"),
             system_prompt: body.to_string(),
@@ -276,7 +371,7 @@ mod tests {
         assert_eq!(a.name, "researcher");
         assert_eq!(a.area, "research");
         assert_eq!(a.kind, "reasoning");
-        assert_eq!(a.chain, "research.bulk");
+        assert_eq!(a.chain.as_deref(), Some("research.bulk"));
         assert_eq!(a.tools, vec!["calc".to_string()]);
         assert_eq!(a.skills, vec!["concise".to_string()]);
         assert_eq!(
@@ -295,7 +390,7 @@ mod tests {
 
     #[test]
     fn agent_from_frontmatter_missing_required_key_errors() {
-        let md = "---\nname: n\narea: a\nkind: k\n---\nbody\n"; // no chain
+        let md = "---\nname: n\nkind: k\nchain: c\n---\nbody\n"; // no area (still required)
         assert!(matches!(
             AgentDefinition::from_frontmatter(md),
             Err(OrchestratorError::FrontmatterParse(_))
@@ -383,6 +478,7 @@ mod tests {
                 body: "b".into(),
             }],
             tools: vec![tool_spec("calc")],
+            chain_bindings: vec![],
         };
         let reg = Registry::from_config(cfg).expect("assembles + validates");
         assert!(reg.agent("researcher").is_some() && reg.tool("calc").is_some());
@@ -392,6 +488,7 @@ mod tests {
             agents: vec![agent.clone()],
             skills: vec![],
             tools: vec![],
+            chain_bindings: vec![],
         };
         assert!(matches!(
             Registry::from_config(dangling),
@@ -408,6 +505,7 @@ mod tests {
                 body: "b".into(),
             }],
             tools: vec![tool_spec("calc")],
+            chain_bindings: vec![],
         };
         assert!(matches!(
             Registry::from_config(dup),
@@ -430,6 +528,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            chain_bindings: vec![],
         };
         assert!(matches!(
             Registry::from_config(dup_skill),
@@ -441,6 +540,7 @@ mod tests {
             agents: vec![],
             skills: vec![],
             tools: vec![tool_spec("calc"), tool_spec("calc")],
+            chain_bindings: vec![],
         };
         assert!(matches!(
             Registry::from_config(dup_tool),
@@ -470,5 +570,119 @@ mod tests {
         assert!(full.validate().is_ok());
         assert!(full.agent("researcher").is_some());
         assert_eq!(full.tool("calc").map(|t| t.name.as_str()), Some("calc"));
+    }
+
+    fn role_agent(area: &str, kind: &str, chain: Option<&str>) -> AgentDefinition {
+        AgentDefinition {
+            name: "role".into(),
+            area: area.into(),
+            kind: kind.into(),
+            chain: chain.map(|c| c.into()),
+            chains: std::collections::HashMap::new(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "SYS".into(),
+        }
+    }
+
+    #[test]
+    fn resolve_chain_prefers_phase_then_explicit_then_binding_then_errors() {
+        let reg = Registry::default().with_chain_binding(ChainBinding {
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: "bound".into(),
+        });
+        let mut phased = role_agent("research", "reasoning", Some("explicit"));
+        phased.chains.insert("plan".into(), "phase-chain".into());
+        assert_eq!(
+            reg.resolve_chain(&phased, Some("plan")).unwrap(),
+            "phase-chain"
+        );
+        assert_eq!(
+            reg.resolve_chain(&phased, Some("nope")).unwrap(),
+            "explicit"
+        );
+        assert_eq!(reg.resolve_chain(&phased, None).unwrap(), "explicit");
+        let bound_only = role_agent("research", "reasoning", None);
+        assert_eq!(reg.resolve_chain(&bound_only, None).unwrap(), "bound");
+        let orphan = role_agent("misc", "misc", None);
+        assert!(matches!(
+            reg.resolve_chain(&orphan, None),
+            Err(OrchestratorError::UnknownChainRef { agent }) if agent == "role"
+        ));
+    }
+
+    #[test]
+    fn from_frontmatter_parses_optional_chain_and_phase_chains() {
+        let md = "---\nname: n\narea: a\nkind: k\nchains: [plan=plan.frontier, execute=code.mid]\n---\nbody\n";
+        let ag = AgentDefinition::from_frontmatter(md).unwrap();
+        assert_eq!(ag.chain, None);
+        assert_eq!(
+            ag.chains.get("plan").map(String::as_str),
+            Some("plan.frontier")
+        );
+        assert_eq!(
+            ag.chains.get("execute").map(String::as_str),
+            Some("code.mid")
+        );
+        let md2 = "---\nname: n\narea: a\nkind: k\nchain: c\n---\nb\n";
+        assert_eq!(
+            AgentDefinition::from_frontmatter(md2)
+                .unwrap()
+                .chain
+                .as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn from_frontmatter_malformed_phase_pair_errors() {
+        let md = "---\nname: n\narea: a\nkind: k\nchains: [bad]\n---\nb\n";
+        assert!(matches!(
+            AgentDefinition::from_frontmatter(md),
+            Err(OrchestratorError::FrontmatterParse(_))
+        ));
+    }
+
+    #[test]
+    fn from_config_rejects_duplicate_area_kind_binding() {
+        let cfg = RegistryConfig {
+            agents: vec![],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![
+                ChainBinding {
+                    area: "coding".into(),
+                    kind: "reasoning".into(),
+                    chain: "a".into(),
+                },
+                ChainBinding {
+                    area: "coding".into(),
+                    kind: "reasoning".into(),
+                    chain: "b".into(),
+                },
+            ],
+        };
+        assert!(matches!(
+            Registry::from_config(cfg),
+            Err(OrchestratorError::RegistryLoad(m)) if m.contains("duplicate chain binding") && m.contains("coding")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_an_agent_with_no_resolvable_chain() {
+        let reg = Registry::default().with_agent(role_agent("x", "y", None));
+        assert!(matches!(
+            reg.validate(),
+            Err(OrchestratorError::UnknownChainRef { agent }) if agent == "role"
+        ));
+        let ok = Registry::default()
+            .with_agent(role_agent("x", "y", None))
+            .with_chain_binding(ChainBinding {
+                area: "x".into(),
+                kind: "y".into(),
+                chain: "c".into(),
+            });
+        assert!(ok.validate().is_ok());
     }
 }

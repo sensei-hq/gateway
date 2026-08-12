@@ -28,6 +28,8 @@ pub enum OrchestratorError {
     UnknownSkillRef { agent: String, skill: String },
     #[error("agent {agent:?} references unknown tool {tool:?}")]
     UnknownToolRef { agent: String, tool: String },
+    #[error("agent {agent:?} has no resolvable chain (no explicit chain, no (area,kind) binding)")]
+    UnknownChainRef { agent: String },
     #[error("payload serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error(
