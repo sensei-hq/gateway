@@ -79,6 +79,17 @@ impl Executor {
         node: &Node,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
+        // Depth cap (self-DoS backstop): the path segment count is the current
+        // nesting level; a top-level subgraph node has 0 segments (level 1). Reject
+        // loud if the nested nodes would exceed max_depth. Conservative — the path
+        // count also includes Map/Loop child nesting.
+        let depth = node.id.0.matches('/').count();
+        if depth + 1 > self.max_depth {
+            return Err(OrchestratorError::GlobalCapExceeded {
+                cap: "max_depth".into(),
+                limit: self.max_depth,
+            });
+        }
         let NodeKind::Subgraph { graph } = &node.kind else {
             unreachable!("run_subgraph on non-Subgraph node");
         };

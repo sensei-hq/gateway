@@ -33,6 +33,8 @@ pub struct Executor {
     registry: Arc<Registry>,
     tools: Arc<ToolRegistry>,
     max_steps: usize,
+    /// Max nesting depth (Subgraph levels; SP-3 self-DoS backstop). Default 8.
+    max_depth: usize,
     concurrency: usize,
     /// The content-addressed store (§7.4) an over-threshold effect output is
     /// split into. `None` (the default) means no CAS is wired, so every output
@@ -136,6 +138,7 @@ impl Executor {
             registry: Arc::new(Registry::default()),
             tools: Arc::new(ToolRegistry::default()),
             max_steps: 8,
+            max_depth: 8,
             concurrency: 8,
             content: None,
             cas_threshold: 4096,
@@ -197,6 +200,12 @@ impl Executor {
     /// Override the ReAct loop's max turns (default 8).
     pub fn with_max_steps(mut self, n: usize) -> Self {
         self.max_steps = n;
+        self
+    }
+
+    /// Set the max nesting depth (Subgraph self-DoS cap; default 8).
+    pub fn with_max_depth(mut self, n: usize) -> Self {
+        self.max_depth = n;
         self
     }
 

@@ -72,6 +72,8 @@ pub enum OrchestratorError {
         "map child {node:?} paused (in-doubt mutation): {reason} — carried out of the fan-out so the whole Map pauses loud"
     )]
     MapChildPaused { node: NodeId, reason: String },
+    #[error("global cap {cap:?} exceeded (limit {limit})")]
+    GlobalCapExceeded { cap: String, limit: usize },
     #[error("blackboard collision: scope {scope} already has key {key:?}")]
     ContextKeyCollision { scope: String, key: String },
     #[error("content-store digest miss: {0} — content is not addressable")]
