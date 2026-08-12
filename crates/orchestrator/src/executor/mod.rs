@@ -590,10 +590,22 @@ impl Executor {
                     },
                 }
             }
-            NodeKind::Agent { agent, input } => {
+            NodeKind::Agent {
+                agent,
+                input,
+                phase,
+            } => {
                 let context = self.resolve_context(node).await?;
                 match self
-                    .drive_agent(run, &node.id, agent, input, &context, fold)
+                    .drive_agent(
+                        run,
+                        &node.id,
+                        agent,
+                        input,
+                        &context,
+                        fold,
+                        phase.as_deref(),
+                    )
                     .await?
                 {
                     AgentStep::Completed(output) => Ok(NodeExec::Completed(output)),
