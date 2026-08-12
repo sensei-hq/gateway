@@ -48,6 +48,10 @@ impl Executor {
     /// turns/tools replay from the journal with no gateway call and no
     /// re-execution (resume without re-spend); an input-hash mismatch halts with
     /// `DeterminismViolation`.
+    // The per-invocation inputs (run/node/agent/input/context/fold/phase) are each
+    // distinct and passed positionally at four call sites; bundling them behind a
+    // struct would only relocate the plumbing, so the arity is allowed here.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn drive_agent(
         &self,
         run: RunId,
@@ -56,13 +60,14 @@ impl Executor {
         input: &serde_json::Value,
         context: &[(ContextKey, serde_json::Value)],
         fold: &Fold,
+        phase: Option<&str>,
     ) -> Result<AgentStep, OrchestratorError> {
         let agent: &AgentDefinition = self
             .registry
             .agent(&agent_ref.0)
             .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
         let (system, tools) = assemble_prompt(&self.registry, agent, context)?;
-        let chain = self.registry.resolve_chain(agent, None)?.to_string();
+        let chain = self.registry.resolve_chain(agent, phase)?.to_string();
         let min_win = self.gateway.min_context_window(&chain).await;
         let ar = AgentRun {
             run,
