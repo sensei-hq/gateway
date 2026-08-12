@@ -242,6 +242,9 @@ async fn agent_node_phase_selects_the_per_phase_chain() {
         "phase route completes: {:?}",
         outcome.failed
     );
+    // The node produced an output under its id — the per-phase chain actually drove
+    // a turn (not merely "didn't fail").
+    assert!(outcome.outputs.contains_key(&NodeId("n1".into())));
 }
 
 #[tokio::test]
