@@ -1045,6 +1045,8 @@ mod tests {
             "case-insensitive substring, any-of"
         );
         assert!(on.is_active("give me a tldr"));
+        // Also case-insensitive on the QUERY side (mixed/upper-case query vs the keywords).
+        assert!(on.is_active("Please SUMMARIZE Now"));
         assert!(
             !on.is_active("translate to french"),
             "no keyword → inactive"
