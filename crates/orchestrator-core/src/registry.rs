@@ -68,22 +68,14 @@ pub struct Permissions {
     pub caps: ResourceCaps,
 }
 
-/// Network egress policy. Default `Deny` (secure).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Network egress policy. Default `Deny` (secure) — pinned via `#[default]` on
+/// the variant so it survives reordering.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum NetworkPolicy {
+    #[default]
     Deny,
     Hosts(Vec<String>),
     Any,
-}
-
-// Keep the manual impl (not a `#[derive(Default)]`/`#[default]` on a variant):
-// `Deny` as the secure default is a deliberate, explicit choice we don't want
-// silently re-derivable-away by variant reordering.
-#[allow(clippy::derivable_impls)]
-impl Default for NetworkPolicy {
-    fn default() -> Self {
-        NetworkPolicy::Deny
-    }
 }
 
 /// Resource ceilings; `None` = unbounded (on a grant) / no requirement (on a need).
