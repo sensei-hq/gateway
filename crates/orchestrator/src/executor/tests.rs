@@ -4712,3 +4712,46 @@ async fn a_reloaded_agent_becomes_runnable_end_to_end() {
     assert!(after.failed.is_none(), "reloaded agent runs: {after:?}");
     assert!(after.outputs.contains_key(&n1));
 }
+
+/// `start()` on a handle-wired executor with an EMPTY journal is a fresh run via
+/// the pin (start → pin → start_inner → empty-journal branch → run_inner): it
+/// completes AND stamps the pinned generation — the last handle-path corner.
+#[tokio::test]
+async fn start_on_a_handle_wired_executor_freshly_runs_and_pins_the_generation() {
+    use orchestrator_core::RegistryHandle;
+    let handle = RegistryHandle::new(Registry::default().with_agent(agent_def("c")));
+    let journal = InMemoryJournal::new();
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry_handle(handle.clone());
+    let n1 = NodeId("n1".into());
+    let run = RunId(uuid::Uuid::new_v4());
+
+    // No journal yet ⇒ start() delegates to the fresh-run path on the pinned clone.
+    let out = exec
+        .start(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("fresh start via handle");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(out.outputs.contains_key(&n1));
+
+    let recorded = journal
+        .load(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::RunStarted { version } => Some(version),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        recorded, "v1#cfg0",
+        "start's empty-journal path pins the generation"
+    );
+}
