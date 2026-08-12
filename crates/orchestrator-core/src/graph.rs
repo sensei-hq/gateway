@@ -15,6 +15,10 @@ pub enum NodeKind {
     Agent {
         agent: crate::registry::AgentRef,
         input: serde_json::Value,
+        /// Optional phase selecting a per-phase chain (`AgentDefinition::chains`);
+        /// `None` resolves via the agent's explicit `chain` or its `(area,kind)`
+        /// binding. A node attribute, fixed for the run — not a mid-loop transition.
+        phase: Option<String>,
     },
     /// A single DAG node that fans out INTERNALLY over `over`, running `body`
     /// once per item concurrently (bounded by `concurrency`), then folding the
@@ -36,6 +40,17 @@ pub enum NodeKind {
         min_viable: usize,
         body: MapBody,
     },
+    /// Iterate `body` at path `"{loop}/{i}"`, feeding each iteration's output into
+    /// the next as input (refine), until `gate` says Stop or `max_iters` is
+    /// reached. Cap-without-Stop completes best-effort (`converged: false`), never
+    /// a bare fail (§10.3); a body failure fails the Loop. Output:
+    /// `{ iterations, converged, output }`.
+    Loop {
+        body: MapBody,
+        input: serde_json::Value,
+        gate: LoopGate,
+        max_iters: usize,
+    },
 }
 
 /// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure
@@ -46,6 +61,30 @@ pub enum NodeKind {
 pub enum MapBody {
     ModelCall { chain: String },
     Agent(crate::registry::AgentRef),
+}
+
+/// A deterministic Stop condition for a [`NodeKind::Loop`], evaluated as a pure
+/// function of one iteration's body output — so a resume recomputes the identical
+/// decision from the memoized output, with no gate journaling (§10.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LoopGate {
+    /// Stop when `output["text"]` contains this marker substring.
+    TextContains(String),
+    /// Stop when `output[field] == true` (strict JSON `true`).
+    FieldTrue(String),
+}
+
+impl LoopGate {
+    /// Whether this iteration's `output` satisfies the Stop condition.
+    pub fn should_stop(&self, output: &serde_json::Value) -> bool {
+        match self {
+            LoopGate::TextContains(marker) => output
+                .get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t.contains(marker.as_str())),
+            LoopGate::FieldTrue(field) => output.get(field) == Some(&serde_json::Value::Bool(true)),
+        }
+    }
 }
 
 /// How a `Map` folds its children's success/failure into the node's own status
@@ -183,6 +222,18 @@ impl Graph {
             }
         }
 
+        // 2b. Per-node-kind sanity: a `Loop` needs at least one iteration — a
+        // `max_iters == 0` Loop would complete degenerately with a null output, a
+        // quiet degenerate path. Reject it loudly up front.
+        for node in &self.nodes {
+            if let NodeKind::Loop { max_iters: 0, .. } = &node.kind {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "loop node {:?} has max_iters == 0 (must be >= 1)",
+                    node.id
+                )));
+            }
+        }
+
         // 3. Acyclic — Kahn's algorithm. `in_degree` counts each node's deps
         // (edges point dep.on → node); repeatedly retire zero-in-degree nodes.
         // If any remain, a cycle exists (no topological order).
@@ -225,6 +276,39 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_dag_rejects_a_zero_iteration_loop() {
+        let graph = Graph {
+            nodes: vec![Node {
+                id: NodeId("L".into()),
+                kind: NodeKind::Loop {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({}),
+                    gate: LoopGate::TextContains("x".into()),
+                    max_iters: 0,
+                },
+                deps: vec![],
+            }],
+        };
+        assert!(matches!(
+            graph.validate_dag(),
+            Err(OrchestratorError::InvalidGraph(_))
+        ));
+    }
+
+    #[test]
+    fn loop_gate_should_stop_is_pure_over_output() {
+        let text = LoopGate::TextContains("DONE".into());
+        assert!(text.should_stop(&serde_json::json!({ "text": "all DONE here" })));
+        assert!(!text.should_stop(&serde_json::json!({ "text": "keep going" })));
+        assert!(!text.should_stop(&serde_json::json!({ "other": "DONE" }))); // only checks `text`
+        let field = LoopGate::FieldTrue("done".into());
+        assert!(field.should_stop(&serde_json::json!({ "done": true })));
+        assert!(!field.should_stop(&serde_json::json!({ "done": false })));
+        assert!(!field.should_stop(&serde_json::json!({ "done": "true" }))); // strict: JSON true only
+        assert!(!field.should_stop(&serde_json::json!({})));
+    }
 
     /// A minimal node carrying a throwaway `ModelCall` kind — `validate_dag`
     /// inspects only ids + deps, never the kind.

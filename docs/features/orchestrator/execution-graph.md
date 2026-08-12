@@ -2,15 +2,32 @@
 title: Execution Graph
 doctype: feature
 module: orchestrator
-status: planned
+status: partial
 phase: 3
 spec: SP-1, SP-3
-source: orchestrator (new)
+source: crates/orchestrator*
 ---
 
 # Execution Graph
 
-> **Status: Planned (Phase 3 · SP-1/3).** Design §10.
+> **Status: Partial (Phase 3 · SP-1/3).** Design §10. Implemented node kinds:
+> `ModelCall`, `Agent`, `Map`, `Consolidate`, and **`Loop`** (walking skeleton).
+> Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
+> scheduler are live. **`Loop`** (loop-node design
+> [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)):
+> `NodeKind::Loop { body: MapBody, input, gate: LoopGate, max_iters }` iterates
+> `body` at path `"{loop}/{i}"`, threads each iteration's output into the next as
+> input (refine), and stops when a **deterministic** `LoopGate`
+> (`TextContains`/`FieldTrue`, pure over the body output) fires or `max_iters` is
+> reached. Cap-without-Stop completes best-effort (`converged: false`) — never a
+> bare fail (§10.3); a body failure fails the Loop (naming the iteration); an
+> Agent-body pause pauses the Loop. Resume replays completed iterations (memo-hit,
+> zero re-spend) and recomputes the pure gate, so it stops at the same iteration —
+> no gate journaling. Output: `{ iterations, converged, output }`.
+> **Deferred:** `Subgraph`/multi-node loop bodies, `Branch`, `PlanDelta` runtime
+> expansion, an LLM/fuzzy gate agent, a cost/timeout budget backstop (the budget
+> axis is dormant, so `max_iters` is the only backstop), and nested-loop/global
+> node caps.
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed
@@ -43,4 +60,8 @@ Feature: Execution graph
 
 ## Notes
 
-- Budget is the primary loop backstop; `max_iters` is secondary; on exhaustion a Loop finalizes best-effort rather than failing bare (design §10.3).
+- Design intent: budget is the primary loop backstop, `max_iters` secondary. This
+  slice ships **`max_iters` only** (the cost-budget axis is dormant); on exhaustion
+  a Loop finalizes best-effort (`converged: false`) rather than failing bare
+  (design §10.3). The budget/timeout backstop + reserved-synthesis-budget are
+  deferred.

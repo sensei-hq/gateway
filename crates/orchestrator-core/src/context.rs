@@ -59,4 +59,9 @@ pub trait ContextStore: Send + Sync {
     ) -> Result<Option<ContextRef>, OrchestratorError>;
 
     async fn load(&self, r: &ContextRef) -> Result<serde_json::Value, OrchestratorError>;
+
+    /// Rehydrate an entry from an already-journaled ref (resume fold), WITHOUT
+    /// touching the CAS. Idempotent: a fold replays every write, so re-inserting
+    /// an identical `(scope, key)` must not error (unlike [`put`](Self::put)).
+    async fn insert_ref(&self, r: ContextRef) -> Result<(), OrchestratorError>;
 }

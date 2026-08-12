@@ -17,7 +17,7 @@ use kernel::types::config::{
 };
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse};
-use kernel::types::request::ToolCall;
+use kernel::types::request::{MessageRole, ToolCall};
 
 /// One recorded gateway call: the resolved model id the adapter was dispatched
 /// with, plus a fingerprint of the payload (the first user message's text).
@@ -381,4 +381,173 @@ pub async fn demo_reference_gateway() -> (Gateway, CallLog) {
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     (Gateway::new(config, adapters, cb), calls)
+}
+
+/// A stateless local adapter (like [`LocalOllamaAdapter`]) that DRIVES a ReAct
+/// loop deterministically: on a turn where a tool is offered and the transcript
+/// has no prior tool result, it emits ONE `tool_call` to the first offered tool
+/// (args shaped by tool name — `search`⇒`{query}`, `record_note`⇒`{note}`); once
+/// a tool result is present (or no tools are offered) it returns a final answer.
+/// `model: None` ⇒ the engine records the fallover candidate id. Stateless, so it
+/// is safe under a `Map`'s concurrent fan-out (a flat script would race). Used by
+/// the slice-4 e2e to exercise Observation/Mutation tools THROUGH the real
+/// reference chain without a live model.
+pub struct ToolEmittingOllamaAdapter {
+    calls: CallLog,
+}
+
+impl Model for ToolEmittingOllamaAdapter {
+    fn id(&self) -> &str {
+        "ollama"
+    }
+}
+
+#[async_trait]
+impl ChatModel for ToolEmittingOllamaAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt.clone()));
+
+        let tool_result_seen = req.messages.iter().any(|m| m.role == MessageRole::Tool);
+        match req.tools.first() {
+            Some(tool) if !tool_result_seen => {
+                let arguments = match tool.name.as_str() {
+                    "search" => serde_json::json!({ "query": prompt }).to_string(),
+                    "record_note" => serde_json::json!({ "note": prompt }).to_string(),
+                    _ => "{}".to_string(),
+                };
+                Ok(ChatResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![ToolCall {
+                        id: "tc".into(),
+                        name: tool.name.clone(),
+                        arguments,
+                    }],
+                    usage: None,
+                    model: None,
+                    degraded: false,
+                })
+            }
+            _ => Ok(ChatResponse {
+                content: Some("synthesized locally".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                model: None,
+                degraded: false,
+            }),
+        }
+    }
+}
+
+/// The REAL gateway (demo catalog / `research.bulk` fallover, as
+/// [`demo_reference_gateway`]) wired to a [`ToolEmittingOllamaAdapter`], so an
+/// agent's ReAct loop actually calls its Observation/Mutation tools end-to-end
+/// through the reference chain.
+pub async fn demo_reference_tool_gateway() -> (Gateway, CallLog) {
+    let config = gateway::catalog::assemble(gateway::catalog::demo_catalog())
+        .expect("demo catalog assembles");
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(ToolEmittingOllamaAdapter {
+            calls: calls.clone(),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(config, adapters, cb), calls)
+}
+
+/// A chat adapter that echoes the request's **system** prompt back as its answer
+/// (no tool calls). Lets a test assert what an agent's assembled system prompt
+/// contained — e.g. a dependency's output injected from the blackboard. `id`
+/// `"r"` binds it to the single-chain harness config.
+pub struct EchoSystemAdapter {
+    calls: CallLog,
+}
+
+impl Model for EchoSystemAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for EchoSystemAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let system = req.system.clone().unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), system.clone()));
+        Ok(ChatResponse {
+            content: Some(system),
+            tool_calls: Vec::new(),
+            usage: None,
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A single-chain gateway whose adapter echoes the system prompt back — the
+/// blackboard read-path fixture.
+pub async fn echo_system_gateway() -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(EchoSystemAdapter {
+            calls: calls.clone(),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
+}
+
+/// A chat adapter (`id = "r"`) that always times out — a transport fault that
+/// cools its router. Warm-gating a single-candidate chain (one `execute`) makes
+/// the NEXT `execute` return `AllGated{resume_after: Some(_)}`.
+pub struct TimeoutAdapter;
+impl Model for TimeoutAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+#[async_trait]
+impl ChatModel for TimeoutAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        Err(GatewayError::Timeout {
+            adapter: "r".into(),
+            model: "m".into(),
+            duration_ms: 1,
+        })
+    }
+}
+
+/// A single-candidate gateway whose only router times out. One warm-up `execute`
+/// cools it; the next `execute` finds the sole candidate gated → `AllGated`.
+pub async fn timeout_gateway() -> Gateway {
+    let adapters = AdapterRegistry::new();
+    adapters.register_chat(Arc::new(TimeoutAdapter)).await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    Gateway::new(single_chain_config(), adapters, cb)
 }
