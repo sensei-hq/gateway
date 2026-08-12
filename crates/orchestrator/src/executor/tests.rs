@@ -1099,6 +1099,79 @@ async fn agent_resume_halts_when_a_skill_changed_under_a_completed_turn() {
     );
 }
 
+/// A gated-OUT `OnKeywords` skill (its keyword absent from the node input) is
+/// omitted from the assembled prompt on BOTH the original run and the resume:
+/// the input is unchanged, so `is_active` reproduces the same (false) decision,
+/// the memoized turn's system prompt/input-hash is byte-identical, and the turn
+/// replays with zero re-spend (no `DeterminismViolation`). Guards that
+/// activation-gating is reproduced deterministically across the crash/resume seam.
+#[tokio::test]
+async fn agent_resume_with_a_gated_out_skill_replays_without_respend() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+
+    // Agent "a" references skill "s", gated on the keyword "summarize".
+    let registry = Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                skills: vec!["s".into()],
+                ..agent_def("c")
+            })
+            .with_skill(orchestrator_core::SkillDef {
+                name: "s".into(),
+                description: None,
+                body: "SKILL_BODY".into(),
+                activation: orchestrator_core::Activation::OnKeywords(vec!["summarize".into()]),
+            }),
+    );
+
+    // Graph [agent n1, model n2]. n1's input MISSES "summarize" → the skill is
+    // gated OUT. Run 1: n1's single turn succeeds (gateway call 1), then n2 fails
+    // (gateway call 2) → n1 is fully journaled+completed, but there is NO
+    // RunCompleted (a partial run to resume).
+    let graph = Graph {
+        nodes: vec![
+            agent_node("n1", "a", "hello world"),
+            Node {
+                id: NodeId("n2".into()),
+                kind: model_call("c", "b"),
+                deps: vec![Dep::hard("n1")],
+            },
+        ],
+    };
+    let (gw1, _c1) = failing_after_gateway(1).await;
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .run(run, &graph)
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(
+        out1.failed.is_some(),
+        "n2 fails, leaving n1's gated-out turn journaled without RunCompleted"
+    );
+
+    // Resume with the SAME registry/input: n1's turn replays from memo (the skill
+    // stays gated out → identical prompt → memo hit, NO gateway call), then n2
+    // retries and the run completes. No DeterminismViolation, and only n2 touches
+    // the gateway — n1's turn is reproduced from the memo with zero re-spend.
+    let (gw2, calls2) = recording_gateway().await;
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(registry)
+        .start(run, &graph)
+        .await
+        .expect("resume completes without a determinism violation");
+    assert!(
+        out2.failed.is_none(),
+        "resume completes cleanly (gated-out activation reproduced): {:?}",
+        out2.failed
+    );
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        1,
+        "only n2 is (re)driven on resume — n1's gated-out turn replays from memo with zero re-spend"
+    );
+}
+
 fn model_call(chain: &str, prompt: &str) -> NodeKind {
     NodeKind::ModelCall {
         chain: chain.to_string(),
