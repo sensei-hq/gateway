@@ -52,6 +52,96 @@ pub struct ToolSpec {
     pub source: Option<String>,
 }
 
+/// A capability declaration — used BOTH as a tool's required needs
+/// (`ToolSpec.permissions`) and an agent's per-tool grant
+/// (`AgentDefinition.grants[tool]`). Secure default: deny/empty everything.
+/// Declarations only this slice — runtime enforcement is SP-4.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Permissions {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub network: NetworkPolicy,
+    #[serde(default)]
+    pub caps: ResourceCaps,
+}
+
+/// Network egress policy. Default `Deny` (secure).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NetworkPolicy {
+    Deny,
+    Hosts(Vec<String>),
+    Any,
+}
+
+// Keep the manual impl (not a `#[derive(Default)]`/`#[default]` on a variant):
+// `Deny` as the secure default is a deliberate, explicit choice we don't want
+// silently re-derivable-away by variant reordering.
+#[allow(clippy::derivable_impls)]
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        NetworkPolicy::Deny
+    }
+}
+
+/// Resource ceilings; `None` = unbounded (on a grant) / no requirement (on a need).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceCaps {
+    #[serde(default)]
+    pub cpu_ms: Option<u64>,
+    #[serde(default)]
+    pub mem_bytes: Option<u64>,
+    #[serde(default)]
+    pub wall_ms: Option<u64>,
+}
+
+impl Permissions {
+    /// Does `self` (an agent's grant) cover `need` (a tool's declared needs)?
+    /// paths: each need is prefixed by some grant path. commands: needed ⊆ granted.
+    /// network/caps: see [`NetworkPolicy::covers`]/[`ResourceCaps::covers`].
+    pub fn covers(&self, need: &Permissions) -> bool {
+        need.paths
+            .iter()
+            .all(|p| self.paths.iter().any(|g| p.starts_with(g)))
+            && need.commands.iter().all(|c| self.commands.contains(c))
+            && self.network.covers(&need.network)
+            && self.caps.covers(&need.caps)
+    }
+}
+
+impl NetworkPolicy {
+    /// `Any` covers all; `Hosts(G)` covers `Hosts(N)` iff N⊆G and covers `Deny`;
+    /// `Deny` covers only `Deny`.
+    fn covers(&self, need: &NetworkPolicy) -> bool {
+        match (self, need) {
+            (NetworkPolicy::Any, _) => true,
+            (_, NetworkPolicy::Deny) => true,
+            (NetworkPolicy::Hosts(g), NetworkPolicy::Hosts(n)) => n.iter().all(|h| g.contains(h)),
+            _ => false,
+        }
+    }
+}
+
+impl ResourceCaps {
+    fn covers(&self, need: &ResourceCaps) -> bool {
+        cap_covers(self.cpu_ms, need.cpu_ms)
+            && cap_covers(self.mem_bytes, need.mem_bytes)
+            && cap_covers(self.wall_ms, need.wall_ms)
+    }
+}
+
+/// A single cap dimension: no requirement → covered; grant `None` = unlimited →
+/// covers any need; else the grant ceiling must be ≥ the need.
+fn cap_covers(grant: Option<u64>, need: Option<u64>) -> bool {
+    match (grant, need) {
+        (_, None) => true,
+        (None, Some(_)) => true,
+        (Some(g), Some(n)) => g >= n,
+    }
+}
+
 /// A registry role binding: `(area, kind)` → a gateway chain-id. The policy
 /// table that lets one edit re-point every agent of that role (§122).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,5 +818,99 @@ mod tests {
                 chain: "c".into(),
             });
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn permissions_covers_each_dimension() {
+        // paths: prefix covers; non-prefix fails.
+        let grant = Permissions {
+            paths: vec!["/workspace".into()],
+            ..Default::default()
+        };
+        let need = Permissions {
+            paths: vec!["/workspace/src/main.rs".into()],
+            ..Default::default()
+        };
+        assert!(grant.covers(&need), "prefix grant covers deeper need");
+        let bad = Permissions {
+            paths: vec!["/etc/passwd".into()],
+            ..Default::default()
+        };
+        assert!(!grant.covers(&bad), "non-prefix path not covered");
+
+        // commands: subset covers; extra needed fails.
+        let g = Permissions {
+            commands: vec!["ls".into(), "cat".into()],
+            ..Default::default()
+        };
+        assert!(g.covers(&Permissions {
+            commands: vec!["ls".into()],
+            ..Default::default()
+        }));
+        assert!(!g.covers(&Permissions {
+            commands: vec!["rm".into()],
+            ..Default::default()
+        }));
+
+        // network: Any ⊇ all; Hosts ⊇ subset & ⊇ Deny; Deny only ⊇ Deny.
+        let any = Permissions {
+            network: NetworkPolicy::Any,
+            ..Default::default()
+        };
+        let hosts = Permissions {
+            network: NetworkPolicy::Hosts(vec!["a.com".into(), "b.com".into()]),
+            ..Default::default()
+        };
+        let deny = Permissions::default(); // network defaults to Deny
+        assert!(any.covers(&hosts) && any.covers(&deny));
+        assert!(hosts.covers(&Permissions {
+            network: NetworkPolicy::Hosts(vec!["a.com".into()]),
+            ..Default::default()
+        }));
+        assert!(hosts.covers(&deny));
+        assert!(!hosts.covers(&any), "Hosts grant does not cover Any need");
+        assert!(!deny.covers(&hosts), "Deny grant does not cover Hosts need");
+        assert!(deny.covers(&Permissions::default()), "Deny covers Deny");
+
+        // caps: need ≤ grant covers; need > grant fails; grant None = unlimited; need None trivially covered.
+        let capped = Permissions {
+            caps: ResourceCaps {
+                mem_bytes: Some(1000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(capped.covers(&Permissions {
+            caps: ResourceCaps {
+                mem_bytes: Some(500),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        assert!(!capped.covers(&Permissions {
+            caps: ResourceCaps {
+                mem_bytes: Some(2000),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let uncapped = Permissions::default(); // caps all None
+        assert!(
+            uncapped.covers(&Permissions {
+                caps: ResourceCaps {
+                    mem_bytes: Some(9999),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            "grant None cap = unlimited, covers any need"
+        );
+        assert!(
+            capped.covers(&Permissions::default()),
+            "need None cap trivially covered"
+        );
+
+        // empty needs covered by anything (incl. an empty grant).
+        assert!(Permissions::default().covers(&Permissions::default()));
     }
 }
