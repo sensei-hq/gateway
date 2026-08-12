@@ -5272,3 +5272,26 @@ async fn subgraph_drives_a_nested_agent_end_to_end() {
         out.outputs[&s]
     );
 }
+
+/// Edge case (whole-slice review): a `Subgraph` wrapping an EMPTY DAG validates and
+/// completes trivially with an empty sink map `{}` (no nodes ⇒ no sinks). Documents
+/// the behavior so a future "reject empty subgraph" decision is a conscious change.
+#[tokio::test]
+async fn an_empty_subgraph_completes_with_an_empty_sink_map() {
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let s = NodeId("s".into());
+    let graph = Graph {
+        nodes: vec![subgraph_node("s", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert_eq!(
+        out.outputs[&s],
+        serde_json::json!({}),
+        "empty subgraph → empty sink map"
+    );
+}
