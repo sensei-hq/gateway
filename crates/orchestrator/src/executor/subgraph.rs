@@ -73,6 +73,14 @@ impl Executor {
     /// Drive a `Subgraph` node's nested DAG under `"{node}/…"` and fold the nested
     /// outcome into this node's `NodeExec`: paused ⇒ `Paused`, failed ⇒ `Failed`,
     /// else `Completed(sink map)`.
+    ///
+    /// Known limitation (fresh-vs-terminal asymmetry, shared with `Map`/`Loop`
+    /// synthesized outputs): the `Completed` sink map is NOT journaled as an
+    /// `EffectRecorded`, so a terminal re-`start` reconstructs `outputs` from the
+    /// journal's per-node effects — the namespaced inner nodes (`"{node}/…"`), not
+    /// the sink map under `node.id`. Captured by
+    /// `re_starting_a_completed_subgraph_run_returns_the_folded_outcome`; not fixed
+    /// in slice 1.
     pub(super) async fn run_subgraph(
         &self,
         run: RunId,

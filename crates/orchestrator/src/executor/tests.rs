@@ -5044,3 +5044,231 @@ async fn subgraph_nesting_beyond_max_depth_halts_loud() {
         .expect("runs within default depth");
     assert!(ok.failed.is_none(), "{ok:?}");
 }
+
+/// Failure propagates OUT of a subgraph: a nested node that fails makes the whole
+/// `Subgraph` node `Failed`, which then cascade-skips the node's HARD dependents in
+/// the OUTER graph while leaving a SOFT dependent runnable (soft edges never
+/// cascade). Proves `run_subgraph`'s Failed mapping is wired to the outer scheduler.
+#[tokio::test]
+async fn a_failing_nested_node_fails_the_subgraph_and_cascades_hard_dependents() {
+    let (gateway, _c) = failing_after_gateway(0).await; // 0 successes ⇒ fails immediately
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let graph = Graph {
+        nodes: vec![
+            subgraph_node("s", vec![mc("n1", None)]),
+            Node {
+                id: NodeId("d".into()),
+                kind: NodeKind::ModelCall {
+                    chain: "c".into(),
+                    payload: serde_json::json!(0),
+                },
+                deps: vec![Dep {
+                    on: NodeId("s".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+            Node {
+                id: NodeId("e".into()),
+                kind: NodeKind::ModelCall {
+                    chain: "c".into(),
+                    payload: serde_json::json!(0),
+                },
+                deps: vec![Dep {
+                    on: NodeId("s".into()),
+                    kind: EdgeKind::Soft,
+                }],
+            },
+        ],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("outcome");
+    assert!(out.failed.is_some(), "the subgraph failed: {out:?}");
+    assert!(
+        out.skipped.contains(&NodeId("d".into())),
+        "hard dependent cascade-skipped: {out:?}"
+    );
+    // The soft dependent is NEVER cascade-skipped — it stays runnable even though
+    // "s" failed (here it then fails too against the always-failing gateway, but it
+    // is emphatically not in `skipped`).
+    assert!(
+        !out.skipped.contains(&NodeId("e".into())),
+        "soft dependent is not cascade-skipped: {out:?}"
+    );
+}
+
+/// Pause propagates OUT of a subgraph: an in-doubt Mutation inside a NESTED agent
+/// pauses that agent (`RunPaused` journaled), `run_subgraph` maps the nested
+/// `RunOutcome.paused` → `NodeExec::Paused`, and the outer scheduler pauses the whole
+/// run — it must NEVER journal `RunCompleted` over the unresolved Intent. This is the
+/// `in_doubt_mutation_in_a_map_child_pauses_the_whole_run` shape with the mutation-
+/// bearing agent wrapped in a `Subgraph` instead of a `Map`.
+#[tokio::test]
+async fn an_in_doubt_mutation_in_a_subgraph_pauses_the_run() {
+    let run = RunId(uuid::Uuid::new_v4());
+    let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
+        let recorder = AgentDefinition {
+            name: "recorder".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: Some("research.bulk".into()),
+            chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            tools: vec!["record_note".into()],
+            skills: vec![],
+            system_prompt: "Record.".into(),
+        };
+        (
+            Arc::new(
+                Registry::default()
+                    .with_agent(recorder)
+                    .with_tool(RecordNote::new(sink.clone()).spec()),
+            ),
+            Arc::new(ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink)))),
+        )
+    };
+    // Same harness as the Map-child test, but the mutation-bearing agent lives inside
+    // a Subgraph "s" (inner node "s/n1") rather than a Map.
+    let subgraph = Graph {
+        nodes: vec![subgraph_node(
+            "s",
+            vec![agent_node("n1", "recorder", "item-0")],
+        )],
+    };
+
+    // Seed: run the subgraph to completion, then truncate to the nested agent's
+    // record_note EffectIntent (drops its EffectRecorded) → in-doubt on resume.
+    let full = InMemoryJournal::new();
+    let (seed_reg, seed_tools) = mk_recorder(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let (gw_s, _c) = demo_reference_tool_gateway().await;
+    Executor::new(Arc::new(gw_s), Arc::new(full.clone()), "v1")
+        .with_registry(seed_reg)
+        .with_tools(seed_tools)
+        .run(run, &subgraph)
+        .await
+        .expect("seed Subgraph run completes");
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("the nested agent journaled a record_note EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // Resume with an Indeterminate reconciler + a FRESH empty sink → the nested
+    // Mutation is in-doubt → the nested agent pauses → the subgraph pauses → the run
+    // pauses.
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (reg, tools) = mk_recorder(sink.clone());
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (gw_r, _c2) = demo_reference_tool_gateway().await;
+    let outcome = Executor::new(Arc::new(gw_r), Arc::new(seeded.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(tools)
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &subgraph)
+        .await
+        .expect("resume yields an outcome");
+
+    let pause = outcome
+        .paused
+        .expect("the in-doubt nested Mutation pauses the whole run");
+    assert_eq!(
+        pause.node,
+        NodeId("s".into()),
+        "the Subgraph node is the pause point"
+    );
+    let resumed = seeded.load(run).await.unwrap();
+    assert!(
+        resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run must NOT complete over an unresolved in-doubt Intent (no silent failure)"
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+}
+
+/// Terminal-resume output shape (a code-review follow-up): re-`start`ing an
+/// ALREADY-COMPLETED subgraph run returns the folded outcome WITHOUT re-driving.
+/// This documents a known fresh-vs-terminal ASYMMETRY (shared with Map/Loop
+/// synthesized outputs): a fresh `run` returns the subgraph's synthesized sink map
+/// under "s", but the terminal fold reconstructs `outputs` from the journal's
+/// per-node `EffectRecorded` — which for a subgraph are the NAMESPACED inner nodes
+/// ("s/n1"), never the synthesized "s" sink map. Captured here, not fixed in slice 1.
+#[tokio::test]
+async fn re_starting_a_completed_subgraph_run_returns_the_folded_outcome() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![subgraph_node("s", vec![mc("n1", None)])],
+    };
+    // Fresh run completes: "s" carries the synthesized sink map {n1: <output>}.
+    {
+        let (gw, _c) = recording_gateway().await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1");
+        let o1 = exec.run(run, &graph).await.expect("run1");
+        assert!(o1.failed.is_none());
+        assert!(
+            o1.outputs[&NodeId("s".into())].get("n1").is_some(),
+            "fresh run: sink map under s"
+        );
+    }
+    // Re-start the already-terminal run: returns the folded outcome without re-driving.
+    {
+        let (gw, _c) = recording_gateway().await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1");
+        let o2 = exec.start(run, &graph).await.expect("terminal replay");
+        assert!(o2.failed.is_none(), "terminal replay succeeds: {o2:?}");
+        // The REAL terminal-replay shape: the synthesized "s" sink map is ABSENT
+        // (it is never journaled), and the namespaced inner output "s/n1" is present
+        // instead. KNOWN LIMITATION — the fresh-vs-terminal asymmetry (Map/Loop share
+        // it); documented, not fixed, in this slice.
+        assert!(
+            !o2.outputs.contains_key(&NodeId("s".into())),
+            "terminal replay: the synthesized sink map under s is absent (known asymmetry): {:?}",
+            o2.outputs
+        );
+        assert!(
+            o2.outputs.contains_key(&NodeId("s/n1".into())),
+            "terminal replay: the namespaced inner node output is present instead: {:?}",
+            o2.outputs
+        );
+    }
+}
+
+/// End-to-end: a `Subgraph` drives a nested `Agent` node through the real gateway,
+/// and the agent's output is the subgraph's sink (`{n1: <agent output>}`).
+#[tokio::test]
+async fn subgraph_drives_a_nested_agent_end_to_end() {
+    let (gateway, _c) = recording_gateway().await;
+    let registry = agent_registry("c");
+    let s = NodeId("s".into());
+    let graph = Graph {
+        nodes: vec![subgraph_node("s", vec![agent_node("n1", "a", "hi")])],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry);
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&s].get("n1").is_some(),
+        "nested agent output is the subgraph sink: {}",
+        out.outputs[&s]
+    );
+}
