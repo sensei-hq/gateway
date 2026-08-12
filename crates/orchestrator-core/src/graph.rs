@@ -16,8 +16,8 @@ pub enum NodeKind {
         agent: crate::registry::AgentRef,
         input: serde_json::Value,
         /// Optional phase selecting a per-phase chain (`AgentDefinition::chains`);
-        /// `None` resolves the agent's default chain. A node attribute, fixed for
-        /// the run — not a mid-loop transition.
+        /// `None` resolves via the agent's explicit `chain` or its `(area,kind)`
+        /// binding. A node attribute, fixed for the run — not a mid-loop transition.
         phase: Option<String>,
     },
     /// A single DAG node that fans out INTERNALLY over `over`, running `body`
