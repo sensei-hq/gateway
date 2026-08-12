@@ -80,7 +80,7 @@ impl Executor {
             fold,
         };
 
-        let mut messages: Vec<Message> = vec![Message::text(MessageRole::User, query.clone())];
+        let mut messages: Vec<Message> = vec![Message::text(MessageRole::User, query)];
         let mut node_started = fold.started.contains(node_id);
 
         // Best-effort hook (§15): fire `on_agent_started` once, gated on the same
