@@ -1049,6 +1049,7 @@ async fn agent_resume_halts_when_a_skill_changed_under_a_completed_turn() {
                     name: "s".into(),
                     description: None,
                     body: body.into(),
+                    activation: orchestrator_core::Activation::default(),
                 }),
         )
     };
@@ -4265,6 +4266,7 @@ async fn granted_tool_permissions_are_inert_end_to_end() {
             network: NetworkPolicy::Any,
             ..Default::default()
         },
+        activation: orchestrator_core::Activation::default(),
     };
     let mut agent = agent_def("c");
     agent.tools = vec!["calc".into()];
@@ -4325,6 +4327,7 @@ async fn granted_tool_executes_normally_declarations_dont_gate() {
             network: NetworkPolicy::Any,
             ..Default::default()
         },
+        activation: orchestrator_core::Activation::default(),
     };
     let mut agent = agent_def("c");
     agent.tools = vec!["calc".into()];
