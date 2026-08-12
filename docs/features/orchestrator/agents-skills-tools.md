@@ -61,7 +61,10 @@ source: crates/orchestrator*
 > rendered input (matched once per run, case-insensitive substring ANY-of) —
 > progressive disclosure to fit the prompt budget. `Always` is byte-identical to the
 > old behavior; over-budget still halts loud (no silent truncation). Determinism-safe
-> (the query is the node input, already in `agent_input_hash`). **Deferred:** per-agent
+> (the query is the node input, already in `agent_input_hash`). Activation gates prompt
+> **disclosure**, not execution: a tool gated out of a run's prompt simply isn't offered
+> to the model that run — the permission grants (slice 3), validated at load, remain the
+> security boundary. **Deferred:** per-agent
 > override, planner-selected activation (SP-3), retrieval-ranked / semantic match (SP-7),
 > per-turn re-activation, prompt compaction (SP-7).
 
