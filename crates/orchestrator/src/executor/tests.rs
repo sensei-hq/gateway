@@ -4501,3 +4501,105 @@ async fn activation_shapes_the_assembled_prompt_end_to_end() {
     // Input misses → gated skill body absent (but the run still completes).
     assert!(!run_with("hello there").await.contains("GATED_BODY"));
 }
+
+#[tokio::test]
+async fn reload_bumps_the_run_version_and_fences_in_flight_resume() {
+    use orchestrator_core::{RegistryConfig, RegistryHandle};
+    use orchestrator_store::InMemoryConfigSource;
+    let handle = RegistryHandle::new(Registry::default().with_agent(agent_def("c")));
+    let journal = InMemoryJournal::new();
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry_handle(handle.clone());
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "hi")],
+    };
+    exec.run(run, &graph).await.expect("run at gen 0");
+
+    // The run recorded the pinned version "v1#cfg0".
+    let recorded = journal
+        .load(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::RunStarted { version } => Some(version),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(recorded, "v1#cfg0");
+
+    // Reload → gen 1. Resuming the gen-0 run on the (now gen-1) executor is fenced.
+    handle
+        .reload(&InMemoryConfigSource(RegistryConfig {
+            agents: vec![agent_def("c")],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        }))
+        .await
+        .unwrap();
+    let err = exec
+        .start(run, &graph)
+        .await
+        .expect_err("reload fences the in-flight resume");
+    assert!(
+        matches!(
+            &err,
+            OrchestratorError::VersionFenceMismatch { recorded, current }
+                if recorded == "v1#cfg0" && current == "v1#cfg1"
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn each_run_pins_the_generation_live_at_its_start() {
+    use orchestrator_core::{RegistryConfig, RegistryHandle};
+    use orchestrator_store::InMemoryConfigSource;
+    let handle = RegistryHandle::new(Registry::default().with_agent(agent_def("c")));
+    let journal = InMemoryJournal::new();
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry_handle(handle.clone());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "hi")],
+    };
+
+    let run_a = RunId(uuid::Uuid::new_v4());
+    exec.run(run_a, &graph).await.expect("run A @ gen0");
+    handle
+        .reload(&InMemoryConfigSource(RegistryConfig {
+            agents: vec![agent_def("c")],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        }))
+        .await
+        .unwrap();
+    let run_b = RunId(uuid::Uuid::new_v4());
+    exec.run(run_b, &graph).await.expect("run B @ gen1");
+
+    let version_of = |r: RunId| {
+        let j = journal.clone();
+        async move {
+            j.load(r)
+                .await
+                .unwrap()
+                .into_iter()
+                .find_map(|(_, e)| match e {
+                    JournalEvent::RunStarted { version } => Some(version),
+                    _ => None,
+                })
+                .unwrap()
+        }
+    };
+    assert_eq!(version_of(run_a).await, "v1#cfg0", "run A pinned gen 0");
+    assert_eq!(
+        version_of(run_b).await,
+        "v1#cfg1",
+        "run B pinned gen 1 (live at its start)"
+    );
+}
