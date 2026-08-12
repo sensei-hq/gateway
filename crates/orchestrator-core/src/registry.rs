@@ -142,6 +142,31 @@ fn cap_covers(grant: Option<u64>, need: Option<u64>) -> bool {
     }
 }
 
+/// When a skill/tool is composed into the prompt (definition-level, §129).
+/// `Always` (default) = unconditional inclusion (today's behavior). `OnKeywords`
+/// = progressive disclosure: include only when the agent's input matches.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum Activation {
+    #[default]
+    Always,
+    OnKeywords(Vec<String>),
+}
+
+impl Activation {
+    /// Is this active for `query` (the agent's rendered input text)?
+    /// `Always` → true. `OnKeywords` → true iff `query` contains ANY keyword,
+    /// case-insensitively (an empty keyword list matches nothing).
+    pub fn is_active(&self, query: &str) -> bool {
+        match self {
+            Activation::Always => true,
+            Activation::OnKeywords(kw) => {
+                let q = query.to_lowercase();
+                kw.iter().any(|k| q.contains(&k.to_lowercase()))
+            }
+        }
+    }
+}
+
 /// A registry role binding: `(area, kind)` → a gateway chain-id. The policy
 /// table that lets one edit re-point every agent of that role (§122).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1007,5 +1032,28 @@ mod tests {
 
         // empty needs covered by anything (incl. an empty grant).
         assert!(Permissions::default().covers(&Permissions::default()));
+    }
+
+    #[test]
+    fn activation_is_active_matches_keywords_case_insensitively() {
+        assert!(Activation::Always.is_active(""));
+        assert!(Activation::Always.is_active("anything"));
+
+        let on = Activation::OnKeywords(vec!["Summarize".into(), "TLDR".into()]);
+        assert!(
+            on.is_active("please summarize this"),
+            "case-insensitive substring, any-of"
+        );
+        assert!(on.is_active("give me a tldr"));
+        assert!(
+            !on.is_active("translate to french"),
+            "no keyword → inactive"
+        );
+
+        // Empty keyword list matches nothing.
+        assert!(!Activation::OnKeywords(vec![]).is_active("summarize"));
+
+        // Default is Always.
+        assert_eq!(Activation::default(), Activation::Always);
     }
 }
