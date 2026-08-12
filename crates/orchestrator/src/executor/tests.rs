@@ -1771,7 +1771,7 @@ async fn start_halts_on_determinism_violation_without_calling_gateway() {
             run,
             JournalEvent::EffectRecorded {
                 node: n1.clone(),
-                effect_id: effect_id("", 0, 0),
+                effect_id: effect_id("n1", 0, 0),
                 class: EffectClass::Pure,
                 input_hash: ih_a,
                 seq: 0,
@@ -4902,5 +4902,117 @@ async fn subgraph_inner_nodes_replay_from_memo_on_resume() {
     assert_eq!(
         recorded2[0].1, "n2",
         "the single resume call carried n2's prompt"
+    );
+}
+
+/// Fix A regression: a completed `Subgraph` drives its nested DAG through the SAME
+/// run's `drive`, which must NOT append `RunCompleted` — that is a run-level event.
+/// Here run 1 completes the subgraph then fails at the tail node `d`; the journal
+/// must carry NO premature `RunCompleted`, and a resume (where `d` succeeds) must
+/// finish the run. Before Fix A, the nested drive emitted a `RunCompleted` for the
+/// whole run, so `start` treated it as terminal and never resumed `d`.
+#[tokio::test]
+async fn a_run_with_a_completed_subgraph_and_a_failing_tail_resumes_correctly() {
+    // Outer: subgraph "s" (nested n1) → node "d" (Hard-dep s). Run 1 fails at "d";
+    // the subgraph's completion must NOT prematurely mark the whole run complete.
+    let graph = Graph {
+        nodes: vec![
+            subgraph_node("s", vec![mc("n1", None)]),
+            Node {
+                id: NodeId("d".into()),
+                kind: NodeKind::ModelCall {
+                    chain: "c".into(),
+                    payload: serde_json::json!("d"),
+                },
+                deps: vec![Dep {
+                    on: NodeId("s".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+        ],
+    };
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // Run 1: gateway succeeds for the subgraph's inner node (call 1) then fails at
+    // "d" (call 2).
+    {
+        let (gw, _c) = failing_after_gateway(1).await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1");
+        let o1 = exec.run(run, &graph).await.expect("run1");
+        assert!(o1.failed.is_some(), "tail failed: {o1:?}");
+    }
+    // The journal must have NO RunCompleted yet (the subgraph's completion must not
+    // have emitted one for the whole run).
+    let rc = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| matches!(e, JournalEvent::RunCompleted))
+        .count();
+    assert_eq!(rc, 0, "no premature RunCompleted from the subgraph");
+    // Resume on a gateway where "d" succeeds → the run completes (tail re-driven).
+    {
+        let (gw, _c) = recording_gateway().await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1");
+        let o2 = exec.start(run, &graph).await.expect("resume");
+        assert!(o2.failed.is_none(), "resume completes the tail: {o2:?}");
+    }
+}
+
+/// Fix B regression: a sibling top-level `ModelCall` (`m`, ready index 0) and a
+/// subgraph's inner `ModelCall` (`s/n1`, the nested drive's ready index 0) must
+/// record under DISTINCT effect ids. With the old empty-prefix, index-based scheme
+/// both keyed `effect_id("", 0, 0)` — a collision that poisons the resume memo.
+/// Node-id-scoped ids (`effect_id(&node.id.0, 0, 0)`) keep them apart. Asserting
+/// the recorded effect ids directly makes this load-bearing: reverting Fix B makes
+/// the two ids equal and trips the `assert_ne!`.
+#[tokio::test]
+async fn a_sibling_modelcall_and_a_subgraph_inner_modelcall_do_not_share_an_effect_id() {
+    let (gateway, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let m = NodeId("m".into());
+    let s = NodeId("s".into());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: m.clone(),
+                kind: NodeKind::ModelCall {
+                    chain: "c".into(),
+                    payload: serde_json::json!("M"),
+                },
+                deps: vec![],
+            },
+            subgraph_node("s", vec![mc("n1", None)]),
+        ],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs.contains_key(&m),
+        "outer ModelCall produced output"
+    );
+    assert!(
+        out.outputs[&s].get("n1").is_some(),
+        "subgraph inner ModelCall produced its own output"
+    );
+
+    // The two recorded ModelCall effects must have DISTINCT ids (no collision).
+    let eids: Vec<EffectId> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded { effect_id, .. } => Some(effect_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(eids.len(), 2, "two ModelCall effects recorded: {eids:?}");
+    assert_ne!(
+        eids[0], eids[1],
+        "a sibling and a nested ModelCall must not share an effect id"
     );
 }

@@ -266,7 +266,9 @@ impl Executor {
             },
         )
         .await?;
-        self.drive(run, graph, &Fold::default()).await
+        let outcome = self.drive(run, graph, &Fold::default()).await?;
+        self.finalize_run(run, &outcome).await?;
+        Ok(outcome)
     }
 
     /// Resume (or freshly start) a run from its durable journal — the headline
@@ -360,7 +362,9 @@ impl Executor {
 
         // Resume the tail: `drive`'s memo branch replays the completed prefix
         // (no gateway call, no new `EffectRecorded`) and finishes the run.
-        self.drive(run, graph, &fold).await
+        let outcome = self.drive(run, graph, &fold).await?;
+        self.finalize_run(run, &outcome).await?;
+        Ok(outcome)
     }
 
     /// Shared node loop for both `run` (an empty [`Fold`]) and `start` (a `Fold`
@@ -419,13 +423,29 @@ impl Executor {
             // unless the run later crashes and resumes.
             self.write_snapshot(run, &state.outcome).await?;
         }
-        // A run with any failure OR a durable pause is not marked complete — it
-        // stays resumable (the slice-1/2 contract), even though soft-dependent
-        // branches ran.
-        if state.outcome.failed.is_none() && state.outcome.paused.is_none() {
+        // NOTE: `drive` does NOT append `RunCompleted` — that is a RUN-level event,
+        // appended once by the run-level callers (`run_inner`/`start_inner`) via
+        // [`finalize_run`]. This matters for a `Subgraph` node, which drives its
+        // nested DAG through `drive` in the SAME run (SP-3): a completing nested
+        // drive must not emit a premature/duplicate `RunCompleted` for the whole
+        // run. `drive` just returns the outcome; the finalizer decides completion.
+        Ok(state.outcome)
+    }
+
+    /// Append `RunCompleted` iff the run's outcome is clean (no failure, no durable
+    /// pause) — a RUN-level finalization done once by the top-level `run_inner`/
+    /// `start_inner`, NOT inside [`drive`] (so a nested `Subgraph` drive can't emit
+    /// a premature/duplicate one). A failed or paused run is left unmarked so it
+    /// stays resumable (the slice-1/2 contract).
+    async fn finalize_run(
+        &self,
+        run: RunId,
+        outcome: &RunOutcome,
+    ) -> Result<(), OrchestratorError> {
+        if outcome.failed.is_none() && outcome.paused.is_none() {
             self.append(run, JournalEvent::RunCompleted).await?;
         }
-        Ok(state.outcome)
+        Ok(())
     }
 
     /// Fold one scheduled node's run result into the drive `state`. A
@@ -531,27 +551,29 @@ impl Executor {
         Ok(())
     }
 
-    /// Execute one node to a terminal result. `index` is the node's declaration
-    /// position, which keys a `ModelCall`'s structural effect id
-    /// (`effect_id("", 0, index)` — the slice-1 scheme, preserved). A memoized
-    /// `ModelCall` replays with no gateway call and no new journal event; a
-    /// live one journals `NodeStarted → EffectRecorded → NodeCompleted`. An
-    /// `Agent` node delegates to [`drive_agent`](Self::drive_agent), which owns
-    /// its own per-turn journaling. A determinism violation propagates as `Err`
-    /// (halting the run before any gateway call). `prior_outputs` carries the
-    /// outputs of already-completed nodes this round advances past — a
-    /// `Consolidate` reads its Map's result from it.
+    /// Execute one node to a terminal result. A `ModelCall`'s structural effect id
+    /// is keyed by the node's **id** (`effect_id(&node.id.0, 0, 0)` — node ids are
+    /// unique within a graph and namespaced across nesting, e.g. `"{sub}/n1"`), so
+    /// a nested `Subgraph`'s inner `ModelCall` can never collide with an outer one
+    /// (an empty-prefix, index-based id would, since each fresh `drive`'s ready-set
+    /// index restarts at 0). A memoized `ModelCall` replays with no gateway call and
+    /// no new journal event; a live one journals `NodeStarted → EffectRecorded →
+    /// NodeCompleted`. An `Agent` node delegates to [`drive_agent`](Self::drive_agent),
+    /// which owns its own per-turn journaling. A determinism violation propagates as
+    /// `Err` (halting the run before any gateway call). `prior_outputs` carries the
+    /// outputs of already-completed nodes this round advances past — a `Consolidate`
+    /// reads its Map's result from it.
     async fn run_node(
         &self,
         run: RunId,
-        index: usize,
+        _index: usize,
         node: &orchestrator_core::Node,
         fold: &Fold,
         prior_outputs: &HashMap<NodeId, serde_json::Value>,
     ) -> Result<NodeExec, OrchestratorError> {
         match &node.kind {
             NodeKind::ModelCall { chain, payload } => {
-                let eid = effect_id("", 0, index);
+                let eid = effect_id(&node.id.0, 0, 0);
                 let ih = input_hash(chain, payload)?;
 
                 if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
