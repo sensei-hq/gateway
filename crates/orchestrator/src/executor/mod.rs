@@ -8,7 +8,7 @@ use gateway::Gateway;
 use orchestrator_core::{
     Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId, EffectOutput,
     ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError,
-    OrchestratorHooks, Registry, RunId, Scope, Seq, SystemClock, effect_id,
+    OrchestratorHooks, Registry, RegistryHandle, RunId, Scope, Seq, SystemClock, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -24,6 +24,7 @@ use support::{
 };
 
 /// The deterministic executor over a durable journal, wired to the gateway.
+#[derive(Clone)]
 pub struct Executor {
     gateway: Arc<Gateway>,
     journal: Arc<dyn ExecutionJournal>,
@@ -53,6 +54,9 @@ pub struct Executor {
     context: Option<Arc<dyn ContextStore>>,
     /// Best-effort observability hooks (§15). `None` ⇒ no firing (byte-identical).
     hooks: Option<Arc<dyn OrchestratorHooks>>,
+    /// A hot-reload handle (SP-2 slice 5). When wired, each run pins the handle's
+    /// current registry + config generation at entry. `None` ⇒ the fixed `registry`.
+    handle: Option<RegistryHandle>,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -138,6 +142,7 @@ impl Executor {
             reconcilers: Arc::new(ReconcileRegistry::default()),
             context: None,
             hooks: None,
+            handle: None,
         }
     }
 
@@ -169,6 +174,14 @@ impl Executor {
     /// Attach the agent registry an `Agent` node resolves its definition against.
     pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
         self.registry = registry;
+        self
+    }
+
+    /// Wire a hot-reloadable [`RegistryHandle`] (SP-2 slice 5). Each `run`/`start`
+    /// pins the handle's current registry + generation; a reload bumps the
+    /// generation, folded into the fence version so a run uses one generation.
+    pub fn with_registry_handle(mut self, handle: RegistryHandle) -> Self {
+        self.handle = Some(handle);
         self
     }
 
@@ -217,9 +230,31 @@ impl Executor {
         self
     }
 
+    /// A per-run clone with the registry + fence version pinned from a
+    /// `RegistryHandle` snapshot (handle cleared, so the pinned copy resolves the
+    /// fixed registry directly — no double-pin).
+    fn pinned(mut self, registry: Arc<Registry>, generation: u64) -> Self {
+        self.version = format!("{}#cfg{}", self.version, generation);
+        self.registry = registry;
+        self.handle = None;
+        self
+    }
+
     /// Execute a fresh linear graph end-to-end: journal `RunStarted`, then drive
     /// every node with an empty memo (nothing has run yet).
     pub async fn run(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
+        if let Some(h) = &self.handle {
+            let (registry, generation) = h.snapshot();
+            return self
+                .clone()
+                .pinned(registry, generation)
+                .run_inner(run, graph)
+                .await;
+        }
+        self.run_inner(run, graph).await
+    }
+
+    async fn run_inner(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
         self.append(
             run,
@@ -248,6 +283,22 @@ impl Executor {
     ///
     /// [`VersionFenceMismatch`]: OrchestratorError::VersionFenceMismatch
     pub async fn start(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
+        if let Some(h) = &self.handle {
+            let (registry, generation) = h.snapshot();
+            return self
+                .clone()
+                .pinned(registry, generation)
+                .start_inner(run, graph)
+                .await;
+        }
+        self.start_inner(run, graph).await
+    }
+
+    async fn start_inner(
+        &self,
+        run: RunId,
+        graph: &Graph,
+    ) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
         let events = self
             .journal
@@ -255,8 +306,9 @@ impl Executor {
             .await
             .map_err(OrchestratorError::Journal)?;
         if events.is_empty() {
-            // Nothing journaled → a fresh run (appends `RunStarted` itself).
-            return self.run(run, graph).await;
+            // Nothing journaled → a fresh run (appends `RunStarted` itself). Already
+            // pinned, so call `run_inner` directly (avoid a redundant handle re-check).
+            return self.run_inner(run, graph).await;
         }
 
         // Version fence: the first recorded `RunStarted.version` must match ours.
