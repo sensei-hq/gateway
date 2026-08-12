@@ -51,6 +51,10 @@ pub enum NodeKind {
         gate: LoopGate,
         max_iters: usize,
     },
+    /// A node whose work is a whole nested DAG, driven under this node's path in
+    /// the SAME run (SP-3). `Box` breaks the recursive type (NodeKind → Graph →
+    /// Node → NodeKind). Static this slice; slice 3 produces subgraphs at runtime.
+    Subgraph { graph: Box<Graph> },
 }
 
 /// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure
@@ -234,6 +238,13 @@ impl Graph {
             }
         }
 
+        // A `Subgraph`'s nested graph must itself be a valid DAG (recursive).
+        for node in &self.nodes {
+            if let NodeKind::Subgraph { graph } = &node.kind {
+                graph.validate_dag()?;
+            }
+        }
+
         // 3. Acyclic — Kahn's algorithm. `in_degree` counts each node's deps
         // (edges point dep.on → node); repeatedly retire zero-in-degree nodes.
         // If any remain, a cycle exists (no topological order).
@@ -394,5 +405,85 @@ mod tests {
             ],
         };
         assert!(g.validate_dag().is_ok());
+    }
+
+    #[test]
+    fn validate_dag_recurses_into_subgraphs() {
+        let nested_cycle = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("a".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!(0),
+                    },
+                    deps: vec![Dep {
+                        on: NodeId("b".into()),
+                        kind: EdgeKind::Hard,
+                    }],
+                },
+                Node {
+                    id: NodeId("b".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!(0),
+                    },
+                    deps: vec![Dep {
+                        on: NodeId("a".into()),
+                        kind: EdgeKind::Hard,
+                    }],
+                },
+            ],
+        };
+        let outer = Graph {
+            nodes: vec![Node {
+                id: NodeId("s".into()),
+                kind: NodeKind::Subgraph {
+                    graph: Box::new(nested_cycle),
+                },
+                deps: vec![],
+            }],
+        };
+        assert!(
+            matches!(
+                outer.validate_dag(),
+                Err(OrchestratorError::InvalidGraph(_))
+            ),
+            "a nested cycle is rejected recursively"
+        );
+
+        let nested_ok = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("a".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!(0),
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("b".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!(0),
+                    },
+                    deps: vec![Dep {
+                        on: NodeId("a".into()),
+                        kind: EdgeKind::Hard,
+                    }],
+                },
+            ],
+        };
+        let outer_ok = Graph {
+            nodes: vec![Node {
+                id: NodeId("s".into()),
+                kind: NodeKind::Subgraph {
+                    graph: Box::new(nested_ok),
+                },
+                deps: vec![],
+            }],
+        };
+        assert!(outer_ok.validate_dag().is_ok());
     }
 }
