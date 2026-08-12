@@ -4832,18 +4832,13 @@ async fn subgraph_diamond_returns_all_sink_outputs() {
     assert!(sub.get("a").is_none(), "a is not a sink");
 }
 
-/// Resume-no-respend across the subgraph boundary: run 1 dies partway *inside* the
-/// subgraph (inner `n1` completes, inner `n2` fails), so on resume the subgraph's
-/// already-completed inner node replays from the memo — the resume gateway is
-/// called only for the node that actually failed.
-///
-/// ADAPTATION (noted in the task report): the task's suggested shape — fail at an
-/// outer node `d` that hard-deps a *completed* subgraph — is infeasible with the
-/// reused `self.drive`: a fully-completing nested `drive` appends a `RunCompleted`
-/// into the SAME run's journal, which makes `start` treat the whole run as terminal
-/// prematurely (it would never resume `d`). Failing *inside* the subgraph keeps the
-/// nested drive from completing (no premature `RunCompleted`) and still proves the
-/// headline: completed inner nodes replay from the memo with no re-spend.
+/// Proves a subgraph's inner nodes replay from the memo across the subgraph
+/// boundary on resume (no re-spend): run 1 dies partway *inside* the subgraph
+/// (inner `n1` completes, inner `n2` fails), so on resume the already-completed
+/// inner node replays from the memo — the resume gateway is called only for the
+/// node that actually failed. The complementary shape — a failing outer tail that
+/// hard-deps a *completed* subgraph — is covered by
+/// `a_run_with_a_completed_subgraph_and_a_failing_tail_resumes_correctly`.
 #[tokio::test]
 async fn subgraph_inner_nodes_replay_from_memo_on_resume() {
     let journal = InMemoryJournal::new();
