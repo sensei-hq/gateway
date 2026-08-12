@@ -861,8 +861,20 @@ mod tests {
         }));
         assert!(hosts.covers(&deny));
         assert!(!hosts.covers(&any), "Hosts grant does not cover Any need");
+        assert!(
+            !hosts.covers(&Permissions {
+                network: NetworkPolicy::Hosts(vec!["c.com".into()]),
+                ..Default::default()
+            }),
+            "Hosts grant missing the needed host is not covered"
+        );
         assert!(!deny.covers(&hosts), "Deny grant does not cover Hosts need");
         assert!(deny.covers(&Permissions::default()), "Deny covers Deny");
+        assert_eq!(
+            NetworkPolicy::default(),
+            NetworkPolicy::Deny,
+            "network default is the secure Deny"
+        );
 
         // caps: need ≤ grant covers; need > grant fails; grant None = unlimited; need None trivially covered.
         let capped = Permissions {
