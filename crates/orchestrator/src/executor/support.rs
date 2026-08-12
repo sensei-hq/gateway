@@ -22,13 +22,12 @@ pub(crate) fn ready_nodes<'g>(
     graph: &'g Graph,
     completed: &HashSet<NodeId>,
     terminal: &HashSet<NodeId>,
-) -> Vec<(usize, &'g Node)> {
+) -> Vec<&'g Node> {
     graph
         .nodes
         .iter()
-        .enumerate()
-        .filter(|(_, node)| !terminal.contains(&node.id))
-        .filter(|(_, node)| {
+        .filter(|node| !terminal.contains(&node.id))
+        .filter(|node| {
             node.deps.iter().all(|dep| match dep.kind {
                 EdgeKind::Hard => completed.contains(&dep.on),
                 EdgeKind::Soft => terminal.contains(&dep.on),

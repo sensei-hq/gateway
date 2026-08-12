@@ -2,14 +2,16 @@
 //! in the SAME run (SP-3 slice 1). Namespacing the inner ids makes nested effects
 //! nest via `effect_id`; `drive` (reused) + the fold give resume-without-re-spend.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use orchestrator_core::{Dep, Graph, Node, NodeId, NodeKind, OrchestratorError, RunId};
 
 use super::{Executor, Fold, NodeExec};
 
 /// Clone `graph` with every inner node id (and each `Dep.on`, and `Consolidate.over`)
-/// rewritten to `"{prefix}/{id}"`. Deeper nesting is handled by recursion.
+/// rewritten to `"{prefix}/{id}"`. A nested `Subgraph`'s own inner graph is NOT
+/// rewritten here (the `other => other.clone()` arm) — it is namespaced when its
+/// `run_subgraph` runs, under the already-namespaced prefix.
 fn namespace_graph(prefix: &str, graph: &Graph) -> Graph {
     let ns = |id: &NodeId| NodeId(format!("{prefix}/{}", id.0));
     Graph {
@@ -48,7 +50,7 @@ fn namespace_graph(prefix: &str, graph: &Graph) -> Graph {
 fn sink_outputs(
     graph: &Graph,
     prefix: &str,
-    outputs: &std::collections::HashMap<NodeId, serde_json::Value>,
+    outputs: &HashMap<NodeId, serde_json::Value>,
 ) -> serde_json::Value {
     let referenced: HashSet<&NodeId> = graph
         .nodes

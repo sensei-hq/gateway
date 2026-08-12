@@ -238,7 +238,7 @@ impl Graph {
             }
         }
 
-        // A `Subgraph`'s nested graph must itself be a valid DAG (recursive).
+        // 2c. A `Subgraph`'s nested graph must itself be a valid DAG (recursive).
         for node in &self.nodes {
             if let NodeKind::Subgraph { graph } = &node.kind {
                 graph.validate_dag()?;
