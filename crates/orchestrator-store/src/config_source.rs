@@ -149,7 +149,7 @@ impl ConfigSource for FilesystemConfigSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestrator_core::{EffectClass, Registry, SkillDef};
+    use orchestrator_core::{Activation, EffectClass, Registry, SkillDef};
     use std::path::{Path, PathBuf};
 
     #[tokio::test]
@@ -160,6 +160,7 @@ mod tests {
                 name: "s".into(),
                 description: None,
                 body: "b".into(),
+                activation: Activation::default(),
             }],
             tools: vec![],
             chain_bindings: vec![],
