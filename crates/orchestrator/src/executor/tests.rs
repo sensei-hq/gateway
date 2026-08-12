@@ -4378,3 +4378,53 @@ async fn granted_tool_executes_normally_declarations_dont_gate() {
         "two model turns: the tool call + the final"
     );
 }
+
+/// SP-2 slice 4 e2e — activation shapes the ASSEMBLED PROMPT, not execution. The
+/// echo gateway returns each agent's system prompt as the answer, so the presence
+/// of a keyword-gated skill body in the output is a direct read of the composed
+/// prompt: it appears when the input matches the keyword and is absent otherwise,
+/// with BOTH runs completing (gating is progressive disclosure, never a failure).
+#[tokio::test]
+async fn activation_shapes_the_assembled_prompt_end_to_end() {
+    use orchestrator_core::{Activation, SkillDef};
+    // Agent "a" references a keyword-gated skill "gated" (body "GATED_BODY").
+    let mut agent = agent_def("c");
+    agent.skills = vec!["gated".into()];
+    let registry = Arc::new(Registry::default().with_agent(agent).with_skill(SkillDef {
+        name: "gated".into(),
+        description: None,
+        body: "GATED_BODY".into(),
+        activation: Activation::OnKeywords(vec!["summarize".into()]),
+    }));
+
+    // The echo gateway returns the assembled SYSTEM prompt as the answer.
+    let run_with = |input: &'static str| {
+        let registry = registry.clone();
+        async move {
+            let (gateway, _calls) = echo_system_gateway().await;
+            let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+                .with_registry(registry);
+            let n1 = NodeId("n1".into());
+            let outcome = exec
+                .run(
+                    RunId(uuid::Uuid::new_v4()),
+                    &Graph {
+                        nodes: vec![agent_node("n1", "a", input)],
+                    },
+                )
+                .await
+                .expect("run");
+            assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+            outcome.outputs[&n1]["text"].as_str().unwrap().to_string()
+        }
+    };
+
+    // Input hits the keyword → gated skill body is in the prompt.
+    assert!(
+        run_with("please summarize this")
+            .await
+            .contains("GATED_BODY")
+    );
+    // Input misses → gated skill body absent (but the run still completes).
+    assert!(!run_with("hello there").await.contains("GATED_BODY"));
+}
