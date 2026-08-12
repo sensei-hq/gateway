@@ -32,6 +32,10 @@ pub enum OrchestratorError {
         "agent {agent:?} has no base chain route: add an explicit `chain` or an `(area,kind)` binding (per-phase `chains` are overrides layered on a base route, so they do not by themselves make an agent routable)"
     )]
     UnknownChainRef { agent: String },
+    #[error(
+        "agent {agent:?} references tool {tool:?} without a grant covering its declared permissions"
+    )]
+    PermissionNotGranted { agent: String, tool: String },
     #[error("payload serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error(

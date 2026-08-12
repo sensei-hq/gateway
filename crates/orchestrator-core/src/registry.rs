@@ -24,6 +24,10 @@ pub struct AgentDefinition {
     /// Per-phase chain overrides (phase → chain-id); empty when unused.
     #[serde(default)]
     pub chains: HashMap<String, String>,
+    /// Per-tool permission grants (tool name → granted scope, §287). Checked
+    /// against each tool's declared `permissions` at load; empty when unused.
+    #[serde(default)]
+    pub grants: HashMap<String, Permissions>,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub system_prompt: String,
@@ -50,6 +54,10 @@ pub struct ToolSpec {
     pub ttl_secs: Option<u64>,
     /// Provenance `source` label recorded with an Observation. Defaults to the tool name.
     pub source: Option<String>,
+    /// The capabilities this tool declares it needs (§132). Enforcement = SP-4;
+    /// this slice only validates an agent's grant covers it.
+    #[serde(default)]
+    pub permissions: Permissions,
 }
 
 /// A capability declaration — used BOTH as a tool's required needs
@@ -294,8 +302,20 @@ impl Registry {
                 }
             }
             for tool in &agent.tools {
-                if !self.tools.contains_key(tool) {
-                    return Err(OrchestratorError::UnknownToolRef {
+                let spec = match self.tools.get(tool) {
+                    Some(s) => s,
+                    None => {
+                        return Err(OrchestratorError::UnknownToolRef {
+                            agent: agent.name.clone(),
+                            tool: tool.clone(),
+                        });
+                    }
+                };
+                // grant⊇need: a missing grant is treated as the (deny/empty) default,
+                // which covers a permissionless tool but not one that declares needs.
+                let grant = agent.grants.get(tool).cloned().unwrap_or_default();
+                if !grant.covers(&spec.permissions) {
+                    return Err(OrchestratorError::PermissionNotGranted {
                         agent: agent.name.clone(),
                         tool: tool.clone(),
                     });
@@ -421,6 +441,7 @@ impl AgentDefinition {
             kind: required_scalar(&f, "kind")?,
             chain: optional_scalar(&f, "chain"),
             chains: optional_pairs(&f, "chains")?,
+            grants: HashMap::new(),
             tools: optional_list(&f, "tools"),
             skills: optional_list(&f, "skills"),
             system_prompt: body.to_string(),
@@ -550,6 +571,7 @@ mod tests {
             effect_class: EffectClass::Pure,
             ttl_secs: None,
             source: None,
+            permissions: Permissions::default(),
         }
     }
 
@@ -665,10 +687,66 @@ mod tests {
             kind: kind.into(),
             chain: chain.map(|c| c.into()),
             chains: HashMap::new(),
+            grants: HashMap::new(),
             tools: vec![],
             skills: vec![],
             system_prompt: "SYS".into(),
         }
+    }
+
+    fn tool_needing(name: &str, need: Permissions) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: need,
+        }
+    }
+
+    #[test]
+    fn validate_requires_a_grant_covering_a_tools_declared_needs() {
+        let need = Permissions {
+            paths: vec!["/workspace".into()],
+            ..Default::default()
+        };
+        let tool = tool_needing("fs.write", need.clone());
+
+        // Agent references the tool but grants nothing → PermissionNotGranted.
+        let mut agent = role_agent("coding", "reasoning", Some("c"));
+        agent.tools = vec!["fs.write".into()];
+        let reg = Registry::default()
+            .with_agent(agent.clone())
+            .with_tool(tool.clone());
+        assert!(matches!(
+            reg.validate(),
+            Err(OrchestratorError::PermissionNotGranted { agent, tool })
+                if agent == "role" && tool == "fs.write"
+        ));
+
+        // With a covering grant → ok.
+        agent.grants.insert(
+            "fs.write".into(),
+            Permissions {
+                paths: vec!["/workspace".into()],
+                ..Default::default()
+            },
+        );
+        let ok = Registry::default().with_agent(agent).with_tool(tool);
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_needs_no_grant_for_a_permissionless_tool() {
+        // A tool with default (empty) permissions requires no grant.
+        let mut agent = role_agent("coding", "reasoning", Some("c"));
+        agent.tools = vec!["calc".into()];
+        let reg = Registry::default()
+            .with_agent(agent)
+            .with_tool(tool_needing("calc", Permissions::default()));
+        assert!(reg.validate().is_ok());
     }
 
     #[test]

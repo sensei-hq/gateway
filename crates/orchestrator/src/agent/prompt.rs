@@ -87,7 +87,7 @@ pub fn over_budget(
 mod tests {
     use super::*;
     use orchestrator_core::EffectClass;
-    use orchestrator_core::{AgentDefinition, Registry, SkillDef, ToolSpec};
+    use orchestrator_core::{AgentDefinition, Permissions, Registry, SkillDef, ToolSpec};
 
     fn registry() -> (Registry, AgentDefinition) {
         let agent = AgentDefinition {
@@ -96,6 +96,7 @@ mod tests {
             kind: "reasoning".into(),
             chain: Some("research.bulk".into()),
             chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
             tools: vec!["calc".into()],
             skills: vec!["concise".into(), "cite".into()],
             system_prompt: "BODY".into(),
@@ -119,6 +120,7 @@ mod tests {
                 effect_class: EffectClass::Pure,
                 ttl_secs: None,
                 source: None,
+                permissions: Permissions::default(),
             });
         (reg, agent)
     }
