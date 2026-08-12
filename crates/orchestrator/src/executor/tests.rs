@@ -75,6 +75,7 @@ fn agent_node(id: &str, agent: &str, input: &str) -> Node {
         kind: NodeKind::Agent {
             agent: AgentRef(agent.into()),
             input: serde_json::json!(input),
+            phase: None,
         },
         deps: vec![],
     }
@@ -208,6 +209,38 @@ async fn agent_node_single_turn_runs_through_gateway_and_journals() {
             "NodeCompleted(n1)",
             "RunCompleted"
         ]
+    );
+}
+
+#[tokio::test]
+async fn agent_node_phase_selects_the_per_phase_chain() {
+    // Agent has NO explicit chain and NO (area,kind) binding — only chains["plan"] = "c".
+    // So it is routable ONLY when the node requests phase "plan".
+    let (gateway, _calls) = recording_gateway().await; // knows chain "c"
+    let mut agent = agent_def("c");
+    agent.chain = None;
+    agent.chains.insert("plan".into(), "c".into());
+    let registry = Arc::new(Registry::default().with_agent(agent));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry);
+
+    let node = Node {
+        id: NodeId("n1".into()),
+        kind: NodeKind::Agent {
+            agent: AgentRef("a".into()),
+            input: serde_json::json!("hi"),
+            phase: Some("plan".into()),
+        },
+        deps: vec![],
+    };
+    let outcome = exec
+        .run(RunId(uuid::Uuid::new_v4()), &Graph { nodes: vec![node] })
+        .await
+        .expect("run");
+    assert!(
+        outcome.failed.is_none(),
+        "phase route completes: {:?}",
+        outcome.failed
     );
 }
 
@@ -2896,6 +2929,7 @@ fn agent_node_with_deps(id: &str, agent: &str, input: &str, deps: Vec<Dep>) -> N
         kind: NodeKind::Agent {
             agent: AgentRef(agent.into()),
             input: serde_json::json!(input),
+            phase: None,
         },
         deps,
     }
