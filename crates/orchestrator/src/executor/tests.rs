@@ -4248,3 +4248,61 @@ async fn agent_runs_from_a_filesystem_loaded_registry() {
     assert_eq!(out.outputs[&NodeId("n1".into())]["text"], "canned-response");
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[tokio::test]
+async fn granted_tool_permissions_are_inert_end_to_end() {
+    use orchestrator_core::{NetworkPolicy, Permissions, RegistryConfig, ToolSpec};
+    // Tool "calc" DECLARES a path+network need; agent GRANTS a covering scope.
+    let tool = ToolSpec {
+        name: "calc".into(),
+        description: None,
+        input_schema: serde_json::json!({}),
+        effect_class: orchestrator_core::EffectClass::Pure,
+        ttl_secs: None,
+        source: None,
+        permissions: Permissions {
+            paths: vec!["/workspace".into()],
+            network: NetworkPolicy::Any,
+            ..Default::default()
+        },
+    };
+    let mut agent = agent_def("c");
+    agent.tools = vec!["calc".into()];
+    agent.grants.insert(
+        "calc".into(),
+        Permissions {
+            paths: vec!["/workspace".into()],
+            network: NetworkPolicy::Any,
+            ..Default::default()
+        },
+    );
+    let cfg = RegistryConfig {
+        agents: vec![agent],
+        skills: vec![],
+        tools: vec![tool],
+        chain_bindings: vec![],
+    };
+    let registry =
+        Arc::new(Registry::from_config(cfg).expect("assembles + validates (grant covers need)"));
+
+    // The agent runs a normal turn; declarations don't gate anything (SP-4 does).
+    let (gateway, _calls) = recording_gateway().await; // final response, no tool_calls
+    let n1 = NodeId("n1".into());
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry);
+    let outcome = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("run");
+    assert!(
+        outcome.failed.is_none(),
+        "granted tool runs (declarations inert): {:?}",
+        outcome.failed
+    );
+    assert!(outcome.outputs.contains_key(&n1));
+}

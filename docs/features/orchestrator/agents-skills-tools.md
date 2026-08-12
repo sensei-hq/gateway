@@ -10,7 +10,7 @@ source: crates/orchestrator*
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2).** Design §6/§9;
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3).** Design §6/§9;
 > config-source design
 > [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
 > **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
@@ -38,6 +38,21 @@ source: crates/orchestrator*
 > transition). **Deferred:** tiers (gateway-catalog), planner-driven phase
 > transitions, tenant dimension (multi-tenancy is by composition — per-tenant
 > `Executor` = per-tenant `Gateway` + tenant-scoped `ConfigSource`).
+>
+> **SP-2 slice 3 — tool permission declarations:** a tool declares the capabilities
+> it needs (`ToolSpec.permissions`: path/command/network allowlists + resource caps,
+> secure-default deny) and an agent declares per-tool grants (`AgentDefinition.grants`,
+> loaded from a central auditable `<root>/grants.json`). `Registry::validate` rejects
+> any agent whose grant does not **cover** a referenced tool's declared needs
+> (`PermissionNotGranted`); `Permissions::covers` is the shared predicate (path-prefix,
+> command subset, network `Any`/`Hosts`/`Deny` lattice, caps `need ≤ grant` with
+> grant-`None` = unlimited). Declarations are **inert** — not in the prompt/hash, tool
+> runtime unchanged. **Deferred to SP-4 (enforcement):** runtime gating on effective =
+> grant ∩ need, sandbox/workspace isolation, command deny-lists, secret redaction — and
+> hardening the declaration-layer coverage before it gates real access: **path matching
+> is raw string-prefix (not path-component-aware, and an empty grant path `""` = allow-all),
+> and `Hosts` matching is exact-host (no subdomain/wildcard)** — SP-4 must canonicalize
+> paths / reject empty allow-all grants / define host-wildcard semantics.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
