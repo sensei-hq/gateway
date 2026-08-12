@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use orchestrator_core::{
-    AgentDefinition, ConfigSource, OrchestratorError, RegistryConfig, SkillDef, ToolSpec,
+    AgentDefinition, ChainBinding, ConfigSource, OrchestratorError, RegistryConfig, SkillDef,
+    ToolSpec,
 };
 
 /// A `ConfigSource` returning a fixed `RegistryConfig` — for tests + programmatic
@@ -77,6 +78,20 @@ fn read_dir_files(
     Ok(out)
 }
 
+/// Read an optional top-level `<root>/<name>` file. Missing → `None`; any other
+/// I/O error is loud.
+fn read_optional_file(root: &Path, name: &str) -> Result<Option<String>, OrchestratorError> {
+    let path = root.join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(OrchestratorError::RegistryLoad(format!(
+            "read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 #[async_trait::async_trait]
 impl ConfigSource for FilesystemConfigSource {
     async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
@@ -105,6 +120,10 @@ impl ConfigSource for FilesystemConfigSource {
                     OrchestratorError::RegistryLoad(format!("parse tool {file}: {e}"))
                 })?,
             );
+        }
+        if let Some(json) = read_optional_file(&self.root, "chains.json")? {
+            cfg.chain_bindings = serde_json::from_str::<Vec<ChainBinding>>(&json)
+                .map_err(|e| OrchestratorError::RegistryLoad(format!("parse chains.json: {e}")))?;
         }
         Ok(cfg)
     }
@@ -209,6 +228,47 @@ mod tests {
         let err = FilesystemConfigSource::new(&root).load().await;
         assert!(
             matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("bad.json")),
+            "got {err:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn filesystem_loads_chain_bindings_from_chains_json() {
+        let root = temp_config_root();
+        write(
+            &root,
+            "chains.json",
+            r#"[{"area":"research","kind":"reasoning","chain":"research.bulk"}]"#,
+        );
+        let cfg = FilesystemConfigSource::new(&root)
+            .load()
+            .await
+            .expect("loads");
+        assert_eq!(cfg.chain_bindings.len(), 1);
+        assert_eq!(cfg.chain_bindings[0].area, "research");
+        assert_eq!(cfg.chain_bindings[0].chain, "research.bulk");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_chains_json_is_an_empty_table() {
+        let root = temp_config_root(); // has no chains.json
+        let cfg = FilesystemConfigSource::new(&root)
+            .load()
+            .await
+            .expect("loads");
+        assert!(cfg.chain_bindings.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_chains_json_is_a_loud_registry_load_error() {
+        let root = temp_config_root();
+        write(&root, "chains.json", "{ not an array");
+        let err = FilesystemConfigSource::new(&root).load().await;
+        assert!(
+            matches!(&err, Err(OrchestratorError::RegistryLoad(m)) if m.contains("chains.json")),
             "got {err:?}"
         );
         std::fs::remove_dir_all(&root).ok();
