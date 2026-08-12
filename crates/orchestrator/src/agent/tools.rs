@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use orchestrator_core::{EffectClass, OrchestratorError, Permissions, ToolSpec};
+use orchestrator_core::{Activation, EffectClass, OrchestratorError, Permissions, ToolSpec};
 
 /// An executable tool. `spec().effect_class` may be `Pure`, `Observation`, or
 /// `Mutation` (slice 4) — the executor is responsible for wrapping
@@ -89,6 +89,7 @@ impl Tool for Calc {
             ttl_secs: None,
             source: None,
             permissions: Permissions::default(),
+            activation: Activation::default(),
         }
     }
 
@@ -142,6 +143,7 @@ impl Tool for Search {
             ttl_secs: Some(60),
             source: Some("search".into()),
             permissions: Permissions::default(),
+            activation: Activation::default(),
         }
     }
 
@@ -188,6 +190,7 @@ impl Tool for RecordNote {
             ttl_secs: None,
             source: None,
             permissions: Permissions::default(),
+            activation: Activation::default(),
         }
     }
 
@@ -306,6 +309,7 @@ mod tests {
                     ttl_secs: Some(60),
                     source: None,
                     permissions: Permissions::default(),
+                    activation: Activation::default(),
                 }
             }
             fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {

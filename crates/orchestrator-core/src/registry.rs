@@ -39,6 +39,9 @@ pub struct SkillDef {
     pub name: String,
     pub description: Option<String>,
     pub body: String,
+    /// When this skill is composed into the prompt (§129); default `Always`.
+    #[serde(default)]
+    pub activation: Activation,
 }
 
 /// A tool's schema + effect class (the model-facing metadata + replay class).
@@ -58,6 +61,9 @@ pub struct ToolSpec {
     /// this slice only validates an agent's grant covers it.
     #[serde(default)]
     pub permissions: Permissions,
+    /// When this tool's schema is exposed to the model (§129); default `Always`.
+    #[serde(default)]
+    pub activation: Activation,
 }
 
 /// A capability declaration — used BOTH as a tool's required needs
@@ -481,10 +487,17 @@ impl SkillDef {
             Some(FmValue::Scalar(s)) => Some(s.clone()),
             _ => None,
         };
+        let kw = optional_list(&f, "activate_on");
+        let activation = if kw.is_empty() {
+            Activation::Always
+        } else {
+            Activation::OnKeywords(kw)
+        };
         Ok(SkillDef {
             name: required_scalar(&f, "name")?,
             description,
             body: body.to_string(),
+            activation,
         })
     }
 }
@@ -595,6 +608,7 @@ mod tests {
             ttl_secs: None,
             source: None,
             permissions: Permissions::default(),
+            activation: Activation::default(),
         }
     }
 
@@ -607,6 +621,7 @@ mod tests {
                 name: "concise".into(),
                 description: None,
                 body: "b".into(),
+                activation: Activation::default(),
             }],
             tools: vec![tool_spec("calc")],
             chain_bindings: vec![],
@@ -634,6 +649,7 @@ mod tests {
                 name: "concise".into(),
                 description: None,
                 body: "b".into(),
+                activation: Activation::default(),
             }],
             tools: vec![tool_spec("calc")],
             chain_bindings: vec![],
@@ -651,11 +667,13 @@ mod tests {
                     name: "s".into(),
                     description: None,
                     body: "b".into(),
+                    activation: Activation::default(),
                 },
                 SkillDef {
                     name: "s".into(),
                     description: None,
                     body: "b2".into(),
+                    activation: Activation::default(),
                 },
             ],
             tools: vec![],
@@ -697,6 +715,7 @@ mod tests {
                 name: "concise".into(),
                 description: None,
                 body: "b".into(),
+                activation: Activation::default(),
             });
         assert!(full.validate().is_ok());
         assert!(full.agent("researcher").is_some());
@@ -726,6 +745,7 @@ mod tests {
             ttl_secs: None,
             source: None,
             permissions: need,
+            activation: Activation::default(),
         }
     }
 
@@ -1057,5 +1077,34 @@ mod tests {
 
         // Default is Always.
         assert_eq!(Activation::default(), Activation::Always);
+    }
+
+    #[test]
+    fn skill_frontmatter_parses_activate_on_into_onkeywords() {
+        let md = "---\nname: s\nactivate_on: [summarize, tldr]\n---\nBODY\n";
+        let s = SkillDef::from_frontmatter(md).unwrap();
+        assert_eq!(
+            s.activation,
+            Activation::OnKeywords(vec!["summarize".into(), "tldr".into()])
+        );
+
+        // Absent activate_on → Always.
+        let s2 = SkillDef::from_frontmatter("---\nname: s\n---\nBODY\n").unwrap();
+        assert_eq!(s2.activation, Activation::Always);
+    }
+
+    #[test]
+    fn tool_spec_deserializes_activation_default_and_onkeywords() {
+        // Absent → Always.
+        let t: ToolSpec =
+            serde_json::from_str(r#"{"name":"t","input_schema":{},"effect_class":"Pure"}"#)
+                .unwrap();
+        assert_eq!(t.activation, Activation::Always);
+        // Explicit OnKeywords round-trips.
+        let t2: ToolSpec = serde_json::from_str(
+            r#"{"name":"t","input_schema":{},"effect_class":"Pure","activation":{"OnKeywords":["sql"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(t2.activation, Activation::OnKeywords(vec!["sql".into()]));
     }
 }

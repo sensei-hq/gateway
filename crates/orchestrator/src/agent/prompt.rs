@@ -87,7 +87,9 @@ pub fn over_budget(
 mod tests {
     use super::*;
     use orchestrator_core::EffectClass;
-    use orchestrator_core::{AgentDefinition, Permissions, Registry, SkillDef, ToolSpec};
+    use orchestrator_core::{
+        Activation, AgentDefinition, Permissions, Registry, SkillDef, ToolSpec,
+    };
 
     fn registry() -> (Registry, AgentDefinition) {
         let agent = AgentDefinition {
@@ -107,11 +109,13 @@ mod tests {
                 name: "concise".into(),
                 description: None,
                 body: "SKILL_CONCISE".into(),
+                activation: Activation::default(),
             })
             .with_skill(SkillDef {
                 name: "cite".into(),
                 description: None,
                 body: "SKILL_CITE".into(),
+                activation: Activation::default(),
             })
             .with_tool(ToolSpec {
                 name: "calc".into(),
@@ -121,6 +125,7 @@ mod tests {
                 ttl_secs: None,
                 source: None,
                 permissions: Permissions::default(),
+                activation: Activation::default(),
             });
         (reg, agent)
     }
