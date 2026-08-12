@@ -161,13 +161,15 @@ pub enum Activation {
 impl Activation {
     /// Is this active for `query` (the agent's rendered input text)?
     /// `Always` → true. `OnKeywords` → true iff `query` contains ANY keyword,
-    /// case-insensitively (an empty keyword list matches nothing).
+    /// case-insensitively (an empty keyword list matches nothing; an empty
+    /// keyword `""` never matches, so it can't accidentally match everything).
     pub fn is_active(&self, query: &str) -> bool {
         match self {
             Activation::Always => true,
             Activation::OnKeywords(kw) => {
                 let q = query.to_lowercase();
-                kw.iter().any(|k| q.contains(&k.to_lowercase()))
+                kw.iter()
+                    .any(|k| !k.is_empty() && q.contains(&k.to_lowercase()))
             }
         }
     }
@@ -487,11 +489,19 @@ impl SkillDef {
             Some(FmValue::Scalar(s)) => Some(s.clone()),
             _ => None,
         };
-        let kw = optional_list(&f, "activate_on");
-        let activation = if kw.is_empty() {
-            Activation::Always
-        } else {
-            Activation::OnKeywords(kw)
+        // A scalar `activate_on` is a loud parse error: forgetting the brackets
+        // (`activate_on: summarize`) must NOT silently become `Always` and defeat
+        // the gate. Absent → Always; empty list → Always (no gating); non-empty
+        // list → OnKeywords.
+        let activation = match f.get("activate_on") {
+            None => Activation::Always,
+            Some(FmValue::List(kw)) if !kw.is_empty() => Activation::OnKeywords(kw.clone()),
+            Some(FmValue::List(_)) => Activation::Always,
+            Some(FmValue::Scalar(_)) => {
+                return Err(OrchestratorError::FrontmatterParse(
+                    "activate_on must be a list, e.g. [summarize, tldr]".into(),
+                ));
+            }
         };
         Ok(SkillDef {
             name: required_scalar(&f, "name")?,
@@ -1075,6 +1085,13 @@ mod tests {
         // Empty keyword list matches nothing.
         assert!(!Activation::OnKeywords(vec![]).is_active("summarize"));
 
+        // An empty keyword must not match everything.
+        assert!(!Activation::OnKeywords(vec!["".into()]).is_active("anything"));
+        assert!(
+            Activation::OnKeywords(vec!["".into(), "cat".into()]).is_active("a cat"),
+            "other keywords still work"
+        );
+
         // Default is Always.
         assert_eq!(Activation::default(), Activation::Always);
     }
@@ -1091,6 +1108,19 @@ mod tests {
         // Absent activate_on → Always.
         let s2 = SkillDef::from_frontmatter("---\nname: s\n---\nBODY\n").unwrap();
         assert_eq!(s2.activation, Activation::Always);
+    }
+
+    #[test]
+    fn skill_frontmatter_scalar_activate_on_is_a_loud_error() {
+        // Forgot the brackets → must NOT silently become Always; a scalar activate_on is loud.
+        let md = "---\nname: s\nactivate_on: summarize\n---\nBODY\n";
+        assert!(
+            matches!(
+                SkillDef::from_frontmatter(md),
+                Err(OrchestratorError::FrontmatterParse(_))
+            ),
+            "scalar activate_on must be a loud FrontmatterParse, not a silent Always"
+        );
     }
 
     #[test]

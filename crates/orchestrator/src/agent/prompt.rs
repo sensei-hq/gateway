@@ -229,6 +229,27 @@ mod tests {
     }
 
     #[test]
+    fn assemble_preserves_skill_order_with_an_active_gated_skill() {
+        let (mut reg, mut agent) = registry();
+        reg = reg.with_skill(SkillDef {
+            name: "mid".into(),
+            description: None,
+            body: "MID_BODY".into(),
+            activation: Activation::OnKeywords(vec!["go".into()]),
+        });
+        // Order: concise, mid, cite  (mid is gated but active for this query)
+        agent.skills = vec!["concise".into(), "mid".into(), "cite".into()];
+        let (system, _t) = assemble_prompt(&reg, &agent, &[], "go now").unwrap();
+        let c = system.find("SKILL_CONCISE").unwrap();
+        let m = system.find("MID_BODY").unwrap();
+        let t = system.find("SKILL_CITE").unwrap();
+        assert!(
+            c < m && m < t,
+            "active skills compose in list order: {system}"
+        );
+    }
+
+    #[test]
     fn est_tokens_is_chars_over_four() {
         assert_eq!(est_tokens("abcdefgh"), 2); // 8 chars / 4
     }
