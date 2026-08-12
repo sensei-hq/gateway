@@ -2,15 +2,36 @@
 title: Shared Context
 doctype: feature
 module: orchestrator
-status: planned
+status: partial
 phase: 3
 spec: SP-1
-source: orchestrator (new)
+source: crates/orchestrator*
 ---
 
 # Shared Context
 
-> **Status: Planned (Phase 3 · SP-1).** Design §8.
+> **Status: Partial (Phase 3 · SP-1).** Design §8; blackboard-wiring design
+> [`../../superpowers/specs/2026-08-10-sp1-blackboard-wiring-design.md`](../../superpowers/specs/2026-08-10-sp1-blackboard-wiring-design.md).
+> The scoped `ContextStore` blackboard is now **wired into the executor**
+> (executor-managed / implicit): a completed node's output publishes to `Run`
+> scope under `key = node.id` (journaled `ContextWrite`, entry held as a CAS
+> ref), and an `Agent` node's prompt is assembled with its **declared
+> dependencies'** outputs read from the blackboard (a `## Context` section).
+> Opt-in — no `ContextStore` wired ⇒ every step is a no-op (behavior
+> byte-identical). Resume rehydrates the store from folded `ContextWrite`s
+> (refs, no blob load) via `ContextStore::insert_ref`.
+>
+> **Determinism:** reads are **dependency-scoped** (not all-of-`Run`), so a
+> resumed run reproduces byte-identical prompts — a dependency's `ContextWrite`
+> is journaled before the dependent runs, and the resolved context is an input to
+> the turn hash (an edited upstream output halts loud with `DeterminismViolation`
+> rather than mixing).
+>
+> **Deferred:** agent-facing `read_context`/`write_context` tools; active
+> summarize/select budgeting (over-budget currently halts loud via
+> `PromptOverBudget`, never truncates); `Scope::Node`/`Plan` reads + per-agent
+> private scratch; TTL/as-of freshness; unifying `Consolidate`'s `prior_outputs`
+> threading onto the blackboard; concurrent-write policies beyond reject.
 
 A scoped, durable blackboard (run / plan / node / agent). Reads resolve up the
 scope chain; writes are journaled (globally sequenced). Entries hold **refs, not
