@@ -4306,3 +4306,72 @@ async fn granted_tool_permissions_are_inert_end_to_end() {
     );
     assert!(outcome.outputs.contains_key(&n1));
 }
+
+#[tokio::test]
+async fn granted_tool_executes_normally_declarations_dont_gate() {
+    use orchestrator_core::{NetworkPolicy, Permissions, RegistryConfig, ToolSpec};
+    // Core registry: a "calc" tool DECLARING a path+network need, and agent "a"
+    // that lists it and GRANTS a covering scope. (The executable Calc in the
+    // ToolRegistry ignores permissions — declarations are inert at execution.)
+    let calc_spec = ToolSpec {
+        name: "calc".into(),
+        description: Some("arith".into()),
+        input_schema: serde_json::json!({"type":"object"}),
+        effect_class: orchestrator_core::EffectClass::Pure,
+        ttl_secs: None,
+        source: None,
+        permissions: Permissions {
+            paths: vec!["/workspace".into()],
+            network: NetworkPolicy::Any,
+            ..Default::default()
+        },
+    };
+    let mut agent = agent_def("c");
+    agent.tools = vec!["calc".into()];
+    agent.grants.insert(
+        "calc".into(),
+        Permissions {
+            paths: vec!["/workspace".into()],
+            network: NetworkPolicy::Any,
+            ..Default::default()
+        },
+    );
+    let cfg = RegistryConfig {
+        agents: vec![agent],
+        skills: vec![],
+        tools: vec![calc_spec],
+        chain_bindings: vec![],
+    };
+    let registry = Arc::new(Registry::from_config(cfg).expect("grant covers need"));
+
+    // The model calls calc, then finalizes — proving the granted tool RUNS.
+    let (gateway, calls) = scripted_gateway(vec![
+        tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}"),
+        final_response("the answer is 5"),
+    ])
+    .await;
+    let n1 = NodeId("n1".into());
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry)
+        .with_tools(calc_tools());
+    let outcome = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "add 2 and 3")],
+            },
+        )
+        .await
+        .expect("run");
+    assert!(
+        outcome.failed.is_none(),
+        "granted tool executes (declarations inert): {:?}",
+        outcome.failed
+    );
+    assert_eq!(outcome.outputs[&n1]["text"], "the answer is 5");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "two model turns: the tool call + the final"
+    );
+}

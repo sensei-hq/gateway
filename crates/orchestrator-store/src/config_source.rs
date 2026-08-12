@@ -139,7 +139,7 @@ impl ConfigSource for FilesystemConfigSource {
                             "grants.json names unknown agent: {agent_name}"
                         ))
                     })?;
-                agent.grants = grants;
+                agent.grants.extend(grants);
             }
         }
         Ok(cfg)
@@ -319,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_merges_grants_json_into_agents() {
-        use orchestrator_core::NetworkPolicy;
+        use orchestrator_core::{NetworkPolicy, ResourceCaps};
         let root = temp_config_root();
         write(
             &root,
@@ -338,6 +338,15 @@ mod tests {
         let grant = agent.grants.get("calc").expect("grant for calc");
         assert_eq!(grant.paths, vec!["/workspace".to_string()]);
         assert_eq!(grant.network, NetworkPolicy::Any);
+        assert!(
+            grant.commands.is_empty(),
+            "omitted commands default to empty"
+        );
+        assert_eq!(
+            grant.caps,
+            ResourceCaps::default(),
+            "omitted caps default to all-None"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
