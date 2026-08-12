@@ -170,7 +170,6 @@ mod tests {
 
     #[test]
     fn assemble_filters_skills_and_tools_by_activation() {
-        use orchestrator_core::Activation;
         let (mut reg, mut agent) = registry();
         // Add a keyword-gated skill "gated" (body GATED_BODY) referenced by the agent.
         reg = reg.with_skill(SkillDef {
@@ -200,7 +199,6 @@ mod tests {
 
     #[test]
     fn assemble_filters_a_gated_tool_schema() {
-        use orchestrator_core::{Activation, EffectClass, Permissions, ToolSpec};
         let (mut reg, mut agent) = registry();
         reg = reg.with_tool(ToolSpec {
             name: "sql".into(),
