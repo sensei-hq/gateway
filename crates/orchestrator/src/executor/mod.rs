@@ -180,6 +180,8 @@ impl Executor {
     /// Wire a hot-reloadable [`RegistryHandle`] (SP-2 slice 5). Each `run`/`start`
     /// pins the handle's current registry + generation; a reload bumps the
     /// generation, folded into the fence version so a run uses one generation.
+    /// Supersedes [`with_registry`](Self::with_registry) when both are set — the
+    /// handle's current registry is pinned per run, overwriting the fixed one.
     pub fn with_registry_handle(mut self, handle: RegistryHandle) -> Self {
         self.handle = Some(handle);
         self

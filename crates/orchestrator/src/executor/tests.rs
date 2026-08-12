@@ -4603,3 +4603,60 @@ async fn each_run_pins_the_generation_live_at_its_start() {
         "run B pinned gen 1 (live at its start)"
     );
 }
+
+/// The positive twin of `reload_bumps_...`: WITHOUT a reload, a handle-wired
+/// executor RESUMES a partial run at the same generation and finishes it — the
+/// per-run pin records and re-compares the SAME `"v1#cfg0"`, so no false
+/// `VersionFenceMismatch` fires. This is the one resume-through-handle path (a
+/// successful resume, not a fenced one) the fence tests don't cover.
+#[tokio::test]
+async fn handle_wired_executor_resumes_a_partial_run_at_the_same_generation() {
+    use orchestrator_core::RegistryHandle;
+    let handle = RegistryHandle::new(Registry::default().with_agent(agent_def("c")));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, n1, n2) = two_node_graph("a", "b");
+
+    // Run 1: n1 succeeds, n2 fails → a partial journal (no RunCompleted), pinned
+    // at gen 0 (recorded version "v1#cfg0").
+    let (gw1, _c1) = failing_after_gateway(1).await;
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry_handle(handle.clone())
+        .run(run, &graph)
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(
+        out1.failed.is_some(),
+        "partial run: n2 fails, leaving n1 journaled without RunCompleted"
+    );
+    let recorded = journal
+        .load(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::RunStarted { version } => Some(version),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(recorded, "v1#cfg0", "run 1 pinned gen 0");
+
+    // NO reload → generation stays 0. Run 2 resumes on a fresh recording gateway:
+    // the pin re-compares "v1#cfg0" == "v1#cfg0" ⇒ no fence ⇒ the run completes.
+    let (gw2, _c2) = recording_gateway().await;
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry_handle(handle.clone())
+        .start(run, &graph)
+        .await
+        .expect("same-generation resume through the handle completes (no false fence)");
+    assert!(
+        out2.failed.is_none(),
+        "same-gen resume through the handle completes: {:?}",
+        out2.failed
+    );
+    assert_eq!(
+        out2.completed,
+        vec![n1, n2],
+        "both nodes finish on the resume"
+    );
+}
