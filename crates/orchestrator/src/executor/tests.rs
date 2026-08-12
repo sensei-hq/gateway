@@ -248,6 +248,54 @@ async fn agent_node_phase_selects_the_per_phase_chain() {
 }
 
 #[tokio::test]
+async fn agent_routes_via_area_kind_binding_end_to_end() {
+    use orchestrator_core::{ChainBinding, RegistryConfig};
+    // Agent omits chain; the (research,reasoning) binding maps it to "c".
+    let agent = AgentDefinition {
+        name: "a".into(),
+        area: "research".into(),
+        kind: "reasoning".into(),
+        chain: None,
+        chains: std::collections::HashMap::new(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: "SYS".into(),
+    };
+    let cfg = RegistryConfig {
+        agents: vec![agent],
+        skills: vec![],
+        tools: vec![],
+        chain_bindings: vec![ChainBinding {
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: "c".into(),
+        }],
+    };
+    let registry = Arc::new(Registry::from_config(cfg).expect("assembles + validates"));
+
+    let (gateway, _calls) = recording_gateway().await; // only knows chain "c"
+    let n1 = NodeId("n1".into());
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry);
+    let outcome = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("run");
+
+    assert!(
+        outcome.failed.is_none(),
+        "table-routed agent completes: {:?}",
+        outcome.failed
+    );
+    assert!(outcome.outputs.contains_key(&n1));
+}
+
+#[tokio::test]
 async fn agent_node_halts_over_budget_before_any_gateway_call() {
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
