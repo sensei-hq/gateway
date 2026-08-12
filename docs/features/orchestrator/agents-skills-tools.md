@@ -10,7 +10,7 @@ source: crates/orchestrator*
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4).** Design §6/§9;
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete)).** Design §6/§9;
 > config-source design
 > [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
 > **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
@@ -67,6 +67,18 @@ source: crates/orchestrator*
 > security boundary. **Deferred:** per-agent
 > override, planner-selected activation (SP-3), retrieval-ranked / semantic match (SP-7),
 > per-turn re-activation, prompt compaction (SP-7).
+>
+> **SP-2 slice 5 — registry hot-reload (closes SP-2):** a `RegistryHandle`
+> (`orchestrator-core`) wraps a swappable `Arc<Registry>` + a config generation;
+> `reload(source)` is atomic, validated (`Registry::from_config`), and last-good (a
+> failed load/validate keeps the old config live). `Executor::with_registry_handle`
+> pins the handle's `(registry, generation)` once per run, folding the generation
+> into the fence version (`"{base}#cfg{gen}"`). A reload takes effect for NEW runs;
+> resuming an in-flight run after a reload is refused loud via the existing
+> `VersionFenceMismatch` (one config generation per run). No handle wired ⇒
+> byte-identical. **Deferred:** version-pinned resume, an `on_config_reloaded` hook,
+> file-watch/auto-reload, and a persistent cross-process config version (SP-DATA
+> `config_versions`).
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
