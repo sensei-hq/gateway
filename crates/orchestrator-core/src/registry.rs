@@ -578,7 +578,7 @@ mod tests {
             area: area.into(),
             kind: kind.into(),
             chain: chain.map(|c| c.into()),
-            chains: std::collections::HashMap::new(),
+            chains: HashMap::new(),
             tools: vec![],
             skills: vec![],
             system_prompt: "SYS".into(),
@@ -642,6 +642,36 @@ mod tests {
             AgentDefinition::from_frontmatter(md),
             Err(OrchestratorError::FrontmatterParse(_))
         ));
+    }
+
+    #[test]
+    fn from_frontmatter_empty_phase_key_or_value_errors() {
+        // `[plan=]` reaches the empty-VALUE guard, `[=code.mid]` the empty-KEY
+        // guard: `parse_fields` only filters comma-split empties, and both items
+        // are non-empty so they survive to `optional_pairs`.
+        for md in [
+            "---\nname: n\narea: a\nkind: k\nchains: [plan=]\n---\nb\n",
+            "---\nname: n\narea: a\nkind: k\nchains: [=code.mid]\n---\nb\n",
+        ] {
+            assert!(
+                matches!(
+                    AgentDefinition::from_frontmatter(md),
+                    Err(OrchestratorError::FrontmatterParse(_))
+                ),
+                "expected loud parse error for {md:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_frontmatter_absent_chains_is_empty_map() {
+        let md = "---\nname: n\narea: a\nkind: k\nchain: c\n---\nb\n";
+        assert!(
+            AgentDefinition::from_frontmatter(md)
+                .unwrap()
+                .chains
+                .is_empty()
+        );
     }
 
     #[test]
