@@ -78,6 +78,50 @@ pub(super) fn sink_outputs(
 }
 
 impl Executor {
+    /// The shared nested-drive tail for `Subgraph`/`Branch`/`Expand` (SP-3): enforce
+    /// the depth cap on `prefix`, namespace `graph` under it, drive it in the SAME
+    /// run, and fold the outcome into a `NodeExec` (paused/failed carried up, else the
+    /// sink map). `kind_label` only tags the pause/fail message; `prefix` is the path
+    /// the nested nodes are namespaced under (`"{node}"` for subgraph/expand,
+    /// `"{node}/{label}"` for a branch arm).
+    pub(super) async fn drive_nested(
+        &self,
+        run: RunId,
+        kind_label: &str,
+        prefix: &str,
+        graph: &Graph,
+        fold: &Fold,
+    ) -> Result<NodeExec, OrchestratorError> {
+        // Depth cap (self-DoS backstop): the path segment count is the nesting level.
+        let depth = prefix.matches('/').count();
+        if depth + 1 > self.max_depth {
+            return Err(OrchestratorError::GlobalCapExceeded {
+                cap: "max_depth".into(),
+                limit: self.max_depth,
+            });
+        }
+        let inner = namespace_graph(prefix, graph);
+        // `Box::pin` breaks the recursive `async fn` cycle (run_node → run_* →
+        // drive_nested → drive → run_node): heap indirection keeps the future finite.
+        let nested = Box::pin(self.drive(run, &inner, fold)).await?;
+        if let Some(p) = nested.paused {
+            return Ok(NodeExec::Paused {
+                reason: format!("{kind_label} {prefix} paused: {}", p.reason),
+            });
+        }
+        if let Some((n, msg)) = nested.failed {
+            return Ok(NodeExec::Failed {
+                message: format!("{kind_label} {prefix} failed at {}: {msg}", n.0),
+                output: None,
+            });
+        }
+        Ok(NodeExec::Completed(sink_outputs(
+            graph,
+            prefix,
+            &nested.outputs,
+        )))
+    }
+
     /// Drive a `Subgraph` node's nested DAG under `"{node}/…"` and fold the nested
     /// outcome into this node's `NodeExec`: paused ⇒ `Paused`, failed ⇒ `Failed`,
     /// else `Completed(sink map)`.
@@ -95,40 +139,11 @@ impl Executor {
         node: &Node,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        // Depth cap (self-DoS backstop): the path segment count is the current
-        // nesting level; a top-level subgraph node has 0 segments (level 1). Reject
-        // loud if the nested nodes would exceed max_depth. Conservative — the path
-        // count also includes Map/Loop child nesting.
-        let depth = node.id.0.matches('/').count();
-        if depth + 1 > self.max_depth {
-            return Err(OrchestratorError::GlobalCapExceeded {
-                cap: "max_depth".into(),
-                limit: self.max_depth,
-            });
-        }
         let NodeKind::Subgraph { graph } = &node.kind else {
             unreachable!("run_subgraph on non-Subgraph node");
         };
-        let inner = namespace_graph(&node.id.0, graph);
-        // `Box::pin` breaks the recursive `async fn` cycle
-        // (run_node → run_subgraph → drive → run_node): a recursive async call
-        // needs heap indirection to keep the future's size finite.
-        let nested = Box::pin(self.drive(run, &inner, fold)).await?;
-        if let Some(p) = nested.paused {
-            return Ok(NodeExec::Paused {
-                reason: format!("subgraph {} paused: {}", node.id.0, p.reason),
-            });
-        }
-        if let Some((n, msg)) = nested.failed {
-            return Ok(NodeExec::Failed {
-                message: format!("subgraph {} failed at {}: {}", node.id.0, n.0, msg),
-                output: None,
-            });
-        }
-        Ok(NodeExec::Completed(sink_outputs(
-            graph,
-            &node.id.0,
-            &nested.outputs,
-        )))
+        // `graph` is `&Box<Graph>`; deref-coerces to the `&Graph` param.
+        self.drive_nested(run, "subgraph", &node.id.0, graph, fold)
+            .await
     }
 }
