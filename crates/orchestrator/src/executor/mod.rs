@@ -302,6 +302,18 @@ impl Executor {
         self
     }
 
+    /// A per-run clone with FRESH expansion counters seeded to `(expansions, nodes)`
+    /// — 0/0 for a fresh `run`, or the journal's expansion tally for a resume — so the
+    /// caps span the crash seam and every nested `run_expand` shares one counter.
+    fn with_expansion_seed(mut self, expansions: usize, nodes: usize) -> Self {
+        use std::sync::atomic::AtomicUsize;
+        self.expansion_counters = Arc::new(ExpansionCounters {
+            expansions: AtomicUsize::new(expansions),
+            nodes: AtomicUsize::new(nodes),
+        });
+        self
+    }
+
     /// Execute a fresh linear graph end-to-end: journal `RunStarted`, then drive
     /// every node with an empty memo (nothing has run yet).
     pub async fn run(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
@@ -318,15 +330,16 @@ impl Executor {
 
     async fn run_inner(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
-        self.append(
+        let this = self.clone().with_expansion_seed(0, 0);
+        this.append(
             run,
             JournalEvent::RunStarted {
-                version: self.version.clone(),
+                version: this.version.clone(),
             },
         )
         .await?;
-        let outcome = self.drive(run, graph, &Fold::default()).await?;
-        self.finalize_run(run, &outcome).await?;
+        let outcome = this.drive(run, graph, &Fold::default()).await?;
+        this.finalize_run(run, &outcome).await?;
         Ok(outcome)
     }
 
@@ -417,12 +430,16 @@ impl Executor {
         // Rehydrate the blackboard from folded `ContextWrite`s (§8) so a resumed
         // Agent node reads its dependencies' context identically to the original
         // run (deterministic prompt → memoized turns replay).
-        self.rehydrate_context(&fold).await?;
-
-        // Resume the tail: `drive`'s memo branch replays the completed prefix
-        // (no gateway call, no new `EffectRecorded`) and finishes the run.
-        let outcome = self.drive(run, graph, &fold).await?;
-        self.finalize_run(run, &outcome).await?;
+        //
+        // Seed the expansion counters from the journaled expansions so the caps span
+        // the crash seam, then rehydrate + resume off that per-run clone.
+        let seed_nodes: usize = fold.expansions.values().map(|g| g.nodes.len()).sum();
+        let this = self
+            .clone()
+            .with_expansion_seed(fold.expansions.len(), seed_nodes);
+        this.rehydrate_context(&fold).await?;
+        let outcome = this.drive(run, graph, &fold).await?;
+        this.finalize_run(run, &outcome).await?;
         Ok(outcome)
     }
 
