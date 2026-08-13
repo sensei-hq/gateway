@@ -72,7 +72,21 @@ pub enum NodeKind {
     /// static `Value` this slice (author-provided); slice 4/5 threads it from a
     /// predecessor's output. No sibling-id references, so `namespace_graph`'s
     /// `other => other.clone()` arm and `validate_dag` need no `Expand` case.
-    Expand { input: serde_json::Value },
+    Expand {
+        input: serde_json::Value,
+        #[serde(default)]
+        planner: PlannerRef,
+    },
+}
+
+/// How an `Expand` node's plan is produced (SP-3 slice 4A). `Injected` = the
+/// slice-3 `Planner` trait (deterministic/test); `Agent` = a journaled ReAct
+/// planner agent (this slice). Slice 4B adds `Select` (goal-based selection).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum PlannerRef {
+    Agent(crate::registry::AgentRef),
+    #[default]
+    Injected,
 }
 
 /// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure
@@ -570,5 +584,25 @@ mod tests {
             }],
         };
         assert!(outer_ok.validate_dag().is_ok());
+    }
+
+    #[test]
+    fn expand_deserializes_without_planner_as_injected() {
+        let j = r#"{"Expand":{"input":{}}}"#;
+        let k: NodeKind = serde_json::from_str(j).unwrap();
+        assert!(matches!(
+            k,
+            NodeKind::Expand {
+                planner: PlannerRef::Injected,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn planner_ref_agent_roundtrips() {
+        let r = PlannerRef::Agent(crate::registry::AgentRef("planner".into()));
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<PlannerRef>(&s).unwrap(), r);
     }
 }
