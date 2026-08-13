@@ -134,6 +134,11 @@ pub fn feasible(
         }
     }
 
+    // Stable, process-independent error order — `ValidatePlan` is a Pure tool, so
+    // its `{errors}` output must be deterministic (the node_plans HashMap and any
+    // other accumulation source iterate in arbitrary order). `PlanError` has no
+    // `Ord`; the debug-string key is a pragmatic total order over every variant.
+    errs.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
     if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
@@ -346,6 +351,34 @@ mod tests {
             node_plans,
         };
         assert!(feasible(&plan, &reg, 512).is_ok());
+    }
+
+    #[test]
+    fn feasible_error_order_is_deterministic() {
+        // Two unknown-agent needs (accumulated by iterating a HashMap) must render
+        // in a stable order across repeated calls — the Pure-tool determinism prop.
+        let mut node_plans = HashMap::new();
+        node_plans.insert(
+            NodeId("n1".into()),
+            NodePlan {
+                label: "x".into(),
+                description: None,
+                needs: NodeNeeds {
+                    agents: vec!["ghost_a".into(), "ghost_b".into()],
+                    ..Default::default()
+                },
+            },
+        );
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![mc("n1", None)],
+            },
+            node_plans,
+        };
+        let first = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        for _ in 0..8 {
+            assert_eq!(feasible(&plan, &agent_reg(), 512).unwrap_err(), first);
+        }
     }
 
     #[test]
