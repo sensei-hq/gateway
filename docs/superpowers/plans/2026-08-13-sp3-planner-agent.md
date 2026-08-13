@@ -80,8 +80,8 @@ Create `crates/orchestrator-core/src/plan.rs` with ONLY this test module first (
 ```rust
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::graph::{Dep, Graph, Node, NodeId, NodeKind};
+    use super::*;                                   // NodeId comes via super::* (private in graph.rs)
+    use crate::graph::{Dep, Graph, Node, NodeKind};
     use crate::registry::{AgentDefinition, Registry};
     use std::collections::HashMap;
 
@@ -187,7 +187,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{Graph, NodeId, NodeKind};
+use crate::graph::{Graph, NodeKind};
+use crate::ids::NodeId;                             // NodeId is private in graph.rs — import from ids
 use crate::registry::Registry;
 
 /// Path segment reserved for the planner sub-run (`"{expand}/__plan__"`); a plan
