@@ -11,8 +11,8 @@ source: crates/orchestrator*
 # Execution Graph
 
 > **Status: Partial (Phase 3 · SP-1/3).** Design §10. Implemented node kinds:
-> `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`**, and **`Subgraph`**
-> (walking skeleton).
+> `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`**, **`Subgraph`**, and
+> **`Branch`** (walking skeleton).
 > Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
 > scheduler are live. **`Loop`** (loop-node design
 > [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)):
@@ -25,7 +25,7 @@ source: crates/orchestrator*
 > Agent-body pause pauses the Loop. Resume replays completed iterations (memo-hit,
 > zero re-spend) and recomputes the pure gate, so it stops at the same iteration —
 > no gate journaling. Output: `{ iterations, converged, output }`.
-> **Deferred:** multi-node loop bodies (Loop-over-`Subgraph`), `Branch`, `PlanDelta`
+> **Deferred:** multi-node loop bodies (Loop-over-`Subgraph`), `PlanDelta`
 > runtime expansion, an LLM/fuzzy gate agent, a cost/timeout budget backstop (the
 > budget axis is dormant, so `max_iters` is the only backstop), and
 > nested-loop/global node caps.
@@ -45,6 +45,14 @@ source: crates/orchestrator*
 >   **Deferred:** cross-boundary input/context (plan-scope blackboard),
 >   Loop-over-Subgraph (slice 5), runtime `PlanDelta` (slice 3), node-count/expansion
 >   caps (slice 3).
+> - **`Branch { on, arms, default }`** (SP-3 slice 2) — a deterministic conditional:
+>   tests predecessor `on`'s memoized output with a pure `BranchCond`
+>   (`FieldEquals`/`FieldTrue`/`TextContains`, first match wins, required `default`) and
+>   runs the selected arm as a nested graph under `{branch}/{label}/…` (reusing the
+>   Subgraph machinery). The decision is recomputed on resume (no branch journaling);
+>   only the selected arm runs. `on` must be a declared Hard dep (a failed `on`
+>   cascade-skips the branch). Output = the selected arm's sink map; failure/pause
+>   propagate like `Subgraph`.
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed

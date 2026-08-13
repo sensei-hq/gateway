@@ -5435,6 +5435,351 @@ async fn branch_journals_only_the_selected_arm() {
     );
 }
 
+/// Determinism/resume: a run whose Branch selected an arm, then a downstream OUTER
+/// node (`d`) fails, resumes by recomputing the SAME arm — the decision is pure over
+/// `on`'s memoized output — and replays the arm's inner node from the memo (no
+/// re-spend). NO branch-decision event is journaled (the Branch node itself never
+/// appends a `NodeStarted`/`NodeCompleted`; only the selected arm's namespaced inner
+/// nodes are). Modeled on `subgraph_inner_nodes_replay_from_memo_on_resume` /
+/// `a_run_with_a_completed_subgraph_and_a_failing_tail_resumes_correctly`.
+#[tokio::test]
+async fn branch_replays_the_same_arm_on_resume_without_respend() {
+    use orchestrator_core::BranchCond;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let br = NodeId("br".into());
+    // Outer: on → br(Branch selecting arm 0 = "armB_out") → d (Hard-dep br).
+    let graph = Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: br.clone(),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![(BranchCond::TextContains("canned".into()), arm("armB_out"))],
+                    default: arm("armDefault_out"),
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+            mc("d", Some("br")),
+        ],
+    };
+
+    // Run 1: succeed through `on` (gateway call 1) and the selected arm's inner
+    // ModelCall "br/0/armB_out" (call 2), then FAIL at the outer tail "d" (call 3).
+    let (gw1, _c1) = failing_after_gateway(2).await;
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(out1.failed.is_some(), "run 1 fails at the tail d: {out1:?}");
+    let rc = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| matches!(e, JournalEvent::RunCompleted))
+        .count();
+    assert_eq!(rc, 0, "no RunCompleted after a failed tail (partial run)");
+
+    // Resume on a FRESH always-succeeding gateway over the SAME journal. The Branch
+    // recomputes the SAME arm from `on`'s memoized output and replays the arm's inner
+    // node from the memo; only the failed tail `d` is re-driven.
+    let (gw2, calls2) = recording_gateway().await;
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .start(run, &graph)
+        .await
+        .expect("resume completes");
+    assert!(out2.failed.is_none(), "resume completes: {:?}", out2.failed);
+
+    // The proof: resume's gateway saw EXACTLY ONE call, carrying `d`'s prompt — the
+    // arm's inner ModelCall "br/0/armB_out" was replayed from the memo, not re-spent.
+    let recorded2 = calls2.lock().unwrap().clone();
+    assert_eq!(
+        recorded2.len(),
+        1,
+        "resume re-called the gateway only for the failed tail d: {recorded2:?}"
+    );
+    assert_eq!(
+        recorded2[0].1, "d",
+        "the single resume call carried d's prompt"
+    );
+    assert!(
+        !recorded2.iter().any(|(_, p)| p == "armB_out"),
+        "the branch arm's inner node was NOT re-driven on resume: {recorded2:?}"
+    );
+
+    // No branch-decision event is journaled: the Branch node "br" itself never
+    // appends a NodeStarted (only its namespaced arm nodes like "br/0/armB_out" do).
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::NodeStarted { node } if node.0 == "br")),
+        "the Branch node journals no decision event of its own"
+    );
+}
+
+/// A failed `on` cascade-skips the Branch: the Branch's HARD dep on `on` means a
+/// failed `on` skips "br" before it ever decides (no arm runs).
+#[tokio::test]
+async fn a_failed_on_cascade_skips_the_branch() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = failing_after_gateway(0).await; // `on` fails immediately
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let graph = branch_graph(
+        vec![(BranchCond::TextContains("x".into()), arm("armA_out"))],
+        arm("armDefault_out"),
+    );
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("outcome");
+    assert!(out.failed.is_some(), "on failed: {out:?}");
+    assert!(
+        out.skipped.contains(&NodeId("br".into())),
+        "branch cascade-skipped (never decided): {out:?}"
+    );
+}
+
+/// Arm failure propagates OUT of a Branch: a failing node inside the SELECTED arm
+/// makes the Branch node `Failed`, which cascade-skips the Branch's outer
+/// Hard-dependent ("dret"). Here `on` succeeds (recording_gateway → "canned-response"
+/// selects arm 0), but that arm's inner ModelCall targets an UNKNOWN chain, so it
+/// fails cleanly at the gateway (`NoCandidates`).
+#[tokio::test]
+async fn a_failing_node_in_the_selected_arm_fails_the_branch() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = recording_gateway().await; // `on` → {"text":"canned-response"}
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let arm_fail = Graph {
+        nodes: vec![Node {
+            id: NodeId("armfail".into()),
+            kind: NodeKind::ModelCall {
+                chain: "nonexistent".into(),
+                payload: serde_json::json!(0),
+            },
+            deps: vec![],
+        }],
+    };
+    let graph = Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: NodeId("br".into()),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![(BranchCond::TextContains("canned".into()), arm_fail)],
+                    default: arm("armDefault_out"),
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+            Node {
+                id: NodeId("dret".into()),
+                kind: NodeKind::ModelCall {
+                    chain: "c".into(),
+                    payload: serde_json::json!(0),
+                },
+                deps: vec![Dep {
+                    on: NodeId("br".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+        ],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("outcome");
+    assert!(
+        out.failed.is_some(),
+        "the selected arm's failure fails the Branch: {out:?}"
+    );
+    assert!(
+        out.skipped.contains(&NodeId("dret".into())),
+        "the outer Hard-dependent of a failed Branch cascade-skips: {out:?}"
+    );
+}
+
+/// Pause propagates OUT of a Branch: an in-doubt Mutation inside the SELECTED arm's
+/// nested agent pauses that agent, `run_branch` maps the nested `RunOutcome.paused` →
+/// `NodeExec::Paused`, and the outer scheduler pauses the whole run — never journaling
+/// `RunCompleted` over the unresolved Intent. This is the
+/// `an_in_doubt_mutation_in_a_subgraph_pauses_the_run` shape with the mutation-bearing
+/// agent wrapped in a Branch's selected arm instead of a Subgraph. NOTE: the Branch's
+/// `on` is a plain `ModelCall` on the demo `research.bulk` chain (the chain the
+/// `ToolEmittingOllamaAdapter` serves) — the `mc()` helper's chain "c" does not exist
+/// in the demo catalog — so `on` runs on the SAME gateway as the agent; its
+/// "synthesized locally" answer selects the agent arm via `TextContains`.
+#[tokio::test]
+async fn an_in_doubt_mutation_in_a_branch_arm_pauses_the_run() {
+    use orchestrator_core::BranchCond;
+    let run = RunId(uuid::Uuid::new_v4());
+    let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
+        let recorder = AgentDefinition {
+            name: "recorder".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: Some("research.bulk".into()),
+            chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            tools: vec!["record_note".into()],
+            skills: vec![],
+            system_prompt: "Record.".into(),
+        };
+        (
+            Arc::new(
+                Registry::default()
+                    .with_agent(recorder)
+                    .with_tool(RecordNote::new(sink.clone()).spec()),
+            ),
+            Arc::new(ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink)))),
+        )
+    };
+    // The mutation-bearing agent lives inside the Branch's SELECTED arm ("br/0/rec").
+    let branch = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("on".into()),
+                kind: NodeKind::ModelCall {
+                    chain: "research.bulk".into(),
+                    payload: serde_json::json!("decide"),
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("br".into()),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![(
+                        BranchCond::TextContains("synthesized".into()),
+                        Graph {
+                            nodes: vec![agent_node("rec", "recorder", "item-0")],
+                        },
+                    )],
+                    default: arm("armDefault_out"),
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+        ],
+    };
+
+    // Seed: run the Branch to completion, then truncate to the nested agent's
+    // record_note EffectIntent (drops its EffectRecorded) → in-doubt on resume.
+    let full = InMemoryJournal::new();
+    let (seed_reg, seed_tools) = mk_recorder(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let (gw_s, _c) = demo_reference_tool_gateway().await;
+    Executor::new(Arc::new(gw_s), Arc::new(full.clone()), "v1")
+        .with_registry(seed_reg)
+        .with_tools(seed_tools)
+        .run(run, &branch)
+        .await
+        .expect("seed Branch run completes");
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("the nested agent journaled a record_note EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // Resume with an Indeterminate reconciler + a FRESH empty sink → the nested
+    // Mutation is in-doubt → the nested agent pauses → the Branch pauses → the run pauses.
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (reg, tools) = mk_recorder(sink.clone());
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (gw_r, _c2) = demo_reference_tool_gateway().await;
+    let outcome = Executor::new(Arc::new(gw_r), Arc::new(seeded.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(tools)
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &branch)
+        .await
+        .expect("resume yields an outcome");
+
+    let pause = outcome
+        .paused
+        .expect("the in-doubt nested Mutation pauses the whole run");
+    assert_eq!(
+        pause.node,
+        NodeId("br".into()),
+        "the Branch node is the pause point"
+    );
+    let resumed = seeded.load(run).await.unwrap();
+    assert!(
+        resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run must NOT complete over an unresolved in-doubt Intent (no silent failure)"
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+}
+
+/// End-to-end: a `Branch` drives a nested `Agent` arm through the real gateway; the
+/// agent's output is the selected arm's sink (`{agent_out: <agent output>}`).
+#[tokio::test]
+async fn branch_drives_a_nested_agent_arm_end_to_end() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = recording_gateway().await;
+    let registry = agent_registry("c");
+    let br = NodeId("br".into());
+    let agent_arm = Graph {
+        nodes: vec![agent_node("agent_out", "a", "hi")],
+    };
+    let graph = Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: br.clone(),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![(BranchCond::TextContains("canned".into()), agent_arm)],
+                    default: Graph {
+                        nodes: vec![mc("armDefault_out", None)],
+                    },
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+        ],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry);
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&br].get("agent_out").is_some(),
+        "nested agent arm ran: {}",
+        out.outputs[&br]
+    );
+}
+
 #[test]
 fn validate_dag_rejects_bad_branch() {
     use orchestrator_core::BranchCond;
@@ -5532,6 +5877,53 @@ fn validate_dag_rejects_bad_branch() {
     };
     assert!(matches!(
         cyc.validate_dag(),
+        Err(OrchestratorError::InvalidGraph(_))
+    ));
+    // nested cycle in the DEFAULT arm → InvalidGraph (recursion into default).
+    let default_cyc = Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: NodeId("br".into()),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![],
+                    default: Graph {
+                        nodes: vec![
+                            Node {
+                                id: NodeId("a".into()),
+                                kind: NodeKind::ModelCall {
+                                    chain: "c".into(),
+                                    payload: serde_json::json!(0),
+                                },
+                                deps: vec![Dep {
+                                    on: NodeId("b".into()),
+                                    kind: EdgeKind::Hard,
+                                }],
+                            },
+                            Node {
+                                id: NodeId("b".into()),
+                                kind: NodeKind::ModelCall {
+                                    chain: "c".into(),
+                                    payload: serde_json::json!(0),
+                                },
+                                deps: vec![Dep {
+                                    on: NodeId("a".into()),
+                                    kind: EdgeKind::Hard,
+                                }],
+                            },
+                        ],
+                    },
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+        ],
+    };
+    assert!(matches!(
+        default_cyc.validate_dag(),
         Err(OrchestratorError::InvalidGraph(_))
     ));
 }
