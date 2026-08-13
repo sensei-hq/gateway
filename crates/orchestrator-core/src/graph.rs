@@ -280,17 +280,14 @@ impl Graph {
             }
         }
 
-        // 2d. A `Branch`: `on` must be a declared node AND a Hard dep of the branch
-        // (so it runs first and a failed `on` cascade-skips the branch); each arm's
-        // and the default's nested graph must be a valid DAG (recursive).
+        // 2d. A `Branch`'s `on` must be a Hard dep of the branch (so it runs first
+        // and a failed `on` cascade-skips the branch). This also enforces the
+        // "declared" invariant: a Hard dep on an undeclared node is already rejected
+        // by the general dependency check (block 2 above), so no separate
+        // `ids.contains(on)` clause is needed. Each arm's and the default's nested
+        // graph must itself be a valid DAG (recursive).
         for node in &self.nodes {
             if let NodeKind::Branch { on, arms, default } = &node.kind {
-                if !ids.contains(on) {
-                    return Err(OrchestratorError::InvalidGraph(format!(
-                        "branch {:?} tests undeclared node {:?}",
-                        node.id, on
-                    )));
-                }
                 if !node
                     .deps
                     .iter()
