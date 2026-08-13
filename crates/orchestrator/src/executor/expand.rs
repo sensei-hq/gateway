@@ -65,6 +65,7 @@ impl Executor {
                     JournalEvent::PlanExpanded {
                         node: node.id.clone(),
                         subgraph: produced.clone(),
+                        node_plans: std::collections::HashMap::new(),
                     },
                 )
                 .await?;
