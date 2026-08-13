@@ -358,7 +358,7 @@ Then remove the now-unused imports from `branch.rs`: delete the line `use super:
 
 - [ ] **Step 4: Verify the refactor compiles and existing nested tests pass**
 
-Run: `cargo test -p sensei-orchestrator subgraph branch`
+Run: `cargo test -p sensei-orchestrator -- subgraph branch` (multiple name filters must follow `--`; a bare `cargo test -p … subgraph branch` errors)
 Expected: PASS — every existing `subgraph_*` and `branch_*` test still green (Subgraph messages/depth unchanged; Branch tests assert path labels/outputs, not messages/depth).
 
 If a Branch test unexpectedly fails on a message substring, update that assertion from the old `"branch <id> arm <label>"` wording to `"branch <id>/<label>"` and re-run. (None are expected — the current Branch tests do not assert pause/fail message text.)
@@ -528,7 +528,7 @@ fn mc_dep(id: &str, dep: Dep) -> Node {
 
 - [ ] **Step 2: Run the tests to verify they fail (compile error — `with_planner`/`Expand` arm missing)**
 
-Run: `cargo test -p sensei-orchestrator expand_ 2>&1 | head -30`
+Run: `cargo test -p sensei-orchestrator expand_` (read the real output/exit code — do NOT pipe through `head`/`tail`/`grep`)
 Expected: FAIL to compile (`no method with_planner`, `no run_expand` dispatch). This confirms the tests exercise the new surface.
 
 - [ ] **Step 3: Add executor fields, `ExpansionCounters`, and setters**
@@ -837,7 +837,7 @@ async fn expand_completed_then_failing_tail_resumes_without_replan() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p sensei-orchestrator expand_resume_uses_the_journaled_plan_not_a_re_plan expand_completed_then_failing_tail_resumes_without_replan`
+Run: `cargo test -p sensei-orchestrator -- expand_resume_uses_the_journaled_plan_not_a_re_plan expand_completed_then_failing_tail_resumes_without_replan`
 Expected: FAIL. Because `run_expand` currently always re-plans, run 2 uses plan B (`zzz`/`other`), so `o2.outputs[&e].get("n2")` is `None` (and/or the gateway call count/prompt is wrong).
 
 - [ ] **Step 3: Add the resume branch to `run_expand`**
@@ -996,7 +996,7 @@ async fn expand_max_nodes_cap_spans_resume() {
 
 - [ ] **Step 2: Run to verify AC9 fails (AC8 already passes from Task 3's `check_expansion_budget`)**
 
-Run: `cargo test -p sensei-orchestrator expand_max_expansions_cap_halts_loud expand_max_nodes_cap_spans_resume`
+Run: `cargo test -p sensei-orchestrator -- expand_max_expansions_cap_halts_loud expand_max_nodes_cap_spans_resume`
 Expected: `expand_max_expansions_cap_halts_loud` PASSES (fresh-run counters start at 0, so the cap already works within a single run); `expand_max_nodes_cap_spans_resume` FAILS — the resume does not yet seed the counter, so e2's 2 nodes fit under 3 and the run completes instead of erroring.
 
 - [ ] **Step 3: Add the per-run seed helper**
@@ -1057,7 +1057,7 @@ In `crates/orchestrator/src/executor/mod.rs`, in `start_inner`, replace the tail
 
 - [ ] **Step 6: Run to verify both cap tests pass**
 
-Run: `cargo test -p sensei-orchestrator expand_max_expansions_cap_halts_loud expand_max_nodes_cap_spans_resume`
+Run: `cargo test -p sensei-orchestrator -- expand_max_expansions_cap_halts_loud expand_max_nodes_cap_spans_resume`
 Expected: both PASS. Verify the real exit code is 0.
 
 - [ ] **Step 7: Commit**
@@ -1216,7 +1216,7 @@ async fn expand_drives_a_produced_agent_plan_end_to_end() {
 
 - [ ] **Step 2: Run the new tests to verify they pass**
 
-Run: `cargo test -p sensei-orchestrator a_failing_node_in_the_expand_plan_fails_the_expand an_in_doubt_mutation_in_an_expand_plan_pauses_the_run expand_drives_a_produced_agent_plan_end_to_end`
+Run: `cargo test -p sensei-orchestrator -- a_failing_node_in_the_expand_plan_fails_the_expand an_in_doubt_mutation_in_an_expand_plan_pauses_the_run expand_drives_a_produced_agent_plan_end_to_end`
 Expected: all three PASS. Verify the real exit code is 0.
 
 - [ ] **Step 3: Full-workspace gate (AC11 + AC13: no regressions, additive)**
