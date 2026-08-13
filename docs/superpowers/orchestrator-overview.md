@@ -173,7 +173,7 @@ Grouped by phase. Each line is a confirmed decision; the per‑slice spec (§4 i
 | SP‑3 s1 Subgraph | [specs/2026-08-12-sp3-subgraph-node-design.md](specs/2026-08-12-sp3-subgraph-node-design.md) | ✅ merged (develop) |
 | SP‑3 s2 Branch | [specs/2026-08-12-sp3-branch-node-design.md](specs/2026-08-12-sp3-branch-node-design.md) | ✅ merged (develop) |
 | SP‑3 s3 PlanDelta/Expand | [specs/2026-08-13-sp3-plandelta-splice-design.md](specs/2026-08-13-sp3-plandelta-splice-design.md) | ✅ merged (develop) |
-| SP‑3 s4A planner (core+agent) | `specs/2026-08-13-sp3-planner-agent-design.md` | 🚧 design agreed, spec pending |
+| SP‑3 s4A planner (core+agent) | [specs/2026-08-13-sp3-planner-agent-design.md](specs/2026-08-13-sp3-planner-agent-design.md) | ✅ spec approved, plan pending |
 | SP‑3 s4B planner selector | (tbd) | ⏳ next |
 | SP‑3 s5 coordinator + loops‑of‑graphs | (tbd) | ⏳ |
 
