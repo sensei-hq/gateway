@@ -5295,3 +5295,243 @@ async fn an_empty_subgraph_completes_with_an_empty_sink_map() {
         "empty subgraph → empty sink map"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SP-3 slice 2 — `NodeKind::Branch`: a deterministic conditional that tests a
+// predecessor's output and drives the first matching arm (else `default`) as a
+// nested graph under `"{branch}/{label}/…"`.
+// ---------------------------------------------------------------------------
+
+fn arm(inner_id: &str) -> Graph {
+    Graph {
+        nodes: vec![mc(inner_id, None)],
+    }
+}
+fn branch_graph(arms: Vec<(orchestrator_core::BranchCond, Graph)>, default: Graph) -> Graph {
+    Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: NodeId("br".into()),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms,
+                    default,
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+        ],
+    }
+}
+
+#[tokio::test]
+async fn branch_selects_first_matching_arm() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = recording_gateway().await; // `on` output = {"text":"canned-response"}
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let br = NodeId("br".into());
+    let graph = branch_graph(
+        vec![
+            (BranchCond::TextContains("zzz-nope".into()), arm("armA_out")),
+            (BranchCond::TextContains("canned".into()), arm("armB_out")),
+        ],
+        arm("armDefault_out"),
+    );
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    let b = &out.outputs[&br];
+    assert!(b.get("armB_out").is_some(), "arm 1 (first match) ran: {b}");
+    assert!(
+        b.get("armA_out").is_none() && b.get("armDefault_out").is_none(),
+        "others didn't: {b}"
+    );
+}
+
+#[tokio::test]
+async fn branch_earlier_matching_arm_wins_over_later() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let br = NodeId("br".into());
+    let graph = branch_graph(
+        vec![
+            (BranchCond::TextContains("canned".into()), arm("armA_out")),
+            (BranchCond::TextContains("response".into()), arm("armB_out")),
+        ],
+        arm("armDefault_out"),
+    );
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    let b = &out.outputs[&br];
+    assert!(
+        b.get("armA_out").is_some() && b.get("armB_out").is_none(),
+        "earlier arm wins: {b}"
+    );
+}
+
+#[tokio::test]
+async fn branch_runs_default_when_no_arm_matches() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let br = NodeId("br".into());
+    let graph = branch_graph(
+        vec![(BranchCond::TextContains("zzz".into()), arm("armA_out"))],
+        arm("armDefault_out"),
+    );
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    let b = &out.outputs[&br];
+    assert!(
+        b.get("armDefault_out").is_some() && b.get("armA_out").is_none(),
+        "default ran: {b}"
+    );
+}
+
+#[tokio::test]
+async fn branch_journals_only_the_selected_arm() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = branch_graph(
+        vec![
+            (BranchCond::TextContains("zzz".into()), arm("armA_out")),
+            (BranchCond::TextContains("canned".into()), arm("armB_out")),
+        ],
+        arm("armDefault_out"),
+    );
+    exec.run(run, &graph).await.expect("run");
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::NodeStarted { node } => Some(node.0.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "br/1/armB_out"),
+        "selected arm journaled: {labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l.contains("armA_out") || l.contains("armDefault_out")),
+        "unselected arms not journaled: {labels:?}"
+    );
+}
+
+#[test]
+fn validate_dag_rejects_bad_branch() {
+    use orchestrator_core::BranchCond;
+    let no_dep = Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: NodeId("br".into()),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![(
+                        BranchCond::FieldTrue("x".into()),
+                        Graph {
+                            nodes: vec![mc("a", None)],
+                        },
+                    )],
+                    default: Graph {
+                        nodes: vec![mc("d", None)],
+                    },
+                },
+                deps: vec![], // MISSING Hard dep on `on`
+            },
+        ],
+    };
+    assert!(matches!(
+        no_dep.validate_dag(),
+        Err(OrchestratorError::InvalidGraph(_))
+    ));
+    let undeclared = Graph {
+        nodes: vec![Node {
+            id: NodeId("br".into()),
+            kind: NodeKind::Branch {
+                on: NodeId("ghost".into()),
+                arms: vec![],
+                default: Graph {
+                    nodes: vec![mc("d", None)],
+                },
+            },
+            deps: vec![Dep {
+                on: NodeId("ghost".into()),
+                kind: EdgeKind::Hard,
+            }],
+        }],
+    };
+    assert!(matches!(
+        undeclared.validate_dag(),
+        Err(OrchestratorError::InvalidGraph(_))
+    ));
+    let cyc = Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: NodeId("br".into()),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![(
+                        BranchCond::FieldTrue("x".into()),
+                        Graph {
+                            nodes: vec![
+                                Node {
+                                    id: NodeId("a".into()),
+                                    kind: NodeKind::ModelCall {
+                                        chain: "c".into(),
+                                        payload: serde_json::json!(0),
+                                    },
+                                    deps: vec![Dep {
+                                        on: NodeId("b".into()),
+                                        kind: EdgeKind::Hard,
+                                    }],
+                                },
+                                Node {
+                                    id: NodeId("b".into()),
+                                    kind: NodeKind::ModelCall {
+                                        chain: "c".into(),
+                                        payload: serde_json::json!(0),
+                                    },
+                                    deps: vec![Dep {
+                                        on: NodeId("a".into()),
+                                        kind: EdgeKind::Hard,
+                                    }],
+                                },
+                            ],
+                        },
+                    )],
+                    default: Graph {
+                        nodes: vec![mc("d", None)],
+                    },
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Hard,
+                }],
+            },
+        ],
+    };
+    assert!(matches!(
+        cyc.validate_dag(),
+        Err(OrchestratorError::InvalidGraph(_))
+    ));
+}
