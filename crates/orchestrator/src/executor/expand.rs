@@ -11,6 +11,13 @@ use super::{Executor, Fold, NodeExec};
 
 impl Executor {
     /// Drive an `Expand` node: produce → validate → cap-check → journal → drive.
+    ///
+    /// Known limitation (fresh-vs-terminal asymmetry, shared with `run_subgraph`/
+    /// `run_branch` and the `Map`/`Loop` synthesized outputs): the `Completed` sink
+    /// map is NOT journaled as an `EffectRecorded`, so a terminal re-`start`
+    /// reconstructs `outputs` from the journal's per-node effects — the namespaced
+    /// inner nodes (`"{node}/…"`), not the sink map under `node.id`. The `PlanExpanded`
+    /// event only reconstructs the graph *structure*, not the folded sink output.
     pub(super) async fn run_expand(
         &self,
         run: RunId,
