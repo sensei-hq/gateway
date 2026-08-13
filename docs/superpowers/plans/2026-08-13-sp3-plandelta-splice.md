@@ -121,7 +121,7 @@ In `crates/orchestrator-core/src/journal.rs`, add to `mod tests`:
 ```rust
     #[test]
     fn plan_expanded_event_roundtrips() {
-        use crate::graph::{Node, NodeKind};
+        use crate::graph::{Graph, Node, NodeKind};
         let e = JournalEvent::PlanExpanded {
             node: NodeId("e".into()),
             subgraph: Graph {
@@ -209,6 +209,25 @@ In `crates/orchestrator/src/executor/support.rs`, add to `mod tests`:
     }
 ```
 
+- [ ] **Step 9b: Satisfy the executor's exhaustive matches (temporary stubs)**
+
+Adding the two core variants forces two *exhaustive* `match`es in the `sensei-orchestrator` crate to handle them, or the crate won't compile (and the pre-commit `clippy --workspace` will reject the commit). Add the minimal arms:
+
+In `crates/orchestrator/src/executor/mod.rs`, in `run_node`'s `match &node.kind { … }`, add a **temporary** arm after the `NodeKind::Branch { .. } =>` arm. Task 3 Step 4 replaces this exact line with the real dispatch:
+
+```rust
+            // TEMPORARY (SP-3 slice 3, Task 1): exhaustiveness stub. Task 3 replaces
+            // this with `=> self.run_expand(run, node, fold).await`. No Task-1 test
+            // constructs an `Expand` node, so this is never reached in this commit.
+            NodeKind::Expand { .. } => unreachable!("Expand execution lands in Task 3"),
+```
+
+In `crates/orchestrator/src/executor/tests.rs`, in the `label` helper's `match event { … }` (an exhaustive match over `JournalEvent`), add this **permanent** arm (place it after the `MapCompacted` arm):
+
+```rust
+        JournalEvent::PlanExpanded { node, .. } => format!("PlanExpanded({})", node.0),
+```
+
 - [ ] **Step 10: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-orchestrator-core plan_expanded_event_roundtrips && cargo test -p sensei-orchestrator fold_journal_captures_plan_expansions`
@@ -221,7 +240,8 @@ cd /Users/Jerry/Developer/gateway
 cargo fmt --all
 git add crates/orchestrator-core/src/planner.rs crates/orchestrator-core/src/lib.rs \
         crates/orchestrator-core/src/graph.rs crates/orchestrator-core/src/journal.rs \
-        crates/orchestrator/src/executor/mod.rs crates/orchestrator/src/executor/support.rs
+        crates/orchestrator/src/executor/mod.rs crates/orchestrator/src/executor/support.rs \
+        crates/orchestrator/src/executor/tests.rs
 git commit -m "feat(orchestrator): SP-3 slice 3 (1/6) — Planner trait, NodeKind::Expand, PlanExpanded event + fold"
 ```
 
@@ -588,9 +608,9 @@ Add the setters (place them next to `with_max_depth`):
     }
 ```
 
-- [ ] **Step 4: Add the `Expand` dispatch arm**
+- [ ] **Step 4: Replace the Task 1 stub with the real `Expand` dispatch arm**
 
-In `crates/orchestrator/src/executor/mod.rs`, in `run_node`'s `match &node.kind { … }`, add (after the `Branch` arm):
+In `crates/orchestrator/src/executor/mod.rs`, in `run_node`'s `match &node.kind { … }`, **replace** the temporary Task 1 stub arm (the `NodeKind::Expand { .. } => unreachable!("Expand execution lands in Task 3")` line and its comment) with the real dispatch:
 
 ```rust
             NodeKind::Expand { .. } => self.run_expand(run, node, fold).await,
