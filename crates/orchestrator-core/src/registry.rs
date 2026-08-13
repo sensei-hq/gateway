@@ -239,6 +239,36 @@ impl Registry {
     pub fn tool(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.get(name)
     }
+    /// Enumerate all agent definitions (for planner discovery + feasibility).
+    pub fn agents(&self) -> impl Iterator<Item = &AgentDefinition> {
+        self.agents.values()
+    }
+    /// Enumerate all skill definitions.
+    pub fn skills(&self) -> impl Iterator<Item = &SkillDef> {
+        self.skills.values()
+    }
+    /// Enumerate all tool specs.
+    pub fn tools(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.tools.values()
+    }
+    /// Distinct chain ids the registry references (agent `chain`, per-phase
+    /// `chains`, and `(area,kind)` bindings), sorted. Best-effort menu — the full
+    /// gateway catalog is not registry-visible.
+    pub fn chain_names(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for a in self.agents.values() {
+            if let Some(c) = &a.chain {
+                set.insert(c.clone());
+            }
+            for c in a.chains.values() {
+                set.insert(c.clone());
+            }
+        }
+        for c in self.chain_bindings.values() {
+            set.insert(c.clone());
+        }
+        set.into_iter().collect()
+    }
     pub fn with_chain_binding(mut self, b: ChainBinding) -> Self {
         self.chain_bindings.insert((b.area, b.kind), b.chain);
         self
