@@ -63,8 +63,34 @@ pub fn parse_plan(text: &str) -> Result<PlannedGraph, PlanError> {
     serde_json::from_str(text).map_err(|e| PlanError::Parse(e.to_string()))
 }
 
+/// Recursively check every `Agent` node's `agent` ref against the registry,
+/// descending into nested `Subgraph`/`Branch` graphs (mirrors `validate_dag`'s
+/// recursion) — a nested unknown agent must fail feasibility, not only at runtime.
+/// `Expand` has no static nested graph (its `input` is a `Value`), so it is not
+/// recursed into. Accumulates into `errs` (all errors, no short-circuit).
+fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError>) {
+    for n in &graph.nodes {
+        match &n.kind {
+            NodeKind::Agent { agent, .. } => {
+                if registry.agent(&agent.0).is_none() {
+                    errs.push(PlanError::UnknownAgent(agent.0.clone()));
+                }
+            }
+            NodeKind::Subgraph { graph } => check_agent_refs(graph, registry, errs),
+            NodeKind::Branch { arms, default, .. } => {
+                for (_, g) in arms {
+                    check_agent_refs(g, registry, errs);
+                }
+                check_agent_refs(default, registry, errs);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Pure feasibility: structure (validate_dag) + registry-resolvable refs (Agent
-/// nodes + each NodePlan.needs) + reserved-id + node-count. Returns ALL errors.
+/// nodes, recursively + each NodePlan.needs) + reserved-id + node-count. Returns
+/// ALL errors.
 pub fn feasible(
     plan: &PlannedGraph,
     registry: &Registry,
@@ -81,16 +107,15 @@ pub fn feasible(
             limit: max_nodes,
         });
     }
+    // Reserved-id is a top-level-only pre-check: nested ids namespace deeper under
+    // their parent path and can't collide with the top-level `__plan__` segment.
     for n in &plan.graph.nodes {
         if n.id.0 == RESERVED_PLAN_ID {
             errs.push(PlanError::ReservedNodeId(n.id.0.clone()));
         }
-        if let NodeKind::Agent { agent, .. } = &n.kind
-            && registry.agent(&agent.0).is_none()
-        {
-            errs.push(PlanError::UnknownAgent(agent.0.clone()));
-        }
     }
+    // Agent refs, recursing into nested Subgraph/Branch graphs.
+    check_agent_refs(&plan.graph, registry, &mut errs);
     for np in plan.node_plans.values() {
         for a in &np.needs.agents {
             if registry.agent(a).is_none() {
@@ -115,8 +140,11 @@ pub fn feasible(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Dep, Graph, Node, NodeKind};
-    use crate::registry::{AgentDefinition, Registry};
+    use crate::effect::EffectClass;
+    use crate::graph::{BranchCond, Dep, Graph, Node, NodeKind};
+    use crate::registry::{
+        Activation, AgentDefinition, AgentRef, Permissions, Registry, SkillDef, ToolSpec,
+    };
     use std::collections::HashMap;
 
     fn agent_reg() -> Registry {
@@ -227,5 +255,159 @@ mod tests {
         };
         let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
         assert!(errs.iter().any(|e| matches!(e, PlanError::Structural(_))));
+    }
+
+    /// An `Agent` node (used only inside nested graphs here) naming `agent`.
+    fn agent_node(id: &str, agent: &str) -> Node {
+        Node {
+            id: NodeId(id.into()),
+            kind: NodeKind::Agent {
+                agent: AgentRef(agent.into()),
+                input: serde_json::json!({}),
+                phase: None,
+            },
+            deps: vec![],
+        }
+    }
+    fn a_tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+        }
+    }
+
+    #[test]
+    fn feasible_reports_unknown_skill_and_tool_in_needs() {
+        // node_plans[*].needs references an unregistered skill AND tool.
+        let mut node_plans = HashMap::new();
+        node_plans.insert(
+            NodeId("n1".into()),
+            NodePlan {
+                label: "x".into(),
+                description: None,
+                needs: NodeNeeds {
+                    skills: vec!["ghost_skill".into()],
+                    tools: vec!["ghost_tool".into()],
+                    ..Default::default()
+                },
+            },
+        );
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![mc("n1", None)],
+            },
+            node_plans,
+        };
+        let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::UnknownSkill(s) if s == "ghost_skill"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::UnknownTool(t) if t == "ghost_tool"))
+        );
+    }
+
+    #[test]
+    fn feasible_accepts_needs_referencing_registered_skill_and_tool() {
+        // Positive path: needs resolve against a registry holding the skill + tool.
+        let reg = agent_reg()
+            .with_skill(SkillDef {
+                name: "concise".into(),
+                description: None,
+                body: "b".into(),
+                activation: Activation::default(),
+            })
+            .with_tool(a_tool("calc"));
+        let mut node_plans = HashMap::new();
+        node_plans.insert(
+            NodeId("n1".into()),
+            NodePlan {
+                label: "x".into(),
+                description: None,
+                needs: NodeNeeds {
+                    skills: vec!["concise".into()],
+                    tools: vec!["calc".into()],
+                    ..Default::default()
+                },
+            },
+        );
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![mc("n1", None)],
+            },
+            node_plans,
+        };
+        assert!(feasible(&plan, &reg, 512).is_ok());
+    }
+
+    #[test]
+    fn feasible_recurses_agent_ref_check_into_nested_subgraph() {
+        // A nested Subgraph's Agent{agent:"ghost"} must be caught (not only at runtime).
+        let inner = Graph {
+            nodes: vec![agent_node("a", "ghost")],
+        };
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("s".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(inner),
+                    },
+                    deps: vec![],
+                }],
+            },
+            node_plans: HashMap::new(),
+        };
+        let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::UnknownAgent(a) if a == "ghost"))
+        );
+    }
+
+    #[test]
+    fn feasible_recurses_agent_ref_check_into_branch_arms_and_default() {
+        // Both a Branch arm graph AND its default graph are descended into.
+        let arm = Graph {
+            nodes: vec![agent_node("arm", "ghost_arm")],
+        };
+        let default = Graph {
+            nodes: vec![agent_node("def", "ghost_default")],
+        };
+        // validate_dag requires the Branch to Hard-depend on its `on` predecessor.
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![
+                    mc("p", None),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("p".into()),
+                            arms: vec![(BranchCond::FieldTrue("go".into()), arm)],
+                            default,
+                        },
+                        deps: vec![Dep::hard("p")],
+                    },
+                ],
+            },
+            node_plans: HashMap::new(),
+        };
+        let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::UnknownAgent(a) if a == "ghost_arm"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::UnknownAgent(a) if a == "ghost_default"))
+        );
     }
 }
