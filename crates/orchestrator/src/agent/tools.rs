@@ -245,6 +245,142 @@ impl orchestrator_core::ReconcileProvider for NoteReconciler {
     }
 }
 
+use orchestrator_core::Registry;
+
+/// Pure discovery: list the registry's agents (name + role).
+pub struct ListAgents(pub Arc<Registry>);
+impl Tool for ListAgents {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_agents".into(),
+            description: Some("List available agents (name, area, kind)".into()),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        let mut agents: Vec<_> = self
+            .0
+            .agents()
+            .map(|a| serde_json::json!({ "name": a.name, "area": a.area, "kind": a.kind }))
+            .collect();
+        agents.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(serde_json::json!({ "agents": agents }))
+    }
+}
+
+/// Pure discovery: list skills (name + description).
+pub struct ListSkills(pub Arc<Registry>);
+impl Tool for ListSkills {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_skills".into(),
+            description: Some("List available skills".into()),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        let mut skills: Vec<_> = self
+            .0
+            .skills()
+            .map(|s| serde_json::json!({ "name": s.name, "description": s.description }))
+            .collect();
+        skills.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(serde_json::json!({ "skills": skills }))
+    }
+}
+
+/// Pure discovery: list tools (name + description + class).
+pub struct ListTools(pub Arc<Registry>);
+impl Tool for ListTools {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_tools".into(),
+            description: Some("List available tools".into()),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        let mut tools: Vec<_> = self
+            .0
+            .tools()
+            .map(|t| {
+                serde_json::json!({ "name": t.name, "description": t.description, "effect_class": format!("{:?}", t.effect_class) })
+            })
+            .collect();
+        tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(serde_json::json!({ "tools": tools }))
+    }
+}
+
+/// Pure discovery: list registry-known chain ids (best-effort menu).
+pub struct ListChains(pub Arc<Registry>);
+impl Tool for ListChains {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_chains".into(),
+            description: Some("List registry-known chain ids".into()),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        Ok(serde_json::json!({ "chains": self.0.chain_names() }))
+    }
+}
+
+/// Pure: validate a draft plan (`{plan: <json string>}`) → `{ok, errors}`.
+pub struct ValidatePlan {
+    pub registry: Arc<Registry>,
+    pub max_nodes: usize,
+}
+impl Tool for ValidatePlan {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "validate_plan".into(),
+            description: Some("Validate a draft plan JSON; returns {ok, errors}".into()),
+            input_schema: serde_json::json!({"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+        }
+    }
+    fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        let text = args
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        match orchestrator_core::parse_plan(text) {
+            Err(e) => Ok(serde_json::json!({ "ok": false, "errors": [format!("{e:?}")] })),
+            Ok(plan) => match orchestrator_core::feasible(&plan, &self.registry, self.max_nodes) {
+                Ok(()) => Ok(serde_json::json!({ "ok": true, "errors": [] })),
+                Err(errs) => Ok(serde_json::json!({ "ok": false,
+                    "errors": errs.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>() })),
+            },
+        }
+    }
+}
+
 /// Test reconcile provider that can never determine the world's state — the
 /// executor must pause loud rather than guess. Used to exercise the
 /// `in_doubt → pause` path.
@@ -400,5 +536,51 @@ mod tests {
             .expect("reconcile runs");
 
         assert_eq!(outcome, ReconcileOutcome::Indeterminate);
+    }
+}
+
+#[cfg(test)]
+mod planner_tool_tests {
+    use super::*;
+    use orchestrator_core::{AgentDefinition, Registry};
+    use std::collections::HashMap;
+
+    fn reg() -> Arc<Registry> {
+        Arc::new(Registry::default().with_agent(AgentDefinition {
+            name: "researcher".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: Some("research.bulk".into()),
+            chains: HashMap::new(),
+            grants: HashMap::new(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "r".into(),
+        }))
+    }
+
+    #[test]
+    fn list_agents_returns_the_menu() {
+        let t = ListAgents(reg());
+        let out = t.call(serde_json::json!({})).unwrap();
+        let arr = out["agents"].as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|a| a["name"] == "researcher" && a["area"] == "research")
+        );
+    }
+
+    #[test]
+    fn validate_plan_tool_reports_errors_and_ok() {
+        let t = ValidatePlan {
+            registry: reg(),
+            max_nodes: 512,
+        };
+        let bad = t.call(serde_json::json!({ "plan": "not json" })).unwrap();
+        assert_eq!(bad["ok"], false);
+        assert!(!bad["errors"].as_array().unwrap().is_empty());
+        let good = t.call(serde_json::json!({ "plan":
+            r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"research.bulk","payload":{}}},"deps":[]}]}}"# })).unwrap();
+        assert_eq!(good["ok"], true);
     }
 }
