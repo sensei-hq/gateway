@@ -6165,3 +6165,115 @@ async fn expand_with_no_planner_fails_loud() {
         "expand with no planner fails loud: {out:?}"
     );
 }
+
+/// AC3: after a crash mid-plan, a resume reconstructs the JOURNALED plan and never
+/// re-invokes the planner — even one rigged to return a different graph.
+#[tokio::test]
+async fn expand_resume_uses_the_journaled_plan_not_a_re_plan() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![])],
+    };
+
+    // Run 1: planner returns plan A (n1 → n2). Gateway succeeds on inner n1 (call 1),
+    // fails on inner n2 (call 2). PlanExpanded{A} + e/n1 are journaled; the run fails.
+    let plan_a = Graph {
+        nodes: vec![mc("n1", None), mc("n2", Some("n1"))],
+    };
+    let (gw1, calls1) = failing_after_gateway(1).await;
+    let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_planner(Arc::new(FixedPlanner(plan_a)));
+    let o1 = exec1
+        .run(run, &graph)
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(o1.failed.is_some(), "run 1 fails inside the plan: {o1:?}");
+    assert_eq!(
+        calls1.lock().unwrap().len(),
+        2,
+        "run 1 hit the gateway for n1 and the failing n2"
+    );
+
+    // Run 2: a DIFFERENT planner (would return `zzz`) + an always-succeeding gateway
+    // over the SAME journal. Resume must reuse plan A from the journal.
+    let plan_b = Graph {
+        nodes: vec![mc("zzz", None)],
+    };
+    let (gw2, calls2) = recording_gateway().await;
+    let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_planner(Arc::new(FixedPlanner(plan_b)));
+    let o2 = exec2.start(run, &graph).await.expect("resume completes");
+    assert!(o2.failed.is_none(), "resume completes: {:?}", o2.failed);
+    assert!(
+        o2.outputs[&e].get("n2").is_some(),
+        "journaled plan A used (n2 present): {}",
+        o2.outputs[&e]
+    );
+    assert!(
+        o2.outputs[&e].get("zzz").is_none(),
+        "the re-plan graph (zzz) was NOT used"
+    );
+
+    // The proof: run-2's gateway saw EXACTLY ONE call, for the failed inner n2 — n1
+    // replayed from the memo, the planner was never re-invoked.
+    let recorded2 = calls2.lock().unwrap().clone();
+    assert_eq!(
+        recorded2.len(),
+        1,
+        "resume re-called the gateway only for n2: {recorded2:?}"
+    );
+    assert_eq!(
+        recorded2[0].1, "n2",
+        "the single resume call carried n2's prompt"
+    );
+}
+
+/// AC4: a completed `Expand` whose OUTER tail fails resumes without re-planning or
+/// re-spending on the plan's inner nodes.
+#[tokio::test]
+async fn expand_completed_then_failing_tail_resumes_without_replan() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // e (Expand, plan = single node "n1") → d (Hard-dep e).
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![]), mc_dep("d", Dep::hard("e"))],
+    };
+
+    // Run 1: e's plan completes (inner n1 = call 1), then d fails (call 2).
+    let (gw1, _c1) = failing_after_gateway(1).await;
+    let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1").with_planner(
+        Arc::new(FixedPlanner(Graph {
+            nodes: vec![mc("n1", None)],
+        })),
+    );
+    let o1 = exec1.run(run, &graph).await.expect("run 1");
+    assert!(o1.failed.is_some(), "tail d failed: {o1:?}");
+
+    // Run 2: a planner that would produce a DIFFERENT plan (`other`) + a succeeding
+    // gateway. Resume replays e from the journal (no re-plan) and re-drives only d.
+    let (gw2, calls2) = recording_gateway().await;
+    let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1").with_planner(
+        Arc::new(FixedPlanner(Graph {
+            nodes: vec![mc("other", None)],
+        })),
+    );
+    let o2 = exec2.start(run, &graph).await.expect("resume completes");
+    assert!(o2.failed.is_none(), "resume completes: {o2:?}");
+    assert!(
+        o2.outputs[&NodeId("e".into())].get("n1").is_some(),
+        "e replayed the journaled plan (n1), not the re-plan: {}",
+        o2.outputs[&NodeId("e".into())]
+    );
+    let recorded2 = calls2.lock().unwrap().clone();
+    assert_eq!(
+        recorded2.len(),
+        1,
+        "resume re-called the gateway only for d: {recorded2:?}"
+    );
+    assert_eq!(
+        recorded2[0].1, "d",
+        "the single resume call carried d's prompt"
+    );
+}
