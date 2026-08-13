@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{Graph, NodeKind};
+use crate::graph::{Graph, MapBody, NodeKind};
 use crate::ids::NodeId;
 use crate::registry::Registry;
 
@@ -63,16 +63,28 @@ pub fn parse_plan(text: &str) -> Result<PlannedGraph, PlanError> {
     serde_json::from_str(text).map_err(|e| PlanError::Parse(e.to_string()))
 }
 
-/// Recursively check every `Agent` node's `agent` ref against the registry,
-/// descending into nested `Subgraph`/`Branch` graphs (mirrors `validate_dag`'s
-/// recursion) — a nested unknown agent must fail feasibility, not only at runtime.
-/// `Expand` has no static nested graph (its `input` is a `Value`), so it is not
-/// recursed into. Accumulates into `errs` (all errors, no short-circuit).
+/// Recursively check every agent ref against the registry: top-level `Agent`
+/// nodes, the `MapBody::Agent` body of `Map`/`Consolidate`/`Loop` nodes, and —
+/// descending into nested graphs (mirrors `validate_dag`'s recursion) — the same
+/// inside every `Subgraph`'s graph and every `Branch`'s arm/`default` graphs. An
+/// unknown agent anywhere must fail feasibility, not only at splice time (where it
+/// would `?`-propagate as a fatal, non-resumable hard halt). `Expand` has no static
+/// nested graph (its `input` is a `Value`), so it is not recursed into. Accumulates
+/// into `errs` (all errors, no short-circuit).
 fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError>) {
     for n in &graph.nodes {
         match &n.kind {
             NodeKind::Agent { agent, .. } => {
                 if registry.agent(&agent.0).is_none() {
+                    errs.push(PlanError::UnknownAgent(agent.0.clone()));
+                }
+            }
+            NodeKind::Map { body, .. }
+            | NodeKind::Consolidate { body, .. }
+            | NodeKind::Loop { body, .. } => {
+                if let MapBody::Agent(agent) = body
+                    && registry.agent(&agent.0).is_none()
+                {
                     errs.push(PlanError::UnknownAgent(agent.0.clone()));
                 }
             }
@@ -88,9 +100,11 @@ fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError
     }
 }
 
-/// Pure feasibility: structure (validate_dag) + registry-resolvable refs (Agent
-/// nodes, recursively + each NodePlan.needs) + reserved-id + node-count. Returns
-/// ALL errors.
+/// Pure feasibility: structure (validate_dag) + registry-resolvable agent refs
+/// (top-level `Agent` nodes, the `Map`/`Consolidate`/`Loop` `MapBody::Agent`
+/// bodies, and both recursively through nested `Subgraph`/`Branch` graphs) + each
+/// `NodePlan.needs` (agents/skills/tools) + reserved-id + node-count. Returns ALL
+/// errors.
 pub fn feasible(
     plan: &PlannedGraph,
     registry: &Registry,
@@ -146,7 +160,7 @@ pub fn feasible(
 mod tests {
     use super::*;
     use crate::effect::EffectClass;
-    use crate::graph::{BranchCond, Dep, Graph, Node, NodeKind};
+    use crate::graph::{Aggregation, BranchCond, Dep, Graph, MapBody, Node, NodeKind};
     use crate::registry::{
         Activation, AgentDefinition, AgentRef, Permissions, Registry, SkillDef, ToolSpec,
     };
@@ -393,6 +407,32 @@ mod tests {
                     id: NodeId("s".into()),
                     kind: NodeKind::Subgraph {
                         graph: Box::new(inner),
+                    },
+                    deps: vec![],
+                }],
+            },
+            node_plans: HashMap::new(),
+        };
+        let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::UnknownAgent(a) if a == "ghost"))
+        );
+    }
+
+    #[test]
+    fn feasible_reports_unknown_agent_in_a_map_body() {
+        // A `Map` (also `Consolidate`/`Loop`) carries its agent in `body`, not as a
+        // top-level `Agent` node — an unknown one must still be caught pre-splice.
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("m".into()),
+                    kind: NodeKind::Map {
+                        body: MapBody::Agent(AgentRef("ghost".into())),
+                        over: vec![serde_json::json!({})],
+                        concurrency: 1,
+                        aggregation: Aggregation::BestEffort,
                     },
                     deps: vec![],
                 }],
