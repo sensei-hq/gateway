@@ -64,6 +64,15 @@ pub enum NodeKind {
         arms: Vec<(BranchCond, Graph)>,
         default: Graph,
     },
+    /// A node that produces a nested subgraph AT RUNTIME (impure), drives it under
+    /// `"{expand}/…"`, and folds its sink map as output (SP-3 slice 3). Unlike
+    /// `Subgraph` (static) and `Branch` (pure decision), the produced graph comes
+    /// from an injected `Planner`, so it is journaled as `PlanExpanded` and
+    /// reconstructed from the journal on resume — never re-planned. `input` is a
+    /// static `Value` this slice (author-provided); slice 4/5 threads it from a
+    /// predecessor's output. No sibling-id references, so `namespace_graph`'s
+    /// `other => other.clone()` arm and `validate_dag` need no `Expand` case.
+    Expand { input: serde_json::Value },
 }
 
 /// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure
