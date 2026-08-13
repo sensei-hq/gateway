@@ -6744,6 +6744,48 @@ async fn unresolvable_planner_agent_fails_the_node() {
     );
 }
 
+/// An infeasible plan whose `Map` body names an UNKNOWN agent must be caught by
+/// `feasible` (the authoritative gate) BEFORE splicing: the Expand node ends
+/// `Failed` (cascade-skipping its hard-dependent), NOT a fatal `?`-propagated hard
+/// halt, and nothing is journaled as `PlanExpanded`. Regression guard for the gap
+/// where `Map`/`Consolidate`/`Loop` `MapBody::Agent` refs skipped feasibility and
+/// only blew up at `drive_agent` splice time (a non-resumable run abort).
+#[tokio::test]
+async fn planner_agent_map_body_unknown_agent_fails_the_node() {
+    // Parseable + structurally valid (one Map node, no deps), but its body agent
+    // "ghost" is absent from the registry (planner_registry holds only "planner").
+    let plan_json = r#"{"graph":{"nodes":[{"id":"m","kind":{"Map":{"body":{"Agent":"ghost"},"over":[{}],"concurrency":1,"aggregation":"BestEffort"}},"deps":[]}]}}"#;
+    let reg = planner_registry();
+    let (gateway, _c) = scripted_gateway(vec![final_response(plan_json)]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1").with_registry(reg);
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![]), mc_dep("d", Dep::hard("e"))],
+    };
+    let out = exec
+        .run(run, &graph)
+        .await
+        .expect("run returns Ok (node Failed), not a fatal Err/panic");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "infeasible Map-body agent → Expand node Failed: {out:?}"
+    );
+    assert!(
+        out.skipped.contains(&NodeId("d".into())),
+        "hard-dependent cascade-skipped (resumable), not aborted"
+    );
+    assert!(
+        !journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, ev)| matches!(ev, JournalEvent::PlanExpanded { .. })),
+        "no PlanExpanded journaled for an infeasible plan (feasible rejects pre-splice)"
+    );
+}
+
 /// Resume post-PlanExpanded reuses the journaled plan; the planner agent is NOT
 /// re-invoked and the plan node is NOT re-spent (mirrors the slice-3
 /// `expand_completed_then_failing_tail_resumes_without_replan`, but the planner is
