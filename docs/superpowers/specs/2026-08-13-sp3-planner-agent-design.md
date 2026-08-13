@@ -53,28 +53,26 @@ library. This slice ships `PlannerRef::{Agent, Injected}` only.
   cycles/dangling deps. Slice-3 `run_expand` already journals `PlanExpanded` + reconstructs
   it on resume; `OrchestratorHooks` fire from inside `append` (can't-miss + replay-
   suppressed).
-- **Impact:** additive plus two **mechanical** ripples (behavior byte-identical, like the
-  slice-3 `Dep` migration): (a) `NodeKind::Expand` gains `planner: PlannerRef` — every
-  `Expand{input}` literal (slice-3 tests) gains `planner: PlannerRef::Injected`; (b) `Node`
-  gains `plan: Option<NodePlan>` — every `Node{ id, kind, deps }` literal gains `plan: None`
-  (Rust struct literals must name all fields; `#[serde(default)]` only covers *de*serialization,
-  so JSON without the field still loads). The churn is largely localized to the test node-
-  builder helpers (`mc`/`agent_node`/`subgraph_node`/`expand_node`/…). **A `Node.plan` field
-  rides `namespace_graph` for free** (the node is cloned, so its metadata travels with it —
-  no sibling-id rewrite needed, unlike a graph-level side-map, which would repeat the
-  slice-2 `Branch.on` namespacing hazard). New: `NodePlan`/`NodeNeeds`/`PlannerRef`/
-  `PlanError`, `feasible`/`parse_plan`, the discovery tools + `validate_plan`, the
-  `run_expand` agent-backed branch, and `OrchestratorHooks::on_plan_expanded`.
+- **Impact:** additive; core `Node`/`Graph` are **UNCHANGED** (the plan metadata is a
+  journaled **side-map**, not a `Node` field — chosen to avoid a 94‑literal churn for
+  metadata the executor never reads; §5 D1). Two small ripples: (a) `NodeKind::Expand` gains
+  `#[serde(default)] planner: PlannerRef` — the `expand_node` test helper + the `run_expand`
+  destructure add `planner` (slice‑3 behavior byte‑identical: default `Injected` = the trait
+  path); (b) `JournalEvent::PlanExpanded` gains `#[serde(default)] node_plans:
+  HashMap<NodeId, NodePlan>` — ~5 construction sites (slice‑3 ones pass an empty map). New:
+  `NodePlan`/`NodeNeeds`/`PlannerRef`/`PlanError`/`PlannedGraph`, `feasible`/`parse_plan`,
+  the discovery tools + `validate_plan`, the `run_expand` agent‑backed branch, and
+  `OrchestratorHooks::on_plan_expanded`.
 
 ## 4. Design
 
-### 4.1 Self-describing plan nodes (`orchestrator-core`, `graph.rs`)
+### 4.1 Self-describing plan metadata (`orchestrator-core`, `graph.rs`)
 
 ```rust
-/// Human-meaningful plan metadata a planner attaches to a node — powers
-/// visualization + progress tracking, and declares the node's requirements.
-/// Optional + serde-default so existing graphs are unaffected; journaled inside
-/// `PlanExpanded`, so tracking/resume see the labels.
+/// Human-meaningful plan metadata for one node — powers visualization + progress
+/// tracking, and declares the node's requirements. Carried in the journaled
+/// `PlanExpanded.node_plans` side-map (keyed by the plan's LOCAL node id), NOT a
+/// `Node` field (core `Node`/`Graph` stay unchanged; D1).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodePlan {
     pub label: String,                 // short title (UX + progress)
@@ -93,18 +91,32 @@ pub struct NodeNeeds {
 }
 ```
 
-`Node` gains `#[serde(default)] pub plan: Option<NodePlan>`. **`needs` is the planner-
-selected activation set** (the SP-2 slice-4 deferral): a node's declared skills/tools become
-its activated set; `self_discover: true` falls back to the existing keyword/retrieval
-activation. (Wiring `needs` INTO `assemble_prompt`'s activation is stated but the minimal
-Slice-A cut only *validates + journals* `needs`; activating from it is a small follow-up
-noted in §6 — this slice keeps the executor's activation path untouched to stay additive.)
+The metadata rides the journal in **`JournalEvent::PlanExpanded { node, subgraph,
+#[serde(default)] node_plans: HashMap<NodeId, NodePlan> }`** — so the plan artifact (graph +
+its per-node metadata) is journaled *together* and surfaced together via `on_plan_expanded`.
+Keys are the plan's **local** node ids (as emitted), so a UX joins namespaced progress events
+(`"{expand}/{id}"`) to plan metadata by stripping the prefix. **`needs` is the planner-
+selected activation set** (the SP-2 slice-4 deferral): a node's declared skills/tools are its
+activated set; `self_discover: true` falls back to keyword/retrieval activation. Slice A only
+*validates + journals* `needs`; wiring it INTO `assemble_prompt`'s activation (which would
+need the local↔namespaced join) is a stated follow-up (§6) — the executor's activation path
+is untouched here.
 
-### 4.2 Plan encoding — native serde `Graph` JSON
+### 4.2 Plan encoding — native serde `PlannedGraph` JSON
 
-The planner emits the plan as **JSON that deserializes directly into `Graph`** —
-`parse_plan(text) = serde_json::from_str::<Graph>(text)` — zero translation layer, the same
-shape `PlanExpanded` journals. `NodePlan` rides along. A parse error is a `PlanError`.
+The planner emits the plan as **JSON that deserializes into a thin wrapper**:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedGraph {
+    pub graph: Graph,                                    // the executable graph (native serde)
+    #[serde(default)]
+    pub node_plans: HashMap<NodeId, NodePlan>,           // per-node metadata (local ids)
+}
+```
+
+`parse_plan(text) = serde_json::from_str::<PlannedGraph>(text)` — near-zero translation (the
+`graph` is the exact shape `PlanExpanded` journals). A parse error is a `PlanError::Parse`.
 
 **Reserved id:** `"__plan__"` is reserved for the planner sub-run's path segment. Because a
 plan node with local id `X` is namespaced to `"{expand}/X"` at splice time, a plan node
@@ -122,23 +134,25 @@ pub enum PlanError {
     TooManyNodes { count: usize, limit: usize },
 }
 
-/// Pure feasibility over a produced graph + a registry snapshot. Structural (via
+/// Pure feasibility over a planned graph + a registry snapshot. Structural (via
 /// validate_dag, which recurses into Subgraph/Branch/Expand arms) + registry-
-/// resolvable refs + reserved-id + a node-count pre-check. Returns ALL errors so the
-/// planner can fix them in one pass.
-pub fn feasible(graph: &Graph, registry: &Registry, max_nodes: usize) -> Result<(), Vec<PlanError>>;
+/// resolvable refs (Agent nodes + each NodePlan.needs) + reserved-id + a node-count
+/// pre-check. Returns ALL errors so the planner can fix them in one pass.
+pub fn feasible(
+    plan: &PlannedGraph, registry: &Registry, max_nodes: usize,
+) -> Result<(), Vec<PlanError>>;
 ```
 
-Checks: `validate_dag` (structure); every `NodeKind::Agent{agent}` and every
-`NodePlan.needs.{agents,skills,tools}` resolves in the registry; no node id is `__plan__`;
-node count ≤ `max_nodes` (a cheap pre-check — the authoritative per-expansion cap is still
-`check_expansion_budget` at splice time). **Chain-existence is best-effort this slice**
-(a bad `ModelCall.chain` / resolved agent chain surfaces at runtime as a gateway error →
-node `Failed`); a gateway `chains()` accessor for exact feasibility is deferred (§6).
+Checks: `plan.graph.validate_dag()` (structure); every `NodeKind::Agent{agent}` and every
+`plan.node_plans[*].needs.{agents,skills,tools}` resolves in the registry; no node id is
+`__plan__`; node count ≤ `max_nodes` (a cheap pre-check — the authoritative per-expansion
+cap is still `check_expansion_budget` at splice time). **Chain-existence is best-effort this
+slice** (a bad `ModelCall.chain` / resolved agent chain surfaces at runtime as a gateway
+error → node `Failed`); a gateway `chains()` accessor for exact feasibility is deferred (§6).
 
-`validate_plan(text) = parse_plan(text).and_then(|g| feasible(g, registry, max_nodes))`,
-returning `Ok` or the `Vec<PlanError>` rendered as structured JSON. It is used **twice**:
-as the planner's `validate_plan` **tool** (inner self-correction) and as `run_expand`'s
+`validate_plan(text) = parse_plan(text).and_then(|p| feasible(&p, registry, max_nodes))`,
+returning `Ok` or the `Vec<PlanError>` rendered as structured JSON. It is used **twice**: as
+the planner's `validate_plan` **tool** (inner self-correction) and as `run_expand`'s
 **authoritative final gate** (defense in depth) before journaling `PlanExpanded`.
 
 ### 4.4 The journaled ReAct planner + `PlannerRef`
@@ -168,11 +182,13 @@ pub enum PlannerRef {
   match self.drive_agent(run, &plan_node, agent_ref, input, &[], fold, None).await? {
       AgentStep::Completed(out) => {
           let text = out.get("text").and_then(|v| v.as_str()).unwrap_or_default();
-          let graph = parse_plan(text)?;                 // → expand_failed on Err
-          feasible(&graph, &self.registry, self.max_nodes)?; // → expand_failed on Err(Vec)
-          self.check_expansion_budget(&graph)?;          // hard Err on cap breach
-          self.append(run, PlanExpanded{ node: node.id.clone(), subgraph: graph.clone() }).await?;
-          graph
+          let plan = parse_plan(text)?;                      // → expand_failed on Err
+          feasible(&plan, &self.registry, self.max_nodes)?;  // → expand_failed on Err(Vec)
+          self.check_expansion_budget(&plan.graph)?;         // hard Err on cap breach
+          self.append(run, PlanExpanded {
+              node: node.id.clone(), subgraph: plan.graph.clone(), node_plans: plan.node_plans,
+          }).await?;
+          plan.graph
       }
       AgentStep::Failed(msg)  => return self.expand_failed(run, node, format!("planner agent failed: {msg}")).await,
       AgentStep::Paused(r)    => return Ok(NodeExec::Paused { reason: format!("planner {} paused: {r}", node.id.0) }),
@@ -228,11 +244,12 @@ child nesting is deferred, §6.)
 ### 4.8 Observability — `on_plan_expanded`
 
 Add to `OrchestratorHooks` (no-op default): `async fn on_plan_expanded(&self, run: RunId,
-node: &NodeId, graph: &Graph) {}`. Fire it from inside `append` when a `PlanExpanded` is
-journaled (same site + pattern as the other hooks) ⇒ can't-miss **and replay-suppressed for
-free** (a resumed completed prefix doesn't re-append `PlanExpanded`). Opt-in ⇒ byte-
-identical when no hooks are wired. A UX receives the **labeled** plan the instant it's
-produced, then the existing node-lifecycle hooks animate progress over it.
+node: &NodeId, graph: &Graph, node_plans: &HashMap<NodeId, NodePlan>) {}`. Fire it from
+inside `append` when a `PlanExpanded` is journaled (same site + pattern as the other hooks)
+⇒ can't-miss **and replay-suppressed for free** (a resumed completed prefix doesn't
+re-append `PlanExpanded`). Opt-in ⇒ byte-identical when no hooks are wired. A UX receives the
+graph **plus its per-node labels** the instant the plan is produced, then the existing
+node-lifecycle hooks animate progress over it.
 
 ### 4.9 Caps interaction (recursive planning)
 
@@ -242,8 +259,12 @@ own ReAct turns are bounded by `max_steps` and do **not** charge the expansion b
 
 ## 5. Decisions
 
-- **D1 — self-describing `NodePlan{label, description, needs}` on `Node`** (optional, serde-
-  default, journaled in `PlanExpanded`): legibility for viz/tracking/resume.
+- **D1 — self-describing `NodePlan{label, description, needs}` as a journaled side-map**
+  (`PlanExpanded.node_plans: HashMap<NodeId, NodePlan>`, keyed by local node id), **not** a
+  `Node` field (approved): legibility for viz/tracking/resume with **zero churn** to core
+  `Node`/`Graph` (a `Node.plan` field would ripple to 94 literals for metadata the executor
+  never reads). Trade-off: a UX joins namespaced progress events to plan metadata by prefix;
+  per-node activation-from-`needs` (deferred, §6) would need that join.
 - **D2 — `needs` = planner-selected activation** (skills/tools/agents; `self_discover` for
   runtime discovery). Settles the SP-2 Q4 "planner-selected" deferral at the *schema* level;
   activating from it in `assemble_prompt` is a stated small follow-up (§6).
@@ -283,10 +304,11 @@ own ReAct turns are bounded by `max_steps` and do **not** charge the expansion b
 
 ## 7. Acceptance criteria (TDD)
 
-1. **Schema round-trips + backward-compat.** `NodePlan`/`NodeNeeds` serde round-trip; a
-   `Node` JSON without `plan` deserializes (`plan: None`); an `Expand` JSON without `planner`
-   deserializes (`PlannerRef::Injected`). Slice-3 Expand tests pass with the mechanical
-   `planner: Injected` / `plan: None` field additions (behavior byte-identical).
+1. **Schema round-trips + backward-compat.** `NodePlan`/`NodeNeeds`/`PlannedGraph` serde
+   round-trip; a `PlanExpanded` JSON without `node_plans` deserializes (empty map); an
+   `Expand` JSON without `planner` deserializes (`PlannerRef::Injected`). Slice-3 Expand
+   tests pass with the mechanical `planner: Injected` addition + `PlanExpanded` gaining
+   `node_plans: {}` (behavior byte-identical); core `Node`/`Graph` literals are untouched.
 2. **`feasible` catches each class.** Dangling agent/skill/tool ref → `UnknownAgent/Skill/
    Tool`; duplicate id / nested cycle → `Structural`; a node id `"__plan__"` → `ReservedNodeId`;
    over-`max_nodes` → `TooManyNodes`; all errors returned together; a clean plan → `Ok`.
