@@ -55,6 +55,15 @@ pub enum NodeKind {
     /// the SAME run (SP-3). `Box` breaks the recursive type (NodeKind → Graph →
     /// Node → NodeKind). Static this slice; slice 3 produces subgraphs at runtime.
     Subgraph { graph: Box<Graph> },
+    /// A deterministic conditional (SP-3): test predecessor `on`'s output, run the
+    /// first arm whose `BranchCond` matches (else `default`) as a nested graph under
+    /// `"{branch}/{label}/…"`. Pure over `on`'s memoized output ⇒ resume recomputes
+    /// the same arm, no branch journaling. Static this slice.
+    Branch {
+        on: NodeId,
+        arms: Vec<(BranchCond, Graph)>,
+        default: Graph,
+    },
 }
 
 /// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure
@@ -268,6 +277,34 @@ impl Graph {
         for node in &self.nodes {
             if let NodeKind::Subgraph { graph } = &node.kind {
                 graph.validate_dag()?;
+            }
+        }
+
+        // 2d. A `Branch`: `on` must be a declared node AND a Hard dep of the branch
+        // (so it runs first and a failed `on` cascade-skips the branch); each arm's
+        // and the default's nested graph must be a valid DAG (recursive).
+        for node in &self.nodes {
+            if let NodeKind::Branch { on, arms, default } = &node.kind {
+                if !ids.contains(on) {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "branch {:?} tests undeclared node {:?}",
+                        node.id, on
+                    )));
+                }
+                if !node
+                    .deps
+                    .iter()
+                    .any(|d| &d.on == on && matches!(d.kind, EdgeKind::Hard))
+                {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "branch {:?} must Hard-depend on its `on` node {:?}",
+                        node.id, on
+                    )));
+                }
+                for (_, g) in arms {
+                    g.validate_dag()?;
+                }
+                default.validate_dag()?;
             }
         }
 

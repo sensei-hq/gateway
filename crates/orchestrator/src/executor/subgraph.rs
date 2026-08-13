@@ -12,7 +12,7 @@ use super::{Executor, Fold, NodeExec};
 /// rewritten to `"{prefix}/{id}"`. A nested `Subgraph`'s own inner graph is NOT
 /// rewritten here (the `other => other.clone()` arm) — it is namespaced when its
 /// `run_subgraph` runs, under the already-namespaced prefix.
-fn namespace_graph(prefix: &str, graph: &Graph) -> Graph {
+pub(super) fn namespace_graph(prefix: &str, graph: &Graph) -> Graph {
     let ns = |id: &NodeId| NodeId(format!("{prefix}/{}", id.0));
     Graph {
         nodes: graph
@@ -47,7 +47,7 @@ fn namespace_graph(prefix: &str, graph: &Graph) -> Graph {
 
 /// The subgraph's output: `{ sink_id: output }` for each sink (a node referenced by
 /// no other node's `Dep`) that produced an output.
-fn sink_outputs(
+pub(super) fn sink_outputs(
     graph: &Graph,
     prefix: &str,
     outputs: &HashMap<NodeId, serde_json::Value>,

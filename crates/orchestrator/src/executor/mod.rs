@@ -14,6 +14,7 @@ use orchestrator_core::{
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
 
 mod agent;
+mod branch;
 mod content;
 mod durability;
 mod fanout;
@@ -707,6 +708,7 @@ impl Executor {
             }
             NodeKind::Loop { .. } => self.run_loop(run, node, fold).await,
             NodeKind::Subgraph { .. } => self.run_subgraph(run, node, fold).await,
+            NodeKind::Branch { .. } => self.run_branch(run, node, prior_outputs, fold).await,
         }
     }
 
