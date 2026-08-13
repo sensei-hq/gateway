@@ -52,7 +52,9 @@ source: crates/orchestrator*
 >   Subgraph machinery). The decision is recomputed on resume (no branch journaling);
 >   only the selected arm runs. `on` must be a declared Hard dep (a failed `on`
 >   cascade-skips the branch). Output = the selected arm's sink map; failure/pause
->   propagate like `Subgraph`.
+>   propagate like `Subgraph`. The output sink-map keys are the SELECTED arm's local
+>   sink ids, so they vary by arm — a downstream consumer that needs a stable key
+>   should give every arm a common sink node id (e.g. `result`).
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed

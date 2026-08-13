@@ -15,6 +15,10 @@ impl Executor {
     /// Drive the selected arm as a nested graph and fold its outcome into a
     /// `NodeExec` (`Completed` = the arm's sink map; paused/failed carried up).
     ///
+    /// Output note: the `Completed` sink map's keys are the SELECTED arm's local
+    /// sink ids, so they VARY by arm. A downstream consumer that needs a stable key
+    /// should give every arm a common sink node id (e.g. `result`).
+    ///
     /// Known limitation (shared with [`run_subgraph`](Self::run_subgraph)): the
     /// synthesized sink map is NOT journaled as an `EffectRecorded`, so a terminal
     /// re-`start` reconstructs the arm's per-node outputs (the namespaced inner ids

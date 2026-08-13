@@ -8,10 +8,13 @@ use orchestrator_core::{Dep, Graph, Node, NodeId, NodeKind, OrchestratorError, R
 
 use super::{Executor, Fold, NodeExec};
 
-/// Clone `graph` with every inner node id (and each `Dep.on`, and `Consolidate.over`)
-/// rewritten to `"{prefix}/{id}"`. A nested `Subgraph`'s own inner graph is NOT
-/// rewritten here (the `other => other.clone()` arm) — it is namespaced when its
-/// `run_subgraph` runs, under the already-namespaced prefix.
+/// Clone `graph` with every inner node id (and each `Dep.on`) rewritten to
+/// `"{prefix}/{id}"`, plus the two *sibling references* that name another node in
+/// this same graph: `Consolidate.over` and `Branch.on`. A nested `Subgraph`'s inner
+/// graph and a `Branch`'s arm/`default` graphs are NOT rewritten here (they hit the
+/// `other`/clone paths) — they are namespaced lazily when their `run_subgraph` /
+/// `run_branch` runs, under the already-namespaced node id (so a `Branch`'s selected
+/// arm ends up under `"{prefix}/{branch}/{label}/…"`).
 pub(super) fn namespace_graph(prefix: &str, graph: &Graph) -> Graph {
     let ns = |id: &NodeId| NodeId(format!("{prefix}/{}", id.0));
     Graph {
@@ -29,6 +32,11 @@ pub(super) fn namespace_graph(prefix: &str, graph: &Graph) -> Graph {
                         over: ns(over),
                         min_viable: *min_viable,
                         body: body.clone(),
+                    },
+                    NodeKind::Branch { on, arms, default } => NodeKind::Branch {
+                        on: ns(on),
+                        arms: arms.clone(),
+                        default: default.clone(),
                     },
                     other => other.clone(),
                 },
