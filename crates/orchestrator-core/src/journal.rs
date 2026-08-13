@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentRef, Digest, EffectOutput};
@@ -5,6 +7,7 @@ use crate::effect::{EffectClass, EffectId};
 use crate::error::JournalError;
 use crate::graph::Graph;
 use crate::ids::{NodeId, RunId, Seq};
+use crate::plan::NodePlan;
 
 /// A compacted per-child record (§5.3): after a `Map`'s `Consolidate` completes,
 /// each child's full `EffectRecorded` collapses to this small shape and leaves
@@ -112,6 +115,10 @@ pub enum JournalEvent {
     PlanExpanded {
         node: NodeId,
         subgraph: Graph,
+        /// Per-node plan metadata (local ids) — the self-describing side-map (§4.1).
+        /// Serde-default so a pre-4A `PlanExpanded` (no field) still deserializes.
+        #[serde(default)]
+        node_plans: HashMap<NodeId, NodePlan>,
     },
     /// A shared-scope blackboard publish (§8). Journaled so a resume rebuilds the
     /// `ContextStore` (as refs, no blob load) via
@@ -305,11 +312,12 @@ mod tests {
                     deps: vec![],
                 }],
             },
+            node_plans: std::collections::HashMap::new(),
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: JournalEvent = serde_json::from_str(&s).unwrap();
         match back {
-            JournalEvent::PlanExpanded { node, subgraph } => {
+            JournalEvent::PlanExpanded { node, subgraph, .. } => {
                 assert_eq!(node, NodeId("e".into()));
                 assert_eq!(subgraph.nodes.len(), 1);
             }

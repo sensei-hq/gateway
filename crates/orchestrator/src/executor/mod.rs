@@ -833,6 +833,11 @@ impl Executor {
                 JournalEvent::ContextWrite { scope, key, .. } => {
                     h.on_context_write(run, scope, key).await
                 }
+                JournalEvent::PlanExpanded {
+                    node,
+                    subgraph,
+                    node_plans,
+                } => h.on_plan_expanded(run, node, subgraph, node_plans).await,
                 _ => {}
             }
         }
