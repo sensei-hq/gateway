@@ -12,6 +12,14 @@ use super::subgraph::{namespace_graph, sink_outputs};
 use super::{Executor, Fold, NodeExec};
 
 impl Executor {
+    /// Drive the selected arm as a nested graph and fold its outcome into a
+    /// `NodeExec` (`Completed` = the arm's sink map; paused/failed carried up).
+    ///
+    /// Known limitation (shared with [`run_subgraph`](Self::run_subgraph)): the
+    /// synthesized sink map is NOT journaled as an `EffectRecorded`, so a terminal
+    /// re-`start` reconstructs the arm's per-node outputs (the namespaced inner ids
+    /// `"{branch}/{label}/…"`), not the sink map under `node.id` — the same
+    /// fresh-vs-terminal asymmetry documented on `run_subgraph`.
     pub(super) async fn run_branch(
         &self,
         run: RunId,
@@ -22,6 +30,19 @@ impl Executor {
         let NodeKind::Branch { on, arms, default } = &node.kind else {
             unreachable!("run_branch on non-Branch node");
         };
+        // Depth cap (self-DoS backstop) first, mirroring run_subgraph's "cap first"
+        // ordering — it doesn't depend on which arm is selected. Conservative: the
+        // arm's nodes actually live one segment DEEPER than a subgraph's (under
+        // `"{branch}/{label}/…"`, not `"{node}/…"`), so capping on `node.id`'s
+        // segment count is a backstop, not an exact bound (same caveat as the
+        // Map/Loop child nesting counted in the path).
+        let depth = node.id.0.matches('/').count();
+        if depth + 1 > self.max_depth {
+            return Err(OrchestratorError::GlobalCapExceeded {
+                cap: "max_depth".into(),
+                limit: self.max_depth,
+            });
+        }
         let value = prior_outputs
             .get(on)
             .ok_or_else(|| OrchestratorError::BranchInputMissing {
@@ -34,14 +55,6 @@ impl Executor {
             .find(|(_, (cond, _))| cond.matches(value))
             .map(|(i, (_, g))| (i.to_string(), g))
             .unwrap_or_else(|| ("default".to_string(), default));
-        // Depth cap (self-DoS backstop), consistent with run_subgraph.
-        let depth = node.id.0.matches('/').count();
-        if depth + 1 > self.max_depth {
-            return Err(OrchestratorError::GlobalCapExceeded {
-                cap: "max_depth".into(),
-                limit: self.max_depth,
-            });
-        }
         let prefix = format!("{}/{}", node.id.0, label);
         let inner = namespace_graph(&prefix, selected);
         let nested = Box::pin(self.drive(run, &inner, fold)).await?;
