@@ -20,43 +20,50 @@ impl Executor {
         let NodeKind::Expand { input } = &node.kind else {
             unreachable!("run_expand on non-Expand node");
         };
-        let Some(planner) = &self.planner else {
-            return self
-                .expand_failed(run, node, format!("expand {}: no planner wired", node.id.0))
-                .await;
-        };
-        let g = match planner.plan(input).await {
-            Ok(g) => g,
-            Err(e) => {
-                return self
-                    .expand_failed(
-                        run,
-                        node,
-                        format!("expand {} planner failed: {e}", node.id.0),
-                    )
-                    .await;
+        // RESUME: a node with a journaled `PlanExpanded` reuses that subgraph — the
+        // planner is NOT re-invoked (determinism §4.4). FRESH: produce → validate →
+        // cap-check → journal (in that order), then drive.
+        let g = match fold.expansions.get(&node.id) {
+            Some(journaled) => journaled.clone(),
+            None => {
+                let Some(planner) = &self.planner else {
+                    return self
+                        .expand_failed(run, node, format!("expand {}: no planner wired", node.id.0))
+                        .await;
+                };
+                let produced = match planner.plan(input).await {
+                    Ok(produced) => produced,
+                    Err(e) => {
+                        return self
+                            .expand_failed(
+                                run,
+                                node,
+                                format!("expand {} planner failed: {e}", node.id.0),
+                            )
+                            .await;
+                    }
+                };
+                if let Err(e) = produced.validate_dag() {
+                    return self
+                        .expand_failed(
+                            run,
+                            node,
+                            format!("expand {} produced an invalid plan: {e}", node.id.0),
+                        )
+                        .await;
+                }
+                self.check_expansion_budget(&produced)?;
+                self.append(
+                    run,
+                    JournalEvent::PlanExpanded {
+                        node: node.id.clone(),
+                        subgraph: produced.clone(),
+                    },
+                )
+                .await?;
+                produced
             }
         };
-        if let Err(e) = g.validate_dag() {
-            return self
-                .expand_failed(
-                    run,
-                    node,
-                    format!("expand {} produced an invalid plan: {e}", node.id.0),
-                )
-                .await;
-        }
-        // Caps are a self-DoS backstop → hard `Err` (halts the run), NOT a node
-        // Failed. Checked BEFORE journaling the expansion.
-        self.check_expansion_budget(&g)?;
-        self.append(
-            run,
-            JournalEvent::PlanExpanded {
-                node: node.id.clone(),
-                subgraph: g.clone(),
-            },
-        )
-        .await?;
         self.drive_nested(run, "expand", &node.id.0, &g, fold).await
     }
 
