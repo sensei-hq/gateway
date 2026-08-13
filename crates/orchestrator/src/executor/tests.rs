@@ -6364,3 +6364,157 @@ async fn expand_max_nodes_cap_spans_resume() {
         "max_nodes breach spans resume: {err:?}"
     );
 }
+
+/// AC10 (failure): a failing node inside the produced plan fails the Expand node and
+/// cascade-skips its outer hard-dependent.
+#[tokio::test]
+async fn a_failing_node_in_the_expand_plan_fails_the_expand() {
+    // The plan's single inner node fails on the gateway's first call.
+    let (gateway, _c) = failing_after_gateway(0).await;
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![]), mc_dep("d", Dep::hard("e"))],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(Arc::new(FixedPlanner(Graph {
+            nodes: vec![mc("boom", None)],
+        })));
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "nested failure fails the expand: {out:?}"
+    );
+    assert!(
+        out.skipped.contains(&NodeId("d".into())),
+        "outer hard-dependent skipped"
+    );
+}
+
+/// AC10 (pause): an in-doubt Mutation inside the Expand's plan pauses the whole run —
+/// mirrors `an_in_doubt_mutation_in_a_subgraph_pauses_the_run`, wrapping the mutating
+/// agent in an `Expand` plan instead of a `Subgraph`.
+#[tokio::test]
+async fn an_in_doubt_mutation_in_an_expand_plan_pauses_the_run() {
+    let run = RunId(uuid::Uuid::new_v4());
+    let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
+        let recorder = AgentDefinition {
+            name: "recorder".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: Some("research.bulk".into()),
+            chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            tools: vec!["record_note".into()],
+            skills: vec![],
+            system_prompt: "Record.".into(),
+        };
+        (
+            Arc::new(
+                Registry::default()
+                    .with_agent(recorder)
+                    .with_tool(RecordNote::new(sink.clone()).spec()),
+            ),
+            Arc::new(ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink)))),
+        )
+    };
+    // The mutation-bearing agent lives inside an Expand plan (inner node "n1").
+    let plan = Graph {
+        nodes: vec![agent_node("n1", "recorder", "item-0")],
+    };
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![])],
+    };
+
+    // Seed: run to completion, then truncate to the nested agent's record_note
+    // EffectIntent (drops its EffectRecorded) → in-doubt on resume.
+    let full = InMemoryJournal::new();
+    let (seed_reg, seed_tools) = mk_recorder(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let (gw_s, _c) = demo_reference_tool_gateway().await;
+    Executor::new(Arc::new(gw_s), Arc::new(full.clone()), "v1")
+        .with_registry(seed_reg)
+        .with_tools(seed_tools)
+        .with_planner(Arc::new(FixedPlanner(plan.clone())))
+        .run(run, &graph)
+        .await
+        .expect("seed Expand run completes");
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("the nested agent journaled a record_note EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // Resume with an Indeterminate reconciler + a FRESH empty sink → the nested
+    // Mutation is in-doubt → the nested agent pauses → the Expand pauses → the run pauses.
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (reg, tools) = mk_recorder(sink.clone());
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (gw_r, _c2) = demo_reference_tool_gateway().await;
+    let outcome = Executor::new(Arc::new(gw_r), Arc::new(seeded.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(tools)
+        .with_reconcilers(Arc::new(reconcilers))
+        .with_planner(Arc::new(FixedPlanner(plan)))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+
+    let pause = outcome
+        .paused
+        .expect("the in-doubt nested Mutation pauses the whole run");
+    assert_eq!(
+        pause.node,
+        NodeId("e".into()),
+        "the Expand node is the pause point"
+    );
+    let resumed = seeded.load(run).await.unwrap();
+    assert!(
+        resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run must NOT complete over an unresolved in-doubt Intent"
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+}
+
+/// AC12 (end-to-end): an Expand whose produced plan is a nested `Agent` node drives it
+/// through the gateway; the agent's output is the Expand's sink.
+#[tokio::test]
+async fn expand_drives_a_produced_agent_plan_end_to_end() {
+    let (gateway, _c) = recording_gateway().await;
+    let registry = agent_registry("c");
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![])],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(registry)
+        .with_planner(Arc::new(FixedPlanner(Graph {
+            nodes: vec![agent_node("n1", "a", "hi")],
+        })));
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&e].get("n1").is_some(),
+        "nested agent output is the expand sink: {}",
+        out.outputs[&e]
+    );
+}
