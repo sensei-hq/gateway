@@ -74,6 +74,8 @@ pub enum OrchestratorError {
     MapChildPaused { node: NodeId, reason: String },
     #[error("global cap {cap:?} exceeded (limit {limit})")]
     GlobalCapExceeded { cap: String, limit: usize },
+    #[error("branch {branch:?} has no decision value — its `on` node {on:?} produced no output")]
+    BranchInputMissing { branch: NodeId, on: NodeId },
     #[error("blackboard collision: scope {scope} already has key {key:?}")]
     ContextKeyCollision { scope: String, key: String },
     #[error("content-store digest miss: {0} — content is not addressable")]
