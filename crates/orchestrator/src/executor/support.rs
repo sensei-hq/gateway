@@ -139,6 +139,9 @@ pub(crate) fn fold_journal(
                     }
                 }
             }
+            JournalEvent::PlanExpanded { node, subgraph } => {
+                fold.expansions.insert(node.clone(), subgraph.clone());
+            }
             _ => {}
         }
     }
@@ -326,6 +329,36 @@ pub(crate) fn est_prompt_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fold_journal_captures_plan_expansions() {
+        use orchestrator_core::{Graph, JournalEvent, Node, NodeId, NodeKind};
+        let subgraph = Graph {
+            nodes: vec![Node {
+                id: NodeId("n1".into()),
+                kind: NodeKind::ModelCall {
+                    chain: "c".into(),
+                    payload: serde_json::json!(0),
+                },
+                deps: vec![],
+            }],
+        };
+        let events = vec![(
+            0u64,
+            JournalEvent::PlanExpanded {
+                node: NodeId("e".into()),
+                subgraph: subgraph.clone(),
+            },
+        )];
+        let (fold, _last, _completed) = fold_journal(&events);
+        assert_eq!(
+            fold.expansions
+                .get(&NodeId("e".into()))
+                .map(|g| g.nodes.len()),
+            Some(1),
+            "PlanExpanded folds into fold.expansions"
+        );
+    }
 
     #[test]
     fn classify_gateway_error_pauses_only_on_timed_allgated() {

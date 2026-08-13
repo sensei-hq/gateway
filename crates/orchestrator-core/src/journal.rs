@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::content::{ContentRef, Digest, EffectOutput};
 use crate::effect::{EffectClass, EffectId};
 use crate::error::JournalError;
+use crate::graph::Graph;
 use crate::ids::{NodeId, RunId, Seq};
 
 /// A compacted per-child record (§5.3): after a `Map`'s `Consolidate` completes,
@@ -102,6 +103,15 @@ pub enum JournalEvent {
     MapCompacted {
         node: NodeId,
         children: Vec<CompactChild>,
+    },
+    /// A runtime graph expansion (§7.2/§7.6/§10.3): node `node` produced `subgraph`.
+    /// Journaled BEFORE the nested graph is driven, so a crash mid-expansion resumes
+    /// with the identical structure. The resume fold reconstructs the spliced graph
+    /// from this — the memo, but for graph structure. `subgraph` carries LOCAL ids
+    /// (namespaced under `node` at drive time), so the event is position-independent.
+    PlanExpanded {
+        node: NodeId,
+        subgraph: Graph,
     },
     /// A shared-scope blackboard publish (§8). Journaled so a resume rebuilds the
     /// `ContextStore` (as refs, no blob load) via
@@ -278,5 +288,32 @@ mod tests {
             serde_json::from_str::<JournalEvent>(&s).unwrap(),
             JournalEvent::ContextWrite { .. }
         ));
+    }
+
+    #[test]
+    fn plan_expanded_event_roundtrips() {
+        use crate::graph::{Graph, Node, NodeKind};
+        let e = JournalEvent::PlanExpanded {
+            node: NodeId("e".into()),
+            subgraph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("n1".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!({ "prompt": "hi" }),
+                    },
+                    deps: vec![],
+                }],
+            },
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let back: JournalEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            JournalEvent::PlanExpanded { node, subgraph } => {
+                assert_eq!(node, NodeId("e".into()));
+                assert_eq!(subgraph.nodes.len(), 1);
+            }
+            other => panic!("expected PlanExpanded, got {other:?}"),
+        }
     }
 }

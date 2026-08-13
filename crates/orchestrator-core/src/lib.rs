@@ -11,6 +11,7 @@ pub mod graph;
 pub mod hooks;
 pub mod ids;
 pub mod journal;
+pub mod planner;
 pub mod reconcile;
 pub mod registry;
 
@@ -25,6 +26,7 @@ pub use ids::{NodeId, RunId, Seq};
 pub use journal::{
     ChildStatus, CompactChild, ExecutionJournal, JournalEvent, ObservationMeta, Snapshot,
 };
+pub use planner::Planner;
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use registry::{
     Activation, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions,

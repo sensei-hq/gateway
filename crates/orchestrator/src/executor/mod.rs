@@ -112,6 +112,10 @@ struct Fold {
     /// whose key is already here is NOT re-published — the guard against a
     /// memoized replay re-`put`ting (which would collide) or re-journaling.
     context: HashMap<(Scope, ContextKey), ContextRef>,
+    /// Runtime graph expansions folded from `PlanExpanded` events (§4.4). The
+    /// structural analog of `memo`: on resume, `run_expand` replays the journaled
+    /// subgraph for a node found here — never re-invoking the planner.
+    expansions: HashMap<NodeId, Graph>,
 }
 
 /// The mutable scheduling state threaded through a `drive` loop: the accumulating
@@ -709,6 +713,10 @@ impl Executor {
             NodeKind::Loop { .. } => self.run_loop(run, node, fold).await,
             NodeKind::Subgraph { .. } => self.run_subgraph(run, node, fold).await,
             NodeKind::Branch { .. } => self.run_branch(run, node, prior_outputs, fold).await,
+            // TEMPORARY (SP-3 slice 3, Task 1): exhaustiveness stub. Task 3 replaces
+            // this with `=> self.run_expand(run, node, fold).await`. No Task-1 test
+            // constructs an `Expand` node, so this is never reached in this commit.
+            NodeKind::Expand { .. } => unreachable!("Expand execution lands in Task 3"),
         }
     }
 
