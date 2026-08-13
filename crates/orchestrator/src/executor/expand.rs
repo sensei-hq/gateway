@@ -2,8 +2,8 @@
 //! injected `Planner`, journal it as `PlanExpanded`, and drive it under the node's
 //! path — reusing the shared `drive_nested`. A planner error, an invalid produced
 //! graph, or no planner is a node `Failed` (journaled `NodeFailed`); a cap breach is
-//! a hard `Err` (self-DoS). The resume path (reuse a journaled expansion, never
-//! re-plan) lands in Task 4.
+//! a hard `Err` (self-DoS). On resume, a node with a journaled `PlanExpanded` reuses
+//! that subgraph from the fold — the planner is never re-invoked (deterministic).
 
 use orchestrator_core::{JournalEvent, Node, NodeKind, OrchestratorError, RunId};
 

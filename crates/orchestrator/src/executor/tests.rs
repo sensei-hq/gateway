@@ -6277,3 +6277,90 @@ async fn expand_completed_then_failing_tail_resumes_without_replan() {
         "the single resume call carried d's prompt"
     );
 }
+
+/// AC8: more expansions than `max_expansions` → a hard `GlobalCapExceeded` halt.
+#[tokio::test]
+async fn expand_max_expansions_cap_halts_loud() {
+    // e1 → e2 (sequential): two expansions. Each plan is a single node.
+    let graph = Graph {
+        nodes: vec![
+            expand_node("e1", vec![]),
+            expand_node("e2", vec![Dep::hard("e1")]),
+        ],
+    };
+    let planner = Arc::new(FixedPlanner(Graph {
+        nodes: vec![mc("x", None)],
+    }));
+
+    // Limit 1: the 2nd expansion breaches the cap → Err.
+    let (gw, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(planner.clone())
+        .with_max_expansions(1);
+    let err = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect_err("cap halts");
+    assert!(
+        matches!(&err, OrchestratorError::GlobalCapExceeded { cap, .. } if cap == "max_expansions"),
+        "max_expansions breach: {err:?}"
+    );
+
+    // Limit 2: both expansions fit → ok.
+    let (gw2, _c2) = recording_gateway().await;
+    let exec2 = Executor::new(Arc::new(gw2), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(planner)
+        .with_max_expansions(2);
+    let out = exec2
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("within cap");
+    assert!(out.failed.is_none(), "{out:?}");
+}
+
+/// AC9: `max_nodes` is cumulative AND spans resume — the counter is seeded from the
+/// journal, so a resumed expansion is charged against nodes counted before the crash.
+#[tokio::test]
+async fn expand_max_nodes_cap_spans_resume() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // e1 (plan = 2 nodes) → d (tail) → e2 (plan = 2 nodes). max_nodes = 3.
+    let graph = Graph {
+        nodes: vec![
+            expand_node("e1", vec![]),
+            mc_dep("d", Dep::hard("e1")),
+            expand_node("e2", vec![Dep::hard("d")]),
+        ],
+    };
+    let plan2 = Graph {
+        nodes: vec![mc("p", None), mc("q", Some("p"))],
+    };
+
+    // Run 1: e1 expands (2 nodes: calls 1,2), then d fails (call 3). e2 never runs.
+    // Journal carries PlanExpanded{e1} (2 nodes).
+    let (gw1, _c1) = failing_after_gateway(2).await;
+    let exec1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_planner(Arc::new(FixedPlanner(plan2.clone())))
+        .with_max_nodes(3);
+    let o1 = exec1
+        .run(run, &graph)
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(o1.failed.is_some(), "run 1 fails at d: {o1:?}");
+
+    // Run 2: resume seeds the node counter from the journal (=2). e1 replays (no
+    // re-count); d succeeds; e2 expands → 2 + 2 = 4 > 3 → cap. Without seeding, e2
+    // alone (2 nodes) would fit, so this assertion is what proves the cap SPANS resume.
+    let (gw2, _c2) = recording_gateway().await;
+    let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_planner(Arc::new(FixedPlanner(plan2)))
+        .with_max_nodes(3);
+    let err = exec2
+        .start(run, &graph)
+        .await
+        .expect_err("resume breaches max_nodes");
+    assert!(
+        matches!(&err, OrchestratorError::GlobalCapExceeded { cap, .. } if cap == "max_nodes"),
+        "max_nodes breach spans resume: {err:?}"
+    );
+}
