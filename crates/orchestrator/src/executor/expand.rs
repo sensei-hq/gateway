@@ -24,9 +24,12 @@ impl Executor {
         node: &Node,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        let NodeKind::Expand { input } = &node.kind else {
+        let NodeKind::Expand { input, planner } = &node.kind else {
             unreachable!("run_expand on non-Expand node");
         };
+        // `planner` is bound for Task 4 (the `PlannerRef::Agent` dispatch); this
+        // slice only drives the injected/slice-3 path. Task 4 removes this line.
+        let _ = planner;
         // RESUME: a node with a journaled `PlanExpanded` reuses that subgraph — the
         // planner is NOT re-invoked (determinism §4.4). FRESH: produce → validate →
         // cap-check → journal (in that order), then drive.

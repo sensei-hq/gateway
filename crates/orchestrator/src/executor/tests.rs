@@ -6049,6 +6049,7 @@ fn expand_node(id: &str, deps: Vec<Dep>) -> Node {
         id: NodeId(id.into()),
         kind: NodeKind::Expand {
             input: serde_json::json!({}),
+            planner: orchestrator_core::PlannerRef::Injected,
         },
         deps,
     }
