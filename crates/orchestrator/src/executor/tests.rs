@@ -6883,3 +6883,76 @@ async fn planner_agent_emits_a_map_consolidate_plan() {
         out.outputs[&e]
     );
 }
+
+/// A mid-plan crash (the planner turn journaled, but NO `PlanExpanded`) that resumes
+/// after the planner agent's `system_prompt` changed → the memoized planner turn's
+/// input-hash diverges → resume HALTS with a fatal `DeterminismViolation` (a hard
+/// `Err`), never silently downgraded to a node `Failed`. Proves the planner branch
+/// `?`-propagates fatal `drive_agent` errors like every other caller.
+#[tokio::test]
+async fn planner_agent_determinism_violation_in_the_plan_sub_run_halts() {
+    // The planner agent, parameterized by its `system_prompt` (the input-hash input).
+    let planner_reg = |sys: &str| {
+        Arc::new(Registry::default().with_agent(AgentDefinition {
+            name: "planner".into(),
+            area: "planning".into(),
+            kind: "reasoning".into(),
+            chain: Some("c".into()),
+            chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: sys.into(),
+        }))
+    };
+    // Single-node plan (n1); e (planner agent) drives it.
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![])],
+    };
+
+    // Run 1 (system_prompt "SYS_A"): run to completion so the planner turn is fully
+    // journaled (NodeStarted/EffectRecorded/NodeCompleted at "e/__plan__") ahead of
+    // the PlanExpanded event.
+    let full = InMemoryJournal::new();
+    let (gw1, _c1) =
+        scripted_gateway(vec![final_response(plan_json), final_response("n1 out")]).await;
+    Executor::new(Arc::new(gw1), Arc::new(full.clone()), "v1")
+        .with_registry(planner_reg("SYS_A"))
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+
+    // Truncate to the prefix BEFORE PlanExpanded → the planner turn is memoized, but
+    // "e" has no journaled expansion, so resume re-enters the Agent branch and replays
+    // the memoized planner turn (hash-checked).
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::PlanExpanded { .. }))
+        .expect("run 1 journaled a PlanExpanded");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // Run 2 (system_prompt "SYS_B" → divergent planner input-hash): resume HALTS with a
+    // fatal DeterminismViolation at "e/__plan__" — never a soft node Failed — and the
+    // gateway is never touched.
+    let (gw2, calls2) = recording_gateway().await;
+    let err = Executor::new(Arc::new(gw2), Arc::new(seeded.clone()), "v1")
+        .with_registry(planner_reg("SYS_B"))
+        .start(run, &graph)
+        .await
+        .expect_err("a changed planner system_prompt halts the mid-plan resume");
+    assert!(
+        matches!(&err, OrchestratorError::DeterminismViolation { node, .. } if node.0 == "e/__plan__"),
+        "got {err:?}"
+    );
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        0,
+        "a determinism violation never touches the gateway"
+    );
+}

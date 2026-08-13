@@ -15,7 +15,7 @@ use orchestrator_core::{
 use super::{AgentStep, Executor, Fold, NodeExec};
 
 impl Executor {
-    /// Drive an `Expand` node: produce → validate → cap-check → journal → drive.
+    /// Drive an `Expand` node: produce → `feasible` → cap-check → journal → drive.
     ///
     /// Known limitation (fresh-vs-terminal asymmetry, shared with `run_subgraph`/
     /// `run_branch` and the `Map`/`Loop` synthesized outputs): the `Completed` sink
@@ -68,15 +68,33 @@ impl Executor {
                         }
                     }
                     orchestrator_core::PlannerRef::Agent(agent_ref) => {
+                        // Config error: an unregistered planner agent → node Failed (a
+                        // recoverable config mistake), NOT a hard halt. Pre-checked here
+                        // so the `drive_agent` call below can `?`-propagate its `Err`s.
+                        if self.registry.agent(&agent_ref.0).is_none() {
+                            return self
+                                .expand_failed(
+                                    run,
+                                    node,
+                                    format!(
+                                        "expand {} unknown planner agent {}",
+                                        node.id.0, agent_ref.0
+                                    ),
+                                )
+                                .await;
+                        }
                         // A journaled ReAct planner sub-run under `"{expand}/__plan__"`:
                         // its turns are Pure effects (replayed from the memo on a
                         // mid-plan resume); its final answer parses as the produced plan.
+                        // `?` propagates fatal invariants (`DeterminismViolation`, journal
+                        // errors) as a HARD HALT — matching every other `drive_agent`
+                        // caller; the agent now exists, so it never returns `UnknownAgent`.
                         let plan_node = NodeId(format!("{}/__plan__", node.id.0));
                         match self
                             .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None)
-                            .await
+                            .await?
                         {
-                            Ok(AgentStep::Completed(out)) => {
+                            AgentStep::Completed(out) => {
                                 let text =
                                     out.get("text").and_then(|v| v.as_str()).unwrap_or_default();
                                 match orchestrator_core::parse_plan(text) {
@@ -92,7 +110,7 @@ impl Executor {
                                     }
                                 }
                             }
-                            Ok(AgentStep::Failed(msg)) => {
+                            AgentStep::Failed(msg) => {
                                 return self
                                     .expand_failed(
                                         run,
@@ -101,21 +119,10 @@ impl Executor {
                                     )
                                     .await;
                             }
-                            Ok(AgentStep::Paused(r)) => {
+                            AgentStep::Paused(r) => {
                                 return Ok(NodeExec::Paused {
                                     reason: format!("planner {} paused: {r}", node.id.0),
                                 });
-                            }
-                            // An unresolvable planner agent (unknown agent) is a config
-                            // error → node Failed, not a hard halt.
-                            Err(e) => {
-                                return self
-                                    .expand_failed(
-                                        run,
-                                        node,
-                                        format!("expand {} planner unavailable: {e}", node.id.0),
-                                    )
-                                    .await;
                             }
                         }
                     }
