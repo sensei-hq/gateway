@@ -139,7 +139,7 @@ pub(crate) fn fold_journal(
                     }
                 }
             }
-            JournalEvent::PlanExpanded { node, subgraph } => {
+            JournalEvent::PlanExpanded { node, subgraph, .. } => {
                 fold.expansions.insert(node.clone(), subgraph.clone());
             }
             _ => {}
@@ -348,6 +348,7 @@ mod tests {
             JournalEvent::PlanExpanded {
                 node: NodeId("e".into()),
                 subgraph: subgraph.clone(),
+                node_plans: std::collections::HashMap::new(),
             },
         )];
         let (fold, _last, _completed) = fold_journal(&events);

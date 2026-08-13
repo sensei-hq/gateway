@@ -6518,3 +6518,43 @@ async fn expand_drives_a_produced_agent_plan_end_to_end() {
         out.outputs[&e]
     );
 }
+
+/// on_plan_expanded fires once with the graph + labels when a plan is journaled.
+#[tokio::test]
+async fn on_plan_expanded_fires_with_the_plan() {
+    use std::sync::{Arc, Mutex};
+    struct Spy(Arc<Mutex<Vec<(String, usize, usize)>>>);
+    #[async_trait::async_trait]
+    impl OrchestratorHooks for Spy {
+        async fn on_plan_expanded(
+            &self,
+            _run: RunId,
+            node: &NodeId,
+            graph: &Graph,
+            node_plans: &std::collections::HashMap<NodeId, orchestrator_core::NodePlan>,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((node.0.clone(), graph.nodes.len(), node_plans.len()));
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (gateway, _c) = recording_gateway().await;
+    let planner = Arc::new(FixedPlanner(Graph {
+        nodes: vec![mc("n1", None)],
+    }));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(planner)
+        .with_hooks(Arc::new(Spy(log.clone())));
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![])],
+    };
+    exec.run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "on_plan_expanded fired once: {seen:?}");
+    assert_eq!(seen[0].0, "e");
+    assert_eq!(seen[0].1, 1, "graph carried to the hook");
+}
