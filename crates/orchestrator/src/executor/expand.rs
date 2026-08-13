@@ -1,13 +1,18 @@
-//! The `Expand` node (SP-3 slice 3): produce a nested subgraph at runtime via the
-//! injected `Planner`, journal it as `PlanExpanded`, and drive it under the node's
-//! path — reusing the shared `drive_nested`. A planner error, an invalid produced
-//! graph, or no planner is a node `Failed` (journaled `NodeFailed`); a cap breach is
-//! a hard `Err` (self-DoS). On resume, a node with a journaled `PlanExpanded` reuses
-//! that subgraph from the fold — the planner is never re-invoked (deterministic).
+//! The `Expand` node (SP-3 slice 3/4A): produce a nested subgraph at runtime — via
+//! the injected `Planner` (`PlannerRef::Injected`) or a journaled ReAct planner agent
+//! (`PlannerRef::Agent`, slice 4A) — run the pure `feasible` gate, journal it as
+//! `PlanExpanded`, and drive it under the node's path (reusing the shared
+//! `drive_nested`). A planner error, an infeasible plan, an unparseable/failed planner
+//! agent, or no wired planner is a node `Failed` (journaled `NodeFailed`); a paused
+//! planner turn pauses the run; a cap breach is a hard `Err` (self-DoS). On resume, a
+//! node with a journaled `PlanExpanded` reuses that subgraph from the fold — the
+//! planner is never re-invoked (deterministic).
 
-use orchestrator_core::{JournalEvent, Node, NodeKind, OrchestratorError, RunId};
+use orchestrator_core::{
+    JournalEvent, Node, NodeId, NodeKind, OrchestratorError, PlannedGraph, RunId,
+};
 
-use super::{Executor, Fold, NodeExec};
+use super::{AgentStep, Executor, Fold, NodeExec};
 
 impl Executor {
     /// Drive an `Expand` node: produce → validate → cap-check → journal → drive.
@@ -27,52 +32,119 @@ impl Executor {
         let NodeKind::Expand { input, planner } = &node.kind else {
             unreachable!("run_expand on non-Expand node");
         };
-        // `planner` is bound for Task 4 (the `PlannerRef::Agent` dispatch); this
-        // slice only drives the injected/slice-3 path. Task 4 removes this line.
-        let _ = planner;
         // RESUME: a node with a journaled `PlanExpanded` reuses that subgraph — the
-        // planner is NOT re-invoked (determinism §4.4). FRESH: produce → validate →
+        // planner is NOT re-invoked (determinism §4.4). FRESH: produce (the injected
+        // `Planner` trait, or a journaled ReAct planner agent) → feasibility →
         // cap-check → journal (in that order), then drive.
         let g = match fold.expansions.get(&node.id) {
             Some(journaled) => journaled.clone(),
             None => {
-                let Some(planner) = &self.planner else {
-                    return self
-                        .expand_failed(run, node, format!("expand {}: no planner wired", node.id.0))
-                        .await;
-                };
-                let produced = match planner.plan(input).await {
-                    Ok(produced) => produced,
-                    Err(e) => {
-                        return self
-                            .expand_failed(
-                                run,
-                                node,
-                                format!("expand {} planner failed: {e}", node.id.0),
-                            )
-                            .await;
+                let produced = match planner {
+                    orchestrator_core::PlannerRef::Injected => {
+                        // Slice-3 path: the injected `Planner` trait (no metadata).
+                        let Some(p) = &self.planner else {
+                            return self
+                                .expand_failed(
+                                    run,
+                                    node,
+                                    format!("expand {}: no planner wired", node.id.0),
+                                )
+                                .await;
+                        };
+                        match p.plan(input).await {
+                            Ok(graph) => PlannedGraph {
+                                graph,
+                                node_plans: std::collections::HashMap::new(),
+                            },
+                            Err(e) => {
+                                return self
+                                    .expand_failed(
+                                        run,
+                                        node,
+                                        format!("expand {} planner failed: {e}", node.id.0),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    orchestrator_core::PlannerRef::Agent(agent_ref) => {
+                        // A journaled ReAct planner sub-run under `"{expand}/__plan__"`:
+                        // its turns are Pure effects (replayed from the memo on a
+                        // mid-plan resume); its final answer parses as the produced plan.
+                        let plan_node = NodeId(format!("{}/__plan__", node.id.0));
+                        match self
+                            .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None)
+                            .await
+                        {
+                            Ok(AgentStep::Completed(out)) => {
+                                let text =
+                                    out.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                                match orchestrator_core::parse_plan(text) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        return self
+                                            .expand_failed(
+                                                run,
+                                                node,
+                                                format!("expand {} plan parse: {e:?}", node.id.0),
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
+                            Ok(AgentStep::Failed(msg)) => {
+                                return self
+                                    .expand_failed(
+                                        run,
+                                        node,
+                                        format!("expand {} planner agent failed: {msg}", node.id.0),
+                                    )
+                                    .await;
+                            }
+                            Ok(AgentStep::Paused(r)) => {
+                                return Ok(NodeExec::Paused {
+                                    reason: format!("planner {} paused: {r}", node.id.0),
+                                });
+                            }
+                            // An unresolvable planner agent (unknown agent) is a config
+                            // error → node Failed, not a hard halt.
+                            Err(e) => {
+                                return self
+                                    .expand_failed(
+                                        run,
+                                        node,
+                                        format!("expand {} planner unavailable: {e}", node.id.0),
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 };
-                if let Err(e) = produced.validate_dag() {
+                // Feasibility subsumes the slice-3 `validate_dag` (its Structural check),
+                // and additionally rejects reserved ids, over-cap plans, and dangling
+                // agent/skill/tool refs — the deterministic gate before journaling.
+                if let Err(errs) =
+                    orchestrator_core::feasible(&produced, &self.registry, self.max_nodes)
+                {
                     return self
                         .expand_failed(
                             run,
                             node,
-                            format!("expand {} produced an invalid plan: {e}", node.id.0),
+                            format!("expand {} infeasible plan: {errs:?}", node.id.0),
                         )
                         .await;
                 }
-                self.check_expansion_budget(&produced)?;
+                self.check_expansion_budget(&produced.graph)?;
                 self.append(
                     run,
                     JournalEvent::PlanExpanded {
                         node: node.id.clone(),
-                        subgraph: produced.clone(),
-                        node_plans: std::collections::HashMap::new(),
+                        subgraph: produced.graph.clone(),
+                        node_plans: produced.node_plans,
                     },
                 )
                 .await?;
-                produced
+                produced.graph
             }
         };
         self.drive_nested(run, "expand", &node.id.0, &g, fold).await

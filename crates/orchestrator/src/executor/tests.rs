@@ -6559,3 +6559,327 @@ async fn on_plan_expanded_fires_with_the_plan() {
     assert_eq!(seen[0].0, "e");
     assert_eq!(seen[0].1, 1, "graph carried to the hook");
 }
+
+// ---------------------------------------------------------------------------
+// SP-3 slice 4A — the journaled planner AGENT: an `Expand` node whose plan is
+// produced by a real ReAct sub-run (`PlannerRef::Agent`) under `"{expand}/__plan__"`,
+// parsed as a `PlannedGraph`, run through `feasible`, journaled, and spliced.
+// ---------------------------------------------------------------------------
+
+/// A registry with a `planner` agent on a plain chain (no tools for the minimal
+/// path — the agent's single turn emits the plan JSON directly). The plan itself
+/// comes from the scripted gateway, so this helper takes no plan argument.
+fn planner_registry() -> Arc<Registry> {
+    Arc::new(Registry::default().with_agent(AgentDefinition {
+        name: "planner".into(),
+        area: "planning".into(),
+        kind: "reasoning".into(),
+        chain: Some("c".into()),
+        chains: std::collections::HashMap::new(),
+        grants: std::collections::HashMap::new(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: "Emit a plan as JSON.".into(),
+    }))
+}
+
+fn expand_agent_node(id: &str, deps: Vec<Dep>) -> Node {
+    Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::Expand {
+            input: serde_json::json!({ "goal": "do the thing" }),
+            planner: orchestrator_core::PlannerRef::Agent(AgentRef("planner".into())),
+        },
+        deps,
+    }
+}
+
+#[tokio::test]
+async fn journaled_planner_agent_produces_and_splices_a_plan() {
+    // The planner agent emits a 2-node plan (n1 -> n2); the executor splices + runs it.
+    let plan_json = r#"{"graph":{"nodes":[
+        {"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]},
+        {"id":"n2","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n2"}}},"deps":[{"on":"n1","kind":"Hard"}]}
+    ]},"node_plans":{"n1":{"label":"first"},"n2":{"label":"second"}}}"#;
+    let reg = planner_registry();
+    // response[0] → the planner turn (runs first, sequentially); [1]/[2] → the spliced
+    // plan nodes n1 then n2 (each a ModelCall on chain "c", one gateway call apiece).
+    let (gateway, _c) = scripted_gateway(vec![
+        final_response(plan_json),
+        final_response("n1 out"),
+        final_response("n2 out"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+
+    // A spy over `on_plan_expanded` proving the `node_plans` side-map reaches the hook
+    // end-to-end (len == 2, not an empty map).
+    use std::sync::Mutex;
+    struct PlanSpy(Arc<Mutex<Vec<(String, usize)>>>);
+    #[async_trait::async_trait]
+    impl OrchestratorHooks for PlanSpy {
+        async fn on_plan_expanded(
+            &self,
+            _run: RunId,
+            node: &NodeId,
+            _graph: &Graph,
+            node_plans: &std::collections::HashMap<NodeId, orchestrator_core::NodePlan>,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((node.0.clone(), node_plans.len()));
+        }
+    }
+    let plan_log = Arc::new(Mutex::new(Vec::new()));
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(reg)
+        .with_hooks(Arc::new(PlanSpy(plan_log.clone())));
+    let run = RunId(uuid::Uuid::new_v4());
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![])],
+    };
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&e].get("n2").is_some(),
+        "sink map has n2: {}",
+        out.outputs[&e]
+    );
+
+    // The `node_plans` side-map reached the hook with both entries (n1, n2).
+    let seen_plans = plan_log.lock().unwrap().clone();
+    assert_eq!(
+        seen_plans.len(),
+        1,
+        "on_plan_expanded fired once: {seen_plans:?}"
+    );
+    assert_eq!(seen_plans[0].0, "e");
+    assert_eq!(
+        seen_plans[0].1, 2,
+        "node_plans side-map carried both entries to the hook: {seen_plans:?}"
+    );
+
+    // The planner turns are journaled under "e/__plan__"; the plan nodes under "e/…".
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|(_, ev)| match ev {
+            JournalEvent::NodeStarted { node } => Some(node.0.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.starts_with("e/__plan__")),
+        "planner turn journaled: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "e/n1"),
+        "plan node journaled: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "e/n2"),
+        "both plan nodes spliced+journaled: {labels:?}"
+    );
+    // The reserved id names the planner sub-run ("e/__plan__") — it is never itself a
+    // spliced plan node ("__plan__" bare, or nested under a plan node).
+    assert!(
+        !labels
+            .iter()
+            .any(|l| l == "__plan__" || l == "e/n1/__plan__"),
+        "reserved id is only the planner sub-run path: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn planner_agent_invalid_plan_fails_the_node() {
+    let reg = planner_registry();
+    let (gateway, _c) = scripted_gateway(vec![final_response("this is not json")]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1").with_registry(reg);
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![]), mc_dep("d", Dep::hard("e"))],
+    };
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "{out:?}"
+    );
+    assert!(
+        out.skipped.contains(&NodeId("d".into())),
+        "hard-dependent skipped"
+    );
+    assert!(
+        !journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, ev)| matches!(ev, JournalEvent::PlanExpanded { .. })),
+        "no PlanExpanded for an unparseable plan"
+    );
+}
+
+#[tokio::test]
+async fn unresolvable_planner_agent_fails_the_node() {
+    // PlannerRef::Agent names an agent NOT in the registry.
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(Arc::new(Registry::default()));
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "{out:?}"
+    );
+}
+
+/// Resume post-PlanExpanded reuses the journaled plan; the planner agent is NOT
+/// re-invoked and the plan node is NOT re-spent (mirrors the slice-3
+/// `expand_completed_then_failing_tail_resumes_without_replan`, but the planner is
+/// an agent). The load-bearing proof: run-2's gateway sees EXACTLY ONE call — `d`.
+#[tokio::test]
+async fn planner_agent_resume_reuses_journaled_plan() {
+    // Single-node plan (ModelCall n1 with prompt "n1"). e (planner agent) -> d (tail).
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![]), mc_dep("d", Dep::hard("e"))],
+    };
+    // Run 1: a scripted gateway supplies the planner's plan (call 1) and plan node n1
+    // (call 2); it has NO 3rd response, so d's call errors → d fails, leaving PlanExpanded
+    // + n1 journaled and NO RunCompleted.
+    {
+        let (gw_s, _c) = scripted_gateway(vec![
+            final_response(plan_json), // planner turn → the plan
+            final_response("n1 out"),  // plan node n1
+        ])
+        .await;
+        let exec = Executor::new(Arc::new(gw_s), Arc::new(journal.clone()), "v1")
+            .with_registry(planner_registry());
+        let o1 = exec.run(run, &graph).await.expect("run1");
+        assert!(o1.failed.is_some(), "tail d failed: {o1:?}");
+    }
+    // Run 2: a FRESH recording gateway (succeeds for everything) over the SAME journal.
+    // Resume reuses the journaled plan (planner skipped, n1 replayed from memo) and
+    // re-drives ONLY d.
+    let (gw2, calls2) = recording_gateway().await;
+    let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(planner_registry());
+    let o2 = exec2.start(run, &graph).await.expect("resume");
+    assert!(o2.failed.is_none(), "resume completes: {o2:?}");
+    assert!(
+        o2.outputs[&NodeId("e".into())].get("n1").is_some(),
+        "journaled plan (n1) reused: {}",
+        o2.outputs[&NodeId("e".into())]
+    );
+    let recorded2 = calls2.lock().unwrap().clone();
+    assert_eq!(
+        recorded2.len(),
+        1,
+        "resume re-called the gateway only for d (no re-plan, no n1 re-spend): {recorded2:?}"
+    );
+    assert_eq!(
+        recorded2[0].1, "d",
+        "the single resume call carried d's prompt"
+    );
+}
+
+/// AC8: the planner agent's turn hits a timed gate → `AgentStep::Paused` →
+/// `run_expand` returns `NodeExec::Paused` → the run pauses (RunOutcome.paused set,
+/// RunPaused journaled, no RunCompleted, no plan produced). Reuses the SP-1
+/// `timeout_gateway()` warm-up→all-gated fixture.
+#[tokio::test]
+async fn planner_agent_pause_pauses_the_run() {
+    use crate::test_support::timeout_gateway;
+    let gw = timeout_gateway().await;
+    let req = support::build_request("c", &serde_json::json!({ "prompt": "warm" }));
+    let _ = gw.execute(&req).await; // warm-up cools the sole router "r"
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![])],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(planner_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .run(run, &graph)
+        .await
+        .expect("run yields an outcome");
+    assert!(
+        out.paused.is_some(),
+        "the planner's gated turn pauses the run: {:?}",
+        out.failed
+    );
+    assert!(out.failed.is_none());
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        events.iter().any(|(_, e)| matches!(
+            e,
+            JournalEvent::RunPaused {
+                resume_after: Some(_),
+                ..
+            }
+        )),
+        "RunPaused with a timed resume_after is journaled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a paused run does not complete"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::PlanExpanded { .. })),
+        "a planner paused before producing a plan journals no PlanExpanded"
+    );
+}
+
+/// AC11 (full palette): the planner emits a tier-2 `Map` -> `Consolidate` plan
+/// (ModelCall bodies over the test chain "c"); the executor splices + runs it to
+/// completion, folding the Consolidate as the Expand's sink.
+#[tokio::test]
+async fn planner_agent_emits_a_map_consolidate_plan() {
+    // Map "m" (2 items, BestEffort) -> Consolidate "cons" (soft-dep m, min_viable 1).
+    let plan_json = r#"{"graph":{"nodes":[
+        {"id":"m","kind":{"Map":{"body":{"ModelCall":{"chain":"c"}},"over":[{"prompt":"i0"},{"prompt":"i1"}],"concurrency":2,"aggregation":"BestEffort"}},"deps":[]},
+        {"id":"cons","kind":{"Consolidate":{"over":"m","min_viable":1,"body":{"ModelCall":{"chain":"c"}}}},"deps":[{"on":"m","kind":"Soft"}]}
+    ]},"node_plans":{"m":{"label":"fan out"},"cons":{"label":"consolidate"}}}"#;
+    // response[0] → planner turn (sequential, first); the rest → the spliced Map
+    // children + Consolidate body (all succeed; content is irrelevant, so identical
+    // responses sidestep the Map's nondeterministic concurrent child order). A small
+    // surplus is harmless (unused responses are never popped).
+    let mut responses = vec![final_response(plan_json)];
+    responses.extend((0..5).map(|_| final_response("ok")));
+    let (gateway, _c) = scripted_gateway(responses).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(planner_registry());
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&e].get("cons").is_some(),
+        "Consolidate is the Expand sink: {}",
+        out.outputs[&e]
+    );
+}
