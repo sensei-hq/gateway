@@ -1060,12 +1060,32 @@ In `crates/orchestrator/src/executor/mod.rs`, in `start_inner`, replace the tail
 Run: `cargo test -p sensei-orchestrator -- expand_max_expansions_cap_halts_loud expand_max_nodes_cap_spans_resume`
 Expected: both PASS. Verify the real exit code is 0.
 
+- [ ] **Step 6b: Correct two now-stale doc comments (Task 4 review follow-up)**
+
+Now that this task wires the per-run reset/seed, two doc comments become accurate to fix:
+
+1. In `crates/orchestrator/src/executor/expand.rs`, the module doc header still says the resume path "lands in Task 4" (it landed in Task 4). Replace the last sentence of the `//!` header:
+
+Old:
+```rust
+//! a hard `Err` (self-DoS). The resume path (reuse a journaled expansion, never
+//! re-plan) lands in Task 4.
+```
+New:
+```rust
+//! a hard `Err` (self-DoS). On resume, a node with a journaled `PlanExpanded` reuses
+//! that subgraph from the fold — the planner is never re-invoked (deterministic).
+```
+
+2. In `crates/orchestrator/src/executor/mod.rs`, confirm the `expansion_counters` field doc ("Reset per run by `run_inner`/`start_inner`.") is now accurate — this task makes it so. Leave it as-is if it already reads that way; no edit needed beyond confirming.
+
 - [ ] **Step 7: Commit**
 
 ```bash
 cd /Users/Jerry/Developer/gateway
 cargo fmt --all
-git add crates/orchestrator/src/executor/mod.rs crates/orchestrator/src/executor/tests.rs
+git add crates/orchestrator/src/executor/mod.rs crates/orchestrator/src/executor/tests.rs \
+        crates/orchestrator/src/executor/expand.rs
 git commit -m "feat(orchestrator): SP-3 slice 3 (5/6) — max_expansions/max_nodes caps, journal-seeded across resume"
 ```
 
