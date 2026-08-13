@@ -8,3 +8,5 @@ Cargo.lock
 # scan is repo-controlled; `.qlty/.gitignore` already ignores the cache/output.
 # Git worktrees for isolated feature work (superpowers workflow).
 /.worktrees/
+# Site design mockups — generated/exported artifacts, kept local, not tracked.
+/docs/mockups/
