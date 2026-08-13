@@ -5780,6 +5780,57 @@ async fn branch_drives_a_nested_agent_arm_end_to_end() {
     );
 }
 
+/// Regression (whole-slice review): `namespace_graph` must rewrite a nested
+/// `Branch.on` (a sibling reference), else a Branch inside a Subgraph (or a Branch
+/// arm) hits `BranchInputMissing` at runtime on a *validated* graph — the branch's
+/// predecessor is namespaced to `"s/on"` while the branch's `on` field stays `"on"`,
+/// so `run_branch`'s `prior_outputs.get(on)` misses. Top-level Branch is unaffected
+/// (its predecessor is not namespaced). `.expect` panics before the fix.
+#[tokio::test]
+async fn a_branch_nested_in_a_subgraph_namespaces_its_on_and_runs() {
+    use orchestrator_core::BranchCond;
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let s = NodeId("s".into());
+    // Subgraph whose inner graph is [ on(ModelCall "c"), br(Branch on `on`, Hard-dep) ].
+    let inner = vec![
+        mc("on", None),
+        Node {
+            id: NodeId("br".into()),
+            kind: NodeKind::Branch {
+                on: NodeId("on".into()),
+                arms: vec![(BranchCond::TextContains("canned".into()), arm("armX"))],
+                default: arm("armD"),
+            },
+            deps: vec![Dep {
+                on: NodeId("on".into()),
+                kind: EdgeKind::Hard,
+            }],
+        },
+    ];
+    let graph = Graph {
+        nodes: vec![subgraph_node("s", inner)],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    // Before the fix: run_branch(prior_outputs["on"]) misses (predecessor is "s/on")
+    // → BranchInputMissing → Err → .expect panics. After: the branch resolves + runs armX.
+    assert!(out.failed.is_none(), "nested branch runs: {out:?}");
+    // The subgraph's sink is the nested branch "br"; its value is the selected arm's
+    // sink map ({armX: <output>}).
+    let sub = &out.outputs[&s];
+    assert!(
+        sub.get("br").is_some(),
+        "subgraph sink includes the nested branch: {sub}"
+    );
+    assert!(
+        sub["br"].get("armX").is_some(),
+        "the nested branch's output is the selected arm's sink map: {sub}"
+    );
+}
+
 #[test]
 fn validate_dag_rejects_bad_branch() {
     use orchestrator_core::BranchCond;
@@ -5806,6 +5857,37 @@ fn validate_dag_rejects_bad_branch() {
     };
     assert!(matches!(
         no_dep.validate_dag(),
+        Err(OrchestratorError::InvalidGraph(_))
+    ));
+    // A SOFT dep on `on` is not enough — the Branch requires a HARD dep on its
+    // predecessor (a failed `on` must cascade-skip the branch, never let it decide
+    // over an absent input).
+    let soft_dep = Graph {
+        nodes: vec![
+            mc("on", None),
+            Node {
+                id: NodeId("br".into()),
+                kind: NodeKind::Branch {
+                    on: NodeId("on".into()),
+                    arms: vec![(
+                        BranchCond::FieldTrue("x".into()),
+                        Graph {
+                            nodes: vec![mc("a", None)],
+                        },
+                    )],
+                    default: Graph {
+                        nodes: vec![mc("d", None)],
+                    },
+                },
+                deps: vec![Dep {
+                    on: NodeId("on".into()),
+                    kind: EdgeKind::Soft, // Soft, not Hard
+                }],
+            },
+        ],
+    };
+    assert!(matches!(
+        soft_dep.validate_dag(),
         Err(OrchestratorError::InvalidGraph(_))
     ));
     let undeclared = Graph {
