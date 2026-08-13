@@ -6956,3 +6956,111 @@ async fn planner_agent_determinism_violation_in_the_plan_sub_run_halts() {
         "a determinism violation never touches the gateway"
     );
 }
+
+/// Full grounding e2e: the planner agent calls validate_plan (a real tool) on a draft,
+/// then emits the final single-Agent plan (right-sizing: tier 1). Executed to completion.
+#[tokio::test]
+async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
+    // Registry: a `planner` agent granted validate_plan + list_agents, and a `worker` agent.
+    let worker = AgentDefinition {
+        name: "worker".into(),
+        area: "research".into(),
+        kind: "reasoning".into(),
+        chain: Some("c".into()),
+        chains: std::collections::HashMap::new(),
+        grants: std::collections::HashMap::new(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: "work".into(),
+    };
+    let planner = AgentDefinition {
+        name: "planner".into(),
+        area: "planning".into(),
+        kind: "reasoning".into(),
+        chain: Some("c".into()),
+        chains: std::collections::HashMap::new(),
+        grants: std::collections::HashMap::new(),
+        tools: vec!["validate_plan".into(), "list_agents".into()],
+        skills: vec![],
+        system_prompt: "Plan. Prefer the simplest structure.".into(),
+    };
+    let reg = Arc::new(
+        Registry::default()
+            .with_agent(planner)
+            .with_agent(worker)
+            .with_tool(
+                crate::agent::tools::ValidatePlan {
+                    registry: Arc::new(Registry::default()),
+                    max_nodes: 512,
+                }
+                .spec(),
+            )
+            .with_tool(crate::agent::tools::ListAgents(Arc::new(Registry::default())).spec()),
+    );
+
+    // The single-Agent plan the planner ends up emitting (tier 1 — right-sizing).
+    // The `Graph` serde shape is {"nodes":[{id, kind, deps}]}; an Agent node's kind is
+    // {"Agent":{"agent":<name>, "input":<value>, "phase":null}}.
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"Agent":{"agent":"worker","input":"go","phase":null}},"deps":[]}]},"node_plans":{"n1":{"label":"do it all"}}}"#;
+
+    // Executable tools the planner actually calls: validate_plan (over the real reg) + list_agents.
+    let tools = Arc::new(
+        ToolRegistry::default()
+            .with_tool(Arc::new(crate::agent::tools::ValidatePlan {
+                registry: reg.clone(),
+                max_nodes: 512,
+            }))
+            .with_tool(Arc::new(crate::agent::tools::ListAgents(reg.clone()))),
+    );
+
+    // Scripted gateway: planner turn 1 → call validate_plan(draft); turn 2 → final plan JSON;
+    // then the spliced worker agent's single turn → final answer.
+    let validate_args = serde_json::json!({ "plan": plan_json }).to_string();
+    let (gateway, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "validate_plan", &validate_args),
+        final_response(plan_json),
+        final_response("worker done"),
+    ])
+    .await;
+
+    let journal = InMemoryJournal::new();
+    let hooks_log = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    struct Counter(std::sync::Arc<std::sync::Mutex<usize>>);
+    #[async_trait::async_trait]
+    impl OrchestratorHooks for Counter {
+        async fn on_plan_expanded(
+            &self,
+            _r: RunId,
+            _n: &NodeId,
+            _g: &Graph,
+            _p: &std::collections::HashMap<NodeId, orchestrator_core::NodePlan>,
+        ) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(tools)
+        .with_hooks(Arc::new(Counter(hooks_log.clone())));
+
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_agent_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    // Tier-1 right-sizing: the produced plan is a single node.
+    assert!(
+        out.outputs[&e].get("n1").is_some(),
+        "single-agent plan executed: {}",
+        out.outputs[&e]
+    );
+    assert_eq!(
+        *hooks_log.lock().unwrap(),
+        1,
+        "on_plan_expanded fired once for the produced plan"
+    );
+}
