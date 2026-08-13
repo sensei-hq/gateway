@@ -91,6 +91,32 @@ impl LoopGate {
     }
 }
 
+/// A pure predicate over a predecessor node's output, selecting a `Branch` arm
+/// (mirrors `LoopGate`). Evaluated in arm order; first match wins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BranchCond {
+    /// `output[field] == value` (strict JSON equality) — switch on a discriminant.
+    FieldEquals(String, serde_json::Value),
+    /// `output[field] == true` (strict JSON `true`).
+    FieldTrue(String),
+    /// `output["text"]` contains this substring.
+    TextContains(String),
+}
+
+impl BranchCond {
+    /// Whether `output` satisfies this condition.
+    pub fn matches(&self, output: &serde_json::Value) -> bool {
+        match self {
+            BranchCond::FieldEquals(f, v) => output.get(f) == Some(v),
+            BranchCond::FieldTrue(f) => output.get(f) == Some(&serde_json::Value::Bool(true)),
+            BranchCond::TextContains(s) => output
+                .get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t.contains(s.as_str())),
+        }
+    }
+}
+
 /// How a `Map` folds its children's success/failure into the node's own status
 /// (§3.4). The per-child manifest is always produced; `aggregation` only decides
 /// whether the Map node itself is `Completed` or `Failed`.
@@ -306,6 +332,22 @@ mod tests {
             graph.validate_dag(),
             Err(OrchestratorError::InvalidGraph(_))
         ));
+    }
+
+    #[test]
+    fn branch_cond_matches_each_variant() {
+        let out = serde_json::json!({ "status": "b", "done": true, "text": "hello world" });
+        assert!(BranchCond::FieldEquals("status".into(), serde_json::json!("b")).matches(&out));
+        assert!(!BranchCond::FieldEquals("status".into(), serde_json::json!("a")).matches(&out));
+        assert!(BranchCond::FieldTrue("done".into()).matches(&out));
+        assert!(!BranchCond::FieldTrue("missing".into()).matches(&out));
+        assert!(!BranchCond::FieldTrue("status".into()).matches(&out)); // "b" is not `true`
+        assert!(BranchCond::TextContains("world".into()).matches(&out));
+        assert!(!BranchCond::TextContains("zzz".into()).matches(&out));
+        // TextContains only inspects `text`.
+        assert!(
+            !BranchCond::TextContains("b".into()).matches(&serde_json::json!({ "status": "b" }))
+        );
     }
 
     #[test]
