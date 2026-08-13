@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use orchestrator_core::{Activation, EffectClass, OrchestratorError, Permissions, ToolSpec};
+use orchestrator_core::{
+    Activation, EffectClass, OrchestratorError, Permissions, Registry, ToolSpec,
+};
 
 /// An executable tool. `spec().effect_class` may be `Pure`, `Observation`, or
 /// `Mutation` (slice 4) — the executor is responsible for wrapping
@@ -245,8 +247,6 @@ impl orchestrator_core::ReconcileProvider for NoteReconciler {
     }
 }
 
-use orchestrator_core::Registry;
-
 /// Pure discovery: list the registry's agents (name + role).
 pub struct ListAgents(pub Arc<Registry>);
 impl Tool for ListAgents {
@@ -357,7 +357,7 @@ impl Tool for ValidatePlan {
         ToolSpec {
             name: "validate_plan".into(),
             description: Some("Validate a draft plan JSON; returns {ok, errors}".into()),
-            input_schema: serde_json::json!({"type":"object","properties":{"plan":{"type":"string"}},"required":["plan"]}),
+            input_schema: serde_json::json!({"type":"object","properties":{"plan":{"type":"string","description":"The draft plan as a JSON string: {\"graph\":{\"nodes\":[{id,kind,deps}]}, \"node_plans\":{id:{label,...}}}"}},"required":["plan"]}),
             effect_class: EffectClass::Pure,
             ttl_secs: None,
             source: None,
@@ -545,9 +545,9 @@ mod planner_tool_tests {
     use orchestrator_core::{AgentDefinition, Registry};
     use std::collections::HashMap;
 
-    fn reg() -> Arc<Registry> {
-        Arc::new(Registry::default().with_agent(AgentDefinition {
-            name: "researcher".into(),
+    fn agent_def(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.into(),
             area: "research".into(),
             kind: "reasoning".into(),
             chain: Some("research.bulk".into()),
@@ -556,7 +556,11 @@ mod planner_tool_tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "r".into(),
-        }))
+        }
+    }
+
+    fn reg() -> Arc<Registry> {
+        Arc::new(Registry::default().with_agent(agent_def("researcher")))
     }
 
     #[test]
@@ -571,6 +575,25 @@ mod planner_tool_tests {
     }
 
     #[test]
+    fn list_agents_output_is_sorted_by_name() {
+        // Insertion order (zeta before alpha) must NOT survive: the Pure tool sorts
+        // by name so its output is deterministic regardless of HashMap iteration.
+        let reg = Arc::new(
+            Registry::default()
+                .with_agent(agent_def("zeta"))
+                .with_agent(agent_def("alpha")),
+        );
+        let out = ListAgents(reg).call(serde_json::json!({})).unwrap();
+        let names: Vec<&str> = out["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
     fn validate_plan_tool_reports_errors_and_ok() {
         let t = ValidatePlan {
             registry: reg(),
@@ -582,5 +605,23 @@ mod planner_tool_tests {
         let good = t.call(serde_json::json!({ "plan":
             r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"research.bulk","payload":{}}},"deps":[]}]}}"# })).unwrap();
         assert_eq!(good["ok"], true);
+    }
+
+    #[test]
+    fn validate_plan_tool_reports_infeasible_parseable_plan() {
+        // The draft PARSES but is INFEASIBLE: a NodePlan need references an agent
+        // absent from the registry → {ok:false} with the unknown-agent error rendered.
+        let t = ValidatePlan {
+            registry: reg(),
+            max_nodes: 512,
+        };
+        let out = t.call(serde_json::json!({ "plan":
+            r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"research.bulk","payload":{}}},"deps":[]}]},"node_plans":{"n1":{"label":"x","needs":{"agents":["ghost"]}}}}"# })).unwrap();
+        assert_eq!(out["ok"], false);
+        let errors = out["errors"].as_array().unwrap();
+        assert!(
+            errors.iter().any(|e| e.as_str().unwrap().contains("ghost")),
+            "unknown-agent error rendered: {errors:?}"
+        );
     }
 }
