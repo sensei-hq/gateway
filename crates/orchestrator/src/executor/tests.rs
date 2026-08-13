@@ -7024,24 +7024,38 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
     .await;
 
     let journal = InMemoryJournal::new();
-    let hooks_log = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-    struct Counter(std::sync::Arc<std::sync::Mutex<usize>>);
+    // One spy captures three signals: how many times on_plan_expanded fired, the
+    // produced graph's node count (for the right-sizing assertion), and every tool
+    // the planner agent invoked (to prove validate_plan was actually called).
+    use std::sync::Mutex;
+    struct Counter {
+        expansions: Arc<Mutex<Vec<usize>>>, // node count per on_plan_expanded fire
+        tool_calls: Arc<Mutex<Vec<String>>>,
+    }
     #[async_trait::async_trait]
     impl OrchestratorHooks for Counter {
         async fn on_plan_expanded(
             &self,
             _r: RunId,
             _n: &NodeId,
-            _g: &Graph,
+            g: &Graph,
             _p: &std::collections::HashMap<NodeId, orchestrator_core::NodePlan>,
         ) {
-            *self.0.lock().unwrap() += 1;
+            self.expansions.lock().unwrap().push(g.nodes.len());
+        }
+        async fn on_agent_tool_call(&self, _r: RunId, _n: &NodeId, tool: &str) {
+            self.tool_calls.lock().unwrap().push(tool.to_string());
         }
     }
+    let expansions = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let tool_calls = Arc::new(Mutex::new(Vec::<String>::new()));
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
         .with_registry(reg)
         .with_tools(tools)
-        .with_hooks(Arc::new(Counter(hooks_log.clone())));
+        .with_hooks(Arc::new(Counter {
+            expansions: expansions.clone(),
+            tool_calls: tool_calls.clone(),
+        }));
 
     let e = NodeId("e".into());
     let graph = Graph {
@@ -7052,15 +7066,29 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
         .await
         .expect("run");
     assert!(out.failed.is_none(), "{out:?}");
-    // Tier-1 right-sizing: the produced plan is a single node.
+    // NOTE: a scripted gateway cannot *act on* validate_plan's verdict (the model's
+    // turns are fixed), so this e2e proves the planner *invoked* validate_plan and
+    // right-sized the plan — not that it reasoned over the tool's ok/errors result.
     assert!(
         out.outputs[&e].get("n1").is_some(),
         "single-agent plan executed: {}",
         out.outputs[&e]
     );
+    // AC10 right-sizing: exactly one expansion, and its produced graph is a single node.
+    let expanded = expansions.lock().unwrap().clone();
     assert_eq!(
-        *hooks_log.lock().unwrap(),
+        expanded.len(),
         1,
-        "on_plan_expanded fired once for the produced plan"
+        "on_plan_expanded fired once for the produced plan: {expanded:?}"
+    );
+    assert_eq!(
+        expanded[0], 1,
+        "tier-1 right-sizing: the plan is a single Agent node"
+    );
+    // The planner actually invoked validate_plan (an executed tool), not just emitted a plan.
+    let invoked = tool_calls.lock().unwrap().clone();
+    assert!(
+        invoked.contains(&"validate_plan".to_string()),
+        "planner invoked validate_plan: {invoked:?}"
     );
 }
