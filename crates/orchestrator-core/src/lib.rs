@@ -11,6 +11,7 @@ pub mod graph;
 pub mod hooks;
 pub mod ids;
 pub mod journal;
+pub mod plan;
 pub mod planner;
 pub mod reconcile;
 pub mod registry;
@@ -25,6 +26,9 @@ pub use hooks::OrchestratorHooks;
 pub use ids::{NodeId, RunId, Seq};
 pub use journal::{
     ChildStatus, CompactChild, ExecutionJournal, JournalEvent, ObservationMeta, Snapshot,
+};
+pub use plan::{
+    NodeNeeds, NodePlan, PlanError, PlannedGraph, RESERVED_PLAN_ID, feasible, parse_plan,
 };
 pub use planner::Planner;
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
