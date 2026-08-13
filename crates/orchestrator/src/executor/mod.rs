@@ -8,7 +8,8 @@ use gateway::Gateway;
 use orchestrator_core::{
     Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId, EffectOutput,
     ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError,
-    OrchestratorHooks, Registry, RegistryHandle, RunId, Scope, Seq, SystemClock, effect_id,
+    OrchestratorHooks, Planner, Registry, RegistryHandle, RunId, Scope, Seq, SystemClock,
+    effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -17,6 +18,7 @@ mod agent;
 mod branch;
 mod content;
 mod durability;
+mod expand;
 mod fanout;
 mod subgraph;
 mod support;
@@ -61,6 +63,17 @@ pub struct Executor {
     /// A hot-reload handle (SP-2 slice 5). When wired, each run pins the handle's
     /// current registry + config generation at entry. `None` ⇒ the fixed `registry`.
     handle: Option<RegistryHandle>,
+    /// The injected planner an `Expand` node produces its subgraph from (SP-3
+    /// slice 3). `None` ⇒ an `Expand` node fails loudly (byte-identical for graphs
+    /// without `Expand`).
+    planner: Option<Arc<dyn Planner>>,
+    /// Max runtime expansions (`PlanDelta`s) per run — a self-DoS cap. Default 32.
+    max_expansions: usize,
+    /// Max cumulative spliced-node count per run — a self-DoS cap. Default 512.
+    max_nodes: usize,
+    /// Run-scoped expansion counters (seeded from the journal on resume) the caps
+    /// are checked against. Reset per run by `run_inner`/`start_inner`.
+    expansion_counters: Arc<ExpansionCounters>,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -118,6 +131,16 @@ struct Fold {
     expansions: HashMap<NodeId, Graph>,
 }
 
+/// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
+/// sequential top-level drive loop (a `Map`'s concurrency wraps `ModelCall`/`Agent`
+/// bodies, never an `Expand`), so `Relaxed` ordering is sufficient — the check is a
+/// self-DoS backstop, not a synchronization primitive.
+#[derive(Default)]
+struct ExpansionCounters {
+    expansions: std::sync::atomic::AtomicUsize,
+    nodes: std::sync::atomic::AtomicUsize,
+}
+
 /// The mutable scheduling state threaded through a `drive` loop: the accumulating
 /// [`RunOutcome`] plus the `completed`/`terminal` node sets the ready-set
 /// computation reads to decide the next round.
@@ -152,6 +175,10 @@ impl Executor {
             context: None,
             hooks: None,
             handle: None,
+            planner: None,
+            max_expansions: 32,
+            max_nodes: 512,
+            expansion_counters: Arc::new(ExpansionCounters::default()),
         }
     }
 
@@ -211,6 +238,24 @@ impl Executor {
     /// Set the max nesting depth (Subgraph self-DoS cap; default 8).
     pub fn with_max_depth(mut self, n: usize) -> Self {
         self.max_depth = n;
+        self
+    }
+
+    /// Attach the planner an `Expand` node produces its subgraph from (SP-3 slice 3).
+    pub fn with_planner(mut self, planner: Arc<dyn Planner>) -> Self {
+        self.planner = Some(planner);
+        self
+    }
+
+    /// Set the max runtime expansions (`PlanDelta`s) per run (self-DoS cap; default 32).
+    pub fn with_max_expansions(mut self, n: usize) -> Self {
+        self.max_expansions = n;
+        self
+    }
+
+    /// Set the max cumulative spliced-node count per run (self-DoS cap; default 512).
+    pub fn with_max_nodes(mut self, n: usize) -> Self {
+        self.max_nodes = n;
         self
     }
 
@@ -565,6 +610,30 @@ impl Executor {
         Ok(())
     }
 
+    /// Enforce the expansion caps (§4.5) against the run-scoped counters, then tally
+    /// the new expansion. A breach is a hard `Err` (self-DoS backstop); on success the
+    /// counters advance by one expansion + `g.nodes.len()` nodes.
+    fn check_expansion_budget(&self, g: &Graph) -> Result<(), OrchestratorError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.expansion_counters.expansions.load(Relaxed) + 1 > self.max_expansions {
+            return Err(OrchestratorError::GlobalCapExceeded {
+                cap: "max_expansions".into(),
+                limit: self.max_expansions,
+            });
+        }
+        if self.expansion_counters.nodes.load(Relaxed) + g.nodes.len() > self.max_nodes {
+            return Err(OrchestratorError::GlobalCapExceeded {
+                cap: "max_nodes".into(),
+                limit: self.max_nodes,
+            });
+        }
+        self.expansion_counters.expansions.fetch_add(1, Relaxed);
+        self.expansion_counters
+            .nodes
+            .fetch_add(g.nodes.len(), Relaxed);
+        Ok(())
+    }
+
     /// Execute one node to a terminal result. A `ModelCall`'s structural effect id
     /// is keyed by the node's **id** (`effect_id(&node.id.0, 0, 0)` — node ids are
     /// unique within a graph and namespaced across nesting, e.g. `"{sub}/n1"`), so
@@ -713,10 +782,7 @@ impl Executor {
             NodeKind::Loop { .. } => self.run_loop(run, node, fold).await,
             NodeKind::Subgraph { .. } => self.run_subgraph(run, node, fold).await,
             NodeKind::Branch { .. } => self.run_branch(run, node, prior_outputs, fold).await,
-            // TEMPORARY (SP-3 slice 3, Task 1): exhaustiveness stub. Task 3 replaces
-            // this with `=> self.run_expand(run, node, fold).await`. No Task-1 test
-            // constructs an `Expand` node, so this is never reached in this commit.
-            NodeKind::Expand { .. } => unreachable!("Expand execution lands in Task 3"),
+            NodeKind::Expand { .. } => self.run_expand(run, node, fold).await,
         }
     }
 

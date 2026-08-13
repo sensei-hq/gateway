@@ -4780,6 +4780,16 @@ fn mc(id: &str, dep: Option<&str>) -> Node {
             .unwrap_or_default(),
     }
 }
+fn mc_dep(id: &str, dep: Dep) -> Node {
+    Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": id }),
+        },
+        deps: vec![dep],
+    }
+}
 fn subgraph_node(id: &str, inner: Vec<Node>) -> Node {
     Node {
         id: NodeId(id.into()),
@@ -6009,4 +6019,149 @@ fn validate_dag_rejects_bad_branch() {
         default_cyc.validate_dag(),
         Err(OrchestratorError::InvalidGraph(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// SP-3 slice 3 — `NodeKind::Expand`: a node whose nested DAG is produced at
+// runtime by an injected `Planner`, journaled as `PlanExpanded`, and driven
+// under the node's path.
+// ---------------------------------------------------------------------------
+
+/// A `Planner` that always returns a fixed graph (the produced plan under test).
+struct FixedPlanner(Graph);
+#[async_trait::async_trait]
+impl orchestrator_core::Planner for FixedPlanner {
+    async fn plan(&self, _input: &serde_json::Value) -> Result<Graph, OrchestratorError> {
+        Ok(self.0.clone())
+    }
+}
+/// A `Planner` that always errors — exercises the planner-failure path.
+struct ErrPlanner;
+#[async_trait::async_trait]
+impl orchestrator_core::Planner for ErrPlanner {
+    async fn plan(&self, _input: &serde_json::Value) -> Result<Graph, OrchestratorError> {
+        Err(OrchestratorError::InvalidGraph("planner boom".into()))
+    }
+}
+
+fn expand_node(id: &str, deps: Vec<Dep>) -> Node {
+    Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::Expand {
+            input: serde_json::json!({}),
+        },
+        deps,
+    }
+}
+
+#[tokio::test]
+async fn expand_drives_a_produced_plan_and_returns_the_sink_map() {
+    let (gateway, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let planner = Arc::new(FixedPlanner(Graph {
+        nodes: vec![mc("n1", None), mc("n2", Some("n1"))],
+    }));
+    let exec =
+        Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1").with_planner(planner);
+    let e = NodeId("e".into());
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![])],
+    };
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&e].get("n2").is_some(),
+        "sink map has n2: {}",
+        out.outputs[&e]
+    );
+    assert!(out.outputs[&e].get("n1").is_none(), "n1 is not a sink");
+
+    // AC2: PlanExpanded precedes the nested effects.
+    let events = journal.load(run).await.unwrap();
+    let pe = events
+        .iter()
+        .position(|(_, ev)| matches!(ev, JournalEvent::PlanExpanded { .. }))
+        .expect("PlanExpanded journaled");
+    let first_rec = events
+        .iter()
+        .position(|(_, ev)| matches!(ev, JournalEvent::EffectRecorded { .. }))
+        .expect("nested effects journaled");
+    assert!(pe < first_rec, "PlanExpanded precedes the nested effects");
+}
+
+#[tokio::test]
+async fn expand_planner_error_fails_the_node_and_cascade_skips_hard_dependents() {
+    let (gateway, _c) = recording_gateway().await;
+    // e (Expand, ErrPlanner) → d (Hard-dep e) ; s (Soft-dep e).
+    let graph = Graph {
+        nodes: vec![
+            expand_node("e", vec![]),
+            mc_dep("d", Dep::hard("e")),
+            mc_dep("s", Dep::soft("e")),
+        ],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(Arc::new(ErrPlanner));
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "expand failed: {out:?}"
+    );
+    assert!(
+        out.skipped.contains(&NodeId("d".into())),
+        "hard-dependent skipped"
+    );
+    assert!(
+        out.completed.contains(&NodeId("s".into())),
+        "soft-dependent still ran"
+    );
+}
+
+#[tokio::test]
+async fn expand_invalid_plan_fails_the_node_without_journaling_an_expansion() {
+    let (gateway, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    // A cyclic produced graph (a → b → a): validate_dag rejects it.
+    let cyclic = Graph {
+        nodes: vec![mc_dep("a", Dep::hard("b")), mc_dep("b", Dep::hard("a"))],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_planner(Arc::new(FixedPlanner(cyclic)));
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![])],
+    };
+    let out = exec.run(run, &graph).await.expect("run yields an outcome");
+    assert!(
+        out.failed.is_some(),
+        "invalid plan fails the expand: {out:?}"
+    );
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|(_, ev)| matches!(ev, JournalEvent::PlanExpanded { .. })),
+        "no PlanExpanded journaled for an invalid plan (validated before append)"
+    );
+}
+
+#[tokio::test]
+async fn expand_with_no_planner_fails_loud() {
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let graph = Graph {
+        nodes: vec![expand_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, m)) if n == &NodeId("e".into()) && m.contains("no planner")),
+        "expand with no planner fails loud: {out:?}"
+    );
 }
