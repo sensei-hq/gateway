@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use gateway::Gateway;
 use orchestrator_core::{
-    Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId, EffectOutput,
-    ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError,
-    OrchestratorHooks, Planner, Registry, RegistryHandle, RunId, Scope, Seq, SystemClock,
-    effect_id,
+    AgentRef, Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId,
+    EffectOutput, ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta,
+    OrchestratorError, OrchestratorHooks, PLANNER_AREA, Planner, PlannerSelector, Registry,
+    RegistryHandle, RunId, Scope, Seq, SystemClock, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -67,6 +67,9 @@ pub struct Executor {
     /// slice 3). `None` ⇒ an `Expand` node fails loudly (byte-identical for graphs
     /// without `Expand`).
     planner: Option<Arc<dyn Planner>>,
+    /// The injected selector a `PlannerRef::Select` node uses to pick a planner agent
+    /// (slice 4B). `None` ⇒ a `Select` node fails loudly.
+    selector: Option<Arc<dyn PlannerSelector>>,
     /// Max runtime expansions (`PlanDelta`s) per run — a self-DoS cap. Default 32.
     max_expansions: usize,
     /// Max cumulative spliced-node count per run — a self-DoS cap. Default 512.
@@ -179,6 +182,7 @@ impl Executor {
             hooks: None,
             handle: None,
             planner: None,
+            selector: None,
             max_expansions: 32,
             max_nodes: 512,
             expansion_counters: Arc::new(ExpansionCounters::default()),
@@ -247,6 +251,12 @@ impl Executor {
     /// Attach the planner an `Expand` node produces its subgraph from (SP-3 slice 3).
     pub fn with_planner(mut self, planner: Arc<dyn Planner>) -> Self {
         self.planner = Some(planner);
+        self
+    }
+
+    /// Attach the planner selector a `PlannerRef::Select` node uses (slice 4B).
+    pub fn with_planner_selector(mut self, selector: Arc<dyn PlannerSelector>) -> Self {
+        self.selector = Some(selector);
         self
     }
 
@@ -628,6 +638,19 @@ impl Executor {
             }
         }
         Ok(())
+    }
+
+    /// The sorted planner library: registry agents whose `area == PLANNER_AREA`, as
+    /// `AgentRef`s (sorted by name for deterministic selection).
+    fn planner_candidates(&self) -> Vec<AgentRef> {
+        let mut c: Vec<AgentRef> = self
+            .registry
+            .agents()
+            .filter(|a| a.area == PLANNER_AREA)
+            .map(|a| AgentRef(a.name.clone()))
+            .collect();
+        c.sort_by(|x, y| x.0.cmp(&y.0));
+        c
     }
 
     /// Enforce the expansion caps (§4.5) against the run-scoped counters, then tally

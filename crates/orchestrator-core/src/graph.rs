@@ -87,6 +87,9 @@ pub enum PlannerRef {
     Agent(crate::registry::AgentRef),
     #[default]
     Injected,
+    /// Registry-driven: the executor's configured `PlannerSelector` picks a planner
+    /// agent (from `area == PLANNER_AREA` candidates) for the goal (slice 4B).
+    Select,
 }
 
 /// What a `Map`/`Consolidate` runs per item. A `ModelCall` child is one Pure

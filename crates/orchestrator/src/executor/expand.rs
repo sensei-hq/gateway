@@ -132,6 +132,79 @@ impl Executor {
                             PlanOutcome::Terminal(ne) => return Ok(ne),
                         }
                     }
+                    orchestrator_core::PlannerRef::Select => {
+                        // RESUME: reuse the recorded pick; the selector is NOT re-invoked.
+                        let agent = match fold.selections.get(&node.id) {
+                            Some(a) => a.clone(),
+                            None => {
+                                let candidates = self.planner_candidates();
+                                if candidates.is_empty() {
+                                    return self
+                                        .expand_failed(
+                                            run,
+                                            node,
+                                            format!(
+                                                "expand {}: no planner agents (area==planning)",
+                                                node.id.0
+                                            ),
+                                        )
+                                        .await;
+                                }
+                                let Some(selector) = &self.selector else {
+                                    return self
+                                        .expand_failed(
+                                            run,
+                                            node,
+                                            format!(
+                                                "expand {}: Select planner but no selector wired",
+                                                node.id.0
+                                            ),
+                                        )
+                                        .await;
+                                };
+                                let a = match selector.select(input, &candidates).await {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        return self
+                                            .expand_failed(
+                                                run,
+                                                node,
+                                                format!("expand {} selector: {e}", node.id.0),
+                                            )
+                                            .await;
+                                    }
+                                };
+                                if !candidates.contains(&a) {
+                                    return self
+                                        .expand_failed(
+                                            run,
+                                            node,
+                                            format!(
+                                                "expand {} selector picked non-candidate {}",
+                                                node.id.0, a.0
+                                            ),
+                                        )
+                                        .await;
+                                }
+                                self.append(
+                                    run,
+                                    JournalEvent::PlannerSelected {
+                                        node: node.id.clone(),
+                                        agent: a.clone(),
+                                    },
+                                )
+                                .await?;
+                                a
+                            }
+                        };
+                        match self
+                            .drive_planner_agent(run, node, &agent, input, fold)
+                            .await?
+                        {
+                            PlanOutcome::Plan(p) => p,
+                            PlanOutcome::Terminal(ne) => return Ok(ne),
+                        }
+                    }
                 };
                 // Feasibility subsumes the slice-3 `validate_dag` (its Structural check),
                 // and additionally rejects reserved ids, over-cap plans, and dangling

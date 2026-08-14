@@ -7137,3 +7137,245 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
         "planner invoked validate_plan: {invoked:?}"
     );
 }
+
+// ---- SP-3 slice 4B: PlannerRef::Select + the selection arm ----
+
+/// A stub selector that always returns a fixed agent (tests the Select flow).
+struct FixedSelector(AgentRef);
+#[async_trait::async_trait]
+impl orchestrator_core::PlannerSelector for FixedSelector {
+    async fn select(
+        &self,
+        _goal: &serde_json::Value,
+        _cands: &[AgentRef],
+    ) -> Result<AgentRef, OrchestratorError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A stub selector whose `select` always errors — exercises the selector-`Err`
+/// failure arm (the Expand node ends `Failed`, resumable, with no `PlanExpanded`).
+struct ErrSelector;
+#[async_trait::async_trait]
+impl orchestrator_core::PlannerSelector for ErrSelector {
+    async fn select(
+        &self,
+        _goal: &serde_json::Value,
+        _cands: &[AgentRef],
+    ) -> Result<AgentRef, OrchestratorError> {
+        Err(OrchestratorError::RegistryLoad("boom".into()))
+    }
+}
+
+/// A registry with two `planning`-area planner agents (both emit a plan via the gateway).
+fn two_planner_registry() -> Arc<Registry> {
+    let mk = |name: &str| AgentDefinition {
+        name: name.into(),
+        area: "planning".into(),
+        kind: "reasoning".into(),
+        chain: Some("c".into()),
+        chains: std::collections::HashMap::new(),
+        grants: std::collections::HashMap::new(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: format!("planner {name}"),
+    };
+    Arc::new(
+        Registry::default()
+            .with_agent(mk("alpha"))
+            .with_agent(mk("beta")),
+    )
+}
+
+fn expand_select_node(id: &str, deps: Vec<Dep>) -> Node {
+    Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::Expand {
+            input: serde_json::json!({ "goal": "g" }),
+            planner: orchestrator_core::PlannerRef::Select,
+        },
+        deps,
+    }
+}
+
+#[tokio::test]
+async fn select_drives_the_chosen_planner_and_journals_the_selection() {
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    // response[0] → beta's planner turn (the plan); [1] → the spliced plan node n1
+    // (a ModelCall on chain "c", one gateway call). The plan under-scripted this to a
+    // single response; the spliced n1 needs its own call (cf. the resume sibling test).
+    let (gateway, _c) =
+        scripted_gateway(vec![final_response(plan_json), final_response("n1 out")]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(FixedSelector(AgentRef("beta".into()))));
+    let run = RunId(uuid::Uuid::new_v4());
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&e].get("n1").is_some(),
+        "chosen planner produced+spliced a plan"
+    );
+    // PlannerSelected{e -> beta} journaled, and the planner ran under "e/__plan__".
+    let evs = journal.load(run).await.unwrap();
+    assert!(
+        evs.iter().any(|(_, ev)| matches!(ev, JournalEvent::PlannerSelected { node, agent } if node.0=="e" && agent.0=="beta")),
+        "PlannerSelected journaled for beta"
+    );
+}
+
+#[tokio::test]
+async fn select_with_no_candidates_fails_the_node() {
+    let (gateway, _c) = recording_gateway().await;
+    // registry has an agent but NOT area=="planning".
+    let reg = Arc::new(Registry::default().with_agent(AgentDefinition {
+        name: "coder".into(),
+        area: "coding".into(),
+        kind: "exec".into(),
+        chain: Some("c".into()),
+        chains: std::collections::HashMap::new(),
+        grants: std::collections::HashMap::new(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: "c".into(),
+    }));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(reg)
+        .with_planner_selector(Arc::new(FixedSelector(AgentRef("x".into()))));
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "no planning agents → Failed: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn select_with_no_selector_wired_fails_the_node() {
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(two_planner_registry()); // no selector
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "no selector → Failed: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn select_picking_a_non_candidate_fails_the_node() {
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(FixedSelector(AgentRef("ghost".into())))); // not a candidate
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "non-candidate pick → Failed: {out:?}"
+    );
+}
+
+/// Extra (coverage gap the plan flagged): a selector that returns `Err` fails the node
+/// (resumable, no `PlanExpanded`) — the selector-error arm of the failure taxonomy.
+#[tokio::test]
+async fn select_selector_error_fails_the_node() {
+    let (gateway, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(ErrSelector));
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
+        "selector Err → Failed: {out:?}"
+    );
+    assert!(
+        !journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, ev)| matches!(ev, JournalEvent::PlanExpanded { .. })),
+        "no PlanExpanded journaled on a selector error"
+    );
+}
+
+/// Resume reuses the journaled pick; the selector is NOT re-invoked even if it would
+/// now pick differently. Mutation-verified: a selector that flips its choice on resume
+/// is ignored because PlannerSelected pinned the original.
+#[tokio::test]
+async fn select_resume_reuses_the_recorded_pick() {
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![]), mc_dep("d", Dep::hard("e"))],
+    };
+    // Run 1: selector picks beta; beta's plan (n1) runs; then d fails (no 2nd scripted response).
+    {
+        let (gw, _c) =
+            scripted_gateway(vec![final_response(plan_json), final_response("n1 out")]).await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(two_planner_registry())
+            .with_planner_selector(Arc::new(FixedSelector(AgentRef("beta".into()))));
+        let o1 = exec.run(run, &graph).await.expect("run1");
+        assert!(o1.failed.is_some(), "tail d failed: {o1:?}");
+    }
+    // Run 2: a selector that would pick ALPHA + a fresh recording gateway. Resume must
+    // reuse beta (journaled) and re-drive only d.
+    let (gw2, calls2) = recording_gateway().await;
+    let exec2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(FixedSelector(AgentRef("alpha".into()))));
+    let o2 = exec2.start(run, &graph).await.expect("resume");
+    assert!(o2.failed.is_none(), "resume completes: {o2:?}");
+    let recorded2 = calls2.lock().unwrap().clone();
+    assert_eq!(
+        recorded2.len(),
+        1,
+        "resume re-called the gateway only for d (planner not re-run): {recorded2:?}"
+    );
+    assert_eq!(recorded2[0].1, "d");
+    // Exactly one PlannerSelected (beta), from run 1 — resume did not re-select.
+    let sel: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|(_, ev)| match ev {
+            JournalEvent::PlannerSelected { agent, .. } => Some(agent.0.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sel,
+        vec!["beta".to_string()],
+        "one selection, beta, never re-selected to alpha: {sel:?}"
+    );
+}
