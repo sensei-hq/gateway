@@ -715,9 +715,12 @@ async fn select_end_to_end_with_llm_selector_and_hook() {
         }
     }
     let gw = Arc::new(gateway);
+    let reg = two_planner_registry();
     let exec = Executor::new(gw.clone(), Arc::new(InMemoryJournal::new()), "v1")
-        .with_registry(two_planner_registry())
-        .with_planner_selector(Arc::new(LlmPlannerSelector::new(gw, "c")))
+        .with_registry(reg.clone())
+        // LlmPlannerSelector::new(gateway, registry, chain) — the registry renders the
+        // capability menu (name/area/kind); reuse the same reg the executor selects from.
+        .with_planner_selector(Arc::new(LlmPlannerSelector::new(gw, reg.clone(), "c")))
         .with_hooks(Arc::new(Spy(selected.clone())));
     let e = NodeId("e".into());
     let graph = Graph { nodes: vec![expand_select_node("e", vec![])] };
