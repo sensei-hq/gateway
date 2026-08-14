@@ -7281,19 +7281,26 @@ async fn select_with_no_selector_wired_fails_the_node() {
 #[tokio::test]
 async fn select_picking_a_non_candidate_fails_the_node() {
     let (gateway, _c) = recording_gateway().await;
-    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
         .with_registry(two_planner_registry())
         .with_planner_selector(Arc::new(FixedSelector(AgentRef("ghost".into())))); // not a candidate
+    let run = RunId(uuid::Uuid::new_v4());
     let graph = Graph {
         nodes: vec![expand_select_node("e", vec![])],
     };
-    let out = exec
-        .run(RunId(uuid::Uuid::new_v4()), &graph)
-        .await
-        .expect("run");
+    let out = exec.run(run, &graph).await.expect("run");
     assert!(
         matches!(&out.failed, Some((n, _)) if n == &NodeId("e".into())),
         "non-candidate pick → Failed: {out:?}"
+    );
+    // Anti-hallucination ordering: the pick is validated against `candidates` BEFORE the
+    // `PlannerSelected` append, so a non-candidate pick is never journaled.
+    let evs = journal.load(run).await.unwrap();
+    assert!(
+        !evs.iter()
+            .any(|(_, ev)| matches!(ev, JournalEvent::PlannerSelected { .. })),
+        "a non-candidate pick is never journaled"
     );
 }
 
@@ -7377,5 +7384,94 @@ async fn select_resume_reuses_the_recorded_pick() {
         sel,
         vec!["beta".to_string()],
         "one selection, beta, never re-selected to alpha: {sel:?}"
+    );
+}
+
+/// Resume in the crash-AFTER-`PlannerSelected`-BEFORE-`PlanExpanded` window: the OUTER
+/// `fold.expansions` short-circuit is absent (the expansion was truncated away), so
+/// resume re-enters the `Select` arm and MUST hit the INNER `fold.selections` guard —
+/// reusing the journaled pick (beta) and skipping the selector. This is the memo the
+/// slice-4B `Select` arm added; the other resume test only exercises the outer
+/// `PlanExpanded` short-circuit, so without this the inner guard is unreached.
+///
+/// Discriminating property: were the inner `Some(a) => a.clone()` reuse removed, run 2's
+/// flipped selector would re-select `alpha` and drive alpha's planner over beta's
+/// memoized `e/__plan__` turn — different `system_prompt` ⇒ different input-hash ⇒ a
+/// `DeterminismViolation` (the `.expect("resume …")` would panic). So this test goes red
+/// without the guard.
+#[tokio::test]
+async fn select_resume_before_plan_expanded_reuses_the_recorded_pick() {
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    let run = RunId(uuid::Uuid::new_v4());
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    // Run 1: FixedSelector(beta) → beta's single planner turn emits the plan (n1), run to
+    // completion so PlannerSelected(beta) + the "e/__plan__" turn effects + PlanExpanded
+    // are all journaled.
+    let full = InMemoryJournal::new();
+    let (gw1, _c1) =
+        scripted_gateway(vec![final_response(plan_json), final_response("n1 out")]).await;
+    Executor::new(Arc::new(gw1), Arc::new(full.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(FixedSelector(AgentRef("beta".into()))))
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+
+    // Truncate to the prefix BEFORE PlanExpanded → keep PlannerSelected(beta) + beta's
+    // memoized planner turn, drop the expansion. So resume folds `selections[e]=beta` but
+    // NO `expansions[e]`, forcing it back through the `Select` arm's inner guard.
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, ev)| matches!(ev, JournalEvent::PlanExpanded { .. }))
+        .expect("run 1 journaled a PlanExpanded");
+    let seeded = InMemoryJournal::new();
+    for (_, ev) in &events[..cut] {
+        seeded.append(run, ev.clone()).await.unwrap();
+    }
+
+    // Run 2: a FLIPPED selector (would pick alpha) + a fresh succeeding gateway. Resume
+    // reuses beta (inner guard), replays beta's memoized turn (no gateway call), journals
+    // PlanExpanded, then runs n1 — never re-selecting to alpha.
+    let (gw2, calls2) = recording_gateway().await;
+    let out = Executor::new(Arc::new(gw2), Arc::new(seeded.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(FixedSelector(AgentRef("alpha".into()))))
+        .start(run, &graph)
+        .await
+        .expect("resume completes (beta's turn replays under beta, no DeterminismViolation)");
+    assert!(out.failed.is_none(), "resume completes cleanly: {out:?}");
+    assert!(
+        out.outputs[&e].get("n1").is_some(),
+        "the reused plan executed: {}",
+        out.outputs[&e]
+    );
+    // Only n1 hit the gateway — beta's planner turn replayed from the memo, not re-spent.
+    let recorded = calls2.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "only n1 hit the gateway (beta's turn replayed from memo): {recorded:?}"
+    );
+    assert_eq!(recorded[0].1, "n1");
+    // Exactly one PlannerSelected, and it is beta — resume did NOT re-select to alpha.
+    let sel: Vec<String> = seeded
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|(_, ev)| match ev {
+            JournalEvent::PlannerSelected { agent, .. } => Some(agent.0.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sel,
+        vec!["beta".to_string()],
+        "one selection, beta, never re-selected to alpha on resume: {sel:?}"
     );
 }
