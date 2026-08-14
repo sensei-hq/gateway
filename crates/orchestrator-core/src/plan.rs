@@ -64,13 +64,14 @@ pub fn parse_plan(text: &str) -> Result<PlannedGraph, PlanError> {
 }
 
 /// Recursively check every agent ref against the registry: top-level `Agent`
-/// nodes, the `MapBody::Agent` body of `Map`/`Consolidate`/`Loop` nodes, and —
-/// descending into nested graphs (mirrors `validate_dag`'s recursion) — the same
-/// inside every `Subgraph`'s graph and every `Branch`'s arm/`default` graphs. An
-/// unknown agent anywhere must fail feasibility, not only at splice time (where it
-/// would `?`-propagate as a fatal, non-resumable hard halt). `Expand` has no static
-/// nested graph (its `input` is a `Value`), so it is not recursed into. Accumulates
-/// into `errs` (all errors, no short-circuit).
+/// nodes, the `MapBody::Agent` body of `Map`/`Consolidate` nodes, a `Loop`'s
+/// `LoopBody::Agent` body (and, descending, a `LoopBody::Subgraph` body's graph),
+/// and — mirroring `validate_dag`'s recursion — the same inside every `Subgraph`'s
+/// graph and every `Branch`'s arm/`default` graphs. An unknown agent anywhere must
+/// fail feasibility, not only at splice time (where it would `?`-propagate as a
+/// fatal, non-resumable hard halt). `Expand` (top-level or a `LoopBody::Expand`
+/// body) has no static nested graph (its plan is produced at runtime), so it is not
+/// recursed into. Accumulates into `errs` (all errors, no short-circuit).
 fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError>) {
     for n in &graph.nodes {
         match &n.kind {
@@ -111,10 +112,10 @@ fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError
 }
 
 /// Pure feasibility: structure (validate_dag) + registry-resolvable agent refs
-/// (top-level `Agent` nodes, the `Map`/`Consolidate`/`Loop` `MapBody::Agent`
-/// bodies, and both recursively through nested `Subgraph`/`Branch` graphs) + each
-/// `NodePlan.needs` (agents/skills/tools) + reserved-id + node-count. Returns ALL
-/// errors.
+/// (top-level `Agent` nodes, the `Map`/`Consolidate` `MapBody::Agent` bodies, a
+/// `Loop`'s `LoopBody::Agent` body, and recursively through nested `Subgraph`/
+/// `Branch` graphs plus a `LoopBody::Subgraph` body) + each `NodePlan.needs`
+/// (agents/skills/tools) + reserved-id + node-count. Returns ALL errors.
 pub fn feasible(
     plan: &PlannedGraph,
     registry: &Registry,

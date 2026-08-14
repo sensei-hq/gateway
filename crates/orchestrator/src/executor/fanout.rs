@@ -370,14 +370,20 @@ impl Executor {
         }
     }
 
-    /// Run a `Loop` node (§10.3): iterate `body` at `"{loop}/{i}"`, threading each
-    /// iteration's output into the next as input (refine), until `gate` says Stop
-    /// or `max_iters` is reached. Cap-without-Stop completes best-effort
-    /// (`converged: false`), never a bare fail; a body failure fails the Loop; an
-    /// Agent-body pause pauses the Loop. Resume replays completed iterations
-    /// (memo-hit, no re-spend) and recomputes the (pure) gate, so it stops at the
-    /// same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are fold-guarded
-    /// (like `run_map`) so a replayed completed Loop does not re-journal them.
+    /// Run a `Loop` node (§10.3): drive `body` at `"{loop}/{i}"` each iteration until
+    /// `gate` says Stop or `max_iters` is reached. A leaf `ModelCall`/`Agent` body
+    /// threads its answer TEXT forward as the next iteration's input (refine); a
+    /// `Subgraph` body drives an authored graph fresh per iteration (no thread —
+    /// each iteration re-runs over the same `input`); an `Expand` body plans+executes
+    /// per iteration and threads its whole output (the sink map) as the next planner
+    /// input (Expand + the gate-agent land in slice-5 Tasks 3/4). A graph-body
+    /// Failed/Paused fails/pauses the Loop exactly like a leaf body. Cap-without-Stop
+    /// completes best-effort (`converged: false`), never a bare fail; a body failure
+    /// fails the Loop; a body pause pauses the Loop. Resume replays completed
+    /// iterations (memo-hit, no re-spend) and recomputes the (pure) gate, so it stops
+    /// at the same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are
+    /// fold-guarded (like `run_map`) so a replayed completed Loop does not re-journal
+    /// them.
     pub(super) async fn run_loop(
         &self,
         run: RunId,

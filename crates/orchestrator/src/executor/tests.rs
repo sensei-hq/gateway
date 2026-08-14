@@ -3828,110 +3828,15 @@ async fn loop_over_a_subgraph_body_iterates_and_stops() {
     );
 }
 
-/// AC2 — a Loop over a Subgraph body converges when the pure gate matches the
-/// iteration's sink map. A graph body's iteration output is a WRAPPED sink map
-/// (`{sink_id: <node output>}`), so the only `LoopGate` that can match it is
-/// `FieldTrue(<sink_id>)` against a sink whose value is the JSON boolean `true`.
-/// A live `ModelCall`/`Agent` node always emits an OBJECT (`{model,text}`), so no
-/// live subgraph yields a boolean-valued sink — semantic convergence over a nested
-/// result is by design the gate-agent's job (design §4.3, slice-5 Task 4). To still
-/// exercise the convergence code path for a graph body under Task 2's pure-gate-only
-/// constraint, we seed iteration 0's inner node `lp/0/s1` with a `true` effect
-/// output and resume: the subgraph node memo-hits → sink map `{"s1": true}` →
-/// `FieldTrue("s1")` fires → the Loop converges at iteration 0. (See report NOTE:
-/// a fresh-run pure-gate convergence over a subgraph sink map is not expressible.)
-#[tokio::test]
-async fn loop_subgraph_body_converges_when_the_gate_matches() {
-    let journal = InMemoryJournal::new();
-    let run = RunId(uuid::Uuid::new_v4());
-    // Seed a partial run: iteration 0's inner subgraph node completed with a boolean
-    // `true` effect output. No `NodeCompleted(lp)` ⇒ the Loop is re-driven on resume.
-    journal
-        .append(
-            run,
-            JournalEvent::RunStarted {
-                version: "v1".into(),
-            },
-        )
-        .await
-        .unwrap();
-    journal
-        .append(
-            run,
-            JournalEvent::NodeStarted {
-                node: NodeId("lp/0/s1".into()),
-            },
-        )
-        .await
-        .unwrap();
-    journal
-        .append(
-            run,
-            JournalEvent::EffectRecorded {
-                node: NodeId("lp/0/s1".into()),
-                effect_id: effect_id("lp/0/s1", 0, 0),
-                class: EffectClass::Pure,
-                // `mc("s1", None)` ⇒ chain "c", payload `{"prompt":"s1"}` (see `mc`).
-                input_hash: input_hash("c", &serde_json::json!({ "prompt": "s1" })).unwrap(),
-                seq: 0,
-                output: EffectOutput::Inline(serde_json::json!(true)),
-                observation: None,
-            },
-        )
-        .await
-        .unwrap();
-    journal
-        .append(
-            run,
-            JournalEvent::NodeCompleted {
-                node: NodeId("lp/0/s1".into()),
-            },
-        )
-        .await
-        .unwrap();
-
-    let inner = Graph {
-        nodes: vec![mc("s1", None)],
-    };
-    let loop_node = Node {
-        id: NodeId("lp".into()),
-        kind: NodeKind::Loop {
-            body: LoopBody::Subgraph(Box::new(inner)),
-            input: serde_json::json!({}),
-            gate: GateSpec::Pure(LoopGate::FieldTrue("s1".into())),
-            max_iters: 3,
-        },
-        deps: vec![],
-    };
-    let (gateway, calls) = recording_gateway().await;
-    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
-        .start(
-            run,
-            &Graph {
-                nodes: vec![loop_node],
-            },
-        )
-        .await
-        .expect("resume");
-    assert!(out.failed.is_none(), "{out:?}");
-    let o = &out.outputs[&NodeId("lp".into())];
-    assert_eq!(
-        o["converged"], true,
-        "gate matched the seeded sink map: {o}"
-    );
-    assert_eq!(o["iterations"], 1, "converged on the first iteration");
-    assert_eq!(
-        o["output"]["s1"], true,
-        "the sink map carried the boolean the pure gate matched"
-    );
-    // Iteration 0's inner node memo-hit (seeded) → the Loop converged before any
-    // live gateway call.
-    assert_eq!(
-        calls.lock().unwrap().len(),
-        0,
-        "converged on the memoized iteration; no live call"
-    );
-}
+// Note: a Loop-over-Subgraph-body CONVERGENCE test with a *pure* gate is
+// intentionally absent. A graph body's iteration output is a wrapped sink map
+// (`{sink_id: <node output>}`) whose values are always objects (`{model,text}`),
+// which no `LoopGate` (`TextContains` reads a top-level `"text"` string; `FieldTrue`
+// a top-level `== true`) can match — semantic convergence over a nested result is by
+// design the gate-agent's job (design §4.3), landing naturally in slice-5 Tasks 4/5.
+// The body-agnostic `converged=true`/`break` path is already covered by the leaf-body
+// convergence tests (`loop_stops_when_the_gate_fires`), and the Subgraph sink-map
+// output shape by `loop_over_a_subgraph_body_iterates_and_stops` above.
 
 // ============================= SP-1 OrchestratorHooks ==========================
 
