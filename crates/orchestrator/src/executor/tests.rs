@@ -7507,3 +7507,58 @@ async fn llm_planner_selector_errors_on_empty_content() {
         .await;
     assert!(err.is_err(), "empty content → Err, got {err:?}");
 }
+
+/// End-to-end: goal → Select (LlmPlannerSelector picks a planner from the menu) → that
+/// planner agent emits a plan → executed; PlannerSelected + on_planner_selected +
+/// on_plan_expanded all observed.
+#[tokio::test]
+async fn select_end_to_end_with_llm_selector_and_hook() {
+    use crate::executor::selector::LlmPlannerSelector;
+    use std::sync::{Arc as StdArc, Mutex};
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    // Scripted gateway: call 1 = selector picks "beta"; call 2 = beta's planner turn → plan;
+    // call 3 = the spliced plan node n1.
+    let (gateway, _c) = scripted_gateway(vec![
+        final_response("beta"),
+        final_response(plan_json),
+        final_response("n1 out"),
+    ])
+    .await;
+    let selected = StdArc::new(Mutex::new(Vec::<String>::new()));
+    struct Spy(StdArc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl OrchestratorHooks for Spy {
+        async fn on_planner_selected(&self, _run: RunId, node: &NodeId, agent: &AgentRef) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}->{}", node.0, agent.0));
+        }
+    }
+    let gw = Arc::new(gateway);
+    let reg = two_planner_registry();
+    let exec = Executor::new(gw.clone(), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(reg.clone())
+        // LlmPlannerSelector::new(gateway, registry, chain) — the registry renders the
+        // capability menu (name/area/kind); reuse the same reg the executor selects from.
+        .with_planner_selector(Arc::new(LlmPlannerSelector::new(gw, reg.clone(), "c")))
+        .with_hooks(Arc::new(Spy(selected.clone())));
+    let e = NodeId("e".into());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert!(
+        out.outputs[&e].get("n1").is_some(),
+        "selected planner produced+spliced a plan"
+    );
+    assert_eq!(
+        *selected.lock().unwrap(),
+        vec!["e->beta".to_string()],
+        "on_planner_selected fired for beta"
+    );
+}
