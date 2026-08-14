@@ -268,8 +268,9 @@ Add the refine arm for the graph bodies (in the existing `current_input = match 
 In `crates/orchestrator/src/executor/tests.rs`, add:
 
 ```rust
-/// AC2 — a Loop over a Subgraph body drives the graph fresh each iteration; the pure
-/// gate stops → {iterations, converged:true, output: <sink map>}.
+/// AC2 — a Loop over a Subgraph body drives the graph fresh each iteration; a pure gate
+/// cannot match the nested sink map (§4.3), so it runs max_iters → best-effort
+/// {iterations, converged:false, output: <sink map>}. Graph-body convergence is AC5/AC10.
 #[tokio::test]
 async fn loop_over_a_subgraph_body_iterates_and_stops() {
     // Subgraph: a single node "s1" whose ModelCall output {model,text} carries a "done"
@@ -296,7 +297,7 @@ async fn loop_over_a_subgraph_body_iterates_and_stops() {
 }
 ```
 
-(Use the existing helpers `mc`, `recording_gateway`, `InMemoryJournal`, and a `graph_of(nodes)`/inline `Graph{nodes}` — match the file's idiom. If `graph_of` doesn't exist, inline `Graph { nodes: vec![loop_node] }`.) Add a second test `loop_subgraph_body_converges_when_the_gate_matches` with a gate that DOES match the subgraph's sink output (assert `converged:true`, `iterations < max_iters`) — construct the subgraph sink so the pure gate's field is present at top level (see design §4.3: the gate sees the sink map).
+(Use the existing helpers `mc`, `recording_gateway`, `InMemoryJournal`, and a `graph_of(nodes)`/inline `Graph{nodes}` — match the file's idiom. If `graph_of` doesn't exist, inline `Graph { nodes: vec![loop_node] }`.) Do **not** add a pure-gate "converges" test for a Subgraph body: a pure `LoopGate` cannot match a nested sink map `{sink_id: {model, text}}` (§4.3), so any such test would have to seed a production-impossible bare-`true` sink output and hand-compute an effect hash — brittle and vacuous. Graph-body convergence is body-agnostic (the `converged=true`/`break` path is already covered by `loop_stops_when_the_gate_fires`) and its semantic form is the **gate-agent's** job, exercised by AC5 (`loop_gate_agent_decides_stop`, Task 4) and AC10 (coordinator, Task 5). Instead, in `crates/orchestrator-core/src/graph.rs` `mod tests`, add `validate_dag_rejects_a_cycle_in_a_loop_subgraph_body` (model on `validate_dag_recurses_into_subgraphs`, reusing its 2-node a↔b `nested_cycle`): wrap it in `NodeKind::Loop { body: LoopBody::Subgraph(Box::new(nested_cycle)), input: json!({}), gate: GateSpec::Pure(LoopGate::TextContains("x".into())), max_iters: 1 }` → assert `validate_dag()` returns `Err(InvalidGraph(_))`. This covers the new `LoopBody::Subgraph` recursion.
 
 - [ ] **Step 6: Run the migrated Loop suite + the new tests**
 
@@ -477,7 +478,7 @@ git commit -m "test(orchestrator): SP-3 s5 (5/5) — coordinator e2e (Loop Expan
 | Spec AC | Task | Test |
 |---|---|---|
 | 1 migration behavior-preserving | 2 | migrated `loop_*` suite green |
-| 2 Subgraph body iterates + stops | 2 | `loop_over_a_subgraph_body_iterates_and_stops`, `loop_subgraph_body_converges_when_the_gate_matches` |
+| 2 Subgraph body iterates (best-effort; convergence → AC5/AC10) | 2 | `loop_over_a_subgraph_body_iterates_and_stops`, `validate_dag_rejects_a_cycle_in_a_loop_subgraph_body` |
 | 3 Expand body refines | 3 | `loop_over_an_expand_body_refines_across_iterations` |
 | 4 `drive_expand_with` behavior-preserving | 1 | slice-4A `expand_*` + 4B `select_*` green |
 | 5 gate-agent decides stop | 4 | `loop_gate_agent_decides_stop` |
