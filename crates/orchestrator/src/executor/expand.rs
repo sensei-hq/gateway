@@ -28,7 +28,7 @@ impl Executor {
     pub(super) async fn drive_planner_agent(
         &self,
         run: RunId,
-        node: &Node,
+        node_id: &NodeId,
         agent_ref: &orchestrator_core::AgentRef,
         input: &serde_json::Value,
         fold: &Fold,
@@ -37,13 +37,13 @@ impl Executor {
             return Ok(PlanOutcome::Terminal(
                 self.expand_failed(
                     run,
-                    node,
-                    format!("expand {} unknown planner agent {}", node.id.0, agent_ref.0),
+                    node_id,
+                    format!("expand {} unknown planner agent {}", node_id.0, agent_ref.0),
                 )
                 .await?,
             ));
         }
-        let plan_node = NodeId(format!("{}/__plan__", node.id.0));
+        let plan_node = NodeId(format!("{}/__plan__", node_id.0));
         match self
             .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None)
             .await?
@@ -55,8 +55,8 @@ impl Executor {
                     Err(e) => Ok(PlanOutcome::Terminal(
                         self.expand_failed(
                             run,
-                            node,
-                            format!("expand {} plan parse: {e:?}", node.id.0),
+                            node_id,
+                            format!("expand {} plan parse: {e:?}", node_id.0),
                         )
                         .await?,
                     )),
@@ -65,13 +65,13 @@ impl Executor {
             AgentStep::Failed(msg) => Ok(PlanOutcome::Terminal(
                 self.expand_failed(
                     run,
-                    node,
-                    format!("expand {} planner agent failed: {msg}", node.id.0),
+                    node_id,
+                    format!("expand {} planner agent failed: {msg}", node_id.0),
                 )
                 .await?,
             )),
             AgentStep::Paused(r) => Ok(PlanOutcome::Terminal(NodeExec::Paused {
-                reason: format!("planner {} paused: {r}", node.id.0),
+                reason: format!("planner {} paused: {r}", node_id.0),
             })),
         }
     }
@@ -93,11 +93,28 @@ impl Executor {
         let NodeKind::Expand { input, planner } = &node.kind else {
             unreachable!("run_expand on non-Expand node");
         };
-        // RESUME: a node with a journaled `PlanExpanded` reuses that subgraph — the
+        self.drive_expand_with(run, &node.id, input, planner, fold)
+            .await
+    }
+
+    /// The Expand pipeline keyed by an arbitrary `path` (a node id OR a Loop iteration
+    /// path `"{loop}/{i}"`): resume via the fold's expansion/selection at `path`, else
+    /// produce (Injected/Agent/Select) → `feasible` → cap-check → journal
+    /// `PlanExpanded{node: path}` → `drive_nested`. `run_expand` and a Loop-`Expand`
+    /// body iteration share this.
+    pub(super) async fn drive_expand_with(
+        &self,
+        run: RunId,
+        path: &NodeId,
+        input: &serde_json::Value,
+        planner: &orchestrator_core::PlannerRef,
+        fold: &Fold,
+    ) -> Result<NodeExec, OrchestratorError> {
+        // RESUME: a path with a journaled `PlanExpanded` reuses that subgraph — the
         // planner is NOT re-invoked (determinism §4.4). FRESH: produce (the injected
         // `Planner` trait, or a journaled ReAct planner agent) → feasibility →
         // cap-check → journal (in that order), then drive.
-        let g = match fold.expansions.get(&node.id) {
+        let g = match fold.expansions.get(path) {
             Some(journaled) => journaled.clone(),
             None => {
                 let produced = match planner {
@@ -107,8 +124,8 @@ impl Executor {
                             return self
                                 .expand_failed(
                                     run,
-                                    node,
-                                    format!("expand {}: no planner wired", node.id.0),
+                                    path,
+                                    format!("expand {}: no planner wired", path.0),
                                 )
                                 .await;
                         };
@@ -121,8 +138,8 @@ impl Executor {
                                 return self
                                     .expand_failed(
                                         run,
-                                        node,
-                                        format!("expand {} planner failed: {e}", node.id.0),
+                                        path,
+                                        format!("expand {} planner failed: {e}", path.0),
                                     )
                                     .await;
                             }
@@ -130,7 +147,7 @@ impl Executor {
                     }
                     orchestrator_core::PlannerRef::Agent(agent_ref) => {
                         match self
-                            .drive_planner_agent(run, node, agent_ref, input, fold)
+                            .drive_planner_agent(run, path, agent_ref, input, fold)
                             .await?
                         {
                             PlanOutcome::Plan(p) => p,
@@ -139,7 +156,7 @@ impl Executor {
                     }
                     orchestrator_core::PlannerRef::Select => {
                         // RESUME: reuse the recorded pick; the selector is NOT re-invoked.
-                        let agent = match fold.selections.get(&node.id) {
+                        let agent = match fold.selections.get(path) {
                             Some(a) => a.clone(),
                             None => {
                                 let candidates = self.planner_candidates();
@@ -147,10 +164,10 @@ impl Executor {
                                     return self
                                         .expand_failed(
                                             run,
-                                            node,
+                                            path,
                                             format!(
                                                 "expand {}: no planner agents (area==planning)",
-                                                node.id.0
+                                                path.0
                                             ),
                                         )
                                         .await;
@@ -159,10 +176,10 @@ impl Executor {
                                     return self
                                         .expand_failed(
                                             run,
-                                            node,
+                                            path,
                                             format!(
                                                 "expand {}: Select planner but no selector wired",
-                                                node.id.0
+                                                path.0
                                             ),
                                         )
                                         .await;
@@ -173,8 +190,8 @@ impl Executor {
                                         return self
                                             .expand_failed(
                                                 run,
-                                                node,
-                                                format!("expand {} selector: {e}", node.id.0),
+                                                path,
+                                                format!("expand {} selector: {e}", path.0),
                                             )
                                             .await;
                                     }
@@ -183,10 +200,10 @@ impl Executor {
                                     return self
                                         .expand_failed(
                                             run,
-                                            node,
+                                            path,
                                             format!(
                                                 "expand {} selector picked non-candidate {}",
-                                                node.id.0, a.0
+                                                path.0, a.0
                                             ),
                                         )
                                         .await;
@@ -194,7 +211,7 @@ impl Executor {
                                 self.append(
                                     run,
                                     JournalEvent::PlannerSelected {
-                                        node: node.id.clone(),
+                                        node: path.clone(),
                                         agent: a.clone(),
                                     },
                                 )
@@ -203,7 +220,7 @@ impl Executor {
                             }
                         };
                         match self
-                            .drive_planner_agent(run, node, &agent, input, fold)
+                            .drive_planner_agent(run, path, &agent, input, fold)
                             .await?
                         {
                             PlanOutcome::Plan(p) => p,
@@ -220,8 +237,8 @@ impl Executor {
                     return self
                         .expand_failed(
                             run,
-                            node,
-                            format!("expand {} infeasible plan: {errs:?}", node.id.0),
+                            path,
+                            format!("expand {} infeasible plan: {errs:?}", path.0),
                         )
                         .await;
                 }
@@ -229,7 +246,7 @@ impl Executor {
                 self.append(
                     run,
                     JournalEvent::PlanExpanded {
-                        node: node.id.clone(),
+                        node: path.clone(),
                         subgraph: produced.graph.clone(),
                         node_plans: produced.node_plans,
                     },
@@ -238,7 +255,7 @@ impl Executor {
                 produced.graph
             }
         };
-        self.drive_nested(run, "expand", &node.id.0, &g, fold).await
+        self.drive_nested(run, "expand", &path.0, &g, fold).await
     }
 
     /// Journal a `NodeFailed` for an `Expand` node then return `Failed` — so a
@@ -247,13 +264,13 @@ impl Executor {
     async fn expand_failed(
         &self,
         run: RunId,
-        node: &Node,
+        node_id: &NodeId,
         message: String,
     ) -> Result<NodeExec, OrchestratorError> {
         self.append(
             run,
             JournalEvent::NodeFailed {
-                node: node.id.clone(),
+                node: node_id.clone(),
                 error: message.clone(),
             },
         )
