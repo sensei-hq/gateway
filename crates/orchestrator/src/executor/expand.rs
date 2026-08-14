@@ -15,6 +15,62 @@ use orchestrator_core::{
 use super::{AgentStep, Executor, Fold, NodeExec};
 
 impl Executor {
+    /// Drive a resolved planner agent's sub-run under `"{node}/__plan__"` and parse its
+    /// final answer as a `PlannedGraph`. Returns `Terminal` for the node-level outcomes
+    /// (unknown agent / parse error / agent Failed → `Failed`; agent Paused → `Paused`),
+    /// so callers (`Agent` and `Select` arms) short-circuit uniformly. A fatal
+    /// `drive_agent` error (`DeterminismViolation`, journal) `?`-propagates as a hard halt.
+    pub(super) async fn drive_planner_agent(
+        &self,
+        run: RunId,
+        node: &Node,
+        agent_ref: &orchestrator_core::AgentRef,
+        input: &serde_json::Value,
+        fold: &Fold,
+    ) -> Result<PlanOutcome, OrchestratorError> {
+        if self.registry.agent(&agent_ref.0).is_none() {
+            return Ok(PlanOutcome::Terminal(
+                self.expand_failed(
+                    run,
+                    node,
+                    format!("expand {} unknown planner agent {}", node.id.0, agent_ref.0),
+                )
+                .await?,
+            ));
+        }
+        let plan_node = NodeId(format!("{}/__plan__", node.id.0));
+        match self
+            .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None)
+            .await?
+        {
+            AgentStep::Completed(out) => {
+                let text = out.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                match orchestrator_core::parse_plan(text) {
+                    Ok(p) => Ok(PlanOutcome::Plan(p)),
+                    Err(e) => Ok(PlanOutcome::Terminal(
+                        self.expand_failed(
+                            run,
+                            node,
+                            format!("expand {} plan parse: {e:?}", node.id.0),
+                        )
+                        .await?,
+                    )),
+                }
+            }
+            AgentStep::Failed(msg) => Ok(PlanOutcome::Terminal(
+                self.expand_failed(
+                    run,
+                    node,
+                    format!("expand {} planner agent failed: {msg}", node.id.0),
+                )
+                .await?,
+            )),
+            AgentStep::Paused(r) => Ok(PlanOutcome::Terminal(NodeExec::Paused {
+                reason: format!("planner {} paused: {r}", node.id.0),
+            })),
+        }
+    }
+
     /// Drive an `Expand` node: produce → `feasible` → cap-check → journal → drive.
     ///
     /// Known limitation (fresh-vs-terminal asymmetry, shared with `run_subgraph`/
@@ -68,62 +124,12 @@ impl Executor {
                         }
                     }
                     orchestrator_core::PlannerRef::Agent(agent_ref) => {
-                        // Config error: an unregistered planner agent → node Failed (a
-                        // recoverable config mistake), NOT a hard halt. Pre-checked here
-                        // so the `drive_agent` call below can `?`-propagate its `Err`s.
-                        if self.registry.agent(&agent_ref.0).is_none() {
-                            return self
-                                .expand_failed(
-                                    run,
-                                    node,
-                                    format!(
-                                        "expand {} unknown planner agent {}",
-                                        node.id.0, agent_ref.0
-                                    ),
-                                )
-                                .await;
-                        }
-                        // A journaled ReAct planner sub-run under `"{expand}/__plan__"`:
-                        // its turns are Pure effects (replayed from the memo on a
-                        // mid-plan resume); its final answer parses as the produced plan.
-                        // `?` propagates fatal invariants (`DeterminismViolation`, journal
-                        // errors) as a HARD HALT — matching every other `drive_agent`
-                        // caller; the agent now exists, so it never returns `UnknownAgent`.
-                        let plan_node = NodeId(format!("{}/__plan__", node.id.0));
                         match self
-                            .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None)
+                            .drive_planner_agent(run, node, agent_ref, input, fold)
                             .await?
                         {
-                            AgentStep::Completed(out) => {
-                                let text =
-                                    out.get("text").and_then(|v| v.as_str()).unwrap_or_default();
-                                match orchestrator_core::parse_plan(text) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        return self
-                                            .expand_failed(
-                                                run,
-                                                node,
-                                                format!("expand {} plan parse: {e:?}", node.id.0),
-                                            )
-                                            .await;
-                                    }
-                                }
-                            }
-                            AgentStep::Failed(msg) => {
-                                return self
-                                    .expand_failed(
-                                        run,
-                                        node,
-                                        format!("expand {} planner agent failed: {msg}", node.id.0),
-                                    )
-                                    .await;
-                            }
-                            AgentStep::Paused(r) => {
-                                return Ok(NodeExec::Paused {
-                                    reason: format!("planner {} paused: {r}", node.id.0),
-                                });
-                            }
+                            PlanOutcome::Plan(p) => p,
+                            PlanOutcome::Terminal(ne) => return Ok(ne),
                         }
                     }
                 };
@@ -179,4 +185,11 @@ impl Executor {
             output: None,
         })
     }
+}
+
+/// The result of driving a planner: a produced plan, or a terminal `NodeExec` the
+/// planner sub-run already decided (Failed/Paused).
+pub(super) enum PlanOutcome {
+    Plan(PlannedGraph),
+    Terminal(NodeExec),
 }
