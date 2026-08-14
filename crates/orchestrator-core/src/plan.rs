@@ -15,6 +15,12 @@ use crate::registry::Registry;
 /// node may not use it as its id (would collide once namespaced).
 pub const RESERVED_PLAN_ID: &str = "__plan__";
 
+/// Path segment reserved for a Loop's gate-agent (`"{loop}/{i}/__gate__"`); a plan
+/// node may not use it as its id (an Expand-body plan node would namespace to the
+/// gate path and collide). Reserved for all plans (harmless for gate-less top-level
+/// Expands) so `feasible` needs no path context.
+pub const RESERVED_GATE_ID: &str = "__gate__";
+
 /// Human-meaningful plan metadata for one node (viz + tracking + declared needs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NodePlan {
@@ -133,9 +139,10 @@ pub fn feasible(
         });
     }
     // Reserved-id is a top-level-only pre-check: nested ids namespace deeper under
-    // their parent path and can't collide with the top-level `__plan__` segment.
+    // their parent path and can't collide with the top-level `__plan__` (planner
+    // sub-run) or `__gate__` (Loop gate-agent) segments.
     for n in &plan.graph.nodes {
-        if n.id.0 == RESERVED_PLAN_ID {
+        if n.id.0 == RESERVED_PLAN_ID || n.id.0 == RESERVED_GATE_ID {
             errs.push(PlanError::ReservedNodeId(n.id.0.clone()));
         }
     }
@@ -272,6 +279,29 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| matches!(e, PlanError::TooManyNodes { .. }))
+        );
+    }
+
+    #[test]
+    fn feasible_reports_a_reserved_gate_id() {
+        // An untrusted Expand-body planner emitting a node id `"__gate__"` would
+        // namespace to `"{loop}/{i}/__gate__"` and collide with the gate-agent path
+        // (same effect_id → a later resume dies with DeterminismViolation). `feasible`
+        // must reject it, exactly like the reserved `"__plan__"` segment.
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("__gate__".into()),
+                    kind: mc("z", None).kind,
+                    deps: vec![],
+                }],
+            },
+            node_plans: HashMap::new(),
+        };
+        let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::ReservedNodeId(id) if id == "__gate__"))
         );
     }
 
