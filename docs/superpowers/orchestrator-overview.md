@@ -174,8 +174,8 @@ Grouped by phase. Each line is a confirmed decision; the per‑slice spec (§4 i
 | SP‑3 s2 Branch | [specs/2026-08-12-sp3-branch-node-design.md](specs/2026-08-12-sp3-branch-node-design.md) | ✅ merged (develop) |
 | SP‑3 s3 PlanDelta/Expand | [specs/2026-08-13-sp3-plandelta-splice-design.md](specs/2026-08-13-sp3-plandelta-splice-design.md) | ✅ merged (develop) |
 | SP‑3 s4A planner (core+agent) | [specs/2026-08-13-sp3-planner-agent-design.md](specs/2026-08-13-sp3-planner-agent-design.md) · [plan](plans/2026-08-13-sp3-planner-agent.md) | ✅ merged (develop `b15fa6b`) |
-| SP‑3 s4B planner selector | [specs/2026-08-13-sp3-planner-selector-design.md](specs/2026-08-13-sp3-planner-selector-design.md) | ✅ spec approved, plan pending |
-| SP‑3 s5 coordinator + loops‑of‑graphs | (tbd) | ⏳ |
+| SP‑3 s4B planner selector | [specs/2026-08-13-sp3-planner-selector-design.md](specs/2026-08-13-sp3-planner-selector-design.md) · [plan](plans/2026-08-13-sp3-planner-selector.md) | ✅ merged (develop `3b1774b`) |
+| SP‑3 s5 coordinator + loops‑of‑graphs | (tbd) | ⏳ next |
 
 Program phases (from the master spec §16): **SP‑0** gateway enrichment → **SP‑CAT/chains** → **SP‑1** durable skeleton → **SP‑2** registry → **SP‑3** hierarchical executor → **SP‑4** permission/effect *enforcement* + sandbox → **SP‑DATA** persistence/control‑plane → **SP‑6** HITL.
 
