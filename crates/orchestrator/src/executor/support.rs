@@ -142,6 +142,9 @@ pub(crate) fn fold_journal(
             JournalEvent::PlanExpanded { node, subgraph, .. } => {
                 fold.expansions.insert(node.clone(), subgraph.clone());
             }
+            JournalEvent::PlannerSelected { node, agent } => {
+                fold.selections.insert(node.clone(), agent.clone());
+            }
             _ => {}
         }
     }

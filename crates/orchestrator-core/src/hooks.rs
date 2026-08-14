@@ -7,6 +7,7 @@ use crate::context::{ContextKey, Scope};
 use crate::graph::Graph;
 use crate::ids::{NodeId, RunId};
 use crate::plan::NodePlan;
+use crate::registry::AgentRef;
 
 /// Observation callbacks fired by the executor at lifecycle points. Every method
 /// defaults to a no-op, so an impl overrides only what it cares about. Best-effort
@@ -33,6 +34,7 @@ pub trait OrchestratorHooks: Send + Sync {
         _node_plans: &HashMap<NodeId, NodePlan>,
     ) {
     }
+    async fn on_planner_selected(&self, _run: RunId, _node: &NodeId, _agent: &AgentRef) {}
 }
 
 #[cfg(test)]

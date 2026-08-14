@@ -129,6 +129,9 @@ struct Fold {
     /// structural analog of `memo`: on resume, `run_expand` replays the journaled
     /// subgraph for a node found here — never re-invoking the planner.
     expansions: HashMap<NodeId, Graph>,
+    /// Planner selections folded from `PlannerSelected` (§4.5). On resume the `Select`
+    /// arm reuses the recorded agent — the selector is NOT re-invoked.
+    selections: std::collections::HashMap<NodeId, orchestrator_core::AgentRef>,
 }
 
 /// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
@@ -838,6 +841,9 @@ impl Executor {
                     subgraph,
                     node_plans,
                 } => h.on_plan_expanded(run, node, subgraph, node_plans).await,
+                JournalEvent::PlannerSelected { node, agent } => {
+                    h.on_planner_selected(run, node, agent).await
+                }
                 _ => {}
             }
         }
