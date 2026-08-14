@@ -161,15 +161,18 @@ async fn drive_planner_agent(
   `AgentRef`. `select` returns the default **if it is a candidate**, else the **first
   candidate by sorted name** (candidates arrive sorted, so `candidates[0]`). Goal-
   independent, fully deterministic. (Richer goal→planner rules are deferred, §6.)
-- **`LlmPlannerSelector { gateway: Arc<Gateway>, chain: String }`** (`orchestrator`,
-  needs the gateway so it lives in the executor crate, not zero-I/O core): one
-  `gateway.execute` over `chain` — system = "choose the single best planner for the goal
-  from the menu; answer with the exact agent name", user = the goal + a rendered candidate
-  menu (name · area/kind · description). Parses the chosen name into an `AgentRef`. It is a
-  **black box** — its internal call is *not* a journaled effect; only its result is
-  (`PlannerSelected`), so a crash *before* that event re-runs one cheap selector call (no
-  divergence — no planner turns exist yet), and after it, resume reuses the recorded agent.
-  A malformed/unknown answer surfaces as the executor's `∉ candidates` → node `Failed`.
+- **`LlmPlannerSelector { gateway: Arc<Gateway>, registry: Arc<Registry>, chain: String }`**
+  (`orchestrator`, needs the gateway so it lives in the executor crate, not zero-I/O core;
+  holds an `Arc<Registry>` to render a **capability** menu): one `gateway.execute` over
+  `chain` — system = "choose the single best planner for the goal from the menu; answer with
+  the exact agent name", user = the goal + a rendered candidate menu **`- {name} ({area}/{kind})`**
+  (looked up from the registry per candidate; `AgentDefinition` has no free-text description
+  field, so role = `area/kind`). Parses the chosen name into an `AgentRef` (empty content →
+  loud `Err`). It is a **black box** — its internal call is *not* a journaled effect; only
+  its result is (`PlannerSelected`), so a crash *before* that event re-runs one cheap selector
+  call (no divergence — no planner turns exist yet), and after it, resume reuses the recorded
+  agent. A malformed/unknown/chatty answer surfaces as the executor's `∉ candidates` → node
+  `Failed`.
 
 ### 4.5 Determinism / resume
 
@@ -218,6 +221,14 @@ Nothing new is a hard halt.
   (coder/reviewer/judge are chosen by the *planner* for plan nodes, not by this selector);
   a configurable planner-role (vs the fixed `PLANNER_AREA = "planning"` convention); a
   reusable demo selector + planner-library registration (types are `pub`; wired in tests).
+- **Known limitations (record for the Coordinator/replan slice):**
+  (a) a **quota-gated selector call** maps to node `Failed`, not the durable auto-resuming
+  `Pause` that `ModelCall`/`Agent` get via `classify_gateway_error(AllGated{resume_after})` —
+  the `PlannerSelector` trait returns `Result<AgentRef>` (no pause channel), so a timed gate
+  degrades to a resumable node failure rather than a scheduled retry; (b) the answer parse is
+  **strict exact-name** — a chatty answer degrades to `∉ candidates` → node `Failed` (a node
+  retry re-invokes the selector); a lenient "candidate whose name appears in the response"
+  parse is a cheap future hardening (no determinism cost — only the result is journaled).
 
 ## 7. Acceptance criteria (TDD)
 
