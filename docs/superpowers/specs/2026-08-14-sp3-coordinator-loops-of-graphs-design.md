@@ -99,12 +99,16 @@ exactly how the SP-1 Agent-body Failed/Paused already flow.
 
 ### 4.3 The gate — pure or agent (`run_loop`)
 
-The gate inspects the iteration **output** — which for a graph body is the **sink map**
-(`{sink_id: value, …}`), not a flat `{model, text}`. So a *pure* gate (`FieldTrue`/
-`FieldEquals`/`TextContains`) over a graph body must reference the sink shape (e.g. a graph
-whose sink node id carries the gate's field at top level); when the stop decision is semantic
-over a nested result, use a **gate-agent** (which reads the whole output). After computing the
-iteration `output`:
+The gate inspects the iteration **output**. For a **leaf** body that output is a flat
+`{model, text}`, so a *pure* gate (`FieldTrue`/`FieldEquals`/`TextContains`) reads it
+directly — this is the SP-1 convergence path and stays fully supported. For a **graph** body
+the output is the **sink map** `{sink_id: {model, text}, …}`: a pure gate only sees top-level
+fields, and every real sink value is nested one level under its id, so a pure gate **does not
+converge over a graph body in practice** — it simply runs to `max_iters` and finalizes
+best-effort (`converged:false`). Semantic convergence over a graph result is therefore the
+**gate-agent's** job (§4.3 Agent arm below): it reads the whole nested output and answers
+Continue|Stop. In short: *pure gate = leaf-body convergence; gate-agent = graph-body
+convergence.* After computing the iteration `output`:
 - `GateSpec::Pure(g)` → `g.should_stop(&output)` — recomputed each drive, **no journaling**
   (unchanged from SP-1).
 - `GateSpec::Agent{ agent, stop_when }` → drive the gate-agent over `output` at the reserved
@@ -200,10 +204,13 @@ agents · loops-of-graphs."
 1. **Migration is behavior-preserving.** All SP-1 Loop tests pass with `body: LoopBody::X` /
    `gate: GateSpec::Pure(g)` — leaf ModelCall/Agent bodies + pure gate + refine + cap→best-
    effort byte-identical.
-2. **Subgraph body iterates + stops.** A `Loop{ body: Subgraph(2-node line), gate: Pure(...)
-   }` drives the graph fresh at `"{loop}/{i}"` each iteration; the pure gate stops → output
-   `{iterations, converged:true, output: <sink map>}`; each iteration's inner nodes are
-   journaled under `"{loop}/{i}/…"`.
+2. **Subgraph body iterates (best-effort).** A `Loop{ body: Subgraph(2-node line), gate:
+   Pure(...) }` drives the graph fresh at `"{loop}/{i}"` each iteration, yielding a sink-map
+   output `{sink_id: {model, text}}`; each iteration's inner nodes are journaled under
+   `"{loop}/{i}/…"`. Because a pure gate cannot match a nested sink map (§4.3), the Loop runs
+   `max_iters` and finalizes best-effort `{iterations, converged:false, output: <sink map>}`.
+   *Graph-body convergence (a gate deciding Stop over a nested result) is exercised by AC5
+   (gate-agent) and AC10 (coordinator), not by a pure gate.*
 3. **Expand body refines (the coordinator core).** A `Loop{ body: Expand{planner} }` — each
    iteration plans+executes; the refine-thread feeds iteration `i`'s output into iteration
    `i+1`'s planning input (assert the 2nd iteration's planner input carries the 1st's output);
