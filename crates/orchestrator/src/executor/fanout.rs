@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use orchestrator_core::{
-    Aggregation, EffectClass, JournalEvent, MapBody, NodeId, NodeKind, OrchestratorError, RunId,
-    effect_id,
+    Aggregation, EffectClass, GateSpec, JournalEvent, LoopBody, MapBody, NodeId, NodeKind,
+    OrchestratorError, RunId, effect_id,
 };
 
 use super::support::{build_request, input_hash};
@@ -409,12 +409,12 @@ impl Executor {
         let mut ran = 0usize;
         for i in 0..*max_iters {
             let path = format!("{}/{}", loop_node.id.0, i);
-            let result = match body {
-                MapBody::ModelCall { chain } => {
+            let output_res: Result<serde_json::Value, String> = match body {
+                LoopBody::ModelCall { chain } => {
                     self.run_map_child_modelcall(run, &path, chain, &current_input, fold)
                         .await?
                 }
-                MapBody::Agent(agent_ref) => match self
+                LoopBody::Agent(agent_ref) => match self
                     .drive_agent(
                         run,
                         &NodeId(path.clone()),
@@ -430,8 +430,22 @@ impl Executor {
                     AgentStep::Failed(m) => Err(m),
                     AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
                 },
+                // A graph body: drive the authored graph fresh under `"{loop}/{i}"`
+                // (its inner nodes journal there); the `Completed` sink map is this
+                // iteration's output, a failure fails the Loop, a pause pauses it.
+                LoopBody::Subgraph(g) => {
+                    match self.drive_nested(run, "loop", &path, g, fold).await? {
+                        NodeExec::Completed(o) => Ok(o),
+                        NodeExec::Failed { message, .. } => Err(message),
+                        NodeExec::Paused { reason } => return Ok(NodeExec::Paused { reason }),
+                    }
+                }
+                // TEMPORARY (Task 2): Expand body lands in Task 3 (uses drive_expand_with).
+                LoopBody::Expand { .. } => {
+                    unreachable!("Loop Expand body implemented in slice-5 Task 3")
+                }
             };
-            let output = match result {
+            let output = match output_res {
                 Ok(o) => o,
                 Err(message) => {
                     let msg = format!("loop {:?} failed at iteration {i}: {message}", loop_node.id);
@@ -451,7 +465,15 @@ impl Executor {
             };
             ran = i + 1;
             last_output = output.clone();
-            if gate.should_stop(&output) {
+            let stop = match gate {
+                GateSpec::Pure(g) => g.should_stop(&output),
+                // TEMPORARY (Task 2): gate-agent lands in Task 4 (async drive + early-return
+                // for its pause/failure, which is why the gate is inline, not a bool helper).
+                GateSpec::Agent { .. } => {
+                    unreachable!("gate-agent implemented in slice-5 Task 4")
+                }
+            };
+            if stop {
                 converged = true;
                 break;
             }
@@ -460,14 +482,19 @@ impl Executor {
             // (so wrap as `{prompt: text}`), an `Agent` body renders its input
             // directly (so pass the text string). Threading the raw `{model, text}`
             // object instead would leave a ModelCall body with no `prompt` (an
-            // empty request every iteration) — a silent no-op refine.
+            // empty request every iteration) — a silent no-op refine. A `Subgraph`
+            // body does not thread (each iteration is a fresh re-run over `input`);
+            // an `Expand` body threads the whole output (its sink map) as the next
+            // planner input.
             let text = output
                 .get("text")
                 .cloned()
                 .unwrap_or_else(|| output.clone());
             current_input = match body {
-                MapBody::ModelCall { .. } => serde_json::json!({ "prompt": text }),
-                MapBody::Agent(_) => text,
+                LoopBody::ModelCall { .. } => serde_json::json!({ "prompt": text }),
+                LoopBody::Agent(_) => text,
+                LoopBody::Subgraph(_) => current_input,
+                LoopBody::Expand { .. } => output.clone(),
             };
         }
 
