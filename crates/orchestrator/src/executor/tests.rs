@@ -5,8 +5,8 @@ use crate::test_support::{
     scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
-    Aggregation, ChildStatus, Dep, EdgeKind, Graph, JournalError, LoopGate, MapBody, Node, NodeId,
-    NodeKind,
+    Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
+    MapBody, Node, NodeId, NodeKind,
 };
 use orchestrator_store::InMemoryJournal;
 
@@ -3439,9 +3439,9 @@ async fn loop_stops_when_the_gate_fires() {
         nodes: vec![Node {
             id: NodeId("L".into()),
             kind: NodeKind::Loop {
-                body: MapBody::ModelCall { chain: "c".into() },
+                body: LoopBody::ModelCall { chain: "c".into() },
                 input: serde_json::json!({ "prompt": "start" }),
-                gate: LoopGate::TextContains("DONE".into()),
+                gate: GateSpec::Pure(LoopGate::TextContains("DONE".into())),
                 max_iters: 5,
             },
             deps: vec![],
@@ -3468,9 +3468,9 @@ async fn loop_caps_at_max_iters_and_completes_unconverged() {
         nodes: vec![Node {
             id: NodeId("L".into()),
             kind: NodeKind::Loop {
-                body: MapBody::ModelCall { chain: "c".into() },
+                body: LoopBody::ModelCall { chain: "c".into() },
                 input: serde_json::json!({ "prompt": "go" }),
-                gate: LoopGate::TextContains("STOP".into()),
+                gate: GateSpec::Pure(LoopGate::TextContains("STOP".into())),
                 max_iters: 3,
             },
             deps: vec![],
@@ -3503,9 +3503,9 @@ async fn loop_body_failure_fails_the_loop() {
         nodes: vec![Node {
             id: NodeId("L".into()),
             kind: NodeKind::Loop {
-                body: MapBody::ModelCall { chain: "c".into() },
+                body: LoopBody::ModelCall { chain: "c".into() },
                 input: serde_json::json!({ "prompt": "FAIL" }),
-                gate: LoopGate::TextContains("never".into()),
+                gate: GateSpec::Pure(LoopGate::TextContains("never".into())),
                 max_iters: 3,
             },
             deps: vec![],
@@ -3536,9 +3536,9 @@ async fn loop_threads_each_iterations_output_into_the_next() {
         nodes: vec![Node {
             id: NodeId("L".into()),
             kind: NodeKind::Loop {
-                body: MapBody::Agent(AgentRef("a".into())),
+                body: LoopBody::Agent(AgentRef("a".into())),
                 input: serde_json::json!("start"),
-                gate: LoopGate::TextContains("NEVER".into()),
+                gate: GateSpec::Pure(LoopGate::TextContains("NEVER".into())),
                 max_iters: 2,
             },
             deps: vec![],
@@ -3574,9 +3574,9 @@ async fn loop_threads_the_prior_answer_into_a_modelcall_bodys_prompt() {
         nodes: vec![Node {
             id: NodeId("L".into()),
             kind: NodeKind::Loop {
-                body: MapBody::ModelCall { chain: "c".into() },
+                body: LoopBody::ModelCall { chain: "c".into() },
                 input: serde_json::json!({ "prompt": "start" }),
-                gate: LoopGate::TextContains("NEVER".into()),
+                gate: GateSpec::Pure(LoopGate::TextContains("NEVER".into())),
                 max_iters: 2,
             },
             deps: vec![],
@@ -3603,9 +3603,9 @@ fn loop_then_modelcall_graph() -> Graph {
             Node {
                 id: NodeId("L".into()),
                 kind: NodeKind::Loop {
-                    body: MapBody::ModelCall { chain: "c".into() },
+                    body: LoopBody::ModelCall { chain: "c".into() },
                     input: serde_json::json!({ "prompt": "go" }),
-                    gate: LoopGate::TextContains("STOP".into()), // never fires → cap at 2
+                    gate: GateSpec::Pure(LoopGate::TextContains("STOP".into())), // never fires → cap at 2
                     max_iters: 2,
                 },
                 deps: vec![],
@@ -3735,11 +3735,11 @@ async fn loop_drives_the_real_reference_chain_each_iteration() {
         nodes: vec![Node {
             id: NodeId("L".into()),
             kind: NodeKind::Loop {
-                body: MapBody::ModelCall {
+                body: LoopBody::ModelCall {
                     chain: "research.bulk".into(),
                 },
                 input: serde_json::json!({ "prompt": "iterate" }),
-                gate: LoopGate::TextContains("NEVER".into()),
+                gate: GateSpec::Pure(LoopGate::TextContains("NEVER".into())),
                 max_iters: 2,
             },
             deps: vec![],
@@ -3761,6 +3761,175 @@ async fn loop_drives_the_real_reference_chain_each_iteration() {
         calls.lock().unwrap().len(),
         2,
         "2 iterations each hit the local adapter once"
+    );
+}
+
+// ===================== SP-3 s5 Loop over a Subgraph body =======================
+
+/// AC2 / AC9 — a Loop over a Subgraph body drives the authored graph fresh each
+/// iteration; a pure gate that never matches the sink map runs to `max_iters` and
+/// completes best-effort → `{iterations:2, converged:false, output:<sink map>}`.
+/// Each iteration's inner node is journaled under `"lp/{i}/…"`.
+#[tokio::test]
+async fn loop_over_a_subgraph_body_iterates_and_stops() {
+    let (gateway, _c) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // Subgraph: a single ModelCall node "s1" whose output is `{model, text}`.
+    let inner = Graph {
+        nodes: vec![mc("s1", None)],
+    };
+    let loop_node = Node {
+        id: NodeId("lp".into()),
+        kind: NodeKind::Loop {
+            body: LoopBody::Subgraph(Box::new(inner)),
+            input: serde_json::json!({}),
+            // The gate inspects the SINK MAP (`{"s1": {model,text}}`), which has no
+            // top-level "text" string → never fires → best-effort at the cap.
+            gate: GateSpec::Pure(LoopGate::TextContains("zzz-never".into())),
+            max_iters: 2,
+        },
+        deps: vec![],
+    };
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec
+        .run(
+            run,
+            &Graph {
+                nodes: vec![loop_node],
+            },
+        )
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    let o = &out.outputs[&NodeId("lp".into())];
+    assert_eq!(o["converged"], false, "gate never matched → best-effort");
+    assert_eq!(o["iterations"], 2, "ran max_iters");
+    // The iteration output is the subgraph's SINK MAP: `{"s1": {model, text}}`.
+    assert_eq!(
+        o["output"]["s1"]["text"], "canned-response",
+        "loop output is the fresh subgraph's sink map: {o}"
+    );
+    // Inner nodes journaled fresh under "lp/0/s1" and "lp/1/s1".
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "NodeCompleted(lp/0/s1)"),
+        "iteration 0's inner node journaled under lp/0/s1: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "NodeCompleted(lp/1/s1)"),
+        "iteration 1's inner node journaled under lp/1/s1: {labels:?}"
+    );
+}
+
+/// AC2 — a Loop over a Subgraph body converges when the pure gate matches the
+/// iteration's sink map. A graph body's iteration output is a WRAPPED sink map
+/// (`{sink_id: <node output>}`), so the only `LoopGate` that can match it is
+/// `FieldTrue(<sink_id>)` against a sink whose value is the JSON boolean `true`.
+/// A live `ModelCall`/`Agent` node always emits an OBJECT (`{model,text}`), so no
+/// live subgraph yields a boolean-valued sink — semantic convergence over a nested
+/// result is by design the gate-agent's job (design §4.3, slice-5 Task 4). To still
+/// exercise the convergence code path for a graph body under Task 2's pure-gate-only
+/// constraint, we seed iteration 0's inner node `lp/0/s1` with a `true` effect
+/// output and resume: the subgraph node memo-hits → sink map `{"s1": true}` →
+/// `FieldTrue("s1")` fires → the Loop converges at iteration 0. (See report NOTE:
+/// a fresh-run pure-gate convergence over a subgraph sink map is not expressible.)
+#[tokio::test]
+async fn loop_subgraph_body_converges_when_the_gate_matches() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // Seed a partial run: iteration 0's inner subgraph node completed with a boolean
+    // `true` effect output. No `NodeCompleted(lp)` ⇒ the Loop is re-driven on resume.
+    journal
+        .append(
+            run,
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeStarted {
+                node: NodeId("lp/0/s1".into()),
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::EffectRecorded {
+                node: NodeId("lp/0/s1".into()),
+                effect_id: effect_id("lp/0/s1", 0, 0),
+                class: EffectClass::Pure,
+                // `mc("s1", None)` ⇒ chain "c", payload `{"prompt":"s1"}` (see `mc`).
+                input_hash: input_hash("c", &serde_json::json!({ "prompt": "s1" })).unwrap(),
+                seq: 0,
+                output: EffectOutput::Inline(serde_json::json!(true)),
+                observation: None,
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: NodeId("lp/0/s1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let inner = Graph {
+        nodes: vec![mc("s1", None)],
+    };
+    let loop_node = Node {
+        id: NodeId("lp".into()),
+        kind: NodeKind::Loop {
+            body: LoopBody::Subgraph(Box::new(inner)),
+            input: serde_json::json!({}),
+            gate: GateSpec::Pure(LoopGate::FieldTrue("s1".into())),
+            max_iters: 3,
+        },
+        deps: vec![],
+    };
+    let (gateway, calls) = recording_gateway().await;
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .start(
+            run,
+            &Graph {
+                nodes: vec![loop_node],
+            },
+        )
+        .await
+        .expect("resume");
+    assert!(out.failed.is_none(), "{out:?}");
+    let o = &out.outputs[&NodeId("lp".into())];
+    assert_eq!(
+        o["converged"], true,
+        "gate matched the seeded sink map: {o}"
+    );
+    assert_eq!(o["iterations"], 1, "converged on the first iteration");
+    assert_eq!(
+        o["output"]["s1"], true,
+        "the sink map carried the boolean the pure gate matched"
+    );
+    // Iteration 0's inner node memo-hit (seeded) → the Loop converged before any
+    // live gateway call.
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "converged on the memoized iteration; no live call"
     );
 }
 

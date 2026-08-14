@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{Graph, MapBody, NodeKind};
+use crate::graph::{Graph, LoopBody, MapBody, NodeKind};
 use crate::ids::NodeId;
 use crate::registry::Registry;
 
@@ -79,15 +79,25 @@ fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError
                     errs.push(PlanError::UnknownAgent(agent.0.clone()));
                 }
             }
-            NodeKind::Map { body, .. }
-            | NodeKind::Consolidate { body, .. }
-            | NodeKind::Loop { body, .. } => {
+            NodeKind::Map { body, .. } | NodeKind::Consolidate { body, .. } => {
                 if let MapBody::Agent(agent) = body
                     && registry.agent(&agent.0).is_none()
                 {
                     errs.push(PlanError::UnknownAgent(agent.0.clone()));
                 }
             }
+            NodeKind::Loop { body, .. } => match body {
+                LoopBody::Agent(agent) => {
+                    if registry.agent(&agent.0).is_none() {
+                        errs.push(PlanError::UnknownAgent(agent.0.clone()));
+                    }
+                }
+                // A `Subgraph` body has a static nested graph — recurse (mirrors the
+                // top-level `Subgraph` node). `ModelCall`/`Expand` have no static
+                // agent ref to resolve here (`Expand`'s plan is checked at splice).
+                LoopBody::Subgraph(g) => check_agent_refs(g, registry, errs),
+                LoopBody::ModelCall { .. } | LoopBody::Expand { .. } => {}
+            },
             NodeKind::Subgraph { graph } => check_agent_refs(graph, registry, errs),
             NodeKind::Branch { arms, default, .. } => {
                 for (_, g) in arms {

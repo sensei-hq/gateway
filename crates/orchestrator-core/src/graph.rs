@@ -44,11 +44,13 @@ pub enum NodeKind {
     /// the next as input (refine), until `gate` says Stop or `max_iters` is
     /// reached. Cap-without-Stop completes best-effort (`converged: false`), never
     /// a bare fail (§10.3); a body failure fails the Loop. Output:
-    /// `{ iterations, converged, output }`.
+    /// `{ iterations, converged, output }`. The body drives a leaf effect
+    /// (`ModelCall`/`Agent`) or a whole graph (`Subgraph`/`Expand`, SP-3 s5) per
+    /// iteration; the gate is a pure predicate or a journaled gate-agent.
     Loop {
-        body: MapBody,
+        body: LoopBody,
         input: serde_json::Value,
-        gate: LoopGate,
+        gate: GateSpec,
         max_iters: usize,
     },
     /// A node whose work is a whole nested DAG, driven under this node's path in
@@ -100,6 +102,30 @@ pub enum PlannerRef {
 pub enum MapBody {
     ModelCall { chain: String },
     Agent(crate::registry::AgentRef),
+}
+
+/// What a `Loop` runs per iteration (SP-3 s5). Leaf variants mirror `MapBody`; the
+/// two graph variants drive a nested graph per iteration — `Subgraph` a static
+/// author-provided graph (fresh re-run each iteration), `Expand` a planned graph
+/// (plan+execute, the coordinator core).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LoopBody {
+    ModelCall { chain: String },
+    Agent(crate::registry::AgentRef),
+    Subgraph(Box<Graph>),
+    Expand { planner: PlannerRef },
+}
+
+/// A `Loop`'s stop decision (SP-3 s5). `Pure` = the SP-1 pure predicate (no journaling);
+/// `Agent` = a gate-agent over the iteration output, then a pure `stop_when` over the
+/// agent's answer (the agent turn is journaled ⇒ resume replays it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GateSpec {
+    Pure(LoopGate),
+    Agent {
+        agent: crate::registry::AgentRef,
+        stop_when: LoopGate,
+    },
 }
 
 /// A deterministic Stop condition for a [`NodeKind::Loop`], evaluated as a pure
@@ -300,8 +326,17 @@ impl Graph {
         }
 
         // 2c. A `Subgraph`'s nested graph must itself be a valid DAG (recursive).
+        // A `Loop` with a `Subgraph` body has a static nested graph too — recurse
+        // into it (a `LoopBody::Expand` has no static graph, so no recursion).
         for node in &self.nodes {
             if let NodeKind::Subgraph { graph } = &node.kind {
+                graph.validate_dag()?;
+            }
+            if let NodeKind::Loop {
+                body: LoopBody::Subgraph(graph),
+                ..
+            } = &node.kind
+            {
                 graph.validate_dag()?;
             }
         }
@@ -380,9 +415,9 @@ mod tests {
             nodes: vec![Node {
                 id: NodeId("L".into()),
                 kind: NodeKind::Loop {
-                    body: MapBody::ModelCall { chain: "c".into() },
+                    body: LoopBody::ModelCall { chain: "c".into() },
                     input: serde_json::json!({}),
-                    gate: LoopGate::TextContains("x".into()),
+                    gate: GateSpec::Pure(LoopGate::TextContains("x".into())),
                     max_iters: 0,
                 },
                 deps: vec![],
