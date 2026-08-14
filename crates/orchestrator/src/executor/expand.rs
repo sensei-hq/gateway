@@ -1,12 +1,17 @@
-//! The `Expand` node (SP-3 slice 3/4A): produce a nested subgraph at runtime — via
-//! the injected `Planner` (`PlannerRef::Injected`) or a journaled ReAct planner agent
-//! (`PlannerRef::Agent`, slice 4A) — run the pure `feasible` gate, journal it as
-//! `PlanExpanded`, and drive it under the node's path (reusing the shared
-//! `drive_nested`). A planner error, an infeasible plan, an unparseable/failed planner
-//! agent, or no wired planner is a node `Failed` (journaled `NodeFailed`); a paused
-//! planner turn pauses the run; a cap breach is a hard `Err` (self-DoS). On resume, a
-//! node with a journaled `PlanExpanded` reuses that subgraph from the fold — the
-//! planner is never re-invoked (deterministic).
+//! The `Expand` node (SP-3 slice 3/4A/4B): produce a nested subgraph at runtime — via
+//! the injected `Planner` (`PlannerRef::Injected`), a journaled ReAct planner agent
+//! (`PlannerRef::Agent`, slice 4A), or a registry-driven selection
+//! (`PlannerRef::Select`, slice 4B: the executor's injected `PlannerSelector` picks a
+//! `planning`-area agent from the sorted candidate library, journaled as
+//! `PlannerSelected` and reused on resume, then that agent runs the 4A path) — run the
+//! pure `feasible` gate, journal it as `PlanExpanded`, and drive it under the node's
+//! path (reusing the shared `drive_nested`). A planner error, an infeasible plan, an
+//! unparseable/failed planner agent, no wired planner/selector, or a selector error /
+//! non-candidate pick is a node `Failed` (journaled `NodeFailed`); a paused planner turn
+//! pauses the run; a cap breach is a hard `Err` (self-DoS). On resume, a node with a
+//! journaled `PlanExpanded` reuses that subgraph from the fold; a `Select` node that
+//! crashed after `PlannerSelected` but before `PlanExpanded` reuses the recorded pick —
+//! the planner/selector is never re-invoked (deterministic).
 
 use orchestrator_core::{
     JournalEvent, Node, NodeId, NodeKind, OrchestratorError, PlannedGraph, RunId,
