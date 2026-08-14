@@ -625,6 +625,58 @@ mod tests {
     }
 
     #[test]
+    fn validate_dag_rejects_a_cycle_in_a_loop_subgraph_body() {
+        // A `Loop` with a `Subgraph` body carries a static nested graph; a cycle
+        // inside it must be rejected recursively (SP-3 s5), mirroring the top-level
+        // `Subgraph` recursion in `validate_dag_recurses_into_subgraphs`.
+        let nested_cycle = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("a".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!(0),
+                    },
+                    deps: vec![Dep {
+                        on: NodeId("b".into()),
+                        kind: EdgeKind::Hard,
+                    }],
+                },
+                Node {
+                    id: NodeId("b".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!(0),
+                    },
+                    deps: vec![Dep {
+                        on: NodeId("a".into()),
+                        kind: EdgeKind::Hard,
+                    }],
+                },
+            ],
+        };
+        let outer = Graph {
+            nodes: vec![Node {
+                id: NodeId("L".into()),
+                kind: NodeKind::Loop {
+                    body: LoopBody::Subgraph(Box::new(nested_cycle)),
+                    input: serde_json::json!({}),
+                    gate: GateSpec::Pure(LoopGate::TextContains("x".into())),
+                    max_iters: 1,
+                },
+                deps: vec![],
+            }],
+        };
+        assert!(
+            matches!(
+                outer.validate_dag(),
+                Err(OrchestratorError::InvalidGraph(_))
+            ),
+            "a cycle in a Loop's Subgraph body is rejected recursively"
+        );
+    }
+
+    #[test]
     fn expand_deserializes_without_planner_as_injected() {
         let j = r#"{"Expand":{"input":{}}}"#;
         let k: NodeKind = serde_json::from_str(j).unwrap();
