@@ -3838,6 +3838,118 @@ async fn loop_over_a_subgraph_body_iterates_and_stops() {
 // convergence tests (`loop_stops_when_the_gate_fires`), and the Subgraph sink-map
 // output shape by `loop_over_a_subgraph_body_iterates_and_stops` above.
 
+/// AC7 (pause) — an in-doubt Mutation inside a Loop's Subgraph body pauses the WHOLE run
+/// loud: the nested agent pauses (`RunPaused` journaled), the Subgraph body maps that to
+/// `NodeExec::Paused`, `run_loop` returns `Paused`, and the outer scheduler pauses the run
+/// — it must NEVER journal `RunCompleted` over the unresolved Intent (no silent failure).
+/// This is the `an_in_doubt_mutation_in_a_subgraph_pauses_the_run` shape with the Subgraph
+/// wrapped as a Loop BODY (inner node under `"lp/0/n1"`).
+#[tokio::test]
+async fn loop_subgraph_body_pause_pauses_the_loop() {
+    let run = RunId(uuid::Uuid::new_v4());
+    let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
+        let recorder = AgentDefinition {
+            name: "recorder".into(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: Some("research.bulk".into()),
+            chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            tools: vec!["record_note".into()],
+            skills: vec![],
+            system_prompt: "Record.".into(),
+        };
+        (
+            Arc::new(
+                Registry::default()
+                    .with_agent(recorder)
+                    .with_tool(RecordNote::new(sink.clone()).spec()),
+            ),
+            Arc::new(ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink)))),
+        )
+    };
+    // The mutation-bearing agent lives inside a Loop's Subgraph BODY (inner node "lp/0/n1")
+    // rather than a top-level Subgraph. A pure gate that never fires keeps the loop looping,
+    // but the pause happens DURING iteration 0's body — before the gate is ever reached.
+    let loop_graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("lp".into()),
+            kind: NodeKind::Loop {
+                body: LoopBody::Subgraph(Box::new(Graph {
+                    nodes: vec![agent_node("n1", "recorder", "item-0")],
+                })),
+                input: serde_json::json!({}),
+                gate: GateSpec::Pure(LoopGate::TextContains("zzz-never".into())),
+                max_iters: 2,
+            },
+            deps: vec![],
+        }],
+    };
+
+    // Seed: run the loop to completion, then truncate to iteration 0's nested agent's
+    // record_note EffectIntent (drops its EffectRecorded) → in-doubt on resume.
+    let full = InMemoryJournal::new();
+    let (seed_reg, seed_tools) = mk_recorder(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let (gw_s, _c) = demo_reference_tool_gateway().await;
+    Executor::new(Arc::new(gw_s), Arc::new(full.clone()), "v1")
+        .with_registry(seed_reg)
+        .with_tools(seed_tools)
+        .run(run, &loop_graph)
+        .await
+        .expect("seed Loop run completes");
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("iteration 0's nested agent journaled a record_note EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // Resume with an Indeterminate reconciler + a FRESH empty sink → iteration 0's nested
+    // Mutation is in-doubt → the nested agent pauses → the Subgraph body pauses → the Loop
+    // pauses → the run pauses.
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (reg, tools) = mk_recorder(sink.clone());
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(AlwaysIndeterminate));
+    let (gw_r, _c2) = demo_reference_tool_gateway().await;
+    let outcome = Executor::new(Arc::new(gw_r), Arc::new(seeded.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(tools)
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &loop_graph)
+        .await
+        .expect("resume yields an outcome");
+
+    let pause = outcome
+        .paused
+        .expect("the in-doubt nested Mutation pauses the whole run");
+    assert_eq!(
+        pause.node,
+        NodeId("lp".into()),
+        "the Loop node is the pause point"
+    );
+    let resumed = seeded.load(run).await.unwrap();
+    assert!(
+        resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run must NOT complete over an unresolved in-doubt Intent (no silent failure)"
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a paused in-doubt Mutation applies no side effect"
+    );
+}
+
 /// AC3 — a Loop over an Expand body: each iteration plans+executes; the refine-thread
 /// feeds iteration i's output into iteration i+1's planner input. A FixedPlanner emits a
 /// single-ModelCall plan; assert the loop runs max_iters (the refine is exercised
@@ -4107,6 +4219,188 @@ async fn loop_gate_agent_decision_replays_on_resume() {
         effect_recorded_count(&events, &effect_id("lp/0/__gate__", 0, 0)),
         1,
         "iter 0's gate-agent turn was replayed from the journal on resume, not re-recorded/re-spent"
+    );
+}
+
+// ==================== SP-3 s5 coordinator e2e (Task 5, AC10) ===================
+
+/// AC10 (coordinator e2e) — the full slice-5 coordinator: a `Loop` whose body is an
+/// `Expand{planner: Agent}` (plan+execute per iteration, threading the prior sink map
+/// into the next planner input) and whose gate is a gate-`Agent` deciding Continue|Stop.
+/// Two iterations run plan→execute→gate through a real (test) gateway; the gate-agent
+/// answers "not yet" at iter 0 (Continue) then "…DONE" at iter 1 (Stop), so the Loop
+/// converges at iterations=2 with max_iters=3 — convergence is the GATE, not the cap.
+/// `on_plan_expanded` fires once per iteration (spy records lp/0 then lp/1).
+///
+/// Non-vacuous: the planner turn, the plan-node output, and the iter-0 "continue" answer
+/// NEVER carry "DONE" — only the gate-agent's iter-1 answer can converge. A bug applying
+/// `stop_when` to the wrong value (e.g. the Expand sink map, which has no top-level
+/// "text"/"DONE") would miss the marker and run to the cap (iterations=3, converged=false),
+/// which the asserts below would catch.
+#[tokio::test]
+async fn coordinator_loop_expand_body_with_gate_agent_converges() {
+    // A registry with BOTH the `planner` agent (area "planning", drives the Expand body)
+    // and the `gate` agent (decides Continue|Stop over each iteration's output).
+    let reg = Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                name: "planner".into(),
+                area: "planning".into(),
+                kind: "reasoning".into(),
+                chain: Some("c".into()),
+                chains: std::collections::HashMap::new(),
+                grants: std::collections::HashMap::new(),
+                tools: vec![],
+                skills: vec![],
+                system_prompt: "Emit a plan as JSON.".into(),
+            })
+            .with_agent(AgentDefinition {
+                name: "gate".into(),
+                area: "gating".into(),
+                kind: "reasoning".into(),
+                chain: Some("c".into()),
+                chains: std::collections::HashMap::new(),
+                grants: std::collections::HashMap::new(),
+                tools: vec![],
+                skills: vec![],
+                system_prompt: "Answer DONE once the goal is met, else keep going.".into(),
+            }),
+    );
+
+    // The planner emits a minimal single-`ModelCall` plan (no "DONE" anywhere).
+    let plan_json = r#"{"graph":{"nodes":[
+        {"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"work"}}},"deps":[]}
+    ]},"node_plans":{"n1":{"label":"do work"}}}"#;
+
+    // `scripted_gateway` is a single FIFO call-order queue. Per iteration the coordinator
+    // consumes it in THIS order:
+    //   (1) the planner agent's ReAct turn → emits the plan JSON     (1 call, no tools),
+    //   (2) the planned single-`ModelCall` node's execution          (1 call),
+    //   (3) the gate agent's answer turn   → Continue|Stop text      (1 call, no tools).
+    // → 3 calls/iteration × 2 iterations = 6. Iter 0's gate answers "not yet" (no DONE →
+    //   Continue); iter 1's gate answers "…DONE" (→ Stop). None of the planner/plan-node/
+    //   continue texts carry "DONE", so ONLY the gate-agent's iter-1 answer can converge.
+    let (gw, calls) = scripted_gateway(vec![
+        final_response(plan_json),       // iter0 (1) planner turn
+        final_response("draft v0"),      // iter0 (2) plan node n1
+        final_response("not yet"),       // iter0 (3) gate → Continue
+        final_response(plan_json),       // iter1 (1) planner turn
+        final_response("draft v1"),      // iter1 (2) plan node n1
+        final_response("all set, DONE"), // iter1 (3) gate → Stop
+    ])
+    .await;
+
+    // Spy over `on_plan_expanded`: records the path of each PlanExpanded (one per iter).
+    use std::sync::Mutex;
+    struct PlanSpy(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl OrchestratorHooks for PlanSpy {
+        async fn on_plan_expanded(
+            &self,
+            _run: RunId,
+            node: &NodeId,
+            _graph: &Graph,
+            _node_plans: &std::collections::HashMap<NodeId, orchestrator_core::NodePlan>,
+        ) {
+            self.0.lock().unwrap().push(node.0.clone());
+        }
+    }
+    let plan_log = Arc::new(Mutex::new(Vec::new()));
+
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let loop_node = Node {
+        id: NodeId("lp".into()),
+        kind: NodeKind::Loop {
+            body: LoopBody::Expand {
+                planner: orchestrator_core::PlannerRef::Agent(AgentRef("planner".into())),
+            },
+            input: serde_json::json!({ "goal": "converge on the answer" }),
+            gate: GateSpec::Agent {
+                agent: AgentRef("gate".into()),
+                stop_when: LoopGate::TextContains("DONE".into()),
+            },
+            max_iters: 3, // > 2 so convergence is the gate, not the cap
+        },
+        deps: vec![],
+    };
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(reg)
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_hooks(Arc::new(PlanSpy(plan_log.clone())))
+        .run(
+            run,
+            &Graph {
+                nodes: vec![loop_node],
+            },
+        )
+        .await
+        .expect("run");
+
+    assert!(out.failed.is_none(), "{out:?}");
+    let o = &out.outputs[&NodeId("lp".into())];
+    assert_eq!(
+        o["converged"], true,
+        "the gate-agent said DONE at iter 1 → converged (not the max_iters cap): {o}"
+    );
+    assert_eq!(
+        o["iterations"], 2,
+        "converged by the gate-agent at iter 1, not run to the max_iters=3 cap: {o}"
+    );
+    // The final output carries the CONVERGED (iter-1) result — the Expand sink map keyed
+    // by the bare plan-node id "n1", whose text is iter 1's plan output ("draft v1"), NOT
+    // iter 0's ("draft v0"). Proves the loop threaded through to the converging iteration.
+    assert_eq!(
+        o["output"]["n1"]["text"], "draft v1",
+        "final output is the converged iteration's Expand sink: {}",
+        o["output"]
+    );
+
+    // Exactly 6 gateway calls: 2 iterations × (planner turn + plan node + gate turn).
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        6,
+        "2 iterations × (1 planner turn + 1 plan node + 1 gate turn)"
+    );
+
+    // `on_plan_expanded` fired once per iteration (one plan splice each), at the reserved
+    // Loop-iteration paths lp/0 then lp/1 — the per-iteration expansion the coordinator
+    // performs, in order.
+    let planned = plan_log.lock().unwrap().clone();
+    assert_eq!(
+        planned,
+        vec!["lp/0".to_string(), "lp/1".to_string()],
+        "one PlanExpanded per iteration, hook-fired under lp/0 then lp/1: {planned:?}"
+    );
+
+    // The two plan splices are journaled as `PlanExpanded` events under lp/0 and lp/1, and
+    // each iteration's planner sub-run + gate-agent turn journal under their reserved paths.
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "PlanExpanded(lp/0)"),
+        "iter 0's plan spliced+journaled under lp/0: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "PlanExpanded(lp/1)"),
+        "iter 1's plan spliced+journaled under lp/1: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "NodeStarted(lp/0/__plan__)"),
+        "iter 0's planner sub-run journaled under lp/0/__plan__: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "NodeStarted(lp/0/__gate__)"),
+        "iter 0's gate-agent journaled under lp/0/__gate__: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "NodeStarted(lp/1/__gate__)"),
+        "iter 1's gate-agent journaled under lp/1/__gate__: {labels:?}"
     );
 }
 
