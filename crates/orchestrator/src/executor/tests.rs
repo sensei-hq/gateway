@@ -3954,6 +3954,162 @@ async fn loop_of_expands_respects_max_expansions_cap() {
     );
 }
 
+// ======================= SP-3 s5 Loop gate-agent (Task 4) ======================
+
+/// The `[lp: Loop{ModelCall body, gate: Agent{a, stop_when: TextContains("STOP")}}]`
+/// graph, `max_iters=3` (so convergence is by the gate, not the cap), agent "a" on
+/// chain "c". Shared by AC5 and the AC6 resume.
+fn loop_gate_agent_graph() -> Graph {
+    Graph {
+        nodes: vec![Node {
+            id: NodeId("lp".into()),
+            kind: NodeKind::Loop {
+                body: LoopBody::ModelCall { chain: "c".into() },
+                input: serde_json::json!({ "prompt": "start" }),
+                gate: GateSpec::Agent {
+                    agent: AgentRef("a".into()),
+                    stop_when: LoopGate::TextContains("STOP".into()),
+                },
+                max_iters: 3,
+            },
+            deps: vec![],
+        }],
+    }
+}
+
+/// AC5 — a `GateSpec::Agent` gate drives a gate-agent over each iteration's output and
+/// applies the pure `stop_when` to the AGENT's answer (not the body output). The
+/// gate-agent answers "keep going" at iter 0 (continue) then "…STOP" at iter 1 (stop),
+/// so the Loop converges at iterations=2 even though max_iters=3. The gate turns are
+/// journaled under the reserved "lp/0/__gate__" / "lp/1/__gate__" paths.
+#[tokio::test]
+async fn loop_gate_agent_decides_stop() {
+    // `scripted_gateway` is a single call-order queue. A ModelCall body consumes ONE
+    // response per iteration; a no-tool gate-agent answer consumes ONE more. Call order:
+    // iter0 body → iter0 gate-agent → iter1 body → iter1 gate-agent. The BODY texts never
+    // carry the STOP marker, so only the gate-agent's answer can drive convergence — a
+    // bug applying `stop_when` to the body output would miss STOP and run to the cap
+    // (iterations=3, converged=false), which the asserts below would catch.
+    let (gw, calls) = scripted_gateway(vec![
+        final_response("body draft v0"),
+        final_response("not yet, keep going"),
+        final_response("body draft v1"),
+        final_response("looks good, STOP"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .run(run, &loop_gate_agent_graph())
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    let o = &out.outputs[&NodeId("lp".into())];
+    assert_eq!(o["converged"], true, "the gate-agent said STOP at iter 1");
+    assert_eq!(
+        o["iterations"], 2,
+        "converged by the gate-agent at iter 1, not the max_iters=3 cap"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        4,
+        "2 iterations × (1 body call + 1 gate-agent call)"
+    );
+    // The gate-agent turns were journaled under the reserved "{loop}/{i}/__gate__" path.
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "NodeStarted(lp/0/__gate__)"),
+        "iter 0's gate-agent journaled under lp/0/__gate__: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "EffectRecorded(lp/0/__gate__)"),
+        "iter 0's gate-agent turn recorded a Pure effect: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "NodeStarted(lp/1/__gate__)"),
+        "iter 1's gate-agent journaled under lp/1/__gate__: {labels:?}"
+    );
+}
+
+/// AC6 — the gate-agent decision REPLAYS from the memo on resume: the gateway is never
+/// re-called for a completed iteration's gate turn. Seed run 1 to a PARTIAL state (iter
+/// 0's body + gate-agent journaled, then the script is exhausted so iter 1's body errors
+/// → the Loop fails, NO RunCompleted). Resume on a FRESH gateway that serves ONLY iter
+/// 1's body + gate-agent: iter 0 (body AND gate-agent) replays from the journal, so the
+/// resume gateway sees EXACTLY 2 calls, and the Loop stops at the SAME iteration
+/// (iterations=2, converged=true) — the resume-determinism the coordinator depends on.
+#[tokio::test]
+async fn loop_gate_agent_decision_replays_on_resume() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+
+    // Run 1: only iter 0's body + gate-agent are scripted ("keep going" → continue);
+    // iter 1's body then hits the exhausted script and errors → the Loop fails, so there
+    // is NO RunCompleted and iter 0's effects (incl. the gate turn) are durably journaled.
+    let (gw1, calls1) = scripted_gateway(vec![
+        final_response("body draft v0"),
+        final_response("not yet, keep going"),
+    ])
+    .await;
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .run(run, &loop_gate_agent_graph())
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(
+        o1.failed.is_some(),
+        "iter 1's body fails (script exhausted) → the Loop fails, no RunCompleted"
+    );
+    assert_eq!(
+        calls1.lock().unwrap().len(),
+        3,
+        "run 1: iter0 body + iter0 gate-agent + the failing iter1 body"
+    );
+
+    // Run 2: a FRESH gateway serving ONLY iter 1's body + gate-agent ("…STOP" → stop),
+    // over the SAME journal. Iter 0's body AND gate-agent replay from the memo, so this
+    // gateway is called EXACTLY twice; were the gate decision re-driven, iter 0's gate
+    // replay would consume iter 1's response (wrong order → wrong decision / count).
+    let (gw2, calls2) = scripted_gateway(vec![
+        final_response("body draft v1"),
+        final_response("looks good, STOP"),
+    ])
+    .await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .start(run, &loop_gate_agent_graph())
+        .await
+        .expect("resume completes");
+    assert!(o2.failed.is_none(), "{:?}", o2.failed);
+    let o = &o2.outputs[&NodeId("lp".into())];
+    assert_eq!(o["converged"], true, "the gate-agent said STOP at iter 1");
+    assert_eq!(o["iterations"], 2, "stops at the SAME iteration on resume");
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        2,
+        "resume re-spent only iter 1 (body + gate-agent); iter 0's body AND gate-agent replayed from the memo"
+    );
+    // Non-vacuous: iter 0's gate-agent turn appears in EXACTLY ONE `EffectRecorded`
+    // across BOTH runs — recorded live in run 1, replayed (not re-recorded) on resume.
+    // A broken memo would re-run it live on resume and this count would be 2.
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        effect_recorded_count(&events, &effect_id("lp/0/__gate__", 0, 0)),
+        1,
+        "iter 0's gate-agent turn was replayed from the journal on resume, not re-recorded/re-spent"
+    );
+}
+
 // ============================= SP-1 OrchestratorHooks ==========================
 
 /// A hooks spy: each fired hook appends a "label(args)" string.

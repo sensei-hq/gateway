@@ -370,18 +370,50 @@ impl Executor {
         }
     }
 
+    /// Fail a `Loop` node: journal its `NodeFailed` and return the matching
+    /// [`NodeExec::Failed`]`{ output: None }`. Colocating the append-then-return
+    /// pairing keeps the invariant in ONE place — a `Failed` return from `run_loop`
+    /// must always be preceded by the `NodeFailed` append (skipping it would corrupt
+    /// replay). Both `run_loop` failure paths (a body-iteration failure and a
+    /// gate-agent failure) go through here. (A `Map` aggregation failure carries its
+    /// manifest out via `output: Some(..)`, so it does NOT use this helper.)
+    pub(super) async fn fail_loop(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        message: String,
+    ) -> Result<NodeExec, OrchestratorError> {
+        self.append(
+            run,
+            JournalEvent::NodeFailed {
+                node: node.clone(),
+                error: message.clone(),
+            },
+        )
+        .await?;
+        Ok(NodeExec::Failed {
+            message,
+            output: None,
+        })
+    }
+
     /// Run a `Loop` node (§10.3): drive `body` at `"{loop}/{i}"` each iteration until
     /// `gate` says Stop or `max_iters` is reached. A leaf `ModelCall`/`Agent` body
     /// threads its answer TEXT forward as the next iteration's input (refine); a
     /// `Subgraph` body drives an authored graph fresh per iteration (no thread —
     /// each iteration re-runs over the same `input`); an `Expand` body plans+executes
     /// per iteration and threads its whole output (the sink map) as the next planner
-    /// input (the gate-agent lands in slice-5 Task 4). A graph-body
-    /// Failed/Paused fails/pauses the Loop exactly like a leaf body. Cap-without-Stop
+    /// input. A graph-body
+    /// Failed/Paused fails/pauses the Loop exactly like a leaf body. The `gate` is
+    /// either `Pure` (an SP-1 pure predicate over the iteration output, no journaling)
+    /// or `Agent` — a gate-agent driven over the output at `"{loop}/{i}/__gate__"`,
+    /// whose journaled answer feeds the pure `stop_when` (a gate-agent Failed fails the
+    /// Loop, a gate-agent Paused pauses it). Cap-without-Stop
     /// completes best-effort (`converged: false`), never a bare fail; a body failure
     /// fails the Loop; a body pause pauses the Loop. Resume replays completed
-    /// iterations (memo-hit, no re-spend) and recomputes the (pure) gate, so it stops
-    /// at the same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are
+    /// iterations (memo-hit, no re-spend) and recomputes the gate — a pure gate from
+    /// the memoized output, a gate-agent from its memoized turns — so it stops at the
+    /// same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are
     /// fold-guarded (like `run_map`) so a replayed completed Loop does not re-journal
     /// them.
     pub(super) async fn run_loop(
@@ -471,28 +503,36 @@ impl Executor {
                 Ok(o) => o,
                 Err(message) => {
                     let msg = format!("loop {:?} failed at iteration {i}: {message}", loop_node.id);
-                    self.append(
-                        run,
-                        JournalEvent::NodeFailed {
-                            node: loop_node.id.clone(),
-                            error: msg.clone(),
-                        },
-                    )
-                    .await?;
-                    return Ok(NodeExec::Failed {
-                        message: msg,
-                        output: None,
-                    });
+                    return self.fail_loop(run, &loop_node.id, msg).await;
                 }
             };
             ran = i + 1;
             last_output = output.clone();
             let stop = match gate {
                 GateSpec::Pure(g) => g.should_stop(&output),
-                // TEMPORARY (Task 2): gate-agent lands in Task 4 (async drive + early-return
-                // for its pause/failure, which is why the gate is inline, not a bool helper).
-                GateSpec::Agent { .. } => {
-                    unreachable!("gate-agent implemented in slice-5 Task 4")
+                // A gate-agent (§4.3/D3): drive it over this iteration's `output` at the
+                // reserved path `"{loop}/{i}/__gate__"`, then apply the pure `stop_when`
+                // to ITS answer (not the body output). The agent's own ReAct turns are
+                // journaled/memoized — no separate gate journaling — so a resume replays
+                // the identical Stop/Continue decision from the memo (no gateway re-call).
+                GateSpec::Agent { agent, stop_when } => {
+                    let gate_path = NodeId(format!("{path}/__gate__"));
+                    match self
+                        .drive_agent(run, &gate_path, agent, &output, &[], fold, None)
+                        .await?
+                    {
+                        AgentStep::Completed(ans) => stop_when.should_stop(&ans),
+                        // A gate-agent failure fails the Loop (like a body-iteration failure).
+                        AgentStep::Failed(m) => {
+                            let msg = format!(
+                                "loop {:?} gate agent failed at iteration {i}: {m}",
+                                loop_node.id
+                            );
+                            return self.fail_loop(run, &loop_node.id, msg).await;
+                        }
+                        // A gate-agent pause (in-doubt Mutation / quota) pauses the Loop.
+                        AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
+                    }
                 }
             };
             if stop {
