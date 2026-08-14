@@ -120,6 +120,13 @@ pub enum JournalEvent {
         #[serde(default)]
         node_plans: HashMap<NodeId, NodePlan>,
     },
+    /// The planner-selection decision (SP-3 s4B): node `node` selected planner
+    /// `agent`. Journaled BEFORE driving the planner, so a mid-plan resume reuses the
+    /// same planner — the memo for the selection (symmetric with `PlanExpanded`).
+    PlannerSelected {
+        node: NodeId,
+        agent: crate::registry::AgentRef,
+    },
     /// A shared-scope blackboard publish (§8). Journaled so a resume rebuilds the
     /// `ContextStore` (as refs, no blob load) via
     /// [`ContextStore::insert_ref`](crate::context::ContextStore::insert_ref). The
@@ -322,6 +329,22 @@ mod tests {
                 assert_eq!(subgraph.nodes.len(), 1);
             }
             other => panic!("expected PlanExpanded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn planner_selected_event_roundtrips() {
+        let e = JournalEvent::PlannerSelected {
+            node: NodeId("e".into()),
+            agent: crate::registry::AgentRef("planner".into()),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        match serde_json::from_str::<JournalEvent>(&s).unwrap() {
+            JournalEvent::PlannerSelected { node, agent } => {
+                assert_eq!(node, NodeId("e".into()));
+                assert_eq!(agent.0, "planner");
+            }
+            other => panic!("expected PlannerSelected, got {other:?}"),
         }
     }
 }

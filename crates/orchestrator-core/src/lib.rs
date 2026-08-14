@@ -32,7 +32,7 @@ pub use journal::{
 pub use plan::{
     NodeNeeds, NodePlan, PlanError, PlannedGraph, RESERVED_PLAN_ID, feasible, parse_plan,
 };
-pub use planner::Planner;
+pub use planner::{PLANNER_AREA, Planner, PlannerSelector, RulePlannerSelector};
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use registry::{
     Activation, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions,
