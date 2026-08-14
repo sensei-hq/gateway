@@ -11,24 +11,38 @@ source: crates/orchestrator*
 # Execution Graph
 
 > **Status: Partial (Phase 3 · SP-1/3).** Design §10. Implemented node kinds:
-> `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`**, **`Subgraph`**, and
-> **`Branch`** (walking skeleton).
+> `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`** (leaf + graph bodies +
+> gate-agent), **`Subgraph`**, **`Branch`**, and **`Expand`** (runtime
+> PlanDelta / planner-driven).
 > Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
-> scheduler are live. **`Loop`** (loop-node design
-> [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)):
-> `NodeKind::Loop { body: MapBody, input, gate: LoopGate, max_iters }` iterates
-> `body` at path `"{loop}/{i}"`, threads each iteration's output into the next as
-> input (refine), and stops when a **deterministic** `LoopGate`
-> (`TextContains`/`FieldTrue`, pure over the body output) fires or `max_iters` is
-> reached. Cap-without-Stop completes best-effort (`converged: false`) — never a
-> bare fail (§10.3); a body failure fails the Loop (naming the iteration); an
-> Agent-body pause pauses the Loop. Resume replays completed iterations (memo-hit,
-> zero re-spend) and recomputes the pure gate, so it stops at the same iteration —
-> no gate journaling. Output: `{ iterations, converged, output }`.
-> **Deferred:** multi-node loop bodies (Loop-over-`Subgraph`), `PlanDelta`
-> runtime expansion, an LLM/fuzzy gate agent, a cost/timeout budget backstop (the
-> budget axis is dormant, so `max_iters` is the only backstop), and
-> nested-loop/global node caps.
+> scheduler are live. **`Loop`** (SP-1 loop-node
+> [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)
+> + SP-3 slice 5 loops-of-graphs
+> [`../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md`](../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md)):
+> `NodeKind::Loop { body: LoopBody, input, gate: GateSpec, max_iters }` iterates
+> `body` at path `"{loop}/{i}"` until the `gate` says Stop or `max_iters` is reached.
+> **`LoopBody`** is a **leaf** (`ModelCall`/`Agent` — threads the iteration's output
+> text into the next as input, the classic refine) or a **graph** body:
+> **`Subgraph`** drives an authored DAG fresh each iteration (no thread — the gate
+> decides stop) and **`Expand`** plans+executes each iteration, threading the whole
+> iteration output into the next planning input (the **refine** that powers the
+> coordinator). **`GateSpec`** is **`Pure(LoopGate)`** (a deterministic predicate over
+> the iteration output — recomputed on resume, no journaling; the leaf-body convergence
+> path) or **`Agent { agent, stop_when }`** — a **gate-agent** driven at the reserved
+> `"{loop}/{i}/__gate__"` whose journaled answer feeds a pure `stop_when` predicate (the
+> semantic Continue|Stop is an LLM decision, memoized ⇒ a resume replays it; graph bodies
+> converge via the gate-agent, since a pure gate can't match a nested sink map).
+> Cap-without-Stop completes best-effort (`converged: false`) — never a bare fail
+> (§10.3); a body/gate failure fails the Loop (naming the iteration), a body/gate pause
+> pauses it. Resume replays completed iterations + gate decisions from the memo (zero
+> re-spend) and stops at the same iteration. A loop-of-`Expand`s is bounded by the
+> run-scoped expansion/node/depth caps (charged per iteration, seeded across resume).
+> Output: `{ iterations, converged, output }`.
+> **The coordinator** = `Loop{ body: Expand{planner}, gate: Agent{…} }` —
+> plan→execute→gate→replan, native and resume-safe.
+> **Deferred:** a cost/timeout budget backstop (the budget axis is dormant, so
+> `max_iters` + the node caps are the backstops), replan-on-failure, and Subgraph-body
+> cross-iteration state (plan-scope blackboard).
 >
 > - **`Subgraph { graph }`** (SP-3 slice 1) — a node whose work is a nested DAG,
 >   driven under the node's path (`{node}/…`) in the same run (namespaced ids ⇒ nested
@@ -55,6 +69,17 @@ source: crates/orchestrator*
 >   propagate like `Subgraph`. The output sink-map keys are the SELECTED arm's local
 >   sink ids, so they vary by arm — a downstream consumer that needs a stable key
 >   should give every arm a common sink node id (e.g. `result`).
+> - **`Expand { input, planner }`** (SP-3 slices 3/4A/4B) — a node whose subgraph is
+>   produced at **runtime** by a `Planner`, journaled as `PlanExpanded` and spliced under
+>   the node's path (reconstructed on resume from the journal — the planner is **not**
+>   re-invoked). `PlannerRef::{Injected, Agent, Select}` chooses the planner: an injected
+>   trait, a journaled ReAct planner sub-run at `"{expand}/__plan__"`, or a
+>   `PlannerSelector` that picks a `planning`-area agent for the goal (its pick journaled
+>   as `PlannerSelected`). A pure `feasible` gate validates the plan (agent-refs, reserved
+>   ids `__plan__`/`__gate__`, DAG, node count) before splicing; run-scoped
+>   `max_expansions`/`max_nodes`/`max_depth` caps backstop self-DoS (a breach is a hard
+>   `GlobalCapExceeded`). Output = the spliced subgraph's sink map; failure/pause propagate
+>   like `Subgraph`.
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed
