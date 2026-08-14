@@ -7479,15 +7479,31 @@ async fn select_resume_before_plan_expanded_reuses_the_recorded_pick() {
 #[tokio::test]
 async fn llm_planner_selector_picks_the_named_agent_from_the_menu() {
     use crate::executor::selector::LlmPlannerSelector;
-    // Scripted gateway returns the chosen agent name as the response content.
-    let (gateway, _c) = scripted_gateway(vec![final_response("beta")]).await;
+    // Scripted gateway returns the chosen agent name (with surrounding whitespace, so the
+    // selector's `.trim()` is exercised) as the response content.
+    let (gateway, _c) = scripted_gateway(vec![final_response("  beta \n")]).await;
     // The scripted-gateway fixture only wires chain "c" (single_chain_config); the plan's
     // literal "select.chain" isn't configured, so the gateway would return "no candidates".
-    let sel = LlmPlannerSelector::new(Arc::new(gateway), "c");
+    // The registry (alpha+beta, area=="planning") lets the selector render a capability menu.
+    let sel = LlmPlannerSelector::new(Arc::new(gateway), two_planner_registry(), "c");
     let cands = vec![AgentRef("alpha".into()), AgentRef("beta".into())];
     let got = sel
         .select(&serde_json::json!({ "goal": "do X" }), &cands)
         .await
         .expect("select");
     assert_eq!(got, AgentRef("beta".into()));
+}
+
+#[tokio::test]
+async fn llm_planner_selector_errors_on_empty_content() {
+    use crate::executor::selector::LlmPlannerSelector;
+    // Empty response content → a clear diagnostic Err (not AgentRef("") — the executor's
+    // Select arm would otherwise report it as a non-candidate pick).
+    let (gateway, _c) = scripted_gateway(vec![final_response("")]).await;
+    let sel = LlmPlannerSelector::new(Arc::new(gateway), two_planner_registry(), "c");
+    let cands = vec![AgentRef("alpha".into()), AgentRef("beta".into())];
+    let err = sel
+        .select(&serde_json::json!({ "goal": "do X" }), &cands)
+        .await;
+    assert!(err.is_err(), "empty content → Err, got {err:?}");
 }

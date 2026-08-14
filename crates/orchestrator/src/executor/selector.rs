@@ -8,19 +8,23 @@ use std::sync::Arc;
 use gateway::Gateway;
 use kernel::types::capability::Capability;
 use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload};
-use orchestrator_core::{AgentRef, OrchestratorError, PlannerSelector};
+use orchestrator_core::{AgentRef, OrchestratorError, PlannerSelector, Registry};
 
 /// Picks a planner via one `gateway.execute` over `chain`; parses the response content
-/// as the chosen agent name (validated against `candidates` by the caller).
+/// as the chosen agent name (validated against `candidates` by the caller). The menu it
+/// renders describes each candidate's capability (`name (area/kind)`, looked up in the
+/// registry) so the reasoning call sees what each planner IS, not just its name.
 pub struct LlmPlannerSelector {
     gateway: Arc<Gateway>,
+    registry: Arc<Registry>,
     chain: String,
 }
 
 impl LlmPlannerSelector {
-    pub fn new(gateway: Arc<Gateway>, chain: impl Into<String>) -> Self {
+    pub fn new(gateway: Arc<Gateway>, registry: Arc<Registry>, chain: impl Into<String>) -> Self {
         Self {
             gateway,
+            registry,
             chain: chain.into(),
         }
     }
@@ -35,7 +39,10 @@ impl PlannerSelector for LlmPlannerSelector {
     ) -> Result<AgentRef, OrchestratorError> {
         let menu = candidates
             .iter()
-            .map(|a| format!("- {}", a.0))
+            .map(|a| match self.registry.agent(&a.0) {
+                Some(def) => format!("- {} ({}/{})", a.0, def.area, def.kind),
+                None => format!("- {}", a.0),
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let system = "Choose the single best planner agent for the goal. \
@@ -66,6 +73,11 @@ impl PlannerSelector for LlmPlannerSelector {
             .await
             .map_err(|e| OrchestratorError::Gateway(e.to_string()))?;
         let name = resp.content.unwrap_or_default().trim().to_string();
+        if name.is_empty() {
+            return Err(OrchestratorError::Gateway(
+                "planner selector returned empty content".into(),
+            ));
+        }
         Ok(AgentRef(name))
     }
 }
