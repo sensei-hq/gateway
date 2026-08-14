@@ -376,7 +376,7 @@ impl Executor {
     /// `Subgraph` body drives an authored graph fresh per iteration (no thread —
     /// each iteration re-runs over the same `input`); an `Expand` body plans+executes
     /// per iteration and threads its whole output (the sink map) as the next planner
-    /// input (Expand + the gate-agent land in slice-5 Tasks 3/4). A graph-body
+    /// input (the gate-agent lands in slice-5 Task 4). A graph-body
     /// Failed/Paused fails/pauses the Loop exactly like a leaf body. Cap-without-Stop
     /// completes best-effort (`converged: false`), never a bare fail; a body failure
     /// fails the Loop; a body pause pauses the Loop. Resume replays completed
@@ -446,9 +446,25 @@ impl Executor {
                         NodeExec::Paused { reason } => return Ok(NodeExec::Paused { reason }),
                     }
                 }
-                // TEMPORARY (Task 2): Expand body lands in Task 3 (uses drive_expand_with).
-                LoopBody::Expand { .. } => {
-                    unreachable!("Loop Expand body implemented in slice-5 Task 3")
+                // An Expand body: plan+execute a fresh graph under `"{loop}/{i}"` each
+                // iteration (shared `drive_expand_with` — resume/cap/journal), the
+                // `Completed` sink map is this iteration's output; a failure fails the
+                // Loop, a pause pauses it.
+                LoopBody::Expand { planner } => {
+                    match self
+                        .drive_expand_with(
+                            run,
+                            &NodeId(path.clone()),
+                            &current_input,
+                            planner,
+                            fold,
+                        )
+                        .await?
+                    {
+                        NodeExec::Completed(o) => Ok(o),
+                        NodeExec::Failed { message, .. } => Err(message),
+                        NodeExec::Paused { reason } => return Ok(NodeExec::Paused { reason }),
+                    }
                 }
             };
             let output = match output_res {
