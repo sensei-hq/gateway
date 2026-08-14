@@ -3992,6 +3992,75 @@ async fn loop_over_an_expand_body_refines_across_iterations() {
     );
 }
 
+/// AC3 (behavioral) — the Expand-body refine threads: iteration 1's planner input IS
+/// iteration 0's output (sink map), not the original input. A recording planner captures
+/// each plan(input) call; asserting seen[1] carries iter-0's sink proves the refine.
+#[tokio::test]
+async fn loop_expand_body_refine_threads_prior_output_into_next_planner_input() {
+    use std::sync::Mutex;
+    struct RecordingPlanner {
+        plan: Graph,
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl orchestrator_core::Planner for RecordingPlanner {
+        async fn plan(&self, input: &serde_json::Value) -> Result<Graph, OrchestratorError> {
+            self.seen.lock().unwrap().push(input.clone());
+            Ok(self.plan.clone())
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let planner = RecordingPlanner {
+        plan: Graph {
+            nodes: vec![mc("n1", None)],
+        },
+        seen: seen.clone(),
+    };
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(Arc::new(planner));
+    let loop_node = Node {
+        id: NodeId("lp".into()),
+        kind: NodeKind::Loop {
+            body: orchestrator_core::LoopBody::Expand {
+                planner: orchestrator_core::PlannerRef::Injected,
+            },
+            input: serde_json::json!({ "goal": "start" }),
+            gate: orchestrator_core::GateSpec::Pure(LoopGate::TextContains("zzz-never".into())),
+            max_iters: 2,
+        },
+        deps: vec![],
+    };
+    let out = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![loop_node],
+            },
+        )
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "planner called once per iteration: {seen:?}");
+    assert_eq!(
+        seen[0],
+        serde_json::json!({ "goal": "start" }),
+        "iter 0 sees the initial input"
+    );
+    // iter 1's planner input is iter 0's OUTPUT (the sink map {n1: {model,text}}), NOT the initial input.
+    assert!(
+        seen[1].get("n1").is_some(),
+        "iter 1 planner input must carry iter 0's sink output (refine); got {:?}",
+        seen[1]
+    );
+    assert_ne!(
+        seen[1],
+        serde_json::json!({ "goal": "start" }),
+        "iter 1 must NOT re-see the initial input"
+    );
+}
+
 /// AC7 — a body failure inside any Loop iteration fails the whole Loop. The planned
 /// single ModelCall fails on the gateway (`failing_after_gateway(0)`), so iteration 0's
 /// expansion fails → the Loop node surfaces as failed (no silent finalize).
