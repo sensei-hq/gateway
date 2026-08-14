@@ -20,6 +20,7 @@ mod content;
 mod durability;
 mod expand;
 mod fanout;
+pub(crate) mod selector;
 mod subgraph;
 mod support;
 use support::{
