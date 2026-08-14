@@ -3838,6 +3838,122 @@ async fn loop_over_a_subgraph_body_iterates_and_stops() {
 // convergence tests (`loop_stops_when_the_gate_fires`), and the Subgraph sink-map
 // output shape by `loop_over_a_subgraph_body_iterates_and_stops` above.
 
+/// AC3 — a Loop over an Expand body: each iteration plans+executes; the refine-thread
+/// feeds iteration i's output into iteration i+1's planner input. A FixedPlanner emits a
+/// single-ModelCall plan; assert the loop runs max_iters (the refine is exercised
+/// structurally — the behavioral refine proof is the coordinator e2e in Task 5).
+#[tokio::test]
+async fn loop_over_an_expand_body_refines_across_iterations() {
+    let plan = Graph {
+        nodes: vec![mc("n1", None)],
+    };
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(Arc::new(FixedPlanner(plan)));
+    let loop_node = Node {
+        id: NodeId("lp".into()),
+        kind: NodeKind::Loop {
+            body: LoopBody::Expand {
+                planner: orchestrator_core::PlannerRef::Injected,
+            },
+            input: serde_json::json!({ "goal": "g" }),
+            gate: GateSpec::Pure(LoopGate::TextContains("zzz-never".into())),
+            max_iters: 2,
+        },
+        deps: vec![],
+    };
+    let out = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![loop_node],
+            },
+        )
+        .await
+        .expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    let o = &out.outputs[&NodeId("lp".into())];
+    assert_eq!(o["iterations"], 2);
+    assert_eq!(
+        o["converged"], false,
+        "pure gate never matches an Expand sink map → best-effort"
+    );
+}
+
+/// AC7 — a body failure inside any Loop iteration fails the whole Loop. The planned
+/// single ModelCall fails on the gateway (`failing_after_gateway(0)`), so iteration 0's
+/// expansion fails → the Loop node surfaces as failed (no silent finalize).
+#[tokio::test]
+async fn loop_expand_body_iteration_failure_fails_the_loop() {
+    let (gateway, _c) = failing_after_gateway(0).await; // the planned node's ModelCall fails
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(Arc::new(FixedPlanner(Graph {
+            nodes: vec![mc("n1", None)],
+        })));
+    let loop_node = Node {
+        id: NodeId("lp".into()),
+        kind: NodeKind::Loop {
+            body: LoopBody::Expand {
+                planner: orchestrator_core::PlannerRef::Injected,
+            },
+            input: serde_json::json!({ "goal": "g" }),
+            gate: GateSpec::Pure(LoopGate::TextContains("zzz-never".into())),
+            max_iters: 2,
+        },
+        deps: vec![],
+    };
+    let out = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![loop_node],
+            },
+        )
+        .await
+        .expect("run yields an outcome");
+    assert!(
+        matches!(&out.failed, Some((n, _)) if n == &NodeId("lp".into())),
+        "an Expand-body iteration failure fails the loop: {out:?}"
+    );
+}
+
+/// AC8 — a Loop over Expand composes with the global expansion cap: each iteration is
+/// one expansion, so the 2nd iteration breaches `max_expansions(1)` with a hard
+/// `GlobalCapExceeded` (a loud halt, not a soft best-effort finalize).
+#[tokio::test]
+async fn loop_of_expands_respects_max_expansions_cap() {
+    let (gateway, _c) = recording_gateway().await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_planner(Arc::new(FixedPlanner(Graph {
+            nodes: vec![mc("n1", None)],
+        })))
+        .with_max_expansions(1);
+    let loop_node = Node {
+        id: NodeId("lp".into()),
+        kind: NodeKind::Loop {
+            body: LoopBody::Expand {
+                planner: orchestrator_core::PlannerRef::Injected,
+            },
+            input: serde_json::json!({ "goal": "g" }),
+            gate: GateSpec::Pure(LoopGate::TextContains("zzz-never".into())),
+            max_iters: 3,
+        },
+        deps: vec![],
+    };
+    let res = exec
+        .run(
+            RunId(uuid::Uuid::new_v4()),
+            &Graph {
+                nodes: vec![loop_node],
+            },
+        )
+        .await;
+    assert!(
+        matches!(&res, Err(OrchestratorError::GlobalCapExceeded { cap, .. }) if cap == "max_expansions"),
+        "2nd iteration's expansion breaches the cap: {res:?}"
+    );
+}
+
 // ============================= SP-1 OrchestratorHooks ==========================
 
 /// A hooks spy: each fired hook appends a "label(args)" string.
