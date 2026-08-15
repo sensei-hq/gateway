@@ -11,11 +11,12 @@ use orchestrator_core::{
 use orchestrator_store::InMemoryJournal;
 
 use crate::agent::tools::{
-    AlwaysIndeterminate, Calc, NoteReconciler, ReconcileRegistry, RecordNote, Search, Tool,
-    ToolRegistry,
+    AlwaysIndeterminate, Calc, NoteReconciler, ReconcileRegistry, RecordNote, ScopedWriter, Search,
+    Tool, ToolRegistry,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, OrchestratorHooks, Registry,
+    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, OrchestratorHooks,
+    Permissions, Registry,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +53,28 @@ fn effect_recorded_count(events: &[(Seq, JournalEvent)], eid: &EffectId) -> usiz
         .count()
 }
 
+/// The inline value recorded by the `EffectRecorded` for one effect id (these
+/// tests wire no `ContentStore`, so every output stays inline). `None` if no such
+/// record — used by the gate tests to read a call's denial/allow output.
+fn recorded_output(events: &[(Seq, JournalEvent)], eid: &EffectId) -> Option<serde_json::Value> {
+    events.iter().find_map(|(_, e)| match e {
+        JournalEvent::EffectRecorded {
+            effect_id,
+            output: EffectOutput::Inline(v),
+            ..
+        } if effect_id == eid => Some(v.clone()),
+        _ => None,
+    })
+}
+
+/// Whether an `EffectIntent` was journaled for one effect id — a DENIED Mutation
+/// never journals one (it skips two-phase), so this is `false` for a denial.
+fn has_effect_intent(events: &[(Seq, JournalEvent)], eid: &EffectId) -> bool {
+    events
+        .iter()
+        .any(|(_, e)| matches!(e, JournalEvent::EffectIntent { effect_id: r, .. } if r == eid))
+}
+
 fn agent_def(chain: &str) -> AgentDefinition {
     AgentDefinition {
         name: "a".into(),
@@ -66,9 +89,21 @@ fn agent_def(chain: &str) -> AgentDefinition {
     }
 }
 
-/// A demo registry/executor: one agent "a" on the recording chain "c".
+/// A demo registry/executor: one agent "a" on the recording chain "c". The agent
+/// LISTS the demo `record_note` (Mutation) and `search` (Observation) tools it may
+/// call, and the registry carries their specs so `assemble_prompt` compiles them.
+/// Both tools carry EMPTY permissions, so the agent's empty grant covers them and
+/// the SP-4 s1 authorization gate is transparent for these pre-gate tool tests.
 fn agent_registry(chain: &str) -> Arc<Registry> {
-    Arc::new(Registry::default().with_agent(agent_def(chain)))
+    Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                tools: vec!["record_note".into(), "search".into()],
+                ..agent_def(chain)
+            })
+            .with_tool(RecordNote::new(Arc::new(std::sync::Mutex::new(Vec::new()))).spec())
+            .with_tool(Search::new(Arc::new(AtomicUsize::new(0))).spec()),
+    )
 }
 
 fn agent_node(id: &str, agent: &str, input: &str) -> Node {
@@ -98,6 +133,35 @@ fn tool_agent_registry() -> Arc<Registry> {
 }
 fn calc_tools() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::default().with_tool(Arc::new(Calc)))
+}
+
+/// A path-only grant `{paths}` (the shape the SP-4 gate tests hand an agent for
+/// the `fs.write` ScopedWriter).
+fn path_grant(paths: &[&str]) -> Permissions {
+    Permissions {
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+/// A single-agent registry for the SP-4 authorization-gate tests: agent "a" on
+/// chain "c" that LISTS `tools` and holds `grants`, with the `fs.write`
+/// ScopedWriter *spec* compiled into the prompt (its executable side — the sink —
+/// is wired separately via `ToolRegistry`). `with_agent` does NOT validate, so a
+/// grant that under-covers a tool is allowed here and enforced at call time.
+fn writer_registry(
+    tools: Vec<String>,
+    grants: std::collections::HashMap<String, Permissions>,
+) -> Arc<Registry> {
+    Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                grants,
+                tools,
+                ..agent_def("c")
+            })
+            .with_tool(ScopedWriter::new(Arc::new(std::sync::Mutex::new(Vec::new()))).spec()),
+    )
 }
 
 #[tokio::test]
@@ -712,6 +776,246 @@ async fn mutation_two_phase_journals_intent_then_recorded() {
         "EffectRecorded(n1)",
         "the Mutation's EffectRecorded immediately follows its Intent: {labels:?}"
     );
+}
+
+/// SP-4 s1 AC4 (authorized): an agent that LISTS `fs.write` AND holds a grant
+/// covering the call's concrete path executes the tool normally — the gate is
+/// transparent. The Mutation still runs two-phase (Intent→Recorded) and the side
+/// effect lands exactly once.
+#[tokio::test]
+async fn granted_tool_call_executes() {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let writer = Arc::new(ScopedWriter::new(sink.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "write it")],
+    };
+    let grants =
+        std::collections::HashMap::from([("fs.write".to_string(), path_grant(&["/workspace"]))]);
+    let (gw, calls) = scripted_gateway(vec![
+        tool_call_response(
+            "t1",
+            "fs.write",
+            "{\"path\":\"/workspace/a.txt\",\"content\":\"x\"}",
+        ),
+        final_response("done"),
+    ])
+    .await;
+    let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(writer_registry(vec!["fs.write".into()], grants))
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(writer)))
+        .run(run, &graph)
+        .await
+        .expect("run completes");
+
+    assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "two model turns (tool + final)"
+    );
+    // The tool RAN: the concrete path is in the sink exactly once.
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["/workspace/a.txt".to_string()],
+        "the granted write reached the tool"
+    );
+
+    // The Mutation is two-phase: its Intent immediately precedes its Recorded, at
+    // the turn-0 tool effect id.
+    let events = journal.load(run).await.unwrap();
+    let tool_eid = effect_id("n1", 0, 1);
+    assert!(
+        has_effect_intent(&events, &tool_eid),
+        "a granted Mutation journals an EffectIntent"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &tool_eid),
+        1,
+        "and exactly one EffectRecorded"
+    );
+    // The recorded output is the tool's real result, NOT a denial.
+    let out = recorded_output(&events, &tool_eid).expect("tool effect recorded");
+    assert_eq!(out["written"], "/workspace/a.txt");
+    assert_ne!(out["error"], "permission_denied");
+}
+
+/// SP-4 s1 AC5 (unauthorized → fed back): an agent that LISTS `fs.write` but holds
+/// NO grant is denied — the tool never runs, the denial is recorded as a Pure
+/// effect (NO `EffectIntent`, since the Mutation is skipped) and fed back to the
+/// agent, which then finishes. A second variant proves a tool that is NOT listed
+/// at all is denied identically.
+#[tokio::test]
+async fn ungranted_tool_is_denied_and_fed_back() {
+    let tool_eid = effect_id("n1", 0, 1);
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "write it")],
+    };
+
+    // Variant A: LISTED but no grant → denied (grant does not cover the need).
+    {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (gw, _c) = scripted_gateway(vec![
+            tool_call_response(
+                "t1",
+                "fs.write",
+                "{\"path\":\"/workspace/a.txt\",\"content\":\"x\"}",
+            ),
+            final_response("done"),
+        ])
+        .await;
+        let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(writer_registry(
+                vec!["fs.write".into()],
+                std::collections::HashMap::new(),
+            ))
+            .with_tools(Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(ScopedWriter::new(sink.clone()))),
+            ))
+            .run(run, &graph)
+            .await
+            .expect("run completes despite the denial");
+
+        assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+        // The tool NEVER ran.
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "an ungranted write must not reach the tool"
+        );
+        let events = journal.load(run).await.unwrap();
+        // The denial IS the call's recorded output, fed back to the agent.
+        let out = recorded_output(&events, &tool_eid).expect("denied call still records an effect");
+        assert_eq!(out["error"], "permission_denied");
+        assert_eq!(out["tool"], "fs.write");
+        // A denied Mutation skips two-phase: EffectRecorded, but NO EffectIntent.
+        assert_eq!(
+            effect_recorded_count(&events, &tool_eid),
+            1,
+            "the denial is recorded once"
+        );
+        assert!(
+            !has_effect_intent(&events, &tool_eid),
+            "a denied Mutation journals NO EffectIntent"
+        );
+    }
+
+    // Variant B: NOT listed at all → denied for the same reason (fed back, no run).
+    {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let grants = std::collections::HashMap::from([(
+            "fs.write".to_string(),
+            path_grant(&["/workspace"]),
+        )]);
+        let (gw, _c) = scripted_gateway(vec![
+            tool_call_response(
+                "t1",
+                "fs.write",
+                "{\"path\":\"/workspace/a.txt\",\"content\":\"x\"}",
+            ),
+            final_response("done"),
+        ])
+        .await;
+        // The agent holds a covering grant but does NOT list the tool.
+        let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(writer_registry(vec![], grants))
+            .with_tools(Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(ScopedWriter::new(sink.clone()))),
+            ))
+            .run(run, &graph)
+            .await
+            .expect("run completes despite the denial");
+
+        assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "an unlisted tool must not run even with a covering grant"
+        );
+        let events = journal.load(run).await.unwrap();
+        let out = recorded_output(&events, &tool_eid).expect("denied call still records an effect");
+        assert_eq!(out["error"], "permission_denied");
+        assert!(
+            !has_effect_intent(&events, &tool_eid),
+            "an unlisted-tool denial journals NO EffectIntent"
+        );
+    }
+}
+
+/// SP-4 s1 AC6 (per-argument): with a `/workspace` grant, an out-of-grant call
+/// (`/etc/passwd`) is denied and fed back, then an in-grant call
+/// (`/workspace/ok.txt`) on a later turn succeeds — proving the gate authorizes
+/// each call against its CONCRETE args, not the tool's coarse static surface. The
+/// denial and the allow land at DISTINCT tool effect ids.
+#[tokio::test]
+async fn out_of_grant_argument_denied_then_in_grant_succeeds() {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "write it")],
+    };
+    let grants =
+        std::collections::HashMap::from([("fs.write".to_string(), path_grant(&["/workspace"]))]);
+    let (gw, calls) = scripted_gateway(vec![
+        // turn 0: out-of-grant path → denied + fed back.
+        tool_call_response(
+            "t1",
+            "fs.write",
+            "{\"path\":\"/etc/passwd\",\"content\":\"x\"}",
+        ),
+        // turn 1: in-grant path → allowed, runs the tool.
+        tool_call_response(
+            "t2",
+            "fs.write",
+            "{\"path\":\"/workspace/ok.txt\",\"content\":\"x\"}",
+        ),
+        // turn 2: final answer.
+        final_response("done"),
+    ])
+    .await;
+    let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(writer_registry(vec!["fs.write".into()], grants))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(ScopedWriter::new(sink.clone()))),
+        ))
+        .run(run, &graph)
+        .await
+        .expect("run completes");
+
+    assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+    assert_eq!(calls.lock().unwrap().len(), 3, "three model turns");
+    // Only the in-grant write reached the tool.
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["/workspace/ok.txt".to_string()],
+        "the out-of-grant write was denied; only the in-grant one ran"
+    );
+
+    let events = journal.load(run).await.unwrap();
+    let denied_eid = effect_id("n1", 0, 1); // turn-0 tool call
+    let allowed_eid = effect_id("n1", 1, 1); // turn-1 tool call
+    assert_ne!(denied_eid, allowed_eid, "distinct tool effect ids");
+
+    // The denial: a Pure EffectRecorded, NO EffectIntent.
+    let denied = recorded_output(&events, &denied_eid).expect("denied call recorded");
+    assert_eq!(denied["error"], "permission_denied");
+    assert!(
+        !has_effect_intent(&events, &denied_eid),
+        "the denied out-of-grant Mutation journals NO EffectIntent"
+    );
+
+    // The allow: a two-phase Mutation — EffectIntent + EffectRecorded with the real
+    // tool output.
+    assert!(
+        has_effect_intent(&events, &allowed_eid),
+        "the in-grant Mutation journals an EffectIntent"
+    );
+    let allowed = recorded_output(&events, &allowed_eid).expect("allowed call recorded");
+    assert_eq!(allowed["written"], "/workspace/ok.txt");
 }
 
 /// Acceptance §8.3 (happy path, resume): a completed Mutation (Intent+Recorded

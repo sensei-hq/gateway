@@ -37,6 +37,11 @@ struct AgentRun<'a> {
     tools: Vec<ToolDefinition>,
     min_win: Option<u32>,
     fold: &'a Fold,
+    // The acting agent's authorization surface (owned clones, built once per
+    // agent-node-run) — the SP-4 s1 gate in `execute_tool_effect` checks each tool
+    // call against these: the tool must be LISTED and its grant must COVER the need.
+    agent_tools: Vec<String>,
+    agent_grants: std::collections::HashMap<String, orchestrator_core::Permissions>,
 }
 
 impl Executor {
@@ -78,6 +83,8 @@ impl Executor {
             tools,
             min_win,
             fold,
+            agent_tools: agent.tools.clone(),
+            agent_grants: agent.grants.clone(),
         };
 
         let mut messages: Vec<Message> = vec![Message::text(MessageRole::User, query)];
@@ -292,6 +299,11 @@ impl Executor {
         teid: &EffectId,
         call: &ToolCall,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        // Unparseable `arguments` degrade to `Null` (a deliberate, currently-safe
+        // posture): the gate then derives an EMPTY `need` (so it passes), but every
+        // tool's `call` fail-closes on missing/invalid args and a non-overriding tool
+        // falls back to its static surface — so no unauthorized side effect escapes. A
+        // future strict mode could instead deny outright on unparseable args.
         let args: serde_json::Value =
             serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
         let tih = tool_input_hash(&call.name, &call.arguments);
@@ -314,6 +326,39 @@ impl Executor {
             if !stale {
                 return Ok(ToolOutcome::Ok(self.materialize(output).await?));
             }
+        }
+
+        // SP-4 s1 authorization gate: the acting agent must LIST this tool AND hold a
+        // grant covering the concrete permissions THIS call needs. Denials are fed
+        // back to the agent (recorded as a Pure effect ⇒ replayed on resume). Runs on
+        // the LIVE path only — a memo hit above already replayed a recorded allow/deny.
+        //
+        // Fail asymmetry: an *unauthorized* call is a SOFT, recoverable denial fed back
+        // to the agent (policy violation — the agent can adapt), whereas an *unknown*
+        // tool (listed+granted but absent from the ToolRegistry) HARD-fails the node via
+        // `execute` → `UnknownTool` (a misconfiguration — loud, not recoverable).
+        let need = self.tools.required_of(&call.name, &args);
+        let no_grant = orchestrator_core::Permissions::default();
+        let grant = ar.agent_grants.get(&call.name).unwrap_or(&no_grant);
+        let listed = ar.agent_tools.iter().any(|t| t == &call.name);
+        if !(listed && grant.covers(&need)) {
+            // Model-facing reason stays TERSE: NEVER enumerate the grant (the
+            // allowlist) into the transcript/journal — the denied party IS the model,
+            // and handing it the full allowlist invites a redirect to another granted
+            // resource (confused-deputy / injection surface). Operators get the full
+            // need/grant via the debug log.
+            let detail = if !listed {
+                format!("tool '{}' is not available to this agent", call.name)
+            } else {
+                format!(
+                    "the requested access for tool '{}' is not permitted by its grant",
+                    call.name
+                )
+            };
+            tracing::debug!(tool = %call.name, ?need, ?grant, listed, "tool permission denied");
+            return self
+                .record_denied_effect(ar, teid, call, &tih, detail)
+                .await;
         }
 
         // Live path. A Mutation is two-phase (Intent → side effect → Recorded,
@@ -440,6 +485,40 @@ impl Executor {
             }
             None => false,
         }
+    }
+
+    /// Record a permission denial as the call's effect output — a Pure, memoize-
+    /// forever `EffectRecorded` with NO tool execution (and, for a Mutation, NO
+    /// `EffectIntent`) — and feed it back to the agent. The decision is a pure fn of
+    /// (config grant, call args) ⇒ a resume replays it from the memo, tool never run.
+    async fn record_denied_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        tih: &str,
+        detail: String,
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        let denial = serde_json::json!({
+            "error": "permission_denied",
+            "tool": call.name,
+            "detail": detail,
+        });
+        let recorded = self.split_output(&denial).await?;
+        self.append(
+            ar.run,
+            JournalEvent::EffectRecorded {
+                node: ar.node_id.clone(),
+                effect_id: teid.clone(),
+                class: EffectClass::Pure,
+                input_hash: tih.to_string(),
+                seq: 0,
+                output: recorded,
+                observation: None,
+            },
+        )
+        .await?;
+        Ok(ToolOutcome::Ok(denial))
     }
 
     /// Execute a tool live and journal its `EffectRecorded` (shared by all effect
