@@ -84,3 +84,61 @@ impl Executor {
         }
     }
 }
+
+/// Scrub a tool output of the EXACT secret values injected into this call (SP-4 broker) —
+/// replace each occurrence in every string leaf with `[REDACTED]`, composing with the s2
+/// pattern redactor. Per-call + pure ⇒ determinism-safe (a tool holds only its own creds).
+pub(super) fn scrub_secret_values(v: &serde_json::Value, secrets: &[&str]) -> serde_json::Value {
+    if secrets.is_empty() {
+        return v.clone();
+    }
+    // Replace LONGER secrets first: an overlapping shorter secret must not fragment (and
+    // partially leak) a longer one, and this makes the output stable regardless of the
+    // HashMap iteration order the callers pass. Sort ONCE here, not per recursive call.
+    let mut ordered: Vec<&str> = secrets.iter().copied().filter(|s| !s.is_empty()).collect();
+    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    scrub_walk(v, &ordered)
+}
+
+/// The recursive string-leaf walker for [`scrub_secret_values`]. `secrets` is already
+/// filtered non-empty and length-sorted (longest first) by the public entry point.
+fn scrub_walk(v: &serde_json::Value, secrets: &[&str]) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            let mut out = s.clone();
+            for secret in secrets {
+                out = out.replace(secret, "[REDACTED]"); // already non-empty + length-sorted
+            }
+            serde_json::Value::String(out)
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(|x| scrub_walk(x, secrets)).collect())
+        }
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), scrub_walk(x, secrets)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Overlapping secrets (one value a substring of another) must never partially leak,
+    /// regardless of the order the caller passes them in — the entry point sorts by length
+    /// descending so the longer secret is replaced whole before the shorter one can
+    /// fragment it. Pins the rank-1 security fix (HashMap iteration order is randomized).
+    #[test]
+    fn scrub_handles_overlapping_secrets_no_partial_leak() {
+        let v = serde_json::json!({ "out": "xtok-secret-123y" });
+        for order in [["tok", "tok-secret-123"], ["tok-secret-123", "tok"]] {
+            let got = super::scrub_secret_values(&v, &order);
+            assert_eq!(
+                got["out"],
+                serde_json::json!("x[REDACTED]y"),
+                "no partial leak regardless of secret order: {order:?}"
+            );
+        }
+    }
+}
