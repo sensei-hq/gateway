@@ -111,10 +111,8 @@ impl Executor {
                     let request = build_request(chain, &payload);
                     match self.gateway.execute(&request).await {
                         Ok(response) => {
-                            let output = serde_json::json!({
-                                "model": response.model,
-                                "text": response.content.clone().unwrap_or_default(),
-                            });
+                            // SP-4 s2: scrub the synthesis text via the shared chokepoint.
+                            let output = self.model_output(&response);
                             let recorded = self.split_output(&output).await?;
                             self.append(
                                 run,
@@ -608,10 +606,8 @@ impl Executor {
         let request = build_request(chain, item);
         match self.gateway.execute(&request).await {
             Ok(response) => {
-                let output = serde_json::json!({
-                    "model": response.model,
-                    "text": response.content.clone().unwrap_or_default(),
-                });
+                // SP-4 s2: scrub the Map-item model text via the shared chokepoint.
+                let output = self.model_output(&response);
                 let recorded = self.split_output(&output).await?;
                 self.append(
                     run,

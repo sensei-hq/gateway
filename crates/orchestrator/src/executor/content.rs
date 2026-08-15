@@ -34,6 +34,34 @@ impl Executor {
         }))
     }
 
+    /// Scrub secrets from an effect output before it is journaled/returned (SP-4 s2).
+    /// Identity when no redactor is wired. Pure ⇒ live == journaled == replayed.
+    pub(super) fn redact(&self, v: &serde_json::Value) -> serde_json::Value {
+        match &self.redactor {
+            Some(r) => r.redact(v),
+            None => v.clone(),
+        }
+    }
+
+    /// Build a model node's journaled+returned output `{model, text}` with `text`
+    /// redacted (SP-4 s2 — the SINGLE redaction point every model-output producer
+    /// routes through, so a new producer is scrubbed by construction). The four live
+    /// producers are the direct `ModelCall` node, the `Map`-item call, the
+    /// `Consolidate` synthesis, and the ReAct turn (`dispatch_model_turn`, which
+    /// APPENDS `tool_calls` to this shape after — it is the only path that carries
+    /// tool calls; the other three are single-shot and text-only).
+    pub(super) fn model_output(
+        &self,
+        resp: &kernel::types::request::InferenceResponse,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "model": resp.model,
+            "text": self.redact(&serde_json::Value::String(
+                resp.content.clone().unwrap_or_default(),
+            )),
+        })
+    }
+
     /// Materialize a recorded [`EffectOutput`] into its value: an inline value is
     /// cloned; a [`ContentRef`] is fetched lazily from the `ContentStore` and
     /// deserialized. A ref with no store wired, or a digest miss, is loud

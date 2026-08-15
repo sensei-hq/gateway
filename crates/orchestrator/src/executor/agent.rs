@@ -541,6 +541,10 @@ impl Executor {
         }
         match self.tools.execute(&call.name, args) {
             Ok(result) => {
+                // SP-4 s2: scrub secrets BEFORE both journaling and feed-back, so the
+                // journaled record and the value returned to the agent are the redacted
+                // one (identical) — determinism-safe (live == journaled == replayed).
+                let result = self.redact(&result);
                 let recorded = self.split_output(&result).await?;
                 self.append(
                     ar.run,
@@ -586,11 +590,13 @@ impl Executor {
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         match self.gateway.execute(&request).await {
             Ok(response) => {
-                let output = serde_json::json!({
-                    "model": response.model,
-                    "text": response.content.clone().unwrap_or_default(),
-                    "tool_calls": response.tool_calls,
-                });
+                // SP-4 s2: `model_output` builds `{model, text}` with `text` scrubbed
+                // (the single redaction chokepoint) before journal + feed-back; the
+                // ReAct path then appends `tool_calls` (the structured call args the
+                // next turn dispatches on) UNREDACTED so a redacted turn still drives
+                // its tools correctly. Same `{model, text, tool_calls}` shape as before.
+                let mut output = self.model_output(&response);
+                output["tool_calls"] = serde_json::json!(response.tool_calls);
                 let recorded = self.split_output(&output).await?;
                 self.append(
                     run,
