@@ -7,7 +7,8 @@ use zeroize::Zeroizing;
 use crate::error::OrchestratorError;
 
 /// A secret value. `Debug` prints `[REDACTED]`; the bytes are zeroized on drop.
-#[derive(Clone)]
+/// Intentionally NOT `Clone`: `ToolContext` shares its `Arc<HashMap<_, Secret>>`, so no
+/// caller needs a `Secret` copy — and a secret type that clones its plaintext is a smell.
 pub struct Secret(Zeroizing<String>);
 
 impl Secret {

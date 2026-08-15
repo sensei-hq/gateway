@@ -52,6 +52,11 @@ pub struct Executor {
     /// behavior, byte-identical). Pure ⇒ live == journaled == replayed, so a resume
     /// reproduces the scrub exactly (no determinism drift).
     redactor: Option<Arc<dyn orchestrator_core::Redactor>>,
+    /// An optional [`CredentialBroker`](orchestrator_core::CredentialBroker) (SP-4) the
+    /// executor resolves a tool's declared credential refs against, injecting the secrets
+    /// into the per-call `ToolContext` (Task 3). `None` (the default) ⇒ no credentials are
+    /// resolved — inert until wired.
+    credential_broker: Option<Arc<dyn orchestrator_core::CredentialBroker>>,
     /// The serialized-byte size **above which** an effect output is stored in the
     /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
     /// when a `content` store is wired.
@@ -184,6 +189,7 @@ impl Executor {
             concurrency: 8,
             content: None,
             redactor: None,
+            credential_broker: None,
             cas_threshold: 4096,
             clock: Arc::new(SystemClock),
             reconcilers: Arc::new(ReconcileRegistry::default()),
@@ -212,6 +218,18 @@ impl Executor {
     /// Recommended for production: `.with_redactor(Arc::new(PatternRedactor::default()))`.
     pub fn with_redactor(mut self, redactor: Arc<dyn orchestrator_core::Redactor>) -> Self {
         self.redactor = Some(redactor);
+        self
+    }
+
+    /// Wire a [`CredentialBroker`](orchestrator_core::CredentialBroker) (SP-4). Default none.
+    /// (Task 3 wires the resolve+inject: a tool that declares a credential ref the broker
+    /// can't resolve — or with no broker wired — will fail loud, never a silent missing
+    /// credential. In THIS commit the field is inert.)
+    pub fn with_credential_broker(
+        mut self,
+        broker: Arc<dyn orchestrator_core::CredentialBroker>,
+    ) -> Self {
+        self.credential_broker = Some(broker);
         self
     }
 

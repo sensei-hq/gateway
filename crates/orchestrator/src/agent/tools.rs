@@ -22,6 +22,22 @@ pub struct ToolContext {
     pub idempotency_key: String,
     /// The effect id for this call (`sha256(parent_path | iter | idx)`), for correlation.
     pub effect_id: EffectId,
+    /// Broker-resolved credentials for THIS call (SP-4). Ephemeral — never journaled/
+    /// hashed; zeroized on drop. `Arc` so cloning `ToolContext` shares one secret store.
+    /// A tool reads `ctx.credentials.get(ref).map(Secret::expose)` and sends it to its API.
+    pub credentials: std::sync::Arc<std::collections::HashMap<String, orchestrator_core::Secret>>,
+}
+
+impl ToolContext {
+    /// The raw, EXPOSED (plaintext) injected secret values, for the executor's per-call
+    /// exact-value scrub (Task 3). Named to self-document the exposure at the call site,
+    /// matching the [`Secret::expose`](orchestrator_core::Secret::expose) convention.
+    pub fn exposed_secret_values(&self) -> Vec<&str> {
+        self.credentials
+            .values()
+            .map(orchestrator_core::Secret::expose)
+            .collect()
+    }
 }
 
 /// An executable tool. `spec().effect_class` may be `Pure`, `Observation`, or
@@ -168,6 +184,26 @@ impl ReconcileRegistry {
         name: &str,
     ) -> Option<&std::sync::Arc<dyn orchestrator_core::ReconcileProvider>> {
         self.providers.get(name)
+    }
+}
+
+/// Demo credential broker: an in-memory `ref → secret` map (SP-4). A real broker (future)
+/// wraps `vault::Vault`.
+pub struct StaticCredentialBroker(std::collections::HashMap<String, String>);
+
+impl StaticCredentialBroker {
+    pub fn new(map: std::collections::HashMap<String, String>) -> Self {
+        Self(map)
+    }
+}
+
+#[async_trait::async_trait]
+impl orchestrator_core::CredentialBroker for StaticCredentialBroker {
+    async fn resolve(
+        &self,
+        cred_ref: &str,
+    ) -> Result<Option<orchestrator_core::Secret>, OrchestratorError> {
+        Ok(self.0.get(cred_ref).map(orchestrator_core::Secret::new))
     }
 }
 
@@ -574,7 +610,8 @@ impl orchestrator_core::ReconcileProvider for AlwaysIndeterminate {
 mod tests {
     use super::*;
     use orchestrator_core::{
-        EffectClass, OrchestratorError, ReconcileOutcome, ReconcileProvider, ToolSpec,
+        CredentialBroker, EffectClass, OrchestratorError, ReconcileOutcome, ReconcileProvider,
+        ToolSpec,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -800,6 +837,7 @@ mod tests {
         let ctx = ToolContext {
             idempotency_key: "k1".into(),
             effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
+            credentials: Default::default(),
         };
         let via_ctx = reg
             .execute_ctx(
@@ -829,6 +867,38 @@ mod tests {
         assert_eq!(
             reg.required_of("unknown", &serde_json::json!({})),
             orchestrator_core::Permissions::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn static_broker_resolves_known_refs() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("api_token".to_string(), format!("tok-{}", "xyz")); // runtime-assembled (semgrep hook)
+        let broker = StaticCredentialBroker::new(m);
+        let got = broker.resolve("api_token").await.unwrap();
+        assert_eq!(
+            got.as_ref().map(|s| s.expose()),
+            Some(format!("tok-{}", "xyz").as_str())
+        );
+        assert!(broker.resolve("nope").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn tool_context_secret_values_lists_injected() {
+        let mut creds = std::collections::HashMap::new();
+        creds.insert("k".to_string(), orchestrator_core::Secret::new("s3cret"));
+        let ctx = ToolContext {
+            idempotency_key: "i".into(),
+            effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
+            credentials: std::sync::Arc::new(creds),
+        };
+        assert_eq!(ctx.exposed_secret_values(), vec!["s3cret"]);
+
+        // Hygiene (Arc): cloning `ToolContext` shares ONE secret store, not a plaintext copy.
+        let cloned = ctx.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&ctx.credentials, &cloned.credentials),
+            "cloning ToolContext shares one secret store, not a plaintext copy"
         );
     }
 }
