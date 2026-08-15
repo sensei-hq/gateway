@@ -25,8 +25,9 @@ pub struct AgentDefinition {
     /// Per-phase chain overrides (phase → chain-id); empty when unused.
     #[serde(default)]
     pub chains: HashMap<String, String>,
-    /// Per-tool permission grants (tool name → granted scope, §287). Checked
-    /// against each tool's declared `permissions` at load; empty when unused.
+    /// Per-tool permission grants (tool name → granted scope, §287) — the
+    /// runtime ceiling. NOT checked at load; enforced per-call at runtime against
+    /// `Tool::required(args)` (ceiling model, SP-4 s1). Empty when unused.
     #[serde(default)]
     pub grants: HashMap<String, Permissions>,
     pub tools: Vec<String>,
@@ -58,8 +59,10 @@ pub struct ToolSpec {
     pub ttl_secs: Option<u64>,
     /// Provenance `source` label recorded with an Observation. Defaults to the tool name.
     pub source: Option<String>,
-    /// The capabilities this tool declares it needs (§132). Enforcement = SP-4;
-    /// this slice only validates an agent's grant covers it.
+    /// The tool's declared **maximum surface** (§132) — for disclosure. The
+    /// agent's grant is the runtime ceiling, and each call is authorized against
+    /// `Tool::required(args)` at runtime (SP-4 s1); `validate` no longer checks
+    /// that a grant covers this.
     #[serde(default)]
     pub permissions: Permissions,
     /// When this tool's schema is exposed to the model (§129); default `Always`.
@@ -394,7 +397,10 @@ impl Registry {
         Ok(reg)
     }
 
-    /// Fail loud if any agent references a skill/tool the registry doesn't hold.
+    /// Fail loud on *structural* unresolvability only: any agent that references
+    /// a skill/tool the registry doesn't hold, or an unroutable chain. Grants are
+    /// NOT checked here — a grant narrower than a tool's declared permission
+    /// surface is legal and is enforced per-call at runtime (ceiling model, SP-4 s1).
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         for agent in self.agents.values() {
             for skill in &agent.skills {
@@ -406,18 +412,8 @@ impl Registry {
                 }
             }
             for tool in &agent.tools {
-                let Some(spec) = self.tools.get(tool) else {
+                if !self.tools.contains_key(tool) {
                     return Err(OrchestratorError::UnknownToolRef {
-                        agent: agent.name.clone(),
-                        tool: tool.clone(),
-                    });
-                };
-                // grant⊇need: a missing grant is treated as the (deny/empty) default,
-                // which covers a permissionless tool but not one that declares needs.
-                let no_grant = Permissions::default();
-                let grant = agent.grants.get(tool).unwrap_or(&no_grant);
-                if !grant.covers(&spec.permissions) {
-                    return Err(OrchestratorError::PermissionNotGranted {
                         agent: agent.name.clone(),
                         tool: tool.clone(),
                     });
@@ -883,35 +879,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_requires_a_grant_covering_a_tools_declared_needs() {
-        let need = Permissions {
-            paths: vec!["/workspace".into()],
-            ..Default::default()
-        };
-        let tool = tool_needing("fs.write", need.clone());
-
-        // Agent references the tool but grants nothing → PermissionNotGranted.
-        let mut agent = role_agent("coding", "reasoning", Some("c"));
-        agent.tools = vec!["fs.write".into()];
-        let reg = Registry::default()
-            .with_agent(agent.clone())
-            .with_tool(tool.clone());
-        assert!(matches!(
-            reg.validate(),
-            Err(OrchestratorError::PermissionNotGranted { agent, tool })
-                if agent == "role" && tool == "fs.write"
-        ));
-
-        // With a covering grant → ok.
-        agent.grants.insert(
-            "fs.write".into(),
+    fn validate_accepts_a_grant_narrower_than_the_tool_surface() {
+        // SP-4: a grant narrower than a tool's declared surface is now LEGAL
+        // (enforced per-call at runtime), so `validate` no longer errors at load.
+        // The tool declares a path need; the agent lists it but grants nothing.
+        let tool = tool_needing(
+            "fs.write",
             Permissions {
                 paths: vec!["/workspace".into()],
                 ..Default::default()
             },
         );
-        let ok = Registry::default().with_agent(agent).with_tool(tool);
-        assert!(ok.validate().is_ok());
+        let mut agent = role_agent("coding", "reasoning", Some("c"));
+        agent.tools = vec!["fs.write".into()]; // lists the tool, grants nothing
+        let reg = Registry::default().with_agent(agent).with_tool(tool);
+        assert!(
+            reg.validate().is_ok(),
+            "a narrower-than-surface (here: absent) grant is legal now"
+        );
     }
 
     #[test]

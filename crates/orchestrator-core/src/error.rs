@@ -32,6 +32,9 @@ pub enum OrchestratorError {
         "agent {agent:?} has no base chain route: add an explicit `chain` or an `(area,kind)` binding (per-phase `chains` are overrides layered on a base route, so they do not by themselves make an agent routable)"
     )]
     UnknownChainRef { agent: String },
+    /// Reserved for a future strict/opt-in load-time grant check (SP-4). Not
+    /// currently produced: runtime enforcement is per-call (ceiling model), and
+    /// `validate` no longer verifies grants cover a tool's declared surface.
     #[error(
         "agent {agent:?} references tool {tool:?} without a grant covering its declared permissions"
     )]
