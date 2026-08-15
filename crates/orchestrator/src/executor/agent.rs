@@ -596,6 +596,7 @@ impl Executor {
         let ctx = crate::agent::tools::ToolContext {
             idempotency_key: idempotency_key.to_string(),
             effect_id: teid.clone(),
+            credentials: Default::default(),
         };
         match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
