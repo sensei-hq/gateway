@@ -589,14 +589,47 @@ impl Executor {
         if let Some(h) = &self.hooks {
             h.on_agent_tool_call(ar.run, ar.node_id, &call.name).await;
         }
+        // SP-4 broker: resolve the tool's DECLARED credential refs + inject into the ctx
+        // (ephemeral — never journaled/hashed). A declared ref that cannot be resolved (no
+        // broker, or the broker returns None) fails loud — never a silent missing credential.
+        let mut resolved = std::collections::HashMap::new();
+        if let Some(spec) = self.tools.spec_of(&call.name) {
+            for cred_ref in &spec.credentials {
+                let secret = match &self.credential_broker {
+                    Some(broker) => broker.resolve(cred_ref).await?,
+                    None => None,
+                };
+                match secret {
+                    Some(s) => {
+                        resolved.insert(cred_ref.clone(), s);
+                    }
+                    None => {
+                        let msg = format!(
+                            "tool '{}' requires credential '{}' but no broker resolved it",
+                            call.name, cred_ref
+                        );
+                        self.append(
+                            ar.run,
+                            JournalEvent::NodeFailed {
+                                node: ar.node_id.clone(),
+                                error: msg.clone(),
+                            },
+                        )
+                        .await?;
+                        return Ok(ToolOutcome::Failed(msg));
+                    }
+                }
+            }
+        }
         // SP-4 s5: thread the effective idempotency key into the tool via `call_ctx`
         // (journaled in the Intent for a Mutation; the structural key for Pure/
         // Observation, which ignore it) so a real tool can send the SAME key to its
-        // external API for provider-side dedup.
+        // external API for provider-side dedup. SP-4 broker: the resolved credentials
+        // ride alongside (ephemeral — never journaled/hashed, zeroized on drop).
         let ctx = crate::agent::tools::ToolContext {
             idempotency_key: idempotency_key.to_string(),
             effect_id: teid.clone(),
-            credentials: Default::default(),
+            credentials: std::sync::Arc::new(resolved),
         };
         match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
@@ -604,6 +637,11 @@ impl Executor {
                 // journaled record and the value returned to the agent are the redacted
                 // one (identical) — determinism-safe (live == journaled == replayed).
                 let result = self.redact(&result);
+                // SP-4 broker: scrub the EXACT injected credential VALUES from this call's
+                // output (composes with the s2 pattern redactor). Per-call + pure ⇒ a tool
+                // holds only its own creds, so this stays determinism-safe.
+                let result =
+                    super::content::scrub_secret_values(&result, &ctx.exposed_secret_values());
                 let recorded = self.split_output(&result).await?;
                 self.append(
                     ar.run,

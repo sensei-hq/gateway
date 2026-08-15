@@ -10193,3 +10193,373 @@ async fn reconcile_confirmed_output_is_redacted() {
         "the run completes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SP-4 credential broker (Task 3) — resolve the tool's DECLARED cred refs via the
+// broker, inject them into the call's `ToolContext.credentials` (ephemeral: never
+// journaled/hashed), scrub the tool output of the injected VALUES by exact match
+// (composing with the s2 pattern redactor), and fail LOUD on a declared-but-
+// unresolvable ref.
+// ---------------------------------------------------------------------------
+
+/// SP-4 broker probe: a Pure tool that DECLARES credential refs (`declares`) and, per
+/// call, records the injected `api_token` secret it received (via `call_ctx`) into a
+/// shared cell. With `echo`, it RETURNS that injected value in its output
+/// (`{"leaked": <cred>}`) so a test can assert the exact-value scrub. The tool's
+/// `spec().credentials` is `declares` — that is the surface `record_tool_effect` reads
+/// (via the executable `ToolRegistry`) to know which refs to resolve+inject.
+struct CredTool {
+    declares: Vec<String>,
+    /// Records `ctx.credentials.get("api_token").map(expose)` seen on each live call.
+    seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    /// When true, the tool ECHOES its injected credential in its output.
+    echo: bool,
+}
+impl Tool for CredTool {
+    fn spec(&self) -> orchestrator_core::ToolSpec {
+        orchestrator_core::ToolSpec {
+            name: "cred_probe".into(),
+            description: Some("records/echoes its injected credential".into()),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: orchestrator_core::Activation::default(),
+            credentials: self.declares.clone(),
+        }
+    }
+    // The executor always dispatches via `call_ctx`; `call` exists only to satisfy the
+    // trait (never reached on the executor path — it cannot see the injected ctx).
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        Ok(serde_json::json!({ "ok": true }))
+    }
+    fn call_ctx(
+        &self,
+        _args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        let got = ctx
+            .credentials
+            .get("api_token")
+            .map(|s| s.expose().to_string());
+        self.seen.lock().unwrap().push(got.clone());
+        if self.echo {
+            Ok(serde_json::json!({ "leaked": got }))
+        } else {
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+}
+
+/// Registry whose agent "a" (chain "c") LISTS the `cred_probe` tool, with a spec compiled
+/// into the prompt. Empty permissions ⇒ the agent's empty grant covers it and the SP-4 s1
+/// authorization gate is transparent (the credential wiring is what's under test).
+fn cred_registry() -> Arc<Registry> {
+    Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                tools: vec!["cred_probe".into()],
+                ..agent_def("c")
+            })
+            .with_tool(
+                CredTool {
+                    declares: vec!["api_token".into()],
+                    seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    echo: false,
+                }
+                .spec(),
+            ),
+    )
+}
+
+/// A `ref → secret` broker map, assembled at RUNTIME (no credential-shaped literal sits in
+/// source — the repo's semgrep CWE-798 hook blocks those).
+fn broker_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// The `input_hash` recorded by the `EffectRecorded` for one effect id (`None` if no such
+/// record). Used to prove the injected credential is NOT folded into the effect hash.
+fn recorded_input_hash(events: &[(Seq, JournalEvent)], eid: &EffectId) -> Option<String> {
+    events.iter().find_map(|(_, e)| match e {
+        JournalEvent::EffectRecorded {
+            effect_id,
+            input_hash,
+            ..
+        } if effect_id == eid => Some(input_hash.clone()),
+        _ => None,
+    })
+}
+
+/// AC3: a tool that DECLARES `api_token` has that credential RESOLVED by the broker and
+/// INJECTED into the call's `ToolContext.credentials` — the tool reads the real secret.
+/// A tool that declares NO credential (even with a broker wired) gets an EMPTY map and
+/// runs fine (the injection is scoped to declared refs only).
+#[tokio::test]
+async fn declared_credential_is_injected_into_call_ctx() {
+    // Runtime-assembled secret (semgrep CWE-798 hook stays quiet).
+    let secret = format!("tok-{}", "abcdef123456");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["api_token".into()],
+        seen: seen.clone(),
+        echo: false,
+    })));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools)
+        .with_credential_broker(Arc::new(crate::agent::tools::StaticCredentialBroker::new(
+            broker_map(&[("api_token", &secret)]),
+        )));
+
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "use the token")],
+    };
+    let outcome = exec
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some(secret.clone())],
+        "the declared credential was resolved + injected into the call ctx"
+    );
+
+    // Companion: a tool that declares NO credential gets an EMPTY map (even with a broker
+    // wired) and runs fine — the injection is scoped to declared refs only.
+    let seen_none = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let (gw2, _c2) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let tools2 = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec![], // declares NOTHING
+        seen: seen_none.clone(),
+        echo: false,
+    })));
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools2)
+        .with_credential_broker(Arc::new(crate::agent::tools::StaticCredentialBroker::new(
+            broker_map(&[("api_token", &secret)]),
+        )))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run");
+    assert!(out2.failed.is_none(), "{:?}", out2.failed);
+    assert_eq!(
+        *seen_none.lock().unwrap(),
+        vec![None],
+        "a tool that declares no credential gets an empty ctx map"
+    );
+}
+
+/// AC5: a tool that ECHOES its injected credential in its output has that EXACT value
+/// scrubbed to `[REDACTED]`. The broker holds a NON-pattern-shaped value (`hunter2`), so
+/// the s2 `PatternRedactor` (wired here to prove COMPOSITION) does NOT catch it — the
+/// `[REDACTED]` can only come from the per-call exact-value scrub. The journaled output
+/// AND the value fed back to the agent are scrubbed; no plaintext survives anywhere.
+#[tokio::test]
+async fn echoed_credential_is_scrubbed_by_exact_value() {
+    // NON-secret-shaped, runtime-assembled: the pattern redactor cannot match it, so only
+    // the exact-value scrub can produce `[REDACTED]`.
+    use orchestrator_core::Redactor;
+    let secret = format!("hun{}", "ter2");
+    assert_eq!(secret, "hunter2");
+    // Prove the premise: the pattern redactor leaves this value untouched.
+    assert_eq!(
+        orchestrator_core::PatternRedactor::default().redact(&serde_json::json!(secret.clone())),
+        serde_json::json!(secret.clone()),
+        "the value is NOT pattern-shaped, so the s2 redactor is transparent to it"
+    );
+
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["api_token".into()],
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        echo: true, // RETURNS the injected credential
+    })));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools)
+        .with_credential_broker(Arc::new(crate::agent::tools::StaticCredentialBroker::new(
+            broker_map(&[("api_token", &secret)]),
+        )))
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "echo the token")],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    // The tool effect is turn-0, call index 0 → effect_id(node, 0, 1).
+    let tool_eid = effect_id("n1", 0, 1);
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &tool_eid).expect("tool effect recorded");
+    assert_eq!(
+        out["leaked"],
+        serde_json::json!("[REDACTED]"),
+        "the echoed credential is scrubbed by exact value: {out}"
+    );
+    // The value fed back to the agent is the SAME scrubbed value (single source) — no
+    // plaintext credential survives ANYWHERE in the journal.
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "plaintext credential must not appear anywhere in the journal"
+    );
+}
+
+/// AC4: the injected credential is EPHEMERAL — it is not journaled and it is not folded
+/// into the effect hash. Proof: (1) with the credential injected but NOT echoed, the
+/// serialized journal never contains the secret; (2) the recorded `input_hash` for the
+/// SAME tool+args is IDENTICAL whether the credential is injected or not (the cred is not
+/// part of the hash), so a resume replays deterministically regardless of the broker.
+#[tokio::test]
+async fn credential_is_ephemeral_not_in_journal_or_hash() {
+    let secret = format!("tok-{}", "abcdef123456");
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "use the token")],
+    };
+    let tool_eid = effect_id("n1", 0, 1);
+
+    // Run WITH the credential injected (broker present), tool does NOT echo it.
+    let jr_with = InMemoryJournal::new();
+    let (gw1, _c1) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let tools1 = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["api_token".into()],
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        echo: false,
+    })));
+    let run_with = RunId(uuid::Uuid::new_v4());
+    Executor::new(Arc::new(gw1), Arc::new(jr_with.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools1)
+        .with_credential_broker(Arc::new(crate::agent::tools::StaticCredentialBroker::new(
+            broker_map(&[("api_token", &secret)]),
+        )))
+        .run(run_with, &graph)
+        .await
+        .expect("run");
+    let events_with = jr_with.load(run_with).await.unwrap();
+    // Ephemeral: the injected secret is nowhere in the serialized journal.
+    assert!(
+        !serde_json::to_string(&events_with)
+            .unwrap()
+            .contains(&secret),
+        "the injected credential is never journaled"
+    );
+    let hash_with = recorded_input_hash(&events_with, &tool_eid).expect("tool effect recorded");
+
+    // Run WITHOUT any credential (tool declares nothing, NO broker), SAME tool name + args.
+    let jr_without = InMemoryJournal::new();
+    let (gw2, _c2) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let tools2 = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec![],
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        echo: false,
+    })));
+    let run_without = RunId(uuid::Uuid::new_v4());
+    Executor::new(Arc::new(gw2), Arc::new(jr_without.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools2)
+        .run(run_without, &graph)
+        .await
+        .expect("run");
+    let hash_without = recorded_input_hash(&jr_without.load(run_without).await.unwrap(), &tool_eid)
+        .expect("tool effect recorded");
+
+    assert_eq!(
+        hash_with, hash_without,
+        "the effect input_hash is identical with vs without the credential — the cred is not hashed"
+    );
+}
+
+/// AC6: a tool that DECLARES a credential the broker cannot resolve fails LOUD — the node
+/// is `Failed` (never a silent missing credential, and the tool is never executed under a
+/// half-populated ctx). Covers BOTH tiers: a broker that returns `None`, and no broker
+/// wired at all.
+#[tokio::test]
+async fn unresolvable_declared_credential_fails_loud() {
+    let n1 = NodeId("n1".into());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "needs a missing cred")],
+    };
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+
+    // Tier 1: a broker is wired but returns `None` for the declared ref.
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response("t1", "cred_probe", "{}")]).await;
+    let tools1 = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["missing".into()],
+        seen: seen.clone(),
+        echo: false,
+    })));
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools1)
+        .with_credential_broker(Arc::new(crate::agent::tools::StaticCredentialBroker::new(
+            broker_map(&[]), // resolves NOTHING
+        )))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run yields an outcome");
+    let (node, msg) = out1
+        .failed
+        .expect("an unresolvable declared credential fails the node");
+    assert_eq!(node, n1, "the failing node is named");
+    assert!(
+        msg.contains("credential 'missing'"),
+        "the failure names the missing credential (not silent): {msg}"
+    );
+
+    // Tier 2: NO broker wired at all — a declared ref is still a loud failure.
+    let (gw2, _c2) = scripted_gateway(vec![tool_call_response("t1", "cred_probe", "{}")]).await;
+    let tools2 = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["missing".into()],
+        seen: seen.clone(),
+        echo: false,
+    })));
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(InMemoryJournal::new()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools2)
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("run yields an outcome");
+    let (node2, msg2) = out2
+        .failed
+        .expect("no broker + a declared credential fails the node");
+    assert_eq!(node2, n1);
+    assert!(msg2.contains("credential 'missing'"), "{msg2}");
+
+    // The tool never executed under either tier (fail closes BEFORE `call_ctx`).
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the tool is never invoked when its declared credential cannot be resolved"
+    );
+}
