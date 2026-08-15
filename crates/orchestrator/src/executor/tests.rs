@@ -12,7 +12,7 @@ use orchestrator_store::InMemoryJournal;
 
 use crate::agent::tools::{
     AlwaysIndeterminate, Calc, NoteReconciler, ReconcileRegistry, RecordNote, ScopedWriter, Search,
-    Tool, ToolRegistry,
+    Tool, ToolContext, ToolRegistry,
 };
 use orchestrator_core::{
     AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, OrchestratorHooks,
@@ -73,6 +73,19 @@ fn has_effect_intent(events: &[(Seq, JournalEvent)], eid: &EffectId) -> bool {
     events
         .iter()
         .any(|(_, e)| matches!(e, JournalEvent::EffectIntent { effect_id: r, .. } if r == eid))
+}
+
+/// The `idempotency_key` journaled in the `EffectIntent` for one effect id (`None`
+/// if the effect journaled no Intent — e.g. a Pure/Observation call or a denial).
+fn intent_key(events: &[(Seq, JournalEvent)], eid: &EffectId) -> Option<String> {
+    events.iter().find_map(|(_, e)| match e {
+        JournalEvent::EffectIntent {
+            effect_id,
+            idempotency_key,
+            ..
+        } if effect_id == eid => Some(idempotency_key.clone()),
+        _ => None,
+    })
 }
 
 fn agent_def(chain: &str) -> AgentDefinition {
@@ -1398,6 +1411,208 @@ async fn in_doubt_indeterminate_pauses_without_applying() {
             .iter()
             .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
         "a paused run does not complete"
+    );
+}
+
+/// A local Mutation probe tool for the SP-4 s5 idempotency-key threading tests. Its
+/// `call_ctx` CAPTURES the `ctx.idempotency_key` the executor threads in (so a test can
+/// assert the tool received the SAME key journaled in the effect's `EffectIntent`), and
+/// it can optionally OVERRIDE `Tool::idempotency_key` to return an author key read from
+/// `args["ref"]` (so a test can assert an author key overrides the structural default).
+/// Empty permissions ⇒ the agent's empty grant covers it and the SP-4 s1 gate is
+/// transparent.
+struct KeyProbe {
+    /// The last `ctx.idempotency_key` threaded into `call_ctx` (`None` until called).
+    seen: Arc<std::sync::Mutex<Option<String>>>,
+    /// When set, `idempotency_key(args)` returns `args["ref"]` — an author override.
+    author_key: bool,
+}
+impl KeyProbe {
+    fn new(seen: Arc<std::sync::Mutex<Option<String>>>, author_key: bool) -> Self {
+        Self { seen, author_key }
+    }
+}
+impl Tool for KeyProbe {
+    fn spec(&self) -> orchestrator_core::ToolSpec {
+        orchestrator_core::ToolSpec {
+            name: "mut_probe".into(),
+            description: Some("a Mutation probe that captures its threaded idempotency key".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "ref": {"type": "string"} }
+            }),
+            effect_class: EffectClass::Mutation,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: orchestrator_core::Activation::default(),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        Ok(serde_json::json!({ "ok": true }))
+    }
+    fn call_ctx(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        *self.seen.lock().unwrap() = Some(ctx.idempotency_key.clone());
+        self.call(args)
+    }
+    fn idempotency_key(&self, args: &serde_json::Value) -> Option<String> {
+        if self.author_key {
+            args.get("ref").and_then(|v| v.as_str()).map(str::to_string)
+        } else {
+            None
+        }
+    }
+}
+
+/// Registry whose agent "a" (chain "c") LISTS the `mut_probe` Mutation tool, with its
+/// spec compiled into the prompt. Empty grant ⇒ the SP-4 s1 gate is transparent.
+fn probe_registry() -> Arc<Registry> {
+    Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                tools: vec!["mut_probe".into()],
+                ..agent_def("c")
+            })
+            .with_tool(KeyProbe::new(Arc::new(std::sync::Mutex::new(None)), false).spec()),
+    )
+}
+
+/// SP-4 s5 (AC2/AC3): the executor threads the JOURNALED idempotency key into the tool
+/// via `call_ctx` — the key the tool receives is byte-identical to the one journaled in
+/// the effect's `EffectIntent`. (A default tool, so the key is the structural one; the
+/// point here is that the threaded key and the journaled key are the SAME string.)
+#[tokio::test]
+async fn tool_receives_the_journaled_idempotency_key() {
+    let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "probe it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "mut_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(probe_registry())
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(KeyProbe::new(seen.clone(), false))),
+        ))
+        .run(run, &graph)
+        .await
+        .expect("run completes");
+    assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+
+    let tool_eid = effect_id("n1", 0, 1);
+    let events = journal.load(run).await.unwrap();
+    let journaled = intent_key(&events, &tool_eid).expect("the Mutation journaled an EffectIntent");
+    let received = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool's call_ctx ran");
+    assert_eq!(
+        received, journaled,
+        "the tool receives EXACTLY the idempotency key journaled in the EffectIntent"
+    );
+}
+
+/// SP-4 s5 (AC1/AC2): a tool that OVERRIDES `Tool::idempotency_key` (an author/domain
+/// key derived from args) makes that key the effective one — it is journaled in the
+/// `EffectIntent` AND threaded to the tool via `call_ctx`, overriding the structural
+/// default.
+#[tokio::test]
+async fn author_supplied_key_is_journaled_and_threaded() {
+    let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "probe it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "mut_probe", "{\"ref\":\"bk-42\"}"),
+        final_response("done"),
+    ])
+    .await;
+    let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(probe_registry())
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(KeyProbe::new(seen.clone(), true))),
+        ))
+        .run(run, &graph)
+        .await
+        .expect("run completes");
+    assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+
+    let tool_eid = effect_id("n1", 0, 1);
+    let events = journal.load(run).await.unwrap();
+    let journaled = intent_key(&events, &tool_eid).expect("the Mutation journaled an EffectIntent");
+    assert_eq!(
+        journaled, "bk-42",
+        "the author key is journaled as the effective idempotency key"
+    );
+    let received = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool's call_ctx ran");
+    assert_eq!(
+        received, "bk-42",
+        "and the SAME author key is threaded to the tool via call_ctx"
+    );
+}
+
+/// SP-4 s5 (AC1, additivity): a Mutation tool with NO `idempotency_key` override
+/// journals the STRUCTURAL key `sha256(effect_id | args_hash)` — byte-identical to the
+/// pre-s5 behavior — and threads that same key to the tool. This is the crux that keeps
+/// the existing in-doubt/reconcile tests green: a default tool journals exactly what a
+/// recompute would have produced.
+#[tokio::test]
+async fn default_tool_journals_the_structural_key() {
+    let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "probe it")],
+    };
+    let args = "{}";
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "mut_probe", args),
+        final_response("done"),
+    ])
+    .await;
+    let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(probe_registry())
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(KeyProbe::new(seen.clone(), false))),
+        ))
+        .run(run, &graph)
+        .await
+        .expect("run completes");
+    assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+
+    let tool_eid = effect_id("n1", 0, 1);
+    let tih = super::support::tool_input_hash("mut_probe", args);
+    let structural = orchestrator_core::idempotency_key(&tool_eid, &tih);
+    let events = journal.load(run).await.unwrap();
+    let journaled = intent_key(&events, &tool_eid).expect("the Mutation journaled an EffectIntent");
+    assert_eq!(
+        journaled, structural,
+        "a default Mutation journals the structural sha256(effect_id | args_hash), byte-identical to pre-s5"
+    );
+    let received = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool's call_ctx ran");
+    assert_eq!(
+        received, structural,
+        "and threads that SAME structural key to the tool"
     );
 }
 
