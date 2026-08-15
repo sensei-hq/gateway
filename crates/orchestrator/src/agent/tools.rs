@@ -7,8 +7,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use orchestrator_core::{
-    Activation, EffectClass, OrchestratorError, Permissions, Registry, ToolSpec,
+    Activation, EffectClass, EffectId, OrchestratorError, Permissions, Registry, ToolSpec,
 };
+
+/// Per-call execution context for a tool (SP-4 s5). Carries the idempotency key the
+/// executor journaled in the `EffectIntent` (so a tool can send it to an external API
+/// for provider-side dedup) + the effect id for correlation.
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    /// The RESOLVED idempotency key the executor journaled in the `EffectIntent`: the
+    /// tool's author key if it overrode `Tool::idempotency_key`, else the structural
+    /// `sha256(effect_id | args_hash)`. A tool sends THIS to an external API for
+    /// provider-side dedup.
+    pub idempotency_key: String,
+    /// The effect id for this call (`sha256(parent_path | iter | idx)`), for correlation.
+    pub effect_id: EffectId,
+}
 
 /// An executable tool. `spec().effect_class` may be `Pure`, `Observation`, or
 /// `Mutation` (slice 4) — the executor is responsible for wrapping
@@ -16,6 +30,36 @@ use orchestrator_core::{
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError>;
+
+    /// Execute with the per-call context (SP-4 s5). Default ignores `ctx` and delegates
+    /// to `call` ⇒ existing tools are byte-identical. Override to send
+    /// `ctx.idempotency_key` to an external API for provider-side dedup.
+    ///
+    /// **The executor invokes `call_ctx`** (never `call` directly). Override `call` for a
+    /// tool's logic; override `call_ctx` ONLY to consume `ctx.idempotency_key` (e.g. send it
+    /// to an external API for provider-side dedup) — the default forwards to `call`, so a
+    /// tool that overrides only `call` is still driven correctly.
+    fn call_ctx(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        self.call(args)
+    }
+
+    /// Author-supplied idempotency key for THIS call. Default `None` ⇒ the executor uses
+    /// the structural key `sha256(effect_id | args_hash)` (`orchestrator_core::idempotency_key`).
+    /// Override for a domain key (booking ref, payment token derived from `args`).
+    ///
+    /// MUST be a pure function of `args` — NO I/O, clock, or RNG. The key is journaled in the
+    /// `EffectIntent` and threaded to `call_ctx`; on an in-doubt resume the executor reads the
+    /// JOURNALED key to query the provider. A nondeterministic key would recompute differently
+    /// across runs → the provider is queried under the wrong key → dedup fails → the mutation
+    /// applies TWICE. (Reading the journaled key protects the reconcile side; a pure derivation
+    /// is still required so the key sent to the provider at execution matches.)
+    fn idempotency_key(&self, _args: &serde_json::Value) -> Option<String> {
+        None
+    }
 
     /// The CONCRETE permissions THIS specific call needs (SP-4 authorization gate).
     /// Default = the tool's static declared surface (`spec().permissions`), so a tool
@@ -59,6 +103,26 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| OrchestratorError::UnknownTool(name.to_string()))?;
         tool.call(args)
+    }
+
+    /// Execute a tool with its per-call context (SP-4 s5). Unknown → loud `UnknownTool`.
+    pub fn execute_ctx(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| OrchestratorError::UnknownTool(name.to_string()))?;
+        tool.call_ctx(args, ctx)
+    }
+
+    /// The author-supplied idempotency key for a call, if the tool overrides it (else None
+    /// ⇒ the executor uses the structural key). Unknown tool → None.
+    pub fn idempotency_key_of(&self, name: &str, args: &serde_json::Value) -> Option<String> {
+        self.tools.get(name).and_then(|t| t.idempotency_key(args))
     }
 
     /// The spec of a registered tool by name (for the executor to read its class/ttl).
@@ -679,6 +743,58 @@ mod tests {
         assert_eq!(need.paths, vec!["/workspace/a.txt".to_string()]);
         // Missing path → no concrete path need (the gate allows; the call errors).
         assert!(w.required(&serde_json::json!({})).paths.is_empty());
+    }
+
+    #[test]
+    fn idempotency_key_defaults_none_and_override_uses_args() {
+        assert_eq!(Calc.idempotency_key(&serde_json::json!({})), None);
+        struct Keyed;
+        impl Tool for Keyed {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "keyed".into(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                    effect_class: EffectClass::Mutation,
+                    ttl_secs: None,
+                    source: None,
+                    permissions: Permissions::default(),
+                    activation: Activation::default(),
+                }
+            }
+            fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+                Ok(serde_json::json!({}))
+            }
+            fn idempotency_key(&self, args: &serde_json::Value) -> Option<String> {
+                args.get("ref").and_then(|v| v.as_str()).map(str::to_string)
+            }
+        }
+        assert_eq!(
+            Keyed.idempotency_key(&serde_json::json!({ "ref": "bk-42" })),
+            Some("bk-42".to_string())
+        );
+    }
+
+    #[test]
+    fn call_ctx_defaults_to_call_and_registry_threads_ctx() {
+        let reg = ToolRegistry::default().with_tool(std::sync::Arc::new(Calc));
+        let ctx = ToolContext {
+            idempotency_key: "k1".into(),
+            effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
+        };
+        let via_ctx = reg
+            .execute_ctx(
+                "calc",
+                serde_json::json!({ "op": "add", "a": 2, "b": 3 }),
+                &ctx,
+            )
+            .unwrap();
+        let via_plain = reg
+            .execute("calc", serde_json::json!({ "op": "add", "a": 2, "b": 3 }))
+            .unwrap();
+        assert_eq!(via_ctx, via_plain, "default call_ctx delegates to call");
+        assert_eq!(reg.idempotency_key_of("calc", &serde_json::json!({})), None);
+        assert_eq!(reg.idempotency_key_of("nope", &serde_json::json!({})), None);
     }
 
     #[test]
