@@ -14,6 +14,7 @@ pub mod journal;
 pub mod plan;
 pub mod planner;
 pub mod reconcile;
+pub mod redact;
 pub mod registry;
 
 pub use clock::{Clock, SystemClock};
@@ -35,6 +36,7 @@ pub use plan::{
 };
 pub use planner::{PLANNER_AREA, Planner, PlannerSelector, RulePlannerSelector};
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
+pub use redact::{PatternRedactor, Redactor};
 pub use registry::{
     Activation, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions,
     Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef, ToolSpec,
