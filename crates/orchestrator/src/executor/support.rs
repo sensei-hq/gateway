@@ -98,8 +98,13 @@ pub(crate) fn fold_journal(
             }
             // The intent phase of a two-phase Mutation (§7.3). An effect id in
             // `intents` with no matching `EffectRecorded` is in-doubt on resume.
-            JournalEvent::EffectIntent { effect_id, .. } => {
-                fold.intents.insert(effect_id.clone());
+            JournalEvent::EffectIntent {
+                effect_id,
+                idempotency_key,
+                ..
+            } => {
+                fold.intents
+                    .insert(effect_id.clone(), idempotency_key.clone());
             }
             // A blackboard publish (§8): fold it so a resume rehydrates the store
             // (as refs, no blob load) and the publish-guard skips re-publishing.
@@ -362,6 +367,24 @@ mod tests {
             Some(1),
             "PlanExpanded folds into fold.expansions"
         );
+    }
+
+    #[test]
+    fn fold_captures_the_intent_idempotency_key() {
+        use orchestrator_core::{JournalEvent, NodeId};
+        let eid = effect_id("n1", 0, 1);
+        let events = vec![(
+            0u64,
+            JournalEvent::EffectIntent {
+                node: NodeId("n1".into()),
+                effect_id: eid.clone(),
+                idempotency_key: "the-key".into(),
+                args_hash: "h".into(),
+                seq: 0,
+            },
+        )];
+        let (fold, _last, _completed) = fold_journal(&events);
+        assert_eq!(fold.intents.get(&eid), Some(&"the-key".to_string()));
     }
 
     #[test]

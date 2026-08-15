@@ -393,7 +393,7 @@ impl Executor {
         args: serde_json::Value,
         tih: &str,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
-        if ar.fold.intents.contains(teid) {
+        if ar.fold.intents.contains_key(teid) {
             return self.reconcile_in_doubt(ar, teid, call, args, tih).await;
         }
         // The `idempotency_key` is persisted in the Intent for a reconciler that
