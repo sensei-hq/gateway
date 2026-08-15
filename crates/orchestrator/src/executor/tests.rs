@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{
-    content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
+    CallLog, content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
     echo_system_gateway, failing_after_gateway, final_response, recording_gateway,
     scripted_gateway, tool_call_response,
 };
@@ -945,13 +945,19 @@ async fn ungranted_tool_is_denied_and_fed_back() {
     }
 }
 
-/// SP-4 s1 AC6 (per-argument): with a `/workspace` grant, an out-of-grant call
-/// (`/etc/passwd`) is denied and fed back, then an in-grant call
-/// (`/workspace/ok.txt`) on a later turn succeeds — proving the gate authorizes
-/// each call against its CONCRETE args, not the tool's coarse static surface. The
-/// denial and the allow land at DISTINCT tool effect ids.
-#[tokio::test]
-async fn out_of_grant_argument_denied_then_in_grant_succeeds() {
+/// Drives the narrow-grant "denied → adapt → succeed" journey once and hands back
+/// the pieces the AC6 (structural) and AC9 (fed-back payload) tests each assert
+/// over. Grant = `{paths:["/workspace"]}`; script: `fs.write /etc/passwd` (denied)
+/// → `fs.write /workspace/ok.txt` (allowed) → final `"done"`. Returns the run
+/// outcome, the loaded journal events, the `ScopedWriter` sink handle, and the
+/// scripted-gateway call log — a PURE setup extraction (no assertions), so both
+/// callers observe byte-identical behavior.
+async fn drive_adapt_and_succeed() -> (
+    RunOutcome,
+    Vec<(Seq, JournalEvent)>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    CallLog,
+) {
     let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
@@ -973,7 +979,7 @@ async fn out_of_grant_argument_denied_then_in_grant_succeeds() {
             "fs.write",
             "{\"path\":\"/workspace/ok.txt\",\"content\":\"x\"}",
         ),
-        // turn 2: final answer.
+        // turn 2: final answer → the run completes.
         final_response("done"),
     ])
     .await;
@@ -985,9 +991,20 @@ async fn out_of_grant_argument_denied_then_in_grant_succeeds() {
         .run(run, &graph)
         .await
         .expect("run completes");
+    let events = journal.load(run).await.unwrap();
+    (o, events, sink, calls)
+}
 
-    assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
-    assert_eq!(calls.lock().unwrap().len(), 3, "three model turns");
+/// SP-4 s1 AC6 (per-argument): with a `/workspace` grant, an out-of-grant call
+/// (`/etc/passwd`) is denied and fed back, then an in-grant call
+/// (`/workspace/ok.txt`) on a later turn succeeds — proving the gate authorizes
+/// each call against its CONCRETE args, not the tool's coarse static surface. The
+/// denial and the allow land at DISTINCT tool effect ids. (Completion / turn-count
+/// facets of the same journey are asserted by `agent_hits_a_denial_adapts_and_succeeds`.)
+#[tokio::test]
+async fn out_of_grant_argument_denied_then_in_grant_succeeds() {
+    let (_o, events, sink, _calls) = drive_adapt_and_succeed().await;
+
     // Only the in-grant write reached the tool.
     assert_eq!(
         &*sink.lock().unwrap(),
@@ -995,7 +1012,6 @@ async fn out_of_grant_argument_denied_then_in_grant_succeeds() {
         "the out-of-grant write was denied; only the in-grant one ran"
     );
 
-    let events = journal.load(run).await.unwrap();
     let denied_eid = effect_id("n1", 0, 1); // turn-0 tool call
     let allowed_eid = effect_id("n1", 1, 1); // turn-1 tool call
     assert_ne!(denied_eid, allowed_eid, "distinct tool effect ids");
@@ -1016,6 +1032,152 @@ async fn out_of_grant_argument_denied_then_in_grant_succeeds() {
     );
     let allowed = recorded_output(&events, &allowed_eid).expect("allowed call recorded");
     assert_eq!(allowed["written"], "/workspace/ok.txt");
+}
+
+/// SP-4 s1 AC7 (resume determinism): a DENIED call is journaled ONCE as a Pure
+/// `EffectRecorded` and, on resume, REPLAYS from that memo — the tool is never
+/// invoked (a fresh sink stays empty) and no second denial is recorded. Because
+/// the gate is a pure fn of (grant, args), re-running it on resume would re-deny
+/// too — so "tool never invoked" alone can't distinguish a memo replay from a
+/// live re-deny (both leave the sink empty). The load-bearing proof is therefore
+/// the COUNT: the denial `EffectRecorded` for the tool effect id appears EXACTLY
+/// ONCE across the whole final journal (recorded live in run 1, replayed — not
+/// re-recorded — in run 2). Disabling the memo replay makes the resume re-record
+/// the denial (count → 2), failing the load-bearing assertion.
+#[tokio::test]
+async fn a_denied_call_replays_from_the_memo_on_resume() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "write it")],
+    };
+    let denied_eid = effect_id("n1", 0, 1); // turn-0 tool call
+
+    // Run 1 (seed a PARTIAL run): the agent LISTS `fs.write` with an EMPTY grant, so
+    // turn 0's `fs.write` is DENIED (Pure EffectRecorded, no tool run); the script
+    // then runs out on turn 1 → the node fails → NO RunCompleted. The denial is
+    // journaled exactly once, live.
+    let sink1 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "fs.write",
+        "{\"path\":\"/workspace/a.txt\",\"content\":\"x\"}",
+    )])
+    .await;
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(writer_registry(
+            vec!["fs.write".into()],
+            std::collections::HashMap::new(),
+        ))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(ScopedWriter::new(sink1.clone()))),
+        ))
+        .run(run, &graph)
+        .await
+        .expect("seed yields an outcome");
+    assert!(
+        o1.failed.is_some(),
+        "seed dies at turn 1 (script exhausted)"
+    );
+    assert!(
+        sink1.lock().unwrap().is_empty(),
+        "the denied write never reached the tool, even live"
+    );
+    let seeded = journal.load(run).await.unwrap();
+    assert_eq!(
+        effect_recorded_count(&seeded, &denied_eid),
+        1,
+        "the denial is recorded once, live, in run 1"
+    );
+
+    // Run 2 (resume over the SAME journal, FRESH gateway + FRESH sink): turn 0's model
+    // turn and its `fs.write` both MEMO-HIT (the denial replays from the journal — the
+    // gate/tool are NOT re-reached), so the fresh sink stays empty; turn 1 is driven
+    // live to a final answer and the run completes.
+    let sink2 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(writer_registry(
+            vec!["fs.write".into()],
+            std::collections::HashMap::new(),
+        ))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(ScopedWriter::new(sink2.clone()))),
+        ))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+
+    assert!(
+        o2.failed.is_none() && o2.paused.is_none(),
+        "resume reaches the same completed state: {:?}",
+        o2.failed
+    );
+    assert!(
+        sink2.lock().unwrap().is_empty(),
+        "the denial replayed from the memo — the tool was NOT re-invoked on resume"
+    );
+
+    // Load-bearing (mutation-verifiable): the denial `EffectRecorded` appears EXACTLY
+    // ONCE across BOTH runs — live in run 1, replayed (not re-recorded) in run 2 — and
+    // a denied Mutation journals NO `EffectIntent`.
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        effect_recorded_count(&events, &denied_eid),
+        1,
+        "the denial is journaled once total: recorded live, then replayed from the memo"
+    );
+    assert!(
+        !has_effect_intent(&events, &denied_eid),
+        "a denied Mutation never journals an EffectIntent, on either run"
+    );
+}
+
+/// SP-4 s1 AC9 (end-to-end adapt-and-succeed): the AC6 journey — narrow
+/// `/workspace` grant → out-of-scope call denied+fed back → in-scope call succeeds
+/// → run completes — is driven end-to-end. The structural half of this journey
+/// (distinct eids, denied-has-no-Intent, allowed-has-Intent, sink) is already
+/// proven by `out_of_grant_argument_denied_then_in_grant_succeeds`; this test adds
+/// the COMPLEMENTARY, uncovered half: the exact denial value the agent's transcript
+/// receives (agent.rs feeds `record_denied_effect`'s value back as the tool result)
+/// is self-describing yet TERSE — it names the tool and a reason but NEVER
+/// enumerates the grant/allowlist, so a denied model can't be redirected onto
+/// another granted resource (confused-deputy / injection defense).
+#[tokio::test]
+async fn agent_hits_a_denial_adapts_and_succeeds() {
+    let (o, events, sink, calls) = drive_adapt_and_succeed().await;
+
+    // The journey succeeded end-to-end: the model was re-invoked after the denial
+    // (3 turns) and only the adapted, in-grant write reached the tool.
+    assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "the denial was fed back — the loop continued to the adapted call and a final turn"
+    );
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["/workspace/ok.txt".to_string()],
+        "the agent adapted: only the in-grant write ran"
+    );
+
+    // The exact value fed back to the agent on the denied call is self-describing…
+    let denied_eid = effect_id("n1", 0, 1); // turn-0 tool call
+    let denied = recorded_output(&events, &denied_eid).expect("denied call recorded");
+    assert_eq!(denied["error"], "permission_denied");
+    assert_eq!(denied["tool"], "fs.write");
+    assert!(
+        denied["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "the fed-back denial carries a non-empty, model-facing reason"
+    );
+    // …yet TERSE: the fed-back value must not enumerate the grant/allowlist — leaking
+    // `/workspace` would invite a redirect onto another granted resource.
+    // "/workspace" is the SOLE granted path in this fixture — a terse denial must not
+    // echo it (confused-deputy). If a second grant path is added above, assert against each.
+    assert!(
+        !denied.to_string().contains("/workspace"),
+        "the fed-back denial must not leak the grant (confused-deputy defense)"
+    );
 }
 
 /// Acceptance §8.3 (happy path, resume): a completed Mutation (Intent+Recorded
