@@ -50,7 +50,11 @@ byte-identical when no tool opts in.
 
 ## 4. Design
 
-### 4.1 Types (`orchestrator-core`)
+### 4.1 Types
+
+`ToolContext` + the `Tool`-trait additions live with the executable `Tool` trait in the
+**orchestrator** crate (`crates/orchestrator/src/agent/tools.rs`), NOT core. Core is unchanged
+(`ReconcileProvider`/`idempotency_key` in `orchestrator-core/src/reconcile.rs` already suffice).
 
 ```rust
 /// Per-call execution context for a tool (SP-4 s5). Carries the idempotency key the
@@ -109,8 +113,11 @@ Today `reconcile_in_doubt` **recomputes** `idempotency_key(teid, tih)`. Once key
 author-supplied, recompute could drift from what was actually sent to the provider (e.g. tool
 code changed between runs). Fix: **fold the journaled key** so reconcile reads it.
 - `Fold.intents` changes from `HashSet<EffectId>` to `HashMap<EffectId, String>` (teid →
-  journaled `idempotency_key`). The fold populates it from `EffectIntent`; an effect with a
-  matching `EffectRecorded` is removed (no longer in-doubt), exactly as today.
+  journaled `idempotency_key`). The fold populates it from `EffectIntent` and does NOT remove
+  on `EffectRecorded` (unchanged from the old `HashSet`) — in-doubt vs completed is decided by
+  the **memo-first** short-circuit: a completed Mutation (Intent+Recorded) replays from
+  `fold.memo` in `execute_tool_effect` before `mutation_tool_effect`'s `intents.contains_key`
+  is ever consulted, so `intents` is read only for the true in-doubt case.
 - `reconcile_in_doubt` reads `let key = fold.intents.get(teid)` (guaranteed present on the
   in-doubt path) and passes it to `provider.reconcile(key, &args)`. So reconcile
   queries the external system by the **exact key used at execution** — the exactly-once
