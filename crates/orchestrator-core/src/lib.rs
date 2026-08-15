@@ -5,6 +5,7 @@
 pub mod clock;
 pub mod content;
 pub mod context;
+pub mod credential;
 pub mod effect;
 pub mod error;
 pub mod graph;
@@ -20,6 +21,7 @@ pub mod registry;
 pub use clock::{Clock, SystemClock};
 pub use content::{ContentRef, ContentStore, Digest, EffectOutput, digest_of};
 pub use context::{ContextKey, ContextRef, ContextStore, Scope};
+pub use credential::{CredentialBroker, Secret};
 pub use effect::{EffectClass, EffectId, effect_id};
 pub use error::{JournalError, OrchestratorError};
 pub use graph::{

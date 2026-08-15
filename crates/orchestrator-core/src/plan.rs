@@ -339,6 +339,7 @@ mod tests {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
