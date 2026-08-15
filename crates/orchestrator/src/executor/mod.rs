@@ -46,6 +46,12 @@ pub struct Executor {
     /// via [`with_content_store`](Self::with_content_store) to enable the split —
     /// shared across the crash/resume boundary so a resume reads blobs back.
     content: Option<Arc<dyn ContentStore>>,
+    /// An optional secret [`Redactor`](orchestrator_core::Redactor) (SP-4 s2) applied
+    /// to every effect output at the two LEAF sites BEFORE it is journaled or fed back
+    /// to the agent. `None` (the default) ⇒ outputs pass through verbatim (the slice-1
+    /// behavior, byte-identical). Pure ⇒ live == journaled == replayed, so a resume
+    /// reproduces the scrub exactly (no determinism drift).
+    redactor: Option<Arc<dyn orchestrator_core::Redactor>>,
     /// The serialized-byte size **above which** an effect output is stored in the
     /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
     /// when a `content` store is wired.
@@ -176,6 +182,7 @@ impl Executor {
             max_depth: 8,
             concurrency: 8,
             content: None,
+            redactor: None,
             cas_threshold: 4096,
             clock: Arc::new(SystemClock),
             reconcilers: Arc::new(ReconcileRegistry::default()),
@@ -196,6 +203,14 @@ impl Executor {
     /// store as the original run — the crash/resume seam the CAS blobs live in.
     pub fn with_content_store(mut self, content: Arc<dyn ContentStore>) -> Self {
         self.content = Some(content);
+        self
+    }
+
+    /// Wire a secret [`Redactor`](orchestrator_core::Redactor) (SP-4 s2). Default
+    /// none ⇒ effect outputs are journaled/fed-back verbatim (byte-identical).
+    /// Recommended for production: `.with_redactor(Arc::new(PatternRedactor::default()))`.
+    pub fn with_redactor(mut self, redactor: Arc<dyn orchestrator_core::Redactor>) -> Self {
+        self.redactor = Some(redactor);
         self
     }
 
@@ -726,10 +741,9 @@ impl Executor {
                 let request = build_request(chain, payload);
                 match self.gateway.execute(&request).await {
                     Ok(response) => {
-                        let output = serde_json::json!({
-                            "model": response.model,
-                            "text": response.content.clone().unwrap_or_default(),
-                        });
+                        // SP-4 s2: route through the shared redaction chokepoint so a
+                        // ModelCall node whose model echoes a secret is scrubbed too.
+                        let output = self.model_output(&response);
                         // `EffectRecorded.seq` is advisory: `append` assigns the
                         // authoritative outer `Seq`, and the resume fold orders
                         // events by that outer `(Seq, event)` from `load` — never by

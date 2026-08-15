@@ -8737,3 +8737,339 @@ async fn select_end_to_end_with_llm_selector_and_hook() {
         "on_planner_selected fired for beta"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SP-4 slice 2 — secret redaction wired into the executor (opt-in `with_redactor`,
+// applied at the two LEAF output sites BEFORE journal + feed-back).
+// ---------------------------------------------------------------------------
+
+/// A Pure demo tool that RETURNS a canned payload — used to plant a secret in a tool
+/// RESULT (not in a tool ARGUMENT), so the redaction target is the tool output. The
+/// secret is assembled at runtime by the tests, never a source literal, so the repo's
+/// semgrep CWE-798 (hard-coded-credential) hook stays quiet. Empty permissions ⇒ the
+/// agent's empty grant covers it and the SP-4 s1 authorization gate is transparent.
+struct LeakTool {
+    payload: serde_json::Value,
+}
+impl Tool for LeakTool {
+    fn spec(&self) -> orchestrator_core::ToolSpec {
+        orchestrator_core::ToolSpec {
+            name: "leak".into(),
+            description: Some("returns a canned payload".into()),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: orchestrator_core::Activation::default(),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        Ok(self.payload.clone())
+    }
+}
+
+/// Registry whose agent "a" (chain "c") LISTS the `leak` demo tool, with its spec
+/// compiled into the prompt. Empty grant ⇒ the SP-4 s1 gate is transparent.
+fn leak_registry() -> Arc<Registry> {
+    Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                tools: vec!["leak".into()],
+                ..agent_def("c")
+            })
+            .with_tool(
+                LeakTool {
+                    payload: serde_json::Value::Null,
+                }
+                .spec(),
+            ),
+    )
+}
+
+/// AC4: a tool RESULT carrying a secret is scrubbed before it is journaled AND before
+/// it is fed back to the agent. With a `PatternRedactor` wired, the tool effect's
+/// journaled `EffectRecorded.output` holds `[REDACTED]` (not the plaintext), and — since
+/// the executor redacts once and uses that SAME value for both the journal split and the
+/// `ToolOutcome::Ok` returned to the agent — the value fed back is redacted too.
+#[tokio::test]
+async fn tool_result_secret_is_redacted_in_journal_and_transcript() {
+    // Assemble at RUNTIME so no credential-shaped literal sits in source (the semgrep
+    // CWE-798 hook blocks those); the redactor still matches the built string.
+    let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+    let (gateway, calls) = scripted_gateway(vec![
+        tool_call_response("t1", "leak", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
+        payload: serde_json::json!({ "leaked": secret.clone() }),
+    })));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(leak_registry())
+        .with_tools(tools)
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "leak a secret")],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    // The tool effect is turn-0, call index 0 → effect_id(node, 0, 1).
+    let tool_eid = effect_id("n1", 0, 1);
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &tool_eid).expect("tool effect recorded");
+    assert_eq!(
+        out["leaked"],
+        serde_json::json!("[REDACTED]"),
+        "journaled tool output is scrubbed: {out}"
+    );
+
+    // The value fed back to the agent is the SAME redacted value (single source), so no
+    // plaintext survives ANYWHERE in the journal — a resume replays the scrubbed value.
+    let dump = serde_json::to_string(&events).unwrap();
+    assert!(
+        !dump.contains(&secret),
+        "plaintext secret must not appear anywhere in the journal"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2, "two model turns");
+}
+
+/// AC5: a model turn's free TEXT is scrubbed while its `tool_calls` (the structured call
+/// args the next turn dispatches on) are left intact. The scripted turn emits both a
+/// secret in `content` and a real `calc` tool call; the journaled turn output's `text`
+/// is `[REDACTED]`, the tool-call `arguments` are byte-identical, and `calc` acts on the
+/// real numbers (result 5) — proving redaction touches text only, never call args.
+#[tokio::test]
+async fn model_text_secret_is_redacted_tool_calls_intact() {
+    let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+    let calc_args = "{\"op\":\"add\",\"a\":2,\"b\":3}";
+    // Turn 0: the model emits FREE TEXT carrying the secret AND a real calc tool call.
+    let turn0 = kernel::types::io::ChatResponse {
+        content: Some(secret.clone()),
+        tool_calls: vec![kernel::types::request::ToolCall {
+            id: "t1".into(),
+            name: "calc".into(),
+            arguments: calc_args.into(),
+        }],
+        usage: None,
+        model: Some("m".into()),
+        degraded: false,
+    };
+    let (gateway, _calls) = scripted_gateway(vec![turn0, final_response("done")]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "compute and leak")],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    let events = journal.load(run).await.unwrap();
+    // Model turn-0 output: text scrubbed, tool_call args intact.
+    let model_out = recorded_output(&events, &effect_id("n1", 0, 0)).expect("model turn recorded");
+    assert_eq!(
+        model_out["text"],
+        serde_json::json!("[REDACTED]"),
+        "model free text redacted: {model_out}"
+    );
+    assert_eq!(
+        model_out["tool_calls"][0]["arguments"],
+        serde_json::json!(calc_args),
+        "tool_call arguments left intact: {model_out}"
+    );
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "plaintext secret not journaled"
+    );
+
+    // The tool-call arg reached calc unredacted → it computed on the REAL numbers.
+    let calc_out = recorded_output(&events, &effect_id("n1", 0, 1)).expect("calc effect recorded");
+    assert_eq!(
+        calc_out["result"].as_f64(),
+        Some(5.0),
+        "calc acted on the intact arg: {calc_out}"
+    );
+}
+
+/// AC8: WITHOUT `with_redactor`, the exact same tool-returns-a-secret run journals the
+/// plaintext verbatim — proving redaction is opt-in (byte-identical default) and that
+/// the two tests above are load-bearing, not asserting an always-on scrub.
+#[tokio::test]
+async fn no_redactor_is_byte_identical() {
+    let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response("t1", "leak", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
+        payload: serde_json::json!({ "leaked": secret.clone() }),
+    })));
+    // Deliberately NO .with_redactor — redaction is opt-in.
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(leak_registry())
+        .with_tools(tools);
+
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "leak a secret")],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    exec.run(run, &graph).await.expect("run");
+
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &effect_id("n1", 0, 1)).expect("tool effect recorded");
+    assert_eq!(
+        out["leaked"],
+        serde_json::json!(secret),
+        "without a redactor the plaintext secret is journaled verbatim"
+    );
+}
+
+/// AC (gap fix): a direct `ModelCall` node whose model echoes a secret is scrubbed too
+/// — proving the redaction chokepoint (`model_output`) covers the `run_node` ModelCall
+/// leaf, not only the ReAct `dispatch_model_turn`.
+#[tokio::test]
+async fn model_call_node_text_is_redacted() {
+    // Runtime-assembled token (no source literal ⇒ semgrep CWE-798 hook stays quiet).
+    let token = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    let (gateway, _calls) =
+        scripted_gateway(vec![final_response(&format!("here it is {token}"))]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let n1 = NodeId("n1".into());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: n1.clone(),
+            kind: model_call("c", "hello"),
+            deps: vec![],
+        }],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    // The ModelCall node's structural effect id is effect_id(node, 0, 0).
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &effect_id("n1", 0, 0)).expect("model call recorded");
+    let text = out["text"].as_str().expect("text field");
+    assert!(
+        text.contains("[REDACTED]"),
+        "model-call text scrubbed: {text}"
+    );
+    assert!(
+        !text.contains(&token),
+        "plaintext token gone from text: {text}"
+    );
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&token),
+        "plaintext token not journaled anywhere"
+    );
+}
+
+/// AC (gap fix): a `Map`-item `ModelCall` whose model echoes a secret is scrubbed —
+/// covering the Map-item leaf (`run_map_item`). The content-gated gateway echoes
+/// `ok:{prompt}`, so a secret-bearing item lands the token in the item's model output.
+#[tokio::test]
+async fn map_item_model_text_is_redacted() {
+    let token = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    let (gateway, _calls) = content_gated_gateway().await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    // One item whose prompt carries the secret ⇒ the echoed model text is `ok:{token}`.
+    let over = map_items([token.as_str()]);
+    let graph = map_graph("m", over, Aggregation::BestEffort);
+    let m = NodeId("m".into());
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("map runs");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    // The child's aggregated model text is redacted in the Map node output …
+    let child_text = outcome.outputs[&m]["results"][0]["ok"]["text"]
+        .as_str()
+        .expect("child text");
+    assert!(
+        child_text.contains("[REDACTED]"),
+        "map-item text scrubbed: {child_text}"
+    );
+    assert!(
+        !child_text.contains(&token),
+        "plaintext token gone from map-item text: {child_text}"
+    );
+    // … and nowhere in the journal (the child's own `EffectRecorded` is scrubbed too).
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&token),
+        "plaintext token not journaled anywhere"
+    );
+}
+
+/// AC (gap fix): a `Consolidate` synthesis `ModelCall` whose model echoes a secret is
+/// scrubbed — covering the Consolidate leaf (`run_consolidate`). A single-item Map (so
+/// the scripted gateway is consumed in a deterministic order: item first, then the
+/// synthesis) feeds a Consolidate whose synthesis response carries the secret.
+#[tokio::test]
+async fn consolidate_synthesis_text_is_redacted() {
+    let token = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    // Response order: [0] the single Map item (clean), [1] the Consolidate synthesis
+    // (secret). One Map item ⇒ no concurrent race for the shared scripted queue.
+    let (gateway, _calls) =
+        scripted_gateway(vec![final_response("clean item"), final_response(&token)]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let cons = NodeId("cons".into());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["only"]),
+                    concurrency: 1,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: cons.clone(),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::soft("m")],
+            },
+        ],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    // The synthesis text (the Consolidate node output) is exactly the placeholder.
+    assert_eq!(
+        outcome.outputs[&cons]["text"],
+        serde_json::json!("[REDACTED]"),
+        "consolidate synthesis text scrubbed: {}",
+        outcome.outputs[&cons]
+    );
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&token),
+        "plaintext token not journaled anywhere"
+    );
+}
