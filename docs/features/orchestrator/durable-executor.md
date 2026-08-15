@@ -45,6 +45,13 @@ tool call on its `ToolSpec.effect_class`.
 | **Observation** | A read whose value can drift; memoize with TTL + provenance. | **Live** (slice 4) — a memo hit replays while fresh (`fetched_at + ttl_secs` per the injected `Clock`), else re-reads and records a superseding `EffectRecorded` with fresh `ObservationMeta{fetched_at, ttl_secs, source}`. *Note:* a stale re-read that returns a **different** value inside a multi-turn agent changes a later already-memoized turn's transcript, so that turn's input-hash mismatches and the resume halts loud with `DeterminismViolation` — safe (never a silent proceed), but a genuinely drifting Observation feeding later turns is a sharp edge to revisit if it bites. |
 | **Mutation** | An external write; two-phase (intent → record) + idempotency key + reconcile. | **Live** (slice 4) — journals `EffectIntent{idempotency_key, args_hash}` **before** the side effect, then `EffectRecorded`. On resume an Intent without a Recorded is **in-doubt** → a per-tool `ReconcileProvider` decides: `Confirmed`⇒record (don't re-run), `NotApplied`⇒run once under the standing Intent, `Indeterminate`/absent⇒durable `RunPaused` (never guess). |
 
+**Secret redaction (SP-4 s2).** Effect **outputs** (tool results, model-turn text, and the
+reconcile-`Confirmed` output) are scrubbed of secrets by an opt-in injected `Redactor`
+(`Executor::with_redactor`; default `PatternRedactor` → `[REDACTED]`) **at production, before
+both journaling and the agent/downstream-return** — so durable plaintext credentials never land
+in the journal/CAS and the model never sees a secret (anti-exfiltration). The redactor is pure ⇒
+`live == journaled == replayed`; default-off ⇒ byte-identical. Best-effort by shape.
+
 ## Journal, effect id, and memoization
 
 - **`ExecutionJournal`** is an append-only log of `JournalEvent`s per `RunId`
