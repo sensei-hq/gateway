@@ -93,6 +93,13 @@ impl ToolRegistry {
 
     /// Execute a tool by name, any effect class (slice 4). Unknown → loud; a
     /// tool error is surfaced.
+    ///
+    /// ⚠️ Test-only (`#[cfg(test)]`): this calls `Tool::call` DIRECTLY, bypassing any
+    /// `call_ctx` override — so it does NOT thread the SP-4 s5 idempotency key. The
+    /// executor dispatches every effect through `execute_ctx`; a production caller
+    /// reaching for this shorter form would silently skip idempotency/dedup, so it is
+    /// gated out of non-test builds entirely.
+    #[cfg(test)]
     pub fn execute(
         &self,
         name: &str,

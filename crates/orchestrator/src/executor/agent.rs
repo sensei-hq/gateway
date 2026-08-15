@@ -336,7 +336,7 @@ impl Executor {
         // Fail asymmetry: an *unauthorized* call is a SOFT, recoverable denial fed back
         // to the agent (policy violation — the agent can adapt), whereas an *unknown*
         // tool (listed+granted but absent from the ToolRegistry) HARD-fails the node via
-        // `execute` → `UnknownTool` (a misconfiguration — loud, not recoverable).
+        // `execute_ctx` → `UnknownTool` (a misconfiguration — loud, not recoverable).
         let need = self.tools.required_of(&call.name, &args);
         let no_grant = orchestrator_core::Permissions::default();
         let grant = ar.agent_grants.get(&call.name).unwrap_or(&no_grant);
@@ -375,8 +375,16 @@ impl Executor {
                         .and_then(|s| s.source.clone())
                         .unwrap_or_else(|| call.name.clone()),
                 });
-                self.record_tool_effect(ar, teid, call, args, &tih, (class, observation))
-                    .await
+                self.record_tool_effect(
+                    ar,
+                    teid,
+                    call,
+                    args,
+                    &tih,
+                    &idempotency_key(teid, &tih),
+                    (class, observation),
+                )
+                .await
             }
         }
     }
@@ -396,23 +404,36 @@ impl Executor {
         if ar.fold.intents.contains_key(teid) {
             return self.reconcile_in_doubt(ar, teid, call, args, tih).await;
         }
-        // The `idempotency_key` is persisted in the Intent for a reconciler that
-        // reads the journal to decide (an SP-4 real provider); this executor
-        // recomputes it deterministically in `reconcile_in_doubt` rather than
-        // reading it back, so the two are guaranteed identical.
+        // The effective idempotency key: the tool's author key (a domain ref) if it
+        // overrides `Tool::idempotency_key`, else the structural
+        // `sha256(effect_id | args_hash)`. Journaled in the Intent AND threaded to the
+        // tool via `call_ctx` (so the tool sends the SAME key to its external API); on
+        // an in-doubt resume `reconcile_in_doubt` READS this journaled key back.
+        let key = self
+            .tools
+            .idempotency_key_of(&call.name, &args)
+            .unwrap_or_else(|| idempotency_key(teid, tih));
         self.append(
             ar.run,
             JournalEvent::EffectIntent {
                 node: ar.node_id.clone(),
                 effect_id: teid.clone(),
-                idempotency_key: idempotency_key(teid, tih),
+                idempotency_key: key.clone(),
                 args_hash: tih.to_string(),
                 seq: 0,
             },
         )
         .await?;
-        self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
-            .await
+        self.record_tool_effect(
+            ar,
+            teid,
+            call,
+            args,
+            tih,
+            &key,
+            (EffectClass::Mutation, None),
+        )
+        .await
     }
 
     /// Reconcile an in-doubt Mutation on resume (§7.3): ask the per-tool
@@ -430,7 +451,17 @@ impl Executor {
         args: serde_json::Value,
         tih: &str,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
-        let key = idempotency_key(teid, tih);
+        // SP-4 s5: READ the effective key the live run journaled in the Intent (an
+        // author override or the structural key) rather than recompute it, so the
+        // reconciler queries the provider under the SAME key the tool sent to its
+        // external API. The fallback is unreachable in practice (this arm runs only
+        // when `teid ∈ fold.intents`); it keeps the recompute as a defensive default.
+        let key = ar
+            .fold
+            .intents
+            .get(teid)
+            .cloned()
+            .unwrap_or_else(|| idempotency_key(teid, tih));
         let verdict = match self.reconcilers.get(&call.name) {
             Some(provider) => provider.reconcile(&key, &args).await?,
             None => ReconcileOutcome::Indeterminate,
@@ -460,8 +491,16 @@ impl Executor {
                 Ok(ToolOutcome::Ok(output))
             }
             ReconcileOutcome::NotApplied => {
-                self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
-                    .await
+                self.record_tool_effect(
+                    ar,
+                    teid,
+                    call,
+                    args,
+                    tih,
+                    &key,
+                    (EffectClass::Mutation, None),
+                )
+                .await
             }
             ReconcileOutcome::Indeterminate => {
                 let reason = format!("mutation in-doubt: {key}");
@@ -530,6 +569,10 @@ impl Executor {
     /// Execute a tool live and journal its `EffectRecorded` (shared by all effect
     /// classes). On a tool error, journal `NodeFailed` and return the failure
     /// message. `observation` is `Some` only for Observation effects.
+    // The effect coordinates (id/call/args/hashes/key/class) are each distinct and
+    // passed positionally by the three call sites; bundling them behind a struct would
+    // only relocate the plumbing, so the arity is allowed here.
+    #[allow(clippy::too_many_arguments)]
     async fn record_tool_effect(
         &self,
         ar: &AgentRun<'_>,
@@ -537,6 +580,7 @@ impl Executor {
         call: &ToolCall,
         args: serde_json::Value,
         tih: &str,
+        idempotency_key: &str,
         record: (EffectClass, Option<ObservationMeta>),
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let (class, observation) = record;
@@ -545,7 +589,15 @@ impl Executor {
         if let Some(h) = &self.hooks {
             h.on_agent_tool_call(ar.run, ar.node_id, &call.name).await;
         }
-        match self.tools.execute(&call.name, args) {
+        // SP-4 s5: thread the effective idempotency key into the tool via `call_ctx`
+        // (journaled in the Intent for a Mutation; the structural key for Pure/
+        // Observation, which ignore it) so a real tool can send the SAME key to its
+        // external API for provider-side dedup.
+        let ctx = crate::agent::tools::ToolContext {
+            idempotency_key: idempotency_key.to_string(),
+            effect_id: teid.clone(),
+        };
+        match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
                 // SP-4 s2: scrub secrets BEFORE both journaling and feed-back, so the
                 // journaled record and the value returned to the agent are the redacted
