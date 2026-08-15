@@ -1424,12 +1424,23 @@ async fn in_doubt_indeterminate_pauses_without_applying() {
 struct KeyProbe {
     /// The last `ctx.idempotency_key` threaded into `call_ctx` (`None` until called).
     seen: Arc<std::sync::Mutex<Option<String>>>,
+    /// The last `ctx.effect_id` threaded into `call_ctx` (`None` until called) — lets a test
+    /// pin AC2's clause that the ToolContext's effect id IS the call's teid.
+    seen_eid: Arc<std::sync::Mutex<Option<EffectId>>>,
     /// When set, `idempotency_key(args)` returns `args["ref"]` — an author override.
     author_key: bool,
 }
 impl KeyProbe {
-    fn new(seen: Arc<std::sync::Mutex<Option<String>>>, author_key: bool) -> Self {
-        Self { seen, author_key }
+    fn new(
+        seen: Arc<std::sync::Mutex<Option<String>>>,
+        seen_eid: Arc<std::sync::Mutex<Option<EffectId>>>,
+        author_key: bool,
+    ) -> Self {
+        Self {
+            seen,
+            seen_eid,
+            author_key,
+        }
     }
 }
 impl Tool for KeyProbe {
@@ -1457,6 +1468,7 @@ impl Tool for KeyProbe {
         ctx: &ToolContext,
     ) -> Result<serde_json::Value, OrchestratorError> {
         *self.seen.lock().unwrap() = Some(ctx.idempotency_key.clone());
+        *self.seen_eid.lock().unwrap() = Some(ctx.effect_id.clone());
         self.call(args)
     }
     fn idempotency_key(&self, args: &serde_json::Value) -> Option<String> {
@@ -1477,7 +1489,14 @@ fn probe_registry() -> Arc<Registry> {
                 tools: vec!["mut_probe".into()],
                 ..agent_def("c")
             })
-            .with_tool(KeyProbe::new(Arc::new(std::sync::Mutex::new(None)), false).spec()),
+            .with_tool(
+                KeyProbe::new(
+                    Arc::new(std::sync::Mutex::new(None)),
+                    Arc::new(std::sync::Mutex::new(None)),
+                    false,
+                )
+                .spec(),
+            ),
     )
 }
 
@@ -1488,6 +1507,7 @@ fn probe_registry() -> Arc<Registry> {
 #[tokio::test]
 async fn tool_receives_the_journaled_idempotency_key() {
     let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen_eid = Arc::new(std::sync::Mutex::new(None::<EffectId>));
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
     let graph = Graph {
@@ -1500,9 +1520,9 @@ async fn tool_receives_the_journaled_idempotency_key() {
     .await;
     let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
         .with_registry(probe_registry())
-        .with_tools(Arc::new(
-            ToolRegistry::default().with_tool(Arc::new(KeyProbe::new(seen.clone(), false))),
-        ))
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+            KeyProbe::new(seen.clone(), seen_eid.clone(), false),
+        ))))
         .run(run, &graph)
         .await
         .expect("run completes");
@@ -1519,6 +1539,17 @@ async fn tool_receives_the_journaled_idempotency_key() {
     assert_eq!(
         received, journaled,
         "the tool receives EXACTLY the idempotency key journaled in the EffectIntent"
+    );
+    // AC2: the ToolContext's `effect_id` is the call's actual teid — the same id the
+    // EffectIntent/EffectRecorded are keyed on (so a tool can correlate its external call).
+    let received_eid = seen_eid
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool's call_ctx ran");
+    assert_eq!(
+        received_eid, tool_eid,
+        "the tool receives EXACTLY the call's effect id in its ToolContext"
     );
 }
 
@@ -1541,9 +1572,9 @@ async fn author_supplied_key_is_journaled_and_threaded() {
     .await;
     let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
         .with_registry(probe_registry())
-        .with_tools(Arc::new(
-            ToolRegistry::default().with_tool(Arc::new(KeyProbe::new(seen.clone(), true))),
-        ))
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+            KeyProbe::new(seen.clone(), Arc::new(std::sync::Mutex::new(None)), true),
+        ))))
         .run(run, &graph)
         .await
         .expect("run completes");
@@ -1588,9 +1619,9 @@ async fn default_tool_journals_the_structural_key() {
     .await;
     let o = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
         .with_registry(probe_registry())
-        .with_tools(Arc::new(
-            ToolRegistry::default().with_tool(Arc::new(KeyProbe::new(seen.clone(), false))),
-        ))
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+            KeyProbe::new(seen.clone(), Arc::new(std::sync::Mutex::new(None)), false),
+        ))))
         .run(run, &graph)
         .await
         .expect("run completes");
@@ -1613,6 +1644,496 @@ async fn default_tool_journals_the_structural_key() {
     assert_eq!(
         received, structural,
         "and threads that SAME structural key to the tool"
+    );
+}
+
+/// A shared, keyed "external system" the demo Mutation writes to (SP-4 s5, AC5). Keys
+/// are the effective idempotency key; values are the recorded side-effect output.
+type Store = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>;
+
+/// Demo Mutation tool with provider-side idempotency: writes to a keyed "external
+/// system" under `ctx.idempotency_key`; re-applying the same key is a no-op returning
+/// the recorded output. `calls` counts REAL applications (dedup MISSES; dedup hits do NOT
+/// count); `invocations` counts EVERY `call_ctx` ENTRY (before the dedup check) — so a test
+/// can prove the tool was NOT re-invoked on resume even though the store would have absorbed
+/// a wrong re-invocation (leaving `calls` reading 1 either way). Empty permissions ⇒ the
+/// agent's empty grant covers it and the SP-4 s1 gate is transparent.
+struct IdempotentStore {
+    store: Store,
+    calls: Arc<AtomicUsize>,
+    invocations: Arc<AtomicUsize>,
+}
+impl Tool for IdempotentStore {
+    fn spec(&self) -> orchestrator_core::ToolSpec {
+        orchestrator_core::ToolSpec {
+            name: "store".into(),
+            description: Some("Write to a keyed external system with provider-side dedup".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "item": {"type": "string"} }
+            }),
+            effect_class: EffectClass::Mutation,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: orchestrator_core::Activation::default(),
+        }
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        // The executor always drives `call_ctx`; a bare `call` would lose the key, so
+        // fail closed rather than apply the mutation without provider-side dedup.
+        Err(OrchestratorError::Tool {
+            tool: "store".into(),
+            message: "needs ctx".into(),
+        })
+    }
+    fn call_ctx(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        // Count EVERY entry (before dedup) so a Confirmed resume that WRONGLY re-invokes the
+        // tool is caught — the store's dedup would otherwise mask it (`calls` stays 1).
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        let mut s = self.store.lock().unwrap();
+        if let Some(existing) = s.get(&ctx.idempotency_key) {
+            return Ok(existing.clone()); // provider-side dedup: no second effect
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let out = serde_json::json!({ "stored": args });
+        s.insert(ctx.idempotency_key.clone(), out.clone());
+        Ok(out)
+    }
+    fn idempotency_key(&self, args: &serde_json::Value) -> Option<String> {
+        // Author/domain key when the caller supplies `ref` (a booking ref); absent ⇒ None ⇒
+        // the executor uses the STRUCTURAL key. So a `{"item": …}` drive stays structural
+        // (the structural-key exactly-once tests are unaffected); only a `{"ref": …}` drive
+        // overrides to the author key.
+        args.get("ref").and_then(|v| v.as_str()).map(str::to_string)
+    }
+}
+
+/// Reconcile provider paired with `IdempotentStore`: on an in-doubt resume, query the
+/// keyed "external system" under the JOURNALED key — a status query, never a re-run. Key
+/// present ⇒ the side effect already landed (`Confirmed` with its recorded output); key
+/// absent ⇒ it did not (`NotApplied`). Never guesses ⇒ never `Indeterminate`.
+struct StatusQueryReconciler {
+    store: Store,
+}
+#[async_trait::async_trait]
+impl orchestrator_core::ReconcileProvider for StatusQueryReconciler {
+    async fn reconcile(
+        &self,
+        idempotency_key: &str,
+        _args: &serde_json::Value,
+    ) -> Result<orchestrator_core::ReconcileOutcome, OrchestratorError> {
+        match self.store.lock().unwrap().get(idempotency_key) {
+            Some(out) => Ok(orchestrator_core::ReconcileOutcome::Confirmed(out.clone())),
+            None => Ok(orchestrator_core::ReconcileOutcome::NotApplied),
+        }
+    }
+}
+
+/// Registry whose agent "a" (chain "c") LISTS the `store` Mutation tool, with its spec
+/// compiled into the prompt. Empty grant ⇒ the SP-4 s1 gate is transparent. The spec-only
+/// instance's store/calls are throwaway (only `.spec()` is read).
+fn store_registry() -> Arc<Registry> {
+    Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                tools: vec!["store".into()],
+                ..agent_def("c")
+            })
+            .with_tool(
+                IdempotentStore {
+                    store: Store::default(),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    invocations: Arc::new(AtomicUsize::new(0)),
+                }
+                .spec(),
+            ),
+    )
+}
+
+/// Build a journal in the in-doubt state for the `store` Mutation (mirrors
+/// `seed_in_doubt_note`): a real run through the two-phase Mutation over the caller-owned
+/// `store`/`calls`, truncated to the prefix up to and including the effect's `EffectIntent`
+/// — so the resume sees an Intent with no matching `EffectRecorded`. The live seed applies
+/// the effect (`store[key]` written, `calls == 1`); the caller decides — by resuming over
+/// the SAME store or a fresh empty one — whether the side effect "survived the crash".
+/// `args` is the tool-call payload (JSON string): `{"item": …}` ⇒ a structural key,
+/// `{"ref": …}` ⇒ an author key (see `IdempotentStore::idempotency_key`).
+async fn seed_in_doubt_store(
+    store: Store,
+    calls: Arc<AtomicUsize>,
+    invocations: Arc<AtomicUsize>,
+    args: &str,
+) -> (InMemoryJournal, RunId) {
+    let full = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "store it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "store", args),
+        final_response("done"),
+    ])
+    .await;
+    Executor::new(Arc::new(gw), Arc::new(full.clone()), "v1")
+        .with_registry(store_registry())
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+            IdempotentStore {
+                store,
+                calls,
+                invocations,
+            },
+        ))))
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+        .expect("seed run journaled an EffectIntent");
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+    (seeded, run)
+}
+
+/// Resume an in-doubt `store` run with a caller-owned `store`/`calls` (whose contents
+/// model whether the side effect survived the crash) + `reconcilers`; return the outcome
+/// and journal events. Mirrors `resume_in_doubt` for the keyed-store demo.
+async fn resume_in_doubt_store(
+    journal: InMemoryJournal,
+    run: RunId,
+    store: Store,
+    calls: Arc<AtomicUsize>,
+    invocations: Arc<AtomicUsize>,
+    reconcilers: ReconcileRegistry,
+) -> (RunOutcome, Vec<(Seq, JournalEvent)>) {
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "store it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(store_registry())
+        .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+            IdempotentStore {
+                store,
+                calls,
+                invocations,
+            },
+        ))))
+        .with_reconcilers(Arc::new(reconcilers))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+    let events = journal.load(run).await.unwrap();
+    (out, events)
+}
+
+/// SP-4 s5 (AC5) — exactly-once, Confirmed-by-key: the side effect DID apply before the
+/// crash (the live seed wrote `store[key]`, `calls == 1`), then the journal was truncated
+/// before the `EffectRecorded` (in-doubt). A FRESH executor resumes sharing the SAME
+/// `store` + `calls` + a `StatusQueryReconciler` over that store. The reconciler finds the
+/// key → `Confirmed` → the executor records WITHOUT re-running: `calls` stays `1`, the
+/// store holds exactly one entry, no `DeterminismViolation`. The side effect happened
+/// exactly once across crash+resume.
+#[tokio::test]
+async fn exactly_once_confirmed_by_key_does_not_double_apply() {
+    let store_eid = effect_id("n1", 0, 1);
+    // Shared across crash+resume: the live seed applies the effect into THIS store.
+    let store: Store = Store::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (journal, run) = seed_in_doubt_store(
+        store.clone(),
+        calls.clone(),
+        invocations.clone(),
+        "{\"item\":\"widget\"}",
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the live seed applied the side effect once before the crash"
+    );
+    assert_eq!(
+        store.lock().unwrap().len(),
+        1,
+        "the seed wrote exactly one keyed entry"
+    );
+
+    // Resume over the SAME store (the effect survived the crash) with a status-query
+    // reconciler that reads it.
+    let reconcilers = ReconcileRegistry::default().with_provider(
+        "store",
+        Arc::new(StatusQueryReconciler {
+            store: store.clone(),
+        }),
+    );
+    let (out, events) = resume_in_doubt_store(
+        journal,
+        run,
+        store.clone(),
+        calls.clone(),
+        invocations.clone(),
+        reconcilers,
+    )
+    .await;
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "Confirmed completes with no DeterminismViolation: {:?}",
+        out.failed
+    );
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the tool's call_ctx was NOT re-invoked on resume (Confirmed records from the reconciler, not the tool)"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly-once: Confirmed-by-key records without re-applying — calls stays 1"
+    );
+    assert_eq!(
+        store.lock().unwrap().len(),
+        1,
+        "the external system still holds exactly one entry for the key (no double-apply)"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &store_eid),
+        1,
+        "Confirmed appends the Mutation's EffectRecorded exactly once"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
+
+/// SP-4 s5 (AC5 + D3, author key) — exactly-once with an AUTHOR key: driving the tool with
+/// `{"ref":"bk-77"}` makes `bk-77` the EFFECTIVE key journaled in the `EffectIntent`. The
+/// live seed applies the effect under `store["bk-77"]`, then the journal is truncated before
+/// `EffectRecorded` (in-doubt). A FRESH executor resumes sharing the SAME store + a
+/// `StatusQueryReconciler`. Because reconcile READS the journaled key (no structural
+/// recompute — the D3 "no drift for author keys" rationale), it queries by `bk-77`, finds it
+/// → `Confirmed` → records WITHOUT re-running: `invocations == 1`, `calls == 1`, one store
+/// entry, `RunCompleted`. Proves the author key survived the crash AND drove reconcile.
+#[tokio::test]
+async fn exactly_once_author_key_confirmed_does_not_double_apply() {
+    let store_eid = effect_id("n1", 0, 1);
+    // Shared across crash+resume; `{"ref":"bk-77"}` ⇒ the effective key is the AUTHOR key.
+    let store: Store = Store::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (journal, run) = seed_in_doubt_store(
+        store.clone(),
+        calls.clone(),
+        invocations.clone(),
+        "{\"ref\":\"bk-77\"}",
+    )
+    .await;
+
+    // The AUTHOR key — not a structural hash — is what got journaled in the Intent, so it is
+    // what survives the crash into the resume.
+    let seeded = journal.load(run).await.unwrap();
+    assert_eq!(
+        intent_key(&seeded, &store_eid).as_deref(),
+        Some("bk-77"),
+        "the author key is journaled in the EffectIntent (no structural recompute)"
+    );
+    assert!(
+        store.lock().unwrap().contains_key("bk-77"),
+        "the seed applied the effect under the author key"
+    );
+
+    // Resume over the SAME store with a status-query reconciler that reads it.
+    let reconcilers = ReconcileRegistry::default().with_provider(
+        "store",
+        Arc::new(StatusQueryReconciler {
+            store: store.clone(),
+        }),
+    );
+    let (out, events) = resume_in_doubt_store(
+        journal,
+        run,
+        store.clone(),
+        calls.clone(),
+        invocations.clone(),
+        reconcilers,
+    )
+    .await;
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "Confirmed completes with no DeterminismViolation: {:?}",
+        out.failed
+    );
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the tool's call_ctx was NOT re-invoked on resume (reconcile confirmed by the author key)"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly-once: author-keyed Confirmed records without re-applying — calls stays 1"
+    );
+    assert_eq!(
+        store.lock().unwrap().len(),
+        1,
+        "the external system still holds exactly one entry for bk-77 (no double-apply)"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &store_eid),
+        1,
+        "Confirmed appends the Mutation's EffectRecorded exactly once"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
+
+/// SP-4 s5 (AC5) — exactly-once, NotApplied-runs-once: the side effect did NOT apply
+/// before the crash. We resume over a fresh EMPTY store (a different keyed system than the
+/// throwaway seed store), so the status-query reconciler finds the key absent → `NotApplied`
+/// → the tool runs now, exactly once (`calls == 1`, the store gains the key), under the
+/// standing Intent (no second `EffectIntent`). Still exactly once.
+#[tokio::test]
+async fn exactly_once_not_applied_runs_the_effect_once() {
+    // Seed the in-doubt Intent over a THROWAWAY store; its write is discarded by resuming
+    // over a fresh empty store (models "the crash was before the side effect landed").
+    let (journal, run) = seed_in_doubt_store(
+        Store::default(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        "{\"item\":\"widget\"}",
+    )
+    .await;
+
+    let store: Store = Store::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let reconcilers = ReconcileRegistry::default().with_provider(
+        "store",
+        Arc::new(StatusQueryReconciler {
+            store: store.clone(),
+        }),
+    );
+    let (out, events) = resume_in_doubt_store(
+        journal,
+        run,
+        store.clone(),
+        calls.clone(),
+        invocations.clone(),
+        reconcilers,
+    )
+    .await;
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "NotApplied completes: {:?}",
+        out.failed
+    );
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "NotApplied invoked the tool exactly once on resume (fresh counter ⇒ only this run's application)"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly-once: NotApplied runs the effect exactly once on resume"
+    );
+    assert_eq!(
+        store.lock().unwrap().len(),
+        1,
+        "the effect now holds exactly one entry for the key"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+            .count(),
+        1,
+        "NotApplied re-uses the standing Intent — no second EffectIntent"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
+
+/// SP-4 s5 (AC7, preserved) — absent provider still pauses: an in-doubt `store` Mutation
+/// with NO `ReconcileProvider` registered resolves to `Indeterminate` → the run pauses
+/// loud (`RunPaused` journaled, `outcome.paused` set), applies NOTHING (the fresh resume
+/// store stays empty, `calls == 0`), and does not complete. The R3 mandatory-human path is
+/// unchanged by s5's exactly-once machinery.
+#[tokio::test]
+async fn absent_provider_for_in_doubt_mutation_pauses() {
+    let (journal, run) = seed_in_doubt_store(
+        Store::default(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        "{\"item\":\"widget\"}",
+    )
+    .await;
+
+    // Fresh empty resume store + NO provider registered for "store".
+    let store: Store = Store::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let reconcilers = ReconcileRegistry::default();
+    let (out, events) = resume_in_doubt_store(
+        journal,
+        run,
+        store.clone(),
+        calls.clone(),
+        invocations.clone(),
+        reconcilers,
+    )
+    .await;
+
+    let pause = out.paused.expect("an absent provider pauses the run");
+    assert_eq!(pause.node, NodeId("n1".into()));
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "the tool's call_ctx is never entered while paused"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a paused in-doubt Mutation applies no side effect"
+    );
+    assert!(
+        store.lock().unwrap().is_empty(),
+        "the external system is untouched while paused"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "RunPaused is journaled"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a paused run does not complete"
     );
 }
 
