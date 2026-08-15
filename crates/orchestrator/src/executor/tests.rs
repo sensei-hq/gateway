@@ -10563,3 +10563,272 @@ async fn unresolvable_declared_credential_fails_loud() {
         "the tool is never invoked when its declared credential cannot be resolved"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SP-4 credential broker (Task 4) — determinism-on-resume + whole-journal
+// no-plaintext e2e. A completed cred-using effect replays from the memo WITHOUT
+// re-consulting the broker (its scrubbed output was journaled, secret-free); a
+// full agent ReAct run that authenticates with an injected secret never lands the
+// plaintext anywhere in the journal OR the final agent output.
+// ---------------------------------------------------------------------------
+
+/// A `CredentialBroker` that COUNTS its `resolve` calls (shared `Arc<AtomicUsize>`) and
+/// delegates to a static `ref → secret` map. Proves a memoized cred-using tool effect is
+/// NOT re-resolved on resume: a FRESH counting broker sees ZERO resolves because the effect
+/// replays from the journal, never re-running the tool.
+struct CountingBroker {
+    map: std::collections::HashMap<String, String>,
+    resolves: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl orchestrator_core::CredentialBroker for CountingBroker {
+    async fn resolve(
+        &self,
+        cred_ref: &str,
+    ) -> Result<Option<orchestrator_core::Secret>, OrchestratorError> {
+        self.resolves.fetch_add(1, Ordering::SeqCst);
+        Ok(self.map.get(cred_ref).map(orchestrator_core::Secret::new))
+    }
+}
+
+/// SP-4 e2e probe: an agent tool that DECLARES `api_token`, EXPOSES it to "authenticate"
+/// (flips `authed` ONLY when the injected secret matches `expect` — an in-memory, never-
+/// journaled comparison), and returns a MASKED confirmation `{"authed": <bool>}` that never
+/// echoes the raw value. Distinct from `CredTool`: it does REAL work with the secret yet its
+/// output is a boolean, so the e2e proves the secret is USED but never LANDS.
+struct AuthTool {
+    /// The secret the tool expects on `expose()` — authenticating means it matches.
+    expect: String,
+}
+impl Tool for AuthTool {
+    fn spec(&self) -> orchestrator_core::ToolSpec {
+        orchestrator_core::ToolSpec {
+            name: "cred_probe".into(),
+            description: Some("authenticates with an injected credential".into()),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: orchestrator_core::Activation::default(),
+            credentials: vec!["api_token".into()],
+        }
+    }
+    // Never reached on the executor path (it always dispatches via `call_ctx`, the only
+    // surface that can see the injected credential): without a ctx there is no secret.
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        Ok(serde_json::json!({ "authed": false }))
+    }
+    fn call_ctx(
+        &self,
+        _args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        // Do real work with the secret (authenticate) — but return only a masked boolean:
+        // `authed == true` can ONLY arise from `expose() == self.expect`, never a raw echo.
+        let authed = ctx
+            .credentials
+            .get("api_token")
+            .map(|s| s.expose() == self.expect)
+            .unwrap_or(false);
+        Ok(serde_json::json!({ "authed": authed }))
+    }
+}
+
+/// AC4 (resume clause): a tool that used a broker credential, once completed + journaled, is
+/// NOT re-run on resume — so the broker is NOT re-consulted (its scrubbed output was
+/// journaled, secret-free). Seed: run the single-turn cred agent to completion through a
+/// COUNTING broker (resolve fires exactly once), then TRUNCATE the journal to the prefix
+/// ending at the tool's `EffectRecorded` (dropping the turn-1 final model call + completion)
+/// — an in-memo tail the resume must drive. Resume over that journal with a FRESH counting
+/// broker: the memoized tool effect replays from the journal, the resume broker's resolve
+/// count stays 0, the tool's `call_ctx` is never re-invoked, the effect is recorded exactly
+/// once, and the run completes with no `DeterminismViolation`.
+#[tokio::test]
+async fn broker_not_reinvoked_for_a_memoized_tool_on_resume() {
+    let secret = format!("tok-{}", "abcdef123456"); // runtime-assembled (semgrep CWE-798)
+    let tool_eid = effect_id("n1", 0, 1);
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "use the token")],
+    };
+
+    // --- Seed run: complete the cred tool through a COUNTING broker. ---
+    let full = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let seed_seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let seed_resolves = Arc::new(AtomicUsize::new(0));
+    let (gw1, _c1) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let tools1 = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["api_token".into()],
+        seen: seed_seen.clone(),
+        echo: false,
+    })));
+    Executor::new(Arc::new(gw1), Arc::new(full.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools1)
+        .with_credential_broker(Arc::new(CountingBroker {
+            map: broker_map(&[("api_token", &secret)]),
+            resolves: seed_resolves.clone(),
+        }))
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+    assert_eq!(
+        seed_resolves.load(Ordering::SeqCst),
+        1,
+        "the seed run resolved the declared credential exactly once"
+    );
+    assert_eq!(
+        *seed_seen.lock().unwrap(),
+        vec![Some(secret.clone())],
+        "the seed run's tool saw the real injected secret"
+    );
+
+    // Truncate to the prefix ending at the tool's `EffectRecorded` — the effect is memoized,
+    // but the turn-1 final model call + NodeCompleted + RunCompleted are dropped, so the
+    // resume MUST drive the tail (and would re-resolve if it re-ran the tool).
+    let events = full.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| {
+            matches!(e, JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &tool_eid)
+        })
+        .expect("seed run journaled the tool's EffectRecorded");
+    assert!(
+        !events[..=cut]
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the truncated seed is a partial (no RunCompleted) — the resume must drive the tail"
+    );
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // --- Resume: FRESH counting broker; the memoized tool must NOT be re-resolved. ---
+    let resume_seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let resume_resolves = Arc::new(AtomicUsize::new(0));
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let tools2 = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["api_token".into()],
+        seen: resume_seen.clone(),
+        echo: false,
+    })));
+    let outcome = Executor::new(Arc::new(gw2), Arc::new(seeded.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools2)
+        .with_credential_broker(Arc::new(CountingBroker {
+            map: broker_map(&[("api_token", &secret)]),
+            resolves: resume_resolves.clone(),
+        }))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+
+    // Load-bearing: the memoized cred effect replayed WITHOUT re-consulting the broker.
+    assert_eq!(
+        resume_resolves.load(Ordering::SeqCst),
+        0,
+        "the resume broker was NOT consulted — the memoized tool effect replayed from the journal"
+    );
+    assert!(
+        resume_seen.lock().unwrap().is_empty(),
+        "the memoized tool's call_ctx was NOT re-invoked on resume"
+    );
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "resume completes with no DeterminismViolation: failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    let resumed = seeded.load(run).await.unwrap();
+    assert_eq!(
+        effect_recorded_count(&resumed, &tool_eid),
+        1,
+        "the tool effect is recorded exactly once across seed + resume (replayed, not re-run)"
+    );
+    assert!(
+        resumed
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the resumed run completes"
+    );
+}
+
+/// AC8 (end-to-end, no plaintext): a full agent ReAct run — reason → call `cred_probe`
+/// (which DECLARES `api_token`) → observe → final answer — with a `StaticCredentialBroker`
+/// holding a runtime-assembled secret. The tool EXPOSES the secret to authenticate but
+/// returns a MASKED `{"authed": true}` (never the raw value). Assert: the run completes;
+/// the tool genuinely authenticated with the real secret (`authed == true` ⇒ `expose()`
+/// matched); and NO plaintext secret appears ANYWHERE — not across the whole serialized
+/// journal, and not in the final agent output. Distinct from Task 3's bare tool-effect
+/// tests: this drives a real multi-turn agent node AND scans the final agent output too.
+#[tokio::test]
+async fn agent_tool_authenticates_with_injected_secret_no_plaintext_e2e() {
+    let secret = format!("tok-{}", "abcdef123456"); // runtime-assembled (semgrep CWE-798)
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("authenticated; proceeding"),
+    ])
+    .await;
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(AuthTool {
+        expect: secret.clone(),
+    })));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools)
+        .with_credential_broker(Arc::new(crate::agent::tools::StaticCredentialBroker::new(
+            broker_map(&[("api_token", &secret)]),
+        )));
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "authenticate, then report status")],
+    };
+    let n1 = NodeId("n1".into());
+    let outcome = exec.run(run, &graph).await.expect("run");
+
+    // The full ReAct run completed.
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "run completes: failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    assert_eq!(outcome.completed, vec![n1.clone()]);
+
+    // The tool genuinely authenticated with the REAL injected secret (`authed == true` can
+    // only arise from `expose() == secret`), yet its output is a MASKED boolean.
+    let tool_eid = effect_id("n1", 0, 1);
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &tool_eid).expect("tool effect recorded");
+    assert_eq!(
+        out,
+        serde_json::json!({ "authed": true }),
+        "the tool authenticated with the real secret and returned a masked confirmation: {out}"
+    );
+
+    // Whole-journal scan: the plaintext secret appears in NO event, anywhere.
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "plaintext secret must not appear anywhere in the journal"
+    );
+    // Final agent output scan: the node's canonical output carries no plaintext secret.
+    assert!(
+        !serde_json::to_string(&outcome.outputs)
+            .unwrap()
+            .contains(&secret),
+        "plaintext secret must not appear in the final agent output"
+    );
+    // The run genuinely reached completion.
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
