@@ -32,7 +32,7 @@ byte-identical when no tool opts in.
   journals `EffectIntent{node, effect_id, idempotency_key, args_hash, seq}` **before** the side
   effect, then `record_tool_effect` runs the tool + journals `EffectRecorded`. On resume, an
   Intent without a Recorded is **in-doubt**: `reconcile_in_doubt` asks a per-tool
-  `ReconcileProvider::reconcile(effect_id, idempotency_key, args_hash) -> {Confirmed(Value),
+  `ReconcileProvider::reconcile(idempotency_key: &str, args: &Value) -> {Confirmed(Value),
   NotApplied, Indeterminate}` (absent ⇒ `Indeterminate` ⇒ durable `RunPaused`, never guess).
   `idempotency_key(effect_id, args_hash) = sha256(effect_id | args_hash)` — **structural**.
 - **The gap:** `Tool::call(&self, args)` receives only `args`. The idempotency key is computed
@@ -112,7 +112,7 @@ code changed between runs). Fix: **fold the journaled key** so reconcile reads i
   journaled `idempotency_key`). The fold populates it from `EffectIntent`; an effect with a
   matching `EffectRecorded` is removed (no longer in-doubt), exactly as today.
 - `reconcile_in_doubt` reads `let key = fold.intents.get(teid)` (guaranteed present on the
-  in-doubt path) and passes it to `provider.reconcile(effect_id, key, args_hash)`. So reconcile
+  in-doubt path) and passes it to `provider.reconcile(key, &args)`. So reconcile
   queries the external system by the **exact key used at execution** — the exactly-once
   correctness crux.
 - `mutation_tool_effect`'s in-doubt check (`teid ∈ fold.intents`) is a map `contains_key` —
