@@ -52,6 +52,15 @@ both journaling and the agent/downstream-return** — so durable plaintext crede
 in the journal/CAS and the model never sees a secret (anti-exfiltration). The redactor is pure ⇒
 `live == journaled == replayed`; default-off ⇒ byte-identical. Best-effort by shape.
 
+**Exactly-once / idempotency keys (SP-4 s5).** A Mutation's `idempotency_key` (author-supplied via
+`Tool::idempotency_key(args)`, else the structural `sha256(effect_id|args_hash)`) is journaled in the
+`EffectIntent` AND threaded to the tool via `call_ctx(args, &ToolContext{idempotency_key, effect_id})`,
+so a tool can send **the same key it journaled** to an external API for provider-side dedup. On an
+in-doubt resume, `reconcile_in_doubt` reads the **journaled** key from the fold (not a recompute) and
+queries the `ReconcileProvider` by it — so the side effect applies **exactly once** across a crash
+(`Confirmed`⇒record without re-running; `NotApplied`⇒run once under the standing Intent; absent
+provider⇒`RunPaused`, R3). Default tools use the structural key ⇒ byte-identical to before.
+
 ## Journal, effect id, and memoization
 
 - **`ExecutionJournal`** is an append-only log of `JournalEvent`s per `RunId`
