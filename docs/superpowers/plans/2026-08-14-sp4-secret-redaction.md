@@ -4,7 +4,7 @@
 
 **Goal:** Scrub secrets from effect outputs (tool results + model-turn text) before they are journaled or fed back to the agent, via a pure, injected `Redactor` (default `PatternRedactor`).
 
-**Architecture:** A `Redactor` trait in `orchestrator-core` (pure, replay-stable) with a `PatternRedactor` default that walks a JSON value and replaces curated secret-shape matches with `[REDACTED]`. The `Executor` gains an opt-in `redactor: Option<Arc<dyn Redactor>>` (`with_redactor`; default `None` ⇒ byte-identical). Redaction is applied at the two leaf output sites — the tool result and the model-turn `text` — **before both journaling and the agent-return**, so live == journaled == replayed (determinism-safe).
+**Architecture:** A `Redactor` trait in `orchestrator-core` (pure, replay-stable) with a `PatternRedactor` default that walks a JSON value and replaces curated secret-shape matches with `[REDACTED]`. The `Executor` gains an opt-in `redactor: Option<Arc<dyn Redactor>>` (`with_redactor`; default `None` ⇒ byte-identical). Redaction is applied at the leaf output sites — the tool result (`record_tool_effect`) and **every model-output producer via a single shared `model_output` chokepoint** (`dispatch_model_turn` + the `ModelCall`/`Map`-item/`Consolidate` nodes) — **before both journaling and the agent/downstream-return**, so live == journaled == replayed (determinism-safe). *(Note: Task 2 review found the model-text leaf is 4 producers, not 1 — closed via the shared `model_output` helper.)*
 
 **Tech Stack:** Rust workspace crates `sensei-orchestrator-core` (pure types + the `Redactor`/`PatternRedactor`, `regex` dep) and `sensei-orchestrator` (the `Executor` leaf sites). Design: `docs/superpowers/specs/2026-08-14-sp4-secret-redaction-design.md`.
 

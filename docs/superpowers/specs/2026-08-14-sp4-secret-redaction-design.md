@@ -16,7 +16,7 @@ Scrub secrets from effect **outputs** (tool results + model-turn text) **before 
 journaled or fed back to the agent**, so durable plaintext credentials never land in the
 journal/CAS (compliance landmine, master spec §289) and the model never sees a secret in a
 tool result (anti-exfiltration). Redaction is a **pure, injected `Redactor`** (default
-`PatternRedactor` — curated secret-shape patterns → `[REDACTED]`), applied at the two leaf
+`PatternRedactor` — curated secret-shape patterns → `[REDACTED]`), applied at the leaf
 output sites so live == journaled == replayed (determinism-safe). Opt-in
 (`Executor::with_redactor`); default off ⇒ byte-identical.
 
@@ -35,12 +35,18 @@ broker + resource-cap killing. 5. exactly-once hardening. This slice depends onl
 
 - **Where plaintext could land durably:** every effect **output** is journaled as
   `EffectRecorded.output` (an `EffectOutput`, CAS-split by `split_output` when large) and, for
-  agent effects, fed back into the ReAct transcript. The two **leaf** producers of externally-
-  sourced output are: **tool results** (`record_tool_effect`, `executor/agent.rs`) and
-  **model-turn text** (`agent_turn_output` → the `{model, text, tool_calls}` Pure effect). All
-  other journaled outputs are compositions of these — Map/Consolidate sink maps, `ContextWrite`
-  blackboard publishes, CAS blobs — so redacting the two leaves covers the durable surface
-  transitively.
+  agent effects, fed back into the ReAct transcript. The **leaf** producers of externally-
+  sourced output are: **tool results** (`record_tool_effect`) and — crucially — **every
+  model-output producer**, of which there are FOUR (they each build a `{model, text[,
+  tool_calls]}` value from a gateway `InferenceResponse`): the ReAct agent turn
+  (`dispatch_model_turn`), the direct `ModelCall` node (`run_node`), the `Map`-item model call
+  (`run_map_item`), and the `Consolidate` synthesis (`run_consolidate`). *(An early draft
+  wrongly assumed only the agent turn produced model text and the rest inherited "transitively"
+  — the Map/Consolidate/ModelCall nodes are direct producers, so they are redacted at
+  production, not transitively.)* The genuinely-derived outputs — `Map`/`Consolidate` **sink
+  maps** (aggregations of already-redacted node outputs), `ContextWrite` blackboard publishes,
+  and CAS blobs — DO inherit redaction transitively (they are compositions of the leaf outputs;
+  the CAS blob is `split_output` run *after* redaction).
 - **What is NOT plaintext-durable:** effect **inputs** are hashed, not stored — `EffectIntent.
   args_hash` and the per-turn `input_hash` are one-way hashes; the system prompt/context is only
   hashed into `agent_input_hash`. So the exposure is in outputs, not inputs.
@@ -55,8 +61,8 @@ broker + resource-cap killing. 5. exactly-once hardening. This slice depends onl
 - **No existing redaction** in the orchestrator. The `vault` crate (zeroize/KEK/crypto) is a
   separate encryption-at-rest subsystem the orchestrator does not consume.
 - **Impact:** additive — a `Redactor` injected via `with_redactor` (default `None` ⇒ identity ⇒
-  byte-identical, like `ContentStore`/reconcilers). The only behavior change is at the two leaf
-  sites *when a redactor is wired*.
+  byte-identical, like `ContentStore`/reconcilers). The only behavior change is at the leaf
+  output sites (the tool result + the shared `model_output` chokepoint) *when a redactor is wired*.
 
 ## 4. Design
 
@@ -99,19 +105,22 @@ fn redact(&self, v: &serde_json::Value) -> serde_json::Value {
     match &self.redactor { Some(r) => r.redact(v), None => v.clone() }
 }
 ```
-Applied at the two leaf sites, **before** the value is used for either journaling or the
-agent-return:
+Applied at the leaf output sites, **before** the value is used for either journaling or the
+agent/downstream-return:
 - **Tool result** (`record_tool_effect`): `let result = self.redact(&result);` — then
   `split_output(&result)` is journaled AND `Ok(ToolOutcome::Ok(result))` is returned. (So the
   CAS blob, produced by `split_output` *after* redaction, stores redacted bytes too.)
-- **Model turn** (`agent_turn_output`): redact the **`text`** field of the `{model, text,
-  tool_calls}` output before it is journaled and threaded into the next turn. **`tool_calls`
-  is left intact** — a model can only emit a secret in a tool-call argument if it *saw* one,
-  and we redact the sources (tool results + text), so the tool-invocation path stays whole and
-  the journaled==replayed tool_calls keep resume determinism.
+- **Every model-output producer**, via a **single shared chokepoint** `model_output(&self, resp)
+  -> Value` that builds `{model, text: self.redact(text)}` — so `text` is redacted **by
+  construction** and a future 5th producer inherits it. The four callers: `dispatch_model_turn`
+  (which appends `tool_calls` *after* the helper — **`tool_calls` left intact** so the ReAct
+  loop still dispatches its tools; a model only emits a secret arg if it *saw* one, and we redact
+  the sources), the direct `ModelCall` node, the `Map`-item call, and the `Consolidate` synthesis
+  (these three are text-only `{model, text}` — no `tool_calls`). `model` is a model *name*, not
+  redacted.
 
-Derived outputs (Map/Consolidate sink maps, `ContextWrite`, CAS blobs) inherit redaction from
-the leaves. A **memo hit replays the already-redacted journaled value** (no re-redaction). The
+Genuinely-derived outputs (`Map`/`Consolidate` sink maps, `ContextWrite`, CAS blobs) inherit
+redaction from the leaves (compositions of already-redacted producer outputs). A **memo hit replays the already-redacted journaled value** (no re-redaction). The
 redactor is pure, so live == journaled == replayed within a run's lifetime; a redactor **swapped
 across a resume** changes new outputs and trips the `input_hash` determinism fence **loud**
 (never silent). Folding a redactor version into the fence is a stated hardening (§6).
@@ -142,9 +151,11 @@ runtime confinement is the sandbox (slice 4). Stated so the boundary is not over
   when unwired), matches every other Executor seam; production opts in with one line
   (documented). Rejected: secure-default-ON (non-additive; false-positive-redacts existing
   test/demo outputs; diverges from the seam convention).
-- **D3 — redact at the two leaf sites, before journal AND agent-return; redactor pure**
+- **D3 — redact at the leaf sites (tool result + the shared `model_output` chokepoint for all
+  four model-output producers), before journal AND agent/downstream-return; redactor pure**
   [approved]: the only determinism-safe placement (live == journaled == replayed). Redacting
-  the journaled copy only would spuriously trip the fence on resume.
+  the journaled copy only would spuriously trip the fence on resume. *(The `model_output`
+  chokepoint corrects an early-draft assumption that only the agent turn produced model text.)*
 - **D4 — irreversible `[REDACTED]` placeholder** [approved]: pure, no key management; reversible
   tokenization/crypto-shred is SP-DATA.
 - **D5 — curated prefix/keyword patterns, no entropy heuristic; ReDoS-safe `regex`** [approved]:
