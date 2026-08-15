@@ -596,7 +596,27 @@ impl Executor {
         if let Some(spec) = self.tools.spec_of(&call.name) {
             for cred_ref in &spec.credentials {
                 let secret = match &self.credential_broker {
-                    Some(broker) => broker.resolve(cred_ref).await?,
+                    // A broker that ERRORS (an infra failure, not a miss) fails LOUD as a node
+                    // failure — journal `NodeFailed` + return `Failed`, mirroring the `None`
+                    // arm below (journal-everything parity; never a raw run-level `Err`).
+                    Some(broker) => match broker.resolve(cred_ref).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let msg = format!(
+                                "tool '{}' requires credential '{}' but the broker errored: {}",
+                                call.name, cred_ref, e
+                            );
+                            self.append(
+                                ar.run,
+                                JournalEvent::NodeFailed {
+                                    node: ar.node_id.clone(),
+                                    error: msg.clone(),
+                                },
+                            )
+                            .await?;
+                            return Ok(ToolOutcome::Failed(msg));
+                        }
+                    },
                     None => None,
                 };
                 match secret {
@@ -633,15 +653,18 @@ impl Executor {
         };
         match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
-                // SP-4 s2: scrub secrets BEFORE both journaling and feed-back, so the
-                // journaled record and the value returned to the agent are the redacted
-                // one (identical) — determinism-safe (live == journaled == replayed).
-                let result = self.redact(&result);
-                // SP-4 broker: scrub the EXACT injected credential VALUES from this call's
-                // output (composes with the s2 pattern redactor). Per-call + pure ⇒ a tool
-                // holds only its own creds, so this stays determinism-safe.
+                // SP-4 broker: scrub the EXACT injected credential VALUES first. A tool echoes
+                // its own credential verbatim, so a whole-value match always succeeds here;
+                // doing this BEFORE the s2 pattern redactor prevents a wrapped/composite secret
+                // (whose high-entropy span the pattern would fragment) from partially surviving.
+                // Per-call + pure ⇒ a tool holds only its own creds, so this stays
+                // determinism-safe.
                 let result =
                     super::content::scrub_secret_values(&result, &ctx.exposed_secret_values());
+                // SP-4 s2: then pattern-redact the residual. Both passes are pure ⇒ the
+                // journaled record and the value fed back to the agent are identical (live ==
+                // journaled == replayed).
+                let result = self.redact(&result);
                 let recorded = self.split_output(&result).await?;
                 self.append(
                     ar.run,

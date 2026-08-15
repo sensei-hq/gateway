@@ -10832,3 +10832,159 @@ async fn agent_tool_authenticates_with_injected_secret_no_plaintext_e2e() {
         "the run completes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SP-4 credential broker — whole-slice review fixes.
+// (1 · Important) scrub the EXACT injected values BEFORE the s2 pattern redact, so a
+//     wrapped/composite secret is redacted WHOLE (no surviving high-entropy-adjacent
+//     fragment). (2 · Minor) a broker RESOLVE ERROR fails LOUD as a node failure,
+//     mirroring the unresolvable-`None` path (journal-everything parity).
+// ---------------------------------------------------------------------------
+
+/// SP-4 broker whole-slice review (Important, security): a WRAPPED/COMPOSITE injected
+/// credential — a high-entropy `sk-…` span wrapped in non-pattern `wrap-` bytes — is
+/// scrubbed WHOLE, with NO surviving fragment. If the s2 pattern redactor ran FIRST it
+/// would collapse only the inner `sk-…` span to `[REDACTED]` (`wrap-[REDACTED]`), leaving
+/// the `wrap-` prefix — real credential material — to survive into BOTH the journal AND the
+/// value fed back to the agent. Scrubbing the EXACT injected value FIRST redacts the whole
+/// secret; the residual pattern pass then finds nothing. The broker holds a runtime-
+/// assembled composite value (the repo's semgrep CWE-798 hook blocks credential literals).
+#[tokio::test]
+async fn echoed_composite_credential_no_fragment_leak() {
+    use orchestrator_core::Redactor;
+    // Composite: `wrap-` (non-pattern) + `sk-` + 20 alnum (matches the s2
+    // `sk-[A-Za-z0-9_-]{20,}` pattern). The pattern alone fragments this; only the
+    // exact-value scrub can redact the WHOLE thing.
+    let secret = format!("wrap-sk-{}", "abcdef0123456789abcd");
+    // Premise: the s2 redactor catches ONLY the inner `sk-…` span, leaving `wrap-`.
+    assert_eq!(
+        orchestrator_core::PatternRedactor::default().redact(&serde_json::json!(secret.clone())),
+        serde_json::json!("wrap-[REDACTED]"),
+        "premise: the pattern redactor alone fragments the composite, leaving `wrap-`"
+    );
+
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response("t1", "cred_probe", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["api_token".into()],
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        echo: true, // RETURNS the injected credential verbatim
+    })));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools)
+        .with_credential_broker(Arc::new(crate::agent::tools::StaticCredentialBroker::new(
+            broker_map(&[("api_token", &secret)]),
+        )))
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "echo the token")],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    // The journaled tool-effect output: the WHOLE composite is `[REDACTED]` — neither the
+    // full secret nor the `wrap-` fragment survives.
+    let tool_eid = effect_id("n1", 0, 1);
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &tool_eid).expect("tool effect recorded");
+    assert_eq!(
+        out["leaked"],
+        serde_json::json!("[REDACTED]"),
+        "the composite credential is scrubbed WHOLE (no fragment): {out}"
+    );
+    // Whole-journal scan (journaled == fed-back, a single-source `result`): neither the full
+    // secret nor the `wrap-` prefix fragment appears ANYWHERE.
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(
+        !serialized.contains(&secret),
+        "no plaintext composite secret survives in the journal"
+    );
+    assert!(
+        !serialized.contains("wrap-"),
+        "no `wrap-` credential fragment survives in the journal: {serialized}"
+    );
+    // The value fed back to the agent carries no fragment either (same single-source
+    // `result` that was journaled).
+    assert!(
+        !serde_json::to_string(&outcome.outputs)
+            .unwrap()
+            .contains("wrap-"),
+        "no `wrap-` fragment in the final agent output fed back"
+    );
+}
+
+/// SP-4 broker whole-slice review (Minor, parity/observability): a broker RESOLVE ERROR
+/// fails LOUD as a NODE failure — a `NodeFailed` is journaled AND the outcome surfaces the
+/// node as `Failed`, mirroring the unresolvable-`None` path (never a raw run-level `Err`
+/// with no journal, and never a silent success). The tool is never executed under a
+/// half-populated ctx.
+#[tokio::test]
+async fn broker_error_fails_loud_as_node_failure() {
+    // A broker whose `resolve` always ERRORS (an infrastructure failure, not a miss).
+    struct ErroringBroker;
+    #[async_trait::async_trait]
+    impl orchestrator_core::CredentialBroker for ErroringBroker {
+        async fn resolve(
+            &self,
+            _cred_ref: &str,
+        ) -> Result<Option<orchestrator_core::Secret>, OrchestratorError> {
+            Err(OrchestratorError::Gateway(
+                "broker backend unavailable".into(),
+            ))
+        }
+    }
+
+    let n1 = NodeId("n1".into());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "needs a cred the broker can't fetch")],
+    };
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let (gateway, _calls) =
+        scripted_gateway(vec![tool_call_response("t1", "cred_probe", "{}")]).await;
+    let journal = InMemoryJournal::new();
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(CredTool {
+        declares: vec!["api_token".into()],
+        seen: seen.clone(),
+        echo: false,
+    })));
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(cred_registry())
+        .with_tools(tools)
+        .with_credential_broker(Arc::new(ErroringBroker))
+        .run(run, &graph)
+        .await
+        .expect("a broker error surfaces as an outcome, not a raw run-level Err");
+
+    // The node failed loud, naming the credential AND the broker error (mirror of the
+    // unresolvable-`None` path — not silent, not a raw run-level Err).
+    let (node, msg) = outcome
+        .failed
+        .expect("a broker resolve error fails the node");
+    assert_eq!(node, n1, "the failing node is named");
+    assert!(
+        msg.contains("credential 'api_token'") && msg.contains("broker errored"),
+        "the failure names the credential AND the broker error: {msg}"
+    );
+    // A `NodeFailed` for n1 is journaled (journal-everything parity with the None path).
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        events.iter().any(|(_, e)| matches!(
+            e,
+            JournalEvent::NodeFailed { node, .. } if node == &n1
+        )),
+        "a NodeFailed is journaled for the broker error"
+    );
+    // The tool never executed under a half-populated ctx (fail closes BEFORE `call_ctx`).
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the tool is never invoked when its broker errors"
+    );
+}
