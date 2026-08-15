@@ -1457,6 +1457,7 @@ impl Tool for KeyProbe {
             source: None,
             permissions: Permissions::default(),
             activation: orchestrator_core::Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -1677,6 +1678,7 @@ impl Tool for IdempotentStore {
             source: None,
             permissions: Permissions::default(),
             activation: orchestrator_core::Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -6256,6 +6258,7 @@ async fn granted_tool_permissions_are_inert_end_to_end() {
             ..Default::default()
         },
         activation: orchestrator_core::Activation::default(),
+        credentials: vec![],
     };
     let mut agent = agent_def("c");
     agent.tools = vec!["calc".into()];
@@ -6317,6 +6320,7 @@ async fn granted_tool_executes_normally_declarations_dont_gate() {
             ..Default::default()
         },
         activation: orchestrator_core::Activation::default(),
+        credentials: vec![],
     };
     let mut agent = agent_def("c");
     agent.tools = vec!["calc".into()];
@@ -9504,6 +9508,7 @@ impl Tool for LeakTool {
             source: None,
             permissions: Permissions::default(),
             activation: orchestrator_core::Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
