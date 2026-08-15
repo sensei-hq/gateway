@@ -94,6 +94,27 @@ source: crates/orchestrator*
 > memo, tool never re-invoked. **Authorizes, does not confine:** a tool that under-reports
 > its `required` bypasses the gate — runtime confinement + cap-killing = the sandbox slice.
 > No-permission tools + agents that list them are byte-identical.
+>
+> **SP-4 credential broker — ephemeral secret injection:** lets a tool authenticate to an
+> external system **without the secret ever reaching the model or the durable journal**
+> (completes the SP-4 arc: s1 authorizes, s2 redacts outputs, s5 makes writes exactly-once,
+> the broker provides the credential out-of-band). A tool **declares** its credential refs
+> on `ToolSpec.credentials: Vec<String>` (alongside `permissions`); `record_tool_effect`
+> resolves each ref via an injected async **`CredentialBroker`** (`Executor::with_credential_broker`,
+> default none; demo `StaticCredentialBroker`, real impl wraps `vault::Vault`) and injects
+> the resolved **`Secret`**s (`Zeroizing<String>`, `[REDACTED]` Debug, audited `expose()`)
+> into `ToolContext.credentials: Arc<HashMap<String,Secret>>` — resolved **before** the sync
+> `call_ctx` (forced by the async-broker / sync-tool boundary). **Ephemeral:** never
+> journaled / hashed (`input_hash` is over `args`) / re-injected on a memoized resume (the
+> broker is not re-consulted for a replayed tool). **Echo-leak closed** by a per-call
+> exact-value scrub of the tool's output (pure over *this* call's output + creds — not a
+> run-wide set that would diverge on resume); it runs **before** the s2 pattern redactor so
+> a wrapped/composite secret can't be fragmented past the exact-value match. **Fail-loud:**
+> a declared ref with no broker / an unresolved (`None`) / an errored broker → journal
+> `NodeFailed` + `ToolOutcome::Failed`, tool never runs. **Confused-deputy safe:** a tool
+> sees only its *own* declared creds. **No broker + empty `credentials` ⇒ byte-identical.**
+> **Deferred:** sandbox egress confinement + resource-cap killing (blocked on the
+> tool-execution-model), the real vault-backed broker, per-tenant credential scoping.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
