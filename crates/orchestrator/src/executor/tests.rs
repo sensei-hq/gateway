@@ -8748,8 +8748,14 @@ async fn select_end_to_end_with_llm_selector_and_hook() {
 /// secret is assembled at runtime by the tests, never a source literal, so the repo's
 /// semgrep CWE-798 (hard-coded-credential) hook stays quiet. Empty permissions ⇒ the
 /// agent's empty grant covers it and the SP-4 s1 authorization gate is transparent.
+///
+/// `calls` is an OPTIONAL invocation sink: each live `call` pushes its args. A resume
+/// that correctly memo-replays the tool's (redacted) output never re-executes the tool,
+/// so a FRESH sink handle stays EMPTY on resume — the direct, independent signal (beside
+/// the `EffectRecorded` count) that the tool was not re-invoked.
 struct LeakTool {
     payload: serde_json::Value,
+    calls: Option<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
 }
 impl Tool for LeakTool {
     fn spec(&self) -> orchestrator_core::ToolSpec {
@@ -8764,7 +8770,10 @@ impl Tool for LeakTool {
             activation: orchestrator_core::Activation::default(),
         }
     }
-    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+    fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        if let Some(sink) = &self.calls {
+            sink.lock().unwrap().push(args);
+        }
         Ok(self.payload.clone())
     }
 }
@@ -8781,6 +8790,7 @@ fn leak_registry() -> Arc<Registry> {
             .with_tool(
                 LeakTool {
                     payload: serde_json::Value::Null,
+                    calls: None,
                 }
                 .spec(),
             ),
@@ -8805,6 +8815,7 @@ async fn tool_result_secret_is_redacted_in_journal_and_transcript() {
     let journal = InMemoryJournal::new();
     let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
         payload: serde_json::json!({ "leaked": secret.clone() }),
+        calls: None,
     })));
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
         .with_registry(leak_registry())
@@ -8914,6 +8925,7 @@ async fn no_redactor_is_byte_identical() {
     let journal = InMemoryJournal::new();
     let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
         payload: serde_json::json!({ "leaked": secret.clone() }),
+        calls: None,
     })));
     // Deliberately NO .with_redactor — redaction is opt-in.
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
@@ -9071,5 +9083,263 @@ async fn consolidate_synthesis_text_is_redacted() {
     assert!(
         !serde_json::to_string(&events).unwrap().contains(&token),
         "plaintext token not journaled anywhere"
+    );
+}
+
+/// AC6 (resume determinism): a redacted tool output is journaled ONCE (redacted) and,
+/// on resume, REPLAYS from that memo — the tool is NOT re-invoked and no second
+/// `EffectRecorded` is appended. Unlike the pure-gate denial case (where a live re-run
+/// would re-produce the same value), a re-invoked `LeakTool` here would re-execute and
+/// re-record, so the COUNT is a sharp, mutation-verifiable proof: the tool effect's
+/// `EffectRecorded` appears EXACTLY ONCE across BOTH runs (recorded live in run 1,
+/// replayed — not re-recorded — in run 2). A broken tool memo would re-run the tool on
+/// resume (count → 2, fresh sink non-empty). The replayed value is the JOURNALED
+/// (redacted) one, so no plaintext ever re-enters the transcript on resume.
+#[tokio::test]
+async fn redacted_output_replays_on_resume() {
+    // Runtime-assembled (no source literal ⇒ the semgrep CWE-798 hook stays quiet); the
+    // redactor still matches the joined string.
+    let secret = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "leak a secret")],
+    };
+    // The tool effect is turn-0, call index 0 → effect_id(node, 0, 1).
+    let tool_eid = effect_id("n1", 0, 1);
+
+    // Run 1 (seed a PARTIAL run): turn 0's `leak` call executes LIVE (sink1 gets ONE
+    // entry) → its redacted output is journaled once; the script then runs out on turn 1
+    // → the node fails → NO RunCompleted.
+    let sink1 = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let (gw1, _c1) = scripted_gateway(vec![tool_call_response("t1", "leak", "{}")]).await;
+    let tools1 = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
+        payload: serde_json::json!({ "leaked": secret.clone() }),
+        calls: Some(sink1.clone()),
+    })));
+    let o1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(leak_registry())
+        .with_tools(tools1)
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()))
+        .run(run, &graph)
+        .await
+        .expect("seed yields an outcome");
+    assert!(
+        o1.failed.is_some(),
+        "seed dies at turn 1 (script exhausted)"
+    );
+    assert_eq!(
+        sink1.lock().unwrap().len(),
+        1,
+        "the tool ran live exactly once in run 1"
+    );
+    let seeded = journal.load(run).await.unwrap();
+    assert_eq!(
+        effect_recorded_count(&seeded, &tool_eid),
+        1,
+        "the redacted tool output is recorded once, live, in run 1"
+    );
+    assert_eq!(
+        recorded_output(&seeded, &tool_eid).expect("tool effect recorded")["leaked"],
+        serde_json::json!("[REDACTED]"),
+        "the journaled output is redacted even before resume"
+    );
+
+    // Run 2 (resume over the SAME journal, FRESH gateway + FRESH `LeakTool` sink): turn
+    // 0's model turn and its `leak` call both MEMO-HIT — the redacted value replays from
+    // the journal (the tool is NOT re-executed), so the fresh sink stays empty; turn 1 is
+    // driven live to a final answer and the run completes.
+    let sink2 = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let tools2 = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
+        payload: serde_json::json!({ "leaked": secret.clone() }),
+        calls: Some(sink2.clone()),
+    })));
+    let o2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(leak_registry())
+        .with_tools(tools2)
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+    assert!(
+        o2.failed.is_none() && o2.paused.is_none(),
+        "resume reaches the completed state: {:?}",
+        o2.failed
+    );
+    assert!(
+        sink2.lock().unwrap().is_empty(),
+        "the redacted output replayed from the memo — the tool was NOT re-invoked on resume"
+    );
+
+    // Load-bearing (mutation-verifiable): the tool effect's `EffectRecorded` appears
+    // EXACTLY ONCE across BOTH runs — the memo replays the redacted value rather than
+    // re-executing the tool. Disabling the tool memo makes resume re-run + re-record it
+    // (count → 2, sink2 non-empty), failing this assertion.
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        effect_recorded_count(&events, &tool_eid),
+        1,
+        "the redacted output is journaled once total: recorded live, then replayed from the memo"
+    );
+    assert_eq!(
+        recorded_output(&events, &tool_eid).expect("tool effect recorded")["leaked"],
+        serde_json::json!("[REDACTED]"),
+        "the single record is the redacted value"
+    );
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "no plaintext secret survives anywhere in the journal across the crash/resume seam"
+    );
+}
+
+/// AC7 (CAS-blob redaction): with a `ContentStore` and a low `cas_threshold`, an
+/// over-threshold tool output is stored in the CAS as a `ContentRef`. Redaction runs in
+/// `record_tool_effect` BEFORE `split_output`, so the BYTES in the CAS are the redacted
+/// ones — the blob contains `[REDACTED]` and never the plaintext. Both the plaintext AND
+/// the redacted output exceed the threshold, so the split happens regardless; the proof
+/// is that the stored blob is scrubbed, i.e. redaction precedes the CAS write.
+#[tokio::test]
+async fn over_threshold_secret_is_redacted_in_cas() {
+    use orchestrator_store::InMemoryContentStore;
+
+    let secret = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response("t1", "leak", "{}"),
+        final_response("done"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let content = Arc::new(InMemoryContentStore::new());
+    // Payload `{"leaked": <secret>}` serializes to ~40 bytes and its redacted form
+    // `{"leaked":"[REDACTED]"}` to ~22 — both exceed an 8-byte threshold, so the output
+    // splits to a Ref either way. What we assert is that the stored blob is SCRUBBED.
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
+        payload: serde_json::json!({ "leaked": secret.clone() }),
+        calls: None,
+    })));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(leak_registry())
+        .with_tools(tools)
+        .with_content_store(content.clone())
+        .with_cas_threshold(8)
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "leak a secret")],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    // The tool effect (turn 0, call index 0) split to a CAS Ref, not an inline value.
+    let tool_eid = effect_id("n1", 0, 1);
+    let events = journal.load(run).await.unwrap();
+    let digest = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded {
+                effect_id,
+                output: EffectOutput::Ref(r),
+                ..
+            } if effect_id == &tool_eid => Some(r.digest.clone()),
+            _ => None,
+        })
+        .expect("the over-threshold tool output split to a CAS ref");
+
+    // The bytes stored in the CAS are the REDACTED ones (redaction precedes split_output).
+    let bytes = content.get(&digest).await.expect("blob present in the CAS");
+    let raw = String::from_utf8(bytes.clone()).expect("utf8 blob");
+    assert!(
+        raw.contains("[REDACTED]"),
+        "the CAS blob is redacted: {raw}"
+    );
+    assert!(
+        !raw.contains(&secret),
+        "the plaintext secret is NOT in the CAS blob: {raw}"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["leaked"],
+        serde_json::json!("[REDACTED]"),
+        "the materialized CAS value is scrubbed: {value}"
+    );
+    // Defense in depth: the plaintext is in NEITHER the journal NOR any CAS blob.
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "plaintext secret not in the journal control log"
+    );
+}
+
+/// AC9 (whole-journal, multi-surface e2e): one agent run leaks a secret on BOTH scrub
+/// surfaces at once — a tool RESULT (`leak`) and the model's free TEXT — and is driven to
+/// completion. Task 2's AC4 already whole-journal-scans a single tool-result secret; this
+/// widens the guarantee to the combined tool + model-text surfaces in ONE run, then
+/// asserts NEITHER plaintext appears ANYWHERE in the journal, that BOTH surfaces are
+/// present as `[REDACTED]`, and that the final agent output carries no plaintext. No CAS
+/// is wired, so every output is inline in the journal — the scan is over the real bytes.
+#[tokio::test]
+async fn agent_tool_secret_never_lands_plaintext_e2e() {
+    // Two DISTINCT runtime-assembled secrets — one per surface — so each surface is
+    // proven scrubbed independently (not one scrub masking the other).
+    let tool_secret = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    let model_secret = ["sk", "zyxwvutsrqponmlkjihgfedcba"].join("-");
+    // Turn 0: a `leak` tool call (result carries `tool_secret`). Turn 1: the model's final
+    // free text echoes `model_secret`.
+    let (gateway, calls) = scripted_gateway(vec![
+        tool_call_response("t1", "leak", "{}"),
+        final_response(&format!("here it is: {model_secret}")),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let tools = Arc::new(ToolRegistry::default().with_tool(Arc::new(LeakTool {
+        payload: serde_json::json!({ "leaked": tool_secret.clone() }),
+        calls: None,
+    })));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(leak_registry())
+        .with_tools(tools)
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let n1 = NodeId("n1".into());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "leak on both surfaces")],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "two model turns drove the run"
+    );
+
+    let events = journal.load(run).await.unwrap();
+
+    // Positive proof BOTH surfaces were scrubbed (not merely absent because the run
+    // short-circuited): the tool result is `[REDACTED]` …
+    let tool_out = recorded_output(&events, &effect_id("n1", 0, 1)).expect("tool effect recorded");
+    assert_eq!(
+        tool_out["leaked"],
+        serde_json::json!("[REDACTED]"),
+        "tool-result surface scrubbed: {tool_out}"
+    );
+    // … and the model's final free text contains `[REDACTED]` (not the plaintext).
+    let final_text = outcome.outputs[&n1]["text"].as_str().expect("final text");
+    assert!(
+        final_text.contains("[REDACTED]") && !final_text.contains(&model_secret),
+        "model-text surface scrubbed in the final output: {final_text}"
+    );
+
+    // The whole-journal guarantee: NEITHER plaintext secret appears ANYWHERE across the
+    // serialized events (all inline — no CAS wired).
+    let dump = serde_json::to_string(&events).unwrap();
+    assert!(
+        !dump.contains(&tool_secret),
+        "the tool-result plaintext never lands in the journal"
+    );
+    assert!(
+        !dump.contains(&model_secret),
+        "the model-text plaintext never lands in the journal"
     );
 }
