@@ -111,7 +111,7 @@ impl Permissions {
     pub fn covers(&self, need: &Permissions) -> bool {
         need.paths
             .iter()
-            .all(|p| self.paths.iter().any(|g| p.starts_with(g)))
+            .all(|p| self.paths.iter().any(|g| path_covers(g, p)))
             && need.commands.iter().all(|c| self.commands.contains(c))
             && self.network.covers(&need.network)
             && self.caps.covers(&need.caps)
@@ -125,7 +125,9 @@ impl NetworkPolicy {
         match (self, need) {
             (NetworkPolicy::Any, _) => true,
             (_, NetworkPolicy::Deny) => true,
-            (NetworkPolicy::Hosts(g), NetworkPolicy::Hosts(n)) => n.iter().all(|h| g.contains(h)),
+            (NetworkPolicy::Hosts(g), NetworkPolicy::Hosts(n)) => {
+                n.iter().all(|h| g.iter().any(|gh| host_covers(gh, h)))
+            }
             _ => false,
         }
     }
@@ -146,6 +148,44 @@ fn cap_covers(grant: Option<u64>, need: Option<u64>) -> bool {
         (_, None) => true,
         (None, Some(_)) => true,
         (Some(g), Some(n)) => g >= n,
+    }
+}
+
+/// Does the grant path `g` cover the need path `n`? Component-aware: `g`'s path
+/// segments must be a prefix of `n`'s. `/workspace` covers `/workspace/sub` but not
+/// `/workspace-secret`. An empty grant covers nothing; a need containing `..` is
+/// rejected (no traversal). Lexical only — symlink/realpath confinement is the
+/// sandbox's job (SP-4 slice 4).
+/// Paths are assumed absolute and normalized (canonicalization is the sandbox's
+/// job); a grant of `/` covers the whole tree.
+fn path_covers(g: &str, n: &str) -> bool {
+    if g.is_empty() {
+        return false;
+    }
+    if n.split('/').any(|s| s == "..") {
+        return false;
+    }
+    let gs: Vec<&str> = g
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    let ns: Vec<&str> = n
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    gs.len() <= ns.len() && gs.iter().zip(&ns).all(|(a, b)| a == b)
+}
+
+/// Does the grant host `g` cover the need host `n`? Exact match, or a `*.suffix`
+/// wildcard grant matching any subdomain of `suffix` (not the bare domain).
+/// Case-insensitive.
+fn host_covers(g: &str, n: &str) -> bool {
+    let (g, n) = (g.to_lowercase(), n.to_lowercase());
+    match g.strip_prefix("*.") {
+        Some(suffix) => n
+            .strip_suffix(&suffix)
+            .is_some_and(|prefix| prefix.ends_with('.')),
+        None => g == n,
     }
 }
 
@@ -1145,6 +1185,103 @@ mod tests {
 
         // empty needs covered by anything (incl. an empty grant).
         assert!(Permissions::default().covers(&Permissions::default()));
+    }
+
+    #[test]
+    fn covers_paths_are_component_aware() {
+        let grant = Permissions {
+            paths: vec!["/workspace".into()],
+            ..Default::default()
+        };
+        let inside = Permissions {
+            paths: vec!["/workspace/sub/a.txt".into()],
+            ..Default::default()
+        };
+        let sibling = Permissions {
+            paths: vec!["/workspace-secret".into()],
+            ..Default::default()
+        };
+        let outside = Permissions {
+            paths: vec!["/etc/passwd".into()],
+            ..Default::default()
+        };
+        assert!(grant.covers(&inside));
+        assert!(grant.covers(&grant), "a path covers itself");
+        assert!(
+            !grant.covers(&sibling),
+            "/workspace must NOT cover /workspace-secret"
+        );
+        assert!(!grant.covers(&outside));
+        let empty_grant = Permissions {
+            paths: vec!["".into()],
+            ..Default::default()
+        };
+        assert!(
+            !empty_grant.covers(&inside),
+            "an empty grant path covers nothing"
+        );
+        let traversal = Permissions {
+            paths: vec!["/workspace/../etc".into()],
+            ..Default::default()
+        };
+        assert!(
+            !grant.covers(&traversal),
+            "a `..` traversal need is rejected"
+        );
+    }
+
+    #[test]
+    fn covers_hosts_support_wildcards() {
+        let wild = Permissions {
+            network: NetworkPolicy::Hosts(vec!["*.example.com".into()]),
+            ..Default::default()
+        };
+        let sub = Permissions {
+            network: NetworkPolicy::Hosts(vec!["api.example.com".into()]),
+            ..Default::default()
+        };
+        let evil = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.evil.com".into()]),
+            ..Default::default()
+        };
+        let bare = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.com".into()]),
+            ..Default::default()
+        };
+        assert!(wild.covers(&sub));
+        assert!(
+            !wild.covers(&evil),
+            "*.example.com must not cover example.evil.com"
+        );
+        assert!(
+            !wild.covers(&bare),
+            "*.example.com does not match the bare domain"
+        );
+        let no_dot = Permissions {
+            network: NetworkPolicy::Hosts(vec!["notexample.com".into()]),
+            ..Default::default()
+        };
+        let left_label = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.com.attacker.com".into()]),
+            ..Default::default()
+        };
+        assert!(
+            !wild.covers(&no_dot),
+            "*.example.com must not cover notexample.com (no dot boundary)"
+        );
+        assert!(
+            !wild.covers(&left_label),
+            "*.example.com must not cover example.com.attacker.com"
+        );
+        let exact = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.com".into()]),
+            ..Default::default()
+        };
+        assert!(exact.covers(&bare));
+        assert!(
+            !exact.covers(&sub),
+            "an exact host grant does not cover a subdomain"
+        );
     }
 
     #[test]
