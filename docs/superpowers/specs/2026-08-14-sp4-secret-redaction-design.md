@@ -167,6 +167,11 @@ runtime confinement is the sandbox (slice 4). Stated so the boundary is not over
 - **Known-value / vault-backed `Redactor`** (redact exact registered credential values from the
   vault/config — zero false-positive precision) — a future impl of the same seam; pairs with the
   slice-4 credential broker.
+- **Control-flow structure is not redacted** — `PlanExpanded` (the planner's spliced graph +
+  `node_plans` side-map), graph node payloads, and other structural journal events are NOT effect
+  *outputs* and are outside this slice's boundary; a planner could in principle embed a secret in
+  a node payload. Redacting plan/graph structure is a future consideration (the model *text* a
+  planner emits IS redacted at `model_output`).
 - **Reversible tokenization / crypto-shred** (recover a value from an authorized context) — needs
   the vault/KEK → SP-DATA (master spec §7.4 crypto-shred).
 - **Entropy/length heuristic** for unknown-shape secrets (with a false-positive budget).
