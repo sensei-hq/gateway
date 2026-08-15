@@ -437,6 +437,12 @@ impl Executor {
         };
         match verdict {
             ReconcileOutcome::Confirmed(output) => {
+                // SP-4 s2: scrub the reconciler's output BEFORE journal + return (mirrors
+                // `record_tool_effect`). This is a recorded side-effect output — the same
+                // secret-bearing class as a live tool result — and run 1 recorded no
+                // `EffectRecorded` (in-doubt), so there is no memo to fence; redacting once
+                // keeps the journaled `split_output` and the returned value identical.
+                let output = self.redact(&output);
                 let recorded = self.split_output(&output).await?;
                 self.append(
                     ar.run,

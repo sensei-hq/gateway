@@ -9343,3 +9343,112 @@ async fn agent_tool_secret_never_lands_plaintext_e2e() {
         "the model-text plaintext never lands in the journal"
     );
 }
+
+/// A `ReconcileProvider` that unconditionally CONFIRMS an in-doubt Mutation with a
+/// caller-supplied output — models a real reconciler whose recorded side-effect output
+/// (the same secret-bearing class as a live tool result) carries a secret. Ignores the
+/// idempotency key/args so the confirmed `output` is fully controlled by the test.
+struct ConfirmWith {
+    output: serde_json::Value,
+}
+#[async_trait::async_trait]
+impl orchestrator_core::ReconcileProvider for ConfirmWith {
+    async fn reconcile(
+        &self,
+        _idempotency_key: &str,
+        _args: &serde_json::Value,
+    ) -> Result<orchestrator_core::ReconcileOutcome, OrchestratorError> {
+        Ok(orchestrator_core::ReconcileOutcome::Confirmed(
+            self.output.clone(),
+        ))
+    }
+}
+
+/// SP-4 s2 (leak fix): the reconcile-in-doubt `Confirmed` path is the fourth
+/// side-effect-output producer and MUST redact like `record_tool_effect`. On resume an
+/// in-doubt Mutation asks its reconciler; a `Confirmed(output)` records that provider's
+/// output AND feeds it back to the agent. Because run 1 recorded NO `EffectRecorded`
+/// (in-doubt), there is no memo to fence — a missed scrub is a SILENT durable plaintext
+/// write. With a `PatternRedactor` wired, the executor redacts ONCE and uses that SAME
+/// value for both the journaled `split_output` and the `ToolOutcome::Ok` returned to the
+/// agent, so the journaled record is `[REDACTED]`, the fed-back value is the identical
+/// redacted one, and NO plaintext survives anywhere in the journal. Mutation-verify:
+/// dropping the `let output = self.redact(&output);` line journals the plaintext and
+/// fails both the journaled-value and whole-journal assertions.
+#[tokio::test]
+async fn reconcile_confirmed_output_is_redacted() {
+    // The note effect id is turn-0, call index 0 → effect_id(node, 0, 1) (matches the
+    // sibling in-doubt reconcile tests).
+    let note_eid = effect_id("n1", 0, 1);
+    // Assemble the secret at RUNTIME so no credential-shaped literal sits in source (the
+    // repo's semgrep CWE-798 hook blocks those); the redactor still matches the built
+    // string. This is the reconciler's confirmed side-effect output — `{"recorded": …}`,
+    // mirroring `NoteReconciler`'s shape — carrying the secret.
+    let secret = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    let (journal, run) = seed_in_doubt_note().await;
+
+    // A reconciler that CONFIRMS with a secret-bearing output. A FRESH empty sink proves
+    // the Confirmed path records WITHOUT re-running the tool (the sink stays empty).
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers = ReconcileRegistry::default().with_provider(
+        "record_note",
+        Arc::new(ConfirmWith {
+            output: serde_json::json!({ "recorded": secret.clone() }),
+        }),
+    );
+
+    // Resume with a `PatternRedactor` wired (mirrors `resume_in_doubt`, plus the redactor).
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "note it")],
+    };
+    let (gw, _c) = scripted_gateway(vec![final_response("done")]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"))
+        .with_tools(Arc::new(
+            ToolRegistry::default().with_tool(Arc::new(RecordNote::new(sink.clone()))),
+        ))
+        .with_reconcilers(Arc::new(reconcilers))
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()))
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+    let events = journal.load(run).await.unwrap();
+
+    assert!(
+        out.failed.is_none() && out.paused.is_none(),
+        "Confirmed completes the run: {:?}",
+        out.failed
+    );
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "Confirmed records WITHOUT re-running the side effect — the tool was not re-invoked"
+    );
+    assert_eq!(
+        effect_recorded_count(&events, &note_eid),
+        1,
+        "Confirmed appends the Mutation's EffectRecorded exactly once"
+    );
+
+    // The journaled reconciler output is scrubbed — `[REDACTED]`, NOT the plaintext.
+    let recorded = recorded_output(&events, &note_eid).expect("the reconciled effect is recorded");
+    assert_eq!(
+        recorded["recorded"],
+        serde_json::json!("[REDACTED]"),
+        "the Confirmed path's journaled output is redacted: {recorded}"
+    );
+
+    // The value fed back to the agent is the SAME redacted value (the executor redacts
+    // once and reuses it for both the journal split and the returned `ToolOutcome::Ok`),
+    // so no plaintext secret survives ANYWHERE in the journal — a resume replays the
+    // scrubbed value, and the model never sees the secret.
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "plaintext secret must not appear anywhere in the journal"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes"
+    );
+}
