@@ -123,9 +123,10 @@ struct Fold {
     memo: HashMap<EffectId, (String, EffectOutput)>,
     started: std::collections::HashSet<NodeId>,
     completed: std::collections::HashSet<NodeId>,
-    /// Effect ids that journaled an `EffectIntent` (§7.3). An id in `intents` but
-    /// NOT in `memo` (no `EffectRecorded`) is an **in-doubt** Mutation on resume.
-    intents: std::collections::HashSet<EffectId>,
+    /// Effect ids that journaled an `EffectIntent` → the journaled idempotency key
+    /// (§7.3, SP-4 s5). An id here with no matching `EffectRecorded` is in-doubt on
+    /// resume; reconcile queries the provider by THIS key.
+    intents: std::collections::HashMap<EffectId, String>,
     /// Each `Observation` effect's recorded freshness + provenance (§7.1). A memo
     /// hit whose `fetched_at + ttl` has lapsed (per the injected `Clock`) is
     /// re-read instead of replayed.
