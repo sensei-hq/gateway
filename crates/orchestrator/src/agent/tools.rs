@@ -189,6 +189,7 @@ impl Tool for Calc {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
@@ -243,6 +244,7 @@ impl Tool for Search {
             source: Some("search".into()),
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
@@ -290,6 +292,7 @@ impl Tool for RecordNote {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
@@ -383,6 +386,7 @@ impl Tool for ScopedWriter {
                 ..Default::default()
             },
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
@@ -424,6 +428,7 @@ impl Tool for ListAgents {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -450,6 +455,7 @@ impl Tool for ListSkills {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -476,6 +482,7 @@ impl Tool for ListTools {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -504,6 +511,7 @@ impl Tool for ListChains {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -527,6 +535,7 @@ impl Tool for ValidatePlan {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
     fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -610,6 +619,7 @@ mod tests {
                     source: None,
                     permissions: Permissions::default(),
                     activation: Activation::default(),
+                    credentials: vec![],
                 }
             }
             fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -719,6 +729,7 @@ mod tests {
                     ..Default::default()
                 },
                 activation: Activation::default(),
+                credentials: vec![],
             }
         }
         fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
@@ -767,6 +778,7 @@ mod tests {
                     source: None,
                     permissions: Permissions::default(),
                     activation: Activation::default(),
+                    credentials: vec![],
                 }
             }
             fn call(&self, _a: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {

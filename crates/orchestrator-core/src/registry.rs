@@ -68,6 +68,11 @@ pub struct ToolSpec {
     /// When this tool's schema is exposed to the model (§129); default `Always`.
     #[serde(default)]
     pub activation: Activation,
+    /// Credential refs this tool needs (SP-4 broker); resolved by the injected
+    /// `CredentialBroker` and injected into the call's `ToolContext.credentials`
+    /// (ephemeral). Empty ⇒ the tool needs no credentials.
+    #[serde(default)]
+    pub credentials: Vec<String>,
 }
 
 /// A capability declaration — used BOTH as a tool's required needs
@@ -738,6 +743,7 @@ mod tests {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
@@ -875,6 +881,7 @@ mod tests {
             source: None,
             permissions: need,
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
@@ -1341,6 +1348,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t2.activation, Activation::OnKeywords(vec!["sql".into()]));
+    }
+
+    #[test]
+    fn tool_spec_credentials_default_empty() {
+        let spec: ToolSpec =
+            serde_json::from_str(r#"{"name":"t","input_schema":{},"effect_class":"Pure"}"#)
+                .unwrap();
+        assert!(spec.credentials.is_empty());
     }
 
     // A minimal in-core ConfigSource for handle tests (yields a fixed config).
