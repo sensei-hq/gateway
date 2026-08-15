@@ -16,6 +16,22 @@ use orchestrator_core::{
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError>;
+
+    /// The CONCRETE permissions THIS specific call needs (SP-4 authorization gate).
+    /// Default = the tool's static declared surface (`spec().permissions`), so a tool
+    /// with no permission-relevant arguments needs no change.
+    ///
+    /// MUST be a pure function of `args` (plus immutable config) — NO I/O, clock, or
+    /// RNG: the gate's allow/deny feeds the journaled ReAct transcript, so any
+    /// nondeterminism here breaks resume-determinism.
+    ///
+    /// A tool whose arguments carry a path/host/command MUST override this. If it
+    /// does not, the gate silently falls back to coarse static-surface granularity —
+    /// a fail-OPEN trap: a specific call could be authorized for a concrete resource
+    /// that its narrow grant would otherwise deny. The type system cannot catch this.
+    fn required(&self, _args: &serde_json::Value) -> Permissions {
+        self.spec().permissions
+    }
 }
 
 /// Name→executor map. Prompt schemas come from the core `Registry`'s `ToolSpec`s;
@@ -48,6 +64,16 @@ impl ToolRegistry {
     /// The spec of a registered tool by name (for the executor to read its class/ttl).
     pub fn spec_of(&self, name: &str) -> Option<orchestrator_core::ToolSpec> {
         self.tools.get(name).map(|t| t.spec())
+    }
+
+    /// The concrete permissions the named tool needs for `args` (for the gate).
+    /// Unknown tool → empty `Permissions` (denied by the separate `tool ∈ agent.tools`
+    /// check in the executor).
+    pub fn required_of(&self, name: &str, args: &serde_json::Value) -> Permissions {
+        self.tools
+            .get(name)
+            .map(|t| t.required(args))
+            .unwrap_or_default()
     }
 }
 
@@ -244,6 +270,73 @@ impl orchestrator_core::ReconcileProvider for NoteReconciler {
         } else {
             Ok(orchestrator_core::ReconcileOutcome::NotApplied)
         }
+    }
+}
+
+/// Demo Mutation tool with a permission-relevant argument: writes to a path.
+/// Its static surface is `/workspace`, but the gate authorizes each call against
+/// the agent's grant using the CONCRETE path in `required(args)`. `call` just
+/// records the path in a sink (the "filesystem" being mutated) — no real I/O.
+///
+/// `required` returns an EMPTY need when `path` is missing/invalid — safe ONLY
+/// because `call` fail-closes (`missing 'path'`) before mutating; a tool with a
+/// default action on a missing arg must NOT copy this (its empty need would be a
+/// fail-open gap). This is a GATE DEMO only: it has no paired `ReconcileProvider`,
+/// so an in-doubt `fs.write` on resume is unreconcilable — not a resume-safe
+/// template. The `content` field in the schema is illustrative (only `path` is read).
+pub struct ScopedWriter {
+    sink: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ScopedWriter {
+    pub fn new(sink: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self { sink }
+    }
+}
+
+impl Tool for ScopedWriter {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fs.write".into(),
+            description: Some("Write content to a path".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": {"type": "string"}, "content": {"type": "string"} },
+                "required": ["path", "content"]
+            }),
+            effect_class: EffectClass::Mutation,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions {
+                paths: vec!["/workspace".into()],
+                ..Default::default()
+            },
+            activation: Activation::default(),
+        }
+    }
+
+    fn required(&self, args: &serde_json::Value) -> Permissions {
+        let paths = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default();
+        Permissions {
+            paths,
+            ..Default::default()
+        }
+    }
+
+    fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        let path =
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| OrchestratorError::Tool {
+                    tool: "fs.write".into(),
+                    message: "missing 'path'".into(),
+                })?;
+        self.sink.lock().unwrap().push(path.to_string());
+        Ok(serde_json::json!({ "written": path }))
     }
 }
 
@@ -536,6 +629,72 @@ mod tests {
             .expect("reconcile runs");
 
         assert_eq!(outcome, ReconcileOutcome::Indeterminate);
+    }
+
+    // A tool with a non-empty surface and NO `required` override — pins that the
+    // default returns the static declaration (not just empty).
+    struct SurfaceOnly;
+    impl Tool for SurfaceOnly {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "surface_only".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                effect_class: EffectClass::Pure,
+                ttl_secs: None,
+                source: None,
+                permissions: Permissions {
+                    paths: vec!["/srv".into()],
+                    ..Default::default()
+                },
+                activation: Activation::default(),
+            }
+        }
+        fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[test]
+    fn required_default_returns_the_non_empty_static_surface() {
+        let need = SurfaceOnly.required(&serde_json::json!({"anything": 1}));
+        assert_eq!(need, SurfaceOnly.spec().permissions);
+        assert_eq!(need.paths, vec!["/srv".to_string()]);
+        assert!(
+            !need.paths.is_empty(),
+            "default must reflect the real surface, not empty"
+        );
+    }
+
+    #[test]
+    fn required_defaults_to_spec_and_overrides_use_args() {
+        // Default impl: a tool that doesn't override returns its static declaration.
+        assert_eq!(
+            Calc.required(&serde_json::json!({})),
+            Calc.spec().permissions
+        );
+        // Override: ScopedWriter derives the concrete path need from the `path` arg.
+        let w = ScopedWriter::new(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let need = w.required(&serde_json::json!({"path":"/workspace/a.txt","content":"x"}));
+        assert_eq!(need.paths, vec!["/workspace/a.txt".to_string()]);
+        // Missing path → no concrete path need (the gate allows; the call errors).
+        assert!(w.required(&serde_json::json!({})).paths.is_empty());
+    }
+
+    #[test]
+    fn required_of_reads_the_registry_or_defaults_empty() {
+        let reg = ToolRegistry::default().with_tool(std::sync::Arc::new(ScopedWriter::new(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        )));
+        assert_eq!(
+            reg.required_of("fs.write", &serde_json::json!({"path":"/x"}))
+                .paths,
+            vec!["/x".to_string()]
+        );
+        assert_eq!(
+            reg.required_of("unknown", &serde_json::json!({})),
+            orchestrator_core::Permissions::default()
+        );
     }
 }
 
