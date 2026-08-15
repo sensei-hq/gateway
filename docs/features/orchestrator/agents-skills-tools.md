@@ -47,12 +47,11 @@ source: crates/orchestrator*
 > (`PermissionNotGranted`); `Permissions::covers` is the shared predicate (path-prefix,
 > command subset, network `Any`/`Hosts`/`Deny` lattice, caps `need ≤ grant` with
 > grant-`None` = unlimited). Declarations are **inert** — not in the prompt/hash, tool
-> runtime unchanged. **Deferred to SP-4 (enforcement):** runtime gating on effective =
-> grant ∩ need, sandbox/workspace isolation, command deny-lists, secret redaction — and
-> hardening the declaration-layer coverage before it gates real access: **path matching
-> is raw string-prefix (not path-component-aware, and an empty grant path `""` = allow-all),
-> and `Hosts` matching is exact-host (no subdomain/wildcard)** — SP-4 must canonicalize
-> paths / reject empty allow-all grants / define host-wildcard semantics.
+> runtime unchanged this slice. **✅ SP-4 slice 1 turned these declarations into runtime
+> enforcement** (authorization gate + the `covers()` hardening — see the SP-4 note below).
+> **Still deferred (later SP-4 slices):** runtime *confinement* (a sandbox intercepting
+> fs/network so a tool that under-reports its needs can't exceed its grant) + resource-cap
+> *killing*, workspace isolation, command deny-lists, secret redaction.
 >
 > **SP-2 slice 4 — skill/tool activation policy (Q4):** skills/tools carry a
 > definition-level `Activation` (`Always` default, or `OnKeywords`) — `SkillDef`
@@ -79,6 +78,22 @@ source: crates/orchestrator*
 > byte-identical. **Deferred:** version-pinned resume, an `on_config_reloaded` hook,
 > file-watch/auto-reload, and a persistent cross-process config version (SP-DATA
 > `config_versions`).
+>
+> **SP-4 slice 1 — tool permission ENFORCEMENT (runtime authorization):** the SP-2‑s3
+> declarations now gate execution. In `execute_tool_effect` (the single chokepoint for
+> Pure/Observation/Mutation calls), a tool call is denied unless `tool ∈ agent.tools`
+> **and** `agent.grants[tool].covers(tool.required(args))`. **`Tool::required(&self,args)
+> -> Permissions`** (default = static `spec().permissions`) reports a call's **concrete**
+> needs, so a grant may be *narrower* than the tool's declared surface (a runtime
+> **ceiling**) — the load-time full-surface `validate` check is **dropped** (a narrow
+> grant is legal, enforced per-call). `covers()` is now **component-aware** (`/work` ⊄
+> `/workspace-secret`; empty grant path rejected; `..` rejected) with **host wildcards**
+> (`*.example.com`). A denial records a **Pure `EffectRecorded`** (no tool run; **no
+> `EffectIntent`** for a Mutation) and is fed back to the agent as a **terse** tool-result
+> error (never echoes the grant → confused-deputy defense) ⇒ a resume replays it from the
+> memo, tool never re-invoked. **Authorizes, does not confine:** a tool that under-reports
+> its `required` bypasses the gate — runtime confinement + cap-killing = the sandbox slice.
+> No-permission tools + agents that list them are byte-identical.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
