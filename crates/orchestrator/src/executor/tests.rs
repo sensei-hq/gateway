@@ -10988,3 +10988,199 @@ async fn broker_error_fails_loud_as_node_failure() {
         "the tool is never invoked when its broker errors"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SP-4 s3 workspace-jail e2e (Task 3)
+// ---------------------------------------------------------------------------
+
+/// A single-agent registry for the SP-4 workspace e2e tests: agent "a" on chain
+/// "c" that LISTS `tools` and holds `grants`, with the real `fs_write`/`fs_read`
+/// specs compiled into the prompt (their executable side is wired via a
+/// `ToolRegistry`). Mirrors `writer_registry`, but for the confined fs tools.
+fn fs_registry(
+    tools: Vec<String>,
+    grants: std::collections::HashMap<String, Permissions>,
+) -> Arc<Registry> {
+    Arc::new(
+        Registry::default()
+            .with_agent(AgentDefinition {
+                grants,
+                tools,
+                ..agent_def("c")
+            })
+            .with_tool(crate::agent::tools::FsWriteTool.spec())
+            .with_tool(crate::agent::tools::FsReadTool.spec()),
+    )
+}
+
+/// SP-4 s3 e2e (AC2/AC3): a full agent run writes then reads a file inside its
+/// per-run workspace jail — the file really lands on disk and both effects journal
+/// their real `{bytes,path}` / `{content}` outputs.
+#[tokio::test]
+async fn fs_tools_round_trip_within_the_workspace_jail() {
+    let base = tempfile::tempdir().unwrap();
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response(
+            "t1",
+            "fs_write",
+            r#"{"path":"work/notes.md","content":"hello"}"#,
+        ),
+        tool_call_response("t2", "fs_read", r#"{"path":"work/notes.md"}"#),
+        final_response("done"),
+    ])
+    .await;
+    let grants = std::collections::HashMap::from([
+        ("fs_write".to_string(), path_grant(&["work"])),
+        ("fs_read".to_string(), path_grant(&["work"])),
+    ]);
+    let tools = Arc::new(
+        ToolRegistry::default()
+            .with_tool(Arc::new(crate::agent::tools::FsWriteTool))
+            .with_tool(Arc::new(crate::agent::tools::FsReadTool)),
+    );
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(fs_registry(
+            vec!["fs_write".into(), "fs_read".into()],
+            grants,
+        ))
+        .with_tools(tools)
+        .with_workspace_root(base.path());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "write then read")],
+    };
+    let outcome = exec.run(run, &graph).await.expect("run");
+
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    // The file really exists on disk in the per-run jail.
+    let path_on_disk = base
+        .path()
+        .join(run.0.to_string())
+        .join("work")
+        .join("notes.md");
+    assert_eq!(std::fs::read_to_string(&path_on_disk).unwrap(), "hello");
+    // fs_write (turn 0, tool idx 1) journaled {bytes,path}; fs_read (turn 1, idx 1) content.
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        recorded_output(&events, &effect_id("n1", 0, 1)).unwrap(),
+        serde_json::json!({"bytes": 5, "path": "work/notes.md"})
+    );
+    assert_eq!(
+        recorded_output(&events, &effect_id("n1", 1, 1)).unwrap(),
+        serde_json::json!({"content": "hello"})
+    );
+}
+
+/// SP-4 s3 e2e (AC4): the jail denies a symlink-out path that s1 GRANTS (grant
+/// covers `work/…`, no `..`) — proving the jail's unique contribution over s1's
+/// lexical `covers`. Only the executor's jail pre-check produces this shape (a
+/// clean Pure `permission_denied`, no `EffectIntent`, run still clean); without it,
+/// s1 would allow and the two-phase Mutation would journal an Intent.
+#[tokio::test]
+async fn jail_denies_symlink_escape_that_s1_would_allow() {
+    let base = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join("sub")).unwrap();
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // Pre-create the per-run jail + a symlink `work/evil -> <outside>` inside it.
+    let run_dir = base.path().join(run.0.to_string());
+    std::fs::create_dir_all(run_dir.join("work")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), run_dir.join("work").join("evil")).unwrap();
+
+    let (gateway, _calls) = scripted_gateway(vec![
+        tool_call_response(
+            "t1",
+            "fs_write",
+            r#"{"path":"work/evil/sub/x","content":"pwned"}"#,
+        ),
+        final_response("done"),
+    ])
+    .await;
+    // s1 COVERS work/evil/sub/x (a `work` prefix grant, `..`-free) — only the jail denies.
+    let grants = std::collections::HashMap::from([("fs_write".to_string(), path_grant(&["work"]))]);
+    let tools =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::FsWriteTool)));
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(fs_registry(vec!["fs_write".into()], grants))
+        .with_tools(tools)
+        .with_workspace_root(base.path());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "write")],
+    };
+    let outcome = exec.run(run, &graph).await.expect("run");
+
+    // The denial is fed back to the agent, which then finalizes — a CLEAN run.
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    // No file escaped into the outside dir.
+    assert!(
+        !outside.path().join("sub").join("x").exists(),
+        "the write ESCAPED the jail"
+    );
+    // The effect was recorded as a terse DENIAL (Pure), not a Mutation write.
+    let events = journal.load(run).await.unwrap();
+    let denied_eid = effect_id("n1", 0, 1);
+    let out =
+        recorded_output(&events, &denied_eid).expect("the denied write recorded a Pure effect");
+    assert_eq!(out["error"], serde_json::json!("permission_denied"));
+    // No EffectIntent for the (denied) write — it never entered the two-phase path.
+    assert!(
+        !has_effect_intent(&events, &denied_eid),
+        "a denied write must not journal an EffectIntent"
+    );
+}
+
+/// SP-4 s3 e2e (AC5): two distinct runs writing the SAME relative path land in
+/// isolated per-run dirs with distinct contents. Sequential by design — this proves
+/// distinct run_ids get distinct directories, not thread-safety.
+#[tokio::test]
+async fn distinct_runs_get_isolated_workspaces() {
+    let base = tempfile::tempdir().unwrap();
+    let run_once = |content: &'static str| {
+        let base = base.path().to_path_buf();
+        async move {
+            let journal = InMemoryJournal::new();
+            let run = RunId(uuid::Uuid::new_v4());
+            let (gateway, _c) = scripted_gateway(vec![
+                tool_call_response(
+                    "t1",
+                    "fs_write",
+                    &format!(r#"{{"path":"work/f","content":"{content}"}}"#),
+                ),
+                final_response("done"),
+            ])
+            .await;
+            let grants =
+                std::collections::HashMap::from([("fs_write".to_string(), path_grant(&["work"]))]);
+            let tools = Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::FsWriteTool)),
+            );
+            let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+                .with_registry(fs_registry(vec!["fs_write".into()], grants))
+                .with_tools(tools)
+                .with_workspace_root(base.clone());
+            let graph = Graph {
+                nodes: vec![agent_node("n1", "a", "write")],
+            };
+            let o = exec.run(run, &graph).await.unwrap();
+            assert!(o.failed.is_none() && o.paused.is_none(), "{:?}", o.failed);
+            base.join(run.0.to_string()).join("work").join("f")
+        }
+    };
+    let p1 = run_once("one").await;
+    let p2 = run_once("two").await;
+    assert_ne!(p1, p2, "runs must not share a path");
+    assert_eq!(std::fs::read_to_string(&p1).unwrap(), "one");
+    assert_eq!(std::fs::read_to_string(&p2).unwrap(), "two");
+}
