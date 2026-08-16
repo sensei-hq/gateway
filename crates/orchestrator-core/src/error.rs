@@ -52,6 +52,11 @@ pub enum OrchestratorError {
     UnknownTool(String),
     #[error("tool {tool:?} failed: {message}")]
     Tool { tool: String, message: String },
+    /// A tool requested a path that escapes its per-run workspace jail (SP-4 s3).
+    /// The message names the requested (relative) path but NOT the absolute host root,
+    /// so the journal/transcript never leaks the host filesystem layout.
+    #[error("workspace escape: {0}")]
+    WorkspaceEscape(String),
     #[error("unknown agent {0:?}")]
     UnknownAgent(String),
     #[error("prompt over budget at node {node:?} turn {turn}: est {est} > window {min_win}")]

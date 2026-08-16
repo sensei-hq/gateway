@@ -25,4 +25,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 orchestrator-store = { package = "sensei-orchestrator-store", path = "../orchestrator-store" }
+tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
