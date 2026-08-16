@@ -650,6 +650,9 @@ impl Executor {
             idempotency_key: idempotency_key.to_string(),
             effect_id: teid.clone(),
             credentials: std::sync::Arc::new(resolved),
+            // SP-4 s3: keep-compiling default (byte-identical: no jail). Task 3 replaces this
+            // with `self.workspace_root_for(ar.run)?` to inject the resolved per-run root.
+            workspace_root: None,
         };
         match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
