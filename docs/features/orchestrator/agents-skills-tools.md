@@ -115,6 +115,24 @@ source: crates/orchestrator*
 > sees only its *own* declared creds. **No broker + empty `credentials` ⇒ byte-identical.**
 > **Deferred:** sandbox egress confinement + resource-cap killing (blocked on the
 > tool-execution-model), the real vault-backed broker, per-tenant credential scoping.
+>
+> **SP-4 s3 — workspace isolation (in-process jail + real fs tools):** the first tools that
+> do REAL I/O — **`fs_write`** (Mutation) + **`fs_read`** (Observation) — confined to a durable
+> per-run `base/<run_id>/` workspace. `Executor::with_workspace_root(base)` (default none ⇒
+> byte-identical) resolves + **canonicalizes** the per-run dir and injects it into
+> `ToolContext.workspace_root`; a jail helper `confine(root, requested)` rejects
+> absolute/`..`/root components and defends symlink-out (lstat the deepest existing ancestor +
+> `starts_with` the canonical root — the lstat matters: `Path::exists` follows links, so a
+> *dangling* symlink would otherwise escape). Enforcement is two-sided: s1 authorizes
+> (`grant.covers(required(args))`, first) then the executor's jail pre-check confines every
+> declared path to the per-run root (an escape → a terse Pure denial, no side effect, no
+> `EffectIntent`, replayed on resume); the tools re-`confine` for defense in depth. The jail's
+> unique value over s1 is per-run **isolation** (distinct runs → distinct dirs) +
+> **canonicalization/symlink** defense (s1's `covers` is lexical). A completed `fs_write`
+> replays `{bytes,path}` from the memo on resume — not re-run, file not re-written; s2
+> redaction composes over real file content. **Honest limit:** an in-process tool that
+> BYPASSES the shared `confine` helper cannot be prevented (ambient authority) — bypass-proof
+> confinement + cpu/mem/wall cap-killing are the deferred subprocess sandbox.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
