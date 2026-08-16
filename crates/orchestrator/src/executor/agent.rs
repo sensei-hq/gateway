@@ -361,6 +361,30 @@ impl Executor {
                 .await;
         }
 
+        // SP-4 s3 workspace confinement: when a per-run jail is wired, every concrete path
+        // THIS (s1-authorized) call declares must resolve WITHIN it. A declared escape is a
+        // terse denial — recorded Pure (like the s1 denial), no side effect, replayed on
+        // resume. The jail BINDS the abstract grant to a live per-run dir + canonicalizes
+        // real paths (per-run isolation + symlink defense — what s1's lexical `covers`
+        // cannot do). In-process ambient authority means this confines the DECLARED surface;
+        // a tool bypassing the shared helper is the (deferred) subprocess sandbox's job.
+        if !need.paths.is_empty()
+            && let Some(root) = self.workspace_root_for(ar.run)?
+        {
+            for p in &need.paths {
+                if crate::agent::workspace::confine(&root, p).is_err() {
+                    tracing::debug!(tool = %call.name, path = %p, "workspace jail escape denied");
+                    let detail = format!(
+                        "the requested path for tool '{}' is outside its workspace",
+                        call.name
+                    );
+                    return self
+                        .record_denied_effect(ar, teid, call, &tih, detail)
+                        .await;
+                }
+            }
+        }
+
         // Live path. A Mutation is two-phase (Intent → side effect → Recorded,
         // §7.3); Pure/Observation record directly (Observations carry
         // freshness/provenance so a later resume can decide replay-vs-re-read).
@@ -566,6 +590,29 @@ impl Executor {
         Ok(ToolOutcome::Ok(denial))
     }
 
+    /// Resolve (and lazily create) the CANONICAL per-run workspace root, or `None` if no
+    /// base is wired. `create_dir_all` is idempotent (safe on resume); `canonicalize`
+    /// resolves symlinks in the base (e.g. macOS `/var`→`/private/var`) so the jail compares
+    /// canonical-to-canonical. Called on the LIVE path only (a memo hit replays without it).
+    pub(super) fn workspace_root_for(
+        &self,
+        run: RunId,
+    ) -> Result<Option<std::sync::Arc<std::path::PathBuf>>, OrchestratorError> {
+        let Some(base) = &self.workspace_root_base else {
+            return Ok(None);
+        };
+        let dir = base.join(run.0.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| OrchestratorError::Tool {
+            tool: "workspace".into(),
+            message: format!("create workspace {}: {e}", dir.display()),
+        })?;
+        let canon = dir.canonicalize().map_err(|e| OrchestratorError::Tool {
+            tool: "workspace".into(),
+            message: format!("canonicalize workspace {}: {e}", dir.display()),
+        })?;
+        Ok(Some(std::sync::Arc::new(canon)))
+    }
+
     /// Execute a tool live and journal its `EffectRecorded` (shared by all effect
     /// classes). On a tool error, journal `NodeFailed` and return the failure
     /// message. `observation` is `Some` only for Observation effects.
@@ -650,9 +697,10 @@ impl Executor {
             idempotency_key: idempotency_key.to_string(),
             effect_id: teid.clone(),
             credentials: std::sync::Arc::new(resolved),
-            // SP-4 s3: keep-compiling default (byte-identical: no jail). Task 3 replaces this
-            // with `self.workspace_root_for(ar.run)?` to inject the resolved per-run root.
-            workspace_root: None,
+            // SP-4 s3: inject the resolved canonical per-run workspace root (a fs tool
+            // resolves its target within it via `confine`). `None` when no jail is wired ⇒
+            // byte-identical.
+            workspace_root: self.workspace_root_for(ar.run)?,
         };
         match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {

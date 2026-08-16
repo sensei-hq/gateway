@@ -57,6 +57,9 @@ pub struct Executor {
     /// into the per-call `ToolContext` (Task 3). `None` (the default) ⇒ no credentials are
     /// resolved — inert until wired.
     credential_broker: Option<Arc<dyn orchestrator_core::CredentialBroker>>,
+    /// SP-4 s3: base dir for the per-run workspace jail (`base/<run_id>/`). `None` ⇒ no fs
+    /// tools / byte-identical. Set via [`with_workspace_root`](Self::with_workspace_root).
+    workspace_root_base: Option<std::path::PathBuf>,
     /// The serialized-byte size **above which** an effect output is stored in the
     /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
     /// when a `content` store is wired.
@@ -190,6 +193,7 @@ impl Executor {
             content: None,
             redactor: None,
             credential_broker: None,
+            workspace_root_base: None,
             cas_threshold: 4096,
             clock: Arc::new(SystemClock),
             reconcilers: Arc::new(ReconcileRegistry::default()),
@@ -230,6 +234,14 @@ impl Executor {
         broker: Arc<dyn orchestrator_core::CredentialBroker>,
     ) -> Self {
         self.credential_broker = Some(broker);
+        self
+    }
+
+    /// SP-4 s3: root a durable per-run workspace jail at `base/<run_id>/`. Default none ⇒
+    /// byte-identical, no fs tools. Confined `fs_write`/`fs_read` tools resolve their targets
+    /// within the canonical per-run dir; the executor pre-checks each declared path.
+    pub fn with_workspace_root(mut self, base: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace_root_base = Some(base.into());
         self
     }
 
