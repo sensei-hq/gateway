@@ -15,10 +15,6 @@ use orchestrator_core::OrchestratorError;
 /// This confines the DECLARED path surface. An in-process tool with ambient authority that
 /// bypasses this helper cannot be prevented here — bypass-proof confinement is the (deferred)
 /// subprocess sandbox (spec §6).
-// Wired to real callers (`fs_write`/`fs_read` + the executor jail pre-check) in SP-4 workspace
-// tasks 2/3; until then its only caller is the `#[cfg(test)]` module, so the non-test lib build
-// sees it as dead. The allow is a no-op (never warns) once those callers land.
-#[allow(dead_code)]
 pub(crate) fn confine(root: &Path, requested: &str) -> Result<PathBuf, OrchestratorError> {
     let req = Path::new(requested);
     if req.is_absolute() {

@@ -26,6 +26,10 @@ pub struct ToolContext {
     /// hashed; zeroized on drop. `Arc` so cloning `ToolContext` shares one secret store.
     /// A tool reads `ctx.credentials.get(ref).map(Secret::expose)` and sends it to its API.
     pub credentials: std::sync::Arc<std::collections::HashMap<String, orchestrator_core::Secret>>,
+    /// The CANONICAL per-run workspace root the executor resolved (SP-4 s3), or `None`
+    /// when no workspace is wired. A confined fs tool resolves its target via
+    /// [`workspace::confine`](crate::agent::workspace::confine) against this root.
+    pub workspace_root: Option<std::sync::Arc<std::path::PathBuf>>,
 }
 
 impl ToolContext {
@@ -451,6 +455,161 @@ impl Tool for ScopedWriter {
     }
 }
 
+/// SP-4 s3: a REAL filesystem write, confined to the per-run workspace jail. Mutation —
+/// rides the two-phase path; a resume replays `{bytes,path}` from the memo (no re-write).
+pub struct FsWriteTool;
+
+impl Tool for FsWriteTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fs_write".into(),
+            description: Some("Write UTF-8 content to a workspace-relative path".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": {"type": "string"}, "content": {"type": "string"} },
+                "required": ["path", "content"]
+            }),
+            effect_class: EffectClass::Mutation,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+            credentials: vec![],
+        }
+    }
+
+    fn required(&self, args: &serde_json::Value) -> Permissions {
+        let paths = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default();
+        Permissions {
+            paths,
+            ..Default::default()
+        }
+    }
+
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        // The executor always drives fs tools via `call_ctx` (needs the workspace root).
+        Err(OrchestratorError::Tool {
+            tool: "fs_write".into(),
+            message: "fs_write requires a workspace context (call_ctx)".into(),
+        })
+    }
+
+    fn call_ctx(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        let root = ctx
+            .workspace_root
+            .as_ref()
+            .ok_or_else(|| OrchestratorError::Tool {
+                tool: "fs_write".into(),
+                message: "no workspace root wired".into(),
+            })?;
+        let path =
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| OrchestratorError::Tool {
+                    tool: "fs_write".into(),
+                    message: "missing 'path'".into(),
+                })?;
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OrchestratorError::Tool {
+                tool: "fs_write".into(),
+                message: "missing 'content'".into(),
+            })?;
+        let target = crate::agent::workspace::confine(root, path)?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| OrchestratorError::Tool {
+                tool: "fs_write".into(),
+                message: format!("mkdir: {e}"),
+            })?;
+        }
+        std::fs::write(&target, content).map_err(|e| OrchestratorError::Tool {
+            tool: "fs_write".into(),
+            message: format!("write: {e}"),
+        })?;
+        // Relative `path` in the output (spec D6) — stable if the base moves; no host-path leak.
+        Ok(serde_json::json!({ "bytes": content.len(), "path": path }))
+    }
+}
+
+/// SP-4 s3: a REAL filesystem read, confined to the per-run workspace jail. Observation
+/// (`ttl_secs: 0` ⇒ always re-read; a resume re-reads the persisted file, no token cost).
+pub struct FsReadTool;
+
+impl Tool for FsReadTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fs_read".into(),
+            description: Some("Read UTF-8 content from a workspace-relative path".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": {"type": "string"} },
+                "required": ["path"]
+            }),
+            effect_class: EffectClass::Observation,
+            ttl_secs: Some(0),
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+            credentials: vec![],
+        }
+    }
+
+    fn required(&self, args: &serde_json::Value) -> Permissions {
+        let paths = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default();
+        Permissions {
+            paths,
+            ..Default::default()
+        }
+    }
+
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        Err(OrchestratorError::Tool {
+            tool: "fs_read".into(),
+            message: "fs_read requires a workspace context (call_ctx)".into(),
+        })
+    }
+
+    fn call_ctx(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        let root = ctx
+            .workspace_root
+            .as_ref()
+            .ok_or_else(|| OrchestratorError::Tool {
+                tool: "fs_read".into(),
+                message: "no workspace root wired".into(),
+            })?;
+        let path =
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| OrchestratorError::Tool {
+                    tool: "fs_read".into(),
+                    message: "missing 'path'".into(),
+                })?;
+        let target = crate::agent::workspace::confine(root, path)?;
+        let content = std::fs::read_to_string(&target).map_err(|e| OrchestratorError::Tool {
+            tool: "fs_read".into(),
+            message: format!("read: {e}"),
+        })?;
+        Ok(serde_json::json!({ "content": content }))
+    }
+}
+
 /// Pure discovery: list the registry's agents (name + role).
 pub struct ListAgents(pub Arc<Registry>);
 impl Tool for ListAgents {
@@ -838,6 +997,7 @@ mod tests {
             idempotency_key: "k1".into(),
             effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
             credentials: Default::default(),
+            workspace_root: None,
         };
         let via_ctx = reg
             .execute_ctx(
@@ -891,6 +1051,7 @@ mod tests {
             idempotency_key: "i".into(),
             effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
             credentials: std::sync::Arc::new(creds),
+            workspace_root: None,
         };
         assert_eq!(ctx.exposed_secret_values(), vec!["s3cret"]);
 
@@ -900,6 +1061,94 @@ mod tests {
             std::sync::Arc::ptr_eq(&ctx.credentials, &cloned.credentials),
             "cloning ToolContext shares one secret store, not a plaintext copy"
         );
+    }
+
+    fn ws_ctx(root: &std::path::Path) -> ToolContext {
+        ToolContext {
+            idempotency_key: "k".into(),
+            effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
+            credentials: std::sync::Arc::new(std::collections::HashMap::new()),
+            workspace_root: Some(std::sync::Arc::new(root.to_path_buf())),
+        }
+    }
+
+    #[test]
+    fn fs_write_writes_real_bytes_in_the_jail() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let ctx = ws_ctx(&root);
+        let out = FsWriteTool
+            .call_ctx(
+                serde_json::json!({"path": "notes.md", "content": "hi"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!({"bytes": 2, "path": "notes.md"}));
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md")).unwrap(),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn fs_write_creates_nested_parent_dirs() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let ctx = ws_ctx(&root);
+        let out = FsWriteTool
+            .call_ctx(
+                serde_json::json!({"path": "a/b/c.txt", "content": "deep"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!({"bytes": 4, "path": "a/b/c.txt"}));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a").join("b").join("c.txt")).unwrap(),
+            "deep"
+        );
+    }
+
+    #[test]
+    fn fs_read_round_trips_a_written_file() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let ctx = ws_ctx(&root);
+        std::fs::write(root.join("notes.md"), "hello").unwrap();
+        let out = FsReadTool
+            .call_ctx(serde_json::json!({"path": "notes.md"}), &ctx)
+            .unwrap();
+        assert_eq!(out, serde_json::json!({"content": "hello"}));
+    }
+
+    #[test]
+    fn fs_write_escape_is_a_workspace_escape_error() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let ctx = ws_ctx(&root);
+        let err = FsWriteTool
+            .call_ctx(
+                serde_json::json!({"path": "../../etc/passwd", "content": "x"}),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrchestratorError::WorkspaceEscape(_)));
+    }
+
+    #[test]
+    fn fs_write_without_a_workspace_fails_loud() {
+        let ctx = ToolContext {
+            idempotency_key: "k".into(),
+            effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
+            credentials: std::sync::Arc::new(std::collections::HashMap::new()),
+            workspace_root: None,
+        };
+        let err = FsWriteTool
+            .call_ctx(
+                serde_json::json!({"path": "notes.md", "content": "x"}),
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OrchestratorError::Tool { .. }));
     }
 }
 
