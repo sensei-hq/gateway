@@ -11184,3 +11184,168 @@ async fn distinct_runs_get_isolated_workspaces() {
     assert_eq!(std::fs::read_to_string(&p1).unwrap(), "one");
     assert_eq!(std::fs::read_to_string(&p2).unwrap(), "two");
 }
+
+// ---------------------------------------------------------------------------
+// SP-4 s3 workspace-jail — resume exactly-once (AC6) + s2 redaction compose (AC7).
+// ---------------------------------------------------------------------------
+
+/// SP-4 s3 (AC6): a COMPLETED `fs_write` (a Mutation) replays `{bytes,path}` from the memo
+/// on resume — the tool is NOT re-run, so the file on disk is NOT re-written (exactly-once
+/// for a REAL side effect). Decisive proof: after the seed writes `"orig"`, we truncate the
+/// journal to the prefix ending at the `fs_write` `EffectRecorded` (asserting the prefix has
+/// NO `RunCompleted`, so the resume must drive a real tail) and EXTERNALLY clobber the file
+/// on disk with `"SENTINEL"`. A re-run of the write would clobber it BACK to `"orig"`; the
+/// surviving `"SENTINEL"` is the load-bearing assertion that the write replayed, not re-ran.
+#[tokio::test]
+async fn fs_write_replays_from_memo_without_rewriting_on_resume() {
+    let base = tempfile::tempdir().unwrap();
+    let run = RunId(uuid::Uuid::new_v4());
+    let grants = std::collections::HashMap::from([("fs_write".to_string(), path_grant(&["work"]))]);
+    let tool_eid = effect_id("n1", 0, 1); // turn 0, tool idx 1 (idx 0 is the model turn)
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "write")],
+    };
+
+    // --- seed run: write "orig" to completion, sharing `base` + `run` with the resume. ---
+    let seed = InMemoryJournal::new();
+    let (gw1, _c1) = scripted_gateway(vec![
+        tool_call_response("t1", "fs_write", r#"{"path":"work/f","content":"orig"}"#),
+        final_response("done"),
+    ])
+    .await;
+    let tools1 =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::FsWriteTool)));
+    Executor::new(Arc::new(gw1), Arc::new(seed.clone()), "v1")
+        .with_registry(fs_registry(vec!["fs_write".into()], grants.clone()))
+        .with_tools(tools1)
+        .with_workspace_root(base.path())
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+    let file = base.path().join(run.0.to_string()).join("work").join("f");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "orig");
+
+    // Truncate to the prefix ending at the fs_write's `EffectRecorded` — the effect is
+    // memoized, but the turn-1 final model call + NodeCompleted + RunCompleted are dropped,
+    // so the resume MUST drive the tail (and would re-write the file if it re-ran the tool).
+    let events = seed.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| {
+            matches!(e, JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &tool_eid)
+        })
+        .expect("seed run journaled the fs_write EffectRecorded");
+    assert!(
+        !events[..=cut]
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the truncated seed is a partial (no RunCompleted) — the resume must drive the tail"
+    );
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+    // Externally clobber the file: a resume that RE-RAN the write would restore "orig".
+    std::fs::write(&file, "SENTINEL").unwrap();
+
+    // --- resume: fs_write memo-replays; the file must NOT be rewritten. ---
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let tools2 =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::FsWriteTool)));
+    let outcome = Executor::new(Arc::new(gw2), Arc::new(seeded.clone()), "v1")
+        .with_registry(fs_registry(vec!["fs_write".into()], grants))
+        .with_tools(tools2)
+        .with_workspace_root(base.path())
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "resume completes with no DeterminismViolation: failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    // Load-bearing: the write replayed from the memo — the on-disk sentinel SURVIVES.
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "SENTINEL",
+        "resume RE-WROTE the file — not exactly-once"
+    );
+    // And the effect is recorded exactly once across seed + resume (replayed, not re-run).
+    assert_eq!(
+        effect_recorded_count(&seeded.load(run).await.unwrap(), &tool_eid),
+        1,
+        "the fs_write effect is recorded exactly once (memo replay, no re-record)"
+    );
+}
+
+/// SP-4 s3 × s2 (AC7): the s2 `PatternRedactor` composes over REAL file content — a secret
+/// stored as a file's bytes, read back via `fs_read`, is `[REDACTED]` in the journaled effect
+/// output AND appears NOWHERE in the journal. The secret is pre-seeded as file content (not
+/// routed through a model `fs_write` tool-call argument): tool-call `arguments` are journaled
+/// UNREDACTED by design (see `model_text_secret_is_redacted_tool_calls_intact`), so writing
+/// the secret via the agent would leak the plaintext into the turn's `tool_calls` and defeat
+/// the whole-journal scan. Reading real on-disk content is the faithful test of AC7.
+/// The secret is assembled at RUNTIME (the repo's semgrep CWE-798 hook blocks literals).
+#[tokio::test]
+async fn fs_read_output_is_redacted() {
+    let base = tempfile::tempdir().unwrap();
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // Matches the s2 `sk-[A-Za-z0-9_-]{20,}` pattern (20 alnum after `sk-`).
+    let secret = format!("sk-{}", "abcdefghij0123456789");
+
+    // Pre-seed the secret as REAL file content inside the per-run jail. Pre-creating
+    // `base/<run>/work/` is safe + idempotent (the executor's lazy `create_dir_all` +
+    // `canonicalize` resolves to the same dir on the first tool call). The agent then
+    // `fs_read`s it back.
+    let run_dir = base.path().join(run.0.to_string());
+    std::fs::create_dir_all(run_dir.join("work")).unwrap();
+    std::fs::write(run_dir.join("work").join("s"), &secret).unwrap();
+
+    let grants = std::collections::HashMap::from([("fs_read".to_string(), path_grant(&["work"]))]);
+    let (gateway, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "fs_read", r#"{"path":"work/s"}"#),
+        final_response("done"),
+    ])
+    .await;
+    let tools =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::FsReadTool)));
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "read the file")],
+    };
+    let outcome = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(fs_registry(vec!["fs_read".into()], grants))
+        .with_tools(tools)
+        .with_workspace_root(base.path())
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()))
+        .run(run, &graph)
+        .await
+        .expect("run");
+
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    // fs_read is turn-0, tool idx 1 → its journaled output is redacted (real content in → out).
+    let events = journal.load(run).await.unwrap();
+    let read_out =
+        recorded_output(&events, &effect_id("n1", 0, 1)).expect("fs_read effect recorded");
+    assert_eq!(
+        read_out,
+        serde_json::json!({ "content": "[REDACTED]" }),
+        "fs_read output must be redacted (real file content in → [REDACTED] out): {read_out}"
+    );
+    assert!(
+        !serde_json::to_string(&read_out).unwrap().contains(&secret),
+        "secret leaked in the fs_read output"
+    );
+    // Whole-journal scan: the plaintext appears NOWHERE (it lives only on disk).
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "secret leaked in the journal"
+    );
+}
