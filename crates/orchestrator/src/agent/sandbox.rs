@@ -394,14 +394,20 @@ fn build_landlock_ruleset(
     workspace: &std::path::Path,
 ) -> Result<landlock::RulesetCreated, OrchestratorError> {
     use landlock::{
-        ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        path_beneath_rules,
+        ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, path_beneath_rules,
     };
     let mk = |m: String| OrchestratorError::Tool {
         tool: "sandbox".into(),
         message: format!("landlock: {m}"),
     };
     let abi = ABI::V1;
+    // Open the workspace fd EXPLICITLY and propagate a failed open — do NOT route the workspace
+    // through `path_beneath_rules`, which swallows a failed `PathFd::new` (`Err(_) => None`) as a
+    // silently-skipped rule. An unopenable workspace must fail the build => `run` refuses-loud (this
+    // fn's documented contract), never a silently-narrowed ruleset with the workspace-write rule
+    // dropped. (A real canonical workspace opens fine, so this is byte-identical for live runs.)
+    let ws_fd = PathFd::new(workspace).map_err(|e| mk(format!("open workspace: {e}")))?;
     // Parity with `MacosSandbox`'s /dev carve-out: writes to these pseudo-devices are safe
     // (`/dev/null` discards, the rest are read-mostly), so a WriteFile grant on the exact existing
     // nodes lets common redirects (`2>/dev/null`, `>/dev/null 2>&1`) work. Filtered to nodes that
@@ -429,8 +435,10 @@ fn build_landlock_ruleset(
         // Broad READ+execute on `/` so the binary + its shared libs load.
         .add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi)))
         .map_err(|e| mk(e.to_string()))?
-        // WRITE (+create/remove/make-*) confined to the workspace subpath.
-        .add_rules(path_beneath_rules([workspace], AccessFs::from_all(abi)))
+        // WRITE (+create/remove/make-*) confined to the workspace subpath (fd opened above so an
+        // unopenable workspace already refused-loud). `from_all` is the same access
+        // `path_beneath_rules` grants a directory, so this is byte-identical for a live workspace.
+        .add_rule(PathBeneath::new(ws_fd, AccessFs::from_all(abi)))
         .map_err(|e| mk(e.to_string()))?
         // WriteFile-only on the safe pseudo-devices (does NOT widen the workspace jail).
         .add_rules(path_beneath_rules(dev_writable, AccessFs::WriteFile))
@@ -1080,5 +1088,30 @@ mod tests {
             "AF_UNIX socket was wrongly blocked under Deny: {out:?}"
         );
         assert!(out.stdout.contains("unix-ok"));
+    }
+
+    // ── SP-4 linux-sandbox (4/4): fail-closed refuse coverage (Docker/Linux only) ──
+
+    /// AC6 fail-closed: `build_landlock_ruleset` opens the workspace via `PathFd`; a non-existent
+    /// (unopenable) workspace fails the ruleset build => `run` returns `Err` (refuse-loud), never
+    /// an unconfined run. The landlock-unavailable branch can't be triggered where landlock IS
+    /// present (the Docker/CI kernels have it), so the ruleset-build-fails path proves the same
+    /// contract: no confinement built ⇒ the command never runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_refuses_when_the_workspace_path_is_unopenable() {
+        let a = argv(&["sh", "-c", "echo x"]);
+        let bogus = std::path::PathBuf::from("/nonexistent-workspace-xyz"); // unopenable
+        let r = LinuxSandbox.run(&SandboxSpec {
+            argv: &a,
+            workspace: &bogus,
+            caps: &caps(Some(5000), None),
+            network: &orchestrator_core::NetworkPolicy::Any,
+            stdin: None,
+        });
+        assert!(
+            matches!(r, Err(OrchestratorError::Tool { .. })),
+            "unopenable workspace must refuse loud: {r:?}"
+        );
     }
 }
