@@ -38,12 +38,26 @@ pub enum KillReason {
 ///
 /// Note: on Darwin `setrlimit(RLIMIT_AS)` returns EINVAL, so a `mem_bytes: Some(_)` cap makes the
 /// child fail-closed (spawn `Err` — it refuses rather than running uncapped); Linux enforces it.
-// Transient: the first non-test caller (the `Sandbox` impls) lands in Task 2; drop this then.
+// The thin wrapper is reached by tests + `MacosSandbox`; on Linux the only in-crate caller is
+// `LinuxSandbox`, which uses `spawn_capped_with` directly, so allow dead_code for it there.
 #[allow(dead_code)]
 pub(crate) fn spawn_capped(
     argv: &[String],
     caps: &ResourceCaps,
     stdin: Option<&str>,
+) -> Result<CapOutcome, OrchestratorError> {
+    spawn_capped_with(argv, caps, stdin, None)
+}
+
+/// Like `spawn_capped`, but runs `extra_pre_exec` (if any) in the child AFTER the rlimits and
+/// BEFORE `execve`. Used by `LinuxSandbox` to APPLY a pre-built landlock ruleset + seccomp filter
+/// (the closure issues syscalls only — no allocation in the child). `None` ⇒ byte-identical.
+#[allow(dead_code)]
+pub(crate) fn spawn_capped_with(
+    argv: &[String],
+    caps: &ResourceCaps,
+    stdin: Option<&str>,
+    mut extra_pre_exec: Option<Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>>,
 ) -> Result<CapOutcome, OrchestratorError> {
     let (cmd0, rest) = argv.split_first().ok_or_else(|| OrchestratorError::Tool {
         tool: "sandbox".into(),
@@ -76,6 +90,10 @@ pub(crate) fn spawn_capped(
             if let Some(b) = mem {
                 setrlimit(Resource::RLIMIT_AS, b, b)
                     .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            }
+            // SP-4 Linux: apply the pre-built confinement (landlock + seccomp) — syscalls only.
+            if let Some(hook) = extra_pre_exec.as_mut() {
+                hook()?;
             }
             Ok(())
         });
