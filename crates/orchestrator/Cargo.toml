@@ -24,6 +24,13 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# SP-4 Linux sandbox backend: landlock (fs-write confinement) + seccomp (egress deny). These are
+# Linux-only and target-gated, so they are NOT pulled into the macOS build.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.4"
+libc = "0.2"
+
 [dev-dependencies]
 orchestrator-store = { package = "sensei-orchestrator-store", path = "../orchestrator-store" }
 tempfile = "3"
