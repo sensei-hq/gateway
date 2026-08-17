@@ -94,28 +94,39 @@ pub(crate) fn spawn_capped(
     let mut out_h = child.stdout.take();
     let mut err_h = child.stderr.take();
     let stdin_h = child.stdin.take();
-    let out_t = std::thread::spawn(move || {
+    // Readers SEND their captured output over a channel (fire-and-forget — NOT joined). A
+    // descendant that escapes the process group via setsid() can hold the pipe write-end open
+    // past the group kill, so a blocking join would hang the caller forever. On a normal run the
+    // group kill closes the pipes and the readers finish immediately; the receive below then
+    // returns instantly (no truncation).
+    let (out_tx, out_rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(h) = out_h.as_mut() {
             let _ = h.read_to_string(&mut s);
         }
-        s
+        let _ = out_tx.send(s); // ignore if the receiver already gave up
     });
-    let err_t = std::thread::spawn(move || {
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(h) = err_h.as_mut() {
             let _ = h.read_to_string(&mut s);
         }
-        s
+        let _ = err_tx.send(s);
     });
-    let stdin_t = stdin.map(|s| {
+    // The stdin writer is fire-and-forget too: a child that never drains a large payload must not
+    // block us. Dropping the handle sends EOF.
+    if let Some(s) = stdin {
         let s = s.to_string();
         std::thread::spawn(move || {
             if let Some(mut si) = stdin_h {
-                let _ = si.write_all(s.as_bytes()); // drop `si` => EOF
+                let _ = si.write_all(s.as_bytes());
             }
-        })
-    });
+        });
+    } else {
+        drop(stdin_h);
+    }
 
     // Wait with an optional wall deadline via a channel; on timeout, SIGKILL the group.
     let (tx, rx) = mpsc::channel();
@@ -155,11 +166,13 @@ pub(crate) fn spawn_capped(
         nix::unistd::Pid::from_raw(-pid),
         nix::sys::signal::Signal::SIGKILL,
     );
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = err_t.join().unwrap_or_default();
-    if let Some(t) = stdin_t {
-        let _ = t.join();
-    }
+    // A descendant that escaped the process group via setsid() can hold the pipe write-end open
+    // past the group kill; don't block the caller forever on EOF. Give the readers a short grace
+    // to drain, then return with whatever was captured. The escapee stays OS-alive but
+    // Seatbelt-confined; the wall cap's caller-return guarantee is preserved.
+    const CAPTURE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+    let stdout = out_rx.recv_timeout(CAPTURE_GRACE).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(CAPTURE_GRACE).unwrap_or_default();
 
     let killed = if wall_killed {
         Some(KillReason::Wall)
@@ -380,6 +393,37 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "straggler not reaped — spawn_capped hung on the pipe"
+        );
+    }
+
+    #[test]
+    fn a_session_escaped_descendant_does_not_hang_capture() {
+        // A grandchild that setsid()s escapes the process group AND holds the stdout/stderr pipes,
+        // so the group kill can't reap it. Bounded capture must still return promptly (not block on
+        // EOF). The grandchild syncs on a pipe so it has provably setsid()'d BEFORE the direct
+        // child (its parent) exits — otherwise the straggler-reap would race and kill it first,
+        // making this test only intermittently exercise the escape. The stray grandchild sleeps 8s
+        // (self-cleans): longer than the fixed path's ~4s (2×CAPTURE_GRACE), so a regression to a
+        // blocking capture would wait the full 8s and blow the 6s bound; short enough not to bloat
+        // the parallel test run or destabilize sibling wall-timer tests.
+        let start = std::time::Instant::now();
+        let out = spawn_capped(
+            &argv(&[
+                "perl",
+                "-e",
+                "use POSIX qw(setsid); pipe(R,W); my $pid=fork(); \
+                 if($pid==0){ close(R); setsid(); close(W); sleep 8; } \
+                 else { close(W); my $x=<R>; exit 0; }",
+            ]),
+            &caps(Some(3000), None),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "capture blocked on a session-escaped descendant holding the pipe (elapsed {:?})",
+            start.elapsed()
         );
     }
 
