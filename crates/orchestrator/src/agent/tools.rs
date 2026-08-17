@@ -30,6 +30,9 @@ pub struct ToolContext {
     /// when no workspace is wired. A confined fs tool resolves its target via
     /// [`workspace::confine`](crate::agent::workspace::confine) against this root.
     pub workspace_root: Option<std::sync::Arc<std::path::PathBuf>>,
+    /// The per-call sandbox handle (SP-4 s4), policy-fixed by the executor from the grant, or
+    /// `None` when no sandbox is wired (⇒ the `shell` tool refuses loud). Ephemeral.
+    pub sandbox: Option<std::sync::Arc<crate::agent::sandbox::BoundSandbox>>,
 }
 
 impl ToolContext {
@@ -610,6 +613,110 @@ impl Tool for FsReadTool {
     }
 }
 
+/// SP-4 s4: run an external command in the subprocess sandbox. Mutation. Args:
+/// `{ "argv": ["cmd","arg",...], "stdin"?: "..." }`. Requires a wired sandbox (`ctx.sandbox`);
+/// refuses loud otherwise (fail-closed — never an unconfined run). A cap-kill / nonzero exit is
+/// surfaced IN the result (a normal Ok Value the model reacts to), not a node failure.
+pub struct ShellTool;
+
+impl Tool for ShellTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "shell".into(),
+            description: Some("Run an external command in the sandbox (argv array)".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "argv": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "stdin": { "type": "string" }
+                },
+                "required": ["argv"]
+            }),
+            effect_class: EffectClass::Mutation,
+            ttl_secs: None,
+            source: None,
+            permissions: Permissions::default(),
+            activation: Activation::default(),
+            credentials: vec![],
+        }
+    }
+
+    fn required(&self, args: &serde_json::Value) -> Permissions {
+        // The s1 gate authorizes the command: the grant's `commands` allowlist must cover argv[0].
+        let commands = args
+            .get("argv")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .map(|c| vec![c.to_string()])
+            .unwrap_or_default();
+        Permissions {
+            commands,
+            ..Default::default()
+        }
+    }
+
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, OrchestratorError> {
+        Err(OrchestratorError::Tool {
+            tool: "shell".into(),
+            message: "shell requires a sandbox context (call_ctx)".into(),
+        })
+    }
+
+    fn call_ctx(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value, OrchestratorError> {
+        let sb = ctx
+            .sandbox
+            .as_ref()
+            .ok_or_else(|| OrchestratorError::Tool {
+                tool: "shell".into(),
+                message: "sandbox required but not available".into(),
+            })?;
+        // STRICT parse: every argv element MUST be a string. A silent filter_map would drop a
+        // non-string element (e.g. a leading `0`), so `required()`'s gated `argv[0]` and the
+        // EXECUTED argv could diverge — a call the command-allowlist never authorized. Reject loud
+        // instead, so the executed argv == the argv the s1 gate reasoned about.
+        let argv_json =
+            args.get("argv")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| OrchestratorError::Tool {
+                    tool: "shell".into(),
+                    message: "missing 'argv'".into(),
+                })?;
+        let mut argv = Vec::with_capacity(argv_json.len());
+        for x in argv_json {
+            let s = x.as_str().ok_or_else(|| OrchestratorError::Tool {
+                tool: "shell".into(),
+                message: "'argv' must be an array of strings".into(),
+            })?;
+            argv.push(s.to_string());
+        }
+        if argv.is_empty() {
+            return Err(OrchestratorError::Tool {
+                tool: "shell".into(),
+                message: "missing 'argv'".into(),
+            });
+        }
+        let stdin = args.get("stdin").and_then(|v| v.as_str());
+        let out = sb.run(&argv, stdin)?;
+        let killed = out.killed.as_ref().map(|k| match k {
+            crate::agent::sandbox::KillReason::Wall => "wall".to_string(),
+            crate::agent::sandbox::KillReason::Cpu => "cpu".to_string(),
+            crate::agent::sandbox::KillReason::Mem => "mem".to_string(),
+            crate::agent::sandbox::KillReason::Signal(s) => format!("signal:{s}"),
+        });
+        Ok(serde_json::json!({
+            "exit_code": out.exit_code,
+            "stdout": out.stdout,
+            "stderr": out.stderr,
+            "killed": killed,
+        }))
+    }
+}
+
 /// Pure discovery: list the registry's agents (name + role).
 pub struct ListAgents(pub Arc<Registry>);
 impl Tool for ListAgents {
@@ -998,6 +1105,7 @@ mod tests {
             effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
             credentials: Default::default(),
             workspace_root: None,
+            sandbox: None,
         };
         let via_ctx = reg
             .execute_ctx(
@@ -1052,6 +1160,7 @@ mod tests {
             effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
             credentials: std::sync::Arc::new(creds),
             workspace_root: None,
+            sandbox: None,
         };
         assert_eq!(ctx.exposed_secret_values(), vec!["s3cret"]);
 
@@ -1069,6 +1178,7 @@ mod tests {
             effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
             credentials: std::sync::Arc::new(std::collections::HashMap::new()),
             workspace_root: Some(std::sync::Arc::new(root.to_path_buf())),
+            sandbox: None,
         }
     }
 
@@ -1141,6 +1251,7 @@ mod tests {
             effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
             credentials: std::sync::Arc::new(std::collections::HashMap::new()),
             workspace_root: None,
+            sandbox: None,
         };
         let err = FsWriteTool
             .call_ctx(
@@ -1149,6 +1260,162 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, OrchestratorError::Tool { .. }));
+    }
+
+    // A recording fake sandbox: captures the policy it was handed, returns a canned outcome.
+    struct RecordingSandbox(
+        std::sync::Mutex<
+            Option<(
+                Vec<String>,
+                orchestrator_core::ResourceCaps,
+                orchestrator_core::NetworkPolicy,
+            )>,
+        >,
+    );
+    impl crate::agent::sandbox::Sandbox for RecordingSandbox {
+        fn run(
+            &self,
+            spec: &crate::agent::sandbox::SandboxSpec,
+        ) -> Result<crate::agent::sandbox::CapOutcome, OrchestratorError> {
+            *self.0.lock().unwrap() =
+                Some((spec.argv.to_vec(), spec.caps.clone(), spec.network.clone()));
+            Ok(crate::agent::sandbox::CapOutcome {
+                exit_code: Some(0),
+                stdout: "canned".into(),
+                stderr: String::new(),
+                killed: None,
+            })
+        }
+    }
+
+    fn bound(
+        inner: std::sync::Arc<dyn crate::agent::sandbox::Sandbox>,
+        caps: orchestrator_core::ResourceCaps,
+        net: orchestrator_core::NetworkPolicy,
+    ) -> std::sync::Arc<crate::agent::sandbox::BoundSandbox> {
+        std::sync::Arc::new(crate::agent::sandbox::BoundSandbox::new(
+            inner,
+            std::sync::Arc::new(std::path::PathBuf::from("/ws")),
+            caps,
+            net,
+        ))
+    }
+
+    fn shell_ctx(
+        sandbox: Option<std::sync::Arc<crate::agent::sandbox::BoundSandbox>>,
+    ) -> ToolContext {
+        ToolContext {
+            idempotency_key: "k".into(),
+            effect_id: orchestrator_core::effect::effect_id("n", 0, 0),
+            credentials: std::sync::Arc::new(std::collections::HashMap::new()),
+            workspace_root: None,
+            sandbox,
+        }
+    }
+
+    #[test]
+    fn shell_without_a_sandbox_refuses_loud() {
+        let err = ShellTool
+            .call_ctx(
+                serde_json::json!({"argv": ["echo", "hi"]}),
+                &shell_ctx(None),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Tool { .. }),
+            "shell must refuse loud with no sandbox"
+        );
+    }
+
+    #[test]
+    fn shell_runs_argv_through_the_bound_sandbox() {
+        let rec = std::sync::Arc::new(RecordingSandbox(std::sync::Mutex::new(None)));
+        let caps = orchestrator_core::ResourceCaps {
+            cpu_ms: None,
+            mem_bytes: None,
+            wall_ms: Some(1234),
+        };
+        let ctx = shell_ctx(Some(bound(
+            rec.clone(),
+            caps.clone(),
+            orchestrator_core::NetworkPolicy::Deny,
+        )));
+        let out = ShellTool
+            .call_ctx(serde_json::json!({"argv": ["echo", "hi"]}), &ctx)
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"exit_code": 0, "stdout": "canned", "stderr": "", "killed": null})
+        );
+        // AC8: the sandbox saw the GRANT's caps/network, not anything derived from argv.
+        let (a, seen_caps, seen_net) = rec.0.lock().unwrap().clone().unwrap();
+        assert_eq!(a, vec!["echo".to_string(), "hi".to_string()]);
+        assert_eq!(seen_caps.wall_ms, Some(1234));
+        assert_eq!(seen_net, orchestrator_core::NetworkPolicy::Deny);
+    }
+
+    #[test]
+    fn shell_maps_a_killed_outcome_to_json() {
+        struct KillingSandbox;
+        impl crate::agent::sandbox::Sandbox for KillingSandbox {
+            fn run(
+                &self,
+                _spec: &crate::agent::sandbox::SandboxSpec,
+            ) -> Result<crate::agent::sandbox::CapOutcome, OrchestratorError> {
+                Ok(crate::agent::sandbox::CapOutcome {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    killed: Some(crate::agent::sandbox::KillReason::Wall),
+                })
+            }
+        }
+        let caps = orchestrator_core::ResourceCaps {
+            cpu_ms: None,
+            mem_bytes: None,
+            wall_ms: Some(100),
+        };
+        let ctx = shell_ctx(Some(bound(
+            std::sync::Arc::new(KillingSandbox),
+            caps,
+            orchestrator_core::NetworkPolicy::Deny,
+        )));
+        let out = ShellTool
+            .call_ctx(serde_json::json!({"argv": ["sleep", "100"]}), &ctx)
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"exit_code": null, "stdout": "", "stderr": "", "killed": "wall"})
+        );
+    }
+
+    #[test]
+    fn shell_rejects_non_string_argv() {
+        // A non-string argv element (a leading `0`) must be rejected LOUD before any subprocess
+        // runs — else `required()`'s gated `argv[0]` and the executed argv would diverge (the
+        // command-allowlist fail-open). Uses the recording fake; the strict parse errors before it.
+        let rec = std::sync::Arc::new(RecordingSandbox(std::sync::Mutex::new(None)));
+        let ctx = shell_ctx(Some(bound(
+            rec.clone(),
+            orchestrator_core::ResourceCaps {
+                cpu_ms: None,
+                mem_bytes: None,
+                wall_ms: Some(1000),
+            },
+            orchestrator_core::NetworkPolicy::Deny,
+        )));
+        let err = ShellTool
+            .call_ctx(serde_json::json!({"argv": [0, "rm"]}), &ctx)
+            .unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::Tool { .. }),
+            "non-string argv must be rejected loud"
+        );
+        // The strict parse rejected BEFORE dispatching to the sandbox.
+        assert!(
+            rec.0.lock().unwrap().is_none(),
+            "the sandbox must not run when argv is malformed"
+        );
     }
 }
 

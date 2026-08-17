@@ -5,9 +5,9 @@
 
 use std::io::{Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use orchestrator_core::{NetworkPolicy, OrchestratorError, ResourceCaps};
@@ -192,6 +192,58 @@ pub struct SandboxSpec<'a> {
 /// where this platform has no backend.
 pub trait Sandbox: Send + Sync {
     fn run(&self, spec: &SandboxSpec) -> Result<CapOutcome, OrchestratorError>;
+}
+
+/// A per-call sandbox handle with the policy FIXED by the executor (from the grant). The tool
+/// supplies only `argv` → it cannot widen caps/workspace/network. Manual `Debug` (the inner
+/// trait object isn't `Debug`).
+#[derive(Clone)]
+pub struct BoundSandbox {
+    inner: Arc<dyn Sandbox>,
+    workspace: Arc<PathBuf>,
+    caps: ResourceCaps,
+    network: NetworkPolicy,
+}
+
+impl std::fmt::Debug for BoundSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundSandbox")
+            .field("workspace", &self.workspace)
+            .field("caps", &self.caps)
+            .field("network", &self.network)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundSandbox {
+    /// Construct from the executor-resolved policy (grant caps/network + per-run workspace).
+    pub fn new(
+        inner: Arc<dyn Sandbox>,
+        workspace: Arc<PathBuf>,
+        caps: ResourceCaps,
+        network: NetworkPolicy,
+    ) -> Self {
+        Self {
+            inner,
+            workspace,
+            caps,
+            network,
+        }
+    }
+    /// Run `argv` under the fixed policy.
+    pub fn run(
+        &self,
+        argv: &[String],
+        stdin: Option<&str>,
+    ) -> Result<CapOutcome, OrchestratorError> {
+        self.inner.run(&SandboxSpec {
+            argv,
+            workspace: &self.workspace,
+            caps: &self.caps,
+            network: &self.network,
+            stdin,
+        })
+    }
 }
 
 /// macOS `sandbox-exec` backend: fs writes confined to the workspace subpath, network per policy.

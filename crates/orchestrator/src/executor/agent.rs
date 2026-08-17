@@ -701,6 +701,9 @@ impl Executor {
             // resolves its target within it via `confine`). `None` when no jail is wired ⇒
             // byte-identical.
             workspace_root: self.workspace_root_for(ar.run)?,
+            // SP-4 s4: the per-call sandbox handle is wired in Task 4 (`bound_sandbox_for`);
+            // `None` here keeps the crate compiling + `shell` refusing loud until then.
+            sandbox: None,
         };
         match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
