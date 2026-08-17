@@ -328,6 +328,112 @@ fn macos_profile(workspace: &Path, network: &NetworkPolicy) -> String {
     )
 }
 
+/// SP-4 Linux backend: landlock fs-write confinement to the workspace + the portable cap-killing.
+/// Network `Deny` refuses-loud until Task 3 adds seccomp egress-deny; `Any`/`Hosts` run unfiltered.
+/// Unprivileged (landlock ≥ 5.13). Parity target: `MacosSandbox`.
+#[cfg(target_os = "linux")]
+pub struct LinuxSandbox;
+
+#[cfg(target_os = "linux")]
+impl Sandbox for LinuxSandbox {
+    fn run(&self, spec: &SandboxSpec) -> Result<CapOutcome, OrchestratorError> {
+        // BUILD the confinement in the PARENT (the landlock ruleset allocates). Refuse-loud if the
+        // fs-confinement can't be built (e.g. an unopenable workspace) — never an unconfined run.
+        let mut ruleset = Some(build_landlock_ruleset(spec.workspace)?);
+        match spec.network {
+            // Any / Hosts(coarse) => no network filter this task (Task 3 adds seccomp egress-deny).
+            NetworkPolicy::Any | NetworkPolicy::Hosts(_) => {}
+            // Egress-deny lands in Task 3 (seccomp). Until then refuse-loud (fail-closed) rather
+            // than run a command with unconfined network.
+            NetworkPolicy::Deny => {
+                return Err(OrchestratorError::Tool {
+                    tool: "sandbox".into(),
+                    message: "linux egress-deny not yet implemented".into(),
+                });
+            }
+        }
+        // APPLY in the CHILD via the extra pre_exec hook. The hook runs post-fork, before execve,
+        // so it must be async-signal-safe: it issues syscalls ONLY (`restrict_self`; the ruleset
+        // was allocated in the parent) on the success path, sidestepping the fork+malloc-lock
+        // hazard. Every abort path is ALSO alloc-free + panic-free — errno-only
+        // `io::Error::from_raw_os_error(EPERM)` (no `format!`, no `expect`) — so a multithreaded
+        // parent's held malloc/unwind locks can never deadlock the child. The parent surfaces a
+        // failed hook as "spawn ... : Operation not permitted" (a fail-closed refuse).
+        let hook: Box<dyn FnMut() -> std::io::Result<()> + Send + Sync> = Box::new(move || {
+            // `let-else`, not `.expect()`: the FnMut runs once so `None` is unreachable, but never
+            // panic post-fork.
+            let Some(rs) = ruleset.take() else {
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            };
+            let status = rs
+                .restrict_self()
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))?;
+            // Fail-closed: if landlock did not enforce (kernel < 5.13 / not compiled in), the fs
+            // confinement did NOT take — abort the child so the command never runs unconfined.
+            if status.ruleset == landlock::RulesetStatus::NotEnforced {
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            }
+            Ok(())
+        });
+        spawn_capped_with(spec.argv, spec.caps, spec.stdin, Some(hook))
+    }
+}
+
+/// Build a landlock ruleset: broad READ+execute on `/` (a binary must start + read shared libs),
+/// WRITE (+create/remove/make-*) confined to the canonical `workspace` subpath, plus a WriteFile
+/// carve-out for safe pseudo-devices (`/dev/null` &c) so common redirects work. Best-effort
+/// forward-ABI (`CompatLevel::BestEffort`); the ABI-1 write handling is the security core. Built
+/// in the PARENT (allocates); `restrict_self` is applied in the child. An unopenable `workspace`
+/// makes the build fail (refuse-loud).
+#[cfg(target_os = "linux")]
+fn build_landlock_ruleset(
+    workspace: &std::path::Path,
+) -> Result<landlock::RulesetCreated, OrchestratorError> {
+    use landlock::{
+        ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        path_beneath_rules,
+    };
+    let mk = |m: String| OrchestratorError::Tool {
+        tool: "sandbox".into(),
+        message: format!("landlock: {m}"),
+    };
+    let abi = ABI::V1;
+    // Parity with `MacosSandbox`'s /dev carve-out: writes to these pseudo-devices are safe
+    // (`/dev/null` discards, the rest are read-mostly), so a WriteFile grant on the exact existing
+    // nodes lets common redirects (`2>/dev/null`, `>/dev/null 2>&1`) work. Filtered to nodes that
+    // exist (e.g. `/dev/tty` may be absent) so `PathFd::new` never fails the whole build. Scoped to
+    // those device files only — WriteFile ONLY, no create/dir rights — so the workspace jail is NOT
+    // widened (a write anywhere else stays denied).
+    let dev_nodes = [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+    ];
+    let dev_writable: Vec<&str> = dev_nodes
+        .into_iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .collect();
+    let ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(|e| mk(e.to_string()))?
+        .create()
+        .map_err(|e| mk(e.to_string()))?
+        // Broad READ+execute on `/` so the binary + its shared libs load.
+        .add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi)))
+        .map_err(|e| mk(e.to_string()))?
+        // WRITE (+create/remove/make-*) confined to the workspace subpath.
+        .add_rules(path_beneath_rules([workspace], AccessFs::from_all(abi)))
+        .map_err(|e| mk(e.to_string()))?
+        // WriteFile-only on the safe pseudo-devices (does NOT widen the workspace jail).
+        .add_rules(path_beneath_rules(dev_writable, AccessFs::WriteFile))
+        .map_err(|e| mk(e.to_string()))?;
+    Ok(ruleset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,7 +554,13 @@ mod tests {
     #[test]
     fn cpu_cap_kills_a_busy_loop() {
         // RLIMIT_CPU is POSIX + implemented on Darwin (unlike RLIMIT_AS). A busy loop capped at 1s
-        // CPU → SIGXCPU → Cpu. Wall set high so the WALL timer doesn't fire first.
+        // CPU is killed by the cpu cap. The delivered signal is arch/kernel-specific: SIGXCPU(24)
+        // => Cpu on macOS + x86_64, but SIGKILL(9) => Signal(9) on arm64 kernels where soft==hard
+        // (the hard-limit SIGKILL races ahead of the soft-limit SIGXCPU). Both are a real cpu-cap
+        // breach — accept either. Wall set high (15s) so the WALL timer doesn't fire first: if
+        // RLIMIT_CPU were NOT applied, the loop would run to the wall cap => killed: Some(Wall),
+        // which is NEITHER arm => the assertion catches that regression (and the test returns in
+        // ~1s from the cpu kill, not 15s).
         let out = spawn_capped(
             &argv(&["sh", "-c", "while :; do :; done"]),
             &ResourceCaps {
@@ -459,10 +571,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            out.killed,
-            Some(KillReason::Cpu),
-            "expected a CPU-cap (SIGXCPU) kill, got {out:?}"
+        assert!(
+            matches!(
+                out.killed,
+                Some(KillReason::Cpu) | Some(KillReason::Signal(9))
+            ),
+            "expected a CPU-cap kill — SIGXCPU=>Cpu (macOS/x86_64) or SIGKILL(9) where soft==hard (arm64 kernels), got {out:?}"
         );
     }
 
@@ -663,5 +777,150 @@ mod tests {
             Some(KillReason::Wall),
             "wall cap did not fire through the sandbox: {out:?}"
         );
+    }
+
+    // ── SP-4 linux-sandbox (2/4): landlock fs-write confinement e2e (Docker/Linux only) ──
+
+    /// THE load-bearing landlock proof: a write to a path OUTSIDE the workspace must be denied
+    /// (landlock confines WRITE to the workspace subpath). The escape target lives in a DIFFERENT
+    /// tempdir, so the only thing that could let the file land is a too-permissive write rule.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_denies_write_outside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let escape = tempfile::tempdir().unwrap();
+        let target = escape.path().join("escaped");
+        let a = argv(&["sh", "-c", &format!("echo x > {}", target.display())]);
+        let out = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        assert!(
+            !target.exists(),
+            "a file escaped the landlock workspace: {out:?}"
+        );
+    }
+
+    /// The complement: a write INSIDE the workspace subpath must succeed (exit 0 + the file lands).
+    /// Rules out "sh couldn't start / all writes denied".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_allows_write_inside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let a = argv(&[
+            "sh",
+            "-c",
+            &format!("echo hi > {}/inside.txt", root.display()),
+        ]);
+        let out = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "in-workspace write was denied: {out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("inside.txt")).unwrap(),
+            "hi\n"
+        );
+    }
+
+    /// Nested writes/mkdir inside the workspace must also succeed (create/make-dir handling).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_allows_nested_write_inside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let a = argv(&[
+            "sh",
+            "-c",
+            &format!(
+                "mkdir -p {r}/a/b && echo hi > {r}/a/b/c.txt",
+                r = root.display()
+            ),
+        ]);
+        let out = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "nested in-workspace write/mkdir denied: {out:?}"
+        );
+        assert!(root.join("a/b/c.txt").exists());
+    }
+
+    /// Cap-killing composes WITH landlock: a `sleep 100` inside the confined child must still be
+    /// wall-killed (the confinement hook runs in the same capped process group).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_wall_kill_composes() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let a = argv(&["sh", "-c", "sleep 100"]);
+        let out = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(200), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.killed,
+            Some(KillReason::Wall),
+            "cap-killing must compose with landlock"
+        );
+    }
+
+    /// The /dev carve-out (parity with `MacosSandbox`): common redirects to `/dev/null` must work
+    /// under landlock. Paired with `linux_denies_write_outside_the_workspace` (unchanged), this
+    /// proves the carve-out grants ONLY the specific device nodes — it does NOT widen the jail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_allows_writing_to_dev_null() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let a = argv(&[
+            "sh",
+            "-c",
+            "echo hi 2>/dev/null; echo x > /dev/null; echo done",
+        ]);
+        let out = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "redirect to /dev/null was denied: {out:?}"
+        );
+        assert!(out.stdout.contains("done"));
     }
 }
