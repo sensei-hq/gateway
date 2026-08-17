@@ -384,11 +384,14 @@ impl Sandbox for LinuxSandbox {
 }
 
 /// Build a landlock ruleset: broad READ+execute on `/` (a binary must start + read shared libs),
-/// WRITE (+create/remove/make-*) confined to the canonical `workspace` subpath, plus a WriteFile
-/// carve-out for safe pseudo-devices (`/dev/null` &c) so common redirects work. Best-effort
-/// forward-ABI (`CompatLevel::BestEffort`); the ABI-1 write handling is the security core. Built
-/// in the PARENT (allocates); `restrict_self` is applied in the child. An unopenable `workspace`
-/// makes the build fail (refuse-loud).
+/// WRITE (+create/remove/make-* + TRUNCATE/REFER/IOCTL_DEV) confined to the canonical `workspace`
+/// subpath, plus a WriteFile+Truncate carve-out for safe pseudo-devices (`/dev/null` &c) so common
+/// redirects work. Handles the ABI V5 access set (`CompatLevel::BestEffort` degrades gracefully on
+/// older kernels) — CRUCIAL: landlock only mediates the rights it HANDLES, so handling only ABI-1
+/// would leave `truncate(2)`/`ftruncate(2)` (the ABI-3 TRUNCATE right) UNMEDIATED, letting a
+/// confined command zero any writable file OUTSIDE the workspace. Built in the PARENT (allocates);
+/// `restrict_self` is applied in the child. An unopenable `workspace` makes the build fail
+/// (refuse-loud).
 #[cfg(target_os = "linux")]
 fn build_landlock_ruleset(
     workspace: &std::path::Path,
@@ -401,7 +404,9 @@ fn build_landlock_ruleset(
         tool: "sandbox".into(),
         message: format!("landlock: {m}"),
     };
-    let abi = ABI::V1;
+    // ABI V5 (not V1) so TRUNCATE (ABI v3) is a HANDLED right — see this fn's doc; handling only
+    // V1 would leave `truncate(2)`/`ftruncate(2)` unmediated (an outside-the-jail write-escape).
+    let abi = ABI::V5;
     // Open the workspace fd EXPLICITLY and propagate a failed open — do NOT route the workspace
     // through `path_beneath_rules`, which swallows a failed `PathFd::new` (`Err(_) => None`) as a
     // silently-skipped rule. An unopenable workspace must fail the build => `run` refuses-loud (this
@@ -440,8 +445,13 @@ fn build_landlock_ruleset(
         // `path_beneath_rules` grants a directory, so this is byte-identical for a live workspace.
         .add_rule(PathBeneath::new(ws_fd, AccessFs::from_all(abi)))
         .map_err(|e| mk(e.to_string()))?
-        // WriteFile-only on the safe pseudo-devices (does NOT widen the workspace jail).
-        .add_rules(path_beneath_rules(dev_writable, AccessFs::WriteFile))
+        // WriteFile+Truncate on the safe pseudo-devices (does NOT widen the workspace jail). Truncate
+        // is REQUIRED now that TRUNCATE is handled: `>/dev/null` opens `O_WRONLY|O_TRUNC`, so without
+        // the Truncate right on the node the redirect would regress.
+        .add_rules(path_beneath_rules(
+            dev_writable,
+            AccessFs::WriteFile | AccessFs::Truncate,
+        ))
         .map_err(|e| mk(e.to_string()))?;
     Ok(ruleset)
 }
@@ -1013,6 +1023,43 @@ mod tests {
             "redirect to /dev/null was denied: {out:?}"
         );
         assert!(out.stdout.contains("done"));
+    }
+
+    /// Whole-slice-review regression: TRUNCATE (ABI v3) must be a HANDLED+ungranted right OUTSIDE
+    /// the workspace — else `truncate(2)` is unmediated and a confined command can zero any writable
+    /// file (a data-destruction escape). Non-vacuous: under an `ABI::V1` pin this fails (the outside
+    /// file becomes size 0); under the `ABI::V5` fix landlock denies the truncate → the file keeps
+    /// its 10 bytes and perl prints "trunc-denied".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_denies_truncate_outside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("data");
+        std::fs::write(&victim, b"0123456789").unwrap(); // 10 bytes, OUTSIDE the workspace
+        let a = argv(&[
+            "perl",
+            "-e",
+            &format!(
+                "truncate('{}', 0) or print \"trunc-denied\\n\"",
+                victim.display()
+            ),
+        ]);
+        let out = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        let size = std::fs::metadata(&victim).unwrap().len();
+        assert_eq!(
+            size, 10,
+            "truncate() escaped the workspace and zeroed an outside file: {out:?}"
+        );
     }
 
     // ── SP-4 linux-sandbox (3/4): seccomp egress-deny e2e (Docker/Linux only) ──
