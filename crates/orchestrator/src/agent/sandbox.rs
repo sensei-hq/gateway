@@ -470,4 +470,136 @@ mod tests {
         );
         assert_eq!(out.stdout, "ok\n");
     }
+
+    // ── Task 5: real `sandbox-exec` (Seatbelt) confinement e2e (macOS dev box only) ──
+
+    /// THE load-bearing confinement proof: a write to a path OUTSIDE the workspace must be denied
+    /// by the OS. The escape target lives in a DIFFERENT tempdir than the workspace, so the only
+    /// thing that could let the file land is a too-permissive `file-write*` allowance.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_denies_write_outside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let escape = tempfile::tempdir().unwrap();
+        let target = escape.path().canonicalize().unwrap().join("escaped");
+        let a = argv(&["sh", "-c", &format!("echo x > {}", target.display())]);
+        let out = MacosSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert!(
+            !target.exists(),
+            "a file escaped the sandbox workspace (write confinement is broken): {out:?}"
+        );
+    }
+
+    /// The complement: a write INSIDE the workspace subpath must succeed (exit 0 + the file lands).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_allows_write_inside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let a = argv(&[
+            "sh",
+            "-c",
+            &format!("echo x > {}/inside.txt", root.display()),
+        ]);
+        let out = MacosSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "in-workspace write was denied: {out:?}"
+        );
+        assert!(
+            root.join("inside.txt").exists(),
+            "in-workspace write did not land: {out:?}"
+        );
+    }
+
+    /// Network egress: a real CONTRAST against a LIVE loopback listener. A closed-port probe would
+    /// be vacuous (connection-refused whether or not Seatbelt denies), so we bind an actual
+    /// `TcpListener` in the (unsandboxed) test and run the SAME connect under `Any` (positive
+    /// control → must connect) and `Deny` (must be blocked). Because the port IS listening, a Deny
+    /// failure can only be Seatbelt, never conn-refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_deny_blocks_a_live_socket_that_any_allows() {
+        use std::net::TcpListener;
+        // A real listener the sandboxed probe can actually reach (no accept() needed — the kernel
+        // completes the handshake from the listen backlog, so connect() succeeds).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo connected || echo blocked");
+        let a = argv(&["bash", "-c", &probe]);
+
+        // Positive control: Any allows the connect to the LIVE listener.
+        let allowed = MacosSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        assert!(
+            allowed.stdout.contains("connected"),
+            "positive control failed — Any did not allow the loopback connect: {allowed:?}"
+        );
+
+        // Deny: the SAME connect to the SAME live listener is blocked by Seatbelt (not conn-refused).
+        let denied = MacosSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert!(
+            denied.stdout.contains("blocked") && !denied.stdout.contains("connected"),
+            "network egress was NOT denied under Deny (a live listener → only Seatbelt can block): {denied:?}"
+        );
+    }
+
+    /// Cap-killing composes WITH OS confinement: a `sleep 100` inside the real sandbox must still be
+    /// wall-killed (the sandbox-exec wrapper runs in the same capped process group).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_wall_kill_through_the_sandbox() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let a = argv(&["sh", "-c", "sleep 100"]);
+        let out = MacosSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(200), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.killed,
+            Some(KillReason::Wall),
+            "wall cap did not fire through the sandbox: {out:?}"
+        );
+    }
 }
