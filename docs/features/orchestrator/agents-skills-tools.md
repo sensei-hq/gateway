@@ -133,6 +133,23 @@ source: crates/orchestrator*
 > redaction composes over real file content. **Honest limit:** an in-process tool that
 > BYPASSES the shared `confine` helper cannot be prevented (ambient authority) — bypass-proof
 > confinement + cpu/mem/wall cap-killing are the deferred subprocess sandbox.
+>
+> **SP-4 s4 — subprocess sandbox + resource-cap killing (macOS-first):** runs an EXTERNAL
+> command as a killable, OS-confined child — what the in-process jail can't do. A portable
+> `spawn_capped` (process-group + `setrlimit` + wall-timeout `kill(-pgid, SIGKILL)` + bounded
+> output capture) underlies a `Sandbox` trait; `MacosSandbox` (`#[cfg(macos)]`) wraps it in
+> `sandbox-exec` (WRITE confined to the per-run workspace, network `(deny network*)` per
+> `NetworkPolicy`). The built-in **`ShellTool`** (`shell`, Mutation) runs its argv through a
+> per-call **`BoundSandbox`** the executor builds from the agent's GRANT (caps/network) + the
+> per-run workspace — the tool supplies only argv and CANNOT widen the policy (finally enforcing
+> the `ResourceCaps`+`NetworkPolicy` s1 declared). `required(args)` gates `commands:[argv[0]]`
+> (strict argv, so the gated command == the executed one). **Fail-closed:** no sandbox / non-macOS
+> / no grant / no workspace ⇒ `shell` refuses loud — never an unconfined run (the Linux/CI-tested
+> path until a landlock backend lands). A completed `shell` replays from the memo on resume (not
+> re-spawned); stdout flows through s2 redaction. `Executor::with_sandbox`, default none ⇒
+> byte-identical. **Deferred:** the Linux `landlock`+netns+`seccomp` backend, a `shell`
+> reconciler, precise network host allowlists (macOS `Hosts`→allow-all is coarse), an output-size
+> cap, read-confinement.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
