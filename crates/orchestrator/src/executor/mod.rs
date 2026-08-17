@@ -60,6 +60,9 @@ pub struct Executor {
     /// SP-4 s3: base dir for the per-run workspace jail (`base/<run_id>/`). `None` ⇒ no fs
     /// tools / byte-identical. Set via [`with_workspace_root`](Self::with_workspace_root).
     workspace_root_base: Option<std::path::PathBuf>,
+    /// SP-4 s4: the injected OS-confinement backend for the `shell` tool (default `None` ⇒
+    /// the tool refuses loud). Set via [`with_sandbox`](Self::with_sandbox).
+    sandbox: Option<Arc<dyn crate::agent::sandbox::Sandbox>>,
     /// The serialized-byte size **above which** an effect output is stored in the
     /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
     /// when a `content` store is wired.
@@ -194,6 +197,7 @@ impl Executor {
             redactor: None,
             credential_broker: None,
             workspace_root_base: None,
+            sandbox: None,
             cas_threshold: 4096,
             clock: Arc::new(SystemClock),
             reconcilers: Arc::new(ReconcileRegistry::default()),
@@ -242,6 +246,13 @@ impl Executor {
     /// within the canonical per-run dir; the executor pre-checks each declared path.
     pub fn with_workspace_root(mut self, base: impl Into<std::path::PathBuf>) -> Self {
         self.workspace_root_base = Some(base.into());
+        self
+    }
+
+    /// SP-4 s4: wire the subprocess sandbox backend (e.g. `MacosSandbox`) used by the `shell`
+    /// tool. Default `None` ⇒ `shell` refuses loud (fail-closed — never an unconfined run).
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn crate::agent::sandbox::Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 
