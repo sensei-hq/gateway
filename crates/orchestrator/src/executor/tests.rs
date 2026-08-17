@@ -11009,7 +11009,11 @@ fn fs_registry(
                 ..agent_def("c")
             })
             .with_tool(crate::agent::tools::FsWriteTool.spec())
-            .with_tool(crate::agent::tools::FsReadTool.spec()),
+            .with_tool(crate::agent::tools::FsReadTool.spec())
+            // SP-4 s4: also compile the `shell` spec so an agent that LISTS `shell` prompts
+            // correctly (`assemble_prompt` only compiles an agent's listed tools, so the fs-only
+            // s3 tests that never list `shell` are unaffected).
+            .with_tool(crate::agent::tools::ShellTool.spec()),
     )
 }
 
@@ -11347,5 +11351,189 @@ async fn fs_read_output_is_redacted() {
     assert!(
         !serde_json::to_string(&events).unwrap().contains(&secret),
         "secret leaked in the journal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SP-4 s4 subprocess-sandbox e2e (Task 4) — portable (fake Sandbox, CI-testable).
+// ---------------------------------------------------------------------------
+
+/// A portable fake `Sandbox`: counts spawns, CAPTURES the policy it was handed (the caps + the
+/// per-run workspace), and returns a canned outcome — it runs NO real subprocess, so these
+/// e2e tests are deterministic on Linux CI. The load-bearing property under test is AC8: the
+/// executor hands the sandbox the GRANT's caps + the per-run workspace (NOT anything the tool
+/// supplied), proving the argv-only tool can't widen the policy.
+struct FakeSandbox {
+    spawns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    seen: std::sync::Mutex<
+        Option<(
+            orchestrator_core::ResourceCaps,
+            std::path::PathBuf,
+            orchestrator_core::NetworkPolicy,
+        )>,
+    >,
+    stdout: String,
+}
+impl crate::agent::sandbox::Sandbox for FakeSandbox {
+    fn run(
+        &self,
+        spec: &crate::agent::sandbox::SandboxSpec,
+    ) -> Result<crate::agent::sandbox::CapOutcome, OrchestratorError> {
+        self.spawns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.seen.lock().unwrap() = Some((
+            spec.caps.clone(),
+            spec.workspace.to_path_buf(),
+            spec.network.clone(),
+        ));
+        Ok(crate::agent::sandbox::CapOutcome {
+            exit_code: Some(0),
+            stdout: self.stdout.clone(),
+            stderr: String::new(),
+            killed: None,
+        })
+    }
+}
+
+/// SP-4 s4 e2e (AC8): an agent calls `shell`; the executor builds a `BoundSandbox` from the
+/// GRANT (caps/network) + the per-run workspace and runs the argv through it; the outcome is
+/// journaled. Asserts the run completes, the sandbox is spawned exactly once, the journaled
+/// shell output carries the canned stdout, AND the sandbox SAW the grant's `wall_ms` cap + the
+/// canonical per-run workspace `base/<run_id>` (never a tool-supplied policy).
+#[tokio::test]
+async fn shell_runs_through_the_sandbox_and_journals() {
+    let base = tempfile::tempdir().unwrap();
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (gateway, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "shell", r#"{"argv":["echo","hello"]}"#),
+        final_response("done"),
+    ])
+    .await;
+    // `mem_bytes: None` — a Some(_) mem cap fails closed on macOS via RLIMIT_AS EINVAL (T1); the
+    // fake ignores it, but the grant models what the real sandbox would receive.
+    let grants = std::collections::HashMap::from([(
+        "shell".to_string(),
+        Permissions {
+            commands: vec!["echo".into()],
+            caps: orchestrator_core::ResourceCaps {
+                cpu_ms: None,
+                mem_bytes: None,
+                wall_ms: Some(2000),
+            },
+            // A NON-default network (default is `Deny`) so the assertion below proves the
+            // executor forwards the grant's network — a mis-wire hardcoding `Deny`/`Any` fails.
+            network: orchestrator_core::NetworkPolicy::Hosts(vec!["api.example.com".to_string()]),
+            ..Default::default()
+        },
+    )]);
+    let spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake = std::sync::Arc::new(FakeSandbox {
+        spawns: spawns.clone(),
+        seen: std::sync::Mutex::new(None),
+        stdout: "hello\n".into(),
+    });
+    let tools =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::ShellTool)));
+    let outcome = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(fs_registry(vec!["shell".into()], grants))
+        .with_tools(tools)
+        .with_workspace_root(base.path())
+        .with_sandbox(fake.clone())
+        .run(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "run a command")],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    assert_eq!(
+        spawns.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the sandbox must be spawned exactly once"
+    );
+    // shell is turn-0, tool idx 1 → its journaled output carries the canned stdout.
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &effect_id("n1", 0, 1)).expect("shell effect recorded");
+    assert_eq!(out["stdout"], serde_json::json!("hello\n"));
+    // AC8: the sandbox saw the GRANT's caps + network + the per-run workspace — all three
+    // policy dimensions are grant-derived (not tool- or default-supplied), completing the
+    // grant → BoundSandbox → SandboxSpec provenance the argv-only tool cannot widen.
+    let (caps, ws, net) = fake.seen.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        caps.wall_ms,
+        Some(2000),
+        "the sandbox saw the grant's wall cap"
+    );
+    // The executor canonicalizes the per-run workspace (`workspace_root_for`), so compare
+    // against the canonicalized `base/<run_id>` (on macOS `/var` → `/private/var`).
+    let expected_ws = base.path().join(run.0.to_string()).canonicalize().unwrap();
+    assert_eq!(ws, expected_ws, "the sandbox saw the per-run workspace");
+    assert_eq!(
+        net,
+        orchestrator_core::NetworkPolicy::Hosts(vec!["api.example.com".to_string()]),
+        "the sandbox saw the grant's network policy"
+    );
+}
+
+/// SP-4 s4 e2e (AC5): NO sandbox wired ⇒ `shell` refuses LOUD (fail-closed) — the tested
+/// behavior on Linux/CI until an OS-confinement backend lands there. The refusal surfaces via
+/// `record_tool_effect`'s `Err` arm as a `NodeFailed` carrying the `call_ctx` error message, so
+/// a whole-journal scan finds the "sandbox required" refusal.
+#[tokio::test]
+async fn shell_refuses_loud_without_a_sandbox() {
+    let base = tempfile::tempdir().unwrap();
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (gateway, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "shell", r#"{"argv":["echo","hi"]}"#),
+        final_response("done"),
+    ])
+    .await;
+    let grants = std::collections::HashMap::from([(
+        "shell".to_string(),
+        Permissions {
+            commands: vec!["echo".into()],
+            ..Default::default()
+        },
+    )]);
+    let tools =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::ShellTool)));
+    let outcome = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(fs_registry(vec!["shell".into()], grants))
+        .with_tools(tools)
+        .with_workspace_root(base.path())
+        // NO .with_sandbox(...) — `bound_sandbox_for` returns None ⇒ ctx.sandbox is None.
+        .run(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "run a command")],
+            },
+        )
+        .await
+        .expect("the refusal surfaces as an outcome, not a raw run-level Err");
+
+    // The node failed loud (the shell tool refused), naming the missing sandbox.
+    let (node, msg) = outcome.failed.expect("the shell refusal fails the node");
+    assert_eq!(node, NodeId("n1".into()));
+    assert!(
+        msg.contains("sandbox required"),
+        "the failure names the missing sandbox: {msg}"
+    );
+    // And the refusal is journaled loud (a NodeFailed carrying the message).
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        serde_json::to_string(&events)
+            .unwrap()
+            .contains("sandbox required"),
+        "expected a loud 'sandbox required' refusal in the journal"
     );
 }
