@@ -11537,3 +11537,205 @@ async fn shell_refuses_loud_without_a_sandbox() {
         "expected a loud 'sandbox required' refusal in the journal"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SP-4 s4 subprocess-sandbox (Task 6) — resume exactly-once (AC9) + s2 redaction
+// compose over stdout (AC10). Portable (fake Sandbox, CI-testable).
+// ---------------------------------------------------------------------------
+
+/// SP-4 s4 (AC9): a COMPLETED `shell` (a Mutation) replays `{exit_code,stdout,stderr,killed}`
+/// from the memo on resume — the sandbox is NOT re-invoked, so no subprocess is re-spawned
+/// (exactly-once for a real side effect). Mirrors `fs_write_replays_from_memo_...`: the seed runs
+/// the shell to completion (spawn counter == 1), we truncate the journal to the prefix ending at
+/// the shell `EffectRecorded` (asserting NO `RunCompleted`, so the resume must drive a real tail),
+/// copy it into a fresh journal via the same per-event `seeded.append(run, e.clone())` helper, and
+/// resume with a FRESH `FakeSandbox` (fresh counter). The load-bearing assertion is that the
+/// resume's spawn counter stays 0 — the memoized shell replayed, the sandbox was never re-called.
+#[tokio::test]
+async fn shell_replays_from_memo_without_respawning_on_resume() {
+    let base = tempfile::tempdir().unwrap();
+    let run = RunId(uuid::Uuid::new_v4());
+    let tool_eid = effect_id("n1", 0, 1); // turn 0, tool idx 1 (idx 0 is the model turn)
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "run a command")],
+    };
+    // `mem_bytes: None` — a Some(_) mem cap fails closed on macOS via RLIMIT_AS (T1); the fake
+    // ignores it, but the grant models what the real sandbox would receive.
+    let grants = std::collections::HashMap::from([(
+        "shell".to_string(),
+        Permissions {
+            commands: vec!["echo".into()],
+            caps: orchestrator_core::ResourceCaps {
+                cpu_ms: None,
+                mem_bytes: None,
+                wall_ms: Some(2000),
+            },
+            ..Default::default()
+        },
+    )]);
+
+    // --- seed run: run `shell` to completion through FakeSandbox #1 (spawn counter == 1),
+    // sharing `base` + `run` with the resume. ---
+    let seed = InMemoryJournal::new();
+    let (gw1, _c1) = scripted_gateway(vec![
+        tool_call_response("t1", "shell", r#"{"argv":["echo","hello"]}"#),
+        final_response("done"),
+    ])
+    .await;
+    let seed_spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake1 = std::sync::Arc::new(FakeSandbox {
+        spawns: seed_spawns.clone(),
+        seen: std::sync::Mutex::new(None),
+        stdout: "hello\n".into(),
+    });
+    let tools1 =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::ShellTool)));
+    Executor::new(Arc::new(gw1), Arc::new(seed.clone()), "v1")
+        .with_registry(fs_registry(vec!["shell".into()], grants.clone()))
+        .with_tools(tools1)
+        .with_workspace_root(base.path())
+        .with_sandbox(fake1.clone())
+        .run(run, &graph)
+        .await
+        .expect("seed run completes");
+    assert_eq!(
+        seed_spawns.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the seed run spawned the sandbox exactly once"
+    );
+
+    // Truncate to the prefix ending at the shell's `EffectRecorded` — the effect is memoized, but
+    // the turn-1 final model call + NodeCompleted + RunCompleted are dropped, so the resume MUST
+    // drive the tail (and would re-spawn the sandbox if it re-ran the tool).
+    let events = seed.load(run).await.unwrap();
+    let cut = events
+        .iter()
+        .position(|(_, e)| {
+            matches!(e, JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &tool_eid)
+        })
+        .expect("seed run journaled the shell EffectRecorded");
+    assert!(
+        !events[..=cut]
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the truncated seed is a partial (no RunCompleted) — the resume must drive the tail"
+    );
+    let seeded = InMemoryJournal::new();
+    for (_, e) in &events[..=cut] {
+        seeded.append(run, e.clone()).await.unwrap();
+    }
+
+    // --- resume: FRESH FakeSandbox #2 (fresh counter); the memoized shell must NOT re-spawn. ---
+    let resume_spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake2 = std::sync::Arc::new(FakeSandbox {
+        spawns: resume_spawns.clone(),
+        seen: std::sync::Mutex::new(None),
+        stdout: "hello\n".into(),
+    });
+    let (gw2, _c2) = scripted_gateway(vec![final_response("done")]).await;
+    let tools2 =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::ShellTool)));
+    let outcome = Executor::new(Arc::new(gw2), Arc::new(seeded.clone()), "v1")
+        .with_registry(fs_registry(vec!["shell".into()], grants))
+        .with_tools(tools2)
+        .with_workspace_root(base.path())
+        .with_sandbox(fake2.clone())
+        .start(run, &graph)
+        .await
+        .expect("resume yields an outcome");
+
+    // Load-bearing: the completed shell replayed from the memo — the sandbox was NOT re-invoked.
+    assert_eq!(
+        resume_spawns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the resume did NOT re-spawn — the memoized shell effect replayed from the journal"
+    );
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "resume completes with no DeterminismViolation: failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    // The shell effect is recorded exactly once across seed + resume (replayed, not re-run).
+    assert_eq!(
+        effect_recorded_count(&seeded.load(run).await.unwrap(), &tool_eid),
+        1,
+        "the shell effect is recorded exactly once (memo replay, no re-record)"
+    );
+}
+
+/// SP-4 s4 × s2 (AC10): the s2 `PatternRedactor` composes over the `shell` tool's stdout — a
+/// secret emitted on the subprocess's stdout is `[REDACTED]` in the journaled effect output AND
+/// appears NOWHERE in the journal. The `FakeSandbox` returns the secret on stdout; the secret is
+/// assembled at RUNTIME (the repo's semgrep CWE-798 hook blocks literals).
+#[tokio::test]
+async fn shell_stdout_is_redacted() {
+    let base = tempfile::tempdir().unwrap();
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // Matches the s2 `sk-[A-Za-z0-9_-]{20,}` pattern (20 alnum after `sk-`).
+    let secret = format!("sk-{}", "abcdefghij0123456789");
+    let grants = std::collections::HashMap::from([(
+        "shell".to_string(),
+        Permissions {
+            commands: vec!["echo".into()],
+            caps: orchestrator_core::ResourceCaps {
+                cpu_ms: None,
+                mem_bytes: None,
+                wall_ms: Some(2000),
+            },
+            ..Default::default()
+        },
+    )]);
+    let (gateway, _c) = scripted_gateway(vec![
+        tool_call_response("t1", "shell", r#"{"argv":["echo","secret"]}"#),
+        final_response("done"),
+    ])
+    .await;
+    // The subprocess "emits" the secret on stdout.
+    let fake = std::sync::Arc::new(FakeSandbox {
+        spawns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        seen: std::sync::Mutex::new(None),
+        stdout: secret.clone(),
+    });
+    let tools =
+        Arc::new(ToolRegistry::default().with_tool(Arc::new(crate::agent::tools::ShellTool)));
+    let outcome = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(fs_registry(vec!["shell".into()], grants))
+        .with_tools(tools)
+        .with_workspace_root(base.path())
+        .with_sandbox(fake.clone())
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()))
+        .run(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "run a command")],
+            },
+        )
+        .await
+        .expect("run");
+
+    assert!(
+        outcome.failed.is_none() && outcome.paused.is_none(),
+        "failed={:?} paused={:?}",
+        outcome.failed,
+        outcome.paused
+    );
+    // shell is turn-0, tool idx 1 → its journaled output's stdout is redacted (secret in → out).
+    let events = journal.load(run).await.unwrap();
+    let out = recorded_output(&events, &effect_id("n1", 0, 1)).expect("shell effect recorded");
+    assert_eq!(
+        out["stdout"],
+        serde_json::json!("[REDACTED]"),
+        "the shell stdout must be redacted (secret in → [REDACTED] out): {out}"
+    );
+    assert!(
+        !serde_json::to_string(&out).unwrap().contains(&secret),
+        "secret leaked in the shell output: {out}"
+    );
+    // Whole-journal scan: the plaintext appears NOWHERE.
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&secret),
+        "secret leaked in the journal"
+    );
+}
