@@ -5,11 +5,12 @@
 
 use std::io::{Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use orchestrator_core::{OrchestratorError, ResourceCaps};
+use orchestrator_core::{NetworkPolicy, OrchestratorError, ResourceCaps};
 
 /// The outcome of a capped subprocess. `killed: Some(_)` => a resource cap was breached.
 /// A deadline race can set `killed: Some(Wall)` alongside a real `exit_code` (the child exited
@@ -177,6 +178,73 @@ pub(crate) fn spawn_capped(
     })
 }
 
+/// The confinement + cap policy for one sandboxed run. `argv` is UNTRUSTED (tool/model);
+/// `workspace`/`caps`/`network` are TRUSTED (executor-derived from the grant).
+pub struct SandboxSpec<'a> {
+    pub argv: &'a [String],
+    pub workspace: &'a Path,
+    pub caps: &'a ResourceCaps,
+    pub network: &'a NetworkPolicy,
+    pub stdin: Option<&'a str>,
+}
+
+/// An OS confinement backend. Runs `argv` fs/network-confined + capped, or `Err` (refuse-loud)
+/// where this platform has no backend.
+pub trait Sandbox: Send + Sync {
+    fn run(&self, spec: &SandboxSpec) -> Result<CapOutcome, OrchestratorError>;
+}
+
+/// macOS `sandbox-exec` backend: fs writes confined to the workspace subpath, network per policy.
+#[cfg(target_os = "macos")]
+pub struct MacosSandbox;
+
+#[cfg(target_os = "macos")]
+impl Sandbox for MacosSandbox {
+    fn run(&self, spec: &SandboxSpec) -> Result<CapOutcome, OrchestratorError> {
+        // The workspace path is interpolated into the Seatbelt profile; a path containing profile
+        // metacharacters would malform (never widen) it. Refuse loud so fail-closed is explicit.
+        let ws = spec
+            .workspace
+            .to_str()
+            .ok_or_else(|| OrchestratorError::Tool {
+                tool: "sandbox".into(),
+                message: "workspace path is not valid UTF-8 for a sandbox profile".into(),
+            })?;
+        if ws.contains(['"', '\\', '\n']) {
+            return Err(OrchestratorError::Tool {
+                tool: "sandbox".into(),
+                message: "workspace path contains characters unsafe for a sandbox profile".into(),
+            });
+        }
+        let profile = macos_profile(spec.workspace, spec.network);
+        let mut wrapped = Vec::with_capacity(spec.argv.len() + 3);
+        wrapped.push("sandbox-exec".to_string());
+        wrapped.push("-p".to_string());
+        wrapped.push(profile);
+        wrapped.extend(spec.argv.iter().cloned());
+        spawn_capped(&wrapped, spec.caps, spec.stdin)
+    }
+}
+
+/// Build a Seatbelt profile: deny by default, allow exec + broad READ (a binary needs it to
+/// start), confine WRITES to the workspace subpath, deny network unless the policy allows it.
+#[cfg(target_os = "macos")]
+fn macos_profile(workspace: &Path, network: &NetworkPolicy) -> String {
+    let ws = workspace.display();
+    let net = match network {
+        // NOTE: `Hosts(_)` coarsens to allow-ALL on macOS — Seatbelt host-level filtering is
+        // unreliable, so precise host allowlists are deferred to the Linux/proxy layer (spec §6).
+        NetworkPolicy::Any | NetworkPolicy::Hosts(_) => "(allow network*)",
+        NetworkPolicy::Deny => "(deny network*)",
+    };
+    format!(
+        "(version 1)\n(deny default)\n(allow process-fork)\n(allow process-exec*)\n\
+         (allow file-read*)\n(allow file-write* (subpath \"{ws}\"))\n\
+         (allow file-write-data (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\"))\n\
+         {net}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +371,51 @@ mod tests {
             !clean_success,
             "an 8MiB mem cap should have prevented a clean success, got {result:?}"
         );
+    }
+
+    struct EchoSandbox; // a portable fake: ignores confinement, just runs capped
+    impl Sandbox for EchoSandbox {
+        fn run(&self, spec: &SandboxSpec) -> Result<CapOutcome, OrchestratorError> {
+            spawn_capped(spec.argv, spec.caps, spec.stdin)
+        }
+    }
+
+    #[test]
+    fn sandbox_trait_runs_a_command() {
+        let a = argv(&["sh", "-c", "echo ok"]);
+        let ws = std::path::PathBuf::from("/tmp");
+        let out = EchoSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &ws,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(out.stdout, "ok\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_sandbox_runs_an_allowed_command() {
+        let td = tempfile::tempdir().unwrap();
+        let ws = td.path().canonicalize().unwrap();
+        let a = argv(&["sh", "-c", "echo ok"]);
+        let out = MacosSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &ws,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "sandbox-exec blocked a trivial command: {out:?}"
+        );
+        assert_eq!(out.stdout, "ok\n");
     }
 }
