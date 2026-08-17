@@ -15,6 +15,7 @@ kernel = { package = "sensei-kernel", path = "../kernel" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+nix = { version = "0.29", features = ["resource", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
