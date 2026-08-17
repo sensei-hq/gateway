@@ -613,6 +613,29 @@ impl Executor {
         Ok(Some(std::sync::Arc::new(canon)))
     }
 
+    /// SP-4 s4: build a per-call `BoundSandbox` for `tool`, or `None` (⇒ the `shell` tool
+    /// refuses loud). Requires ALL THREE: a wired `Sandbox`, a resolved per-run workspace, AND a
+    /// grant for the tool — the grant's caps/network are the enforced policy (the tool supplies
+    /// only argv, so it can NEVER widen them). Any one missing ⇒ `None` ⇒ fail-closed.
+    fn bound_sandbox_for(
+        &self,
+        ar: &AgentRun<'_>,
+        tool: &str,
+        workspace: &Option<std::sync::Arc<std::path::PathBuf>>,
+    ) -> Option<std::sync::Arc<crate::agent::sandbox::BoundSandbox>> {
+        let inner = self.sandbox.clone()?;
+        let ws = workspace.clone()?;
+        let grant = ar.agent_grants.get(tool)?;
+        Some(std::sync::Arc::new(
+            crate::agent::sandbox::BoundSandbox::new(
+                inner,
+                ws,
+                grant.caps.clone(),
+                grant.network.clone(),
+            ),
+        ))
+    }
+
     /// Execute a tool live and journal its `EffectRecorded` (shared by all effect
     /// classes). On a tool error, journal `NodeFailed` and return the failure
     /// message. `observation` is `Some` only for Observation effects.
@@ -693,17 +716,20 @@ impl Executor {
         // Observation, which ignore it) so a real tool can send the SAME key to its
         // external API for provider-side dedup. SP-4 broker: the resolved credentials
         // ride alongside (ephemeral — never journaled/hashed, zeroized on drop).
+        // SP-4 s3: resolve the canonical per-run workspace root ONCE (a fs tool resolves its
+        // target within it via `confine`; `None` when no jail is wired ⇒ byte-identical) and
+        // reuse it below to also derive the s4 sandbox — avoiding a redundant resolve.
+        let workspace_root = self.workspace_root_for(ar.run)?;
+        // SP-4 s4: the per-call sandbox handle, policy-fixed by the executor from the grant's
+        // caps/network + this per-run workspace. `None` unless a `Sandbox` is wired AND a
+        // workspace is resolved AND the agent holds a grant for this tool ⇒ `shell` refuses loud.
+        let sandbox = self.bound_sandbox_for(ar, &call.name, &workspace_root);
         let ctx = crate::agent::tools::ToolContext {
             idempotency_key: idempotency_key.to_string(),
             effect_id: teid.clone(),
             credentials: std::sync::Arc::new(resolved),
-            // SP-4 s3: inject the resolved canonical per-run workspace root (a fs tool
-            // resolves its target within it via `confine`). `None` when no jail is wired ⇒
-            // byte-identical.
-            workspace_root: self.workspace_root_for(ar.run)?,
-            // SP-4 s4: the per-call sandbox handle is wired in Task 4 (`bound_sandbox_for`);
-            // `None` here keeps the crate compiling + `shell` refusing loud until then.
-            sandbox: None,
+            workspace_root,
+            sandbox,
         };
         match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
