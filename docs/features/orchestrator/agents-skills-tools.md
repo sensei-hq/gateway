@@ -147,9 +147,15 @@ source: crates/orchestrator*
 > / no grant / no workspace ⇒ `shell` refuses loud — never an unconfined run (the Linux/CI-tested
 > path until a landlock backend lands). A completed `shell` replays from the memo on resume (not
 > re-spawned); stdout flows through s2 redaction. `Executor::with_sandbox`, default none ⇒
-> byte-identical. **Deferred:** the Linux `landlock`+netns+`seccomp` backend, a `shell`
-> reconciler, precise network host allowlists (macOS `Hosts`→allow-all is coarse), an output-size
-> cap, read-confinement.
+> byte-identical. **Linux backend (landed):** a `LinuxSandbox` (`#[cfg(target_os="linux")]`) reaches
+> macOS parity UNPRIVILEGED — **landlock** confines WRITE to the per-run workspace (ABI V5 handles
+> TRUNCATE; broad read; `/dev/null` carve-out) and **seccomp** denies IP egress
+> (`socket(AF_INET|AF_INET6|AF_PACKET)` + `io_uring_setup` → EPERM) under `Deny`, built-in-parent /
+> applied-in-child via the `spawn_capped_with` seam, fail-closed (refuse if a mechanism can't be
+> enforced). Verified in a Docker Linux container + `ubuntu-latest` CI (the dev box is macOS).
+> **Deferred:** precise network host allowlists (an egress proxy — `Hosts` is coarse both
+> platforms), a `close_range` egress-hardening, a `shell` reconciler, an output-size cap,
+> read-confinement, cgroups, BSD `pledge`/`unveil`.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
