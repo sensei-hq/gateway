@@ -328,37 +328,34 @@ fn macos_profile(workspace: &Path, network: &NetworkPolicy) -> String {
     )
 }
 
-/// SP-4 Linux backend: landlock fs-write confinement to the workspace + the portable cap-killing.
-/// Network `Deny` refuses-loud until Task 3 adds seccomp egress-deny; `Any`/`Hosts` run unfiltered.
-/// Unprivileged (landlock ≥ 5.13). Parity target: `MacosSandbox`.
+/// SP-4 Linux backend: landlock fs-write confinement to the workspace + seccomp egress-deny +
+/// the portable cap-killing. Network `Deny` denies `socket(AF_INET|AF_INET6)` (EPERM) via seccomp;
+/// `Any`/`Hosts` run unfiltered. Unprivileged (landlock ≥ 5.13). Parity target: `MacosSandbox`.
 #[cfg(target_os = "linux")]
 pub struct LinuxSandbox;
 
 #[cfg(target_os = "linux")]
 impl Sandbox for LinuxSandbox {
     fn run(&self, spec: &SandboxSpec) -> Result<CapOutcome, OrchestratorError> {
-        // BUILD the confinement in the PARENT (the landlock ruleset allocates). Refuse-loud if the
-        // fs-confinement can't be built (e.g. an unopenable workspace) — never an unconfined run.
+        // BUILD the confinement in the PARENT (the landlock ruleset + seccomp BPF program allocate).
+        // Refuse-loud if the fs-confinement can't be built (e.g. an unopenable workspace) — never an
+        // unconfined run.
         let mut ruleset = Some(build_landlock_ruleset(spec.workspace)?);
-        match spec.network {
-            // Any / Hosts(coarse) => no network filter this task (Task 3 adds seccomp egress-deny).
-            NetworkPolicy::Any | NetworkPolicy::Hosts(_) => {}
-            // Egress-deny lands in Task 3 (seccomp). Until then refuse-loud (fail-closed) rather
-            // than run a command with unconfined network.
-            NetworkPolicy::Deny => {
-                return Err(OrchestratorError::Tool {
-                    tool: "sandbox".into(),
-                    message: "linux egress-deny not yet implemented".into(),
-                });
-            }
-        }
+        // Egress-deny is a seccomp filter that denies `socket(AF_INET|AF_INET6)` (EPERM). Built in
+        // the PARENT (it allocates); refuse-loud if the build fails. `Any`/`Hosts(coarse)` => no
+        // network filter (Hosts is coarsened to allow-all here, per the macOS parity note).
+        let mut bpf = match spec.network {
+            NetworkPolicy::Any | NetworkPolicy::Hosts(_) => None,
+            NetworkPolicy::Deny => Some(build_egress_deny_filter()?),
+        };
         // APPLY in the CHILD via the extra pre_exec hook. The hook runs post-fork, before execve,
-        // so it must be async-signal-safe: it issues syscalls ONLY (`restrict_self`; the ruleset
-        // was allocated in the parent) on the success path, sidestepping the fork+malloc-lock
-        // hazard. Every abort path is ALSO alloc-free + panic-free — errno-only
-        // `io::Error::from_raw_os_error(EPERM)` (no `format!`, no `expect`) — so a multithreaded
-        // parent's held malloc/unwind locks can never deadlock the child. The parent surfaces a
-        // failed hook as "spawn ... : Operation not permitted" (a fail-closed refuse).
+        // so it must be async-signal-safe: it issues syscalls ONLY (`restrict_self` +
+        // `apply_filter`; the ruleset AND the BPF program were allocated in the parent) on the
+        // success path, sidestepping the fork+malloc-lock hazard. Every abort path is ALSO
+        // alloc-free + panic-free — errno-only `io::Error::from_raw_os_error(EPERM)` (no `format!`,
+        // no `expect`) — so a multithreaded parent's held malloc/unwind locks can never deadlock the
+        // child. The parent surfaces a failed hook as "spawn ... : Operation not permitted" (a
+        // fail-closed refuse).
         let hook: Box<dyn FnMut() -> std::io::Result<()> + Send + Sync> = Box::new(move || {
             // `let-else`, not `.expect()`: the FnMut runs once so `None` is unreachable, but never
             // panic post-fork.
@@ -372,6 +369,13 @@ impl Sandbox for LinuxSandbox {
             // confinement did NOT take — abort the child so the command never runs unconfined.
             if status.ruleset == landlock::RulesetStatus::NotEnforced {
                 return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            }
+            // Apply seccomp egress-deny AFTER landlock: the filter is allow-by-default (only
+            // `socket(AF_INET|AF_INET6)` is denied), so it never blocks execve or the landlock
+            // syscall. `apply_filter` also sets NO_NEW_PRIVS. Syscalls only (BPF pre-built).
+            if let Some(program) = bpf.take() {
+                seccompiler::apply_filter(&program)
+                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))?;
             }
             Ok(())
         });
@@ -432,6 +436,85 @@ fn build_landlock_ruleset(
         .add_rules(path_beneath_rules(dev_writable, AccessFs::WriteFile))
         .map_err(|e| mk(e.to_string()))?;
     Ok(ruleset)
+}
+
+/// Build a seccomp BPF program that denies IP-socket creation (egress) while allowing everything
+/// else: `socket(domain == AF_INET|AF_INET6|AF_PACKET, ..)` -> EPERM, plus `io_uring_setup` -> EPERM
+/// (io_uring can create+use an AF_INET socket without the `socket` syscall, bypassing the domain
+/// filter). `connect()` can't be filtered by address (seccomp can't deref the sockaddr pointer), so
+/// socket-creation is the chokepoint; AF_UNIX/AF_NETLINK stay allowed so programs start. Built in
+/// the PARENT (allocates); the child's `pre_exec` hook only `apply_filter`s it (syscalls). Filter is
+/// allow-by-default (mismatch=Allow), so applying it never blocks execve or the landlock syscall.
+#[cfg(target_os = "linux")]
+fn build_egress_deny_filter() -> Result<seccompiler::BpfProgram, OrchestratorError> {
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
+    use std::collections::BTreeMap;
+    let mk = |m: String| OrchestratorError::Tool {
+        tool: "sandbox".into(),
+        message: format!("seccomp: {m}"),
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        seccompiler::TargetArch::x86_64
+    } else if cfg!(target_arch = "aarch64") {
+        seccompiler::TargetArch::aarch64
+    } else {
+        return Err(mk("unsupported arch for seccomp".into()));
+    };
+    // arg0 (domain) == AF_INET  -> the rule matches -> match_action (EPERM).
+    let inet = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_INET as u64,
+        )
+        .map_err(|e| mk(e.to_string()))?,
+    ])
+    .map_err(|e| mk(e.to_string()))?;
+    // arg0 (domain) == AF_INET6 -> the rule matches -> match_action (EPERM).
+    let inet6 = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_INET6 as u64,
+        )
+        .map_err(|e| mk(e.to_string()))?,
+    ])
+    .map_err(|e| mk(e.to_string()))?;
+    // Also deny AF_PACKET (raw L2 frames) — closes raw egress even if the child were to hold
+    // CAP_NET_RAW (this layer doesn't guarantee it doesn't). AF_UNIX/AF_NETLINK stay allowed.
+    let packet = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_PACKET as u64,
+        )
+        .map_err(|e| mk(e.to_string()))?,
+    ])
+    .map_err(|e| mk(e.to_string()))?;
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    rules.insert(libc::SYS_socket, vec![inet, inet6, packet]);
+    // io_uring can create+use an AF_INET socket WITHOUT the socket() syscall (IORING_OP_SOCKET/
+    // CONNECT/SEND), bypassing the socket-domain filter entirely on kernels ≥ 5.19. Deny
+    // io_uring_setup outright (an EMPTY rule vec matches the syscall unconditionally → the
+    // match_action EPERM) so no io_uring instance can be created in the first place.
+    rules.insert(libc::SYS_io_uring_setup, vec![]);
+    // mismatch_action = Allow (everything not matched runs); match_action = Errno(EPERM).
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|e| mk(e.to_string()))?;
+    let bpf: seccompiler::BpfProgram = filter
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| mk(e.to_string()))?;
+    Ok(bpf)
 }
 
 #[cfg(test)]
@@ -922,5 +1005,80 @@ mod tests {
             "redirect to /dev/null was denied: {out:?}"
         );
         assert!(out.stdout.contains("done"));
+    }
+
+    // ── SP-4 linux-sandbox (3/4): seccomp egress-deny e2e (Docker/Linux only) ──
+
+    /// THE load-bearing seccomp proof: a real CONTRAST against a LIVE loopback listener. Bind an
+    /// actual `TcpListener` (unsandboxed) and run the SAME connect under `Any` (positive control →
+    /// must connect) and `Deny` (must be blocked). Because the port IS listening, a Deny failure can
+    /// only be the seccomp `socket(AF_INET)->EPERM`, never connection-refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_network_deny_blocks_a_live_socket_that_any_allows() {
+        use std::net::TcpListener;
+        // A real listener the sandboxed probe can reach, so a Deny failure can only be seccomp
+        // (not connection-refused). bash /dev/tcp does a socket(AF_INET)+connect.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo connected || echo blocked");
+        let a = argv(&["bash", "-c", &probe]);
+        let allowed = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Any,
+                stdin: None,
+            })
+            .unwrap();
+        assert!(
+            allowed.stdout.contains("connected"),
+            "positive control: Any must allow the loopback connect: {allowed:?}"
+        );
+        let denied = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert!(
+            denied.stdout.contains("blocked") && !denied.stdout.contains("connected"),
+            "Deny must block the IP connect (seccomp socket(AF_INET)->EPERM): {denied:?}"
+        );
+    }
+
+    /// The filter is SURGICAL: it denies `socket(AF_INET|AF_INET6)` only, so AF_UNIX still works and
+    /// ordinary programs start. Prove an AF_UNIX socket succeeds under Deny.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_network_deny_still_allows_af_unix_and_startup() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().canonicalize().unwrap();
+        let a = argv(&[
+            "perl",
+            "-e",
+            "use Socket; socket(S, PF_UNIX, SOCK_STREAM, 0) or do { print \"unix-blocked\\n\"; exit 1 }; print \"unix-ok\\n\"",
+        ]);
+        let out = LinuxSandbox
+            .run(&SandboxSpec {
+                argv: &a,
+                workspace: &root,
+                caps: &caps(Some(5000), None),
+                network: &orchestrator_core::NetworkPolicy::Deny,
+                stdin: None,
+            })
+            .unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "AF_UNIX socket was wrongly blocked under Deny: {out:?}"
+        );
+        assert!(out.stdout.contains("unix-ok"));
     }
 }
