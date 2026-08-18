@@ -426,11 +426,17 @@ impl ContextStore for PostgresContextStore {
 /// cross-process meaningful. `store`/`bump_config_version` are the write path (this slice's seeder +
 /// SP-DATA-4's CLI entry point).
 ///
-/// NOTE (known limitation, spec §6 on-demand-reload scope): `load()` and `version()` are SEPARATE
-/// reads. A concurrent `store()`+`bump_config_version()` landing between a reload's `load()` and
-/// `version()` can pair a stale config with a fresh generation (or vice versa). Accepted because
-/// reloads are explicit + infrequent (no background poller this slice) and a resuming process always
-/// re-`version()`s at resume; a future atomic `load_versioned()` (one snapshot) closes the window.
+/// KNOWN LIMITATION — cross-process fence correctness under a CONCURRENT config writer
+/// (deferred: unreachable in this slice, MUST close before SP-DATA-4 ships a live writer):
+/// `load()` and `version()` are separate reads, and `load()` itself reads the four config tables
+/// across four independent pool snapshots. So a concurrent `store()`+`bump_config_version()` can
+/// hand a reload a TORN pair — notably (STALE config, FRESH generation): a run then stamps a
+/// fresh-gen fence while serving stale config, and a later resume that reads the now-consistent
+/// (fresh, fresh) state MATCHES the fence and silently continues under different config. Re-reading
+/// `version()` at resume does NOT neutralize this (it reads the consistent state and passes). It is
+/// safe ONLY because this slice has no concurrent writer (`store` is test-only; reloads serialized).
+/// Fix: read the four config tables AND `config_versions` in ONE `REPEATABLE READ` transaction
+/// (a single `load_versioned()` snapshot); land it before SP-DATA-4's CLI introduces a live writer.
 #[derive(Clone)]
 pub struct PostgresConfigSource {
     pool: PgPool,
@@ -445,6 +451,12 @@ impl PostgresConfigSource {
     /// Replace-all write of the whole registry in one transaction: delete every config row, then
     /// insert `cfg`'s — so `load()` afterward reproduces `cfg` exactly. Does NOT bump the version
     /// (the caller bumps explicitly after committing a change).
+    ///
+    /// FOOTGUN (close in SP-DATA-4): the fence is generation-based, not content-based — a `store()`
+    /// whose caller forgets `bump_config_version()` changes config content WITHOUT advancing the
+    /// generation, so a cross-process resume matches the (unchanged) fence and silently runs the new
+    /// config. A live config-mutation surface MUST couple store+bump (ideally one transaction / a
+    /// `store_and_bump` helper). Safe in-slice: the only callers are tests that immediately bump.
     pub async fn store(&self, cfg: &RegistryConfig) -> Result<(), OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(store_err)?;
         for t in [
