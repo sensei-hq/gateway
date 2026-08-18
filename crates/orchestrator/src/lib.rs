@@ -8,9 +8,11 @@
 
 pub mod agent;
 pub mod executor;
+pub mod scheduler;
 
 #[cfg(test)]
 mod test_support;
 
 pub use executor::selector::LlmPlannerSelector;
 pub use executor::{Executor, RunOutcome};
+pub use scheduler::Scheduler;
