@@ -25,13 +25,13 @@ docker run -d --name spdata-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=orch -p 55
 until docker exec spdata-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 0.5; done
 export DATABASE_URL="postgres://postgres:pw@localhost:55432/orch"
 # apply the schema (reliable path: psql the idempotent ddl; dbd-native path: `cd database && dbd reconcile`):
-docker exec -i spdata-pg psql -U postgres -d orch -v ON_ERROR_STOP=1 < database/ddl/_apply_all.sql
+docker exec -i spdata-pg psql -U postgres -d orch -v ON_ERROR_STOP=1 < database/_apply_all.sql
 cargo test -p sensei-orchestrator-store --features postgres -- --test-threads=1  ; echo "PG_TEST_EXIT=$?"
 docker rm -f spdata-pg >/dev/null 2>&1
 ```
 - `--test-threads=1` so parity tests don't collide on shared tables (or each test uses a unique `run_id` — prefer unique ids, keep the flag as a safety net).
 - Read the REAL `PG_TEST_EXIT`. `postgres:16` pulls on first run.
-- `database/ddl/_apply_all.sql` is a convenience include (Task 1) that `\i`'s the schema + tables in order — so the harness applies the dbd-authored ddl without needing dbd's target configured; `dbd reconcile` remains the authoring workflow.
+- `database/_apply_all.sql` is a convenience include (Task 1) that `\i`'s the schema + tables in order — so the harness applies the dbd-authored ddl without needing dbd's target configured; `dbd reconcile` remains the authoring workflow.
 
 ---
 
