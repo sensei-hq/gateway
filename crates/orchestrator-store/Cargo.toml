@@ -8,10 +8,16 @@ license = "MIT"
 [lib]
 name = "orchestrator_store"
 
+[features]
+# Postgres adapters (PostgresJournal/ContentStore/ContextStore). Off by default so the crate
+# stays dependency-light + the InMemory path is byte-identical; a deployment enables it.
+postgres = ["dep:sqlx"]
+
 [dependencies]
 orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }
 async-trait = "0.1"
 serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
