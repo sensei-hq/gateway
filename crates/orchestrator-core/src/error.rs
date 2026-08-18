@@ -50,6 +50,10 @@ pub enum OrchestratorError {
     PermissionNotGranted { agent: String, tool: String },
     #[error("payload serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// A durable store (CAS/context) backend/transport failure — loud, never swallowed. Distinct
+    /// from [`JournalError::Backend`] so a store fault isn't mislabeled a journal fault.
+    #[error("store backend error: {0}")]
+    Store(String),
     #[error(
         "tool {tool:?} has non-Pure effect class {class:?}; Observation/Mutation are deferred to SP-1 slice 4"
     )]
