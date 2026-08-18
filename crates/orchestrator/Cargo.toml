@@ -8,6 +8,14 @@ license = "MIT"
 [lib]
 name = "orchestrator"
 
+[features]
+# Docker-Postgres-only e2e (cross-process durable resume + durable in-doubt reconcile).
+# OFF by default so the default build/test stays byte-identical and DB-free; enables the
+# store crate's Postgres adapters for the `#[cfg(feature = "postgres-tests")]` tests, which
+# reach Postgres only through `orchestrator_store::postgres::{connect, PostgresJournal,
+# PostgresContentStore}` (no direct sqlx handle).
+postgres-tests = ["orchestrator-store/postgres"]
+
 [dependencies]
 orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }
 gateway = { package = "sensei-gateway", path = "../gateway" }
