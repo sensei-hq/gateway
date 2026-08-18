@@ -11,8 +11,10 @@ use std::sync::{Arc, Mutex};
 use orchestrator_core::{ExecutionJournal, JournalError, JournalEvent, RunId, Seq, Snapshot};
 
 mod config_source;
+mod scheduler_store;
 mod stores;
 pub use config_source::{FilesystemConfigSource, InMemoryConfigSource};
+pub use scheduler_store::InMemorySchedulerStore;
 pub use stores::{InMemoryContentStore, InMemoryContextStore};
 
 #[cfg(feature = "postgres")]
