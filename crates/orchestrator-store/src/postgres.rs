@@ -3,10 +3,12 @@
 //! Uses sqlx RUNTIME queries (not the compile-time `query!` macros) so the crate builds with
 //! no database. Feature-gated: default builds don't pull sqlx.
 
+use chrono::{DateTime, Utc};
 use orchestrator_core::{
     ChainBinding, ConfigSource, ContentRef, ContentStore, ContextKey, ContextRef, ContextStore,
-    Digest, ExecutionJournal, FORMAT_VERSION, JournalError, JournalEvent, OrchestratorError,
-    RegistryConfig, RunId, Scope, Seq, Snapshot, digest_of,
+    Digest, ExecutionJournal, FORMAT_VERSION, Graph, JournalError, JournalEvent, OrchestratorError,
+    RegistryConfig, RunId, RunStatus, ScheduledRun, SchedulerStore, Scope, Seq, Snapshot,
+    digest_of,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -602,14 +604,193 @@ fn cfg_load_err(e: sqlx::Error) -> OrchestratorError {
     OrchestratorError::RegistryLoad(format!("postgres config load: {e}"))
 }
 
+/// A durable [`SchedulerStore`] (SP-DATA-3): the wake set lives in `orchestrator.scheduled_runs`,
+/// one row per submitted run holding its ORIGINAL graph (jsonb) + status/schedule. `claim_due` is an
+/// atomic `UPDATE … WHERE run_id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`, so concurrent
+/// claimers never overlap (the row lock is held only for the brief claim UPDATE, NOT during the drive).
+pub struct PostgresSchedulerStore {
+    pool: PgPool,
+}
+
+impl PostgresSchedulerStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl SchedulerStore for PostgresSchedulerStore {
+    async fn enqueue(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        now: DateTime<Utc>,
+    ) -> Result<(), OrchestratorError> {
+        let g = serde_json::to_value(graph).map_err(store_err_ser)?;
+        let res = sqlx::query(
+            "insert into orchestrator.scheduled_runs (run_id, graph, status, claimed_at, updated_at)
+             values ($1,$2,'waking',$3,$3) on conflict (run_id) do nothing",
+        )
+        .bind(run.0)
+        .bind(g)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        if res.rows_affected() == 0 {
+            return Err(OrchestratorError::Store(format!(
+                "duplicate submit for run {run:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn record_paused(
+        &self,
+        run: RunId,
+        next_wake: Option<DateTime<Utc>>,
+        reason: &str,
+    ) -> Result<(), OrchestratorError> {
+        sqlx::query(
+            "update orchestrator.scheduled_runs set status='paused', next_wake=$2, claimed_at=null,
+                    reason=$3, updated_at=now() where run_id=$1 and status='waking'",
+        )
+        .bind(run.0)
+        .bind(next_wake)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn record_terminal(
+        &self,
+        run: RunId,
+        status: RunStatus,
+        reason: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
+        sqlx::query(
+            "update orchestrator.scheduled_runs set status=$2, next_wake=null, claimed_at=null,
+                    reason=$3, updated_at=now() where run_id=$1 and status='waking'",
+        )
+        .bind(run.0)
+        .bind(status.as_str())
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn claim_due(
+        &self,
+        now: DateTime<Utc>,
+        lease: chrono::Duration,
+        limit: usize,
+    ) -> Result<Vec<(RunId, Graph)>, OrchestratorError> {
+        let stale_before = now - lease;
+        let rows: Vec<(sqlx::types::Uuid, serde_json::Value)> = sqlx::query_as(
+            "update orchestrator.scheduled_runs set status='waking', claimed_at=$1, updated_at=now()
+             where run_id in (
+                 select run_id from orchestrator.scheduled_runs
+                 where (status='paused' and next_wake is not null and next_wake <= $1)
+                    or (status='waking' and claimed_at < $2)
+                 order by next_wake nulls last
+                 limit $3
+                 for update skip locked)
+             returning run_id, graph",
+        )
+        .bind(now)
+        .bind(stale_before)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        rows.into_iter()
+            .map(|(id, g)| Ok((RunId(id), serde_json::from_value(g).map_err(store_err_ser)?)))
+            .collect()
+    }
+
+    async fn status(&self, run: RunId) -> Result<Option<ScheduledRun>, OrchestratorError> {
+        let row: Option<(String, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>)> =
+            sqlx::query_as(
+                "select status, next_wake, reason, updated_at
+                 from orchestrator.scheduled_runs where run_id=$1",
+            )
+            .bind(run.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(row.map(|(s, nw, r, u)| ScheduledRun {
+            run,
+            status: RunStatus::from_db_str(&s).unwrap_or(RunStatus::Failed),
+            next_wake: nw,
+            reason: r,
+            updated_at: u,
+        }))
+    }
+
+    async fn list_paused(&self) -> Result<Vec<ScheduledRun>, OrchestratorError> {
+        let rows: Vec<(
+            sqlx::types::Uuid,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            "select run_id, next_wake, reason, updated_at
+                 from orchestrator.scheduled_runs where status='paused'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, nw, r, u)| ScheduledRun {
+                run: RunId(id),
+                status: RunStatus::Paused,
+                next_wake: nw,
+                reason: r,
+                updated_at: u,
+            })
+            .collect())
+    }
+
+    async fn cancel(&self, run: RunId) -> Result<(), OrchestratorError> {
+        sqlx::query(
+            "update orchestrator.scheduled_runs set status='cancelled', next_wake=null, updated_at=now()
+             where run_id=$1 and status not in ('completed','failed','cancelled')",
+        )
+        .bind(run.0)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn force_wake(&self, run: RunId, now: DateTime<Utc>) -> Result<(), OrchestratorError> {
+        sqlx::query(
+            "update orchestrator.scheduled_runs set next_wake=$2, updated_at=now()
+             where run_id=$1 and status='paused'",
+        )
+        .bind(run.0)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Duration, Utc};
     use orchestrator_core::{
         AgentDefinition, ChildStatus, CompactChild, ContentRef, ContentStore, ContextKey,
-        ContextRef, ContextStore, Digest, EffectClass, ExecutionJournal, JournalError,
-        JournalEvent, NetworkPolicy, NodeId, OrchestratorError, Permissions, RunId, Scope,
-        SkillDef, Snapshot, ToolSpec,
+        ContextRef, ContextStore, Digest, EffectClass, ExecutionJournal, Graph, JournalError,
+        JournalEvent, NetworkPolicy, NodeId, OrchestratorError, Permissions, RunId, RunStatus,
+        SchedulerStore, Scope, SkillDef, Snapshot, ToolSpec,
     };
     use std::collections::HashMap;
 
@@ -1185,6 +1366,119 @@ mod tests {
             got_tool.effect_class,
             EffectClass::Observation,
             "effect_class survives"
+        );
+    }
+
+    // ---- SP-DATA-3: PostgresSchedulerStore --------------------------------------------------
+
+    fn sg() -> Graph {
+        Graph { nodes: vec![] }
+    }
+    fn ts(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
+    }
+
+    /// The exactly-once gate: two concurrent `claim_due` on one due run → exactly one wins.
+    #[tokio::test]
+    async fn pg_claim_due_is_exactly_once_under_concurrent_claims() {
+        let Some(url) = db_url() else { return };
+        let s = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let r = run();
+        let now = ts(2_000_000);
+        s.enqueue(r, &sg(), now).await.unwrap();
+        s.record_paused(r, Some(now), "gated").await.unwrap(); // due exactly at `now`
+        let (a, b) = tokio::join!(
+            s.claim_due(now, Duration::seconds(60), 10),
+            s.claim_due(now, Duration::seconds(60), 10),
+        );
+        let got: usize = a
+            .unwrap()
+            .iter()
+            .chain(b.unwrap().iter())
+            .filter(|(x, _)| *x == r)
+            .count();
+        assert_eq!(
+            got, 1,
+            "a due run is claimed by exactly one of two concurrent claimers"
+        );
+    }
+
+    /// Round-trip + transitions: not-due is skipped; due is claimed (stored graph returned); terminal.
+    #[tokio::test]
+    async fn pg_round_trip_and_transitions() {
+        let Some(url) = db_url() else { return };
+        let s = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let r = run();
+        let t0 = ts(2_100_000);
+        s.enqueue(r, &sg(), t0).await.unwrap();
+        s.record_paused(r, Some(t0 + Duration::seconds(10)), "gated")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.status(r).await.unwrap().unwrap().status,
+            RunStatus::Paused
+        );
+        assert!(s.list_paused().await.unwrap().iter().any(|x| x.run == r));
+        // not due yet
+        assert!(
+            s.claim_due(t0, Duration::seconds(60), 10)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(x, _)| *x != r)
+        );
+        // due → claimed, and the stored graph round-trips
+        let due = s
+            .claim_due(t0 + Duration::seconds(20), Duration::seconds(60), 10)
+            .await
+            .unwrap();
+        assert!(
+            due.iter().any(|(x, g)| *x == r && g.nodes.is_empty()),
+            "claim returns the stored graph"
+        );
+        s.record_terminal(r, RunStatus::Completed, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.status(r).await.unwrap().unwrap().status,
+            RunStatus::Completed
+        );
+    }
+
+    /// Intervene: cancel makes a paused run unwakeable; force_wake makes a NULL-deadline pause claimable.
+    #[tokio::test]
+    async fn pg_cancel_and_force_wake() {
+        let Some(url) = db_url() else { return };
+        let s = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let (c, f) = (run(), run());
+        let now = ts(2_200_000);
+        s.enqueue(c, &sg(), now).await.unwrap();
+        s.record_paused(c, Some(now + Duration::seconds(10)), "g")
+            .await
+            .unwrap();
+        s.cancel(c).await.unwrap();
+        assert_eq!(
+            s.status(c).await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        s.enqueue(f, &sg(), now).await.unwrap();
+        s.record_paused(f, None, "in-doubt").await.unwrap(); // NULL deadline
+        assert!(
+            s.claim_due(now + Duration::seconds(1000), Duration::seconds(60), 10)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(x, _)| *x != f),
+            "a NULL-deadline pause is never auto-woken"
+        );
+        s.force_wake(f, now).await.unwrap();
+        assert!(
+            s.claim_due(now + Duration::seconds(1), Duration::seconds(60), 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(x, _)| *x == f),
+            "force_wake makes it claimable"
         );
     }
 }
