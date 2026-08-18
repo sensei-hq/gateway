@@ -11740,6 +11740,151 @@ async fn shell_stdout_is_redacted() {
     );
 }
 
+// ============================= SP-DATA-3 scheduler driver =====================
+
+/// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded
+/// `paused` with the journaled deadline, is NOT woken before it, and a `tick` past the deadline wakes it
+/// to completion (a second tick no-ops). Mirrors `a_paused_gated_run_reattempts_and_completes_on_resume`
+/// (tests.rs) but with the scheduler automating the wake half — the fake clock drives `claim_due`, so the
+/// gated-submit / un-gated-wake split needs no fight with the gateway's real-time cooldown.
+mod scheduler_driver {
+    use super::*;
+    use crate::Scheduler;
+    use crate::test_support::timeout_gateway;
+    use chrono::{DateTime, Duration, Utc};
+    use orchestrator_core::{Clock, RunId, RunStatus, SchedulerStore};
+    use orchestrator_store::InMemorySchedulerStore;
+    use std::sync::{Arc, Mutex};
+
+    /// A settable clock for deterministic wakes.
+    struct FakeClock(Mutex<DateTime<Utc>>);
+    impl FakeClock {
+        fn new(t: DateTime<Utc>) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(t)))
+        }
+        fn set(&self, t: DateTime<Utc>) {
+            *self.0.lock().unwrap() = t;
+        }
+    }
+    impl Clock for FakeClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    fn one_node_graph() -> Graph {
+        Graph {
+            nodes: vec![Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", "go"),
+                deps: vec![],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_run_is_recorded_then_woken_by_a_tick_after_its_deadline() {
+        let journal = InMemoryJournal::new();
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = one_node_graph();
+        let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap());
+
+        // Submit with a GATED executor → the run pauses on the timed gate (resume_after journaled).
+        let gw = timeout_gateway().await;
+        let _ = gw
+            .execute(&support::build_request(
+                "c",
+                &serde_json::json!({ "prompt": "warm" }),
+            ))
+            .await;
+        let gated_exec =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+        let sched_submit = Scheduler::new(
+            store.clone(),
+            gated_exec,
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+        let o1 = sched_submit
+            .submit(run, graph.clone())
+            .await
+            .expect("submit");
+        assert!(o1.paused.is_some(), "the run pauses on the timed gate");
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Paused);
+        let deadline = st.next_wake.expect("a timed pause has a next_wake");
+
+        // A fresh, UN-GATED scheduler (a real quota reset) drives the wake half.
+        let (gw2, calls2) = recording_gateway().await;
+        let un_gated =
+            Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+        let sched = Scheduler::new(
+            store.clone(),
+            un_gated,
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+
+        // Before the deadline: nothing is due.
+        clock.set(deadline - Duration::seconds(1));
+        assert_eq!(sched.tick().await.unwrap(), 0, "not due yet");
+
+        // Past the deadline: the tick wakes it → completed; a second tick no-ops.
+        clock.set(deadline + Duration::seconds(1));
+        assert_eq!(sched.tick().await.unwrap(), 1, "woken");
+        assert_eq!(
+            store.status(run).await.unwrap().unwrap().status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            calls2.lock().unwrap().len(),
+            1,
+            "only the gated node re-attempted on the wake"
+        );
+        assert_eq!(
+            sched.tick().await.unwrap(),
+            0,
+            "a terminal run is not re-woken"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_prevents_a_wake() {
+        let journal = InMemoryJournal::new();
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap());
+        // Seed a paused run directly (a store-level behavior — no gateway needed).
+        store
+            .enqueue(run, &one_node_graph(), clock.now())
+            .await
+            .unwrap();
+        store
+            .record_paused(run, Some(clock.now() + Duration::seconds(10)), "gated")
+            .await
+            .unwrap();
+        let (gw, _c) = recording_gateway().await;
+        let sched = Scheduler::new(
+            store.clone(),
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone()),
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+        sched.cancel(run).await.unwrap();
+        clock.set(clock.now() + Duration::seconds(100));
+        assert_eq!(
+            sched.tick().await.unwrap(),
+            0,
+            "a cancelled run is not woken"
+        );
+        assert_eq!(
+            store.status(run).await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+    }
+}
+
 /// SP-DATA-1 (5/5) — the HEADLINE: cross-process durable resume + durable in-doubt reconcile,
 /// proven on a live Docker Postgres. Feature-gated (`postgres-tests`) AND `DATABASE_URL`-guarded,
 /// so the default suite is byte-identical and DB-free (each test `return`s early with no DB).
@@ -11749,7 +11894,8 @@ async fn shell_stdout_is_redacted() {
 /// `with_content_store`). These tests reach Postgres ONLY through
 /// `orchestrator_store::postgres::{connect, PostgresJournal, PostgresContentStore}` — no direct
 /// sqlx handle. Every test uses a fresh `RunId` so the shared `orchestrator.*` tables never
-/// collide across tests (belt-and-suspenders with `--test-threads=1`).
+/// collide across tests (belt-and-suspenders with `--test-threads=1`). SP-DATA-3 adds the scheduler
+/// cross-process wake e2e here too.
 #[cfg(feature = "postgres-tests")]
 mod postgres_e2e {
     use super::*;
