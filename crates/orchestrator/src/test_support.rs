@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use gateway::Gateway;
 use gateway::adapters::AdapterRegistry;
 use gateway::adapters::capability::{ChatModel, Model};
@@ -18,6 +19,7 @@ use kernel::types::config::{
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse};
 use kernel::types::request::{MessageRole, ToolCall};
+use orchestrator_core::Clock;
 
 /// One recorded gateway call: the resolved model id the adapter was dispatched
 /// with, plus a fingerprint of the payload (the first user message's text).
@@ -550,4 +552,21 @@ pub async fn timeout_gateway() -> Gateway {
     adapters.register_chat(Arc::new(TimeoutAdapter)).await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     Gateway::new(single_chain_config(), adapters, cb)
+}
+
+/// A settable [`Clock`] for deterministic scheduler/wake tests — advance time by hand (no real
+/// sleeps) to make a `Scheduler::tick` fire.
+pub struct FakeClock(Mutex<DateTime<Utc>>);
+impl FakeClock {
+    pub fn new(t: DateTime<Utc>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(t)))
+    }
+    pub fn set(&self, t: DateTime<Utc>) {
+        *self.0.lock().unwrap() = t;
+    }
+}
+impl Clock for FakeClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().unwrap()
+    }
 }

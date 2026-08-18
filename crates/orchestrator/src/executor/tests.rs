@@ -11750,27 +11750,11 @@ async fn shell_stdout_is_redacted() {
 mod scheduler_driver {
     use super::*;
     use crate::Scheduler;
-    use crate::test_support::timeout_gateway;
+    use crate::test_support::{FakeClock, timeout_gateway};
     use chrono::{DateTime, Duration, Utc};
-    use orchestrator_core::{Clock, RunId, RunStatus, SchedulerStore};
+    use orchestrator_core::{RunId, RunStatus, SchedulerStore};
     use orchestrator_store::InMemorySchedulerStore;
-    use std::sync::{Arc, Mutex};
-
-    /// A settable clock for deterministic wakes.
-    struct FakeClock(Mutex<DateTime<Utc>>);
-    impl FakeClock {
-        fn new(t: DateTime<Utc>) -> Arc<Self> {
-            Arc::new(Self(Mutex::new(t)))
-        }
-        fn set(&self, t: DateTime<Utc>) {
-            *self.0.lock().unwrap() = t;
-        }
-    }
-    impl Clock for FakeClock {
-        fn now(&self) -> DateTime<Utc> {
-            *self.0.lock().unwrap()
-        }
-    }
+    use std::sync::Arc;
 
     fn one_node_graph() -> Graph {
         Graph {
@@ -11901,7 +11885,8 @@ mod postgres_e2e {
     use super::*;
     use orchestrator_core::{RegistryConfig, RegistryHandle};
     use orchestrator_store::postgres::{
-        PostgresConfigSource, PostgresContentStore, PostgresJournal, connect,
+        PostgresConfigSource, PostgresContentStore, PostgresJournal, PostgresSchedulerStore,
+        connect,
     };
 
     fn db_url() -> Option<String> {
@@ -12261,6 +12246,88 @@ mod postgres_e2e {
                     if recorded == &format!("v1#cfg{v}") && current == &format!("v1#cfg{v2}")
             ),
             "expected a loud config-generation fence, got {err:?}"
+        );
+    }
+
+    /// SP-DATA-3 AC6: a run paused by process A wakes durably in a FRESH process B at its deadline.
+    /// The scheduler owns the graph (`scheduled_runs`), so process B needs only the run id + the SAME
+    /// DB — it shares NOTHING in-process with A. B reads A's durable pause (status + deadline) from PG,
+    /// then a `tick` past the deadline drives the woken run to completion (the gated node re-attempts
+    /// once under the un-gated gateway — a real quota reset).
+    #[tokio::test]
+    async fn scheduler_wakes_a_paused_run_cross_process() {
+        let Some(url) = db_url() else { return };
+        use crate::Scheduler;
+        use crate::test_support::{FakeClock, timeout_gateway};
+        use chrono::{DateTime, Duration, Utc};
+        use orchestrator_core::{RunStatus, SchedulerStore};
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", "go"),
+                deps: vec![],
+            }],
+        };
+        let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(3_000_000, 0).unwrap());
+
+        // --- Process A: submit with a gated executor → pauses + persists to PG (scheduled_runs + journal).
+        let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+        let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+        let gw = timeout_gateway().await;
+        let _ = gw
+            .execute(&support::build_request(
+                "c",
+                &serde_json::json!({ "prompt": "warm" }),
+            ))
+            .await;
+        let exec_a = Executor::new(Arc::new(gw), journal_a.clone(), "v1").with_clock(clock.clone());
+        let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
+        let o1 = sched_a.submit(run, graph.clone()).await.unwrap();
+        assert!(o1.paused.is_some(), "the run pauses on the timed gate");
+        let deadline = store_a
+            .status(run)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_wake
+            .expect("a timed pause has a next_wake");
+
+        // --- Process B: FRESH store/journal/executor on the SAME DB — nothing shared in-process.
+        let store_b = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+        let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+        // B reads A's durable pause straight from Postgres.
+        let st_b = store_b.status(run).await.unwrap().unwrap();
+        assert_eq!(st_b.status, RunStatus::Paused, "B sees A's durable pause");
+        assert_eq!(
+            st_b.next_wake,
+            Some(deadline),
+            "B sees the durable deadline"
+        );
+
+        let (gw_b, calls_b) = recording_gateway().await;
+        let clock_b = FakeClock::new(deadline + Duration::seconds(1));
+        let exec_b = Executor::new(Arc::new(gw_b), journal_b.clone(), "v1")
+            .with_content_store(Arc::new(PostgresContentStore::new(
+                connect(&url).await.unwrap(),
+            )))
+            .with_clock(clock_b.clone());
+        let sched_b = Scheduler::new(store_b.clone(), exec_b, journal_b.clone(), clock_b.clone());
+        // A tick past the deadline wakes the due set — OUR run among any others sharing the
+        // `scheduled_runs` table (unique run ids + a GLOBAL claim, per the harness's shared-table
+        // convention). Assert OUR run's outcome, not the global count.
+        let woken = sched_b.tick().await.unwrap();
+        assert!(woken >= 1, "process B wakes at least the due run");
+        assert_eq!(
+            store_b.status(run).await.unwrap().unwrap().status,
+            RunStatus::Completed,
+            "the woken run completes across the process boundary"
+        );
+        assert_eq!(
+            calls_b.lock().unwrap().len(),
+            1,
+            "the woken run drove the one node once (no re-spend beyond it)"
         );
     }
 }
