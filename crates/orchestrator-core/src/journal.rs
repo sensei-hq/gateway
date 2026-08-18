@@ -9,6 +9,11 @@ use crate::graph::Graph;
 use crate::ids::{NodeId, RunId, Seq};
 use crate::plan::NodePlan;
 
+/// The durable journal format / effect-id scheme version. A persisted journal stamped with a
+/// different value fences loudly on resume (never a silent mis-fold). Bump on any effect-id or
+/// journal-serialization break.
+pub const FORMAT_VERSION: i32 = 1;
+
 /// A compacted per-child record (§5.3): after a `Map`'s `Consolidate` completes,
 /// each child's full `EffectRecorded` collapses to this small shape and leaves
 /// the hot fold path. The child's content stays retrievable from the

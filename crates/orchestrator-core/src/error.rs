@@ -1,5 +1,5 @@
 use crate::effect::EffectId;
-use crate::ids::NodeId;
+use crate::ids::{NodeId, RunId};
 
 /// An error from an [`ExecutionJournal`](crate::journal::ExecutionJournal)
 /// backend. Journal writes are strict: this error is surfaced, never swallowed.
@@ -7,6 +7,15 @@ use crate::ids::NodeId;
 pub enum JournalError {
     #[error("journal backend error: {0}")]
     Backend(String),
+    /// A persisted journal's `format_version` differs from this build's
+    /// [`FORMAT_VERSION`](crate::journal::FORMAT_VERSION) — the effect-id/serialization
+    /// scheme is incompatible; resume must halt loudly, not mis-fold.
+    #[error("incompatible journal format for run {run:?}: stored {stored}, expected {expected}")]
+    IncompatibleFormat {
+        run: RunId,
+        stored: i32,
+        expected: i32,
+    },
 }
 
 /// A top-level orchestrator error.
