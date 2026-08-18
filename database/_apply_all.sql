@@ -58,3 +58,40 @@ create table if not exists orchestrator.runs (
     format_version integer     not null,
     created_at     timestamptz not null default now()
 );
+
+-- ddl/table/orchestrator/config_agents.sql
+create table if not exists orchestrator.config_agents (
+    name       text        primary key,
+    def        jsonb       not null,
+    updated_at timestamptz not null default now()
+);
+
+-- ddl/table/orchestrator/config_skills.sql
+create table if not exists orchestrator.config_skills (
+    name       text        primary key,
+    def        jsonb       not null,
+    updated_at timestamptz not null default now()
+);
+
+-- ddl/table/orchestrator/config_tools.sql
+create table if not exists orchestrator.config_tools (
+    name       text        primary key,
+    spec       jsonb       not null,
+    updated_at timestamptz not null default now()
+);
+
+-- ddl/table/orchestrator/config_chain_bindings.sql
+create table if not exists orchestrator.config_chain_bindings (
+    area       text        not null,
+    kind       text        not null,
+    chain      text        not null,
+    updated_at timestamptz not null default now(),
+    primary key (area, kind)
+);
+
+-- ddl/table/orchestrator/config_versions.sql
+create table if not exists orchestrator.config_versions (
+    id         boolean     primary key default true check (id),
+    version    bigint      not null default 1,
+    updated_at timestamptz not null default now()
+);
