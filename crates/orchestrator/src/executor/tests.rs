@@ -11753,7 +11753,10 @@ async fn shell_stdout_is_redacted() {
 #[cfg(feature = "postgres-tests")]
 mod postgres_e2e {
     use super::*;
-    use orchestrator_store::postgres::{PostgresContentStore, PostgresJournal, connect};
+    use orchestrator_core::{RegistryConfig, RegistryHandle};
+    use orchestrator_store::postgres::{
+        PostgresConfigSource, PostgresContentStore, PostgresJournal, connect,
+    };
 
     fn db_url() -> Option<String> {
         std::env::var("DATABASE_URL").ok()
@@ -11974,6 +11977,144 @@ mod postgres_e2e {
                 .iter()
                 .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
             "the resumed run completes"
+        );
+    }
+
+    /// AC5 — unchanged config, cross-process resume PASSES with zero re-spend. Process A runs a
+    /// partial with a handle booted from the durable config version → `RunStarted.version = "v1#cfg{v}"`.
+    /// A FRESH process B boots a fresh handle from the SAME source (config unchanged) → same gen → the
+    /// fence matches → the completed prefix replays from the durable memo (the fresh gateway is called
+    /// only for the tail). The cross-process form of the in-process fence test
+    /// `reload_bumps_the_run_version_and_fences_in_flight_resume`.
+    #[tokio::test]
+    async fn postgres_unchanged_config_generation_permits_cross_process_resume() {
+        let Some(url) = db_url() else { return };
+        let run = RunId(uuid::Uuid::new_v4());
+        let (graph, n1, n2) = two_node_graph("a", "b");
+
+        // Seed durable config + move to a known generation.
+        let cfg_src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        cfg_src.store(&RegistryConfig::default()).await.unwrap();
+        let v = cfg_src.bump_config_version().await.unwrap(); // v >= 1
+
+        // Process A: partial run (n1 ok, n2 crashes), handle pinned at the durable version.
+        let handle_a = RegistryHandle::from_source(&cfg_src).await.unwrap();
+        assert_eq!(
+            handle_a.generation(),
+            v,
+            "handle boots at the durable version"
+        );
+        let (gw_a, _ca) = failing_after_gateway(1).await;
+        let out_a = Executor::new(
+            Arc::new(gw_a),
+            Arc::new(PostgresJournal::new(connect(&url).await.unwrap())),
+            "v1",
+        )
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_cas_threshold(8)
+        .with_registry_handle(handle_a)
+        .run(run, &graph)
+        .await
+        .expect("seed run yields an outcome");
+        assert!(
+            out_a.failed.is_some(),
+            "n2 crashes, leaving n1 durably journaled"
+        );
+
+        // Process B: FRESH source/handle over the SAME DB, config unchanged (still v).
+        let cfg_src_b = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let handle_b = RegistryHandle::from_source(&cfg_src_b).await.unwrap();
+        assert_eq!(
+            handle_b.generation(),
+            v,
+            "process B agrees on the durable generation"
+        );
+        let (gw_b, calls_b) = recording_gateway().await;
+        let out_b = Executor::new(
+            Arc::new(gw_b),
+            Arc::new(PostgresJournal::new(connect(&url).await.unwrap())),
+            "v1",
+        )
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_cas_threshold(8)
+        .with_registry_handle(handle_b)
+        .start(run, &graph)
+        .await
+        .expect("fence matches across processes → resume proceeds");
+        assert!(out_b.failed.is_none(), "{:?}", out_b.failed);
+        assert_eq!(out_b.completed, vec![n1.clone(), n2.clone()]);
+        assert_eq!(
+            calls_b.lock().unwrap().len(),
+            1,
+            "n1 replayed from the durable memo → the fresh gateway ran only the tail (0 re-spend)"
+        );
+    }
+
+    /// AC6 — a config change (a bump) between the original run and the resume is caught LOUDLY across
+    /// the process boundary. AC7 (mutation-check): were `version()` to return None, both handles would
+    /// boot at 0 and this mismatch would NOT fire — proving the durable version carries the fence.
+    #[tokio::test]
+    async fn postgres_bumped_config_generation_fences_a_cross_process_resume() {
+        let Some(url) = db_url() else { return };
+        let run = RunId(uuid::Uuid::new_v4());
+        let (graph, _n1, _n2) = two_node_graph("a", "b");
+
+        let cfg_src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        cfg_src.store(&RegistryConfig::default()).await.unwrap();
+        let v = cfg_src.bump_config_version().await.unwrap();
+
+        // Process A runs (fully) at generation v.
+        let handle_a = RegistryHandle::from_source(&cfg_src).await.unwrap();
+        let (gw_a, _ca) = recording_gateway().await;
+        Executor::new(
+            Arc::new(gw_a),
+            Arc::new(PostgresJournal::new(connect(&url).await.unwrap())),
+            "v1",
+        )
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_registry_handle(handle_a)
+        .run(run, &graph)
+        .await
+        .expect("A completes at gen v");
+
+        // Config is re-committed and the generation bumped → v2 (the fence is generation-based,
+        // so advancing the counter is what matters, not the content).
+        cfg_src.store(&RegistryConfig::default()).await.unwrap();
+        let v2 = cfg_src.bump_config_version().await.unwrap();
+        assert!(v2 > v, "the bump advanced the durable generation");
+
+        // Process B boots at v2 → resuming the v-authored run is fenced LOUDLY.
+        let handle_b =
+            RegistryHandle::from_source(&PostgresConfigSource::new(connect(&url).await.unwrap()))
+                .await
+                .unwrap();
+        assert_eq!(handle_b.generation(), v2);
+        let (gw_b, _cb) = recording_gateway().await;
+        let err = Executor::new(
+            Arc::new(gw_b),
+            Arc::new(PostgresJournal::new(connect(&url).await.unwrap())),
+            "v1",
+        )
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_registry_handle(handle_b)
+        .start(run, &graph)
+        .await
+        .expect_err("a changed config generation must fence the cross-process resume");
+        assert!(
+            matches!(
+                &err,
+                OrchestratorError::VersionFenceMismatch { recorded, current }
+                    if recorded == &format!("v1#cfg{v}") && current == &format!("v1#cfg{v2}")
+            ),
+            "expected a loud config-generation fence, got {err:?}"
         );
     }
 }
