@@ -17,6 +17,7 @@ pub mod planner;
 pub mod reconcile;
 pub mod redact;
 pub mod registry;
+pub mod scheduler;
 
 pub use clock::{Clock, SystemClock};
 pub use content::{ContentRef, ContentStore, Digest, EffectOutput, digest_of};
@@ -44,3 +45,4 @@ pub use registry::{
     Activation, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions,
     Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef, ToolSpec,
 };
+pub use scheduler::{RunStatus, ScheduledRun, SchedulerStore};
