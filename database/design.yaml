@@ -1,0 +1,9 @@
+project:
+  name: sensei-orchestrator
+source:
+  dialect: postgresql
+target:
+  postgres:
+    url: $DATABASE_URL
+schemas:
+  - orchestrator
