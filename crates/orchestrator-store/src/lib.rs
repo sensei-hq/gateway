@@ -15,6 +15,9 @@ mod stores;
 pub use config_source::{FilesystemConfigSource, InMemoryConfigSource};
 pub use stores::{InMemoryContentStore, InMemoryContextStore};
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 /// The shared, `Seq`-stamped event log keyed by run, guarded for concurrent
 /// appends and clonable across executors.
 type SharedLog = Arc<Mutex<HashMap<RunId, Vec<(Seq, JournalEvent)>>>>;
