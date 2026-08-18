@@ -4,9 +4,9 @@
 //! no database. Feature-gated: default builds don't pull sqlx.
 
 use orchestrator_core::{
-    ContentRef, ContentStore, ContextKey, ContextRef, ContextStore, Digest, ExecutionJournal,
-    FORMAT_VERSION, JournalError, JournalEvent, OrchestratorError, RunId, Scope, Seq, Snapshot,
-    digest_of,
+    ChainBinding, ConfigSource, ContentRef, ContentStore, ContextKey, ContextRef, ContextStore,
+    Digest, ExecutionJournal, FORMAT_VERSION, JournalError, JournalEvent, OrchestratorError,
+    RegistryConfig, RunId, Scope, Seq, Snapshot, digest_of,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -196,6 +196,13 @@ impl ExecutionJournal for PostgresJournal {
 /// parity only concerns the domain variants `ContentDigestMiss` / `ContextKeyCollision` /
 /// `Serialization`, which are matched exactly below.)
 fn store_err(e: sqlx::Error) -> OrchestratorError {
+    OrchestratorError::Store(e.to_string())
+}
+
+/// Map a serde (de)serialization error onto the same `Store` transport channel — used on the
+/// [`PostgresConfigSource`] WRITE path (encoding a domain object to jsonb before the insert).
+/// The load path uses [`cfg_load_err`] instead (→ `RegistryLoad`, the `ConfigSource` convention).
+fn store_err_ser(e: serde_json::Error) -> OrchestratorError {
     OrchestratorError::Store(e.to_string())
 }
 
@@ -413,14 +420,186 @@ impl ContextStore for PostgresContextStore {
     }
 }
 
+/// A durable `ConfigSource` (SP-DATA-2): the registry config lives in the `orchestrator.config_*`
+/// tables as jsonb rows, with a single-row `config_versions` global generation. `load()` reads the
+/// whole registry; `version()` reports the durable generation so a run's `#cfg{gen}` fence is
+/// cross-process meaningful. `store`/`bump_config_version` are the write path (this slice's seeder +
+/// SP-DATA-4's CLI entry point).
+///
+/// NOTE (known limitation, spec §6 on-demand-reload scope): `load()` and `version()` are SEPARATE
+/// reads. A concurrent `store()`+`bump_config_version()` landing between a reload's `load()` and
+/// `version()` can pair a stale config with a fresh generation (or vice versa). Accepted because
+/// reloads are explicit + infrequent (no background poller this slice) and a resuming process always
+/// re-`version()`s at resume; a future atomic `load_versioned()` (one snapshot) closes the window.
+#[derive(Clone)]
+pub struct PostgresConfigSource {
+    pool: PgPool,
+}
+
+impl PostgresConfigSource {
+    /// Wrap a connection pool (see [`connect`]).
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Replace-all write of the whole registry in one transaction: delete every config row, then
+    /// insert `cfg`'s — so `load()` afterward reproduces `cfg` exactly. Does NOT bump the version
+    /// (the caller bumps explicitly after committing a change).
+    pub async fn store(&self, cfg: &RegistryConfig) -> Result<(), OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        for t in [
+            "orchestrator.config_agents",
+            "orchestrator.config_skills",
+            "orchestrator.config_tools",
+            "orchestrator.config_chain_bindings",
+        ] {
+            sqlx::query(&format!("delete from {t}"))
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+        }
+        for a in &cfg.agents {
+            let v = serde_json::to_value(a).map_err(store_err_ser)?;
+            sqlx::query("insert into orchestrator.config_agents (name, def) values ($1, $2)")
+                .bind(&a.name)
+                .bind(v)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+        }
+        for s in &cfg.skills {
+            let v = serde_json::to_value(s).map_err(store_err_ser)?;
+            sqlx::query("insert into orchestrator.config_skills (name, def) values ($1, $2)")
+                .bind(&s.name)
+                .bind(v)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+        }
+        for t in &cfg.tools {
+            let v = serde_json::to_value(t).map_err(store_err_ser)?;
+            sqlx::query("insert into orchestrator.config_tools (name, spec) values ($1, $2)")
+                .bind(&t.name)
+                .bind(v)
+                .execute(&mut *tx)
+                .await
+                .map_err(store_err)?;
+        }
+        for b in &cfg.chain_bindings {
+            sqlx::query(
+                "insert into orchestrator.config_chain_bindings (area, kind, chain) values ($1, $2, $3)",
+            )
+            .bind(&b.area)
+            .bind(&b.kind)
+            .bind(&b.chain)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        }
+        tx.commit().await.map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Atomic upsert-increment of the single-row global generation; returns the new version.
+    pub async fn bump_config_version(&self) -> Result<u64, OrchestratorError> {
+        let (v,): (i64,) = sqlx::query_as(
+            "insert into orchestrator.config_versions (id, version) values (true, 1)
+             on conflict (id) do update set version = orchestrator.config_versions.version + 1,
+                                            updated_at = now()
+             returning version",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(v as u64)
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigSource for PostgresConfigSource {
+    async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+        let agents: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("select name, def from orchestrator.config_agents order by name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(cfg_load_err)?;
+        let skills: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("select name, def from orchestrator.config_skills order by name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(cfg_load_err)?;
+        let tools: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("select name, spec from orchestrator.config_tools order by name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(cfg_load_err)?;
+        let bindings: Vec<(String, String, String)> = sqlx::query_as(
+            "select area, kind, chain from orchestrator.config_chain_bindings order by area, kind",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(cfg_load_err)?;
+        Ok(RegistryConfig {
+            agents: agents
+                .into_iter()
+                .map(|(n, v)| {
+                    serde_json::from_value(v).map_err(|e| {
+                        OrchestratorError::RegistryLoad(format!("deser agent {n}: {e}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            skills: skills
+                .into_iter()
+                .map(|(n, v)| {
+                    serde_json::from_value(v).map_err(|e| {
+                        OrchestratorError::RegistryLoad(format!("deser skill {n}: {e}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            tools: tools
+                .into_iter()
+                .map(|(n, v)| {
+                    serde_json::from_value(v).map_err(|e| {
+                        OrchestratorError::RegistryLoad(format!("deser tool {n}: {e}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            chain_bindings: bindings
+                .into_iter()
+                .map(|(area, kind, chain)| ChainBinding { area, kind, chain })
+                .collect(),
+        })
+    }
+
+    async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+        // A versioned source ALWAYS returns Some (absent row ⇒ Some(0)); None is reserved for
+        // genuinely-unversioned sources (filesystem/in-memory).
+        let row: Option<(i64,)> =
+            sqlx::query_as("select version from orchestrator.config_versions where id = true")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_err)?;
+        Ok(Some(row.map(|(v,)| v as u64).unwrap_or(0)))
+    }
+}
+
+/// A config LOAD-path transport/parse failure → `RegistryLoad` (the `ConfigSource` convention;
+/// parity with `FilesystemConfigSource`, which never surfaces a bare `Store`/`Serialization` on
+/// a read).
+fn cfg_load_err(e: sqlx::Error) -> OrchestratorError {
+    OrchestratorError::RegistryLoad(format!("postgres config load: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use orchestrator_core::{
-        ChildStatus, CompactChild, ContentRef, ContentStore, ContextKey, ContextRef, ContextStore,
-        Digest, ExecutionJournal, JournalError, JournalEvent, NodeId, OrchestratorError, RunId,
-        Scope, Snapshot,
+        AgentDefinition, ChildStatus, CompactChild, ContentRef, ContentStore, ContextKey,
+        ContextRef, ContextStore, Digest, EffectClass, ExecutionJournal, JournalError,
+        JournalEvent, NetworkPolicy, NodeId, OrchestratorError, Permissions, RunId, Scope,
+        SkillDef, Snapshot, ToolSpec,
     };
+    use std::collections::HashMap;
 
     /// Tests require a live PG at $DATABASE_URL with the dbd schema applied (the Docker harness).
     /// Absent DATABASE_URL, they skip (so a bare `cargo test --features postgres` without a DB
@@ -764,5 +943,236 @@ mod tests {
 
         // Idempotent — re-inserting the same (scope,key) does not collide (unlike `put`).
         store.insert_ref(r).await.unwrap();
+    }
+
+    // ---- PostgresConfigSource (SP-DATA-2 Task 3) ------------------------------------------
+    // Isolated from the run-state tables above: these tests only touch `config_agents` /
+    // `config_skills` / `config_tools` / `config_chain_bindings` / `config_versions`. Per-test
+    // unique entity names so the shared tables never collide.
+
+    fn uniq(p: &str) -> String {
+        format!("{p}-{}", uuid::Uuid::new_v4())
+    }
+
+    fn skill(name: &str) -> SkillDef {
+        // SkillDef { name, description: Option<String>, body: String, activation: #[serde(default)] }
+        SkillDef {
+            name: name.into(),
+            description: Some("d".into()),
+            body: "b".into(),
+            activation: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_then_load_round_trips_config() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let s = uniq("skill");
+        let cfg = RegistryConfig {
+            agents: vec![],
+            skills: vec![skill(&s)],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
+        src.store(&cfg).await.unwrap();
+        let got = src.load().await.unwrap();
+        assert!(
+            got.skills.iter().any(|k| k.name == s),
+            "the stored skill round-trips via jsonb"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_is_zero_on_empty_then_monotonic_under_bump() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        // config_versions is a single shared row; assert STRICT INCREASE (robust under a shared row).
+        let v0 = src
+            .version()
+            .await
+            .unwrap()
+            .expect("a versioned source always returns Some");
+        let v1 = src.bump_config_version().await.unwrap();
+        assert!(v1 > v0, "bump strictly increases ({v0} -> {v1})");
+        assert_eq!(
+            src.version().await.unwrap(),
+            Some(v1),
+            "version() reflects the bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_is_replace_all_removed_entities_do_not_linger() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let keep = uniq("keep");
+        let drop = uniq("drop");
+        src.store(&RegistryConfig {
+            agents: vec![],
+            skills: vec![skill(&keep), skill(&drop)],
+            tools: vec![],
+            chain_bindings: vec![],
+        })
+        .await
+        .unwrap();
+        src.store(&RegistryConfig {
+            agents: vec![],
+            skills: vec![skill(&keep)],
+            tools: vec![],
+            chain_bindings: vec![],
+        })
+        .await
+        .unwrap();
+        let got = src.load().await.unwrap();
+        assert!(got.skills.iter().any(|k| k.name == keep));
+        assert!(
+            !got.skills.iter().any(|k| k.name == drop),
+            "replace-all dropped the removed skill"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_bindings_round_trip_as_a_relational_row() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let area = uniq("area");
+        src.store(&RegistryConfig {
+            agents: vec![],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![ChainBinding {
+                area: area.clone(),
+                kind: "plan".into(),
+                chain: "c".into(),
+            }],
+        })
+        .await
+        .unwrap();
+        let got = src.load().await.unwrap();
+        assert!(
+            got.chain_bindings
+                .iter()
+                .any(|b| b.area == area && b.kind == "plan" && b.chain == "c")
+        );
+    }
+
+    /// AC2's highest-risk serde path: `AgentDefinition` and `ToolSpec` carry NESTED structure
+    /// (a `grants` map of `Permissions`, a nested `input_schema` object, a `credentials` vec) —
+    /// unlike `SkillDef`/`ChainBinding`, which are flat. Proves the jsonb round-trip preserves
+    /// that nested structure exactly, not just that a row with the right name exists.
+    #[tokio::test]
+    async fn agent_and_tool_round_trip_through_jsonb_including_nested_fields() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let agent_name = uniq("agent");
+        let tool_name = uniq("tool");
+
+        let mut grants = HashMap::new();
+        grants.insert(
+            tool_name.clone(),
+            Permissions {
+                paths: vec!["/w".into()],
+                commands: vec![],
+                network: NetworkPolicy::Hosts(vec!["x.example.com".into()]),
+                caps: Default::default(),
+            },
+        );
+        let agent = AgentDefinition {
+            name: agent_name.clone(),
+            area: "research".into(),
+            kind: "reasoning".into(),
+            chain: Some("c".into()),
+            chains: HashMap::new(),
+            grants,
+            tools: vec![tool_name.clone()],
+            skills: vec!["concise".into()],
+            system_prompt: "be careful".into(),
+        };
+
+        let input_schema =
+            serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}});
+        let tool = ToolSpec {
+            name: tool_name.clone(),
+            description: Some("does a thing".into()),
+            input_schema: input_schema.clone(),
+            effect_class: EffectClass::Observation,
+            ttl_secs: Some(60),
+            source: Some("web".into()),
+            permissions: Permissions {
+                paths: vec!["/w".into()],
+                commands: vec!["ls".into()],
+                network: NetworkPolicy::Deny,
+                caps: Default::default(),
+            },
+            activation: Default::default(),
+            credentials: vec!["api-key".into()],
+        };
+
+        src.store(&RegistryConfig {
+            agents: vec![agent],
+            skills: vec![],
+            tools: vec![tool],
+            chain_bindings: vec![],
+        })
+        .await
+        .unwrap();
+
+        let got = src.load().await.unwrap();
+
+        let got_agent = got
+            .agents
+            .iter()
+            .find(|a| a.name == agent_name)
+            .expect("agent round-trips");
+        assert_eq!(
+            got_agent.tools,
+            vec![tool_name.clone()],
+            "tools list survives"
+        );
+        assert_eq!(
+            got_agent.skills,
+            vec!["concise".to_string()],
+            "skills list survives"
+        );
+        let grant = got_agent
+            .grants
+            .get(&tool_name)
+            .expect("grants map entry survives");
+        assert_eq!(
+            grant.paths,
+            vec!["/w".to_string()],
+            "nested Permissions.paths survives"
+        );
+        assert_eq!(
+            grant.network,
+            NetworkPolicy::Hosts(vec!["x.example.com".into()]),
+            "nested Permissions.network survives"
+        );
+
+        let got_tool = got
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .expect("tool round-trips");
+        assert_eq!(
+            got_tool.input_schema, input_schema,
+            "nested input_schema object survives"
+        );
+        assert_eq!(
+            got_tool.credentials,
+            vec!["api-key".to_string()],
+            "credentials vec survives"
+        );
+        assert_eq!(
+            got_tool.permissions.commands,
+            vec!["ls".to_string()],
+            "nested ToolSpec.permissions.commands survives"
+        );
+        assert_eq!(
+            got_tool.effect_class,
+            EffectClass::Observation,
+            "effect_class survives"
+        );
     }
 }
