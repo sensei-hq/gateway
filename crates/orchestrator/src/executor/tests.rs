@@ -11739,3 +11739,241 @@ async fn shell_stdout_is_redacted() {
         "secret leaked in the journal"
     );
 }
+
+/// SP-DATA-1 (5/5) — the HEADLINE: cross-process durable resume + durable in-doubt reconcile,
+/// proven on a live Docker Postgres. Feature-gated (`postgres-tests`) AND `DATABASE_URL`-guarded,
+/// so the default suite is byte-identical and DB-free (each test `return`s early with no DB).
+///
+/// The Executor is UNCHANGED: the durable `PostgresJournal`/`PostgresContentStore` inject through
+/// the same seams the InMemory resume tests use (`Executor::new(.., journal, ..)` +
+/// `with_content_store`). These tests reach Postgres ONLY through
+/// `orchestrator_store::postgres::{connect, PostgresJournal, PostgresContentStore}` — no direct
+/// sqlx handle. Every test uses a fresh `RunId` so the shared `orchestrator.*` tables never
+/// collide across tests (belt-and-suspenders with `--test-threads=1`).
+#[cfg(feature = "postgres-tests")]
+mod postgres_e2e {
+    use super::*;
+    use orchestrator_store::postgres::{PostgresContentStore, PostgresJournal, connect};
+
+    fn db_url() -> Option<String> {
+        std::env::var("DATABASE_URL").ok()
+    }
+
+    /// The headline (spec §4.3, AC4/AC5): a run journaled by one Executor instance resumes in a
+    /// FRESH Executor (process B) on the SAME Postgres DB — completes, the memoized effect replays
+    /// with ZERO gateway re-spend, and a CAS `Ref` materializes from the durable Postgres CAS.
+    ///
+    /// Mirrors the in-memory `resume_folds_a_ref_lazily_and_rematerializes_it_from_the_cas_without_respending`,
+    /// but the two executors share NOTHING in-process: they hold independent pools/instances over
+    /// the same `DATABASE_URL`, so a pass proves the state crossed the process boundary via Postgres.
+    #[tokio::test]
+    async fn postgres_cross_process_resume_replays_from_the_durable_journal() {
+        let Some(url) = db_url() else { return };
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let (graph, n1, n2) = two_node_graph("a", "b"); // linear: n1 -> n2
+
+        // ---- Process A: seed a PARTIAL run into Postgres --------------------------------------
+        // n1 succeeds; its ~28-byte model output exceeds the low CAS threshold, so the durable
+        // journal records an `EffectOutput::Ref` and the blob lands in the PG CAS. n2 then fails
+        // (the crash) → no `RunCompleted`; the run is left durably resumable.
+        let journal_a = PostgresJournal::new(connect(&url).await.unwrap());
+        let content_a = PostgresContentStore::new(connect(&url).await.unwrap());
+        let (gw_a, _calls_a) = failing_after_gateway(1).await;
+        let out_a = Executor::new(Arc::new(gw_a), Arc::new(journal_a.clone()), "v1")
+            .with_content_store(Arc::new(content_a))
+            .with_cas_threshold(8)
+            .run(run, &graph)
+            .await
+            .expect("seed run yields an outcome");
+        assert!(
+            out_a.failed.is_some(),
+            "n2 crashes, leaving n1 durably journaled without RunCompleted"
+        );
+
+        // n1's effect was recorded as a durable Ref (not inline). Capture its digest so we can
+        // prove the blob materializes from the PG CAS via a fresh pool below.
+        let events_a = journal_a.load(run).await.unwrap();
+        let n1_digest = events_a
+            .iter()
+            .find_map(|(_, e)| match e {
+                JournalEvent::EffectRecorded {
+                    node,
+                    output: EffectOutput::Ref(r),
+                    ..
+                } if node == &n1 => Some(r.digest.clone()),
+                _ => None,
+            })
+            .expect("n1's over-threshold output split to a durable Ref in Postgres");
+
+        // ---- Process B: a FRESH Executor + FRESH PG stores on the SAME DATABASE_URL -----------
+        // Brand-new `PostgresJournal`/`PostgresContentStore` instances (independent pools) over
+        // the same durable schema + the same run id — nothing shared in-process. A call-counting
+        // gateway proves n1 is NOT re-spent.
+        let journal_b = PostgresJournal::new(connect(&url).await.unwrap());
+        let content_b = PostgresContentStore::new(connect(&url).await.unwrap());
+        let (gw_b, calls_b) = recording_gateway().await;
+        let out_b = Executor::new(Arc::new(gw_b), Arc::new(journal_b), "v1")
+            .with_content_store(Arc::new(content_b))
+            .with_cas_threshold(8)
+            .start(run, &graph)
+            .await
+            .expect("the fresh executor resumes from the durable journal");
+
+        // The run COMPLETES across the process boundary.
+        assert!(out_b.failed.is_none(), "{:?}", out_b.failed);
+        assert_eq!(out_b.completed, vec![n1.clone(), n2.clone()]);
+
+        // ZERO re-spend: the fresh gateway was called ONLY for the tail n2 — n1 replayed from the
+        // durable memo, never re-dispatched.
+        assert_eq!(
+            calls_b.lock().unwrap().len(),
+            1,
+            "the fresh process re-called the gateway only for n2 (n1 replayed → 0 re-spend)"
+        );
+
+        // n1's output MATERIALIZED from the durable Postgres CAS Ref (proves the ref crossed the
+        // boundary and the blob is durable, not in-process).
+        assert_eq!(
+            out_b.outputs[&n1]["text"], "canned-response",
+            "n1 re-materialized from the Postgres CAS on resume"
+        );
+
+        // And the Ref is genuinely addressable in the durable CAS via a THIRD fresh pool.
+        let cas = PostgresContentStore::new(connect(&url).await.unwrap());
+        let bytes = cas
+            .get(&n1_digest)
+            .await
+            .expect("the Ref blob is durable in the Postgres CAS");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["text"], "canned-response",
+            "the durable CAS blob round-trips"
+        );
+    }
+
+    /// Durable in-doubt reconcile (spec §4.3, AC5): a standing `EffectIntent` with no matching
+    /// `EffectRecorded` persisted in Postgres → a FRESH Executor resumes, folds the durable
+    /// journal, sees the in-doubt Mutation, and CONSULTS the reconciler (a status query) rather
+    /// than blindly re-running. The reconciler finds the key → `Confirmed` → the executor records
+    /// WITHOUT re-invoking the tool: no double-apply across the process boundary.
+    ///
+    /// Mirrors the in-memory `exactly_once_confirmed_by_key_does_not_double_apply`, but the
+    /// standing intent lives in Postgres (durable) and a brand-new `PostgresJournal` reads it back.
+    #[tokio::test]
+    async fn postgres_in_doubt_reconcile_is_durable() {
+        let Some(url) = db_url() else { return };
+
+        // The mutation's effect id: n1, turn 0, tool index 1 (turn-0 model is index 0).
+        let store_eid = effect_id("n1", 0, 1);
+        // The shared "external system" (a keyed HashMap) — durable state lives in PG; the world is
+        // this mock, shared across the seed and the resume via `Arc` clone.
+        let store: Store = Store::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "store it")],
+        };
+
+        // ---- Seed: run the full flow into Postgres, then persist ONLY the prefix up to and
+        // including the mutation's `EffectIntent` under a FRESH run id — a durable standing intent
+        // with no `EffectRecorded`. The live seed applies the effect once (store[key], calls == 1).
+        let seed_journal = PostgresJournal::new(connect(&url).await.unwrap());
+        let seed_run = RunId(uuid::Uuid::new_v4());
+        let (gw_seed, _c) = scripted_gateway(vec![
+            tool_call_response("t1", "store", "{\"item\":\"widget\"}"),
+            final_response("done"),
+        ])
+        .await;
+        Executor::new(Arc::new(gw_seed), Arc::new(seed_journal.clone()), "v1")
+            .with_registry(store_registry())
+            .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+                IdempotentStore {
+                    store: store.clone(),
+                    calls: calls.clone(),
+                    invocations: invocations.clone(),
+                },
+            ))))
+            .run(seed_run, &graph)
+            .await
+            .expect("seed run completes");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the live seed applied the side effect once before the crash"
+        );
+
+        let events = seed_journal.load(seed_run).await.unwrap();
+        let cut = events
+            .iter()
+            .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { .. }))
+            .expect("seed run journaled an EffectIntent");
+        // Persist the prefix under a fresh run id via a fresh PostgresJournal — the durable
+        // standing intent (no `EffectRecorded` for the mutation).
+        let run = RunId(uuid::Uuid::new_v4());
+        let indoubt_journal = PostgresJournal::new(connect(&url).await.unwrap());
+        for (_, e) in &events[..=cut] {
+            indoubt_journal.append(run, e.clone()).await.unwrap();
+        }
+
+        // ---- Resume: a FRESH Executor + FRESH PostgresJournal on the SAME DATABASE_URL, sharing
+        // the SAME store + a `StatusQueryReconciler` over it. The reconciler finds the key →
+        // Confirmed → records without re-running the tool.
+        let reconcilers = ReconcileRegistry::default().with_provider(
+            "store",
+            Arc::new(StatusQueryReconciler {
+                store: store.clone(),
+            }),
+        );
+        let (gw_resume, _c2) = scripted_gateway(vec![final_response("done")]).await;
+        let resume_journal = PostgresJournal::new(connect(&url).await.unwrap());
+        let out = Executor::new(Arc::new(gw_resume), Arc::new(resume_journal.clone()), "v1")
+            .with_registry(store_registry())
+            .with_tools(Arc::new(ToolRegistry::default().with_tool(Arc::new(
+                IdempotentStore {
+                    store: store.clone(),
+                    calls: calls.clone(),
+                    invocations: invocations.clone(),
+                },
+            ))))
+            .with_reconcilers(Arc::new(reconcilers))
+            .start(run, &graph)
+            .await
+            .expect("resume yields an outcome");
+        let resume_events = resume_journal.load(run).await.unwrap();
+
+        // The reconcile path ran (not a blind re-run): Confirmed completes with no pause/failure.
+        assert!(
+            out.failed.is_none() && out.paused.is_none(),
+            "durable in-doubt Confirmed completes cleanly: failed={:?} paused={:?}",
+            out.failed,
+            out.paused
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "the tool was NOT re-invoked on resume — Confirmed records from the reconciler, not the tool"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly-once across the process boundary: Confirmed records without re-applying"
+        );
+        assert_eq!(
+            store.lock().unwrap().len(),
+            1,
+            "the external system still holds exactly one entry for the key (no double-apply)"
+        );
+        assert_eq!(
+            effect_recorded_count(&resume_events, &store_eid),
+            1,
+            "the standing Intent resolves to exactly one Mutation EffectRecorded"
+        );
+        assert!(
+            resume_events
+                .iter()
+                .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+            "the resumed run completes"
+        );
+    }
+}
