@@ -253,6 +253,14 @@ pub struct RegistryConfig {
 pub trait ConfigSource: Send + Sync {
     /// Load the whole registry config (a one-shot snapshot; hot-reload re-calls it).
     async fn load(&self) -> Result<RegistryConfig, OrchestratorError>;
+
+    /// The durable config generation, if this source is versioned. Default `None`
+    /// ⇒ [`RegistryHandle`] keeps its local monotonic counter (filesystem / in-memory
+    /// are unversioned). A versioned backend (`PostgresConfigSource`) returns
+    /// `Some(n)` so the generation is globally meaningful across processes.
+    async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+        Ok(None)
+    }
 }
 
 /// In-memory registry of agents/skills/tool-specs, built by a demo/preset
@@ -471,18 +479,38 @@ impl RegistryHandle {
         (g.0.clone(), g.1)
     }
 
-    /// Reload from `source`, atomically swapping in the new registry and bumping
+    /// Reload from `source`, atomically swapping in the new registry and setting
     /// the generation (returns the new generation). Validated + last-good: the
     /// load + `Registry::from_config` (which validates) run BEFORE the swap, so a
     /// failed load/validate returns `Err` with the old registry still live. The
-    /// `.await` is OUTSIDE the lock.
+    /// `.await` is OUTSIDE the lock. A versioned source (`ConfigSource::version`
+    /// returns `Some(v)`) pins its durable generation; an unversioned source
+    /// (`None` — filesystem/in-memory) keeps bumping the local monotonic counter.
     pub async fn reload(&self, source: &dyn ConfigSource) -> Result<u64, OrchestratorError> {
         let cfg = source.load().await?;
+        let ver = source.version().await?;
         let next = Registry::from_config(cfg)?;
         let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
         w.0 = Arc::new(next);
-        w.1 += 1;
+        // A versioned source pins its durable generation; an unversioned one increments locally.
+        w.1 = match ver {
+            Some(v) => v,
+            None => w.1 + 1,
+        };
         Ok(w.1)
+    }
+
+    /// Boot a handle at a source's durable generation. A versioned source pins its
+    /// version; an unversioned source (filesystem/in-memory) boots at 0 — identical
+    /// to [`new`](Self::new). The `load`/`version`/`from_config` run before the handle
+    /// exists, so a failed load/validate returns `Err` (no half-built handle).
+    pub async fn from_source(source: &dyn ConfigSource) -> Result<Self, OrchestratorError> {
+        let cfg = source.load().await?;
+        let ver = source.version().await?.unwrap_or(0);
+        let registry = Registry::from_config(cfg)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new((Arc::new(registry), ver))),
+        })
     }
 }
 
@@ -1381,6 +1409,18 @@ mod tests {
         }
     }
 
+    /// A ConfigSource that reports a durable generation (mirrors PostgresConfigSource).
+    struct VersionedSource(RegistryConfig, u64);
+    #[async_trait::async_trait]
+    impl ConfigSource for VersionedSource {
+        async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+            Ok(self.0.clone())
+        }
+        async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+            Ok(Some(self.1))
+        }
+    }
+
     #[tokio::test]
     async fn registry_handle_new_current_and_generation() {
         let reg = Registry::from_config(cfg_with_skill("s0")).unwrap();
@@ -1427,5 +1467,44 @@ mod tests {
         // Last-good preserved: old registry still live, generation unchanged.
         assert_eq!(h.generation(), 0);
         assert!(h.current().skill("s0").is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_from_a_versioned_source_pins_the_durable_version_not_a_blind_increment() {
+        let h = RegistryHandle::new(Registry::from_config(cfg_with_skill("s0")).unwrap());
+        assert_eq!(h.generation(), 0);
+        let g = h
+            .reload(&VersionedSource(cfg_with_skill("s1"), 5))
+            .await
+            .unwrap();
+        assert_eq!(g, 5, "the durable version is pinned as the generation");
+        assert_eq!(h.generation(), 5);
+        assert!(h.current().skill("s1").is_some(), "new config is live");
+    }
+
+    #[tokio::test]
+    async fn reload_from_an_unversioned_source_keeps_the_local_increment() {
+        let h = RegistryHandle::new(Registry::from_config(cfg_with_skill("s0")).unwrap());
+        assert_eq!(
+            h.reload(&FixedSource(cfg_with_skill("s1"))).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            h.reload(&FixedSource(cfg_with_skill("s2"))).await.unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn from_source_boots_at_the_durable_version_and_unversioned_at_zero() {
+        let h = RegistryHandle::from_source(&VersionedSource(cfg_with_skill("s0"), 7))
+            .await
+            .unwrap();
+        assert_eq!(h.generation(), 7);
+        assert!(h.current().skill("s0").is_some());
+        let h0 = RegistryHandle::from_source(&FixedSource(cfg_with_skill("s0")))
+            .await
+            .unwrap();
+        assert_eq!(h0.generation(), 0);
     }
 }
