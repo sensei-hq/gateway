@@ -230,9 +230,10 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 })?;
                 let d = boot::heavy(&env, &gateway_config, workspace_root.as_deref()).await?;
                 // Print the id BEFORE driving: an operator who loses the terminal
-                // must still be able to find the run.
-                println!("submitted: {}", run.0);
-                cmd::run::submit(&d.scheduler, run, g).await
+                // must still be able to find the run. `submit` calls this AFTER its
+                // duplicate pre-check, so a rejected submit no longer announces an
+                // effect that never happened.
+                cmd::run::submit(&d.scheduler, run, g, || println!("submitted: {}", run.0)).await
             }
         },
         Command::Worker { action } => match action {
@@ -266,7 +267,17 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                             &mut std::io::stderr(),
                         )
                     };
-                    cmd::config::push(&d.config_source, &dir, yes, &mut confirm).await
+                    // The scheduler store rides the same pool `light` already opened —
+                    // `push` reads it to disclose how much paused work a generation
+                    // bump would strand.
+                    cmd::config::push(
+                        &d.config_source,
+                        d.scheduler_store.as_ref(),
+                        &dir,
+                        yes,
+                        &mut confirm,
+                    )
+                    .await
                 }
             }
         }

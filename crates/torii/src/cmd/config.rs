@@ -5,7 +5,7 @@ use crate::cmd::Outcome;
 use crate::diff::{ConfigDiff, diff};
 use crate::errors::CliError;
 use crate::render::one_line;
-use orchestrator_core::{ConfigSource, Registry, RegistryConfig};
+use orchestrator_core::{ConfigSource, Registry, RegistryConfig, SchedulerStore};
 use orchestrator_store::FilesystemConfigSource;
 use orchestrator_store::postgres::PostgresConfigSource;
 use std::io::{BufRead, Read, Write};
@@ -20,22 +20,36 @@ pub enum PushDecision {
     NoOp(#[allow(dead_code)] ConfigDiff),
     /// Safe to write.
     Apply(ConfigDiff),
-    /// Refused: removals need confirmation that was not given.
+    /// Refused: either a removal or a paused run needs confirmation that was not given.
     NeedsConfirmation(ConfigDiff),
 }
 
 /// The pure decision: is this push safe to apply? `confirmed` is true when the
 /// operator passed `--yes` or answered the prompt.
+///
+/// `paused_runs` gates the push INDEPENDENTLY of what the diff removes, and that is the
+/// substantive rule here. A run's fence is `{base}#cfg{generation}`; a push ADVANCES the
+/// generation; `Executor::start_inner` refuses a journal whose recorded `RunStarted.version`
+/// differs, and `Scheduler::record` writes that refusal as terminal `Failed`. So ANY
+/// successful push terminally kills every already-journaled paused run — a pure ADDITION
+/// as surely as a removal, with the in-flight work unrecoverable through the product. The
+/// entity-removal count is simply the wrong measure of a push's destructiveness on its own.
+///
+/// (The fence behaviour itself is CORRECT — it is what prevents a silent wrong-config
+/// resume — so the fix is disclosure and consent, not a weaker fence.)
 pub fn plan_push(
     current: &RegistryConfig,
     incoming: &RegistryConfig,
+    paused_runs: usize,
     confirmed: bool,
 ) -> PushDecision {
     let d = diff(current, incoming);
     if d.is_noop() {
+        // A no-op writes nothing and so never advances the generation: no paused run is
+        // at risk, whatever `paused_runs` says.
         return PushDecision::NoOp(d);
     }
-    if d.requires_confirmation() && !confirmed {
+    if (d.requires_confirmation() || paused_runs > 0) && !confirmed {
         return PushDecision::NeedsConfirmation(d);
     }
     PushDecision::Apply(d)
@@ -50,7 +64,16 @@ pub fn plan_push(
 /// rendered terminal output entirely. `one_line` (shared with `render::table`, which
 /// guards the same class of attack from a run's pause reason) collapses every control
 /// character — including ESC — to a space.
-pub fn describe_diff(d: &ConfigDiff, current_version: u64, source: &str) -> String {
+///
+/// `paused_runs` is disclosed here for the same reason the removal count is: it is the
+/// destruction the operator is consenting to. It is rendered whenever it is non-zero —
+/// including on the `Apply`/`--yes` path, which never prompts but does surface this text.
+pub fn describe_diff(
+    d: &ConfigDiff,
+    current_version: u64,
+    source: &str,
+    paused_runs: usize,
+) -> String {
     let mut s = format!("config diff (durable v{current_version} -> {source}):\n");
     for e in &d.added {
         s.push_str(&format!(
@@ -79,6 +102,13 @@ pub fn describe_diff(d: &ConfigDiff, current_version: u64, source: &str) -> Stri
         let noun = if n == 1 { "entity" } else { "entities" };
         s.push_str(&format!(
             "\nThis REMOVES {n} {noun}. A push is replace-all: removed entities cannot be recovered.\n"
+        ));
+    }
+    if paused_runs > 0 {
+        s.push_str(&format!(
+            "\nWARNING: {paused_runs} run(s) are currently paused. This push advances the config \
+             generation, so each will terminally FAIL on its next wake (version fence mismatch) \
+             and cannot be resumed.\n"
         ));
     }
     s
@@ -144,8 +174,13 @@ async fn write_and_report(
 /// specifies as a refusal — so a scripted push that would delete config refuses
 /// instead of proceeding. `push` itself has no way to enforce that through the `&mut
 /// dyn FnMut` shape; it is `interactive_confirm`'s contract, verified by its own tests.
+///
+/// `scheduler` is read (never written) purely to count the in-flight work this push would
+/// strand — see [`plan_push`]. `LightDeps` already carries the scheduler store over the
+/// same pool, so this costs no new connection.
 pub async fn push(
     src: &PostgresConfigSource,
+    scheduler: &dyn SchedulerStore,
     dir: &Path,
     yes: bool,
     confirm: &mut dyn FnMut(&str) -> bool,
@@ -168,14 +203,26 @@ pub async fn push(
     let (current, current_v) = src.load_versioned().await?;
     let current_v = current_v.unwrap_or(0);
 
+    // 2b. Count the in-flight work this push would terminally kill. Read BEFORE the
+    // decision because a non-zero count must be able to force confirmation on its own,
+    // independent of what the diff removes (see `plan_push`). Read unconditionally, i.e.
+    // one small query is also paid on the no-op path — cheaper than splitting the pure
+    // decision function in two to save it, and `list_paused` is the same query
+    // `torii run list-paused` runs.
+    //
+    // Inherently a snapshot: a run can pause between this read and the write. It is a
+    // disclosure of impact, not a lock — the fence still refuses such a run loudly at
+    // wake time, which is the actual safety property.
+    let paused = scheduler.list_paused().await?.len();
+
     // 3. Decide.
     let source = sanitized_source(dir);
-    match plan_push(&current, &incoming, yes) {
+    match plan_push(&current, &incoming, paused, yes) {
         PushDecision::NoOp(_) => Ok(Outcome::ok(format!(
             "no changes: {source} already matches durable config v{current_v}"
         ))),
         PushDecision::NeedsConfirmation(d) => {
-            let text = describe_diff(&d, current_v, &source);
+            let text = describe_diff(&d, current_v, &source, paused);
             if !confirm(&text) {
                 // `confirm` already showed `text` to the operator — do not repeat it.
                 return Ok(Outcome::precondition(format!(
@@ -186,7 +233,7 @@ pub async fn push(
             write_and_report(src, &incoming, current_v, None).await
         }
         PushDecision::Apply(d) => {
-            let text = describe_diff(&d, current_v, &source);
+            let text = describe_diff(&d, current_v, &source, paused);
             // This path never calls `confirm` — `text` must appear in the outcome, see
             // `write_and_report`'s doc.
             write_and_report(src, &incoming, current_v, Some(&text)).await
@@ -258,21 +305,21 @@ mod tests {
 
     #[test]
     fn a_pure_addition_applies_without_confirmation() {
-        let d = plan_push(&cfg(vec![]), &cfg(vec![skill("s", "b")]), false);
+        let d = plan_push(&cfg(vec![]), &cfg(vec![skill("s", "b")]), 0, false);
         assert!(matches!(d, PushDecision::Apply(_)), "{d:?}");
     }
 
     #[test]
     fn an_identical_config_is_a_noop() {
         let c = cfg(vec![skill("s", "b")]);
-        let d = plan_push(&c, &c, false);
+        let d = plan_push(&c, &c, 0, false);
         assert!(matches!(d, PushDecision::NoOp(_)), "{d:?}");
     }
 
     /// AC4: a removal without confirmation must refuse, so nothing is written.
     #[test]
     fn a_removal_without_confirmation_is_refused() {
-        let d = plan_push(&cfg(vec![skill("s", "b")]), &cfg(vec![]), false);
+        let d = plan_push(&cfg(vec![skill("s", "b")]), &cfg(vec![]), 0, false);
         match d {
             PushDecision::NeedsConfirmation(diff) => {
                 assert_eq!(diff.removed.len(), 1);
@@ -283,8 +330,89 @@ mod tests {
 
     #[test]
     fn a_removal_with_confirmation_applies() {
-        let d = plan_push(&cfg(vec![skill("s", "b")]), &cfg(vec![]), true);
+        let d = plan_push(&cfg(vec![skill("s", "b")]), &cfg(vec![]), 0, true);
         assert!(matches!(d, PushDecision::Apply(_)), "{d:?}");
+    }
+
+    // ---- WHOLE-SLICE FIX 1: a push strands every paused run -------------------------
+    //
+    // The fence is `{base}#cfg{generation}`, a push advances the generation, and a
+    // journalled paused run whose recorded version no longer matches is recorded terminal
+    // `Failed` on its next wake. Demonstrated against the real binary: a PURE-ADDITION
+    // push (which the removal-only guard deliberately does not prompt for) printed
+    // `pushed: config now at v1443` at exit 0, and the next `worker serve --once` left the
+    // run `failed` with `stale: config changed (version fence mismatch: recorded
+    // v1#cfg1442, current v1#cfg1443)` — unrecoverable through the product.
+
+    /// The behaviour change: entity removals are not the only lethal push.
+    #[test]
+    fn a_pure_addition_with_paused_runs_requires_confirmation() {
+        let d = plan_push(&cfg(vec![]), &cfg(vec![skill("s", "b")]), 3, false);
+        match d {
+            PushDecision::NeedsConfirmation(diff) => assert!(
+                diff.removed.is_empty(),
+                "this is the PURE-ADDITION case — nothing is removed, and it must still \
+                 need consent: {diff:?}"
+            ),
+            other => panic!(
+                "a push that would terminally kill 3 paused runs must not apply silently: \
+                 {other:?}"
+            ),
+        }
+    }
+
+    /// The no-regression half: with no paused runs there is nothing to strand, so a pure
+    /// addition must still apply unprompted (scripted/CI pushes must not start blocking).
+    #[test]
+    fn a_pure_addition_with_zero_paused_runs_still_applies_without_confirmation() {
+        let d = plan_push(&cfg(vec![]), &cfg(vec![skill("s", "b")]), 0, false);
+        assert!(matches!(d, PushDecision::Apply(_)), "{d:?}");
+    }
+
+    /// `--yes` bypasses the paused-run gate exactly as it bypasses the removal gate — one
+    /// consistent escape hatch, not two rules.
+    #[test]
+    fn yes_bypasses_the_paused_run_gate_as_it_does_the_removal_gate() {
+        let d = plan_push(&cfg(vec![]), &cfg(vec![skill("s", "b")]), 3, true);
+        assert!(matches!(d, PushDecision::Apply(_)), "{d:?}");
+    }
+
+    /// A no-op writes nothing, so it advances no generation and strands nothing.
+    #[test]
+    fn an_identical_config_stays_a_noop_even_with_paused_runs() {
+        let c = cfg(vec![skill("s", "b")]);
+        let d = plan_push(&c, &c, 5, false);
+        assert!(matches!(d, PushDecision::NoOp(_)), "{d:?}");
+    }
+
+    /// The count and the consequence must both be IN the consent text — a gate that
+    /// prompts without saying why trains blind `y`.
+    #[test]
+    fn describe_diff_warns_about_the_paused_runs_a_push_would_strand() {
+        let d = diff(&cfg(vec![]), &cfg(vec![skill("s", "b")]));
+        let text = describe_diff(&d, 7, "./cfg", 3);
+        assert!(
+            text.contains("3 run(s) are currently paused"),
+            "the count must be named: {text}"
+        );
+        assert!(
+            text.contains("terminally FAIL") && text.contains("version fence mismatch"),
+            "the consequence and its mechanism must be named: {text}"
+        );
+        assert!(
+            text.contains("cannot be resumed"),
+            "the unrecoverability must be explicit: {text}"
+        );
+    }
+
+    /// And no warning when there is nothing to warn about: a false alarm on every push
+    /// would be indistinguishable from the real one.
+    #[test]
+    fn describe_diff_omits_the_paused_warning_when_no_run_is_paused() {
+        let d = diff(&cfg(vec![]), &cfg(vec![skill("s", "b")]));
+        let text = describe_diff(&d, 7, "./cfg", 0);
+        assert!(!text.contains("paused"), "{text}");
+        assert!(!text.contains("WARNING"), "{text}");
     }
 
     #[test]
@@ -293,7 +421,7 @@ mod tests {
             &cfg(vec![skill("gone", "b")]),
             &cfg(vec![skill("new", "b")]),
         );
-        let text = describe_diff(&d, 7, "./config");
+        let text = describe_diff(&d, 7, "./config", 0);
         assert!(text.contains("v7"), "{text}");
         assert!(text.contains("./config"), "{text}");
         assert!(text.contains("gone"), "removals must be named: {text}");
@@ -322,7 +450,7 @@ mod tests {
             }],
             unchanged: 0,
         };
-        let text = describe_diff(&d, 7, "./cfg");
+        let text = describe_diff(&d, 7, "./cfg", 0);
         let removal_lines: Vec<&str> = text
             .lines()
             .filter(|l| l.trim_start().starts_with("- skill"))
@@ -353,7 +481,7 @@ mod tests {
             }],
             unchanged: 0,
         };
-        let text = describe_diff(&d, 1, "./cfg");
+        let text = describe_diff(&d, 1, "./cfg", 0);
         assert!(
             !text.contains('\u{1b}'),
             "no raw escape byte may survive: {text:?}"
@@ -374,7 +502,7 @@ mod tests {
     #[test]
     fn describe_diff_pluralizes_a_single_removal_correctly() {
         let d = diff(&cfg(vec![skill("only", "b")]), &cfg(vec![]));
-        let text = describe_diff(&d, 1, "./cfg");
+        let text = describe_diff(&d, 1, "./cfg", 0);
         assert!(
             text.contains("This REMOVES 1 entity."),
             "singular must not read '1 entities': {text}"
@@ -457,7 +585,7 @@ mod tests {
     fn describe_diffs_output_never_contains_a_raw_escape_from_the_source_path() {
         let dir = Path::new("./cfg\u{1b}[8m");
         let d = diff(&cfg(vec![]), &cfg(vec![skill("s", "b")]));
-        let text = describe_diff(&d, 1, &sanitized_source(dir));
+        let text = describe_diff(&d, 1, &sanitized_source(dir), 0);
         assert!(
             !text.contains('\u{1b}'),
             "the source path must be sanitized before rendering: {text:?}"
@@ -470,13 +598,20 @@ mod tests {
     // is replace-all, so seeding via it establishes exactly our state regardless of
     // leftover rows from other probing.
 
-    fn db_url() -> Option<String> {
-        std::env::var("DATABASE_URL").ok()
-    }
+    /// Every test below that writes or measures the durable config holds `config_guard` —
+    /// see its definition for why it lives at crate root rather than here. `db_url` lives
+    /// there too so its skip notice (WHOLE-SLICE FIX 6) covers every DB-gated test in the
+    /// crate from one place.
+    use crate::test_guard::{config_guard, db_url};
 
-    /// Every test below that writes or measures the durable config holds this — see its
-    /// definition for why it lives at crate root rather than here.
-    use crate::test_guard::config_guard;
+    /// A scheduler store with NOTHING paused. `push` reads it only to count the in-flight
+    /// work a generation bump would strand, and every test below is about config
+    /// semantics — so an empty in-memory store keeps the paused-run gate out of the way.
+    /// Deliberately NOT the real `PostgresSchedulerStore`: `scheduled_runs` is a shared
+    /// table with hundreds of leftover rows, which would make every push here prompt.
+    fn no_paused_runs() -> orchestrator_store::InMemorySchedulerStore {
+        orchestrator_store::InMemorySchedulerStore::default()
+    }
 
     /// An existing, empty directory: `FilesystemConfigSource::load` treats a missing
     /// SUBdir as empty, but a missing ROOT is loud — so the root itself must exist.
@@ -541,7 +676,7 @@ mod tests {
             true
         };
 
-        let out = push(&src, &dir, false, &mut confirm)
+        let out = push(&src, &no_paused_runs(), &dir, false, &mut confirm)
             .await
             .expect("no hard error");
         std::fs::remove_dir_all(&dir).ok();
@@ -587,7 +722,7 @@ mod tests {
 
         let dir = empty_config_dir(); // removes everything -> requires confirmation
         let mut confirm = |_text: &str| false; // the operator declines
-        let out = push(&src, &dir, false, &mut confirm)
+        let out = push(&src, &no_paused_runs(), &dir, false, &mut confirm)
             .await
             .expect("no hard error");
         std::fs::remove_dir_all(&dir).ok();
@@ -683,7 +818,7 @@ mod tests {
         )
         .unwrap();
         let mut always_yes = |_: &str| true;
-        let err = push(&src, &bad, true, &mut always_yes)
+        let err = push(&src, &no_paused_runs(), &bad, true, &mut always_yes)
             .await
             .expect_err("a config that does not assemble must be refused");
         std::fs::remove_dir_all(&bad).ok();
@@ -698,7 +833,7 @@ mod tests {
         // 2. AN UNCONFIRMED REMOVAL WRITES NOTHING — neither content nor generation.
         let empty = empty_config_dir();
         let mut always_no = |_: &str| false;
-        let refused = push(&src, &empty, false, &mut always_no)
+        let refused = push(&src, &no_paused_runs(), &empty, false, &mut always_no)
             .await
             .expect("a declined push is not a hard error");
         assert_eq!(
@@ -720,7 +855,7 @@ mod tests {
         );
 
         // 3. THE SAME REMOVAL, CONFIRMED, LANDS AND BUMPS EXACTLY ONCE.
-        let applied = push(&src, &empty, false, &mut always_yes)
+        let applied = push(&src, &no_paused_runs(), &empty, false, &mut always_yes)
             .await
             .expect("a confirmed push is not a hard error");
         std::fs::remove_dir_all(&empty).ok();
@@ -742,6 +877,82 @@ mod tests {
             after.skills.is_empty(),
             "the confirmed removal actually landed: {:?}",
             after.skills
+        );
+    }
+
+    /// WHOLE-SLICE FIX 1, the WIRING half. `plan_push`'s paused-run arm is only reachable
+    /// if `push` actually asks the scheduler store — a `push` that always passed 0 would
+    /// leave every pure test above green while the real command still stranded runs
+    /// silently. So this drives the real `push`: durable state empty, incoming adds one
+    /// chain binding (a PURE ADDITION — `d.requires_confirmation()` is false, the old code
+    /// went straight to `Apply` and wrote), against a store holding one paused run.
+    ///
+    /// It asserts three things the pure tests cannot: that the prompt happened at all,
+    /// that the text the operator saw named the strand risk, and that declining left the
+    /// generation where it was.
+    #[tokio::test]
+    async fn a_pure_addition_prompts_and_names_the_paused_runs_it_would_strand() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let src =
+            PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
+        let v0 = src.store_and_bump(&cfg(vec![])).await.unwrap();
+
+        // A single chain binding: pure JSON (no frontmatter), assembles fine on its own,
+        // and adds exactly one entity against the empty durable state.
+        let dir = empty_config_dir();
+        std::fs::write(
+            dir.join("chains.json"),
+            r#"[{"area":"research","kind":"reasoning","chain":"a"}]"#,
+        )
+        .unwrap();
+
+        // One paused run, in-memory: this test is about `push` READING the count, not
+        // about the Postgres scheduler store (covered by its own suite).
+        let store = no_paused_runs();
+        let run = orchestrator_core::RunId(uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        store
+            .enqueue(run, &orchestrator_core::Graph { nodes: vec![] }, now)
+            .await
+            .unwrap();
+        store
+            .record_paused(run, Some(now), "quota: rate limited")
+            .await
+            .unwrap();
+
+        let mut shown: Option<String> = None;
+        let mut decline = |text: &str| {
+            shown = Some(text.to_string());
+            false
+        };
+        let out = push(&src, &store, &dir, false, &mut decline)
+            .await
+            .expect("no hard error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let prompt = shown.expect(
+            "a pure ADDITION with a paused run must PROMPT — this is the whole finding: the \
+             removal-only guard let it apply silently and the run then failed terminally on \
+             its next wake",
+        );
+        assert!(
+            prompt.contains("1 run(s) are currently paused"),
+            "the prompt must disclose the count it read from the store: {prompt}"
+        );
+        assert!(
+            prompt.contains("terminally FAIL"),
+            "and the consequence: {prompt}"
+        );
+        assert!(
+            prompt.contains("+ chain"),
+            "…while still showing the addition itself: {prompt}"
+        );
+        assert_eq!(out.code, crate::errors::EXIT_PRECONDITION, "{}", out.text);
+        assert_eq!(
+            src.version().await.unwrap(),
+            Some(v0),
+            "a declined push must not advance the generation"
         );
     }
 }

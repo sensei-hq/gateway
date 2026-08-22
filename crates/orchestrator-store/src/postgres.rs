@@ -900,8 +900,33 @@ mod tests {
     /// Tests require a live PG at $DATABASE_URL with the dbd schema applied (the Docker harness).
     /// Absent DATABASE_URL, they skip (so a bare `cargo test --features postgres` without a DB
     /// doesn't fail spuriously).
+    ///
+    /// A skip is ANNOUNCED, not silent (SP-DATA-4 whole-slice review): the same suite reports the
+    /// same 53 passing tests whether it exercised Postgres or returned immediately, so a CI job
+    /// that loses the variable reported a fully-green database suite that touched nothing.
+    ///
+    /// The notice goes to the process's REAL stderr rather than through `eprintln!`: libtest
+    /// captures the print macros and replays them only for a FAILING test, so an `eprintln!`
+    /// would be invisible in exactly the green run it exists to annotate. Under libtest the
+    /// current thread's name is the test's path, which is what lets this one helper — the single
+    /// choke point for every guard in the module — still name the test that skipped.
     fn db_url() -> Option<String> {
-        std::env::var("DATABASE_URL").ok()
+        let url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if url.is_none() {
+            use std::io::Write;
+            let name = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed test>")
+                .to_string();
+            // Formatted first, then ONE `write_all`: `Stderr` is unbuffered, so a
+            // `writeln!` emits a separate syscall per format fragment and a parallel
+            // test's output interleaves mid-line.
+            let line = format!("SKIP {name}: DATABASE_URL not set\n");
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+        url
     }
 
     /// A fresh, unique run id — every test gets its own so the shared `orchestrator.*`
