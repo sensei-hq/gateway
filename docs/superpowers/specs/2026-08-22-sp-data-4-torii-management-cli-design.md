@@ -496,6 +496,16 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
   subscriber itself is wired this slice — without one, `tracing` macros are no-ops and the worker's
   store-fault diagnostics were invisible.
 - **Terminal-row pruning/retention** for `scheduled_runs`.
+- **The DB tests' isolation guards are process-wide, not cross-process.** The `config_*` tables and
+  the single-row `config_versions` are global, and `claim_due` is an instance-wide sweep that can steal
+  another test's due row — two distinct race classes, both now serialized by in-process mutexes in the
+  store crate. But torii's own DB tests call `store_and_bump` on those same tables from a **different
+  process**, which no in-process mutex can serialize; forcing two concurrent `cargo` invocations
+  reproduces a failure roughly one run in four. This is not reachable through `cargo test --workspace`,
+  because cargo runs test binaries sequentially. It **would** become reachable under `cargo nextest`,
+  which runs tests in separate processes in parallel and defeats in-process guards entirely. Closing it
+  properly needs a Postgres advisory lock taken by both crates' guards. **Adopting nextest without that
+  lock would silently reintroduce the flakiness.**
 - **`sqlx` now compiles in the default workspace build** (torii depends on it unconditionally) —
   accepted tradeoff; the invariant preserved is that *tests* need no database.
 
