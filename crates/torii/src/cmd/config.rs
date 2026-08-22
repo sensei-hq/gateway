@@ -8,7 +8,7 @@ use crate::render::one_line;
 use orchestrator_core::{ConfigSource, Registry, RegistryConfig};
 use orchestrator_store::FilesystemConfigSource;
 use orchestrator_store::postgres::PostgresConfigSource;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
 /// What `plan_push` decided, before any write happens.
@@ -108,16 +108,24 @@ pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, 
 
 /// The shared tail of both writable `plan_push` outcomes (`Apply` and a confirmed
 /// `NeedsConfirmation`): re-check the generation immediately before writing, then
-/// `store_and_bump` and report the new version alongside the diff `text` already
-/// shown to the operator.
+/// `store_and_bump` and report the new version.
 ///
-/// The re-check is load-bearing, not decorative: `text`/`current_v` were computed
-/// from the snapshot `push` took in step 2, and on the confirmation path a human can
-/// sit on the prompt for minutes. A concurrent writer landing in that window means the
-/// approved diff no longer describes what this replace-all would do — writing anyway
-/// would silently destroy entities the operator never saw (and on the `Apply` path,
-/// which never prompts at all, with zero operator visibility). Sharing this one
-/// function between both call sites is what makes the guard cover both of them.
+/// The re-check is load-bearing, not decorative: `current_v` was computed from the
+/// snapshot `push` took in step 2, and on the confirmation path a human can sit on the
+/// prompt for minutes. A concurrent writer landing in that window means the approved
+/// diff no longer describes what this replace-all would do — writing anyway would
+/// silently destroy entities the operator never saw (and on the `Apply` path, which
+/// never prompts at all, with zero operator visibility). Sharing this one function
+/// between both call sites is what makes the guard cover both of them.
+///
+/// `text` is `Some(diff)` ONLY on the `Apply` path, which never calls `confirm` and so
+/// is the only place the operator will ever see the diff at all — it must appear in
+/// EITHER outcome (success or a stale-generation refusal). On the confirmed
+/// `NeedsConfirmation` path `confirm` already displayed the diff once; passing `None`
+/// there keeps this function from repeating it (an operator would otherwise see the
+/// full diff — and the "REMOVES N" warning — twice on every confirmed push, which
+/// trains skimming on the one line that must not be skimmed, and for a large diff
+/// scrolls the copy they actually approved out of view).
 // Only called from `push`, which itself isn't consumed outside tests until Task 10
 // (main.rs clap dispatch) — see the allow there.
 #[allow(dead_code)]
@@ -125,17 +133,18 @@ async fn write_and_report(
     src: &PostgresConfigSource,
     incoming: &RegistryConfig,
     current_v: u64,
-    text: String,
+    text: Option<&str>,
 ) -> Result<Outcome, CliError> {
+    let prefix = text.map(|t| format!("{t}\n")).unwrap_or_default();
     let now_v = src.version().await?.unwrap_or(0);
     if now_v != current_v {
         return Ok(Outcome::precondition(format!(
-            "{text}\nrefused: durable config moved v{current_v} -> v{now_v} while this diff was \
+            "{prefix}refused: durable config moved v{current_v} -> v{now_v} while this diff was \
              being reviewed; nothing written. Re-run `torii config push` to see the current diff."
         )));
     }
     let v = src.store_and_bump(incoming).await?;
-    Ok(Outcome::ok(format!("{text}\npushed: config now at v{v}")))
+    Ok(Outcome::ok(format!("{prefix}pushed: config now at v{v}")))
 }
 
 /// `confirm` is called ONLY when the diff removes something and `--yes` was absent.
@@ -171,7 +180,7 @@ pub async fn push(
     let current_v = current_v.unwrap_or(0);
 
     // 3. Decide.
-    let source = dir.display().to_string();
+    let source = sanitized_source(dir);
     match plan_push(&current, &incoming, yes) {
         PushDecision::NoOp(_) => Ok(Outcome::ok(format!(
             "no changes: {source} already matches durable config v{current_v}"
@@ -179,33 +188,60 @@ pub async fn push(
         PushDecision::NeedsConfirmation(d) => {
             let text = describe_diff(&d, current_v, &source);
             if !confirm(&text) {
+                // `confirm` already showed `text` to the operator — do not repeat it.
                 return Ok(Outcome::precondition(format!(
-                    "{text}\nrefused: nothing written, config still at v{current_v}"
+                    "refused: nothing written, config still at v{current_v}"
                 )));
             }
-            write_and_report(src, &incoming, current_v, text).await
+            // `confirm` already showed `text` — see `write_and_report`'s doc.
+            write_and_report(src, &incoming, current_v, None).await
         }
         PushDecision::Apply(d) => {
             let text = describe_diff(&d, current_v, &source);
-            write_and_report(src, &incoming, current_v, text).await
+            // This path never calls `confirm` — `text` must appear in the outcome, see
+            // `write_and_report`'s doc.
+            write_and_report(src, &incoming, current_v, Some(&text)).await
         }
     }
+}
+
+/// The push source label rendered in both `describe_diff`'s header and the `NoOp`
+/// message. `dir.display()` is free text — the incoming path is not necessarily typed
+/// by the consenting human (a wrapper script, a Makefile variable, a CI job
+/// interpolating a repo-supplied value) — so it gets the same [`one_line`] guard as an
+/// entity name, removing the need to reason about provenance at all.
+// Only called from `push` — see the allow there.
+#[allow(dead_code)]
+fn sanitized_source(dir: &Path) -> String {
+    one_line(&dir.display().to_string())
 }
 
 /// The real confirmer: Task 10 calls this with `stdin().lock()` and `stderr()`. Writes
 /// `prompt` plus a `Continue? [y/N] ` cue to `w`, reads one line from `r`, and returns
 /// true ONLY for an explicit affirmative (`y`/`yes`, case-insensitive). EOF (nothing to
-/// read — a scripted push with stdin redirected from `/dev/null`) and an empty line
-/// both return false: the safe default for a destructive, unrecoverable write is
-/// refusal, not an ambiguous "empty means yes".
+/// read — a scripted push with stdin redirected from `/dev/null`), an empty line, and a
+/// failure to DISPLAY the prompt all return false: the safe default for a destructive,
+/// unrecoverable write is refusal, not an ambiguous "empty means yes" — and if the
+/// operator never saw the diff, there is nothing for them to have consented to. (A
+/// silently-discarded write error, e.g. `2>/dev/null`, cannot be distinguished from a
+/// successfully rendered prompt and is out of scope — `IsTerminal` would be the fuller
+/// answer, and a deliberately piped `y` is arguably equivalent to `--yes` anyway.)
+///
+/// The read is bounded to 64 bytes — far more than any legitimate answer — so a
+/// pathological input (`torii config push ./cfg < /dev/zero`) cannot buffer an
+/// unbounded line into memory.
 // Consumed by Task 10 (main.rs clap dispatch) as the real, non-test `confirm` callback.
 #[allow(dead_code)]
 pub fn interactive_confirm(prompt: &str, r: &mut impl BufRead, w: &mut impl Write) -> bool {
-    let _ = writeln!(w, "{prompt}");
-    let _ = write!(w, "Continue? [y/N] ");
-    let _ = w.flush();
+    if writeln!(w, "{prompt}").is_err()
+        || write!(w, "Continue? [y/N] ").is_err()
+        || w.flush().is_err()
+    {
+        // Could not show the operator the diff, so there is nothing to consent to.
+        return false;
+    }
     let mut line = String::new();
-    let read = r.read_line(&mut line).unwrap_or(0);
+    let read = (&mut *r).take(64).read_line(&mut line).unwrap_or(0);
     if read == 0 {
         return false;
     }
@@ -383,6 +419,66 @@ mod tests {
         assert!(interactive_confirm("prompt", &mut r, &mut w));
     }
 
+    /// A `Write` whose every call errors — simulating a closed stderr (`2>&-`, EBADF)
+    /// or a broken pipe into a dead pager.
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// MINOR 1: if the prompt cannot be displayed at all, there is nothing for the
+    /// operator to have consented to — a `y` sitting on stdin (e.g. a pre-typed
+    /// keystroke, or a piped answer meant for a DIFFERENT, earlier prompt) must not be
+    /// accepted as consent to a diff the operator never saw.
+    #[test]
+    fn interactive_confirm_fails_closed_when_the_prompt_cannot_be_displayed() {
+        let mut r = std::io::Cursor::new(b"y\n" as &[u8]);
+        let mut w = FailingWriter;
+        assert!(
+            !interactive_confirm("prompt", &mut r, &mut w),
+            "a write/flush failure must refuse, not fall through to reading stdin"
+        );
+    }
+
+    /// MINOR 4: unbounded `read_line` would buffer an arbitrarily large line into
+    /// memory (`torii config push ./cfg < /dev/zero`). `Cursor::position()` reports
+    /// exactly how many bytes were consumed from the input, so this proves the read is
+    /// bounded rather than merely proving the function returns eventually.
+    #[test]
+    fn interactive_confirm_bounds_the_read_so_a_huge_line_cannot_allocate_unboundedly() {
+        let huge = vec![b'a'; 10_000_000];
+        let mut r = std::io::Cursor::new(huge.as_slice());
+        let mut w: Vec<u8> = Vec::new();
+        let accepted = interactive_confirm("prompt", &mut r, &mut w);
+        assert!(!accepted, "10MB of 'a' is not an explicit yes");
+        assert!(
+            r.position() <= 64,
+            "read_line must be bounded to a few bytes, not the whole 10MB input: consumed {}",
+            r.position()
+        );
+    }
+
+    /// MINOR 2: `source` is free text (`dir.display()`) never validated for shape — the
+    /// incoming path is not necessarily typed by the consenting human (a wrapper
+    /// script, a CI job interpolating a repo-supplied value). An unsanitized escape
+    /// here (e.g. SGR conceal, `\x1b[8m`) could render the entire removal list and the
+    /// "REMOVES N" warning invisible on a terminal that implements it.
+    #[test]
+    fn describe_diffs_output_never_contains_a_raw_escape_from_the_source_path() {
+        let dir = Path::new("./cfg\u{1b}[8m");
+        let d = diff(&cfg(vec![]), &cfg(vec![skill("s", "b")]));
+        let text = describe_diff(&d, 1, &sanitized_source(dir));
+        assert!(
+            !text.contains('\u{1b}'),
+            "the source path must be sanitized before rendering: {text:?}"
+        );
+    }
+
     // ---- DB: the diff-goes-stale race (FIX 1) ---------------------------------------
     // Requires a live PG at $DATABASE_URL with the dbd schema applied; skips otherwise,
     // matching the convention in orchestrator-store's postgres.rs tests. `store_and_bump`
@@ -468,12 +564,94 @@ mod tests {
         );
         assert!(out.text.contains("moved v"), "{}", out.text);
         assert!(out.text.contains("nothing written"), "{}", out.text);
+        // MINOR 3: `confirm` already displayed the diff once (the closure above IS the
+        // display, standing in for `interactive_confirm` writing it to stderr) — the
+        // stale-generation refusal must not repeat it.
+        assert!(
+            !out.text.contains("config diff (durable v"),
+            "confirm already showed the diff; the stale-refusal must not repeat it: {}",
+            out.text
+        );
 
         let after = src.load().await.unwrap();
         assert!(
             after.skills.iter().any(|s| s.name == survivor),
             "the concurrent writer's entity must survive an aborted push: {:?}",
             after.skills
+        );
+    }
+
+    /// MINOR 3, the decline path: `confirm` returns false without ever seeing a
+    /// concurrent write. The refusal must still say "refused" but must NOT repeat the
+    /// diff `confirm` already displayed.
+    #[tokio::test]
+    async fn a_declined_push_refuses_without_repeating_the_diff_text() {
+        let Some(url) = db_url() else { return };
+        let src =
+            PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
+        let a = format!("decline-{}", uuid::Uuid::new_v4());
+        src.store_and_bump(&cfg(vec![skill(&a, "x")]))
+            .await
+            .unwrap();
+
+        let dir = empty_config_dir(); // removes everything -> requires confirmation
+        let mut confirm = |_text: &str| false; // the operator declines
+        let out = push(&src, &dir, false, &mut confirm)
+            .await
+            .expect("no hard error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(out.code, crate::errors::EXIT_PRECONDITION, "{}", out.text);
+        assert!(out.text.contains("refused"), "{}", out.text);
+        assert!(
+            !out.text.contains("config diff (durable v"),
+            "confirm already showed the diff; the decline outcome must not repeat it: {}",
+            out.text
+        );
+    }
+
+    /// MINOR 3, the `Apply` path (via `write_and_report` directly): `Apply` never calls
+    /// `confirm`, so `text` must survive into the outcome — including on a
+    /// stale-generation refusal, which is deliberately forced here (rather than raced)
+    /// with an impossible `current_v`, so the assertion holds regardless of any
+    /// concurrent activity from other tests sharing the same durable generation.
+    #[tokio::test]
+    async fn write_and_report_keeps_the_diff_text_when_confirm_was_never_called() {
+        let Some(url) = db_url() else { return };
+        let src =
+            PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
+        let text = "config diff (durable vX -> ./cfg):\n  - skill  gone\n".to_string();
+        let out = write_and_report(&src, &cfg(vec![]), u64::MAX, Some(&text))
+            .await
+            .unwrap();
+        assert_eq!(out.code, crate::errors::EXIT_PRECONDITION, "{}", out.text);
+        assert!(out.text.contains("moved v"), "{}", out.text);
+        assert!(
+            out.text.contains("config diff (durable vX"),
+            "the Apply path never calls confirm, so a refusal must still show the diff: {}",
+            out.text
+        );
+    }
+
+    /// MINOR 3, the confirmed-write path (via `write_and_report` directly): the
+    /// counterpart of the test above — `None` means `confirm` already displayed the
+    /// diff, so neither a success NOR a refusal may repeat it. Forced with an
+    /// impossible `current_v`, same rationale as above.
+    #[tokio::test]
+    async fn write_and_report_omits_the_diff_text_when_confirm_already_showed_it() {
+        let Some(url) = db_url() else { return };
+        let src =
+            PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
+        let out = write_and_report(&src, &cfg(vec![]), u64::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(out.code, crate::errors::EXIT_PRECONDITION, "{}", out.text);
+        assert!(out.text.contains("moved v"), "{}", out.text);
+        assert!(out.text.contains("nothing written"), "{}", out.text);
+        assert!(
+            !out.text.contains("config diff (durable v"),
+            "confirm already showed the diff; the outcome must not repeat it: {}",
+            out.text
         );
     }
 }
