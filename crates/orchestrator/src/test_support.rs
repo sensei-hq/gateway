@@ -1,7 +1,9 @@
 //! Test-only fixtures for the executor's tests: a recording chat adapter plus a
 //! minimal single-chain [`Gateway`], modeled on the gateway crate's own
 //! adapter/reference-chain test harness (`gateway::engine::tests` /
-//! `gateway::catalog::presets`). Kept behind `#[cfg(test)]`.
+//! `gateway::catalog::presets`). Compiled only under `#[cfg(test)]` or the dev-only
+//! `test-support` feature, which lets another crate's dev-dependencies reuse the same
+//! doubles (torii's cross-process e2e).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -18,7 +20,7 @@ use kernel::types::config::{
 };
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse};
-use kernel::types::request::{MessageRole, ToolCall};
+use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload, ToolCall};
 use orchestrator_core::Clock;
 
 /// One recorded gateway call: the resolved model id the adapter was dispatched
@@ -552,6 +554,44 @@ pub async fn timeout_gateway() -> Gateway {
     adapters.register_chat(Arc::new(TimeoutAdapter)).await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     Gateway::new(single_chain_config(), adapters, cb)
+}
+
+/// A [`timeout_gateway`] that has ALREADY been warmed: one `execute` against chain `"c"`
+/// is spent cooling its sole router, so the very NEXT `execute` finds every candidate
+/// gated and returns `AllGated { resume_after }` — which is what makes a run over this
+/// gateway *pause* (resumable, with a deadline) instead of failing outright.
+///
+/// The warm-up belongs with the fixture rather than at each call site: a caller that
+/// forgets it silently gets a FAILED run instead of a paused one, which is a different
+/// test. The request must target the same chain and capability the executor's own
+/// `build_request` compiles a `ModelCall` into, since that is what decides which router
+/// cools — hence the deliberate mirroring below (the executor's helper is private to its
+/// module, and widening that module's visibility for a test fixture would make a private
+/// type reachable at `pub(crate)`).
+pub async fn gated_gateway() -> Gateway {
+    let gw = timeout_gateway().await;
+    let _ = gw
+        .execute(&InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("c".to_string()),
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "warm")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+        })
+        .await;
+    gw
 }
 
 /// A settable [`Clock`] for deterministic scheduler/wake tests — advance time by hand (no real

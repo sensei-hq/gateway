@@ -15,6 +15,10 @@ name = "orchestrator"
 # reach Postgres only through `orchestrator_store::postgres::{connect, PostgresJournal,
 # PostgresContentStore}` (no direct sqlx handle).
 postgres-tests = ["orchestrator-store/postgres", "orchestrator-store/test-support"]
+# Exposes the gateway/clock test doubles (`recording_gateway`, `timeout_gateway`,
+# `FakeClock`, ...) to OTHER crates' dev-dependencies. Dev-only: nothing in a production
+# build enables it, and with it off `test_support` stays `#[cfg(test)]`-private as before.
+test-support = []
 
 [dependencies]
 orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }
