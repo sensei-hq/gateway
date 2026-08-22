@@ -261,6 +261,19 @@ pub trait ConfigSource: Send + Sync {
     async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
         Ok(None)
     }
+
+    /// Load the config AND its generation as ONE consistent pair.
+    ///
+    /// The default performs the two reads separately — correct for unversioned
+    /// sources (`version()` is `None`, so there is no generation for the content
+    /// to be inconsistent with). A **versioned** backend MUST override this with
+    /// a single-snapshot read: otherwise a concurrent writer can hand back a torn
+    /// (stale config, fresh generation) pair, a run stamps a fresh-generation
+    /// fence over stale config, and a later resume matches the fence and silently
+    /// continues under different config (SP-DATA-2 carry-forward).
+    async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+        Ok((self.load().await?, self.version().await?))
+    }
 }
 
 /// In-memory registry of agents/skills/tool-specs, built by a demo/preset
@@ -483,12 +496,14 @@ impl RegistryHandle {
     /// the generation (returns the new generation). Validated + last-good: the
     /// load + `Registry::from_config` (which validates) run BEFORE the swap, so a
     /// failed load/validate returns `Err` with the old registry still live. The
-    /// `.await` is OUTSIDE the lock. A versioned source (`ConfigSource::version`
-    /// returns `Some(v)`) pins its durable generation; an unversioned source
-    /// (`None` — filesystem/in-memory) keeps bumping the local monotonic counter.
+    /// `.await` is OUTSIDE the lock. Config and generation are read as ONE atomic
+    /// pair via `ConfigSource::load_versioned` — never as two separate reads —
+    /// so a concurrent writer can never hand back a torn (stale config, fresh
+    /// generation) snapshot. A versioned source (`Some(v)`) pins its durable
+    /// generation; an unversioned source (`None` — filesystem/in-memory) keeps
+    /// bumping the local monotonic counter.
     pub async fn reload(&self, source: &dyn ConfigSource) -> Result<u64, OrchestratorError> {
-        let cfg = source.load().await?;
-        let ver = source.version().await?;
+        let (cfg, ver) = source.load_versioned().await?;
         let next = Registry::from_config(cfg)?;
         let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
         w.0 = Arc::new(next);
@@ -502,11 +517,13 @@ impl RegistryHandle {
 
     /// Boot a handle at a source's durable generation. A versioned source pins its
     /// version; an unversioned source (filesystem/in-memory) boots at 0 — identical
-    /// to [`new`](Self::new). The `load`/`version`/`from_config` run before the handle
-    /// exists, so a failed load/validate returns `Err` (no half-built handle).
+    /// to [`new`](Self::new). Config and generation are read as ONE atomic pair via
+    /// `ConfigSource::load_versioned` (see [`reload`](Self::reload) for why). The
+    /// `load_versioned`/`from_config` run before the handle exists, so a failed
+    /// load/validate returns `Err` (no half-built handle).
     pub async fn from_source(source: &dyn ConfigSource) -> Result<Self, OrchestratorError> {
-        let cfg = source.load().await?;
-        let ver = source.version().await?.unwrap_or(0);
+        let (cfg, ver) = source.load_versioned().await?;
+        let ver = ver.unwrap_or(0);
         let registry = Registry::from_config(cfg)?;
         Ok(Self {
             inner: Arc::new(RwLock::new((Arc::new(registry), ver))),
@@ -1506,5 +1523,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(h0.generation(), 0);
+    }
+
+    /// A source that counts how many times each read method is called, so we can
+    /// prove `reload` uses the ATOMIC pair method rather than the two separate reads.
+    struct CountingSource {
+        cfg: RegistryConfig,
+        version: u64,
+        loads: std::sync::atomic::AtomicUsize,
+        versions: std::sync::atomic::AtomicUsize,
+        pairs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSource {
+        fn new(cfg: RegistryConfig, version: u64) -> Self {
+            Self {
+                cfg,
+                version,
+                loads: Default::default(),
+                versions: Default::default(),
+                pairs: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigSource for CountingSource {
+        async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.cfg.clone())
+        }
+        async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+            self.versions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.version))
+        }
+        async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+            self.pairs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((self.cfg.clone(), Some(self.version)))
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_reads_config_and_version_through_the_atomic_pair_method() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let src = CountingSource::new(cfg_with_skill("s1"), 9);
+        let h = RegistryHandle::new(Registry::default());
+        let g = h.reload(&src).await.expect("reloads");
+        assert_eq!(g, 9, "the durable version is pinned as the generation");
+        assert_eq!(src.pairs.load(SeqCst), 1, "reload must use load_versioned");
+        assert_eq!(
+            (src.loads.load(SeqCst), src.versions.load(SeqCst)),
+            (0, 0),
+            "reload must NOT issue the two separate reads (that is the TOCTOU)"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_source_also_uses_the_atomic_pair_method() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let src = CountingSource::new(cfg_with_skill("s1"), 4);
+        let h = RegistryHandle::from_source(&src).await.expect("boots");
+        assert_eq!(h.generation(), 4);
+        assert_eq!(src.pairs.load(SeqCst), 1);
+        assert_eq!((src.loads.load(SeqCst), src.versions.load(SeqCst)), (0, 0));
+    }
+
+    /// The DEFAULT impl must keep today's behavior for unversioned sources, whose
+    /// `version()` is None — so there is no generation for the content to be
+    /// inconsistent with, and the non-atomic default is harmless.
+    #[tokio::test]
+    async fn the_default_load_versioned_delegates_to_load_and_version() {
+        let src = FixedSource(cfg_with_skill("s0"));
+        let (cfg, ver) = src.load_versioned().await.expect("pair");
+        assert_eq!(ver, None, "an unversioned source reports no generation");
+        assert_eq!(cfg.skills.len(), 1);
     }
 }
