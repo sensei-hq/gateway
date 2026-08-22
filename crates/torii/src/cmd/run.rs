@@ -133,7 +133,14 @@ pub async fn submit(
         )));
     }
     if let Some((node, msg)) = &outcome.failed {
-        return Ok(Outcome::precondition(format!(
+        // A run that actually executed and failed is an EXECUTION error (exit 1),
+        // not a precondition-not-met no-op (exit 2, this taxonomy's code for "ran
+        // fine, nothing to do"): automation needs to tell "the workload failed,
+        // page someone" apart from an idempotent no-op. `submitted: <id>` has
+        // already reached stdout by the time this returns — that is fine and
+        // intentional (an operator who loses the terminal must still be able to
+        // find the run).
+        return Err(CliError::error(format!(
             "failed: {} at node {} ({msg})",
             run.0, node.0
         )));

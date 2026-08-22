@@ -19,7 +19,12 @@ use std::path::PathBuf;
     long_about = "Observe and intervene on runs, drive due wakes, and manage durable config.\n\n\
                   DATABASE_URL must be set (env only — a flag would leak the password into `ps`).\n\
                   `run submit` and `worker serve` additionally need TORII_FENCE_VERSION and \
-                  --gateway-config."
+                  --gateway-config.\n\n\
+                  Exit codes: 0 ok, 1 error (including a submitted run that actually executed \
+                  and failed), 2 not-found or precondition-not-met. Note exit 2 is also clap's \
+                  own usage-error code (a missing subcommand, an unknown flag), so it is not \
+                  unique to a business-logic outcome — a script keying off it should also check \
+                  stderr."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -113,18 +118,61 @@ fn parse_run_id(s: &str) -> Result<RunId, CliError> {
         .map_err(|e| CliError::error(format!("invalid run id {s:?}: {e}")))
 }
 
+/// Wait for either SIGINT or, on unix, SIGTERM — the graceful-shutdown signal every
+/// `docker stop` and rolling deploy sends. Without racing SIGTERM in too, `worker
+/// serve`'s documented "let the in-flight tick finish, then exit cleanly" behavior
+/// is unreachable in the only deployment shape torii targets: SIGTERM's POSIX
+/// default disposition kills the process immediately (no output, no grace period),
+/// because nothing has installed a handler for it. This is not a correctness bug —
+/// the scheduler's lease reclaim makes an abrupt kill safe by construction — but an
+/// abrupt kill still strands whatever run was mid-tick for up to the lease duration.
+///
+/// SIGTERM registration happens eagerly here (before `serve`'s loop starts) and its
+/// failure is surfaced loudly rather than swallowed: `signal()` can fail for a
+/// reachable reason (e.g. the process has already exhausted its signal-handling
+/// slots), and this crate's error discipline is to never flatten a loud failure
+/// into silence. `ctrl_c()`'s own await-time failure is left exactly as before
+/// (discarded) — that path was never surfaced pre-fix and changing it is out of
+/// scope here.
+#[cfg(unix)]
+fn shutdown_signal() -> Result<impl std::future::Future<Output = ()> + Send, CliError> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| CliError::error(format!("cannot install a SIGTERM handler: {e}")))?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    })
+}
+
+/// Non-unix fallback: `tokio::signal::unix` does not exist off unix, and there is
+/// no portable SIGTERM equivalent, so SIGINT (`ctrl_c`) is all that's available.
+#[cfg(not(unix))]
+fn shutdown_signal() -> Result<impl std::future::Future<Output = ()> + Send, CliError> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+/// `ExitCode` rather than `std::process::exit`: `process::exit` skips destructors
+/// and any buffered-but-unflushed output. It was safe here only incidentally
+/// (`ensure_newline` guarantees a trailing newline and `Stdout` is line-buffered,
+/// so nothing was ever actually left unflushed) — `ExitCode` is the robust idiom
+/// and costs nothing. Exit codes are always 0/1/2 (see `errors::EXIT_*`), so the
+/// `as u8` cast is exact, never a truncation.
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     boot::init_tracing();
     let cli = Cli::parse();
     match dispatch(cli).await {
         Ok(out) => {
             print!("{}", ensure_newline(&out.text));
-            std::process::exit(out.code);
+            std::process::ExitCode::from(out.code as u8)
         }
         Err(e) => {
             eprintln!("torii: {}", e.message);
-            std::process::exit(e.code);
+            std::process::ExitCode::from(e.code as u8)
         }
     }
 }
@@ -196,9 +244,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 workspace_root,
             } => {
                 let d = boot::heavy(&env, &gateway_config, workspace_root.as_deref()).await?;
-                let shutdown = async {
-                    let _ = tokio::signal::ctrl_c().await;
-                };
+                let shutdown = shutdown_signal()?;
                 cmd::worker::serve(
                     &d.scheduler,
                     cmd::worker::ServeOpts { interval, once },
