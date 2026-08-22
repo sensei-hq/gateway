@@ -12,6 +12,17 @@ fn fmt_wake(w: Option<DateTime<Utc>>) -> String {
     }
 }
 
+/// A pause reason is free text from a provider or a pause site, so it can contain
+/// newlines and tabs. The table is line-oriented, so a raw newline would split one
+/// run's row into fragments with no id prefix — and a UUID inside such a fragment
+/// reads as a separate row, which is how an operator ends up cancelling the wrong
+/// run. Collapse control characters for DISPLAY only; JSON keeps the raw value.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 // Consumed by Task 6 (cmd/run.rs `status`/`list-paused`), the default (non-`--json`) output.
 #[allow(dead_code)]
 pub fn table(rows: &[ScheduledRun]) -> String {
@@ -24,7 +35,7 @@ pub fn table(rows: &[ScheduledRun]) -> String {
             r.run.0,
             r.status.as_str(),
             fmt_wake(r.next_wake),
-            r.reason.as_deref().unwrap_or("")
+            r.reason.as_deref().map(one_line).unwrap_or_default()
         ));
     }
     s
@@ -94,5 +105,63 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].next_wake, Some(t));
         assert_eq!(back[0].reason.as_deref(), Some("quota"));
+    }
+
+    #[test]
+    fn a_multiline_reason_cannot_forge_a_second_table_row() {
+        let forged = uuid::Uuid::from_u128(0xdead_beef_dead_beef_dead_beef_dead_beef);
+        let mut r = row(None, None);
+        r.reason = Some(format!("provider conflict\n{forged} is stuck"));
+        let out = table(&[r]);
+        let data_lines = out.lines().filter(|l| !l.starts_with("RUN ")).count();
+        assert_eq!(
+            data_lines, 1,
+            "one run must render as exactly one line:\n{out}"
+        );
+        assert!(
+            out.contains("provider conflict"),
+            "the reason text is kept: {out}"
+        );
+    }
+
+    #[test]
+    fn json_status_is_lowercase_matching_as_str_and_the_db() {
+        let out = json(&[row(None, None)]).expect("serializes");
+        assert!(out.contains("\"status\": \"paused\""), "{out}");
+        assert!(
+            !out.contains("\"Paused\""),
+            "PascalCase would break scripts: {out}"
+        );
+    }
+
+    #[test]
+    fn header_labels_align_with_data_columns_for_the_longest_status() {
+        // "cancelled" is 9 chars — the longest `RunStatus::as_str()` — so this pins
+        // the hand-counted header spacing against the `{:<9}` field with zero margin.
+        let r = ScheduledRun {
+            run: RunId(uuid::Uuid::from_u128(
+                0x1234_5678_9abc_def0_1234_5678_9abc_def0,
+            )),
+            status: RunStatus::Cancelled,
+            next_wake: None,
+            reason: None,
+            updated_at: DateTime::<Utc>::from_timestamp(3_000_000, 0).unwrap(),
+        };
+        let out = table(&[r]);
+        let mut lines = out.lines();
+        let header = lines.next().expect("header line");
+        let data = lines.next().expect("data line");
+        let status_col = header.find("STATUS").expect("STATUS header present");
+        let status_data = data.find("cancelled").expect("status text present");
+        assert_eq!(
+            status_col, status_data,
+            "STATUS header must align with the status column:\n{out}"
+        );
+        let wake_col = header.find("NEXT WAKE").expect("NEXT WAKE header present");
+        let wake_data = data.find('—').expect("em dash present");
+        assert_eq!(
+            wake_col, wake_data,
+            "NEXT WAKE header must align with the wake column:\n{out}"
+        );
     }
 }
