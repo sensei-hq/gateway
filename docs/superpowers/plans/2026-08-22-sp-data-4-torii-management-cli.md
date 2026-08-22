@@ -829,9 +829,11 @@ Append to the existing `#[cfg(test)] mod tests` in `crates/orchestrator-core/src
     async fn reload_reads_config_and_version_through_the_atomic_pair_method() {
         use std::sync::atomic::Ordering::SeqCst;
         let src = CountingSource::new(cfg_with_skill("s1"), 9);
-        let h = RegistryHandle::new(Arc::new(Registry::default()));
-        let gen = h.reload(&src).await.expect("reloads");
-        assert_eq!(gen, 9, "the durable version is pinned as the generation");
+        // `RegistryHandle::new` takes `Registry` BY VALUE, not `Arc<Registry>`.
+        let h = RegistryHandle::new(Registry::default());
+        // `gen` is a RESERVED KEYWORD in edition 2024 — do not name a binding that.
+        let g = h.reload(&src).await.expect("reloads");
+        assert_eq!(g, 9, "the durable version is pinned as the generation");
         assert_eq!(src.pairs.load(SeqCst), 1, "reload must use load_versioned");
         assert_eq!(
             (src.loads.load(SeqCst), src.versions.load(SeqCst)),
@@ -862,9 +864,13 @@ Append to the existing `#[cfg(test)] mod tests` in `crates/orchestrator-core/src
     }
 ```
 
-If `RegistryHandle` has no public `generation()` accessor, use the value returned by `reload` for
-the first two tests and replace `h.generation()` with a `reload` of the same source (asserting the
-pinned value) in `from_source_also_uses_the_atomic_pair_method`.
+`RegistryHandle::generation()` **is** public (`registry.rs:471`), so use it directly.
+
+Also add a `FailingSource` (returns `Err` from `load()`, does NOT override `load_versioned`) plus two
+tests, since `load_versioned` is now the single chokepoint both entry points depend on and no existing
+test covers the source itself failing: `reload` from a failing source must leave the previous registry
+live **and not advance the generation** (a bumped counter over an old registry would be silent fence
+drift), and `from_source` on a failing source must yield `Err` with no handle.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -952,6 +958,34 @@ git commit -m "feat(core): SP-DATA-4 (4/11) — defaulted ConfigSource::load_ver
 - Modify: `crates/orchestrator-store/src/postgres.rs:425-598` (`PostgresConfigSource`)
 - Modify: `crates/orchestrator-store/Cargo.toml` (new `test-support` feature)
 - Modify: `crates/orchestrator/Cargo.toml` (`postgres-tests` also enables `orchestrator-store/test-support`)
+
+- [ ] **Step 0: Add the versioned-source tripwire to the defaulted `load_versioned`**
+
+Carried forward from Task 4's quality review. The default `load_versioned` is a footgun: a versioned
+backend that forgets to override it silently gets the torn-pair behavior — no compile error, no
+runtime signal, and the consequence is a silent wrong-config resume. A doc comment does not stop a
+second implementor, or a refactor that deletes an override later. Add to the default body in
+`crates/orchestrator-core/src/registry.rs`:
+
+```rust
+    debug_assert!(
+        ver.is_none(),
+        "ConfigSource::version() returned Some(_) through the DEFAULT load_versioned() — a \
+         versioned source MUST override load_versioned with a single atomic snapshot, or it \
+         reopens the torn (stale config, fresh generation) read hazard"
+    );
+```
+
+This lands in the SAME commit as the Postgres override below, deliberately: on its own it would turn
+the existing `postgres_*` fence e2e tests red, and this project does not leave the tree red between
+commits.
+
+**Prove the tripwire works** (a mutation check, since a `debug_assert` that never fires is
+indistinguishable from no tripwire at all): after both changes are in, temporarily comment out the
+`load_versioned` override on `PostgresConfigSource`, run
+`cargo test -p sensei-orchestrator --features postgres-tests -- --test-threads=1` with `DATABASE_URL`
+set, and confirm a `postgres_*` fence test now panics on the assertion. Then restore the override and
+confirm green.
 
 - [ ] **Step 1: Add the `test-support` feature**
 
