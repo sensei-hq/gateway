@@ -910,6 +910,39 @@ mod tests {
         RunId(uuid::Uuid::new_v4())
     }
 
+    // ---- Isolation for the tests that CANNOT scope themselves ------------------------------
+    //
+    // Most tests here isolate by a fresh `RunId`, so they are parallel-safe. Two groups
+    // cannot, and they are serialized with process-wide guards rather than by relying on
+    // `--test-threads=1` — correctness must not depend on how the suite is invoked, or a
+    // plain `cargo test` goes red while `-j1` stays green (a masked failure).
+    //
+    // These are `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held across the
+    // test's awaits, which trips `clippy::await_holding_lock` (denied here) and would park a
+    // worker thread of the multi-threaded test below. A bonus for this use: tokio's mutex has
+    // NO poisoning, so a panicking test simply releases the guard instead of cascading one
+    // real failure into a dozen confusing ones across its whole group.
+
+    /// Group 1 — the `config_*` tables and the single-row `config_versions`. There is no
+    /// per-test key to scope by: `config_versions` is `id boolean PK check(id)`, i.e.
+    /// deliberately ONE row, so any test asserting a specific generation conflicts with any
+    /// concurrent config writer, and `store`/`store_and_bump` are replace-ALL.
+    static CONFIG_TABLES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn config_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        CONFIG_TABLES.lock().await
+    }
+
+    /// Group 2 — `scheduled_runs` claim sweeps. A fresh `RunId` is NOT enough here:
+    /// `claim_due` is an instance-wide sweep (`… limit N`), so a concurrent test's claim
+    /// steals another test's due row and the victim's `any(|x| x == r)` assertion fails.
+    /// Only tests that CLAIM need this; the enqueue/status-only tests scope fine by run id.
+    static SCHEDULED_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn scheduler_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        SCHEDULED_RUNS.lock().await
+    }
+
     fn started() -> JournalEvent {
         JournalEvent::RunStarted {
             version: "v1".into(),
@@ -1262,6 +1295,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_then_load_round_trips_config() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         let s = uniq("skill");
@@ -1281,6 +1315,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_is_zero_on_empty_then_monotonic_under_bump() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         // config_versions is a single shared row; assert STRICT INCREASE (robust under a shared row).
@@ -1300,6 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_is_replace_all_removed_entities_do_not_linger() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         let keep = uniq("keep");
@@ -1330,6 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn chain_bindings_round_trip_as_a_relational_row() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         let area = uniq("area");
@@ -1359,6 +1396,7 @@ mod tests {
     /// that nested structure exactly, not just that a row with the right name exists.
     #[tokio::test]
     async fn agent_and_tool_round_trip_through_jsonb_including_nested_fields() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         let agent_name = uniq("agent");
@@ -1565,6 +1603,7 @@ mod tests {
     /// silently keeps `{x, z}`.
     #[tokio::test]
     async fn concurrent_store_and_bumps_do_not_merge_their_content() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
 
@@ -1650,6 +1689,7 @@ mod tests {
     /// cycle). Real parallelism is what makes the cycle reachable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_writers_with_overlapping_names_neither_deadlock_nor_merge() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         src.store_and_bump(&RegistryConfig::default())
@@ -1713,6 +1753,7 @@ mod tests {
     /// isolation level` line deleted from `load_versioned`. This version fails.
     #[tokio::test]
     async fn load_versioned_returns_a_consistent_pair_despite_a_writer_committing_mid_read() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
 
@@ -1810,6 +1851,7 @@ mod tests {
     /// the test that guards the production code path.
     #[tokio::test]
     async fn repeatable_read_snapshots_are_fixed_at_the_first_read() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
 
@@ -1861,6 +1903,7 @@ mod tests {
     /// AC6 — content and generation move together, atomically.
     #[tokio::test]
     async fn store_and_bump_advances_content_and_generation_together() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         let (_, before) = src.load_versioned().await.unwrap();
@@ -1883,6 +1926,7 @@ mod tests {
     /// AC6 — a rolled-back write moves NEITHER content nor generation.
     #[tokio::test]
     async fn a_failed_store_and_bump_leaves_content_and_generation_untouched() {
+        let _guard = config_guard().await;
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
         src.store_and_bump(&cfg_with_skill("stable")).await.unwrap();
@@ -1930,6 +1974,7 @@ mod tests {
     /// The exactly-once gate: two concurrent `claim_due` on one due run → exactly one wins.
     #[tokio::test]
     async fn pg_claim_due_is_exactly_once_under_concurrent_claims() {
+        let _guard = scheduler_guard().await;
         let Some(url) = db_url() else { return };
         let s = PostgresSchedulerStore::new(connect(&url).await.unwrap());
         let r = run();
@@ -1955,6 +2000,7 @@ mod tests {
     /// Round-trip + transitions: not-due is skipped; due is claimed (stored graph returned); terminal.
     #[tokio::test]
     async fn pg_round_trip_and_transitions() {
+        let _guard = scheduler_guard().await;
         let Some(url) = db_url() else { return };
         let s = PostgresSchedulerStore::new(connect(&url).await.unwrap());
         let r = run();
@@ -1997,6 +2043,7 @@ mod tests {
     /// Intervene: cancel makes a paused run unwakeable; force_wake makes a NULL-deadline pause claimable.
     #[tokio::test]
     async fn pg_cancel_and_force_wake() {
+        let _guard = scheduler_guard().await;
         let Some(url) = db_url() else { return };
         let s = PostgresSchedulerStore::new(connect(&url).await.unwrap());
         let (c, f) = (run(), run());
