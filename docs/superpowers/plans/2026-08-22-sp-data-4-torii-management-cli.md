@@ -2210,7 +2210,9 @@ sleep, so `a_persistent_store_fault_exits_non_zero_after_the_cap` sees exactly
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p sensei-torii cmd::worker`
-Expected: 7 passed. If `a_transient_store_fault_is_retried_not_fatal` is flaky under
+Expected: 6 passed (the code block above defines six tests). Note the gap this leaves: nothing
+exercises the counter RESET — four failures, a success, then four more failures must not exit. Add
+that seventh test. If `a_transient_store_fault_is_retried_not_fatal` is flaky under
 `start_paused`, replace the spawned timer with a shutdown future that resolves after a fixed
 `tokio::time::sleep(Duration::from_secs(60))` — with a paused clock this is deterministic and
 instant.
