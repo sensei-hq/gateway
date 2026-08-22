@@ -10,6 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 
 /// A scheduled run's lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RunStatus {
     /// In-flight — either `submit`'s initial drive or a claimed wake; lease-protected.
     Waking,
