@@ -25,8 +25,28 @@ use orchestrator_store::postgres::{
 };
 use std::sync::Arc;
 
+/// WHOLE-SLICE FIX 6: `None` also emits a VISIBLE skip notice naming the test, so a green
+/// run that touched no database is distinguishable from one that did. Written to the real
+/// stderr rather than through `eprintln!`, which libtest captures for a passing test. (Same
+/// helper as torii's internal `test_guard::db_url`; an integration test is a separate crate
+/// and cannot see a `#[cfg(test)]` item.)
 fn db_url() -> Option<String> {
-    std::env::var("DATABASE_URL").ok()
+    let url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if url.is_none() {
+        use std::io::Write;
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed test>")
+            .to_string();
+        // Formatted first, then ONE `write_all`: `Stderr` is unbuffered, so a
+        // `writeln!` emits a separate syscall per format fragment and a parallel
+        // test's output interleaves mid-line.
+        let line = format!("SKIP {name}: DATABASE_URL not set\n");
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }
+    url
 }
 
 /// `scheduled_runs` is a GLOBAL table and `tick()` claims the whole due set, not just the
@@ -137,7 +157,9 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
         )))
         .with_clock(clock.clone());
     let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
-    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone())
+    // `|| {}` for the announce hook: `main` passes the `submitted: <id>` print, which a
+    // test has no use for.
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), || {})
         .await
         .expect("a paused run is not an error");
     assert_eq!(submitted.code, torii::errors::EXIT_OK, "{}", submitted.text);
@@ -268,7 +290,7 @@ async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
         )))
         .with_clock(clock.clone());
     let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
-    let submitted = torii::cmd::run::submit(&sched_a, run, one_node_graph(&marker))
+    let submitted = torii::cmd::run::submit(&sched_a, run, one_node_graph(&marker), || {})
         .await
         .expect("a paused run is not an error");
     assert!(submitted.text.starts_with("paused:"), "{}", submitted.text);

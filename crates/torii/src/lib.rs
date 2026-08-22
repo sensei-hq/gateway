@@ -12,9 +12,43 @@ pub mod diff;
 pub mod errors;
 pub mod render;
 
-/// Test-only serialization for the durable config tables.
+/// Test-only helpers: serialization for the durable config tables, and the shared
+/// `DATABASE_URL` guard every DB-gated unit test in this crate goes through.
 #[cfg(test)]
 pub(crate) mod test_guard {
+    /// The single choke point for every DB-gated unit test in this crate: `Some(url)` to
+    /// run, `None` — plus a VISIBLE skip notice naming the test — to skip.
+    ///
+    /// WHOLE-SLICE FIX 6: a silent early return made a skipped DB suite indistinguishable
+    /// from a green one (same test count, same "ok"), so a CI job that loses the variable
+    /// reported a fully-passing database suite that touched nothing.
+    ///
+    /// Written to the process's REAL stderr rather than through `eprintln!`: libtest
+    /// captures the print macros and replays them only for a FAILING test, so an
+    /// `eprintln!` notice would be invisible in exactly the green run it exists to
+    /// annotate. `std::io::stderr()` writes fd 2 directly, bypassing that capture.
+    ///
+    /// Under libtest the current thread's name IS the test's path, which is what lets one
+    /// helper at the choke point still name the test that skipped.
+    pub(crate) fn db_url() -> Option<String> {
+        let url = std::env::var(crate::boot::ENV_DATABASE_URL)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if url.is_none() {
+            use std::io::Write;
+            let name = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed test>")
+                .to_string();
+            // Formatted first, then ONE `write_all`: `Stderr` is unbuffered, so a
+            // `writeln!` emits a separate syscall per format fragment and a parallel
+            // test's output interleaves mid-line.
+            let line = format!("SKIP {name}: {} not set\n", crate::boot::ENV_DATABASE_URL);
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+        url
+    }
+
     /// `orchestrator.config_*` is GLOBAL and every durable write is replace-all, so two
     /// tests writing it concurrently clobber each other's seeded content and move the
     /// generation the other just measured. It lives at crate root because the writers are
