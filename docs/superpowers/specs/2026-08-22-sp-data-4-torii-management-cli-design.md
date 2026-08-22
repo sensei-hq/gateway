@@ -145,6 +145,29 @@ a worker tick does the driving:
 queued for wake: 9b21…7e (a worker tick will drive it)
 ```
 
+**The re-read must key on `status`, not on `next_wake` presence.** `next_wake` is not a value
+uniquely produced by a successful `force_wake`: `claim_due` flips `paused → waking` and leaves
+`next_wake` **untouched**. So `after.next_wake.is_some()` cannot distinguish "my `force_wake` set
+this" from "this was already set and my call was a no-op" — and the no-op case is ordinary, because an
+operator runs `wake` precisely on the overdue pauses a worker tick is also about to claim. With an
+`is_some()` check, a run claimed between the pre-check and the `force_wake` reports *"queued for wake
+— a worker tick will drive it"* at **exit 0** while the run is already being driven and the command
+changed nothing. The correct condition keys on **status** as the primary signal — `after.status == Paused` — because a
+successful `force_wake` leaves the run `paused`, whereas a lost race leaves it `waking` (worker
+claimed) or `cancelled` (another operator). The failure branch names the actual status, so a
+cancellation is not misdiagnosed as a missing deadline.
+
+The timestamp is secondary corroboration, and it needs a **symmetric drift tolerance**, not an
+equality or an inequality. Measured against the real backend: Postgres `timestamptz` is
+microsecond-resolution while `chrono` carries nanoseconds, and Postgres **rounds to nearest** rather
+than truncating — sending `…10.123456789Z` reads back `…10.123457000Z`, i.e. **211 ns later** than the
+value sent. So `t == now` fails always and `t <= now` fails whenever the nanosecond fraction rounds
+up, which is about half of real `Utc::now()` calls — a false negative on the happy path, worse than
+the bug being fixed. Use `|t - now| <= 1ms`: three orders of magnitude above the observed rounding
+error, still far tighter than any real stale-deadline value. The timestamp check is load-bearing
+despite `status == Paused`: a run that went `paused → waking → paused` via a claim and a re-pause
+would satisfy the status check while carrying the *new pause's* deadline rather than this call's.
+
 ### 5.2 `config push` validates before it writes
 
 Order is **validate → diff → confirm → write**, and the validate step is load-bearing:
