@@ -194,7 +194,30 @@ config diff (durable v7 -> ./config):
 This REMOVES 2 entities. Continue? [y/N]
 ```
 
-Non-interactive stdin (EOF/not a tty) without `--yes` **refuses and changes nothing**.
+Non-interactive stdin (EOF/not a tty) without `--yes` **refuses and changes nothing**. That guarantee
+is what stops `torii config push ./cfg < /dev/null` in a cron job from wiping config, so the default
+confirmer lives in `cmd/config.rs` beside the doc that specifies it — generic over reader/writer and
+unit-tested for EOF ⇒ false — rather than being described in one module and implemented in another.
+
+**The diff must be re-validated immediately before the write.** Steps 2–4 are a check-then-act
+sequence: the diff is computed from a snapshot, the prompt can sit in front of a human for minutes,
+and then a replace-all executes. A concurrent writer in that window means the approved diff no longer
+describes what the write will do. Demonstrated: durable `{a, b}` at v1, the operator is shown
+"REMOVES 2 — a, b" and approves, a second writer commits `{a, b, c-brand-new}` → v2 during the read,
+and the push lands `{survivor}` at v3 — **destroying `c-brand-new`, which appears nowhere in the text
+the operator approved**, unrecoverably. The `Apply` branch has the same hole with a millisecond window
+and *no prompt at all*. So `push` re-reads the generation immediately before writing and refuses if it
+moved, on both branches.
+
+**Entity names are sanitized in the prompt.** The prompt text *is* the destruction consent, so it is
+the most safety-critical renderer in the CLI — more so than the run table. A name containing a newline
+or an ANSI escape survives `FilesystemConfigSource`, passes `Registry::from_config`, and round-trips
+through Postgres jsonb intact, and getting one in requires no confirmation because a pure addition
+never prompts. Such a name can then forge removal lines (including a verbatim copy of torii's own
+"no changes" message) or use `\u{1b}[4A\u{1b}[2K` to erase the real removal lines above it. The
+`requires_confirmation()` gate and the trailing `REMOVES N` count are computed from the diff and stay
+truthful; what a raw render compromises is the operator's knowledge of *which* entities die. Every
+name goes through the shared `one_line` control-character collapse.
 
 ### 5.3 `submit` drives inline
 
@@ -413,6 +436,13 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
 - **Redactor coverage for pause reasons** (§8), and a `reason` length cap.
 - **`config pull` / rollback** — today recovery from a bad push means re-pushing a good directory;
   the old rows are gone.
+- **An airtight compare-and-swap on the config write.** `push` re-reads the generation immediately
+  before writing and refuses if it moved (§5.2), which closes the minutes-long human-latency window —
+  the entire practical risk. A residual ~1 ms window remains between that re-read returning and
+  `store_and_bump`'s bump committing. Closing it properly is cheap and known: because `store_and_bump`
+  already bumps *first*, a `store_and_bump_if(expected_version)` adding `where version = $1` to that
+  `UPDATE` is a true CAS at zero extra round-trips. Deferred only because it is an `orchestrator-store`
+  API change, and the residual window is negligible against two humans.
 - **Pool sizing** — `connect()` hardcodes `max_connections(8)` (s1 defer-minor); a multi-worker
   deployment will want it configurable.
 - **Metrics/tracing export** from `worker serve` (counts, wake latency, backoff state).
