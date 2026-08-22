@@ -59,11 +59,22 @@ fn an_unparseable_interval_is_rejected_by_the_parser() {
     assert!(err.contains("invalid interval"), "{err}");
 }
 
-/// A connect failure must never echo the password.
+/// A connect failure must never echo the password. Deliberately uses a port
+/// number out of the valid u16 range (not a refused-connection address like
+/// `127.0.0.1:1`): sqlx's pool treats `ECONNREFUSED` as transient and retries
+/// with backoff for the whole default 30s `acquire_timeout`, so a refused-port
+/// target makes this test take ~30s. An out-of-range port fails to parse into
+/// `PgConnectOptions` before any I/O happens at all, so this is a millisecond
+/// test — while still routing the raw URL through the real `boot::light` ->
+/// `redact_url` error path, so the assertion below exercises genuine
+/// redaction rather than short-circuiting before it ever runs. (An
+/// unresolvable hostname was also measured fast, but rejected: it depends on
+/// the CI/sandbox DNS stack resolving-and-failing quickly, which a parse
+/// failure does not need at all.)
 #[test]
 fn a_connect_failure_does_not_leak_the_password() {
     let pw = format!("s3cr{}t", "e");
-    let url = format!("postgres://operator:{pw}@127.0.0.1:1/none");
+    let url = format!("postgres://operator:{pw}@127.0.0.1:999999/none");
     let out = torii()
         .env("DATABASE_URL", &url)
         .args(["config", "version"])
