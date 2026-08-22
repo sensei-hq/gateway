@@ -216,12 +216,25 @@ those sources stay byte-identical.
 
 ### 6.2 Atomic write — `store_and_bump()`
 
-`store_and_bump(&cfg) -> u64` performs the deletes, the inserts, and the version increment in
+`store_and_bump(&cfg) -> u64` performs the version increment, the deletes, and the inserts in
 **one transaction**. This closes more than the documented "caller forgets to bump" footgun:
 even a disciplined caller doing `store()` then `bump()` has a **crash window** between them,
 and dying in it leaves new content under an old generation *durably* — precisely the
 silent-wrong-config state the fence exists to prevent. One transaction removes the window
 instead of asking callers to be careful.
+
+**The increment goes FIRST, and that ordering is load-bearing.** With the bump last, two concurrent
+`store_and_bump` calls at the default READ COMMITTED silently **merge**: writer B's `DELETE` takes its
+statement snapshot before A commits, so A's freshly-inserted rows are invisible to it and survive B's
+"replace-all". Both writers return `Ok` and the durable config is *neither* writer's. The damaging
+case is a revocation — config `{x}` durable, A pushes `{x, z}`, B concurrently pushes `{}` to revoke
+everything; B deletes nothing it can see, inserts nothing, and the result is `{x, z}` at gen+2, so the
+revocation silently did not happen with a success exit code. Bumping first serializes every writer on
+the single `config_versions` row, so B blocks until A commits and B's `DELETE` then runs on a
+post-commit snapshot: true last-writer-wins. It also removes a pkey-index deadlock between two
+writers inserting shared names in different order. Note the **fence survived even the merge** (every
+content-mutating transaction bumps within that transaction, so content-changed ⇒ generation-changed
+holds) — this was a wrong-durable-content bug, not a wrong-config-resume one.
 
 **The two fixes compose provably.** A `REPEATABLE READ` reader takes its snapshot at first
 read; a single-transaction writer either committed before it (reader sees new content *and*
@@ -331,6 +344,12 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
   first read, run a **complete `store_and_bump` from a second connection**, then finish reading
   in the first transaction → the returned pair is the **old consistent** pair. Deterministic
   proof that `(stale config, fresh gen)` is unreachable, not a race-hopeful one.
+  **The assertion must be on the pair `load_versioned` itself returns**, with the writer interleaved
+  *inside* that call (block it mid-read with a `LOCK TABLE … ACCESS EXCLUSIVE` on a table it reads
+  after the first one, commit the writer, then await it). A test that hand-rolls its own transaction
+  and asserts on values read inside *that* transaction proves only that Postgres implements
+  `REPEATABLE READ` — it passes with the `SET` deleted from the implementation, so it does not guard
+  the line. Verify the test FAILS with the `SET` removed.
 - **AC6 — atomic write (Docker):** `store_and_bump` moves content and version together; a
   rolled-back transaction moves neither. `load_versioned` afterward reproduces `cfg` exactly,
   including nested grants/permissions/credentials/input_schema (s2's AC2 property).
