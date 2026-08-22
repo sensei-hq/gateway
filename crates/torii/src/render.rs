@@ -17,7 +17,13 @@ fn fmt_wake(w: Option<DateTime<Utc>>) -> String {
 /// run's row into fragments with no id prefix — and a UUID inside such a fragment
 /// reads as a separate row, which is how an operator ends up cancelling the wrong
 /// run. Collapse control characters for DISPLAY only; JSON keeps the raw value.
-fn one_line(s: &str) -> String {
+///
+/// `char::is_control` covers Unicode category Cc, which includes ESC (`\u{1b}`) — so
+/// this also collapses ANSI escape sequences, not just newlines/tabs. `pub(crate)`
+/// because `cmd::config::describe_diff` shares it: an entity name is equally free
+/// text, and its diff text is the destruction consent an operator reads before
+/// approving a replace-all write, so it needs the identical guard.
+pub(crate) fn one_line(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -122,6 +128,21 @@ mod tests {
             out.contains("provider conflict"),
             "the reason text is kept: {out}"
         );
+    }
+
+    /// `char::is_control` is documented as covering Unicode category Cc — verify that
+    /// actually includes ESC (`\u{1b}`) rather than assume it, since a `describe_diff`
+    /// consent prompt depends on `one_line` collapsing ANSI cursor-control escapes, not
+    /// just newlines/tabs.
+    #[test]
+    fn one_line_collapses_the_escape_control_character() {
+        let out = one_line("k\u{1b}[4A\u{1b}[2Kerased\u{1b}[K");
+        assert!(
+            !out.contains('\u{1b}'),
+            "no raw escape byte may survive: {out:?}"
+        );
+        assert_eq!(out.lines().count(), 1, "still a single line: {out:?}");
+        assert!(out.contains("erased"), "the real text is kept: {out:?}");
     }
 
     #[test]
