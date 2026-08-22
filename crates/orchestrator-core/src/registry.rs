@@ -271,8 +271,20 @@ pub trait ConfigSource: Send + Sync {
     /// (stale config, fresh generation) pair, a run stamps a fresh-generation
     /// fence over stale config, and a later resume matches the fence and silently
     /// continues under different config (SP-DATA-2 carry-forward).
+    /// A tripwire guards the footgun: reaching this default WITH a `Some(_)`
+    /// version means a versioned backend forgot to override it, which otherwise
+    /// fails silently (no compile error, no runtime signal) and reopens the
+    /// hazard above.
     async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
-        Ok((self.load().await?, self.version().await?))
+        let cfg = self.load().await?;
+        let ver = self.version().await?;
+        debug_assert!(
+            ver.is_none(),
+            "ConfigSource::version() returned Some(_) through the DEFAULT load_versioned() — a \
+             versioned source MUST override load_versioned with a single atomic snapshot, or it \
+             reopens the torn (stale config, fresh generation) read hazard"
+        );
+        Ok((cfg, ver))
     }
 }
 
@@ -1427,6 +1439,10 @@ mod tests {
     }
 
     /// A ConfigSource that reports a durable generation (mirrors PostgresConfigSource).
+    /// Overrides `load_versioned` for the same reason the real backend must: a versioned
+    /// source owes callers ONE consistent (config, generation) pair, and the default's two
+    /// separate reads are the torn-pair hazard. Its own fields are immutable, so returning
+    /// them together IS the atomic snapshot.
     struct VersionedSource(RegistryConfig, u64);
     #[async_trait::async_trait]
     impl ConfigSource for VersionedSource {
@@ -1435,6 +1451,9 @@ mod tests {
         }
         async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
             Ok(Some(self.1))
+        }
+        async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+            Ok((self.0.clone(), Some(self.1)))
         }
     }
 
