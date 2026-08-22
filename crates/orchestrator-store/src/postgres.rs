@@ -595,10 +595,30 @@ impl PostgresConfigSource {
     /// generation DURABLY — a cross-process resume then matches the unchanged fence
     /// and silently runs the new config. Atomicity removes the window instead of
     /// asking callers to be careful.
+    ///
+    /// The bump comes FIRST, and the order is load-bearing — it is what makes
+    /// concurrent writers serialize. Every writer's first act is to increment the
+    /// single `config_versions` row, so a second writer blocks there until the first
+    /// COMMITS; its replace-all `DELETE` then runs on a statement snapshot taken
+    /// after that commit and actually removes the first writer's rows. True
+    /// last-writer-wins.
+    ///
+    /// With the bump last, the loser's `DELETE` takes its snapshot BEFORE the winner
+    /// commits (the transaction runs at READ COMMITTED), cannot see the winner's
+    /// freshly-inserted rows, and they survive the "replace-all": the durable content
+    /// becomes the UNION of both configs while both calls return `Ok`. A push that
+    /// reports success and did not happen — e.g. an operator revoking everything with
+    /// `{}` concurrently with a `{x, z}` push silently keeps `{x, z}`. Bumping first
+    /// also removes a pkey-index deadlock between two writers inserting overlapping
+    /// names in different order.
+    ///
+    /// Deliberately NOT solved by raising the isolation level: REPEATABLE READ or
+    /// SERIALIZABLE would turn the merge into a `40001` serialization failure, which
+    /// only converts silent corruption into a retry obligation for every caller.
     pub async fn store_and_bump(&self, cfg: &RegistryConfig) -> Result<u64, OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(store_err)?;
-        write_all(&mut tx, cfg).await?;
         let v = bump_on(&mut tx).await?;
+        write_all(&mut tx, cfg).await?;
         tx.commit().await.map_err(store_err)?;
         Ok(v)
     }
@@ -1460,12 +1480,297 @@ mod tests {
         }
     }
 
-    /// AC5 — the TOCTOU is CLOSED, proven adversarially rather than hopefully.
-    /// A REPEATABLE READ snapshot is taken at the transaction's first read; a
-    /// concurrent single-transaction writer therefore lands entirely before or
-    /// entirely after it. Never (stale config, fresh generation).
+    /// A minimal named `ToolSpec` — the atomic-read test needs content in a table read
+    /// AFTER the first one, and `config_tools` is `read_all`'s third table.
+    fn cfg_tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: Some("d".into()),
+            input_schema: serde_json::json!({"type": "object"}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Default::default(),
+            activation: Default::default(),
+            credentials: Default::default(),
+        }
+    }
+
+    /// Block until some backend is genuinely waiting on a lock, so the interleaving
+    /// tests below are DETERMINISTIC rather than sleep-and-hope. Without this a slow
+    /// spawned writer could still be pre-lock when we release the other side, and the
+    /// test would pass for the wrong reason (a false green on broken code).
+    async fn wait_until_a_backend_blocks(pool: &PgPool) {
+        for _ in 0..200 {
+            let (n,): (i64,) = sqlx::query_as("select count(*) from pg_locks where not granted")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if n > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no backend ever blocked on a lock — the interleaving under test never happened");
+    }
+
+    /// The four config tables, in `write_all`'s replace-all order.
+    const CFG_TABLES: [&str; 4] = [
+        "orchestrator.config_agents",
+        "orchestrator.config_skills",
+        "orchestrator.config_tools",
+        "orchestrator.config_chain_bindings",
+    ];
+
+    /// FIX 1 — two concurrent `store_and_bump`s must never MERGE their content.
+    ///
+    /// Both writers increment the single `config_versions` row FIRST, so they serialize
+    /// there. The loser then runs its replace-all `DELETE` on a statement snapshot taken
+    /// AFTER the winner committed, so it actually removes the winner's rows: true
+    /// last-writer-wins.
+    ///
+    /// With the bump LAST (the original ordering) the loser's `DELETE` takes its snapshot
+    /// before the winner commits, cannot see the winner's freshly-inserted rows, and they
+    /// survive the "replace-all" — the durable content becomes the UNION of both configs
+    /// while BOTH calls return `Ok`. That is a config push that reports success and did not
+    /// happen: an operator revoking access with `{}` against a concurrent `{x, z}` push
+    /// silently keeps `{x, z}`.
     #[tokio::test]
-    async fn load_versioned_is_immune_to_a_concurrent_store_and_bump() {
+    async fn concurrent_store_and_bumps_do_not_merge_their_content() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+
+        // Seed EMPTY content: the loser's DELETE then has no rows of its own to block on,
+        // so the ONLY contention is the version row — exactly the mechanism under test.
+        let v0 = src
+            .store_and_bump(&RegistryConfig::default())
+            .await
+            .unwrap();
+
+        // Writer A: an explicit transaction shaped exactly like `store_and_bump` (bump,
+        // then replace-all), held open so we control when it commits.
+        let mut a = src.pool_for_test().begin().await.unwrap();
+        let (va,): (i64,) = sqlx::query_as(
+            "insert into orchestrator.config_versions (id, version) values (true, 1)
+             on conflict (id) do update set version = orchestrator.config_versions.version + 1,
+                                            updated_at = now()
+             returning version",
+        )
+        .fetch_one(&mut *a)
+        .await
+        .unwrap();
+        for t in CFG_TABLES {
+            sqlx::query(&format!("delete from {t}"))
+                .execute(&mut *a)
+                .await
+                .unwrap();
+        }
+        sqlx::query("insert into orchestrator.config_skills (name, def) values ($1, $2)")
+            .bind("a1")
+            .bind(serde_json::to_value(skill("a1")).unwrap())
+            .execute(&mut *a)
+            .await
+            .unwrap();
+
+        // Writer B: a REAL `store_and_bump` on an independent connection. It must block
+        // until A commits (on the version row when bumping first).
+        let writer = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let b = tokio::spawn(async move { writer.store_and_bump(&cfg_with_skill("b1")).await });
+        wait_until_a_backend_blocks(src.pool_for_test()).await;
+        assert!(!b.is_finished(), "B must not commit before A does");
+
+        a.commit().await.unwrap();
+        let vb = b
+            .await
+            .unwrap()
+            .expect("the losing writer still reports success");
+
+        let (cfg, generation) = src.load_versioned().await.unwrap();
+        let names: Vec<&str> = cfg.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["b1"],
+            "last-writer-wins: the durable content must be EXACTLY the last writer's config, \
+             never the union of both"
+        );
+        assert_eq!(va as u64, v0 + 1, "A took the first generation step");
+        assert_eq!(vb, v0 + 2, "B's bump serialized after A's");
+        assert_eq!(generation, Some(v0 + 2), "both bumps are durable");
+    }
+
+    /// FIX 1 (corollary) — the same reorder also removes a DEADLOCK. Two writers whose
+    /// configs share an entity name could each hold the primary-key index entry the other
+    /// needed next and abort with `40P01`. Bumping the single version row first serializes
+    /// writers BEFORE either touches content, so the interleaving cannot arise.
+    ///
+    /// Doubles as the invariant statement of the merge bug without hand-built interleaving:
+    /// after two genuinely concurrent pushes, the durable content must equal EXACTLY one of
+    /// the two inputs — never their union.
+    #[tokio::test]
+    async fn concurrent_writers_with_overlapping_names_neither_deadlock_nor_merge() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        src.store_and_bump(&RegistryConfig::default())
+            .await
+            .unwrap();
+
+        // One shared name, one distinct — and in OPPOSITE order, the shape that made two
+        // writers grab the shared pkey entry from different directions.
+        let cfg_of = |own: &str, first_shared: bool| {
+            let mine = skill(own);
+            let shared = skill("s_shared");
+            RegistryConfig {
+                agents: vec![],
+                skills: if first_shared {
+                    vec![shared, mine]
+                } else {
+                    vec![mine, shared]
+                },
+                tools: vec![],
+                chain_bindings: vec![],
+            }
+        };
+        let (one, two) = (cfg_of("s_x", false), cfg_of("s_y", true));
+        let wa = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let wb = PostgresConfigSource::new(connect(&url).await.unwrap());
+
+        // Repeat: a deadlock is a race, so one round could get lucky.
+        for round in 0..10 {
+            let (a, b) = (wa.clone(), wb.clone());
+            let (o, t) = (one.clone(), two.clone());
+            let ha = tokio::spawn(async move { a.store_and_bump(&o).await });
+            let hb = tokio::spawn(async move { b.store_and_bump(&t).await });
+            ha.await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: writer A failed (deadlock?): {e:?}"));
+            hb.await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: writer B failed (deadlock?): {e:?}"));
+
+            let (cfg, _) = src.load_versioned().await.unwrap();
+            let mut names: Vec<&str> = cfg.skills.iter().map(|s| s.name.as_str()).collect();
+            names.sort_unstable();
+            assert!(
+                names == ["s_shared", "s_x"] || names == ["s_shared", "s_y"],
+                "round {round}: content must be exactly one writer's config, got {names:?} \
+                 (three names = the two configs merged)"
+            );
+        }
+    }
+
+    /// AC5 — `load_versioned` ITSELF returns a consistent pair with a writer committing
+    /// in the MIDDLE of its read. This is the real guard for the TOCTOU fix.
+    ///
+    /// Mechanism: `read_all` reads agents, then skills, then tools, then bindings. Holding
+    /// `access exclusive` on `config_tools` lets the reader take its snapshot on the FIRST
+    /// read and then block on the THIRD, giving the writer a window to commit a complete
+    /// new config mid-read. Under the `repeatable read` snapshot the reader must still
+    /// return the ENTIRELY OLD world; without it each statement re-snapshots and the
+    /// returned pair is torn (`t_new` content under a fresh generation).
+    ///
+    /// Deliberately asserts on `load_versioned`'s OWN return value, not on a
+    /// hand-rolled transaction: an earlier version of this test drove its own
+    /// `repeatable read` transaction and asserted on values read inside it, which merely
+    /// demonstrated Postgres semantics — it passed even with the `set transaction
+    /// isolation level` line deleted from `load_versioned`. This version fails.
+    #[tokio::test]
+    async fn load_versioned_returns_a_consistent_pair_despite_a_writer_committing_mid_read() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+
+        // Seed a known, self-consistent world: skill "old" + tool "t_old" at v0.
+        let seed = RegistryConfig {
+            agents: vec![],
+            skills: vec![skill("old")],
+            tools: vec![cfg_tool("t_old")],
+            chain_bindings: vec![],
+        };
+        let v0 = src.store_and_bump(&seed).await.unwrap();
+
+        // Take the gate BEFORE the reader starts, so the reader is guaranteed to block
+        // on its third read rather than racing past it.
+        let gate = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let mut w = gate.pool_for_test().begin().await.unwrap();
+        sqlx::query("lock table orchestrator.config_tools in access exclusive mode")
+            .execute(&mut *w)
+            .await
+            .unwrap();
+
+        let reader = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let r = tokio::spawn(async move { reader.load_versioned().await });
+        wait_until_a_backend_blocks(src.pool_for_test()).await;
+        assert!(
+            !r.is_finished(),
+            "the reader must still be mid-read when the writer commits"
+        );
+
+        // A COMPLETE new config lands, generation and all, while the read is in flight.
+        for t in CFG_TABLES {
+            sqlx::query(&format!("delete from {t}"))
+                .execute(&mut *w)
+                .await
+                .unwrap();
+        }
+        sqlx::query("insert into orchestrator.config_skills (name, def) values ($1, $2)")
+            .bind("new")
+            .bind(serde_json::to_value(skill("new")).unwrap())
+            .execute(&mut *w)
+            .await
+            .unwrap();
+        sqlx::query("insert into orchestrator.config_tools (name, spec) values ($1, $2)")
+            .bind("t_new")
+            .bind(serde_json::to_value(cfg_tool("t_new")).unwrap())
+            .execute(&mut *w)
+            .await
+            .unwrap();
+        let (vw,): (i64,) = sqlx::query_as(
+            "insert into orchestrator.config_versions (id, version) values (true, 1)
+             on conflict (id) do update set version = orchestrator.config_versions.version + 1,
+                                            updated_at = now()
+             returning version",
+        )
+        .fetch_one(&mut *w)
+        .await
+        .unwrap();
+        w.commit().await.unwrap();
+
+        let (cfg, ver) = r.await.unwrap().expect("the read itself must succeed");
+
+        // The whole point: the pair is internally consistent and entirely pre-write.
+        assert_eq!(
+            ver,
+            Some(v0),
+            "the generation must be the one matching the content read, not the writer's"
+        );
+        assert_eq!(
+            cfg.tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t_old"],
+            "the tools read (AFTER the writer committed) must come from the original snapshot"
+        );
+        assert_eq!(
+            cfg.skills
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old"],
+            "the skills read (BEFORE the writer committed) must agree with the tools read"
+        );
+        assert_eq!(vw as u64, v0 + 1, "the writer really did advance the world");
+    }
+
+    /// A check of the Postgres mechanism `load_versioned` RELIES on, not of
+    /// `load_versioned` itself: a `repeatable read` transaction's snapshot is fixed at its
+    /// first read, so a concurrent single-transaction writer lands wholly before or wholly
+    /// after it. Kept because that guarantee is the design's load-bearing assumption and a
+    /// server-version change could invalidate it — but it drives its OWN transaction, so it
+    /// canNOT detect a regression in `load_versioned`. See
+    /// `load_versioned_returns_a_consistent_pair_despite_a_writer_committing_mid_read` for
+    /// the test that guards the production code path.
+    #[tokio::test]
+    async fn repeatable_read_snapshots_are_fixed_at_the_first_read() {
         let Some(url) = db_url() else { return };
         let src = PostgresConfigSource::new(connect(&url).await.unwrap());
 
