@@ -98,6 +98,30 @@ So an operator can cancel a runaway run or inspect the wake queue **on a box wit
 credentials at all**. A missing heavy-tier input is a loud, specific startup error — never a
 half-built executor.
 
+**The heavy tier refuses loud on two boot states that would otherwise look healthy.** Both were found
+by review, and both matter because the failure surfaces one burned run at a time rather than at
+startup:
+
+- **A gateway config that registered no provider adapters.** `FacadeBuilder::build()` is infallible by
+  design — bad routers are logged and skipped, and an unknown router id is skipped without even a
+  warning. So a single typo in `--gateway-config` yields a clean boot whose first tick claims a paused
+  run, gets `AllAttemptsFailed`, and records it terminal-`Failed`. That row is then unreachable through
+  the product, because `claim_due` selects only `paused` or stale `waking`. One typo turns the worker
+  into a run-shredder, recoverable only by editing `scheduled_runs` by hand. So boot asserts the
+  adapter registry is non-empty.
+- **A registry with zero agents.** `RegistryHandle::from_source` succeeds on a fresh database, so
+  pointing a worker at the wrong `DATABASE_URL`, or starting it before `torii config push`, yields a
+  worker that fences every run at `#cfg0` and cannot resolve a single agent. The light tier is
+  deliberately unaffected — observe and intervene must keep working on an empty database.
+
+**One pool, cloned.** All five Postgres adapters take `PgPool` by value and `PgPool` is `Arc`-backed,
+so one `connect()` plus clones is exactly equivalent to four separate pools — and four pools at
+`max_connections(8)` each meant **32 backends per worker**, so three workers exhausted a default
+Postgres's 97 usable connections and starved the next operator command. The tradeoff is explicit: the
+adapters now contend for 8 connections rather than 8 each, which suits the executor's default
+concurrency of 8 and short-lived journal/CAS acquires. If it ever doesn't, the lever is a pool-size
+parameter on `connect()` — hardcoded in `orchestrator-store` as an SP-DATA-1 deferral.
+
 Heavy-tier wiring: `PostgresJournal` + `PostgresContentStore` + `PostgresContextStore`
 (s1), `RegistryHandle::from_source(PostgresConfigSource)` (s2), `PostgresSchedulerStore` (s3),
 `SystemClock`, the built-in `ToolRegistry`, and **`PatternRedactor` unconditionally** — s2
@@ -463,7 +487,14 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
   API change, and the residual window is negligible against two humans.
 - **Pool sizing** — `connect()` hardcodes `max_connections(8)` (s1 defer-minor); a multi-worker
   deployment will want it configurable.
-- **Metrics/tracing export** from `worker serve` (counts, wake latency, backoff state).
+- **A long-lived worker's registry and config generation are frozen at process start.** Nothing calls
+  `RegistryHandle::reload()`, so a run a worker submits after someone else pushes config is born with
+  a stale fence and will be refused by any freshly-booted worker. Whether to reload per tick,
+  periodically, or on a notification is a design decision, not a quick fix — the hot-reload mechanism
+  (SP-2 s5) already exists, only the trigger is missing.
+- **Metrics/tracing export** from `worker serve` (counts, wake latency, backoff state). Note the
+  subscriber itself is wired this slice — without one, `tracing` macros are no-ops and the worker's
+  store-fault diagnostics were invisible.
 - **Terminal-row pruning/retention** for `scheduled_runs`.
 - **`sqlx` now compiles in the default workspace build** (torii depends on it unconditionally) —
   accepted tradeoff; the invariant preserved is that *tests* need no database.
