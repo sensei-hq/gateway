@@ -97,14 +97,17 @@ pub async fn wake(
     //
     // The timestamp tolerance is not compensating for multi-process clock skew — `now`
     // here is the exact value this call sent to the store — it only absorbs the
-    // sub-microsecond rounding a `timestamptz` column performs on write. Verified
-    // empirically against a live Postgres: writing a nanosecond-precision value and
-    // reading it back can round it UP by a fraction of a microsecond (not only down),
-    // so a one-sided `t <= now` is not safe; the drift is checked in both directions.
+    // sub-microsecond rounding a `timestamptz` column performs on write. Measured
+    // empirically against a live Postgres: encoding rounds a nanosecond-precision
+    // value to the nearest microsecond (round-half-to-even), a drift of at most
+    // ±500ns, in EITHER direction — so a one-sided `t <= now` is not safe. 2µs is a
+    // 4x margin over that measured bound, and still five orders of magnitude tighter
+    // than any real re-pause deadline (seconds-to-minutes out), so it cannot be
+    // satisfied by an unrelated pause that happens to land in the race window.
     let applied = after.status == RunStatus::Paused
         && after.next_wake.is_some_and(|t| {
             let drift = if t >= now { t - now } else { now - t };
-            drift <= chrono::Duration::milliseconds(1)
+            drift <= chrono::Duration::microseconds(2)
         });
     if applied {
         Ok(Outcome::ok(format!(
@@ -257,6 +260,12 @@ mod tests {
         ClaimsFirst,
         /// Another operator cancels the run first (`paused -> cancelled`).
         CancelsFirst,
+        /// A worker's tick claims it, wake()'s OWN `force_wake` lands while it is
+        /// `waking` (a no-op), and THEN the executor's drive finishes and re-pauses
+        /// it with a fresh, UNRELATED deadline — landing status back on `paused`
+        /// before `wake`'s post-check re-reads it. Proves the status check alone is
+        /// not enough: only the timestamp half catches this.
+        ReclaimsThenRepausesWithUnrelatedDeadline,
     }
 
     /// Delegates to a real `InMemorySchedulerStore` for everything, EXCEPT that its
@@ -325,19 +334,40 @@ mod tests {
             run: RunId,
             now: DateTime<Utc>,
         ) -> Result<(), orchestrator_core::OrchestratorError> {
-            if run == self.run {
-                match self.actor {
-                    ConcurrentActor::ClaimsFirst => {
-                        self.inner
-                            .claim_due(now, chrono::Duration::seconds(60), 10)
-                            .await?;
-                    }
-                    ConcurrentActor::CancelsFirst => {
-                        self.inner.cancel(run).await?;
-                    }
+            if run != self.run {
+                return self.inner.force_wake(run, now).await;
+            }
+            match self.actor {
+                ConcurrentActor::ClaimsFirst => {
+                    self.inner
+                        .claim_due(now, chrono::Duration::seconds(60), 10)
+                        .await?;
+                    self.inner.force_wake(run, now).await
+                }
+                ConcurrentActor::CancelsFirst => {
+                    self.inner.cancel(run).await?;
+                    self.inner.force_wake(run, now).await
+                }
+                ConcurrentActor::ReclaimsThenRepausesWithUnrelatedDeadline => {
+                    self.inner
+                        .claim_due(now, chrono::Duration::seconds(60), 10)
+                        .await?;
+                    // This IS wake()'s own force_wake call — it lands while the row
+                    // is `waking` (conditional on `paused`), so it is a no-op.
+                    self.inner.force_wake(run, now).await?;
+                    // The executor's drive finishes and re-pauses with a fresh,
+                    // UNRELATED deadline (mirrors a journaled `RunPaused.resume_after`
+                    // backoff — realistically seconds-to-minutes out, from a
+                    // different process than the CLI's own `now`).
+                    self.inner
+                        .record_paused(
+                            run,
+                            Some(now + chrono::Duration::minutes(5)),
+                            "unrelated re-pause",
+                        )
+                        .await
                 }
             }
-            self.inner.force_wake(run, now).await
         }
     }
 
@@ -402,6 +432,44 @@ mod tests {
         assert_eq!(
             inner.status(run).await.unwrap().unwrap().status,
             RunStatus::Cancelled
+        );
+    }
+
+    /// Guards the TIMESTAMP half of the check specifically — `status == Paused` alone
+    /// is NOT enough. A `paused -> waking -> paused` round trip (a claim, then the
+    /// executor's own re-pause) lands the row back on `Paused` with a fresh,
+    /// UNRELATED deadline. Our own `force_wake` landed while the row was `waking` and
+    /// never applied, but by the time `wake` re-reads it, status is `Paused` again —
+    /// purely because of someone else's unrelated pause, not our call. Without the
+    /// timestamp condition this would report a false success.
+    #[tokio::test]
+    async fn wake_reports_not_queued_when_a_re_pause_restores_paused_with_an_unrelated_deadline() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let inner = paused_store(run, Some(now())).await;
+        let racing = RacingStore {
+            inner: inner.clone(),
+            run,
+            actor: ConcurrentActor::ReclaimsThenRepausesWithUnrelatedDeadline,
+        };
+
+        let out = wake(&racing, run, now()).await.expect("no hard error");
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "our force_wake never applied; an unrelated re-pause landing inside the \
+             race window must not be reported as success: {}",
+            out.text
+        );
+        assert!(out.text.contains("not queued"), "{}", out.text);
+        assert!(
+            out.text.contains("paused"),
+            "must name the real state: {}",
+            out.text
+        );
+        assert_eq!(
+            inner.status(run).await.unwrap().unwrap().status,
+            RunStatus::Paused,
+            "the row IS paused again — just not because of our force_wake"
         );
     }
 }
