@@ -3,6 +3,7 @@
 
 mod diff;
 mod errors;
+mod render;
 
 fn main() {
     eprintln!(
