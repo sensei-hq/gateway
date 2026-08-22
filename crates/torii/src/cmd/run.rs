@@ -8,8 +8,6 @@ use crate::render;
 use chrono::{DateTime, Utc};
 use orchestrator_core::{RunId, RunStatus, SchedulerStore};
 
-// Consumed by Task 10 (main.rs clap dispatch), `torii run status <id>`.
-#[allow(dead_code)]
 pub async fn status(
     store: &dyn SchedulerStore,
     run: RunId,
@@ -25,8 +23,6 @@ pub async fn status(
     }
 }
 
-// Consumed by Task 10 (main.rs clap dispatch), `torii run list-paused`.
-#[allow(dead_code)]
 pub async fn list_paused(store: &dyn SchedulerStore, json: bool) -> Result<Outcome, CliError> {
     let rows = store.list_paused().await?;
     Ok(Outcome::ok(if json {
@@ -36,8 +32,6 @@ pub async fn list_paused(store: &dyn SchedulerStore, json: bool) -> Result<Outco
     }))
 }
 
-// Consumed by Task 10 (main.rs clap dispatch), `torii run cancel <id>`.
-#[allow(dead_code)]
 pub async fn cancel(store: &dyn SchedulerStore, run: RunId) -> Result<Outcome, CliError> {
     if store.status(run).await?.is_none() {
         return Ok(Outcome::precondition(format!("no such run: {}", run.0)));
@@ -62,8 +56,6 @@ pub async fn cancel(store: &dyn SchedulerStore, run: RunId) -> Result<Outcome, C
     }
 }
 
-// Consumed by Task 10 (main.rs clap dispatch), `torii run wake <id>`.
-#[allow(dead_code)]
 pub async fn wake(
     store: &dyn SchedulerStore,
     run: RunId,
@@ -121,6 +113,36 @@ pub async fn wake(
             after.status.as_str()
         )))
     }
+}
+
+/// Submit a fresh run and drive it inline. Blocks until the run pauses or ends —
+/// there is no `--detach` yet, because `enqueue` stamps the row `waking`, so a
+/// detached run would only be picked up once the lease expired and the crash-reclaim
+/// path grabbed it. Abusing crash recovery as a scheduling primitive was rejected;
+/// a real `pending` status is the fix.
+pub async fn submit(
+    scheduler: &orchestrator::Scheduler,
+    run: RunId,
+    graph: orchestrator_core::Graph,
+) -> Result<Outcome, CliError> {
+    let outcome = scheduler.submit(run, graph).await?;
+    if let Some(p) = &outcome.paused {
+        return Ok(Outcome::ok(format!(
+            "paused: {} at node {} ({})",
+            run.0, p.node.0, p.reason
+        )));
+    }
+    if let Some((node, msg)) = &outcome.failed {
+        return Ok(Outcome::precondition(format!(
+            "failed: {} at node {} ({msg})",
+            run.0, node.0
+        )));
+    }
+    Ok(Outcome::ok(format!(
+        "completed: {} ({} node(s))",
+        run.0,
+        outcome.completed.len()
+    )))
 }
 
 #[cfg(test)]

@@ -29,8 +29,6 @@ pub(crate) fn one_line(s: &str) -> String {
         .collect()
 }
 
-// Consumed by Task 6 (cmd/run.rs `status`/`list-paused`), the default (non-`--json`) output.
-#[allow(dead_code)]
 pub fn table(rows: &[ScheduledRun]) -> String {
     let mut s = String::from(
         "RUN                                   STATUS     NEXT WAKE             REASON\n",
@@ -47,8 +45,6 @@ pub fn table(rows: &[ScheduledRun]) -> String {
     s
 }
 
-// Consumed by Task 6 (cmd/run.rs `status`/`list-paused`), the `--json` output.
-#[allow(dead_code)]
 pub fn json(rows: &[ScheduledRun]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(rows)
 }
