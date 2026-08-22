@@ -1599,4 +1599,52 @@ mod tests {
         assert_eq!(ver, None, "an unversioned source reports no generation");
         assert_eq!(cfg.skills.len(), 1);
     }
+
+    /// A source whose `load` fails (a transport/IO failure), so the DEFAULT
+    /// `load_versioned` propagates the error through its `?` — the path `reload`
+    /// and `from_source` now take through the chokepoint. Does NOT override
+    /// `load_versioned`: the point is proving the default's propagation, not a
+    /// bespoke one.
+    struct FailingSource;
+    #[async_trait::async_trait]
+    impl ConfigSource for FailingSource {
+        async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+            Err(OrchestratorError::RegistryLoad("transport failure".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_from_a_failing_source_leaves_the_previous_registry_live() {
+        let h = RegistryHandle::new(Registry::default());
+        let g0 = h
+            .reload(&FixedSource(cfg_with_skill("known-good")))
+            .await
+            .expect("first reload succeeds");
+        assert_eq!(g0, 1);
+
+        let err = h.reload(&FailingSource).await;
+        assert!(err.is_err(), "a failing source must not silently succeed");
+
+        // Previous registry still live — a failed reload never tears down the last-good state.
+        assert!(
+            h.current().skill("known-good").is_some(),
+            "the previously-loaded config remains resolvable"
+        );
+        // Generation did not advance — a partial commit that bumped the counter while
+        // leaving the old registry would be a silent fence drift.
+        assert_eq!(
+            h.generation(),
+            g0,
+            "a failed reload must not advance the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_source_on_a_failing_source_yields_err_and_no_handle() {
+        let err = RegistryHandle::from_source(&FailingSource).await;
+        assert!(
+            matches!(err, Err(OrchestratorError::RegistryLoad(_))),
+            "a failing source must yield Err, never a half-built handle"
+        );
+    }
 }
