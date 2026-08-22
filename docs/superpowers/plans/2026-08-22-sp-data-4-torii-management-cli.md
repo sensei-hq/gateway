@@ -494,90 +494,124 @@ Replace the `unimplemented!()` body. Entities are compared as `serde_json::Value
 ```rust
 use std::collections::BTreeMap;
 
-/// Serialize a named entity set into name -> json for order-insensitive comparison.
-fn index<T: serde::Serialize>(
-    items: &[T],
-    name_of: impl Fn(&T) -> String,
-) -> BTreeMap<String, serde_json::Value> {
-    items
-        .iter()
-        .map(|i| {
-            let v = serde_json::to_value(i).unwrap_or(serde_json::Value::Null);
-            (name_of(i), v)
-        })
-        .collect()
+/// Index an entity set by a comparison KEY. The key is generic, not a display
+/// string: joining a composite key into `"a/b"` is not injective when the parts
+/// can contain the separator, and a collision there hides a REMOVAL behind a
+/// spurious "changed" — leaving `removed` empty so `requires_confirmation()`
+/// returns false and the replace-all write destroys a live entity with no prompt.
+fn index<T, K>(items: &[T], key_of: impl Fn(&T) -> K) -> BTreeMap<K, serde_json::Value>
+where
+    T: serde::Serialize,
+    K: Ord + std::fmt::Debug,
+{
+    let mut out = BTreeMap::new();
+    for item in items {
+        let v = serde_json::to_value(item).expect(
+            "a config entity must serialize: every RegistryConfig type is a plain \
+             derive(Serialize) struct with no non-string map keys and no float fields, \
+             so to_value cannot fail. Coercing a failure to Null would make two \
+             unserializable entities compare EQUAL and be reported 'unchanged' — a \
+             silent under-report in the guard that prevents config loss.",
+        );
+        let k = key_of(item);
+        // Duplicate keys are impossible on the real call path (`current` comes from
+        // PK-backed tables, `incoming` is validated by Registry::from_config first),
+        // but silent last-write-wins would UNDER-COUNT a removal.
+        debug_assert!(!out.contains_key(&k), "duplicate config entity key: {k:?}");
+        out.insert(k, v);
+    }
+    out
 }
 
-fn compare(
+fn compare<K>(
     kind: EntityKind,
-    current: &BTreeMap<String, serde_json::Value>,
-    incoming: &BTreeMap<String, serde_json::Value>,
+    current: &BTreeMap<K, serde_json::Value>,
+    incoming: &BTreeMap<K, serde_json::Value>,
+    display: impl Fn(&K) -> String,
     out: &mut ConfigDiff,
-) {
-    for (name, new_v) in incoming {
-        match current.get(name) {
-            None => out.added.push(DiffEntry { kind, name: name.clone() }),
+) where
+    K: Ord + std::fmt::Debug,
+{
+    for (key, new_v) in incoming {
+        match current.get(key) {
+            None => out.added.push(DiffEntry { kind, name: display(key) }),
             Some(old_v) if old_v != new_v => {
-                out.changed.push(DiffEntry { kind, name: name.clone() })
+                out.changed.push(DiffEntry { kind, name: display(key) })
             }
             Some(_) => out.unchanged += 1,
         }
     }
-    for name in current.keys() {
-        if !incoming.contains_key(name) {
-            out.removed.push(DiffEntry { kind, name: name.clone() });
+    for key in current.keys() {
+        if !incoming.contains_key(key) {
+            out.removed.push(DiffEntry { kind, name: display(key) });
         }
     }
 }
 
+/// Diff two configs. Names are assumed unique within each `Vec`: `current` gets
+/// that from the PK-backed `config_*` tables, `incoming` from `Registry::from_config`
+/// running first. `index`'s `debug_assert!` catches a caller that bypasses both.
 pub fn diff(current: &RegistryConfig, incoming: &RegistryConfig) -> ConfigDiff {
     let mut out = ConfigDiff::default();
+    let by_name = |n: &String| n.clone();
     compare(
         EntityKind::Agent,
         &index(&current.agents, |a| a.name.clone()),
         &index(&incoming.agents, |a| a.name.clone()),
+        by_name,
         &mut out,
     );
     compare(
         EntityKind::Skill,
         &index(&current.skills, |s| s.name.clone()),
         &index(&incoming.skills, |s| s.name.clone()),
+        by_name,
         &mut out,
     );
     compare(
         EntityKind::Tool,
         &index(&current.tools, |t| t.name.clone()),
         &index(&incoming.tools, |t| t.name.clone()),
+        by_name,
         &mut out,
     );
-    // A binding's identity is (area, kind); its `chain` is the value that changes.
-    let key = |b: &orchestrator_core::ChainBinding| format!("{}/{}", b.area, b.kind);
+    // A binding's identity is the (area, kind) TUPLE — the same key `Registry`
+    // itself uses. The joined "area/kind" form is for DISPLAY only.
+    let key = |b: &orchestrator_core::ChainBinding| (b.area.clone(), b.kind.clone());
     compare(
         EntityKind::ChainBinding,
         &index(&current.chain_bindings, key),
         &index(&incoming.chain_bindings, key),
+        |(a, k): &(String, String)| format!("{a}/{k}"),
         &mut out,
     );
     out
 }
 ```
 
-Note: `index` on `chain_bindings` serializes the whole binding including `area`/`kind`, so two
-bindings with the same key always differ only by `chain` — which is exactly the "changed" signal the
-last test asserts.
+Add three more tests: `a_chain_binding_key_collision_does_not_hide_a_removal` (the regression guard —
+`("research/reasoning","x")` in `current` versus `("research","reasoning/x")` in `incoming` must
+yield one `removed` + one `added` and `requires_confirmation() == true`, NOT a single `changed`), plus
+one added-agent and one changed-tool test, since the `Agent`/`Tool` arms are copy-paste of the
+`Skill` arm and a swapped field would otherwise compile and pass everything. Expected total after
+this task: 15 crate tests.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-torii diff`
-Expected: 5 passed.
+Expected: 8 passed (5 base + the collision guard + the agent and tool tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
-git add crates/torii/src/diff.rs crates/torii/src/main.rs
+git add crates/torii/src/diff.rs crates/torii/src/main.rs crates/torii/Cargo.toml
 git commit -m "feat(torii): SP-DATA-4 (2/11) — pure config diff (the guard on a replace-all write)"
 ```
+
+Note: `crates/torii/Cargo.toml` needs `serde = { version = "1", features = ["derive"] }` added —
+`index` is generic over `serde::Serialize`, which requires `serde` as a direct dependency rather than
+reaching it transitively through `serde_json`.
 
 ---
 
