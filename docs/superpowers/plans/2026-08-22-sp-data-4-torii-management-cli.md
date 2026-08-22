@@ -729,11 +729,42 @@ Expected: 5 passed. If `a_timed_next_wake_renders_as_rfc3339` fails on the exact
 print the actual value and correct the expectation — the assertion's purpose is the RFC3339 *shape*,
 not that specific epoch.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Sanitize `reason` in the table, and fix `RunStatus`'s JSON casing**
+
+Two defects a quality review caught in the code above — both must be applied:
+
+**(a) `reason` needs control-character collapsing, in the TABLE path only.** `reason` is free text
+from pause sites and provider messages, so it can contain `\n`/`\t`. The table is line-oriented, so a
+raw newline splits one run's row into prefix-less fragments — and a UUID inside such a fragment reads
+as a separate row, which is how an operator cancels the wrong run. Add:
+
+```rust
+fn one_line(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+```
+
+and apply it to `reason` inside `table()`. Do **not** apply it in `json()` — a script consuming
+`--json` must get the exact stored value.
+
+**(b) `RunStatus` serializes PascalCase while everything else is lowercase.** `as_str()`,
+`from_db_str()`, and the `scheduled_runs.status` text column all use `"paused"`, but the derived
+`Serialize` emits `"Paused"`, so a script filtering `--json` on the documented value matches nothing.
+Add `#[serde(rename_all = "lowercase")]` to `RunStatus` in `crates/orchestrator-core/src/scheduler.rs`.
+Safe and verified: `RunStatus` is never journaled, the PG store binds `status.as_str()` and reads
+`from_db_str` (serde is not on the persistence path), and no test asserts a PascalCase status. This is
+a latent SP-DATA-3 inconsistency; torii's `--json` is merely the first thing to expose it.
+
+Three tests go with these: a multi-line `reason` must still render as exactly one data row; `--json`
+must contain `"status": "paused"` and never `"Paused"`; and one test pinning the hand-counted column
+alignment (the header spacing agrees with `{:<9}`/`{:<20}` only by hand-counting, so a longer future
+`RunStatus` variant would silently desync it).
+
+- [ ] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
-git add crates/torii/src/render.rs crates/torii/src/main.rs
+git add crates/torii/src/render.rs crates/torii/src/main.rs crates/orchestrator-core/src/scheduler.rs
 git commit -m "feat(torii): SP-DATA-4 (3/11) — table + JSON rendering of ScheduledRun"
 ```
 
