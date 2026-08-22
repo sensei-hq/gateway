@@ -149,9 +149,10 @@ impl From<OrchestratorError> for CliError {
                 "this run's config generation drifted: recorded {recorded}, current {current}.\n\
                  The run cannot resume under different config. Check `torii config version`."
             ),
+            // No "journal format mismatch:" prefix — the variant's own Display already
+            // says "incompatible journal format for run ...", so a prefix repeats it.
             OrchestratorError::Journal(JournalError::IncompatibleFormat { .. }) => format!(
-                "journal format mismatch: {e}.\n\
-                 This binary cannot safely fold this run's journal. Do not continue."
+                "{e}.\nThis binary cannot safely fold this run's journal. Do not continue."
             ),
             OrchestratorError::Store(m) => format!("store transport fault: {m}"),
             OrchestratorError::Journal(JournalError::Backend(m)) => {
@@ -168,9 +169,15 @@ impl From<OrchestratorError> for CliError {
 /// without leaking the password into logs, terminals, or CI output.
 /// Returns `host[:port]/dbname`, or a fixed placeholder if the URL is unparseable
 /// (never the input — an unparseable URL may still contain the password).
+///
+/// Both splits deliberately tolerate the delimiter appearing INSIDE the password,
+/// which is common in hand-built connection strings: `split_once("://")` keeps
+/// everything after the FIRST scheme separator, and `rsplit_once('@')` cuts at the
+/// LAST `@` (the real user/host boundary). Using `split_once('@')` here leaks a
+/// suffix of a password that contains an `@`.
 pub fn redact_url(url: &str) -> String {
-    let after_scheme = url.split("://").nth(1).unwrap_or("");
-    let host_and_path = match after_scheme.split_once('@') {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+    let host_and_path = match after_scheme.rsplit_once('@') {
         Some((_creds, rest)) => rest,
         None => after_scheme,
     };
@@ -217,6 +224,33 @@ mod tests {
         assert!(!out.contains(&pw), "unparseable input echoed the secret: {out}");
     }
 
+    /// A password containing `@` is common in hand-built connection strings. Splitting
+    /// on the FIRST `@` misclassifies a suffix of the password as the host and returns
+    /// it verbatim — so this asserts on that suffix, not just on the whole password
+    /// (a bare `!contains(&pw)` passes even while a partial password leaks).
+    #[test]
+    fn redact_url_does_not_leak_a_password_containing_an_at_sign() {
+        let leaky = format!("ss{}ord", "w");
+        let pw = format!("p@{leaky}");
+        let out = redact_url(&format!("postgres://operator:{pw}@db.internal:5432/orch"));
+        assert_eq!(out, "db.internal:5432/orch");
+        assert!(!out.contains(&pw), "whole password leaked: {out}");
+        assert!(!out.contains(&leaky), "a password SUFFIX leaked: {out}");
+    }
+
+    /// Same defect class on the scheme split: `split("://").nth(1)` keeps only the
+    /// second segment, so a `://` inside the password truncates the string and can
+    /// return credential material.
+    #[test]
+    fn redact_url_does_not_leak_a_password_containing_a_scheme_separator() {
+        let leaky = format!("ss{}ord", "w");
+        let pw = format!("p://{leaky}");
+        let out = redact_url(&format!("postgres://operator:{pw}@db.internal:5432/orch"));
+        assert_eq!(out, "db.internal:5432/orch");
+        assert!(!out.contains(&leaky), "a password fragment leaked: {out}");
+        assert!(!out.contains("operator"), "the user leaked: {out}");
+    }
+
     #[test]
     fn fence_mismatch_maps_to_an_actionable_message() {
         let e = OrchestratorError::VersionFenceMismatch {
@@ -257,7 +291,7 @@ fn main() {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-torii`
-Expected: 5 passed. (These are written-then-run together because `errors.rs` is a pure mapping module with no prior art to fail against; the assertions are the specification.)
+Expected: 7 passed. (These are written-then-run together because `errors.rs` is a pure mapping module with no prior art to fail against; the assertions are the specification. The two password-delimiter tests are the exception — run them against the naive `split_once('@')`/`split("://").nth(1)` form FIRST and confirm they fail, since that is the bug they exist to pin.)
 
 - [ ] **Step 6: Verify the whole workspace still builds and the existing suite is intact**
 
