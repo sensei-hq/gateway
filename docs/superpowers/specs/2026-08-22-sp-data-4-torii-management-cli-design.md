@@ -187,8 +187,8 @@ microsecond-resolution while `chrono` carries nanoseconds, and Postgres **rounds
 than truncating — sending `…10.123456789Z` reads back `…10.123457000Z`, i.e. **211 ns later** than the
 value sent. So `t == now` fails always and `t <= now` fails whenever the nanosecond fraction rounds
 up, which is about half of real `Utc::now()` calls — a false negative on the happy path, worse than
-the bug being fixed. Use `|t - now| <= 1ms`: three orders of magnitude above the observed rounding
-error, still far tighter than any real stale-deadline value. The timestamp check is load-bearing
+the bug being fixed. Use a symmetric `|t - now| <= 2µs`: 4× the measured ±500 ns worst case, and still
+five orders of magnitude tighter than any realistic re-pause deadline. The timestamp check is load-bearing
 despite `status == Paused`: a run that went `paused → waking → paused` via a claim and a re-pause
 would satisfy the status check while carrying the *new pause's* deadline rather than this call's.
 
@@ -240,6 +240,24 @@ Everything on this path fails **closed**. That includes the display: if the prom
 there is nothing to consent to if the operator never saw the diff. Both the entity names *and* the
 source path are sanitized — the path is free text and an `\u{1b}[8m` in it is SGR conceal, which would
 render the removal list and the `REMOVES N` warning invisible.
+
+**A push strands every paused run, and the diff guard alone does not catch it.** This is the most
+consequential fact about `config push` and it was missing from the first draft of this spec. The fence
+is `{base}#cfg{generation}`; `push` advances the generation; `Executor::start_inner` refuses any journal
+whose recorded `RunStarted.version` differs; and `Scheduler::record` writes that refusal as terminal
+`Failed`. So **any successful push terminally kills every already-journaled paused run**, and those rows
+are then unreachable through the product — the generation is monotonic, so the fence can never match
+again, and `claim_due` selects only `paused` or stale `waking`. Demonstrated end to end: a push that
+merely *added* entities left the next `worker serve --once` reporting
+`stale: config changed (version fence mismatch: recorded v1#cfg1442, current v1#cfg1443)`.
+
+The fence behaviour is correct — it is precisely what stops a silent wrong-config resume, and §7.6
+rejects deriving the fence base from the build version for exactly this reason. The defect was the
+*silence*, compounded by the removal-only guard: a pure addition was classified `Apply` and never
+prompted, yet an addition is just as lethal to in-flight work as a deletion. So `push` now reads
+`list_paused()` and a non-zero count **requires confirmation on its own**, independent of removals, with
+the count named in the prompt. `--yes` still bypasses (consistent with removals) and still prints the
+warning.
 
 **Entity names are sanitized in the prompt.** The prompt text *is* the destruction consent, so it is
 the most safety-critical renderer in the CLI — more so than the run table. A name containing a newline
@@ -359,9 +377,17 @@ Named here rather than discovered at 3am.
 
 ### 7.3 Shutdown
 
-SIGINT/SIGTERM finishes the in-flight tick, then exits; a second signal exits immediately. Both
-are safe — an abandoned `waking` row is what the lease reclaim was built for. Graceful shutdown
-is about not wasting a partial drive, not about correctness.
+SIGINT and SIGTERM both finish the in-flight tick, then exit. Abandoning the tick is safe either way —
+an abandoned `waking` row is what the lease reclaim was built for — so graceful shutdown is about not
+wasting a partial drive, not about correctness.
+
+**There is deliberately no second-signal fast path, and an earlier draft of this spec claimed one.**
+`shutdown_signal()` yields a one-shot future, so signals arriving during a tick are consumed and
+discarded: sending SIGTERM twice more, then SIGINT, to a worker blocked mid-`claim_due` leaves it alive
+until SIGKILL. That is safe (the lease covers a hard kill) but it means the worst case is bounded by the
+**lease alone**, not by a second signal, and an operator watching a wedged-looking process should
+escalate to SIGKILL rather than wait. Implementing the fast path means racing a second signal against
+the tick itself; it is recorded as a carry-forward rather than asserted as existing.
 
 Note the consequence, which is deliberate rather than an oversight: shutdown is raced against the
 **sleep between ticks**, not against a tick in progress. `tick()` drives each due run inline via
@@ -389,8 +415,15 @@ Nothing collapses to "something went wrong".
 - **`DATABASE_URL` is env-only, no flag** — a `--database-url` puts the password in `ps` output
   and shell history for every user on the box.
 - **The URL is never echoed** — not in a "connected to" line, not in a connect error. Failures
-  report host and database name only, via a pure `redact_url()`.
-- **`--gateway-config` contents are never echoed**, only its path (it holds provider API keys).
+  report host and database name only, via a pure `redact_url()`. **Redacting the URL is not sufficient
+  on its own:** a scheme-less `DATABASE_URL` (an ordinary secret-store mistake) makes `redact_url`
+  correctly return its placeholder while the *adjacent sqlx error* echoes the raw string —
+  `cannot connect to <unparseable database url>: … database "s3cr3t-XyZ@host/db" does not exist`. So the
+  error text is scrubbed of the raw URL before interpolation, at both connect sites.
+- **`--gateway-config` contents are never echoed**, only its path (it holds provider API keys). Again
+  the error text is the leak: pasting a key as a router *value* instead of under `api_key` made
+  serde_json echo it verbatim into a worker's stderr, and thence journald. Only the parse error's
+  classification and line/column are reported, never its `Display`.
 - **Test fixtures assemble credential-shaped strings at runtime** — the repo's Semgrep CWE-798
   hook blocks literal ones.
 
@@ -475,6 +508,13 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
 - **`run submit --detach`** — needs a real `pending` status rather than leaning on lease-reclaim (§5.3).
 - **Wake backoff/jitter/`max_attempts`/dead-letter** (still open from s3) — until then a poison-pill
   run can crash-loop a worker (§7.2).
+- **A second-signal fast path for `worker serve`** (§7.3). Signals arriving during a tick are consumed
+  and discarded, so a worker blocked mid-`claim_due` survives repeated SIGTERM/SIGINT until SIGKILL.
+  Safe, but the worst case is bounded by the lease alone.
+- **Resuming a run whose config generation moved.** A push strands every paused run terminally (§5.2);
+  the operator is now warned and must confirm, but there is no recovery path short of re-submitting.
+  Carrying the generation forward so a re-pin could *offer* to resume a stale run under new config is
+  the same deferral s3 recorded, and it is what would turn this from a warning into a workflow.
 - **Redactor coverage for pause reasons** (§8), and a `reason` length cap.
 - **`config pull` / rollback** — today recovery from a bad push means re-pushing a good directory;
   the old rows are gone.
