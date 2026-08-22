@@ -90,13 +90,35 @@ pub fn init_tracing() {
 /// failing router is logged and skipped, never surfaced as an `Err`) — so this is
 /// the ONLY place a completely broken gateway config is caught, before a worker
 /// boots happily and then terminally fails every run it wakes with zero signal.
+///
+/// The message names the routers that WERE present but produced no adapter (not
+/// just "check your config"): a generic "check the router names and API keys"
+/// misdirects an operator whose config is otherwise correct but names an
+/// unsupported/skipped router (e.g. `bedrock`, which `register_cloud_from_config`
+/// deliberately never registers from config alone) — they would re-verify valid
+/// values and stay stuck. Naming the actual routers makes any future skipped-router
+/// case self-diagnosing instead of needing its own bespoke message.
 // Guards `heavy()`; tested directly below without a live provider.
-fn require_adapters(registered: &[String], gateway_config: &Path) -> Result<(), CliError> {
+fn require_adapters(
+    registered: &[String],
+    configured_routers: &[String],
+    gateway_config: &Path,
+) -> Result<(), CliError> {
     if registered.is_empty() {
+        let detail = if configured_routers.is_empty() {
+            "it has no routers configured at all".to_string()
+        } else {
+            format!(
+                "it configured {} but none produced a working adapter — an unsupported or \
+                 not-yet-wired router (e.g. `bedrock`, which requires explicit AWS SDK setup \
+                 and is never registered from config alone) is silently skipped, not reported \
+                 as an error",
+                configured_routers.join(", ")
+            )
+        };
         return Err(CliError::error(format!(
-            "{} registered no provider adapters. Every model call would fail, and a worker \
-             would terminally fail every run it wakes. Check the router names and API keys \
-             in this config.",
+            "{} registered no provider adapters: {detail}. Every model call would fail, and a \
+             worker would terminally fail every run it wakes.",
             gateway_config.display()
         )));
     }
@@ -207,11 +229,15 @@ pub async fn heavy(
     // One atomic (config, generation) read — the fence generation must match the
     // config it was computed from.
     let handle = RegistryHandle::from_source(&light.config_source).await?;
-    let registry = handle.current();
+    // `snapshot()`, not `.current()` + `.generation()` as two separate lock
+    // acquisitions: those release the lock in between, which is exactly the torn
+    // -read shape SP-DATA-2 eliminated. Not reachable today (boot is sequential
+    // and nothing calls `reload()`), but it must not quietly plant one for
+    // whoever wires the deferred reload trigger.
+    let (registry, generation) = handle.snapshot();
     let agents_n = registry.agents().count();
     let skills_n = registry.skills().count();
     let tools_n = registry.tools().count();
-    let generation = handle.generation();
     tracing::info!(
         generation,
         agents = agents_n,
@@ -228,10 +254,15 @@ pub async fn heavy(
     // is infallible by design (a bad router is logged and skipped), so `registered`
     // is captured from the shared, Arc-backed registry BEFORE `build()` consumes the
     // builder, and checked right after.
+    let configured_routers: Vec<String> = gw_config.routers.keys().cloned().collect();
     let builder = gateway::FacadeBuilder::new(gw_config);
     let registered = builder.registry().clone();
     let facade = builder.build().await;
-    require_adapters(&registered.list().await, gateway_config)?;
+    require_adapters(
+        &registered.list().await,
+        &configured_routers,
+        gateway_config,
+    )?;
     let gateway = Arc::new(facade.gateway);
 
     let journal = Arc::new(PostgresJournal::new(pool.clone()));
@@ -379,7 +410,8 @@ mod tests {
     /// the check is pure over the already-registered adapter ids.
     #[test]
     fn heavy_refuses_a_gateway_config_that_registered_no_adapters() {
-        let err = require_adapters(&[], Path::new("/tmp/gateway.json")).expect_err("must refuse");
+        let err =
+            require_adapters(&[], &[], Path::new("/tmp/gateway.json")).expect_err("must refuse");
         assert_eq!(err.code, crate::errors::EXIT_ERROR);
         assert!(err.message.contains("gateway.json"), "{}", err.message);
         assert!(
@@ -387,12 +419,40 @@ mod tests {
             "{}",
             err.message
         );
+        assert!(
+            err.message.contains("no routers configured"),
+            "an EMPTY config must say so, not misdirect toward router names/keys: {}",
+            err.message
+        );
+    }
+
+    /// Minor 3 (re-review of `6c71703`): a config that named a router which produced
+    /// no adapter (e.g. `bedrock`, deliberately skipped — see `facade.rs`) must be
+    /// told WHICH router, not just "check the router names and API keys" — the
+    /// operator's names and keys may already be correct for a case torii can't wire.
+    #[test]
+    fn heavy_names_the_configured_routers_that_produced_no_adapter() {
+        let err = require_adapters(
+            &[],
+            &["bedrock".to_string()],
+            Path::new("/tmp/gateway.json"),
+        )
+        .expect_err("must refuse");
+        assert!(
+            err.message.contains("bedrock"),
+            "must name the skipped router: {}",
+            err.message
+        );
     }
 
     #[test]
     fn a_gateway_config_with_at_least_one_adapter_is_accepted() {
-        require_adapters(&["anthropic".to_string()], Path::new("/tmp/gateway.json"))
-            .expect("at least one adapter is enough");
+        require_adapters(
+            &["anthropic".to_string()],
+            &["anthropic".to_string()],
+            Path::new("/tmp/gateway.json"),
+        )
+        .expect("at least one adapter is enough");
     }
 
     /// FIX 7: an empty registry is a VALID registry (`from_source` succeeds on a
@@ -415,36 +475,106 @@ mod tests {
         require_agents(1, 0, 0, 3).expect("one agent is enough");
     }
 
-    /// FIX 3, empirically: `PgPool` is `Pool<DB>(Arc<PoolInner>)`, so cloning it
-    /// into every adapter `heavy()` builds shares ONE connection cap rather than
-    /// one PER adapter. Skips without a live database — this proves an operational
-    /// property (real backend connections), not something a mock can stand in for.
+    /// Minor 1 (re-review of `f7e6eb8`): the test this replaces
+    /// (`heavy_shares_one_pool_across_every_postgres_adapter`) asserted
+    /// `pool.size() <= 8` on a pool it built itself and never called `heavy()` —
+    /// true by construction for ANY `connect()` result, so it could not fail even
+    /// against the pre-fix four-separate-`connect()` shape (mutation-proven by the
+    /// reviewer). This version drives the REAL `heavy()` and counts REAL backend
+    /// connections in `pg_stat_activity` before and after: the four-pool shape
+    /// shows a delta of ~4 (each `connect()` eagerly opens a backend), this one a
+    /// delta of ~1. Discrimination was verified by hand: temporarily reverting
+    /// `heavy()`'s pool sharing to four separate `connect()` calls made this
+    /// exact test fail with a reported delta of 4; restoring the fix made it pass
+    /// with a delta of 1 (both outputs reported alongside this change).
+    ///
+    /// `config_agents`/`config_versions` are process-wide shared tables and
+    /// `store_and_bump` is replace-all (see its own doc comment: concurrent
+    /// writers serialize and last-writer-wins, which is clean, not corruption) —
+    /// so a concurrent `cmd::config` test's write can legitimately race this
+    /// seed away between the write and `heavy()`'s read. Retrying absorbs that
+    /// instead of flaking; any OTHER failure is a real bug and is not retried.
     #[tokio::test]
-    async fn heavy_shares_one_pool_across_every_postgres_adapter() {
+    async fn heavy_boots_on_one_pools_worth_of_real_backend_connections() {
         let Some(url) = std::env::var(ENV_DATABASE_URL).ok() else {
             return;
         };
-        let pool = connect(&url).await.expect("connect");
 
-        // Exactly the five adapters `heavy()` builds, all over ONE cloned pool.
-        let _scheduler_store = PostgresSchedulerStore::new(pool.clone());
-        let _config_source = PostgresConfigSource::new(pool.clone());
-        let _journal = PostgresJournal::new(pool.clone());
-        let _content = PostgresContentStore::new(pool.clone());
-        let _context = PostgresContextStore::new(pool.clone());
+        let probe_pool = connect(&url).await.expect("connect");
+        let config_source = PostgresConfigSource::new(probe_pool.clone());
+        let agent = orchestrator_core::AgentDefinition {
+            name: "torii-boot-probe-agent".to_string(),
+            area: "test".to_string(),
+            kind: "test".to_string(),
+            // An explicit override so this doesn't also need a chain-binding row.
+            chain: Some("torii-boot-probe-chain".to_string()),
+            chains: Default::default(),
+            grants: Default::default(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "probe".to_string(),
+        };
+        let seed = orchestrator_core::RegistryConfig {
+            agents: vec![agent],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
 
-        // Force a real backend connection through the pool the five adapters share.
-        sqlx::query("select 1")
-            .execute(&pool)
+        let gw_dir = std::env::temp_dir().join(format!("torii-boot-gw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&gw_dir).expect("tmp dir");
+        let gw_path = gw_dir.join("gateway.json");
+        // `ollama` registers WITHOUT credentials (the key resolves lazily per
+        // request, confirmed by the review) — exactly what lets this test drive
+        // a real `heavy()` boot with no live provider.
+        std::fs::write(
+            &gw_path,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+        )
+        .expect("write gateway config");
+
+        let env = EnvConfig {
+            database_url: url.clone(),
+            fence_version: Some("torii-boot-probe-fence".to_string()),
+        };
+
+        async fn backend_count(pool: &sqlx::PgPool) -> i64 {
+            let (n,): (i64,) = sqlx::query_as(
+                "select count(*) from pg_stat_activity where datname = current_database()",
+            )
+            .fetch_one(pool)
             .await
-            .expect("a live backend connection");
+            .expect("count backends");
+            n
+        }
 
-        // The whole point of Fix 3: one shared pool caps total connections at ITS
-        // OWN max_connections(8), not 8 per adapter (32 for four separate pools).
+        let mut outcome = None;
+        for _ in 0..5 {
+            config_source
+                .store_and_bump(&seed)
+                .await
+                .expect("seed the probe agent");
+            let before = backend_count(&probe_pool).await;
+            match heavy(&env, &gw_path, None).await {
+                Ok(deps) => {
+                    let after = backend_count(&probe_pool).await;
+                    outcome = Some((deps, before, after));
+                    break;
+                }
+                Err(e) if e.message.contains("zero agents") => continue,
+                Err(e) => panic!("heavy() failed for a reason other than the seed race: {e:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&gw_dir);
+        let (deps, before, after) =
+            outcome.expect("heavy() never won the probe-agent seed race after 5 attempts");
+        let delta = after - before;
         assert!(
-            pool.size() <= 8,
-            "one shared pool must stay within its own cap, saw {}",
-            pool.size()
+            delta <= 2,
+            "heavy() must share ONE pool (a delta of ~1 backend connection), saw a \
+             delta of {delta} (before={before}, after={after}) — a regression to a \
+             separate connect() per adapter would show ~4",
         );
+        drop(deps);
     }
 }
