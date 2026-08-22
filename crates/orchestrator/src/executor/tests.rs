@@ -11750,7 +11750,7 @@ async fn shell_stdout_is_redacted() {
 mod scheduler_driver {
     use super::*;
     use crate::Scheduler;
-    use crate::test_support::{FakeClock, timeout_gateway};
+    use crate::test_support::{FakeClock, gated_gateway};
     use chrono::{DateTime, Duration, Utc};
     use orchestrator_core::{RunId, RunStatus, SchedulerStore};
     use orchestrator_store::InMemorySchedulerStore;
@@ -11775,13 +11775,7 @@ mod scheduler_driver {
         let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap());
 
         // Submit with a GATED executor → the run pauses on the timed gate (resume_after journaled).
-        let gw = timeout_gateway().await;
-        let _ = gw
-            .execute(&support::build_request(
-                "c",
-                &serde_json::json!({ "prompt": "warm" }),
-            ))
-            .await;
+        let gw = gated_gateway().await;
         let gated_exec =
             Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
         let sched_submit = Scheduler::new(
@@ -12258,7 +12252,7 @@ mod postgres_e2e {
     async fn scheduler_wakes_a_paused_run_cross_process() {
         let Some(url) = db_url() else { return };
         use crate::Scheduler;
-        use crate::test_support::{FakeClock, timeout_gateway};
+        use crate::test_support::{FakeClock, gated_gateway};
         use chrono::{DateTime, Duration, Utc};
         use orchestrator_core::{RunStatus, SchedulerStore};
 
@@ -12275,13 +12269,7 @@ mod postgres_e2e {
         // --- Process A: submit with a gated executor → pauses + persists to PG (scheduled_runs + journal).
         let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
         let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
-        let gw = timeout_gateway().await;
-        let _ = gw
-            .execute(&support::build_request(
-                "c",
-                &serde_json::json!({ "prompt": "warm" }),
-            ))
-            .await;
+        let gw = gated_gateway().await;
         let exec_a = Executor::new(Arc::new(gw), journal_a.clone(), "v1").with_clock(clock.clone());
         let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
         let o1 = sched_a.submit(run, graph.clone()).await.unwrap();

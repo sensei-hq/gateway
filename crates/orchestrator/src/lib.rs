@@ -10,8 +10,12 @@ pub mod agent;
 pub mod executor;
 pub mod scheduler;
 
-#[cfg(test)]
-mod test_support;
+// Dev-only: `test` for this crate's own tests, `feature = "test-support"` for ANOTHER
+// crate's dev-dependencies (torii's cross-process e2e needs the same gateway/clock
+// doubles). Nothing in a production build enables the feature, so a release binary is
+// byte-identical to before.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub use executor::selector::LlmPlannerSelector;
 pub use executor::{Executor, RunOutcome};

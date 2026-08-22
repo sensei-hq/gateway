@@ -1,16 +1,15 @@
 //! `torii` — the operator control plane for the sensei orchestrator.
-
-mod boot;
-mod cmd;
-mod diff;
-mod errors;
-mod render;
+//!
+//! This binary is deliberately thin: the clap surface plus `dispatch`. Every
+//! command implementation lives in the `torii` LIBRARY (`src/lib.rs`) so an
+//! integration test can call the real thing — see that module's docs.
 
 use clap::{Parser, Subcommand};
-use cmd::Outcome;
-use errors::CliError;
 use orchestrator_core::{Graph, RunId};
 use std::path::PathBuf;
+use torii::cmd::Outcome;
+use torii::errors::CliError;
+use torii::{boot, cmd};
 
 #[derive(Parser)]
 #[command(
