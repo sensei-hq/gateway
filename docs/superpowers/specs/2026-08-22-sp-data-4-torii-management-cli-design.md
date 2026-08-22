@@ -355,8 +355,10 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
   two-read form fails AC5.
 - **AC12 — additivity:** `orchestrator`'s executor logic is unchanged; the `orchestrator-core` delta
   is one defaulted trait method plus `reload`/`from_source` calling it; unversioned sources behave
-  identically. The **1131 existing tests all still pass** and every test added by this slice runs
-  **without a database** — so `cargo test --workspace` stays DB-free and no existing count regresses.
+  identically. The **1149 pre-slice tests all still pass** (measured `cargo test --workspace`,
+  0 failed, real exit 0 — the "1131" in the s3 checkpoint was a different measure and is not the
+  baseline to verify against) and every test added by this slice runs **without a database** — so
+  `cargo test --workspace` stays DB-free and no existing count regresses.
 - **AC13 — Docker verification:** the store suite (`--features postgres`), the torii DB suite, and
   the e2e run green against `postgres:16` with **real, unpiped exit codes**.
 
