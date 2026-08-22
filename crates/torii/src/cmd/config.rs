@@ -474,6 +474,10 @@ mod tests {
         std::env::var("DATABASE_URL").ok()
     }
 
+    /// Every test below that writes or measures the durable config holds this — see its
+    /// definition for why it lives at crate root rather than here.
+    use crate::test_guard::config_guard;
+
     /// An existing, empty directory: `FilesystemConfigSource::load` treats a missing
     /// SUBdir as empty, but a missing ROOT is loud — so the root itself must exist.
     fn empty_config_dir() -> std::path::PathBuf {
@@ -491,6 +495,7 @@ mod tests {
     #[tokio::test]
     async fn a_confirmed_push_refuses_when_the_diff_went_stale_mid_prompt() {
         let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
         let src =
             PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
 
@@ -572,6 +577,7 @@ mod tests {
     #[tokio::test]
     async fn a_declined_push_refuses_without_repeating_the_diff_text() {
         let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
         let src =
             PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
         let a = format!("decline-{}", uuid::Uuid::new_v4());
@@ -603,6 +609,7 @@ mod tests {
     #[tokio::test]
     async fn write_and_report_keeps_the_diff_text_when_confirm_was_never_called() {
         let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
         let src =
             PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
         let text = "config diff (durable vX -> ./cfg):\n  - skill  gone\n".to_string();
@@ -625,6 +632,7 @@ mod tests {
     #[tokio::test]
     async fn write_and_report_omits_the_diff_text_when_confirm_already_showed_it() {
         let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
         let src =
             PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
         let out = write_and_report(&src, &cfg(vec![]), u64::MAX, None)
@@ -637,6 +645,103 @@ mod tests {
             !out.text.contains("config diff (durable v"),
             "confirm already showed the diff; the outcome must not repeat it: {}",
             out.text
+        );
+    }
+
+    /// AC3 + AC4 against a live database. These are the three claims the pure `plan_push`
+    /// tests structurally cannot make, because each one is about whether the DATABASE
+    /// changed — and each covers a `push` branch nothing else reaches: the validation gate
+    /// ahead of step 2, the declined-removal exit (the test above asserts its TEXT, not
+    /// that the rows survived), and `write_and_report`'s success arm (both of its own
+    /// tests force the refusal arm with an impossible `current_v`, so the write itself was
+    /// never exercised end to end).
+    #[tokio::test]
+    async fn a_push_validates_then_refuses_then_applies_against_a_live_database() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let src =
+            PostgresConfigSource::new(orchestrator_store::postgres::connect(&url).await.unwrap());
+
+        // Seed a known durable state: a push is replace-all, so after this the durable
+        // config IS exactly this one skill, whatever other tests left behind.
+        let seeded = format!("seed-{}", uuid::Uuid::new_v4());
+        let v0 = src
+            .store_and_bump(&cfg(vec![skill(&seeded, "body")]))
+            .await
+            .unwrap();
+
+        // 1. VALIDATION REFUSES BEFORE WRITING. A `chains.json` with a duplicate
+        //    (area, kind) LOADS fine but does not assemble, so the refusal has to come
+        //    from `push`'s own `Registry::from_config` gate — which sits ahead of the
+        //    snapshot read, let alone the write. `yes = true` so nothing else could
+        //    refuse it.
+        let bad = empty_config_dir();
+        std::fs::write(
+            bad.join("chains.json"),
+            r#"[{"area":"research","kind":"reasoning","chain":"a"},
+                {"area":"research","kind":"reasoning","chain":"b"}]"#,
+        )
+        .unwrap();
+        let mut always_yes = |_: &str| true;
+        let err = push(&src, &bad, true, &mut always_yes)
+            .await
+            .expect_err("a config that does not assemble must be refused");
+        std::fs::remove_dir_all(&bad).ok();
+        assert_eq!(err.code, crate::errors::EXIT_ERROR, "{}", err.message);
+        assert!(err.message.contains("does not assemble"), "{}", err.message);
+        assert_eq!(
+            src.version().await.unwrap(),
+            Some(v0),
+            "an invalid push must not advance the generation"
+        );
+
+        // 2. AN UNCONFIRMED REMOVAL WRITES NOTHING — neither content nor generation.
+        let empty = empty_config_dir();
+        let mut always_no = |_: &str| false;
+        let refused = push(&src, &empty, false, &mut always_no)
+            .await
+            .expect("a declined push is not a hard error");
+        assert_eq!(
+            refused.code,
+            crate::errors::EXIT_PRECONDITION,
+            "{}",
+            refused.text
+        );
+        let (survived, survived_v) = src.load_versioned().await.unwrap();
+        assert_eq!(
+            survived_v,
+            Some(v0),
+            "a refused push must not advance the generation"
+        );
+        assert!(
+            survived.skills.iter().any(|s| s.name == seeded),
+            "a refused push must not delete content: {:?}",
+            survived.skills
+        );
+
+        // 3. THE SAME REMOVAL, CONFIRMED, LANDS AND BUMPS EXACTLY ONCE.
+        let applied = push(&src, &empty, false, &mut always_yes)
+            .await
+            .expect("a confirmed push is not a hard error");
+        std::fs::remove_dir_all(&empty).ok();
+        assert_eq!(applied.code, crate::errors::EXIT_OK, "{}", applied.text);
+        assert!(
+            applied
+                .text
+                .contains(&format!("pushed: config now at v{}", v0 + 1)),
+            "the operator is told the new generation: {}",
+            applied.text
+        );
+        let (after, after_v) = src.load_versioned().await.unwrap();
+        assert_eq!(
+            after_v,
+            Some(v0 + 1),
+            "a successful push bumps exactly once, not twice"
+        );
+        assert!(
+            after.skills.is_empty(),
+            "the confirmed removal actually landed: {:?}",
+            after.skills
         );
     }
 }

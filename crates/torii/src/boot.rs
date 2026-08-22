@@ -1,6 +1,9 @@
-//! Wiring: environment and files -> live dependencies. This lives in the BINARY,
-//! not the library: `Executor` takes every backend as an injected `Arc<dyn ...>`
-//! precisely so the library knows nothing about Postgres, env vars, or config files.
+//! Wiring: environment and files -> live dependencies. This is torii's ONLY
+//! Postgres/env/config-file-aware module: `Executor` takes every backend as an injected
+//! `Arc<dyn ...>` precisely so the orchestrator library knows nothing about any of them,
+//! and every `cmd` here takes its dependencies as arguments so none of them needs this
+//! module either. Concentrating the wiring in one place is what keeps the commands
+//! unit-testable against in-memory doubles.
 
 use crate::errors::{CliError, redact_url};
 use orchestrator::agent::tools::{FsReadTool, FsWriteTool, ShellTool, ToolRegistry};
@@ -492,13 +495,17 @@ mod tests {
     /// `store_and_bump` is replace-all (see its own doc comment: concurrent
     /// writers serialize and last-writer-wins, which is clean, not corruption) —
     /// so a concurrent `cmd::config` test's write can legitimately race this
-    /// seed away between the write and `heavy()`'s read. Retrying absorbs that
-    /// instead of flaking; any OTHER failure is a real bug and is not retried.
+    /// seed away between the write and `heavy()`'s read. `config_guard` now
+    /// serializes every durable-config writer in this crate, which closes that
+    /// race at the source; the retry below is kept as the backstop for any
+    /// future writer that forgets the guard, and any OTHER failure is a real bug
+    /// and is not retried.
     #[tokio::test]
     async fn heavy_boots_on_one_pools_worth_of_real_backend_connections() {
         let Some(url) = std::env::var(ENV_DATABASE_URL).ok() else {
             return;
         };
+        let _guard = crate::test_guard::config_guard().await;
 
         let probe_pool = connect(&url).await.expect("connect");
         let config_source = PostgresConfigSource::new(probe_pool.clone());

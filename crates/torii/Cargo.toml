@@ -5,6 +5,13 @@ edition = "2024"
 description = "torii: the operator control plane for the sensei orchestrator"
 license = "MIT"
 
+# lib+bin: the binary is only clap + `dispatch`; the command implementations live in the
+# library so an integration test can drive the real `cmd::worker::serve` (and the real
+# `cmd::config::push`) rather than a re-implementation of their contracts.
+[lib]
+name = "torii"
+path = "src/lib.rs"
+
 [[bin]]
 name = "torii"
 path = "src/main.rs"
@@ -28,3 +35,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# The cross-process e2e needs the same gateway/clock doubles the executor's own tests
+# use (a gated gateway to force a durable pause, a recording one to count re-spend).
+orchestrator = { package = "sensei-orchestrator", path = "../orchestrator", features = ["test-support"] }
