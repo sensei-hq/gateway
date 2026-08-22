@@ -63,6 +63,90 @@ pub fn env_config() -> Result<EnvConfig, CliError> {
     env_config_from(|k| std::env::var(k).ok())
 }
 
+/// What replaces credential material scrubbed out of text torii did not compose.
+const REDACTED: &str = "<redacted>";
+
+/// The credential material in a connection string, so it can be scrubbed out of an
+/// error message torii did NOT compose (see [`connect_failure`]).
+///
+/// The username is deliberately NOT a needle. It is not a secret, `redact_url` drops it
+/// from the part torii composes anyway, and scrubbing it would mangle every legitimate
+/// error for the overwhelmingly common `postgres://postgres@host/postgres` — where the
+/// scheme, the user and the database name are all the same token.
+fn credential_needles(url: &str) -> Vec<&str> {
+    let mut out = vec![url];
+    // No `://` means a scheme-less URL, which is exactly the shape that leaks: `Url::parse`
+    // reads `operator:s3cret@host:5433/db` as scheme `operator` + an opaque path, so sqlx
+    // takes the whole password-onward tail as the DATABASE NAME and the server echoes it
+    // back in `database "…" does not exist`. Treating the whole string as the post-scheme
+    // remainder is what finds the userinfo in that case.
+    let after_scheme = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    if let Some((userinfo, _host_and_path)) = after_scheme.rsplit_once('@')
+        && let Some((_user, password)) = userinfo.split_once(':')
+    {
+        out.push(userinfo);
+        out.push(password);
+    }
+    out
+}
+
+/// Replace every occurrence of `url`'s credential material in `text`.
+///
+/// Deliberately fail-closed: a one-character password is scrubbed too, which can mangle an
+/// unrelated word in the message. An over-scrubbed error message is a cosmetic annoyance;
+/// an under-scrubbed one is a credential in journald and CI logs. (Known limit: a
+/// percent-encoded password that some layer decodes before printing would not match. No
+/// shipped sqlx error does that — it echoes the string it was given.)
+fn scrub_credentials(text: &str, url: &str) -> String {
+    let mut needles = credential_needles(url);
+    // Longest first: replacing a nested needle (the password) before the string that
+    // contains it (the whole URL) would leave the outer match broken and its remaining
+    // fragments in place.
+    needles.sort_unstable_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out = text.to_string();
+    for n in needles {
+        // `str::replace` with an empty pattern splices the replacement between every
+        // character — a URL with no password must not shred the message.
+        if !n.is_empty() {
+            out = out.replace(n, REDACTED);
+        }
+    }
+    out
+}
+
+/// Compose a connect failure without echoing the connection string.
+///
+/// `redact_url` covers the half torii interpolates itself, but it CANNOT cover the sqlx
+/// error's own text, which carries the raw input: for a scheme-less `DATABASE_URL` (an
+/// ordinary secret-store mistake) `redact_url` correctly returns its placeholder and the
+/// adjacent `{e}` then prints `database "s3cret@127.0.0.1:5433/postgres" does not exist`,
+/// defeating it entirely. Both connect sites go through here so neither can regress.
+fn connect_failure(database_url: &str, err: &str) -> String {
+    format!(
+        "cannot connect to {}: {}",
+        redact_url(database_url),
+        scrub_credentials(err, database_url)
+    )
+}
+
+/// A gateway-config parse failure reports the serde error's LOCATION ONLY — never its
+/// `Display`, which echoes the offending VALUE (`invalid type: string "sk-live-…",
+/// expected struct RouterConfig`). This file is the one that holds provider API keys, and
+/// the single most likely first-run typo is pasting a key where a struct belongs — which
+/// would put a live credential in a worker's stderr and thus in journald/CI logs.
+/// `RouterConfig` already has a redacting `Debug` for exactly this reason; the serde error
+/// is the hole that bypasses it. Line/column/category is enough to find the problem.
+fn gateway_config_parse_error(path: &Path, e: &serde_json::Error) -> CliError {
+    CliError::error(format!(
+        "{} is not a valid gateway config: {:?} error at line {} column {}. \
+         The offending value is deliberately not echoed — this file holds provider API keys.",
+        path.display(),
+        e.classify(),
+        e.line(),
+        e.column()
+    ))
+}
+
 /// The heavy tier additionally requires the fence base.
 pub fn require_fence(env: &EnvConfig) -> Result<&str, CliError> {
     env.fence_version.as_deref().ok_or_else(|| {
@@ -170,12 +254,9 @@ fn light_from_pool(pool: sqlx::PgPool) -> LightDeps {
 }
 
 pub async fn light(env: &EnvConfig) -> Result<LightDeps, CliError> {
-    let pool = connect(&env.database_url).await.map_err(|e| {
-        CliError::error(format!(
-            "cannot connect to {}: {e}",
-            redact_url(&env.database_url)
-        ))
-    })?;
+    let pool = connect(&env.database_url)
+        .await
+        .map_err(|e| CliError::error(connect_failure(&env.database_url, &e.to_string())))?;
     Ok(light_from_pool(pool))
 }
 
@@ -206,12 +287,7 @@ pub async fn heavy(
     let raw = std::fs::read_to_string(gateway_config)
         .map_err(|e| CliError::error(format!("cannot read {}: {e}", gateway_config.display())))?;
     let gw_config: kernel::types::config::GatewayConfig =
-        serde_json::from_str(&raw).map_err(|e| {
-            CliError::error(format!(
-                "{} is not a valid gateway config: {e}",
-                gateway_config.display()
-            ))
-        })?;
+        serde_json::from_str(&raw).map_err(|e| gateway_config_parse_error(gateway_config, &e))?;
 
     // ONE shared pool for the whole heavy tier: `PgPool` is `Pool<DB>(Arc<PoolInner>)`,
     // so cloning it is an `Arc::clone`, not a new connection. One `connect()` + N
@@ -226,7 +302,7 @@ pub async fn heavy(
     let url = &env.database_url;
     let pool = connect(url)
         .await
-        .map_err(|e| CliError::error(format!("cannot connect to {}: {e}", redact_url(url))))?;
+        .map_err(|e| CliError::error(connect_failure(url, &e.to_string())))?;
     let light = light_from_pool(pool.clone());
 
     // One atomic (config, generation) read — the fence generation must match the
@@ -408,6 +484,96 @@ mod tests {
         assert!(debug.contains("h:5432/db"), "{debug}");
     }
 
+    /// WHOLE-SLICE FIX 2: `redact_url` handles the URL torii interpolates itself, and the
+    /// AC10 test above proves that half — but only for the out-of-range-port shape, where
+    /// sqlx happens not to echo its input. A SCHEME-LESS `DATABASE_URL` (an ordinary
+    /// secret-store mistake: the scheme dropped somewhere in the pipeline) is the shape
+    /// that actually leaked, reproduced 3/3 against the real binary:
+    ///
+    /// ```text
+    /// torii: cannot connect to <unparseable database url>: error returned from database:
+    ///        database "s3cr3t-XyZ@127.0.0.1:5433/postgres" does not exist
+    /// ```
+    ///
+    /// `redact_url` did its job and the adjacent `{e}` defeated it. The error text is
+    /// verbatim from that reproduction (a live server round trip, so it cannot be
+    /// exercised as a fast unit test) — `connect_failure` is pure precisely so the
+    /// composition can be proven without one.
+    #[test]
+    fn a_connect_failure_scrubs_the_password_out_of_the_sqlx_error_text() {
+        let pw = format!("s3cr3t-{}", "XyZ");
+        let url = format!("operator:{pw}@127.0.0.1:5433/postgres");
+        let sqlx_err = format!(
+            "error returned from database: database \"{pw}@127.0.0.1:5433/postgres\" does not exist"
+        );
+        let msg = connect_failure(&url, &sqlx_err);
+        assert!(
+            !msg.contains(&pw),
+            "password leaked via the error text: {msg}"
+        );
+        assert!(
+            msg.contains("does not exist"),
+            "the diagnosis must survive scrubbing: {msg}"
+        );
+    }
+
+    /// The same guard for the shape where sqlx echoes the WHOLE connection string.
+    #[test]
+    fn a_connect_failure_scrubs_a_whole_echoed_connection_string() {
+        let pw = format!("s3cr{}t", "e");
+        let url = format!("postgres://operator:{pw}@db.internal:5432/orch");
+        let msg = connect_failure(&url, &format!("invalid connection string: {url}"));
+        assert!(!msg.contains(&pw), "password leaked: {msg}");
+        assert!(
+            msg.contains("db.internal:5432/orch"),
+            "the redacted host/db must still be reported: {msg}"
+        );
+    }
+
+    /// The scrub must not fire when there is nothing to scrub: a passwordless URL whose
+    /// user, scheme and database name are the same token (`postgres`) is the common case,
+    /// and mangling it would make every legitimate connect error unreadable.
+    #[test]
+    fn a_connect_failure_leaves_a_passwordless_url_error_intact() {
+        let msg = connect_failure(
+            "postgres://postgres@localhost:5433/postgres",
+            "error returned from database: database \"postgres\" does not exist",
+        );
+        assert!(
+            msg.contains("database \"postgres\" does not exist"),
+            "a passwordless URL has no credential to scrub: {msg}"
+        );
+    }
+
+    /// WHOLE-SLICE FIX 3: serde_json's `Display` echoes the offending VALUE, so a key
+    /// pasted as a router value instead of under `api_key` would land a live credential in
+    /// a worker's stderr. Drives the REAL serde error (not a fabricated string) so the
+    /// assertion is about what serde actually produces.
+    #[test]
+    fn a_bad_gateway_config_reports_the_location_not_the_offending_value() {
+        let key = format!("sk-live-{}", "AbC1234567890");
+        let raw = format!("{{\"routers\": {{\"openai\": \"{key}\"}}}}");
+        let e = serde_json::from_str::<kernel::types::config::GatewayConfig>(&raw)
+            .expect_err("a string where a struct belongs must not parse");
+        // The hazard, stated as a fact about serde rather than an assumption.
+        assert!(
+            e.to_string().contains(&key),
+            "precondition: serde's Display is what echoes the key: {e}"
+        );
+        let err = gateway_config_parse_error(Path::new("/tmp/gw-bad.json"), &e);
+        assert!(
+            !err.message.contains(&key),
+            "the API key must never reach stderr: {}",
+            err.message
+        );
+        assert!(err.message.contains("gw-bad.json"), "{}", err.message);
+        assert!(
+            err.message.contains("line 1") && err.message.contains("column"),
+            "the operator still needs the location: {}",
+            err.message
+        );
+    }
+
     /// FIX 1: `FacadeBuilder::build` never fails on a bad router — this is the only
     /// place a completely misconfigured gateway is caught. No live provider needed:
     /// the check is pure over the already-registered adapter ids.
@@ -502,7 +668,7 @@ mod tests {
     /// and is not retried.
     #[tokio::test]
     async fn heavy_boots_on_one_pools_worth_of_real_backend_connections() {
-        let Some(url) = std::env::var(ENV_DATABASE_URL).ok() else {
+        let Some(url) = crate::test_guard::db_url() else {
             return;
         };
         let _guard = crate::test_guard::config_guard().await;

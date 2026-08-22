@@ -14,7 +14,15 @@ pub async fn status(
     json: bool,
 ) -> Result<Outcome, CliError> {
     match store.status(run).await? {
-        None => Ok(Outcome::precondition(format!("no such run: {}", run.0))),
+        // WHOLE-SLICE FIX 5: `--json` promises machine-parseable STDOUT, and the not-found
+        // path was emitting prose there — so `torii run status X --json | jq` failed on
+        // exactly the case a script is most likely to hit. `null` is the honest JSON answer
+        // (the run does not exist); the exit code, not the payload, still carries "2".
+        None => Ok(Outcome::precondition(if json {
+            "null".to_string()
+        } else {
+            format!("no such run: {}", run.0)
+        })),
         Some(r) => Ok(Outcome::ok(if json {
             render::json(&[r]).map_err(|e| CliError::error(e.to_string()))?
         } else {
@@ -120,11 +128,44 @@ pub async fn wake(
 /// detached run would only be picked up once the lease expired and the crash-reclaim
 /// path grabbed it. Abusing crash recovery as a scheduling primitive was rejected;
 /// a real `pending` status is the fix.
+///
+/// `announce` is called EXACTLY when the submit is known to be going ahead: after the
+/// duplicate pre-check, before the (potentially very long) drive. `main` passes the
+/// `submitted: <id>` print — WHOLE-SLICE FIX 4. It used to run before this function was
+/// even entered, which announced an effect that a rejected `enqueue` never performed:
+/// precisely the "report the effect, not the Ok" discipline the rest of this module
+/// enforces. It must still precede the drive, so an operator who loses the terminal can
+/// find the run.
 pub async fn submit(
     scheduler: &orchestrator::Scheduler,
     run: RunId,
     graph: orchestrator_core::Graph,
+    announce: impl FnOnce(),
 ) -> Result<Outcome, CliError> {
+    // A run id that already has a schedule record cannot be submitted again. Left to
+    // `enqueue`, this surfaces as `OrchestratorError::Store` — which §7.4 defines as a
+    // RETRYABLE TRANSPORT FAULT — at exit 1, with `RunId(..)` `Debug` formatting in the
+    // text. It is neither retryable nor a transport problem: the caller passed a
+    // `--run-id` that is already taken, which is a precondition failure (exit 2).
+    //
+    // Read through the scheduler rather than a separately-passed store, deliberately:
+    // `Scheduler::status` delegates to the very store its own `enqueue` will hit, so the
+    // pre-check cannot be aimed at a different database than the write.
+    //
+    // A pre-check is a better MESSAGE, not a lock: two concurrent submits of the same id
+    // can both pass it. `enqueue` remains the real guard (`on conflict do nothing` +
+    // `rows_affected == 0`), so that race degrades to the old loud error rather than
+    // double-enqueueing — which is why the check belongs here and not in place of it.
+    if let Some(existing) = scheduler.status(run).await? {
+        return Ok(Outcome::precondition(format!(
+            "already submitted: {} is {} — a run id can only be submitted once. Use \
+             `torii run status {}` to inspect it.",
+            run.0,
+            existing.status.as_str(),
+            run.0
+        )));
+    }
+    announce();
     let outcome = scheduler.submit(run, graph).await?;
     if let Some(p) = &outcome.paused {
         return Ok(Outcome::ok(format!(
@@ -136,10 +177,10 @@ pub async fn submit(
         // A run that actually executed and failed is an EXECUTION error (exit 1),
         // not a precondition-not-met no-op (exit 2, this taxonomy's code for "ran
         // fine, nothing to do"): automation needs to tell "the workload failed,
-        // page someone" apart from an idempotent no-op. `submitted: <id>` has
-        // already reached stdout by the time this returns — that is fine and
-        // intentional (an operator who loses the terminal must still be able to
-        // find the run).
+        // page someone" apart from an idempotent no-op. `announce` has already
+        // reached stdout by the time this returns — that is fine and intentional
+        // (an operator who loses the terminal must still be able to find the run),
+        // and by then the enqueue really did happen.
         return Err(CliError::error(format!(
             "failed: {} at node {} ({msg})",
             run.0, node.0
@@ -158,6 +199,7 @@ mod tests {
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::Graph;
     use orchestrator_store::InMemorySchedulerStore;
+    use std::sync::Arc;
 
     fn now() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(3_000_000, 0).unwrap()
@@ -185,6 +227,28 @@ mod tests {
             .expect("no hard error");
         assert_eq!(out.code, EXIT_PRECONDITION);
         assert!(out.text.contains("no such run"), "{}", out.text);
+    }
+
+    /// WHOLE-SLICE FIX 5: `--json` must never put prose on stdout — `torii run status X
+    /// --json | jq` has to survive the not-found case, which is the one a script polling
+    /// for a run is most likely to hit first.
+    #[tokio::test]
+    async fn status_of_an_unknown_run_is_still_valid_json_under_json() {
+        let s = InMemorySchedulerStore::default();
+        let out = status(&s, RunId(uuid::Uuid::new_v4()), true)
+            .await
+            .expect("no hard error");
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "the exit code still says not-found: {}",
+            out.text
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.text)
+            .unwrap_or_else(|e| panic!("--json emitted non-JSON {:?}: {e}", out.text));
+        assert!(
+            v.is_null(),
+            "a run that does not exist is JSON null, not a fabricated record: {v}"
+        );
     }
 
     #[tokio::test]
@@ -278,6 +342,83 @@ mod tests {
             out.text.contains("waking"),
             "must name the actual state: {}",
             out.text
+        );
+    }
+
+    // ---- WHOLE-SLICE FIX 4: a duplicate submit ---------------------------------------
+
+    /// A real `Scheduler` over in-memory backends. No database, no live provider: the
+    /// recording gateway is never reached on the duplicate path (the pre-check returns
+    /// first), and the empty graph spends nothing on the fresh path.
+    async fn scheduler_over(store: Arc<InMemorySchedulerStore>) -> orchestrator::Scheduler {
+        let journal = Arc::new(orchestrator_store::InMemoryJournal::new());
+        let (gw, _calls) = orchestrator::test_support::recording_gateway().await;
+        let clock = orchestrator::test_support::FakeClock::new(now());
+        let exec = orchestrator::Executor::new(Arc::new(gw), journal.clone(), "v1");
+        orchestrator::Scheduler::new(store, exec, journal, clock)
+    }
+
+    /// Re-submitting a taken run id must be a PRECONDITION failure, and must not have
+    /// announced `submitted:` first.
+    ///
+    /// Both halves were wrong before: `enqueue`'s refusal surfaced as
+    /// `OrchestratorError::Store` — which the CLI's taxonomy (§7.4) reserves for a
+    /// RETRYABLE TRANSPORT FAULT — at exit 1, carrying `RunId(..)` `Debug` formatting; and
+    /// `main` had already printed `submitted: <id>` for a run that was never enqueued.
+    #[tokio::test]
+    async fn a_duplicate_submit_is_a_precondition_failure_and_announces_nothing() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::default());
+        store.enqueue(run, &empty_graph(), now()).await.unwrap();
+        let sched = scheduler_over(store.clone()).await;
+
+        let mut announced = false;
+        let out = submit(&sched, run, empty_graph(), || announced = true)
+            .await
+            .expect("a duplicate submit is not a transport fault");
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "a taken run id is a precondition failure, not a retryable transport fault: {}",
+            out.text
+        );
+        assert!(out.text.contains("already submitted"), "{}", out.text);
+        assert!(
+            out.text.contains("waking"),
+            "must name the run's actual state: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains(&run.0.to_string()) && !out.text.contains("RunId("),
+            "the id must be the plain uuid, not `RunId(..)` Debug formatting: {}",
+            out.text
+        );
+        assert!(
+            !announced,
+            "an effect that never happened must never be announced"
+        );
+    }
+
+    /// The counterpart, so the fix cannot be satisfied by never announcing at all:
+    /// a FIRST submit announces (and structurally does so before the drive — `announce()`
+    /// is the statement immediately preceding `scheduler.submit`).
+    #[tokio::test]
+    async fn a_fresh_submit_announces_and_then_drives() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::default());
+        let sched = scheduler_over(store.clone()).await;
+
+        let mut announced = false;
+        let out = submit(&sched, run, empty_graph(), || announced = true)
+            .await
+            .expect("a fresh submit runs");
+
+        assert!(announced, "the operator must get the id");
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+        assert!(out.text.starts_with("completed:"), "{}", out.text);
+        assert!(
+            store.status(run).await.unwrap().is_some(),
+            "and the enqueue really happened"
         );
     }
 
