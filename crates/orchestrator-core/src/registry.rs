@@ -274,16 +274,24 @@ pub trait ConfigSource: Send + Sync {
     /// A tripwire guards the footgun: reaching this default WITH a `Some(_)`
     /// version means a versioned backend forgot to override it, which otherwise
     /// fails silently (no compile error, no runtime signal) and reopens the
-    /// hazard above.
+    /// hazard above. It is a hard error, not a `debug_assert!` — the latter
+    /// compiles out in release, which is precisely where a torn pair would do
+    /// its damage unobserved. Reaching it is always a programming error, and
+    /// this codebase fails loud on those (`IncompatibleFormat`,
+    /// `VersionFenceMismatch`, `ContentDigestMiss`).
     async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+        // `load()` first, so a source whose load fails propagates ITS error rather
+        // than being masked by the tripwire.
         let cfg = self.load().await?;
         let ver = self.version().await?;
-        debug_assert!(
-            ver.is_none(),
-            "ConfigSource::version() returned Some(_) through the DEFAULT load_versioned() — a \
-             versioned source MUST override load_versioned with a single atomic snapshot, or it \
-             reopens the torn (stale config, fresh generation) read hazard"
-        );
+        if ver.is_some() {
+            return Err(OrchestratorError::RegistryLoad(
+                "ConfigSource::version() returned Some(_) through the DEFAULT load_versioned() — a \
+                 versioned source MUST override load_versioned with a single atomic snapshot, or it \
+                 reopens the torn (stale config, fresh generation) read hazard"
+                    .into(),
+            ));
+        }
         Ok((cfg, ver))
     }
 }
