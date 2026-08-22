@@ -50,7 +50,7 @@ impl From<OrchestratorError> for CliError {
                  The run cannot resume under different config. Check `torii config version`."
             ),
             OrchestratorError::Journal(JournalError::IncompatibleFormat { .. }) => format!(
-                "journal format mismatch: {e}.\n\
+                "{e}.\n\
                  This binary cannot safely fold this run's journal. Do not continue."
             ),
             OrchestratorError::Store(m) => format!("store transport fault: {m}"),
@@ -71,8 +71,8 @@ impl From<OrchestratorError> for CliError {
 // Consumed by Task 9 (boot.rs two-tier wiring), reporting a DB connect failure.
 #[allow(dead_code)]
 pub fn redact_url(url: &str) -> String {
-    let after_scheme = url.split("://").nth(1).unwrap_or("");
-    let host_and_path = match after_scheme.split_once('@') {
+    let after_scheme = url.split_once("://").map_or("", |(_scheme, rest)| rest);
+    let host_and_path = match after_scheme.rsplit_once('@') {
         Some((_creds, rest)) => rest,
         None => after_scheme,
     };
@@ -109,6 +109,31 @@ mod tests {
         let out = redact_url(&url);
         assert_eq!(out, "db.internal:5432/orch");
         assert!(!out.contains(&pw));
+    }
+
+    #[test]
+    fn redact_url_does_not_leak_a_password_containing_an_at_sign() {
+        let pw = format!("p{}ssword", "@");
+        let url = format!("postgres://operator:{pw}@db.internal:5432/orch");
+        let out = redact_url(&url);
+        assert_eq!(out, "db.internal:5432/orch");
+        assert!(!out.contains(&pw), "password leaked whole: {out}");
+        // The bug leaks the password's suffix after its embedded '@' (here "ssword"),
+        // not the whole password — a bare `!contains(&pw)` would miss that.
+        assert!(!out.contains("ssword"), "password suffix leaked: {out}");
+    }
+
+    #[test]
+    fn redact_url_does_not_leak_a_password_containing_a_scheme_separator() {
+        let pw = format!("p{}ssword", "://");
+        let url = format!("postgres://operator:{pw}@db.internal:5432/orch");
+        let out = redact_url(&url);
+        assert_eq!(out, "db.internal:5432/orch");
+        assert!(!out.contains(&pw), "password leaked whole: {out}");
+        assert!(
+            !out.contains("operator:p"),
+            "user+password prefix leaked: {out}"
+        );
     }
 
     #[test]
