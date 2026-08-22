@@ -316,7 +316,10 @@ honors that distinction: `Ok(n)` logs the count and sleeps `--interval` (default
 consecutive failures the worker exits non-zero** so a supervisor restarts it and an alert fires.
 Surviving a Postgres failover is worth a retry; treating a dead database as normal is not.
 
-`--once` runs a single tick and exits (cron-friendly, and the e2e's driver).
+`--once` runs a single tick and exits (cron-friendly, and the e2e's driver). **In `--once` mode a store
+fault is fatal**, because the cap can never be reached in a single tick: falling through to a success
+outcome would exit 0 on a dead database, and the exit code is the entire signal for the cron and
+health-check callers that use this mode.
 
 ### 7.2 A panicking run, and the crash-loop limitation
 
@@ -335,6 +338,13 @@ Named here rather than discovered at 3am.
 SIGINT/SIGTERM finishes the in-flight tick, then exits; a second signal exits immediately. Both
 are safe — an abandoned `waking` row is what the lease reclaim was built for. Graceful shutdown
 is about not wasting a partial drive, not about correctness.
+
+Note the consequence, which is deliberate rather than an oversight: shutdown is raced against the
+**sleep between ticks**, not against a tick in progress. `tick()` drives each due run inline via
+`Executor::start`, so a tick's duration is unbounded, and a signal arriving mid-tick is not observed
+until that tick returns. What bounds the worst case is the second-signal path plus the lease — a hard
+kill is safe by construction. Interrupting a tick would abandon a partial drive for no correctness
+gain.
 
 ### 7.4 Errors are mapped, never flattened
 
