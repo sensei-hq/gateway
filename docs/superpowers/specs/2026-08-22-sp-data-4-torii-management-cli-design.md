@@ -207,7 +207,15 @@ describes what the write will do. Demonstrated: durable `{a, b}` at v1, the oper
 and the push lands `{survivor}` at v3 — **destroying `c-brand-new`, which appears nowhere in the text
 the operator approved**, unrecoverably. The `Apply` branch has the same hole with a millisecond window
 and *no prompt at all*. So `push` re-reads the generation immediately before writing and refuses if it
-moved, on both branches.
+moved, on both branches. **`--yes` does not bypass this guard** — it consents to *removals*, not to a
+config different from the one that was diffed. The operational consequence is deliberate: a `--yes` CI
+job under a concurrent writer now exits 2 with a retry instruction rather than clobbering that writer.
+
+Everything on this path fails **closed**. That includes the display: if the prompt cannot be written
+(stderr closed, a broken pipe into a dead pager), consent is refused rather than accepted, because
+there is nothing to consent to if the operator never saw the diff. Both the entity names *and* the
+source path are sanitized — the path is free text and an `\u{1b}[8m` in it is SGR conceal, which would
+render the removal list and the `REMOVES N` warning invisible.
 
 **Entity names are sanitized in the prompt.** The prompt text *is* the destruction consent, so it is
 the most safety-critical renderer in the CLI — more so than the run table. A name containing a newline
