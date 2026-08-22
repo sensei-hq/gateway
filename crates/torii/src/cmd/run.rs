@@ -45,6 +45,8 @@ pub async fn cancel(store: &dyn SchedulerStore, run: RunId) -> Result<Outcome, C
     store.cancel(run).await?;
     // Re-read: `cancel` is a conditional no-op on a terminal row, so only the
     // observed state proves what happened.
+    // This row is never deleted by any shipped store, so `None` here would mean a
+    // hypothetical future retention/purge raced us, not a reachable path today.
     let after = store
         .status(run)
         .await?
@@ -78,19 +80,43 @@ pub async fn wake(
         )));
     }
     store.force_wake(run, now).await?;
+    // This row is never deleted by any shipped store, so `None` here would mean a
+    // hypothetical future retention/purge raced us, not a reachable path today.
     let after = store
         .status(run)
         .await?
         .ok_or_else(|| CliError::error(format!("run {} vanished mid-wake", run.0)))?;
-    match after.next_wake {
-        Some(_) => Ok(Outcome::ok(format!(
+    // The primary signal is STATUS, not next_wake's mere presence: `claim_due` flips
+    // `paused -> waking` and leaves a stale `next_wake` untouched, and `cancel` clears
+    // it to NULL — neither on its own tells us whether OUR force_wake actually applied
+    // (both shipped stores make force_wake conditional on the row still being
+    // `paused`). A real force_wake success leaves the row `paused` with `next_wake`
+    // pinned to (within clock precision of) `now`; a lost race to a concurrent claim
+    // or cancel moves the status away from `paused` instead, which the timestamp alone
+    // cannot distinguish from a stale pre-existing deadline.
+    //
+    // The timestamp tolerance is not compensating for multi-process clock skew — `now`
+    // here is the exact value this call sent to the store — it only absorbs the
+    // sub-microsecond rounding a `timestamptz` column performs on write. Verified
+    // empirically against a live Postgres: writing a nanosecond-precision value and
+    // reading it back can round it UP by a fraction of a microsecond (not only down),
+    // so a one-sided `t <= now` is not safe; the drift is checked in both directions.
+    let applied = after.status == RunStatus::Paused
+        && after.next_wake.is_some_and(|t| {
+            let drift = if t >= now { t - now } else { now - t };
+            drift <= chrono::Duration::milliseconds(1)
+        });
+    if applied {
+        Ok(Outcome::ok(format!(
             "queued for wake: {} (a worker tick will drive it)",
             run.0
-        ))),
-        None => Ok(Outcome::precondition(format!(
-            "not queued: {} still has no wake deadline",
-            run.0
-        ))),
+        )))
+    } else {
+        Ok(Outcome::precondition(format!(
+            "not queued: {} is {} — force_wake did not apply",
+            run.0,
+            after.status.as_str()
+        )))
     }
 }
 
@@ -220,6 +246,162 @@ mod tests {
             out.text.contains("waking"),
             "must name the actual state: {}",
             out.text
+        );
+    }
+
+    /// Which concurrent actor lands in the gap between `wake`'s pre-check (`status`)
+    /// and its own `force_wake` call.
+    #[derive(Clone, Copy)]
+    enum ConcurrentActor {
+        /// A worker's tick claims the same due pause first (`paused -> waking`).
+        ClaimsFirst,
+        /// Another operator cancels the run first (`paused -> cancelled`).
+        CancelsFirst,
+    }
+
+    /// Delegates to a real `InMemorySchedulerStore` for everything, EXCEPT that its
+    /// `force_wake` runs `actor` against `run` first. `wake()` calls `store.status`
+    /// (the pre-check) and only then `store.force_wake` — so running the concurrent
+    /// actor at the top of THIS `force_wake` lands it exactly in that gap, reproducing
+    /// a real multi-process race deterministically, single-threaded, no database.
+    struct RacingStore {
+        inner: InMemorySchedulerStore,
+        run: RunId,
+        actor: ConcurrentActor,
+    }
+
+    #[async_trait::async_trait]
+    impl SchedulerStore for RacingStore {
+        async fn enqueue(
+            &self,
+            run: RunId,
+            graph: &Graph,
+            now: DateTime<Utc>,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.enqueue(run, graph, now).await
+        }
+        async fn record_paused(
+            &self,
+            run: RunId,
+            next_wake: Option<DateTime<Utc>>,
+            reason: &str,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.record_paused(run, next_wake, reason).await
+        }
+        async fn record_terminal(
+            &self,
+            run: RunId,
+            status: RunStatus,
+            reason: Option<&str>,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.record_terminal(run, status, reason).await
+        }
+        async fn claim_due(
+            &self,
+            now: DateTime<Utc>,
+            lease: chrono::Duration,
+            limit: usize,
+        ) -> Result<Vec<(RunId, Graph)>, orchestrator_core::OrchestratorError> {
+            self.inner.claim_due(now, lease, limit).await
+        }
+        async fn status(
+            &self,
+            run: RunId,
+        ) -> Result<Option<orchestrator_core::ScheduledRun>, orchestrator_core::OrchestratorError>
+        {
+            self.inner.status(run).await
+        }
+        async fn list_paused(
+            &self,
+        ) -> Result<Vec<orchestrator_core::ScheduledRun>, orchestrator_core::OrchestratorError>
+        {
+            self.inner.list_paused().await
+        }
+        async fn cancel(&self, run: RunId) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.cancel(run).await
+        }
+        async fn force_wake(
+            &self,
+            run: RunId,
+            now: DateTime<Utc>,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            if run == self.run {
+                match self.actor {
+                    ConcurrentActor::ClaimsFirst => {
+                        self.inner
+                            .claim_due(now, chrono::Duration::seconds(60), 10)
+                            .await?;
+                    }
+                    ConcurrentActor::CancelsFirst => {
+                        self.inner.cancel(run).await?;
+                    }
+                }
+            }
+            self.inner.force_wake(run, now).await
+        }
+    }
+
+    /// FALSE POSITIVE reproduction: a worker's `claim_due` claims the same overdue
+    /// pause in the window between `wake`'s pre-check and its `force_wake`. The old
+    /// `is_some()` check reported success (`next_wake` survives the claim untouched);
+    /// the run was ALREADY being driven and torii's own call changed nothing.
+    #[tokio::test]
+    async fn wake_reports_not_queued_when_a_concurrent_claim_wins_the_race() {
+        let run = RunId(uuid::Uuid::new_v4());
+        // Overdue: next_wake <= now, so the injected claim_due actually claims it.
+        let inner = paused_store(run, Some(now())).await;
+        let racing = RacingStore {
+            inner: inner.clone(),
+            run,
+            actor: ConcurrentActor::ClaimsFirst,
+        };
+
+        let out = wake(&racing, run, now()).await.expect("no hard error");
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "a claimed run must NOT be reported as a successful wake: {}",
+            out.text
+        );
+        assert!(out.text.contains("not queued"), "{}", out.text);
+        assert!(
+            out.text.contains("waking"),
+            "must name the real state, not a proxy: {}",
+            out.text
+        );
+        assert_eq!(
+            inner.status(run).await.unwrap().unwrap().status,
+            RunStatus::Waking,
+            "the claim, not our force_wake, owns this run now"
+        );
+    }
+
+    /// MISLEADING FAILURE reproduction: another operator's `cancel` wins the race.
+    /// The old code read the resulting NULL `next_wake` and reported the generic
+    /// "still has no wake deadline" (the retryable HOTL phrasing) — hiding that the
+    /// run was actually CANCELLED and retrying will no-op forever.
+    #[tokio::test]
+    async fn wake_reports_not_queued_when_a_concurrent_cancel_wins_the_race() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let inner = paused_store(run, Some(now())).await;
+        let racing = RacingStore {
+            inner: inner.clone(),
+            run,
+            actor: ConcurrentActor::CancelsFirst,
+        };
+
+        let out = wake(&racing, run, now()).await.expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION);
+        assert!(out.text.contains("not queued"), "{}", out.text);
+        assert!(
+            out.text.contains("cancelled"),
+            "must name the true reason (cancelled), not a generic NULL-deadline phrase: {}",
+            out.text
+        );
+        assert_eq!(
+            inner.status(run).await.unwrap().unwrap().status,
+            RunStatus::Cancelled
         );
     }
 }
