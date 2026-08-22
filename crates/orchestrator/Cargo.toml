@@ -14,7 +14,7 @@ name = "orchestrator"
 # store crate's Postgres adapters for the `#[cfg(feature = "postgres-tests")]` tests, which
 # reach Postgres only through `orchestrator_store::postgres::{connect, PostgresJournal,
 # PostgresContentStore}` (no direct sqlx handle).
-postgres-tests = ["orchestrator-store/postgres"]
+postgres-tests = ["orchestrator-store/postgres", "orchestrator-store/test-support"]
 
 [dependencies]
 orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }

@@ -422,23 +422,154 @@ impl ContextStore for PostgresContextStore {
     }
 }
 
+/// Read the whole registry over ONE connection. Callers decide the snapshot
+/// semantics: `load` uses a pooled connection (per-statement snapshots — the
+/// documented non-atomic path, retained for the unversioned contract), while
+/// `load_versioned` passes a REPEATABLE READ transaction for one snapshot.
+async fn read_all(conn: &mut sqlx::PgConnection) -> Result<RegistryConfig, OrchestratorError> {
+    let agents: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("select name, def from orchestrator.config_agents order by name")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(cfg_load_err)?;
+    let skills: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("select name, def from orchestrator.config_skills order by name")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(cfg_load_err)?;
+    let tools: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("select name, spec from orchestrator.config_tools order by name")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(cfg_load_err)?;
+    let bindings: Vec<(String, String, String)> = sqlx::query_as(
+        "select area, kind, chain from orchestrator.config_chain_bindings order by area, kind",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(cfg_load_err)?;
+    Ok(RegistryConfig {
+        agents: agents
+            .into_iter()
+            .map(|(n, v)| {
+                serde_json::from_value(v)
+                    .map_err(|e| OrchestratorError::RegistryLoad(format!("deser agent {n}: {e}")))
+            })
+            .collect::<Result<_, _>>()?,
+        skills: skills
+            .into_iter()
+            .map(|(n, v)| {
+                serde_json::from_value(v)
+                    .map_err(|e| OrchestratorError::RegistryLoad(format!("deser skill {n}: {e}")))
+            })
+            .collect::<Result<_, _>>()?,
+        tools: tools
+            .into_iter()
+            .map(|(n, v)| {
+                serde_json::from_value(v)
+                    .map_err(|e| OrchestratorError::RegistryLoad(format!("deser tool {n}: {e}")))
+            })
+            .collect::<Result<_, _>>()?,
+        chain_bindings: bindings
+            .into_iter()
+            .map(|(area, kind, chain)| ChainBinding { area, kind, chain })
+            .collect(),
+    })
+}
+
+/// Replace-all write of every config table, on a caller-supplied connection so it
+/// can be composed into a larger transaction (that composition is the whole point
+/// of [`PostgresConfigSource::store_and_bump`]).
+async fn write_all(
+    conn: &mut sqlx::PgConnection,
+    cfg: &RegistryConfig,
+) -> Result<(), OrchestratorError> {
+    for t in [
+        "orchestrator.config_agents",
+        "orchestrator.config_skills",
+        "orchestrator.config_tools",
+        "orchestrator.config_chain_bindings",
+    ] {
+        sqlx::query(&format!("delete from {t}"))
+            .execute(&mut *conn)
+            .await
+            .map_err(store_err)?;
+    }
+    for a in &cfg.agents {
+        let v = serde_json::to_value(a).map_err(store_err_ser)?;
+        sqlx::query("insert into orchestrator.config_agents (name, def) values ($1, $2)")
+            .bind(&a.name)
+            .bind(v)
+            .execute(&mut *conn)
+            .await
+            .map_err(store_err)?;
+    }
+    for s in &cfg.skills {
+        let v = serde_json::to_value(s).map_err(store_err_ser)?;
+        sqlx::query("insert into orchestrator.config_skills (name, def) values ($1, $2)")
+            .bind(&s.name)
+            .bind(v)
+            .execute(&mut *conn)
+            .await
+            .map_err(store_err)?;
+    }
+    for t in &cfg.tools {
+        let v = serde_json::to_value(t).map_err(store_err_ser)?;
+        sqlx::query("insert into orchestrator.config_tools (name, spec) values ($1, $2)")
+            .bind(&t.name)
+            .bind(v)
+            .execute(&mut *conn)
+            .await
+            .map_err(store_err)?;
+    }
+    for b in &cfg.chain_bindings {
+        sqlx::query(
+            "insert into orchestrator.config_chain_bindings (area, kind, chain) values ($1, $2, $3)",
+        )
+        .bind(&b.area)
+        .bind(&b.kind)
+        .bind(&b.chain)
+        .execute(&mut *conn)
+        .await
+        .map_err(store_err)?;
+    }
+    Ok(())
+}
+
+/// The single-row atomic generation increment, on a caller-supplied connection.
+async fn bump_on(conn: &mut sqlx::PgConnection) -> Result<u64, OrchestratorError> {
+    let (v,): (i64,) = sqlx::query_as(
+        "insert into orchestrator.config_versions (id, version) values (true, 1)
+         on conflict (id) do update set version = orchestrator.config_versions.version + 1,
+                                        updated_at = now()
+         returning version",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(store_err)?;
+    Ok(v as u64)
+}
+
 /// A durable `ConfigSource` (SP-DATA-2): the registry config lives in the `orchestrator.config_*`
-/// tables as jsonb rows, with a single-row `config_versions` global generation. `load()` reads the
-/// whole registry; `version()` reports the durable generation so a run's `#cfg{gen}` fence is
-/// cross-process meaningful. `store`/`bump_config_version` are the write path (this slice's seeder +
-/// SP-DATA-4's CLI entry point).
+/// tables as jsonb rows, with a single-row `config_versions` global generation, so a run's
+/// `#cfg{gen}` fence is cross-process meaningful.
 ///
-/// KNOWN LIMITATION — cross-process fence correctness under a CONCURRENT config writer
-/// (deferred: unreachable in this slice, MUST close before SP-DATA-4 ships a live writer):
-/// `load()` and `version()` are separate reads, and `load()` itself reads the four config tables
-/// across four independent pool snapshots. So a concurrent `store()`+`bump_config_version()` can
-/// hand a reload a TORN pair — notably (STALE config, FRESH generation): a run then stamps a
-/// fresh-gen fence while serving stale config, and a later resume that reads the now-consistent
-/// (fresh, fresh) state MATCHES the fence and silently continues under different config. Re-reading
-/// `version()` at resume does NOT neutralize this (it reads the consistent state and passes). It is
-/// safe ONLY because this slice has no concurrent writer (`store` is test-only; reloads serialized).
-/// Fix: read the four config tables AND `config_versions` in ONE `REPEATABLE READ` transaction
-/// (a single `load_versioned()` snapshot); land it before SP-DATA-4's CLI introduces a live writer.
+/// ATOMICITY (SP-DATA-4 — closes the SP-DATA-2 carry-forwards). The (config, generation) pair is
+/// only ever safe when both sides move together, so this type exposes exactly one atomic reader and
+/// exactly one atomic writer:
+/// - [`load_versioned`](ConfigSource::load_versioned) — the atomic READ: the four config tables AND
+///   `config_versions` in ONE `REPEATABLE READ` transaction, so a concurrent writer can never hand
+///   back a torn (stale config, fresh generation) pair.
+/// - [`store_and_bump`](Self::store_and_bump) — the atomic WRITE: the replace-all content write AND
+///   the generation increment in ONE transaction, so no crash window can leave new content durably
+///   parked under an old generation.
+///
+/// [`load`](ConfigSource::load) and [`version`](ConfigSource::version) remain individually
+/// non-atomic BY DESIGN: they are the unversioned `ConfigSource` contract (each is a single
+/// self-consistent read of its own thing), and callers that need the pair use `load_versioned`
+/// (`RegistryHandle::reload`/`from_source` already do). The un-coupled writers (`store`,
+/// `bump_config_version`) are gated out of production builds behind `test-support`/`test` — see
+/// [`store`](Self::store).
 #[derive(Clone)]
 pub struct PostgresConfigSource {
     pool: PgPool,
@@ -450,139 +581,65 @@ impl PostgresConfigSource {
         Self { pool }
     }
 
-    /// Replace-all write of the whole registry in one transaction: delete every config row, then
-    /// insert `cfg`'s — so `load()` afterward reproduces `cfg` exactly. Does NOT bump the version
-    /// (the caller bumps explicitly after committing a change).
+    /// The pool, for tests that need to drive an explicit transaction (the TOCTOU proof).
+    #[cfg(test)]
+    pub(crate) fn pool_for_test(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Replace the whole registry AND advance the generation in ONE transaction —
+    /// the only config write production code may use. Returns the new generation.
     ///
-    /// FOOTGUN (close in SP-DATA-4): the fence is generation-based, not content-based — a `store()`
-    /// whose caller forgets `bump_config_version()` changes config content WITHOUT advancing the
-    /// generation, so a cross-process resume matches the (unchanged) fence and silently runs the new
-    /// config. A live config-mutation surface MUST couple store+bump (ideally one transaction / a
-    /// `store_and_bump` helper). Safe in-slice: the only callers are tests that immediately bump.
+    /// One transaction, not two calls: a `store()` followed by a `bump()` has a
+    /// crash window between them, and dying in it leaves new content under an old
+    /// generation DURABLY — a cross-process resume then matches the unchanged fence
+    /// and silently runs the new config. Atomicity removes the window instead of
+    /// asking callers to be careful.
+    pub async fn store_and_bump(&self, cfg: &RegistryConfig) -> Result<u64, OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        write_all(&mut tx, cfg).await?;
+        let v = bump_on(&mut tx).await?;
+        tx.commit().await.map_err(store_err)?;
+        Ok(v)
+    }
+
+    /// Replace-all write of the whole registry in one transaction, WITHOUT bumping the generation.
+    ///
+    /// The UN-COUPLED writer, gated behind `test-support` because a `store` whose caller forgets
+    /// [`bump_config_version`](Self::bump_config_version) changes content without advancing the
+    /// generation — a cross-process resume then matches the (unchanged) fence and silently runs the
+    /// new config. Production code uses [`store_and_bump`](Self::store_and_bump); tests need the
+    /// un-coupled pair to PROVE that the coupled path is what fixes it.
+    ///
+    /// The gate is `test-support` OR `test`, and needs both halves: `test` alone cannot reach the
+    /// three callers in `sensei-orchestrator`'s executor tests (a DIFFERENT crate, where `cfg(test)`
+    /// is not enabled for a dependency), and `test-support` alone cannot reach THIS crate's own unit
+    /// tests under `cargo test --workspace` — `crates/torii` depends on us with
+    /// `features = ["postgres"]` unconditionally, so workspace feature unification compiles this
+    /// module's tests with `postgres` on but `test-support` off. Neither cfg is ever active in a
+    /// production build, which is the property that matters: the footgun stays unreachable.
+    #[cfg(any(feature = "test-support", test))]
     pub async fn store(&self, cfg: &RegistryConfig) -> Result<(), OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(store_err)?;
-        for t in [
-            "orchestrator.config_agents",
-            "orchestrator.config_skills",
-            "orchestrator.config_tools",
-            "orchestrator.config_chain_bindings",
-        ] {
-            sqlx::query(&format!("delete from {t}"))
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
-        }
-        for a in &cfg.agents {
-            let v = serde_json::to_value(a).map_err(store_err_ser)?;
-            sqlx::query("insert into orchestrator.config_agents (name, def) values ($1, $2)")
-                .bind(&a.name)
-                .bind(v)
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
-        }
-        for s in &cfg.skills {
-            let v = serde_json::to_value(s).map_err(store_err_ser)?;
-            sqlx::query("insert into orchestrator.config_skills (name, def) values ($1, $2)")
-                .bind(&s.name)
-                .bind(v)
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
-        }
-        for t in &cfg.tools {
-            let v = serde_json::to_value(t).map_err(store_err_ser)?;
-            sqlx::query("insert into orchestrator.config_tools (name, spec) values ($1, $2)")
-                .bind(&t.name)
-                .bind(v)
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
-        }
-        for b in &cfg.chain_bindings {
-            sqlx::query(
-                "insert into orchestrator.config_chain_bindings (area, kind, chain) values ($1, $2, $3)",
-            )
-            .bind(&b.area)
-            .bind(&b.kind)
-            .bind(&b.chain)
-            .execute(&mut *tx)
-            .await
-            .map_err(store_err)?;
-        }
+        write_all(&mut tx, cfg).await?;
         tx.commit().await.map_err(store_err)?;
         Ok(())
     }
 
     /// Atomic upsert-increment of the single-row global generation; returns the new version.
+    /// The other half of the un-coupled pair — see [`store`](Self::store) for why it is gated.
+    #[cfg(any(feature = "test-support", test))]
     pub async fn bump_config_version(&self) -> Result<u64, OrchestratorError> {
-        let (v,): (i64,) = sqlx::query_as(
-            "insert into orchestrator.config_versions (id, version) values (true, 1)
-             on conflict (id) do update set version = orchestrator.config_versions.version + 1,
-                                            updated_at = now()
-             returning version",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(v as u64)
+        let mut conn = self.pool.acquire().await.map_err(store_err)?;
+        bump_on(&mut conn).await
     }
 }
 
 #[async_trait::async_trait]
 impl ConfigSource for PostgresConfigSource {
     async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
-        let agents: Vec<(String, serde_json::Value)> =
-            sqlx::query_as("select name, def from orchestrator.config_agents order by name")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(cfg_load_err)?;
-        let skills: Vec<(String, serde_json::Value)> =
-            sqlx::query_as("select name, def from orchestrator.config_skills order by name")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(cfg_load_err)?;
-        let tools: Vec<(String, serde_json::Value)> =
-            sqlx::query_as("select name, spec from orchestrator.config_tools order by name")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(cfg_load_err)?;
-        let bindings: Vec<(String, String, String)> = sqlx::query_as(
-            "select area, kind, chain from orchestrator.config_chain_bindings order by area, kind",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(cfg_load_err)?;
-        Ok(RegistryConfig {
-            agents: agents
-                .into_iter()
-                .map(|(n, v)| {
-                    serde_json::from_value(v).map_err(|e| {
-                        OrchestratorError::RegistryLoad(format!("deser agent {n}: {e}"))
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-            skills: skills
-                .into_iter()
-                .map(|(n, v)| {
-                    serde_json::from_value(v).map_err(|e| {
-                        OrchestratorError::RegistryLoad(format!("deser skill {n}: {e}"))
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-            tools: tools
-                .into_iter()
-                .map(|(n, v)| {
-                    serde_json::from_value(v).map_err(|e| {
-                        OrchestratorError::RegistryLoad(format!("deser tool {n}: {e}"))
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-            chain_bindings: bindings
-                .into_iter()
-                .map(|(area, kind, chain)| ChainBinding { area, kind, chain })
-                .collect(),
-        })
+        let mut conn = self.pool.acquire().await.map_err(store_err)?;
+        read_all(&mut conn).await
     }
 
     async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
@@ -594,6 +651,26 @@ impl ConfigSource for PostgresConfigSource {
                 .await
                 .map_err(store_err)?;
         Ok(Some(row.map(|(v,)| v as u64).unwrap_or(0)))
+    }
+
+    /// ONE `REPEATABLE READ` snapshot over the four config tables AND
+    /// `config_versions` — closing the SP-DATA-2 TOCTOU. The snapshot is taken at
+    /// the transaction's first read, so a concurrent `store_and_bump` lands wholly
+    /// before or wholly after it: the pair can never be torn.
+    async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        sqlx::query("set transaction isolation level repeatable read")
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        let cfg = read_all(&mut tx).await?;
+        let row: Option<(i64,)> =
+            sqlx::query_as("select version from orchestrator.config_versions where id = true")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
+        Ok((cfg, Some(row.map(|(v,)| v as u64).unwrap_or(0))))
     }
 }
 
@@ -1366,6 +1443,134 @@ mod tests {
             got_tool.effect_class,
             EffectClass::Observation,
             "effect_class survives"
+        );
+    }
+
+    // ---- SP-DATA-4: the atomic read/write pair (the SP-DATA-2 TOCTOU carry-forwards) --------
+
+    /// A whole config carrying exactly one named skill — the smallest content the
+    /// atomicity tests can move and observe (mirrors `skill()` above; the name is
+    /// verbatim, not uniquified, because these tests assert on it).
+    fn cfg_with_skill(name: &str) -> RegistryConfig {
+        RegistryConfig {
+            agents: vec![],
+            skills: vec![skill(name)],
+            tools: vec![],
+            chain_bindings: vec![],
+        }
+    }
+
+    /// AC5 — the TOCTOU is CLOSED, proven adversarially rather than hopefully.
+    /// A REPEATABLE READ snapshot is taken at the transaction's first read; a
+    /// concurrent single-transaction writer therefore lands entirely before or
+    /// entirely after it. Never (stale config, fresh generation).
+    #[tokio::test]
+    async fn load_versioned_is_immune_to_a_concurrent_store_and_bump() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+
+        // Seed a known (content, generation) pair.
+        src.store_and_bump(&cfg_with_skill("before")).await.unwrap();
+        let (_, v0) = src.load_versioned().await.unwrap();
+        let v0 = v0.expect("a versioned source always reports Some");
+
+        // Open the snapshot and take its FIRST read inside the transaction.
+        let mut tx = src.pool_for_test().begin().await.unwrap();
+        sqlx::query("set transaction isolation level repeatable read")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let (first,): (i64,) = sqlx::query_as("select count(*) from orchestrator.config_skills")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+        // A COMPLETE concurrent write from an independent connection.
+        let writer = PostgresConfigSource::new(connect(&url).await.unwrap());
+        writer
+            .store_and_bump(&cfg_with_skill("after"))
+            .await
+            .unwrap();
+
+        // Finish reading inside the original snapshot: it must still see the OLD world.
+        let (again,): (i64,) = sqlx::query_as("select count(*) from orchestrator.config_skills")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let (snap_v,): (i64,) =
+            sqlx::query_as("select version from orchestrator.config_versions where id = true")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            again, first,
+            "the snapshot must not see the concurrent write"
+        );
+        assert_eq!(
+            snap_v as u64, v0,
+            "the snapshot's generation must match its content — never a torn pair"
+        );
+    }
+
+    /// AC6 — content and generation move together, atomically.
+    #[tokio::test]
+    async fn store_and_bump_advances_content_and_generation_together() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let (_, before) = src.load_versioned().await.unwrap();
+        let before = before.expect("Some");
+
+        let v = src
+            .store_and_bump(&cfg_with_skill("coupled"))
+            .await
+            .unwrap();
+
+        let (cfg, after) = src.load_versioned().await.unwrap();
+        assert_eq!(after, Some(v), "the returned version is the durable one");
+        assert_eq!(v, before + 1, "exactly one generation step");
+        assert!(
+            cfg.skills.iter().any(|s| s.name == "coupled"),
+            "the content landed with the bump"
+        );
+    }
+
+    /// AC6 — a rolled-back write moves NEITHER content nor generation.
+    #[tokio::test]
+    async fn a_failed_store_and_bump_leaves_content_and_generation_untouched() {
+        let Some(url) = db_url() else { return };
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        src.store_and_bump(&cfg_with_skill("stable")).await.unwrap();
+        let (before_cfg, before_v) = src.load_versioned().await.unwrap();
+
+        // A tool whose jsonb serialization is fine but whose NAME violates the
+        // primary key twice in one transaction -> the txn aborts.
+        let dup = ToolSpec {
+            name: "dup".into(),
+            description: Some("d".into()),
+            input_schema: serde_json::json!({"type": "object"}),
+            effect_class: EffectClass::Pure,
+            ttl_secs: None,
+            source: None,
+            permissions: Default::default(),
+            activation: Default::default(),
+            credentials: Default::default(),
+        };
+        let mut bad = cfg_with_skill("stable");
+        bad.tools = vec![dup.clone(), dup];
+        let err = src.store_and_bump(&bad).await;
+        assert!(err.is_err(), "a duplicate primary key must abort the txn");
+
+        let (after_cfg, after_v) = src.load_versioned().await.unwrap();
+        assert_eq!(
+            after_v, before_v,
+            "generation must not advance on a failed write"
+        );
+        assert_eq!(
+            after_cfg.skills.len(),
+            before_cfg.skills.len(),
+            "content must not change on a failed write"
         );
     }
 
