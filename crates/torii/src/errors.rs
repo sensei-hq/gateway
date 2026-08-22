@@ -6,17 +6,10 @@
 use orchestrator_core::{JournalError, OrchestratorError};
 
 /// Exit codes: 0 did it, 1 error, 2 not-found or precondition-not-met.
-// Consumed by Task 10 (main.rs clap dispatch), which exits 0 on a successful command.
-#[allow(dead_code)]
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
-// Consumed by Task 6 (cmd/run.rs observe + intervene), e.g. a run-not-found lookup.
-#[allow(dead_code)]
 pub const EXIT_PRECONDITION: i32 = 2;
 
-// Consumed starting Task 6 (cmd/run.rs), the common error type command functions
-// return; Task 10's dispatch reads `.code` to set the process exit code.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub struct CliError {
     pub message: String,
@@ -24,15 +17,16 @@ pub struct CliError {
 }
 
 impl CliError {
-    // Consumed starting Task 6 (cmd/run.rs).
-    #[allow(dead_code)]
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             code: EXIT_ERROR,
         }
     }
-    // Consumed by Task 6 (cmd/run.rs observe + intervene), e.g. a run-not-found lookup.
+    /// Not called by the current dispatch — every precondition-not-met outcome
+    /// today flows through `cmd::Outcome::precondition` instead (a command that
+    /// ran fine but changed nothing). Kept for a future hard error that is itself
+    /// a precondition failure rather than a transport/config fault.
     #[allow(dead_code)]
     pub fn precondition(message: impl Into<String>) -> Self {
         Self {
@@ -68,8 +62,6 @@ impl From<OrchestratorError> for CliError {
 /// without leaking the password into logs, terminals, or CI output.
 /// Returns `host[:port]/dbname`, or a fixed placeholder if the URL is unparseable
 /// (never the input — an unparseable URL may still contain the password).
-// Consumed by Task 9 (boot.rs two-tier wiring), reporting a DB connect failure.
-#[allow(dead_code)]
 pub fn redact_url(url: &str) -> String {
     let after_scheme = url.split_once("://").map_or("", |(_scheme, rest)| rest);
     let host_and_path = match after_scheme.rsplit_once('@') {

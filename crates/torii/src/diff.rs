@@ -3,9 +3,6 @@
 
 use orchestrator_core::RegistryConfig;
 
-// Consumed by Task 7 (cmd/config.rs plan_push), which renders a diff for operator
-// confirmation before a replace-all config push.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityKind {
     Agent,
@@ -15,8 +12,6 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    // Consumed by Task 7 (cmd/config.rs plan_push / render.rs).
-    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             EntityKind::Agent => "agent",
@@ -27,16 +22,12 @@ impl EntityKind {
     }
 }
 
-// Consumed by Task 7 (cmd/config.rs plan_push).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffEntry {
     pub kind: EntityKind,
     pub name: String,
 }
 
-// Consumed by Task 7 (cmd/config.rs plan_push).
-#[allow(dead_code)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ConfigDiff {
     pub added: Vec<DiffEntry>,
@@ -48,14 +39,10 @@ pub struct ConfigDiff {
 impl ConfigDiff {
     /// Any removal requires explicit operator confirmation: a replace-all write
     /// makes a removal unrecoverable.
-    // Consumed by Task 7 (cmd/config.rs plan_push), gating the confirmation prompt.
-    #[allow(dead_code)]
     pub fn requires_confirmation(&self) -> bool {
         !self.removed.is_empty()
     }
 
-    // Consumed by Task 7 (cmd/config.rs plan_push).
-    #[allow(dead_code)]
     pub fn is_noop(&self) -> bool {
         self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
     }
@@ -67,9 +54,6 @@ use std::collections::BTreeMap;
 /// comparison. `K` must be the entity's real identity (e.g. a `(area, kind)`
 /// tuple for a chain binding) — never a joined display string, which can
 /// collide across two distinct entities and hide a removal (see `compare`).
-// Only called from `diff`, below, which itself isn't consumed outside tests until
-// Task 7 (cmd/config.rs plan_push) — see the allow there.
-#[allow(dead_code)]
 fn index<T, K>(items: &[T], key_of: impl Fn(&T) -> K) -> BTreeMap<K, serde_json::Value>
 where
     T: serde::Serialize,
@@ -95,8 +79,6 @@ where
     out
 }
 
-// Only called from `diff`, below. See the allow there.
-#[allow(dead_code)]
 fn compare<K>(
     kind: EntityKind,
     current: &BTreeMap<K, serde_json::Value>,
@@ -139,9 +121,6 @@ fn compare<K>(
 /// caller bypasses that and hands in duplicates, `index`'s `debug_assert!`
 /// catches it in a debug build rather than silently under-counting via
 /// last-write-wins.
-// Consumed by Task 7 (cmd/config.rs plan_push), the guard in front of the
-// replace-all `ConfigSource::store` write.
-#[allow(dead_code)]
 pub fn diff(current: &RegistryConfig, incoming: &RegistryConfig) -> ConfigDiff {
     let mut out = ConfigDiff::default();
     let name_key = |n: &String| n.clone();

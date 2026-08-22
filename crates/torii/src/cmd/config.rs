@@ -12,12 +12,12 @@ use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
 /// What `plan_push` decided, before any write happens.
-// Consumed by Task 10 (main.rs clap dispatch), `torii config push <dir>`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum PushDecision {
-    /// Nothing to do — the incoming config matches the durable one.
-    NoOp(ConfigDiff),
+    /// Nothing to do — the incoming config matches the durable one. The diff is
+    /// carried for `Debug`/parity with the other variants; `push` and its tests
+    /// only match the variant, never read the (necessarily-empty) payload.
+    NoOp(#[allow(dead_code)] ConfigDiff),
     /// Safe to write.
     Apply(ConfigDiff),
     /// Refused: removals need confirmation that was not given.
@@ -26,8 +26,6 @@ pub enum PushDecision {
 
 /// The pure decision: is this push safe to apply? `confirmed` is true when the
 /// operator passed `--yes` or answered the prompt.
-// Consumed by Task 10 (main.rs clap dispatch), `torii config push <dir>`.
-#[allow(dead_code)]
 pub fn plan_push(
     current: &RegistryConfig,
     incoming: &RegistryConfig,
@@ -52,8 +50,6 @@ pub fn plan_push(
 /// rendered terminal output entirely. `one_line` (shared with `render::table`, which
 /// guards the same class of attack from a run's pause reason) collapses every control
 /// character — including ESC — to a space.
-// Consumed by Task 10 (main.rs clap dispatch), `torii config push <dir>`.
-#[allow(dead_code)]
 pub fn describe_diff(d: &ConfigDiff, current_version: u64, source: &str) -> String {
     let mut s = format!("config diff (durable v{current_version} -> {source}):\n");
     for e in &d.added {
@@ -88,8 +84,6 @@ pub fn describe_diff(d: &ConfigDiff, current_version: u64, source: &str) -> Stri
     s
 }
 
-// Consumed by Task 10 (main.rs clap dispatch), `torii config version`.
-#[allow(dead_code)]
 pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, CliError> {
     let v = src.version().await?.unwrap_or(0);
     Ok(Outcome::ok(if json {
@@ -126,9 +120,6 @@ pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, 
 /// full diff — and the "REMOVES N" warning — twice on every confirmed push, which
 /// trains skimming on the one line that must not be skimmed, and for a large diff
 /// scrolls the copy they actually approved out of view).
-// Only called from `push`, which itself isn't consumed outside tests until Task 10
-// (main.rs clap dispatch) — see the allow there.
-#[allow(dead_code)]
 async fn write_and_report(
     src: &PostgresConfigSource,
     incoming: &RegistryConfig,
@@ -153,8 +144,6 @@ async fn write_and_report(
 /// specifies as a refusal — so a scripted push that would delete config refuses
 /// instead of proceeding. `push` itself has no way to enforce that through the `&mut
 /// dyn FnMut` shape; it is `interactive_confirm`'s contract, verified by its own tests.
-// Consumed by Task 10 (main.rs clap dispatch), `torii config push <dir>`.
-#[allow(dead_code)]
 pub async fn push(
     src: &PostgresConfigSource,
     dir: &Path,
@@ -210,8 +199,6 @@ pub async fn push(
 /// by the consenting human (a wrapper script, a Makefile variable, a CI job
 /// interpolating a repo-supplied value) — so it gets the same [`one_line`] guard as an
 /// entity name, removing the need to reason about provenance at all.
-// Only called from `push` — see the allow there.
-#[allow(dead_code)]
 fn sanitized_source(dir: &Path) -> String {
     one_line(&dir.display().to_string())
 }
@@ -230,8 +217,6 @@ fn sanitized_source(dir: &Path) -> String {
 /// The read is bounded to 64 bytes — far more than any legitimate answer — so a
 /// pathological input (`torii config push ./cfg < /dev/zero`) cannot buffer an
 /// unbounded line into memory.
-// Consumed by Task 10 (main.rs clap dispatch) as the real, non-test `confirm` callback.
-#[allow(dead_code)]
 pub fn interactive_confirm(prompt: &str, r: &mut impl BufRead, w: &mut impl Write) -> bool {
     if writeln!(w, "{prompt}").is_err()
         || write!(w, "Continue? [y/N] ").is_err()

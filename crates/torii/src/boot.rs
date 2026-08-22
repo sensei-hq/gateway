@@ -17,8 +17,6 @@ pub const ENV_DATABASE_URL: &str = "DATABASE_URL";
 pub const ENV_FENCE_VERSION: &str = "TORII_FENCE_VERSION";
 
 /// The validated environment. `fence_version` is only required by the heavy tier.
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 #[derive(PartialEq)]
 pub struct EnvConfig {
     pub database_url: String,
@@ -41,8 +39,6 @@ impl std::fmt::Debug for EnvConfig {
 
 /// Validate the environment through an injected getter, so tests never mutate
 /// process env (which is `unsafe` in edition 2024 and racy across parallel tests).
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 pub fn env_config_from(get: impl Fn(&str) -> Option<String>) -> Result<EnvConfig, CliError> {
     let database_url = get(ENV_DATABASE_URL)
         .filter(|s| !s.trim().is_empty())
@@ -60,15 +56,11 @@ pub fn env_config_from(get: impl Fn(&str) -> Option<String>) -> Result<EnvConfig
     })
 }
 
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 pub fn env_config() -> Result<EnvConfig, CliError> {
     env_config_from(|k| std::env::var(k).ok())
 }
 
 /// The heavy tier additionally requires the fence base.
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 pub fn require_fence(env: &EnvConfig) -> Result<&str, CliError> {
     env.fence_version.as_deref().ok_or_else(|| {
         CliError::error(format!(
@@ -85,8 +77,6 @@ pub fn require_fence(env: &EnvConfig) -> Result<&str, CliError> {
 /// machine-parseable. `try_init` (not `init`) so a double call (e.g. a test, or
 /// two entry points in one process) never panics; it just keeps the first
 /// subscriber installed.
-// Consumed by Task 10 (main.rs), once, before dispatching any command.
-#[allow(dead_code)]
 pub fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -101,7 +91,6 @@ pub fn init_tracing() {
 /// the ONLY place a completely broken gateway config is caught, before a worker
 /// boots happily and then terminally fails every run it wakes with zero signal.
 // Guards `heavy()`; tested directly below without a live provider.
-#[allow(dead_code)]
 fn require_adapters(registered: &[String], gateway_config: &Path) -> Result<(), CliError> {
     if registered.is_empty() {
         return Err(CliError::error(format!(
@@ -119,7 +108,6 @@ fn require_adapters(registered: &[String], gateway_config: &Path) -> Result<(), 
 /// registry). A worker with zero agents cannot do useful work; refusing loud at
 /// boot is far cheaper than an operator discovering it one burned run at a time.
 // Guards `heavy()`; tested directly below without a live database.
-#[allow(dead_code)]
 fn require_agents(
     agents: usize,
     skills: usize,
@@ -139,8 +127,6 @@ fn require_agents(
 /// Light tier: everything reachable with just a database. No gateway, no model
 /// credentials, no fence — so an operator can cancel a runaway run or inspect the
 /// wake queue on a box that has none of those.
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 pub struct LightDeps {
     pub scheduler_store: Arc<PostgresSchedulerStore>,
     pub config_source: PostgresConfigSource,
@@ -151,7 +137,6 @@ pub struct LightDeps {
 /// one — `light()` below keeps its own single-connect path for standalone
 /// light-tier commands (`run status`, `config diff`, …), which never call
 /// `heavy()` at all.
-#[allow(dead_code)]
 fn light_from_pool(pool: sqlx::PgPool) -> LightDeps {
     LightDeps {
         scheduler_store: Arc::new(PostgresSchedulerStore::new(pool.clone())),
@@ -159,8 +144,6 @@ fn light_from_pool(pool: sqlx::PgPool) -> LightDeps {
     }
 }
 
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 pub async fn light(env: &EnvConfig) -> Result<LightDeps, CliError> {
     let pool = connect(&env.database_url).await.map_err(|e| {
         CliError::error(format!(
@@ -173,16 +156,17 @@ pub async fn light(env: &EnvConfig) -> Result<LightDeps, CliError> {
 
 /// Heavy tier: a full Executor behind a Scheduler. Adds the gateway config file
 /// and the fence base.
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 pub struct HeavyDeps {
+    // Not read by the current dispatch (only `.scheduler` is): kept for a future
+    // heavy-tier command that needs the shared pool's config source directly, or a
+    // test that wants to fast-forward the injected clock.
+    #[allow(dead_code)]
     pub light: LightDeps,
     pub scheduler: Scheduler,
+    #[allow(dead_code)]
     pub clock: Arc<dyn Clock>,
 }
 
-// Consumed by Task 10 (main.rs clap dispatch).
-#[allow(dead_code)]
 pub async fn heavy(
     env: &EnvConfig,
     gateway_config: &Path,

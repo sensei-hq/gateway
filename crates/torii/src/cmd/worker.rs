@@ -7,9 +7,6 @@ use std::time::Duration;
 
 /// The tick surface, injected so the loop's resilience policy is testable without
 /// a database or a gateway.
-// Consumed by Task 10 (main.rs boot wiring), which drives this against a real
-// `orchestrator::Scheduler`.
-#[allow(dead_code)]
 #[async_trait::async_trait]
 pub trait Ticker: Send + Sync {
     async fn tick(&self) -> Result<usize, OrchestratorError>;
@@ -22,20 +19,14 @@ impl Ticker for orchestrator::Scheduler {
     }
 }
 
-// Consumed by Task 10 (main.rs boot wiring / clap dispatch).
-#[allow(dead_code)]
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
-// Consumed by Task 10 (main.rs clap dispatch), `torii worker serve`.
-#[allow(dead_code)]
 pub struct ServeOpts {
     pub interval: Duration,
     pub once: bool,
 }
 
 /// Parse `5s` / `2m` / `500ms` into a Duration.
-// Consumed by Task 10 (main.rs clap dispatch), parsing the `--interval` flag.
-#[allow(dead_code)]
 pub fn parse_interval(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let (num, unit) = if let Some(n) = s.strip_suffix("ms") {
@@ -83,8 +74,6 @@ pub fn parse_interval(s: &str) -> Result<Duration, String> {
 /// second shutdown signal exits immediately (the caller's concern, not this
 /// loop's), and an abandoned `waking` row is reclaimed by the scheduler's lease
 /// if the process is killed mid-tick — so a hard kill is safe by construction.
-// Consumed by Task 10 (main.rs clap dispatch), `torii worker serve`.
-#[allow(dead_code)]
 pub async fn serve(
     ticker: &dyn Ticker,
     opts: ServeOpts,
