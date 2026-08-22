@@ -1,6 +1,7 @@
 //! `torii` — the operator control plane for the sensei orchestrator.
 //! Task 10 replaces this with the clap dispatch.
 
+mod diff;
 mod errors;
 
 fn main() {
