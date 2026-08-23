@@ -406,6 +406,9 @@ impl Executor {
             run,
             JournalEvent::RunStarted {
                 version: this.version.clone(),
+                // SP-DATA-5 Task 5 threads the operator-specified budget through here
+                // (submit → `RunStarted`).
+                budget: None,
             },
         )
         .await?;
@@ -461,7 +464,7 @@ impl Executor {
 
         // Version fence: the first recorded `RunStarted.version` must match ours.
         if let Some(recorded) = events.iter().find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version } => Some(version.clone()),
+            JournalEvent::RunStarted { version, .. } => Some(version.clone()),
             _ => None,
         }) && recorded != self.version
         {
@@ -802,6 +805,9 @@ impl Executor {
                                 seq: 0,
                                 output: recorded,
                                 observation: None,
+                                // SP-DATA-5 Task 4 threads real usage through the
+                                // ModelCall producer.
+                                usage: None,
                             },
                         )
                         .await?;

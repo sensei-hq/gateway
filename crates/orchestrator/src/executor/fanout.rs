@@ -124,6 +124,9 @@ impl Executor {
                                     seq: 0,
                                     output: recorded,
                                     observation: None,
+                                    // SP-DATA-5 Task 4 threads real usage through the
+                                    // Consolidate producer.
+                                    usage: None,
                                 },
                             )
                             .await?;
@@ -619,6 +622,9 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
+                        // SP-DATA-5 Task 4 threads real usage through the Map-item
+                        // producer.
+                        usage: None,
                     },
                 )
                 .await?;

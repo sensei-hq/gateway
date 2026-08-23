@@ -48,6 +48,9 @@ orchestrator
   src/executor/agent.rs    ReAct site routes through it
   src/executor/fanout.rs   Map + Consolidate sites route through it
 
+orchestrator-store
+  (test-only construction sites updated mechanically in Task 1)
+
 torii
   src/cmd/run.rs     --budget-tokens on submit; spent/budget in status; wake raises
   src/main.rs        clap flags
@@ -56,9 +59,35 @@ torii
 
 ---
 
-## Task 1: `TokenBudget` + the journal fields
+## Task 1: `TokenBudget` + the journal fields + restore compilation
 
-**Files:** create `crates/orchestrator-core/src/budget.rs`; modify `crates/orchestrator-core/src/journal.rs`, `crates/orchestrator-core/src/lib.rs`.
+**Files:** create `crates/orchestrator-core/src/budget.rs`; modify `crates/orchestrator-core/src/journal.rs`, `crates/orchestrator-core/src/lib.rs`; **plus every construction and match site across `crates/orchestrator` and `crates/orchestrator-store` needed to make the workspace compile again.**
+
+**Why this task is wider than it looks — a correction to this plan's original decomposition.** Adding a
+field to a `JournalEvent` variant is a **multi-crate ripple**: it breaks every literal construction and
+every exhaustive match, in `orchestrator` and `orchestrator-store` alike. The original decomposition
+split this slice by concern, but the enum change does not respect those boundaries, so Task 1 could
+never compile alone — and the pre-commit hook lints the WHOLE workspace, so it could never commit
+either. Leaving the tree red between tasks would also make the per-task review meaningless.
+
+So Task 1 owns restoring compilation. The known break sites:
+
+```
+crates/orchestrator/src/executor/agent.rs:504,579,751,803
+crates/orchestrator/src/executor/fanout.rs:119,614
+crates/orchestrator/src/executor/mod.rs:407,464,797
+crates/orchestrator/src/executor/tests.rs:2189,2426,2970,2980,3027,4901,6448,6513,6558,6669
+crates/orchestrator-store/src/lib.rs:115
+crates/orchestrator-store/src/postgres.rs:1249
+```
+
+Note `orchestrator-store` was missing from this plan's File Structure section entirely — also corrected.
+
+**These fixes must be STRICTLY MECHANICAL.** Construction sites get `usage: None` / `budget: None`;
+match patterns bind and ignore; the newly-non-exhaustive matches get a `BudgetRaised` arm that does
+nothing yet. Do NOT thread real values — Task 4 owns usage capture, Task 5 owns the budget reaching
+`RunStarted`, Task 2 gives `BudgetRaised` meaning. Put a comment on each deliberate no-op naming the
+task that fills it in, so a reviewer can tell an intentional placeholder from an oversight.
 
 - [ ] **Step 1: Write the failing test**
 

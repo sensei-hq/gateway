@@ -509,6 +509,8 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
+                        // SP-DATA-5 Task 4 threads real usage through the reconcile path.
+                        usage: None,
                     },
                 )
                 .await?;
@@ -584,6 +586,9 @@ impl Executor {
                 seq: 0,
                 output: recorded,
                 observation: None,
+                // SP-DATA-5 Task 4 threads real usage through here; a denial never
+                // dispatches, so this will stay None.
+                usage: None,
             },
         )
         .await?;
@@ -756,6 +761,8 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation,
+                        // SP-DATA-5 Task 4 threads real usage through here.
+                        usage: None,
                     },
                 )
                 .await?;
@@ -808,6 +815,9 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
+                        // SP-DATA-5 Task 4 threads `response.usage` through here (this is
+                        // the ReAct-turn producer the design calls out).
+                        usage: None,
                     },
                 )
                 .await?;

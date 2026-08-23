@@ -2194,6 +2194,9 @@ async fn changed_tool_input_on_resume_halts_with_determinism_violation() {
                 output,
                 observation,
                 input_hash: "TAMPERED".into(),
+                // SP-DATA-5 mechanical fix: the `..` above doesn't capture `usage`, and this
+                // test doesn't exercise it — always None here.
+                usage: None,
             },
             other => other,
         };
@@ -2444,6 +2447,8 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::ContextWrite { key, .. } => format!("ContextWrite({})", key.0),
         JournalEvent::RunCompleted => "RunCompleted".to_string(),
         JournalEvent::RunPaused { .. } => "RunPaused".to_string(),
+        // SP-DATA-5 Task 2 gives this a real label once BudgetRaised is exercised.
+        JournalEvent::BudgetRaised { .. } => "BudgetRaised".to_string(),
     }
 }
 
@@ -2969,6 +2974,8 @@ async fn start_halts_on_determinism_violation_without_calling_gateway() {
             run,
             JournalEvent::RunStarted {
                 version: "v1".into(),
+                // SP-DATA-5: this test doesn't exercise a budget.
+                budget: None,
             },
         )
         .await
@@ -2987,6 +2994,9 @@ async fn start_halts_on_determinism_violation_without_calling_gateway() {
                     serde_json::json!({ "model": "m", "text": "canned-response" }),
                 ),
                 observation: None,
+                // SP-DATA-5 Task 4 threads real usage through here; this test doesn't
+                // exercise it.
+                usage: None,
             },
         )
         .await
@@ -3026,6 +3036,8 @@ async fn start_refuses_resume_on_version_fence_mismatch() {
             run,
             JournalEvent::RunStarted {
                 version: "v1".into(),
+                // SP-DATA-5: this test doesn't exercise a budget.
+                budget: None,
             },
         )
         .await
@@ -4906,6 +4918,9 @@ async fn loop_resume_halts_on_a_tampered_iteration() {
                 output,
                 observation,
                 input_hash: "TAMPERED".into(),
+                // SP-DATA-5 mechanical fix: the `..` above doesn't capture `usage`, and this
+                // test doesn't exercise it — always None here.
+                usage: None,
             },
             other => other,
         };
@@ -6445,7 +6460,7 @@ async fn reload_bumps_the_run_version_and_fences_in_flight_resume() {
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version } => Some(version),
+            JournalEvent::RunStarted { version, .. } => Some(version),
             _ => None,
         })
         .unwrap();
@@ -6510,7 +6525,7 @@ async fn each_run_pins_the_generation_live_at_its_start() {
                 .unwrap()
                 .into_iter()
                 .find_map(|(_, e)| match e {
-                    JournalEvent::RunStarted { version } => Some(version),
+                    JournalEvent::RunStarted { version, .. } => Some(version),
                     _ => None,
                 })
                 .unwrap()
@@ -6555,7 +6570,7 @@ async fn handle_wired_executor_resumes_a_partial_run_at_the_same_generation() {
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version } => Some(version),
+            JournalEvent::RunStarted { version, .. } => Some(version),
             _ => None,
         })
         .unwrap();
@@ -6666,7 +6681,7 @@ async fn start_on_a_handle_wired_executor_freshly_runs_and_pins_the_generation()
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version } => Some(version),
+            JournalEvent::RunStarted { version, .. } => Some(version),
             _ => None,
         })
         .unwrap();
