@@ -109,8 +109,13 @@ impl Executor {
                     self.materialize(recorded).await?
                 } else {
                     let request = build_request(chain, &payload);
-                    match self.gateway.execute(&request).await {
-                        Ok(response) => {
+                    // SP-DATA-5: the Consolidate producer routes through the single
+                    // metered chokepoint.
+                    match self
+                        .dispatch_metered(&request, fold.spent(), fold.budget())
+                        .await
+                    {
+                        Ok(Ok(response)) => {
                             // SP-4 s2: scrub the synthesis text via the shared chokepoint.
                             let output = self.model_output(&response);
                             let recorded = self.split_output(&output).await?;
@@ -131,6 +136,22 @@ impl Executor {
                             )
                             .await?;
                             output
+                        }
+                        // SP-DATA-5: refused before spending — already journaled by
+                        // `record_refusal`. A budget pause halts the Consolidate
+                        // resumably; an unmetered call fails the node.
+                        Ok(Err(refusal)) => {
+                            return match self.record_refusal(run, &node.id, refusal).await? {
+                                super::dispatch::RefusalKind::Paused(reason) => {
+                                    Ok(NodeExec::Paused { reason })
+                                }
+                                super::dispatch::RefusalKind::Failed(message) => {
+                                    Ok(NodeExec::Failed {
+                                        message,
+                                        output: None,
+                                    })
+                                }
+                            };
                         }
                         Err(error) => {
                             let message = error.to_string();
@@ -450,8 +471,21 @@ impl Executor {
             let path = format!("{}/{}", loop_node.id.0, i);
             let output_res: Result<serde_json::Value, String> = match body {
                 LoopBody::ModelCall { chain } => {
-                    self.run_map_child_modelcall(run, &path, chain, &current_input, fold)
-                        .await?
+                    match self
+                        .run_map_child_modelcall(run, &path, chain, &current_input, fold)
+                        .await
+                    {
+                        Ok(inner) => inner,
+                        // SP-DATA-5: a `ModelCall` body shares the Map child's pause
+                        // channel (`MapChildPaused`). Pause the Loop — exactly like an
+                        // `Agent` body's `AgentStep::Paused` below — rather than
+                        // letting it escape `?` as a FATAL error, which would abort the
+                        // whole run instead of leaving it resumable.
+                        Err(OrchestratorError::MapChildPaused { reason, .. }) => {
+                            return Ok(NodeExec::Paused { reason });
+                        }
+                        Err(fatal) => return Err(fatal),
+                    }
                 }
                 LoopBody::Agent(agent_ref) => match self
                     .drive_agent(
@@ -607,8 +641,12 @@ impl Executor {
         }
 
         let request = build_request(chain, item);
-        match self.gateway.execute(&request).await {
-            Ok(response) => {
+        // SP-DATA-5: the Map-item producer routes through the single metered chokepoint.
+        match self
+            .dispatch_metered(&request, fold.spent(), fold.budget())
+            .await
+        {
+            Ok(Ok(response)) => {
                 // SP-4 s2: scrub the Map-item model text via the shared chokepoint.
                 let output = self.model_output(&response);
                 let recorded = self.split_output(&output).await?;
@@ -629,6 +667,27 @@ impl Executor {
                 )
                 .await?;
                 Ok(Ok(output))
+            }
+            // SP-DATA-5: refused before spending. A child has no pause channel in its
+            // inner `Result` (that carries only a manifest error message), so a budget
+            // pause rides OUT on `MapChildPaused` — the SAME signal an in-doubt
+            // Agent-child Mutation uses, which `run_map` folds into a whole-Map pause
+            // and `run_loop` into a Loop pause. Never swallowed into the manifest:
+            // that would let the Map complete over an un-run child. An unmetered call
+            // is an ordinary child failure and does land in the manifest.
+            Ok(Err(refusal)) => {
+                match self
+                    .record_refusal(run, &NodeId(path.to_string()), refusal)
+                    .await?
+                {
+                    super::dispatch::RefusalKind::Paused(reason) => {
+                        Err(OrchestratorError::MapChildPaused {
+                            node: NodeId(path.to_string()),
+                            reason,
+                        })
+                    }
+                    super::dispatch::RefusalKind::Failed(message) => Ok(Err(message)),
+                }
             }
             Err(error) => Ok(Err(error.to_string())),
         }

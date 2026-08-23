@@ -17,6 +17,7 @@ use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
 mod agent;
 mod branch;
 mod content;
+mod dispatch;
 mod durability;
 mod expand;
 mod fanout;
@@ -164,11 +165,6 @@ struct Fold {
     budget: Option<u64>,
 }
 
-// SP-DATA-5 (2/6): `spent`/`budget` have no non-test caller yet — the
-// metered-dispatch chokepoint that reads them is Task 3. Allowed here rather
-// than deferring the methods themselves, so the fold logic and its tests land
-// as one reviewable unit; drop this attribute when Task 3 wires the gate.
-#[allow(dead_code)]
 impl Fold {
     /// Total tokens this run has spent, folded from the journal. Idempotent across
     /// any number of resumes because it sums over effect ids (`usage`'s keys), never
@@ -823,8 +819,13 @@ impl Executor {
                 .await?;
 
                 let request = build_request(chain, payload);
-                match self.gateway.execute(&request).await {
-                    Ok(response) => {
+                // SP-DATA-5: the ModelCall producer routes through the single metered
+                // chokepoint — the budget gate cannot be bypassed here.
+                match self
+                    .dispatch_metered(&request, fold.spent(), fold.budget())
+                    .await
+                {
+                    Ok(Ok(response)) => {
                         // SP-4 s2: route through the shared redaction chokepoint so a
                         // ModelCall node whose model echoes a secret is scrubbed too.
                         let output = self.model_output(&response);
@@ -859,6 +860,16 @@ impl Executor {
                         .await?;
                         Ok(NodeExec::Completed(output))
                     }
+                    // SP-DATA-5: the chokepoint refused before spending (budget
+                    // exhausted ⇒ a durable HOTL pause; unmetered ⇒ a node failure).
+                    // `record_refusal` already journaled it.
+                    Ok(Err(refusal)) => match self.record_refusal(run, &node.id, refusal).await? {
+                        dispatch::RefusalKind::Paused(reason) => Ok(NodeExec::Paused { reason }),
+                        dispatch::RefusalKind::Failed(message) => Ok(NodeExec::Failed {
+                            message,
+                            output: None,
+                        }),
+                    },
                     Err(error) => match classify_gateway_error(&error) {
                         // A fully-gated chain with a timed re-eligibility (§11.2):
                         // durable pause (resumable), never a bare fail. On resume
