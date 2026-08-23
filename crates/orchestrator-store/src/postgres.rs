@@ -563,6 +563,10 @@ async fn bump_on(conn: &mut sqlx::PgConnection) -> Result<u64, OrchestratorError
 /// - [`store_and_bump`](Self::store_and_bump) — the atomic WRITE: the replace-all content write AND
 ///   the generation increment in ONE transaction, so no crash window can leave new content durably
 ///   parked under an old generation.
+/// - [`store_and_bump_if`](Self::store_and_bump_if) — the atomic CONDITIONAL write (SP-DATA-4.1):
+///   the same coupling, plus a compare-and-swap against an expected generation, so a writer that
+///   built its diff against a stale read cannot silently clobber a concurrent one. `torii config
+///   push` uses this instead of the plain `store_and_bump` + a caller-side re-read.
 ///
 /// [`load`](ConfigSource::load) and [`version`](ConfigSource::version) remain individually
 /// non-atomic BY DESIGN: they are the unversioned `ConfigSource` contract (each is a single
@@ -627,6 +631,95 @@ impl PostgresConfigSource {
         write_all(&mut tx, cfg).await?;
         tx.commit().await.map_err(store_err)?;
         Ok(v)
+    }
+
+    /// Replace the whole registry AND advance the generation, but ONLY if the current
+    /// generation is still `expected` — a true compare-and-swap, at zero extra round
+    /// trips over [`store_and_bump`](Self::store_and_bump). Returns `Ok(None)` if it
+    /// moved (nothing is written); `Ok(Some(v))` is the new generation.
+    ///
+    /// SP-DATA-4.1 Task 1: closes the residual window a caller-side re-read-then-write
+    /// cannot close. `torii config push` already re-reads the generation immediately
+    /// before writing and refuses if it moved, which closes the *human-latency* window
+    /// (a confirmation prompt can sit in front of an operator for minutes) — but that
+    /// leaves the ~1 ms between the re-read returning and the write committing open.
+    /// Folding the expectation into the bump's own `WHERE` clause removes that window
+    /// entirely: the bump (which already runs FIRST in `store_and_bump`, precisely so
+    /// concurrent writers serialize on the `config_versions` row) now only lands when
+    /// it is still looking at the row the caller expected.
+    ///
+    /// FIRST PUSH — the subtlety a plain `UPDATE … WHERE version = $1` gets wrong.
+    /// `config_versions` starts with NO ROW at all: absent means generation 0, by
+    /// [`version`](ConfigSource::version)'s contract. A plain conditional `UPDATE` can
+    /// never match a row that does not exist, so it would report a miss on a
+    /// first-ever push even though nothing raced — a false refusal of the single most
+    /// important write (bootstrapping an empty registry).
+    ///
+    /// The tempting fix is to handle that in the caller: on a miss with `expected ==
+    /// 0`, re-check `version()`, and if it still reports `Some(0)`, fall back to
+    /// unconditional `store_and_bump`. That works for the common case, but it
+    /// reopens a — narrower — version of the exact race this method exists to close:
+    /// if a SECOND concurrent first-push lands in the gap between that re-check and
+    /// the fallback call, both fallback calls are plain `store_and_bump`s, which (by
+    /// design, see that method's doc comment) serialize and both return `Ok` —
+    /// true last-writer-wins, not a refusal. The caller has no way to tell its own
+    /// write landed second.
+    ///
+    /// So this method folds both cases into ONE statement instead, in ONE
+    /// transaction:
+    /// - `expected == 0`: attempt `INSERT … ON CONFLICT (id) DO NOTHING`. If the row
+    ///   is genuinely absent, this alone is the whole CAS — it lands, and the
+    ///   sibling conditional `UPDATE` is skipped (guarded by `WHERE NOT EXISTS
+    ///   (SELECT 1 FROM ins)`, which — per Postgres's documented semantics for
+    ///   writable CTEs — forces the `INSERT` to be fully resolved, conflict and all,
+    ///   before the `UPDATE` decides whether to run). If a concurrent writer already
+    ///   created the row — including a second concurrent first-push racing this
+    ///   exact call, which Postgres blocks on the unique index until the first one
+    ///   commits, then re-evaluates the conflict — the `INSERT` no-ops and the
+    ///   `UPDATE` takes over, sees the real (non-zero) version, and correctly
+    ///   refuses. Proven directly: `concurrent_first_pushes_do_not_both_land`.
+    /// - `expected != 0`: the `INSERT`'s `WHERE $1 = 0` guard is false, so it never
+    ///   runs at all (and never emits conflict noise); only the conditional `UPDATE`
+    ///   fires — the plain CAS case.
+    ///
+    /// Both arms are one round trip and one transaction, so there is no window
+    /// between "decide" and "write" for anything to land in, in either case.
+    pub async fn store_and_bump_if(
+        &self,
+        cfg: &RegistryConfig,
+        expected: u64,
+    ) -> Result<Option<u64>, OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        let applied: Option<(i64,)> = sqlx::query_as(
+            "with ins as (
+                 insert into orchestrator.config_versions (id, version)
+                 select true, 1
+                 where $1::bigint = 0
+                 on conflict (id) do nothing
+                 returning version
+             ), upd as (
+                 update orchestrator.config_versions
+                    set version = version + 1, updated_at = now()
+                  where id = true and version = $1::bigint
+                    and not exists (select 1 from ins)
+                 returning version
+             )
+             select version from ins
+             union all
+             select version from upd",
+        )
+        .bind(expected as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(store_err)?;
+        let Some((v,)) = applied else {
+            // Neither the insert-if-absent nor the conditional update matched: the
+            // generation genuinely moved. Roll back (drop `tx`) and report the miss.
+            return Ok(None);
+        };
+        write_all(&mut tx, cfg).await?;
+        tx.commit().await.map_err(store_err)?;
+        Ok(Some(v as u64))
     }
 
     /// Replace-all write of the whole registry in one transaction, WITHOUT bumping the generation.
@@ -1984,6 +2077,132 @@ mod tests {
             after_cfg.skills.len(),
             before_cfg.skills.len(),
             "content must not change on a failed write"
+        );
+    }
+
+    // ---- SP-DATA-4.1 Task 1: store_and_bump_if (an airtight CAS) ----------------------------
+
+    /// A CAS write must apply ONLY at the expected generation. This is the residual
+    /// window the SP-DATA-4 re-read could not close: between `version()` returning and
+    /// the bump committing.
+    #[tokio::test]
+    async fn store_and_bump_if_refuses_at_an_unexpected_generation() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+
+        let v = src.store_and_bump(&cfg_with_skill("base")).await.unwrap();
+
+        // Wrong expectation -> refuse, and change NOTHING.
+        let refused = src
+            .store_and_bump_if(&cfg_with_skill("should-not-land"), v - 1)
+            .await
+            .unwrap();
+        assert!(refused.is_none(), "a stale expectation must not apply");
+        let (cfg, now) = src.load_versioned().await.unwrap();
+        assert_eq!(now, Some(v), "generation must not advance on a refusal");
+        assert!(
+            cfg.skills.iter().any(|s| s.name == "base"),
+            "content must not change on a refusal"
+        );
+
+        // Correct expectation -> applies and advances by exactly one.
+        let applied = src
+            .store_and_bump_if(&cfg_with_skill("landed"), v)
+            .await
+            .unwrap()
+            .expect("the matching expectation must apply");
+        assert_eq!(applied, v + 1);
+        let (cfg, now) = src.load_versioned().await.unwrap();
+        assert_eq!(now, Some(v + 1));
+        assert!(cfg.skills.iter().any(|s| s.name == "landed"));
+    }
+
+    /// The first-push subtlety: `config_versions` starts with NO ROW (absent ⇒
+    /// generation 0 per `version()`'s contract). A naive `UPDATE … WHERE version = $1`
+    /// can never match a genuinely absent row, so it would report a miss on a
+    /// first-ever push even though nothing raced. `store_and_bump_if` must fold that
+    /// case into the same atomic statement — not push it onto the caller as a
+    /// re-check-then-fallback, which would reopen a (narrower) version of the very
+    /// race this method exists to close (see the doc comment on the method for the
+    /// full argument). Proven here directly against a table where the row is absent.
+    #[tokio::test]
+    async fn store_and_bump_if_lands_a_genuine_first_push_when_the_row_is_absent() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+
+        sqlx::query("delete from orchestrator.config_versions")
+            .execute(src.pool_for_test())
+            .await
+            .unwrap();
+        assert_eq!(
+            src.version().await.unwrap(),
+            Some(0),
+            "an absent row reports generation 0"
+        );
+
+        let applied = src
+            .store_and_bump_if(&cfg_with_skill("first-ever"), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            Some(1),
+            "a genuine first push against an absent row must land, not report a false miss"
+        );
+        let (cfg, now) = src.load_versioned().await.unwrap();
+        assert_eq!(now, Some(1));
+        assert!(cfg.skills.iter().any(|s| s.name == "first-ever"));
+    }
+
+    /// The concurrency proof for the same first-push case: two writers BOTH believing
+    /// the generation is 0 (row absent) must never both land — exactly one succeeds,
+    /// the loser gets a clean `None`, and the final generation is 1, not 2. This is
+    /// what distinguishes the single-statement CAS from the plan's caller-side
+    /// check-then-fallback, which — for this exact interleaving — would let both
+    /// `store_and_bump` fallback calls succeed (true last-writer-wins, per
+    /// `store_and_bump`'s own doc comment) rather than refusing the loser outright.
+    #[tokio::test]
+    async fn concurrent_first_pushes_do_not_both_land() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let seed = PostgresConfigSource::new(connect(&url).await.unwrap());
+        sqlx::query("delete from orchestrator.config_versions")
+            .execute(seed.pool_for_test())
+            .await
+            .unwrap();
+
+        let a = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let b = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let (ba, bb) = (barrier.clone(), barrier.clone());
+        let ha = tokio::spawn(async move {
+            ba.wait().await;
+            a.store_and_bump_if(&cfg_with_skill("racer-a"), 0).await
+        });
+        let hb = tokio::spawn(async move {
+            bb.wait().await;
+            b.store_and_bump_if(&cfg_with_skill("racer-b"), 0).await
+        });
+        let (ra, rb) = (ha.await.unwrap().unwrap(), hb.await.unwrap().unwrap());
+
+        let landed = [ra, rb].into_iter().filter(|r| r.is_some()).count();
+        assert_eq!(
+            landed, 1,
+            "exactly one concurrent first push may land: a={ra:?} b={rb:?}"
+        );
+        let (cfg, now) = seed.load_versioned().await.unwrap();
+        assert_eq!(
+            now,
+            Some(1),
+            "the generation must advance exactly once, not merge two bumps"
+        );
+        let winner_name = if ra.is_some() { "racer-a" } else { "racer-b" };
+        assert!(
+            cfg.skills.iter().any(|s| s.name == winner_name),
+            "the durable content must be the winner's alone, not a union: {:?}",
+            cfg.skills
         );
     }
 

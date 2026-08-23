@@ -131,16 +131,19 @@ pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, 
 }
 
 /// The shared tail of both writable `plan_push` outcomes (`Apply` and a confirmed
-/// `NeedsConfirmation`): re-check the generation immediately before writing, then
-/// `store_and_bump` and report the new version.
+/// `NeedsConfirmation`): `store_and_bump_if` the generation is still `current_v`, and
+/// report the outcome.
 ///
-/// The re-check is load-bearing, not decorative: `current_v` was computed from the
-/// snapshot `push` took in step 2, and on the confirmation path a human can sit on the
-/// prompt for minutes. A concurrent writer landing in that window means the approved
-/// diff no longer describes what this replace-all would do — writing anyway would
-/// silently destroy entities the operator never saw (and on the `Apply` path, which
-/// never prompts at all, with zero operator visibility). Sharing this one function
-/// between both call sites is what makes the guard cover both of them.
+/// SP-DATA-4.1 Task 1: this used to re-read the generation and compare before calling
+/// the unconditional `store_and_bump` — closing the *human-latency* window (a
+/// confirmation prompt can sit in front of an operator for minutes) but leaving ~1 ms
+/// between that re-read returning and the write committing. `store_and_bump_if` folds
+/// the expectation into the write's own `WHERE` clause instead, so there is no window
+/// at all: a concurrent writer landing at ANY point before this call either loses the
+/// race in Postgres (this call refuses, `None`) or already committed before it started
+/// (this call sees the new generation and refuses) — never a torn decision. It also
+/// closes the first-push false-negative in the same statement (see its doc comment),
+/// so no caller-side fallback is needed here.
 ///
 /// `text` is `Some(diff)` ONLY on the `Apply` path, which never calls `confirm` and so
 /// is the only place the operator will ever see the diff at all — it must appear in
@@ -157,15 +160,20 @@ async fn write_and_report(
     text: Option<&str>,
 ) -> Result<Outcome, CliError> {
     let prefix = text.map(|t| format!("{t}\n")).unwrap_or_default();
-    let now_v = src.version().await?.unwrap_or(0);
-    if now_v != current_v {
-        return Ok(Outcome::precondition(format!(
-            "{prefix}refused: durable config moved v{current_v} -> v{now_v} while this diff was \
-             being reviewed; nothing written. Re-run `torii config push` to see the current diff."
-        )));
+    match src.store_and_bump_if(incoming, current_v).await? {
+        Some(v) => Ok(Outcome::ok(format!("{prefix}pushed: config now at v{v}"))),
+        None => {
+            // The CAS refused — report what the generation actually is now. This read
+            // is purely for the operator-facing message; it plays no role in the
+            // decision (already made, atomically, above), so no window reopens here.
+            let now_v = src.version().await?.unwrap_or(0);
+            Ok(Outcome::precondition(format!(
+                "{prefix}refused: durable config moved v{current_v} -> v{now_v} while this diff \
+                 was being reviewed; nothing written. Re-run `torii config push` to see the \
+                 current diff."
+            )))
+        }
     }
-    let v = src.store_and_bump(incoming).await?;
-    Ok(Outcome::ok(format!("{prefix}pushed: config now at v{v}")))
 }
 
 /// `confirm` is called ONLY when the diff removes something and `--yes` was absent.
@@ -781,6 +789,63 @@ mod tests {
             "confirm already showed the diff; the outcome must not repeat it: {}",
             out.text
         );
+    }
+
+    /// SP-DATA-4.1 Task 1: a genuine first-ever push, through the REAL `push` caller
+    /// path, against a database where the `config_versions` row is absent (not merely
+    /// "at generation 0" — genuinely no row, the actual bootstrap state). `push` reads
+    /// `version()` (which reports `Some(0)` for an absent row, same as any other
+    /// generation), decides `Apply` since nothing durable exists to diff against, and
+    /// `write_and_report` calls `store_and_bump_if(cfg, 0)`. This must land — not
+    /// report a false CAS miss — proving `store_and_bump_if`'s first-push handling is
+    /// reachable and correct through the caller, not just unit-tested in isolation in
+    /// `orchestrator-store`.
+    #[tokio::test]
+    async fn a_genuine_first_push_lands_through_the_real_push_path_when_the_row_is_absent() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let pool = orchestrator_store::postgres::connect(&url).await.unwrap();
+        let src = PostgresConfigSource::new(pool.clone());
+
+        sqlx::query("delete from orchestrator.config_versions")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            src.version().await.unwrap(),
+            Some(0),
+            "an absent row reports generation 0, indistinguishable from a real v0"
+        );
+
+        let first = format!("first-{}", uuid::Uuid::new_v4());
+        let dir = empty_config_dir();
+        std::fs::create_dir_all(dir.join("skills")).unwrap();
+        std::fs::write(
+            dir.join("skills").join(format!("{first}.md")),
+            format!("---\nname: {first}\n---\nbody"),
+        )
+        .unwrap();
+
+        let mut always_yes = |_: &str| true;
+        let out = push(&src, &no_paused_runs(), &dir, true, &mut always_yes)
+            .await
+            .expect("no hard error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            out.code,
+            crate::errors::EXIT_OK,
+            "a genuine first push must land, not refuse on a false CAS miss: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("pushed: config now at v1"),
+            "the very first push must land at generation 1: {}",
+            out.text
+        );
+        let (after, after_v) = src.load_versioned().await.unwrap();
+        assert_eq!(after_v, Some(1));
+        assert!(after.skills.iter().any(|s| s.name == first));
     }
 
     /// AC3 + AC4 against a live database. These are the three claims the pure `plan_push`
