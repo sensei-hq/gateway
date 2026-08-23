@@ -508,24 +508,24 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
 - **`run submit --detach`** — needs a real `pending` status rather than leaning on lease-reclaim (§5.3).
 - **Wake backoff/jitter/`max_attempts`/dead-letter** (still open from s3) — until then a poison-pill
   run can crash-loop a worker (§7.2).
-- **A second-signal fast path for `worker serve`** (§7.3). Signals arriving during a tick are consumed
+- ~~**A second-signal fast path for `worker serve`**~~ — **CLOSED in SP-DATA-4.1.** A second signal now abandons the in-flight tick; the abandoned run's row stays `waking` and the lease reclaims it. §7.3 describes what exists again. (§7.3). Signals arriving during a tick are consumed
   and discarded, so a worker blocked mid-`claim_due` survives repeated SIGTERM/SIGINT until SIGKILL.
   Safe, but the worst case is bounded by the lease alone.
 - **Resuming a run whose config generation moved.** A push strands every paused run terminally (§5.2);
   the operator is now warned and must confirm, but there is no recovery path short of re-submitting.
   Carrying the generation forward so a re-pin could *offer* to resume a stale run under new config is
   the same deferral s3 recorded, and it is what would turn this from a warning into a workflow.
-- **Redactor coverage for pause reasons** (§8), and a `reason` length cap.
+- ~~**Redactor coverage for pause reasons**~~ — **CLOSED in SP-DATA-4.1** at DISPLAY time, on both the table and JSON paths, with a length cap. A secret split by a control character defeats pattern matching in either order, so a commutativity check (`strip_control(redact(s))` vs `redact(strip_control(s))`) detects the evasion and withholds the whole reason. **The durable `scheduled_runs.reason` still holds raw text** — that residue remains open. (§8), and a `reason` length cap.
 - **`config pull` / rollback** — today recovery from a bad push means re-pushing a good directory;
   the old rows are gone.
-- **An airtight compare-and-swap on the config write.** `push` re-reads the generation immediately
+- ~~**An airtight compare-and-swap on the config write.**~~ — **CLOSED in SP-DATA-4.1** as `store_and_bump_if`. A single CTE gives a first push (absent `config_versions` row) the same CAS as every other generation; the caller-side fallback originally planned would have let two concurrent first-pushes both report success. `push` re-reads the generation immediately
   before writing and refuses if it moved (§5.2), which closes the minutes-long human-latency window —
   the entire practical risk. A residual ~1 ms window remains between that re-read returning and
   `store_and_bump`'s bump committing. Closing it properly is cheap and known: because `store_and_bump`
   already bumps *first*, a `store_and_bump_if(expected_version)` adding `where version = $1` to that
   `UPDATE` is a true CAS at zero extra round-trips. Deferred only because it is an `orchestrator-store`
   API change, and the residual window is negligible against two humans.
-- **Pool sizing** — `connect()` hardcodes `max_connections(8)` (s1 defer-minor); a multi-worker
+- ~~**Pool sizing**~~ — **CLOSED in SP-DATA-4.1** as `connect_with_max`, exposed as `TORII_POOL_SIZE` (default 8 unchanged). — `connect()` hardcodes `max_connections(8)` (s1 defer-minor); a multi-worker
   deployment will want it configurable.
 - **A long-lived worker's registry and config generation are frozen at process start.** Nothing calls
   `RegistryHandle::reload()`, so a run a worker submits after someone else pushes config is born with
@@ -535,8 +535,8 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
 - **Metrics/tracing export** from `worker serve` (counts, wake latency, backoff state). Note the
   subscriber itself is wired this slice — without one, `tracing` macros are no-ops and the worker's
   store-fault diagnostics were invisible.
-- **Terminal-row pruning/retention** for `scheduled_runs`.
-- **The DB tests' isolation guards are process-wide, not cross-process.** The `config_*` tables and
+- ~~**Terminal-row pruning/retention** for `scheduled_runs`.~~ — **CLOSED in SP-DATA-4.1** as `torii run prune --older-than`, an explicit operator command rather than automatic in `tick()`. Selects by ALLOWLIST (`completed`/`failed`/`cancelled`), so an unrecognised status is kept, and `paused`/`waking` are never eligible at any age.
+- ~~**The DB tests' isolation guards are process-wide, not cross-process.**~~ — **CLOSED in SP-DATA-4.1** with a Postgres session-level advisory lock shared by both crates' guards. Pre-fix, two concurrent `cargo` invocations failed 7 of 8 rounds; post-fix, 16/16 clean. `cargo nextest` is now safe. The `config_*` tables and
   the single-row `config_versions` are global, and `claim_due` is an instance-wide sweep that can steal
   another test's due row — two distinct race classes, both now serialized by in-process mutexes in the
   store crate. But torii's own DB tests call `store_and_bump` on those same tables from a **different
