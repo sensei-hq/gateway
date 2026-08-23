@@ -35,6 +35,19 @@ pub(crate) fn one_line(s: &str) -> String {
 /// set, which is not free to redo per row.
 static REASON_REDACTOR: LazyLock<PatternRedactor> = LazyLock::new(PatternRedactor::default);
 
+/// The literal placeholder `PatternRedactor` substitutes on a match
+/// (`crates/orchestrator-core/src/redact.rs`, `PLACEHOLDER`). Not exported — it is a
+/// private const there — so it is duplicated here. Only `safe_reason`'s
+/// mid-placeholder cap guard depends on this literal staying in sync; the evasion
+/// check in `redact_reason` below does not (it compares whole redacted strings, not
+/// this substring), so a drift here would silently reopen only the MINOR
+/// straddled-truncation cosmetic issue, not the CRITICAL leak.
+const PLACEHOLDER_TEXT: &str = "[REDACTED]";
+
+/// What a WITHHELD reason renders as: the whole reason discarded, not a partial
+/// redaction. See `redact_reason` for when this fires.
+const WITHHELD_REASON: &str = "[REDACTED: reason withheld]";
+
 /// A pause reason is `ScheduledRun.reason`: free text lifted from `PauseInfo.reason`
 /// and provider messages (SP-DATA-3), stored UNREDACTED — the SP-4 s2 `Redactor`
 /// covers effect outputs and model output, not pause reasons, and torii is the first
@@ -49,13 +62,62 @@ static REASON_REDACTOR: LazyLock<PatternRedactor> = LazyLock::new(PatternRedacto
 ///
 /// `Redactor::redact` operates on `serde_json::Value`, not `&str`, so a plain string
 /// is wrapped and unwrapped around the call.
+///
+/// **A control-character evasion, and why this withholds rather than half-redacts.**
+/// `PatternRedactor`'s whole-match patterns (`sk-[A-Za-z0-9_-]{20,}` and siblings)
+/// are contiguous character classes that exclude control characters. A secret with
+/// one control byte spliced into the middle —
+/// `"sk-AAAAAAAAAAAA\u{1}AAAAAAAAAAAA"` — therefore fails to match as a whole: the
+/// pattern only ever sees two 12-char runs, neither long enough to fire, and
+/// `one_line`'s later newline→space collapse does not create this leak, it just
+/// fails to hide it (the pattern already missed on the raw text). This is unmodified
+/// SP-4 s2 behavior — `PatternRedactor` is documented there as best-effort-by-shape
+/// — and changing it is out of scope here: its blast radius is effect outputs and
+/// model output, a separate design question. The defense on THIS display path is to
+/// DETECT the evasion rather than out-pattern it: redact once as given, redact again
+/// on a control-character-STRIPPED copy (characters removed outright, not collapsed
+/// to spaces, so a split secret reassembles into one contiguous run), then check
+/// whether stripping control characters OUT of the already-redacted original agrees
+/// with stripping-then-redacting. If a secret was fully caught on the first pass (or
+/// never present at all), both orderings reduce to the same string — stripping a
+/// control character from an inert placeholder or from ordinary prose does not
+/// depend on when it happens. A disagreement means the ordering mattered, which only
+/// happens when stripping-first exposed a contiguous run the original pass missed.
+///
+/// A simpler placeholder-COUNT comparison (redacted-original vs redacted-stripped)
+/// was tried first and rejected: verified against `"Bearer abc123defghi\u{1}abc123defghi"`,
+/// the RAW text partially matches — `bearer\s+[A-Za-z0-9._-]{8,}` consumes "Bearer "
+/// plus the first fragment before the control byte stops the class — producing ONE
+/// placeholder, the SAME count as the fully-reassembled stripped pass (also one
+/// placeholder, now covering both fragments). The counts tie while the CONTENT
+/// differs: the original pass leaves the second fragment as raw trailing text
+/// (`"[REDACTED] abc123defghi"`). Comparing full strings after normalizing control
+/// characters catches this; comparing counts does not.
+///
+/// On a disagreement, withhold the ENTIRE reason rather than guessing which part is
+/// safe to keep: this is a display path, and a legitimate provider message does not
+/// contain a credential bisected by a control byte, so there is no honest partial
+/// rendering to fall back to.
 fn redact_reason(s: &str) -> String {
-    match REASON_REDACTOR.redact(&serde_json::Value::String(s.to_string())) {
-        serde_json::Value::String(out) => out,
-        other => {
-            unreachable!("redacting a Value::String must yield a Value::String, got {other:?}")
+    let redact_once = |text: &str| -> String {
+        match REASON_REDACTOR.redact(&serde_json::Value::String(text.to_string())) {
+            serde_json::Value::String(out) => out,
+            other => {
+                unreachable!("redacting a Value::String must yield a Value::String, got {other:?}")
+            }
         }
+    };
+    let strip_control =
+        |text: &str| -> String { text.chars().filter(|c| !c.is_control()).collect() };
+
+    let redacted_first = redact_once(s);
+    let redacted_first_then_stripped = strip_control(&redacted_first);
+    let stripped_first_then_redacted = redact_once(&strip_control(s));
+
+    if redacted_first_then_stripped != stripped_first_then_redacted {
+        return WITHHELD_REASON.to_string();
     }
+    redacted_first
 }
 
 /// Rendered reasons are capped so one unbounded provider message can't wreck the
@@ -65,36 +127,57 @@ const REASON_MAX: usize = 300;
 /// The table-display transform for a reason: redact, THEN collapse control
 /// characters (`one_line`), THEN cap length.
 ///
-/// Order, and what was checked rather than assumed: redact-before-collapse looks
-/// like the obviously safer order on its face — collapse-first could in principle
-/// glue two halves of a newline-split secret into a form that no longer matches a
-/// pattern that only fires on the concatenated text (or, less intuitively, the
-/// reverse: collapsing could join two halves the pattern DOES then match). Checked
-/// against `PatternRedactor`'s actual patterns (`crates/orchestrator-core/src/redact.rs`):
-/// every whole-match pattern is a contiguous character class — `[A-Za-z0-9_-]` and
-/// siblings — that excludes BOTH raw control characters and the space `one_line`
-/// replaces them with, so a secret split across an embedded newline fails to match
-/// EITHER before or after collapsing; the assignment-form pattern's value group
-/// (`[^\s"',&;]{6,}`) excludes whitespace outright for the same reason. The one
-/// pattern that spans newlines on purpose — the PEM private-key block, `[\s\S]*?` —
-/// matches a run of spaces exactly as it matches a run of newlines, so it too is
-/// order-independent. So for this redactor's current pattern set, the two orders are
-/// provably equivalent on the "split secret" scenario. Redact-first is still the
-/// order used below: it is the safer default in general, it costs nothing here, and
-/// it does not depend on today's patterns staying exactly this narrow if more are
-/// added later.
+/// Order: redact-before-collapse looks like the obviously safer order on its face —
+/// collapse-first could in principle glue two halves of a newline-split secret into
+/// a form that no longer matches a pattern that only fires on the concatenated text.
+/// Checked directly against `PatternRedactor`'s patterns
+/// (`crates/orchestrator-core/src/redact.rs`): every whole-match pattern is a
+/// contiguous character class that excludes BOTH raw control characters and the
+/// space `one_line` replaces them with, so — at the level of `PatternRedactor`
+/// alone — a secret split across an embedded control character fails to match
+/// EITHER before or after collapsing; the two orders are equivalent there. That
+/// finding is NOT what makes a split secret safe, though — equivalently-failing is
+/// still failing, since `PatternRedactor` alone leaves the un-caught fragments as
+/// plain text either way. The actual defense against a split secret is
+/// `redact_reason`'s own evasion check (see its doc comment), which runs regardless
+/// of order and withholds the whole reason when it detects one. Redact-first is kept
+/// here anyway as the safer general default — it costs nothing — but this function
+/// does not need to (and does not) carry the split-secret defense itself.
 fn safe_reason(s: &str) -> String {
     let redacted = redact_reason(s);
     let collapsed = one_line(&redacted);
-    if collapsed.chars().count() <= REASON_MAX {
-        collapsed
-    } else {
-        // Cap in CHARACTERS, not bytes: a byte-offset slice through a multi-byte
-        // character (anything outside ASCII) would panic at the split point.
-        let mut truncated: String = collapsed.chars().take(REASON_MAX).collect();
-        truncated.push('…');
-        truncated
+    cap_chars(&collapsed, REASON_MAX)
+}
+
+/// Cap `s` to at most `max` CHARACTERS (not bytes — a byte-offset slice through a
+/// multi-byte character, anything outside ASCII, would panic at the split point),
+/// appending `…` when truncated.
+///
+/// MINOR fix: if the naive cut point at `max` would land strictly inside an
+/// occurrence of the redaction placeholder, back the cut up to just before that
+/// occurrence starts instead. No data is disclosed either way — the secret behind
+/// the placeholder was already replaced before this function ever sees it — but a
+/// straddled cut renders a confusing shard like `[REDA…` in scrollback, which reads
+/// as a truncated SECRET rather than a truncated placeholder.
+fn cap_chars(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
     }
+    let placeholder: Vec<char> = PLACEHOLDER_TEXT.chars().collect();
+    let plen = placeholder.len();
+    let mut cut = max;
+    if plen <= chars.len() {
+        for start in 0..=(chars.len() - plen) {
+            if start < max && max < start + plen && chars[start..start + plen] == placeholder[..] {
+                cut = start;
+                break;
+            }
+        }
+    }
+    let mut truncated: String = chars[..cut].iter().collect();
+    truncated.push('…');
+    truncated
 }
 
 pub fn table(rows: &[ScheduledRun]) -> String {
@@ -272,6 +355,100 @@ mod tests {
         let long = "€".repeat(500);
         let out = table(&[row(None, Some(&long))]);
         assert!(out.contains('…'), "truncation must be visible: {out}");
+    }
+
+    // -- Review follow-up: a secret split by an embedded control character evades
+    // `PatternRedactor`'s contiguous-character-class patterns entirely (they exclude
+    // control characters, so a control byte spliced into the middle of e.g.
+    // `sk-AAAA...AAAA` breaks the match into two runs, neither long enough to fire).
+    // `one_line`'s later newline→space collapse does not create the leak; the pattern
+    // already failed to match on the raw text. These tests must fail before the fix.
+
+    #[test]
+    fn a_control_split_secret_is_withheld_entirely_not_partially_redacted() {
+        let half = "A".repeat(12);
+        let secret = format!("sk-{half}\u{1}{half}"); // 24 alnum chars total, split by one SOH byte
+        let reason = format!("quota exceeded for {secret}");
+
+        let out = table(&[row(None, Some(&reason))]);
+        assert!(
+            !out.contains(&half),
+            "a 12-char fragment of the split key leaked verbatim: {out}"
+        );
+        assert!(
+            out.contains("[REDACTED"),
+            "must render a redaction marker, not raw text: {out}"
+        );
+
+        let j = json(&[row(None, Some(&reason))]).expect("serializes");
+        assert!(
+            !j.contains(&half),
+            "the JSON path leaked a fragment of the split key: {j}"
+        );
+    }
+
+    #[test]
+    fn a_control_split_bearer_token_is_withheld_not_half_leaked() {
+        // A partial match on the raw text ("Bearer " + the first fragment) can catch
+        // ONE placeholder while leaving the second fragment as untouched trailing
+        // text — this is the case a naive placeholder-count comparison misses.
+        let half = "abc123defghi";
+        let reason = format!("Bearer {half}\u{1}{half}");
+
+        let out = table(&[row(None, Some(&reason))]);
+        assert!(
+            !out.contains(half),
+            "the trailing half of a split bearer token leaked verbatim: {out}"
+        );
+    }
+
+    #[test]
+    fn a_newline_split_secret_is_withheld_not_glued_and_leaked() {
+        // The shape a real garbled provider message is most likely to take.
+        let half = "A".repeat(12);
+        let secret = format!("sk-{half}\n{half}");
+        let reason = format!("quota exceeded for {secret}");
+
+        let out = table(&[row(None, Some(&reason))]);
+        assert!(
+            !out.contains(&half),
+            "a 12-char fragment of the newline-split key leaked verbatim: {out}"
+        );
+    }
+
+    /// Guards against the withholding being over-eager: a reason with control
+    /// characters but genuinely no secret must still render normally (control chars
+    /// collapsed via `one_line`, exactly as before), not get blanked.
+    #[test]
+    fn a_reason_with_control_characters_but_no_secret_still_renders_normally() {
+        let reason = "provider timed out\u{1}please retry";
+        let out = table(&[row(None, Some(reason))]);
+        assert!(
+            out.contains("provider timed out") && out.contains("please retry"),
+            "an ordinary control-bearing reason must not be withheld: {out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("withheld"),
+            "must not be over-eager: {out}"
+        );
+    }
+
+    /// MINOR: the cap must not land mid-placeholder. `[REDACTED]` straddling the cut
+    /// would render as e.g. `[REDA…`, disclosing nothing but confusing in scrollback.
+    /// 295 'x's then a real (non-split) secret means the placeholder occupies chars
+    /// [295, 305) — squarely straddling the 300-char cap.
+    #[test]
+    fn a_capped_reason_never_splits_the_redaction_placeholder() {
+        let secret = format!("sk-{}", "B".repeat(30));
+        let reason = format!("{}{}", "x".repeat(295), secret);
+
+        let out = table(&[row(None, Some(&reason))]);
+        let line = out.lines().nth(1).expect("a data row");
+        assert!(out.contains('…'), "truncation must still be visible: {out}");
+        assert!(
+            line.contains("[REDACTED]") || !line.contains("[RED"),
+            "a truncation must not leave a mangled placeholder fragment: {line}"
+        );
     }
 
     #[test]
