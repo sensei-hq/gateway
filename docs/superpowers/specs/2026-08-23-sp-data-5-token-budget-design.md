@@ -349,6 +349,21 @@ SP-DATA-4 alone — so each of these names the mutation that must break it.
   carrying run/fold context, and a decision about whether the selector's call should become a
   journaled effect so it can be ledgered at all. Bounded exposure today: one call per
   `PlannerRef::Select` node.
+- **⚠️ `Snapshot` carries no spend — a DORMANT third instance of the Critical-2 family.** Found while
+  auditing for more of the same after §6.5b. `Snapshot { seq, completed, skipped, outputs }` has no
+  `usage` and no `budget`, and its own doc comment states the design intent plainly: *"A resume seeds
+  from the latest snapshot and folds only the journal **tail** (events with `Seq >` seq)."* The moment
+  anyone wires that, every `EffectRecorded.usage` at or below `snapshot.seq` stops being folded and
+  the ledger silently loses the run's whole prefix — the exact failure compaction had, but **worse**:
+  `write_snapshot` runs at *every round boundary*, not only after a `Consolidate` over a `Map`.
+  **Not a live defect today** — `Executor::start` folds the FULL journal via `load()`, and nothing in
+  the workspace calls `load_since`/`latest_snapshot` outside the stores' own tests, so the
+  snapshot-seeded resume is built but unwired. Recorded here rather than fixed because fixing it
+  means designing what a snapshot must carry (a folded `spent` scalar plus the effective `budget`,
+  and an argument for why re-folding the tail on top cannot double-count) — the same
+  keyed-by-effect-id reasoning §6.5b needed, but over a summary rather than a per-child manifest.
+  **Whoever wires snapshot-seeded resume owns this**; a tail-only fold that compiles will pass the
+  entire suite while quietly un-capping every budgeted run.
 - **Fleet-wide / per-tenant budgets**, and a precedence rule against the per-run cap.
 - **Pre-flight estimation** to eliminate the one-call overshoot.
 - **Budget-aware scheduling** — e.g. refusing to wake a run whose remaining budget cannot plausibly
