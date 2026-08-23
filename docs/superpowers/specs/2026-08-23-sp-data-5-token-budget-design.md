@@ -156,6 +156,27 @@ everything else, **latest value wins**. It also leaves an audit trail in the jou
 moved. Lowering it below current spend is legitimate and is a reasonable way to halt a runaway run at
 its next call.
 
+> **STATUS — THIS SLICE IS NOT COMPLETE. Two demonstrated defects defeat the headline property.**
+> A whole-slice review reproduced both against live Postgres:
+> 1. **A concurrent `Map` fan-out passes the gate en masse.** Every child reads the ledger before any
+>    sibling's response returns — a deterministic check-then-act, not a memory-ordering race. A Map no
+>    wider than `min(map.concurrency, executor.concurrency)` (**default 8**) is not gated at all.
+>    Measured: 6-item Map, cap 100 → 6 calls, 900 tokens, `Completed`, zero pauses.
+> 2. **Map compaction erases the children's spend.** `CompactChild` carries no `usage`, and compaction
+>    removes the child `EffectRecorded` rows, so a `Consolidate` over a `ModelCall` Map deletes that
+>    Map's spend from the ledger permanently. Measured: a run completed having spent 1050 against a
+>    700 cap, with `torii run status` reporting 600 and no operator action taken.
+>
+> **§6.5's "overshoot bounded by at most one call" is therefore FALSE**, as is the same claim repeated
+> in the overview decision log and asserted inside the AC6 test docstring. The honest bound is: one
+> call per sequential path, and `min(map.concurrency, executor.concurrency)` per fan-out — with a
+> narrow Map not gated at all.
+>
+> Root cause of why five tasks and their reviews missed both: **every gateway test double returns
+> without a suspension point**, so `join_all` degenerates to sequential execution and the gate looks
+> tight. A double that awaits, plus one end-to-end assertion that re-reads a fresh journal after each
+> producer, would have caught these and the Task 6 defect alike.
+
 ### 6.5 The gate is a floor-trigger, not a ceiling
 
 The gate tests already-accumulated spend **before** each call, so a budget can be overshot by at most
@@ -206,7 +227,7 @@ the two new tests fail with the whole graph completed. Unbudgeted runs are unaff
 | Overshoot | Bounded by one call (§6.5) |
 | Old journal | `usage: None` + `budget: None` ⇒ ungated and unmetered. **Verify** no `FORMAT_VERSION` bump is needed rather than assuming it |
 | `--budget-tokens 0` | Rejected at submit, consistent with `--interval 0s` and `TORII_POOL_SIZE=0` |
-| Sum overflow | `u64` **checked** arithmetic — a saturating sum would silently cap the ledger and under-report spend |
+| Sum overflow | `u64` **saturating** arithmetic. §7 originally specified *checked*; the implementation deliberately saturates, and the code's reasoning is the better one — saturating HIGH is conservative because it pauses the run, where wrapping could reset the ledger near zero and let it spend unbounded. Corrected here to match the code. |
 | Resume at/over budget | Pauses immediately without dispatching |
 
 **Acceptance criteria.** This slice has a history of tests that did not guard their line — five in
