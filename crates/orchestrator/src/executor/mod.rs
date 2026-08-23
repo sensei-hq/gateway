@@ -845,9 +845,9 @@ impl Executor {
                                 seq: 0,
                                 output: recorded,
                                 observation: None,
-                                // SP-DATA-5 Task 4 threads real usage through the
-                                // ModelCall producer.
-                                usage: None,
+                                // SP-DATA-5: the ModelCall producer — the real usage the
+                                // provider reported, converted at the boundary.
+                                usage: response.usage.map(content::convert_usage),
                             },
                         )
                         .await?;
