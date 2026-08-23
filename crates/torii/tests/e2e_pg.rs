@@ -17,10 +17,14 @@
 //! That is the reason this crate is a lib+bin pair.
 
 use chrono::{DateTime, Duration, Utc};
-use orchestrator::test_support::{CallLog, FakeClock, gated_gateway, recording_gateway};
+use kernel::types::cost::TokenUsage;
+use orchestrator::test_support::{
+    CallLog, FakeClock, gated_gateway, metered_gateway, recording_gateway,
+};
 use orchestrator::{Executor, Scheduler};
 use orchestrator_core::{
-    ConfigSource, Graph, Node, NodeId, NodeKind, RegistryHandle, RunId, RunStatus, SchedulerStore,
+    ConfigSource, ExecutionJournal, Graph, Node, NodeId, NodeKind, RegistryHandle, RunId,
+    RunStatus, SchedulerStore, TokenBudget,
 };
 use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresJournal, PostgresSchedulerStore, connect,
@@ -78,6 +82,31 @@ fn one_node_graph(marker: &str) -> Graph {
     }
 }
 
+/// SP-DATA-5 AC6: a LINEAR TWO-node graph, `n1 → n2`, each node's prompt carrying the
+/// run's own marker plus its node id so a call is attributable to both the run AND the
+/// node — which is what lets the budget e2e below say "n1 was replayed, n2 was driven"
+/// rather than merely "one call happened".
+///
+/// Two nodes because a budget pause needs a node LEFT to gate: the run must spend past
+/// its cap on `n1` and then be refused at `n2`, in that same drive.
+fn two_node_graph(marker: &str) -> Graph {
+    let node = |id: &str| Node {
+        id: NodeId(id.into()),
+        kind: NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": format!("{marker}#{id}") }),
+        },
+        deps: if id == "n1" {
+            vec![]
+        } else {
+            vec![orchestrator_core::Dep::hard("n1")]
+        },
+    };
+    Graph {
+        nodes: vec![node("n1"), node("n2")],
+    }
+}
+
 /// How many recorded gateway calls carried `marker` as their prompt.
 fn calls_for(log: &CallLog, marker: &str) -> usize {
     log.lock()
@@ -111,6 +140,41 @@ async fn fresh_worker(url: &str, at: DateTime<Utc>) -> (Scheduler, CallLog) {
     let (exec, journal, clock, calls) = fresh_executor(url, at).await;
     let store = Arc::new(PostgresSchedulerStore::new(connect(url).await.unwrap()));
     (Scheduler::new(store, exec, journal, clock), calls)
+}
+
+/// SP-DATA-5: [`fresh_worker`], but over a gateway that REPORTS token usage.
+///
+/// A separate constructor rather than a parameter on `fresh_worker` because the two are
+/// not interchangeable under a budget: `recording_gateway` hardcodes `usage: None`, which
+/// a budgeted run refuses outright as an unmetered call (spec §4, fail closed). A worker
+/// that resumes a budgeted run therefore MUST be metered, and a test that used the
+/// recording double here would fail the node instead of completing the run — arriving at
+/// a red test by the right rule, which is confusing rather than informative.
+async fn fresh_metered_worker(
+    url: &str,
+    at: DateTime<Utc>,
+    per_call_tokens: u32,
+) -> (Scheduler, CallLog) {
+    let journal = Arc::new(PostgresJournal::new(connect(url).await.unwrap()));
+    let (gw, calls) = metered_gateway(Some(usage(per_call_tokens))).await;
+    let clock = FakeClock::new(at);
+    let exec = Executor::new(Arc::new(gw), journal.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(url).await.unwrap(),
+        )))
+        .with_clock(clock.clone());
+    let store = Arc::new(PostgresSchedulerStore::new(connect(url).await.unwrap()));
+    (Scheduler::new(store, exec, journal, clock), calls)
+}
+
+/// A provider-reported usage of `total` tokens on one call. The input/output split is
+/// arbitrary — `Fold::spent` only ever reads `total_tokens`.
+fn usage(total: u32) -> TokenUsage {
+    TokenUsage {
+        input_tokens: total / 2,
+        output_tokens: total - total / 2,
+        total_tokens: total,
+    }
 }
 
 /// Like [`fresh_worker`], but ALSO wired with a registry handle freshly loaded from the
@@ -495,5 +559,183 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
         woken.text.contains("not queued") && woken.text.contains("failed"),
         "an operator waking a failed run must be told plainly, not given a silent no-op: {}",
         woken.text
+    );
+}
+
+/// SP-DATA-5 AC6 — the per-run token budget, end to end, across a process boundary.
+///
+/// The one property that cannot be shown in-process: a budget is only worth anything if
+/// the ledger is DURABLE. An in-memory counter would restart at zero on every resume, so
+/// each wake would let the run spend its whole cap again. Here process A's spend is read
+/// back out of Postgres by a process that shares nothing with it.
+///
+/// 1. **Process A** submits a two-node graph with `--budget-tokens 100` against a gateway
+///    that reports 150 tokens per call. `n1` dispatches (nothing spent yet), `n2` is
+///    refused — inside that same drive, which is the floor-trigger property: the cap is
+///    overshot by exactly ONE call, never by "everything the drive can reach".
+/// 2. The pause is the **HOTL class** — `next_wake` NULL. No amount of waiting refills a
+///    budget, so the scheduler must never auto-wake this run; only an operator can.
+/// 3. **The operator, light tier** (`run status`) reads spend and cap out of the durable
+///    journal — on its own pool, with no model credentials and no gateway at all.
+/// 4. **`run wake --budget-tokens 1000`** appends `BudgetRaised` and queues the run.
+/// 5. **Process B** — a fresh store/journal/content-store/gateway — drives it through
+///    torii's real `worker serve --once` to `Completed`, folding the RAISED cap.
+/// 6. **Zero re-spend**, asserted per node: B's gateway saw `n2` exactly once and `n1`
+///    NEVER — A's already-paid-for prefix was replayed from the durable journal + CAS.
+///    And the final ledger reads 300, not 150: spend ACCUMULATED across the boundary
+///    rather than restarting, which is the whole point of journaling it.
+#[tokio::test]
+async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fresh_process() {
+    let Some(url) = db_url() else { return };
+    let _guard = SCHEDULED_RUNS.lock().await;
+
+    const PER_CALL: u32 = 150;
+    const CAP: u64 = 100;
+    const RAISED: u64 = 1_000;
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let marker = run.0.to_string();
+    let (first, second) = (format!("{marker}#n1"), format!("{marker}#n2"));
+    let graph = two_node_graph(&marker);
+    let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(5_000_000, 0).unwrap());
+
+    // ---- Process A: submit under a cap one call already exceeds --------------------
+    let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let (gw_a, calls_a) = metered_gateway(Some(usage(PER_CALL))).await;
+    let exec_a = Executor::new(Arc::new(gw_a), journal_a.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_clock(clock.clone());
+    let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
+    let submitted = torii::cmd::run::submit(
+        &sched_a,
+        run,
+        graph.clone(),
+        Some(TokenBudget { total_tokens: CAP }),
+        || {},
+    )
+    .await
+    .expect("a budget-paused run is not an error");
+    assert_eq!(submitted.code, torii::errors::EXIT_OK, "{}", submitted.text);
+    assert!(
+        submitted.text.starts_with("paused:") && submitted.text.contains("budget:"),
+        "an exhausted budget must PAUSE the run (resumable), naming the budget as the \
+         cause: {}",
+        submitted.text
+    );
+    assert!(
+        submitted.text.contains("n2"),
+        "the pause lands on the node that was REFUSED, not the one that spent: {}",
+        submitted.text
+    );
+
+    // The floor-trigger property, measured: exactly one call escaped the 100-token cap.
+    assert_eq!(
+        (calls_for(&calls_a, &first), calls_for(&calls_a, &second)),
+        (1, 0),
+        "n1 spends past the cap and n2 is refused — the overshoot is bounded by ONE \
+         call. Two calls here would mean the ledger froze for the drive."
+    );
+
+    // ---- The pause is the HOTL class: NULL deadline, never auto-woken ---------------
+    let paused = store_a
+        .status(run)
+        .await
+        .unwrap()
+        .expect("a schedule record");
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(
+        paused.next_wake, None,
+        "a budget pause has no deadline to auto-wake on — waiting never refills a \
+         budget, so only an operator can move this run: {paused:?}"
+    );
+    assert!(
+        paused
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("budget:"),
+        "the durable reason must name the budget: {paused:?}"
+    );
+
+    // ---- The operator, light tier: read spend out of the DURABLE journal ------------
+    // A separate pool and a separate journal handle — this process has no gateway, no
+    // model credentials, and shares nothing in-process with A.
+    let store_b = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let shown = torii::cmd::run::status(store_b.as_ref(), journal_b.as_ref(), run, false)
+        .await
+        .expect("status");
+    assert_eq!(shown.code, torii::errors::EXIT_OK, "{}", shown.text);
+    assert!(
+        shown
+            .text
+            .contains(&format!("spent: {PER_CALL} / budget: {CAP}")),
+        "status must show the spend it folded from the journal against the cap: {}",
+        shown.text
+    );
+
+    // ---- The operator raises the cap and queues the run ----------------------------
+    let queued_at = paused.updated_at + Duration::seconds(600);
+    let woken = torii::cmd::run::wake(
+        store_b.as_ref(),
+        journal_b.as_ref(),
+        run,
+        queued_at,
+        Some(TokenBudget {
+            total_tokens: RAISED,
+        }),
+    )
+    .await
+    .expect("wake");
+    assert_eq!(woken.code, torii::errors::EXIT_OK, "{}", woken.text);
+    assert!(woken.text.contains("queued for wake"), "{}", woken.text);
+
+    // The raise is DURABLE, and the run is now gateable at the new cap. Without
+    // `BudgetRaised` the woken run would fold the ORIGINAL 100, refuse `n2` again and
+    // re-pause — permanently stuck, and the feature useless.
+    let (spent_before, budget_before) = orchestrator::spend_of(&journal_b.load(run).await.unwrap());
+    assert_eq!(
+        (spent_before, budget_before),
+        (u64::from(PER_CALL), Some(RAISED)),
+        "the raise is folded as the effective cap (latest wins), and the spend it is \
+         weighed against survived the pause"
+    );
+
+    // ---- Process B: a FRESH metered worker drives it to completion ------------------
+    let (sched_b, calls_b) =
+        fresh_metered_worker(&url, queued_at + Duration::seconds(1), PER_CALL).await;
+    let served = serve_once(&sched_b).await;
+    assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
+    assert_eq!(
+        store_b.status(run).await.unwrap().unwrap().status,
+        RunStatus::Completed,
+        "under the raised cap the fresh process finishes the run: {}",
+        served.text
+    );
+
+    // ---- Zero re-spend of the completed prefix, per node ----------------------------
+    assert_eq!(
+        calls_for(&calls_b, &first),
+        0,
+        "n1 was paid for by process A — B must replay it from the durable journal + \
+         CAS, never call the gateway for it again"
+    );
+    assert_eq!(
+        calls_for(&calls_b, &second),
+        1,
+        "exactly the one un-run node, driven once"
+    );
+
+    // ---- The ledger ACCUMULATED across the process boundary -------------------------
+    // The assertion an in-memory counter could never satisfy: 300, not 150. A counter
+    // that restarted at zero on resume would let every wake re-spend the whole cap.
+    let (spent_after, budget_after) = orchestrator::spend_of(&journal_b.load(run).await.unwrap());
+    assert_eq!(
+        (spent_after, budget_after),
+        (u64::from(PER_CALL) * 2, Some(RAISED)),
+        "both processes' spend is in ONE durable ledger, folded by effect id"
     );
 }
