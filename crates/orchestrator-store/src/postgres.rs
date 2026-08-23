@@ -560,13 +560,19 @@ async fn bump_on(conn: &mut sqlx::PgConnection) -> Result<u64, OrchestratorError
 /// - [`load_versioned`](ConfigSource::load_versioned) — the atomic READ: the four config tables AND
 ///   `config_versions` in ONE `REPEATABLE READ` transaction, so a concurrent writer can never hand
 ///   back a torn (stale config, fresh generation) pair.
-/// - [`store_and_bump`](Self::store_and_bump) — the atomic WRITE: the replace-all content write AND
-///   the generation increment in ONE transaction, so no crash window can leave new content durably
-///   parked under an old generation.
-/// - [`store_and_bump_if`](Self::store_and_bump_if) — the atomic CONDITIONAL write (SP-DATA-4.1):
-///   the same coupling, plus a compare-and-swap against an expected generation, so a writer that
-///   built its diff against a stale read cannot silently clobber a concurrent one. `torii config
-///   push` uses this instead of the plain `store_and_bump` + a caller-side re-read.
+/// - [`store_and_bump_if`](Self::store_and_bump_if) — the atomic write (SP-DATA-4.1), and the
+///   one PRODUCTION CALLERS SHOULD USE: the replace-all content write AND the generation
+///   increment in ONE transaction (so no crash window can leave new content durably parked
+///   under an old generation), gated by a compare-and-swap against an expected generation (so
+///   a writer that built its diff against a stale read cannot silently clobber a concurrent
+///   one). `torii config push` uses this.
+/// - [`store_and_bump`](Self::store_and_bump) — the unconditional atomic write this superseded.
+///   Every production caller has migrated to `store_and_bump_if`; what remains is test seeding
+///   (this crate's own fixtures, `sensei-orchestrator`'s executor tests, and — the reason it
+///   cannot be gated behind `test-support`/`test` like its un-coupled siblings below —
+///   `sensei-torii`'s own test suite, which depends on this crate with only the `postgres`
+///   feature and so cannot see a `test-support`-gated item at all). Do not add a new
+///   production caller; use `store_and_bump_if` instead.
 ///
 /// [`load`](ConfigSource::load) and [`version`](ConfigSource::version) remain individually
 /// non-atomic BY DESIGN: they are the unversioned `ConfigSource` contract (each is a single
@@ -591,8 +597,19 @@ impl PostgresConfigSource {
         &self.pool
     }
 
-    /// Replace the whole registry AND advance the generation in ONE transaction —
-    /// the only config write production code may use. Returns the new generation.
+    /// Replace the whole registry AND advance the generation in ONE transaction,
+    /// unconditionally. Returns the new generation.
+    ///
+    /// SP-DATA-4.1: superseded as the production write path by
+    /// [`store_and_bump_if`](Self::store_and_bump_if), which adds a compare-and-swap
+    /// against an expected generation at zero extra round trips — do not add a new
+    /// production caller here; use that instead. This method stays `pub` and
+    /// ungated (unlike its un-coupled siblings `store`/`bump_config_version`) purely
+    /// because it is still the seeding utility test code across this crate,
+    /// `sensei-orchestrator`, and `sensei-torii` relies on, and `sensei-torii`
+    /// depends on this crate with only the `postgres` feature — a `test-support`
+    /// gate would be invisible to it. See the struct-level doc for the full
+    /// reasoning.
     ///
     /// One transaction, not two calls: a `store()` followed by a `bump()` has a
     /// crash window between them, and dying in it leaves new content under an old
@@ -669,18 +686,34 @@ impl PostgresConfigSource {
     /// transaction:
     /// - `expected == 0`: attempt `INSERT … ON CONFLICT (id) DO NOTHING`. If the row
     ///   is genuinely absent, this alone is the whole CAS — it lands, and the
-    ///   sibling conditional `UPDATE` is skipped (guarded by `WHERE NOT EXISTS
-    ///   (SELECT 1 FROM ins)`, which — per Postgres's documented semantics for
-    ///   writable CTEs — forces the `INSERT` to be fully resolved, conflict and all,
-    ///   before the `UPDATE` decides whether to run). If a concurrent writer already
-    ///   created the row — including a second concurrent first-push racing this
-    ///   exact call, which Postgres blocks on the unique index until the first one
-    ///   commits, then re-evaluates the conflict — the `INSERT` no-ops and the
-    ///   `UPDATE` takes over, sees the real (non-zero) version, and correctly
-    ///   refuses. Proven directly: `concurrent_first_pushes_do_not_both_land`.
+    ///   sibling conditional `UPDATE` matches nothing (see below for why). If a
+    ///   concurrent writer already created the row — including a second concurrent
+    ///   first-push racing this exact call, which Postgres blocks on the unique index
+    ///   until the first one commits, then re-evaluates the conflict — the `INSERT`
+    ///   no-ops and the `UPDATE` takes over. Proven directly:
+    ///   `concurrent_first_pushes_do_not_both_land`.
     /// - `expected != 0`: the `INSERT`'s `WHERE $1 = 0` guard is false, so it never
     ///   runs at all (and never emits conflict noise); only the conditional `UPDATE`
-    ///   fires — the plain CAS case.
+    ///   fires — the plain CAS case. Proven under concurrency too:
+    ///   `concurrent_pushes_at_the_same_nonzero_generation_do_not_both_land`.
+    ///
+    /// WHY THE TWO SUB-STATEMENTS NEVER BOTH FIRE. It is tempting to credit the `WHERE
+    /// NOT EXISTS (SELECT 1 FROM ins)` guard on `upd` with forcing an order — "the
+    /// `INSERT` must fully resolve, conflict and all, before the `UPDATE` decides
+    /// whether to run." That is NOT what Postgres guarantees, and citing it would be
+    /// wrong: the documented behaviour for data-modifying CTEs is the opposite —
+    /// sub-statements in one `WITH` "are executed concurrently with each other and
+    /// with the main query… the order in which the specified updates actually happen
+    /// is unpredictable." What actually holds, and what this method leans on, is the
+    /// SHARED SNAPSHOT: those same sub-statements "cannot see one another's effects on
+    /// the target tables." So when `ins` inserts the first-ever row, `upd`'s `WHERE
+    /// version = $1` is evaluated against a snapshot in which that row does not exist
+    /// at all — not a version mismatch, an absent row — and matches nothing regardless
+    /// of the `NOT EXISTS` guard. Removing the guard entirely (tested against a
+    /// scratch table seeded so `upd`'s predicate WOULD match the inserted value if it
+    /// were visible) still produces no double-bump, which is the direct evidence: the
+    /// guard is defensive belt-and-suspenders, not load-bearing. The snapshot is what
+    /// makes this method correct.
     ///
     /// Both arms are one round trip and one transaction, so there is no window
     /// between "decide" and "write" for anything to land in, in either case.
@@ -2204,6 +2237,110 @@ mod tests {
             "the durable content must be the winner's alone, not a union: {:?}",
             cfg.skills
         );
+    }
+
+    /// The COMMON production path, under concurrency: two operators both pushing
+    /// against the same non-zero generation. This rests on a DIFFERENT Postgres
+    /// mechanism than the first-push race above — there the winner's row is simply
+    /// invisible to the loser's snapshot; here a row ALREADY EXISTS at the expected
+    /// version, so the loser's `UPDATE` blocks on the row lock, then Postgres's
+    /// EvalPlanQual re-check re-evaluates `version = $1` (with the CTE subplan) against
+    /// the winner's committed row and correctly finds no match. Nothing in the
+    /// `expected == 0` tests exercises that path, so this is the one that would catch a
+    /// regression here — notably, a future switch to `REPEATABLE READ` would turn this
+    /// clean `None` into a `40001` serialization error instead.
+    #[tokio::test]
+    async fn concurrent_pushes_at_the_same_nonzero_generation_do_not_both_land() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let seed = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let v0 = seed
+            .store_and_bump(&cfg_with_skill("seed-nonzero"))
+            .await
+            .unwrap();
+
+        let a = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let b = PostgresConfigSource::new(connect(&url).await.unwrap());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let (ba, bb) = (barrier.clone(), barrier.clone());
+        let ha = tokio::spawn(async move {
+            ba.wait().await;
+            a.store_and_bump_if(&cfg_with_skill("nz-racer-a"), v0).await
+        });
+        let hb = tokio::spawn(async move {
+            bb.wait().await;
+            b.store_and_bump_if(&cfg_with_skill("nz-racer-b"), v0).await
+        });
+        let (ra, rb) = (ha.await.unwrap().unwrap(), hb.await.unwrap().unwrap());
+
+        let landed = [ra, rb].into_iter().filter(|r| r.is_some()).count();
+        assert_eq!(
+            landed, 1,
+            "exactly one concurrent push at the same non-zero generation may land: \
+             a={ra:?} b={rb:?}"
+        );
+        let (cfg, now) = seed.load_versioned().await.unwrap();
+        assert_eq!(
+            now,
+            Some(v0 + 1),
+            "the generation must advance exactly once past the seeded value, not twice"
+        );
+        let winner_name = if ra.is_some() {
+            "nz-racer-a"
+        } else {
+            "nz-racer-b"
+        };
+        assert!(
+            cfg.skills.iter().any(|s| s.name == winner_name),
+            "the durable content must be the winner's alone, not a union: {:?}",
+            cfg.skills
+        );
+    }
+
+    /// The remaining untested cell of the matrix: `expected == 0` with the row
+    /// PRESENT at generation 0 — the state where BOTH CTE arms are structurally live
+    /// in the same statement (`ins`'s `WHERE $1 = 0` guard is true, so it attempts the
+    /// insert; `upd`'s `WHERE version = $1` would also match if it ran). `bump_on`
+    /// never actually produces a stored `version = 0` (its first write is `1`), so
+    /// this state is reached here only by a direct row insert — but it is exactly the
+    /// shape the `ON CONFLICT (id) DO NOTHING` exists to handle: `ins` attempts the
+    /// insert, collides on the existing row, and no-ops (returning nothing); `upd`
+    /// then sees its `NOT EXISTS (SELECT 1 FROM ins)` guard hold, and its own `WHERE
+    /// version = $1` matches the row that is genuinely present — so the update, not
+    /// the insert, is what lands.
+    #[tokio::test]
+    async fn store_and_bump_if_applies_when_the_row_is_present_at_generation_zero() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+
+        sqlx::query("delete from orchestrator.config_versions")
+            .execute(src.pool_for_test())
+            .await
+            .unwrap();
+        sqlx::query("insert into orchestrator.config_versions (id, version) values (true, 0)")
+            .execute(src.pool_for_test())
+            .await
+            .unwrap();
+        assert_eq!(
+            src.version().await.unwrap(),
+            Some(0),
+            "the row is PRESENT, at version 0 — distinct from the absent-row case"
+        );
+
+        let applied = src
+            .store_and_bump_if(&cfg_with_skill("present-at-zero"), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            Some(1),
+            "the conditional UPDATE must land: the insert collides and no-ops, \
+             the update matches the present row"
+        );
+        let (cfg, now) = src.load_versioned().await.unwrap();
+        assert_eq!(now, Some(1));
+        assert!(cfg.skills.iter().any(|s| s.name == "present-at-zero"));
     }
 
     // ---- SP-DATA-3: PostgresSchedulerStore --------------------------------------------------
