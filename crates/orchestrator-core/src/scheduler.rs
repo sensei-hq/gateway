@@ -115,4 +115,28 @@ pub trait SchedulerStore: Send + Sync {
     /// Intervene: a `paused` run → set `next_wake=now` so the next tick claims it regardless of the
     /// original deadline (the human-wake path for NULL-deadline pauses). Conditional on `paused`.
     async fn force_wake(&self, run: RunId, now: DateTime<Utc>) -> Result<(), OrchestratorError>;
+
+    /// Observe: how many rows [`prune_terminal`](Self::prune_terminal) would delete at this exact
+    /// `before`. The operator's PREVIEW — `torii run prune` shows this count and asks for
+    /// confirmation before deleting anything.
+    ///
+    /// A separate method rather than a `dry_run: bool` on `prune_terminal` deliberately: a bool is
+    /// easy to pass wrong, and a caller who inverts it DELETES when it meant to preview. Two
+    /// methods cannot be confused for one another.
+    async fn count_terminal_before(&self, before: DateTime<Utc>) -> Result<u64, OrchestratorError>;
+
+    /// Delete TERMINAL rows (`completed`/`failed`/`cancelled`) whose `updated_at` is strictly older
+    /// than `before`, returning the count actually deleted.
+    ///
+    /// **NEVER touches a non-terminal row**, at any age. A `paused` run has no age at which it
+    /// becomes safe to forget — it is live work awaiting a wake, and the in-doubt-mutation class
+    /// pauses with a NULL `next_wake` and waits INDEFINITELY for a human, so an old `paused` row is
+    /// the NORM, not a leak. A `waking` row may be a live lease held by an in-flight drive in
+    /// another process. Implementors must select terminal statuses by ALLOWLIST, never by excluding
+    /// the known non-terminal ones, so an unrecognised status is kept rather than deleted.
+    ///
+    /// Required, NOT defaulted. A default would have to no-op, and a store that silently reports
+    /// "0 deleted" while the table keeps growing is worse than one that fails to compile: the
+    /// operator concludes retention is working. Every implementor must make this choice explicitly.
+    async fn prune_terminal(&self, before: DateTime<Utc>) -> Result<u64, OrchestratorError>;
 }

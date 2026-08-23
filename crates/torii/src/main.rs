@@ -77,6 +77,18 @@ enum RunAction {
     Cancel { run_id: String },
     /// Queue a paused run for the next worker tick
     Wake { run_id: String },
+    /// Delete terminal run records (completed/failed/cancelled) older than a window
+    ///
+    /// Paused and waking runs are NEVER eligible, at any age.
+    Prune {
+        /// Retention window, e.g. 30d, 12h, 90m. No default: the policy is the
+        /// operator's to state, not this command's to assume.
+        #[arg(long, value_parser = cmd::run::parse_retention)]
+        older_than: chrono::Duration,
+        /// Delete without confirmation
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -239,6 +251,28 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 let d = boot::light(&env).await?;
                 let now = chrono::Utc::now();
                 cmd::run::wake(d.scheduler_store.as_ref(), run, now).await
+            }
+            RunAction::Prune { older_than, yes } => {
+                let d = boot::light(&env).await?;
+                // Same confirmation discipline as `config push`, and for the same reason:
+                // this is an unrecoverable durable delete. `interactive_confirm` refuses on
+                // EOF, so a non-interactive invocation (cron, `< /dev/null`) declines
+                // rather than proceeding — `--yes` is the only way to script it.
+                let mut confirm = |text: &str| {
+                    cmd::config::interactive_confirm(
+                        text,
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stderr(),
+                    )
+                };
+                cmd::run::prune(
+                    d.scheduler_store.as_ref(),
+                    older_than,
+                    chrono::Utc::now(),
+                    yes,
+                    &mut confirm,
+                )
+                .await
             }
             RunAction::Submit {
                 graph,
