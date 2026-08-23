@@ -11755,6 +11755,301 @@ async fn shell_stdout_is_redacted() {
     );
 }
 
+// ======================= SP-DATA-5 budget gate (chokepoint) ===================
+//
+// One test per model-output PRODUCER. There are four `gateway.execute()` sites and
+// SP-4 s2's review found the secret redactor wired into only ONE of them; the same
+// miss here would let a producer spend real tokens past the operator's cap. These
+// four are the coverage proof for the single `dispatch_metered` chokepoint: remove
+// the `spent >= cap` check and ALL FOUR must fail.
+//
+// Each test seeds a resumable journal whose folded spend already meets a small
+// budget, using an in-graph MEMOIZED effect to carry the spend — so the seeded work
+// replays for free and the producer under test is the only live dispatcher left.
+
+/// A budgeted `RunStarted` for a seeded journal. `"v1"` matches the executor's
+/// fence version, so `start` resumes rather than refusing.
+fn run_started_with_budget(cap: u64) -> JournalEvent {
+    JournalEvent::RunStarted {
+        version: "v1".into(),
+        budget: Some(orchestrator_core::TokenBudget { total_tokens: cap }),
+    }
+}
+
+/// A memoized `EffectRecorded` carrying `total_tokens` of spend: the seed that makes
+/// a resumed run's folded spend meet its cap with NO live call. `ih` must be the real
+/// `input_hash(chain, payload)` of the node it stands in for, or the replay is a
+/// `DeterminismViolation` instead of a memo hit.
+fn spent_effect(node: &str, eid: EffectId, ih: String, total_tokens: u32) -> JournalEvent {
+    JournalEvent::EffectRecorded {
+        node: NodeId(node.into()),
+        effect_id: eid,
+        class: EffectClass::Pure,
+        input_hash: ih,
+        seq: 0,
+        output: EffectOutput::Inline(serde_json::json!({ "model": "m", "text": "seeded" })),
+        observation: None,
+        usage: Some(orchestrator_core::TokenUsage {
+            input_tokens: 0,
+            output_tokens: total_tokens,
+            total_tokens,
+        }),
+    }
+}
+
+/// The shared assertion for every producer: the run PAUSED at `node` with a budget
+/// reason, the pause is the HOTL class (`resume_after: None` — no amount of waiting
+/// refills a budget, only an operator raising the cap does), and the gateway was
+/// never called.
+fn assert_budget_paused(
+    events: &[(Seq, JournalEvent)],
+    outcome: &RunOutcome,
+    calls: &CallLog,
+    node: &str,
+) {
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "an exhausted budget must dispatch NOTHING — this is the whole point of the gate"
+    );
+    let pause = outcome
+        .paused
+        .as_ref()
+        .expect("an exhausted budget pauses the run");
+    assert_eq!(pause.node.0, node, "paused at the producer under test");
+    assert!(
+        pause.reason.starts_with("budget: "),
+        "budget pause reason: {}",
+        pause.reason
+    );
+    let resume_after = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::RunPaused {
+                reason,
+                resume_after,
+            } if reason.starts_with("budget: ") => Some(*resume_after),
+            _ => None,
+        })
+        .expect("the budget pause is journaled as RunPaused");
+    assert!(
+        resume_after.is_none(),
+        "a budget pause is the HOTL class: no deadline to auto-wake on"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a paused run stays resumable — never marked complete"
+    );
+}
+
+/// Producer 1/4 — the ReAct turn (`dispatch_model_turn`, `agent.rs`). `n0` replays
+/// from the memo carrying the spend; the agent node's turn 0 is the live dispatcher.
+#[tokio::test]
+async fn budget_gate_stops_the_react_turn_producer() {
+    let (gateway, calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n0".into()),
+                kind: model_call("c", "p0"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("n1".into()),
+                kind: NodeKind::Agent {
+                    agent: AgentRef("a".into()),
+                    input: serde_json::json!("hi"),
+                    phase: None,
+                },
+                deps: vec![Dep::hard("n0")],
+            },
+        ],
+    };
+
+    let ih = input_hash("c", &serde_json::json!({ "prompt": "p0" })).unwrap();
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+    journal
+        .append(run, spent_effect("n0", effect_id("n0", 0, 0), ih, 120))
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: NodeId("n0".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(agent_registry("c"));
+    let out = exec.start(run, &graph).await.expect("drives");
+    assert_budget_paused(&journal.load(run).await.unwrap(), &out, &calls, "n1");
+}
+
+/// Producer 2/4 — the `ModelCall` node (`run_node`, `mod.rs`). `n1` replays from the
+/// memo carrying the spend; `n2` is the live dispatcher.
+#[tokio::test]
+async fn budget_gate_stops_the_model_call_node_producer() {
+    let (gateway, calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, ..) = two_node_graph("p1", "p2");
+
+    let ih = input_hash("c", &serde_json::json!({ "prompt": "p1" })).unwrap();
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+    journal
+        .append(run, spent_effect("n1", effect_id("n1", 0, 0), ih, 120))
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: NodeId("n1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.start(run, &graph).await.expect("drives");
+    assert_budget_paused(&journal.load(run).await.unwrap(), &out, &calls, "n2");
+}
+
+/// Producer 3/4 — a Map item (`run_map_child_modelcall`, `fanout.rs`). Child `m/0`
+/// replays from the memo carrying the spend; `m/1` is the live dispatcher, and its
+/// refusal pauses the WHOLE Map (the established `MapChildPaused` idiom).
+#[tokio::test]
+async fn budget_gate_stops_the_map_item_producer() {
+    let (gateway, calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = map_graph("m", map_items(["i0", "i1"]), Aggregation::BestEffort);
+
+    let ih = input_hash("c", &serde_json::json!({ "prompt": "i0" })).unwrap();
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeStarted {
+                node: NodeId("m".into()),
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::MapExpanded {
+                node: NodeId("m".into()),
+                child_count: 2,
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(run, spent_effect("m/0", effect_id("m/0", 0, 0), ih, 120))
+        .await
+        .unwrap();
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.start(run, &graph).await.expect("drives");
+    assert_budget_paused(&journal.load(run).await.unwrap(), &out, &calls, "m");
+}
+
+/// Producer 4/4 — the `Consolidate` synthesis (`run_consolidate`, `fanout.rs`). BOTH
+/// Map children replay from the memo (so the Map completes free and the spend is
+/// already folded); the synthesis is the only live dispatcher left.
+#[tokio::test]
+async fn budget_gate_stops_the_consolidate_producer() {
+    let (gateway, calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["i0", "i1"]),
+                    concurrency: 4,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("cons".into()),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::soft("m")],
+            },
+        ],
+    };
+
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeStarted {
+                node: NodeId("m".into()),
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::MapExpanded {
+                node: NodeId("m".into()),
+                child_count: 2,
+            },
+        )
+        .await
+        .unwrap();
+    for (i, item) in ["i0", "i1"].iter().enumerate() {
+        let path = format!("m/{i}");
+        let ih = input_hash("c", &serde_json::json!({ "prompt": item })).unwrap();
+        journal
+            .append(run, spent_effect(&path, effect_id(&path, 0, 0), ih, 60))
+            .await
+            .unwrap();
+    }
+    journal
+        .append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: NodeId("m".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.start(run, &graph).await.expect("drives");
+    assert_budget_paused(&journal.load(run).await.unwrap(), &out, &calls, "cons");
+}
+
 // ============================= SP-DATA-3 scheduler driver =====================
 
 /// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded
