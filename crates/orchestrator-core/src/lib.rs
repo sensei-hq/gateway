@@ -2,6 +2,7 @@
 //! the graph, effect, and journal vocabulary shared by the executor and its
 //! journal stores. Depends on nothing else in the workspace (not the gateway).
 
+pub mod budget;
 pub mod clock;
 pub mod content;
 pub mod context;
@@ -19,6 +20,7 @@ pub mod redact;
 pub mod registry;
 pub mod scheduler;
 
+pub use budget::{TokenBudget, TokenUsage};
 pub use clock::{Clock, SystemClock};
 pub use content::{ContentRef, ContentStore, Digest, EffectOutput, digest_of};
 pub use context::{ContextKey, ContextRef, ContextStore, Scope};
