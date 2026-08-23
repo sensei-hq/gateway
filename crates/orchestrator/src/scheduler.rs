@@ -10,7 +10,7 @@
 use crate::executor::{Executor, RunOutcome};
 use orchestrator_core::{
     Clock, ExecutionJournal, Graph, JournalEvent, OrchestratorError, RunId, RunStatus,
-    ScheduledRun, SchedulerStore,
+    ScheduledRun, SchedulerStore, TokenBudget,
 };
 use std::sync::Arc;
 
@@ -50,9 +50,23 @@ impl Scheduler {
     }
 
     /// Enqueue the graph, drive a FRESH run, record the outcome. Returns the [`RunOutcome`].
+    /// Unbudgeted — delegates to [`submit_budgeted`](Self::submit_budgeted) with
+    /// `None`, so every existing caller stays byte-identical.
     pub async fn submit(&self, run: RunId, graph: Graph) -> Result<RunOutcome, OrchestratorError> {
+        self.submit_budgeted(run, graph, None).await
+    }
+
+    /// SP-DATA-5 Task 5: like [`submit`](Self::submit), but journals a per-run token
+    /// cap on `RunStarted` (via [`Executor::run_budgeted`]) — the operator-facing
+    /// `torii run submit --budget-tokens N` path.
+    pub async fn submit_budgeted(
+        &self,
+        run: RunId,
+        graph: Graph,
+        budget: Option<TokenBudget>,
+    ) -> Result<RunOutcome, OrchestratorError> {
         self.store.enqueue(run, &graph, self.clock.now()).await?;
-        let outcome = self.executor.run(run, &graph).await;
+        let outcome = self.executor.run_budgeted(run, &graph, budget).await;
         self.record(run, &outcome).await?;
         outcome
     }

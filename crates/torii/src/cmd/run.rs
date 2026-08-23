@@ -6,10 +6,14 @@ use crate::cmd::Outcome;
 use crate::errors::CliError;
 use crate::render;
 use chrono::{DateTime, Utc};
-use orchestrator_core::{RunId, RunStatus, SchedulerStore};
+use orchestrator_core::{
+    ExecutionJournal, JournalEvent, OrchestratorError, RunId, RunStatus, SchedulerStore,
+    TokenBudget,
+};
 
 pub async fn status(
     store: &dyn SchedulerStore,
+    journal: &dyn ExecutionJournal,
     run: RunId,
     json: bool,
 ) -> Result<Outcome, CliError> {
@@ -23,11 +27,57 @@ pub async fn status(
         } else {
             format!("no such run: {}", run.0)
         })),
-        Some(r) => Ok(Outcome::ok(if json {
-            render::json(&[r]).map_err(|e| CliError::error(e.to_string()))?
-        } else {
-            render::table(&[r])
-        })),
+        Some(r) => {
+            // SP-DATA-5 Task 5: spend lives in the JOURNAL (`EffectRecorded.usage`), not
+            // the `scheduled_runs` row, so it has to be folded here. Goes through
+            // `orchestrator::spend_of` — the SAME fold the metered-dispatch gate itself
+            // uses — rather than summing `EffectRecorded.usage` locally: a second,
+            // torii-side sum would inevitably drift from the real one (e.g. missing the
+            // effect-id keying that makes a duplicate record from the two-phase
+            // Mutation in-doubt-`Confirmed` path count once, not twice) and stay wrong
+            // silently, compounding on every resume.
+            let events = journal
+                .load(run)
+                .await
+                .map_err(OrchestratorError::Journal)?;
+            let (spent, budget) = orchestrator::spend_of(&events);
+
+            if json {
+                let base = render::json(&[r]).map_err(|e| CliError::error(e.to_string()))?;
+                match budget {
+                    // No budget ⇒ return `render::json`'s own string UNTOUCHED — no
+                    // parse/re-serialize round trip at all. That round trip is not
+                    // idempotent: `serde_json::Value`'s object map does not preserve
+                    // insertion order the way `ScheduledRun`'s derived `Serialize`
+                    // does, so re-serializing would silently reorder every key. Only
+                    // taking that detour when there is something to splice in is what
+                    // keeps the unbudgeted case byte-identical.
+                    None => Ok(Outcome::ok(base)),
+                    Some(cap) => {
+                        // Reuse `render::json` for the row shape + redaction, then
+                        // splice spent/budget in — rather than hand-building the
+                        // object here, which would duplicate `render::json`'s
+                        // redaction of `reason`.
+                        let mut rows: serde_json::Value = serde_json::from_str(&base)
+                            .map_err(|e| CliError::error(e.to_string()))?;
+                        rows[0]["spent"] = serde_json::json!(spent);
+                        rows[0]["budget"] = serde_json::json!(cap);
+                        Ok(Outcome::ok(
+                            serde_json::to_string_pretty(&rows)
+                                .map_err(|e| CliError::error(e.to_string()))?,
+                        ))
+                    }
+                }
+            } else {
+                let mut text = render::table(&[r]);
+                // Same additivity: nothing appended when unbudgeted, so the table
+                // stays byte-identical to the pre-SP-DATA-5 output.
+                if let Some(cap) = budget {
+                    text.push_str(&format!("spent: {spent} / budget: {cap} tokens\n"));
+                }
+                Ok(Outcome::ok(text))
+            }
+        }
     }
 }
 
@@ -66,8 +116,10 @@ pub async fn cancel(store: &dyn SchedulerStore, run: RunId) -> Result<Outcome, C
 
 pub async fn wake(
     store: &dyn SchedulerStore,
+    journal: &dyn ExecutionJournal,
     run: RunId,
     now: DateTime<Utc>,
+    budget: Option<TokenBudget>,
 ) -> Result<Outcome, CliError> {
     let Some(before) = store.status(run).await? else {
         return Ok(Outcome::precondition(format!("no such run: {}", run.0)));
@@ -78,6 +130,29 @@ pub async fn wake(
             run.0,
             before.status.as_str()
         )));
+    }
+    // SP-DATA-5 Task 5: if the operator is raising the cap, this MUST append to the
+    // journal BEFORE calling `force_wake` below — never the other way round. This is
+    // a real race, not a style preference: `force_wake` only flips the store's
+    // `next_wake` to `now`; it does not itself drive the run. But a worker's
+    // `tick()` polling loop can claim the SAME due wake the instant that deadline
+    // lands, in another process, before this function returns. If the wake landed
+    // first, that worker could win the race, drive the run under the OLD
+    // (already-exhausted) cap, and re-pause it immediately — the operator's command
+    // would then appear to "succeed" while the run is right back where it started,
+    // one moment later, under the very cap they just tried to raise. Appending
+    // first closes that window: any worker that can observe the wake can only ever
+    // fold a journal that already includes the raise.
+    if let Some(b) = budget {
+        journal
+            .append(
+                run,
+                JournalEvent::BudgetRaised {
+                    new_total_tokens: b.total_tokens,
+                },
+            )
+            .await
+            .map_err(OrchestratorError::Journal)?;
     }
     store.force_wake(run, now).await?;
     // This row is never deleted by any shipped store, so `None` here would mean a
@@ -121,6 +196,29 @@ pub async fn wake(
             after.status.as_str()
         )))
     }
+}
+
+/// Parse `--budget-tokens N` (on both `run submit` and `run wake`): a plain positive
+/// integer, rejecting 0 loudly and with the offending value echoed back —
+/// consistent with `--interval 0s` (`cmd::worker::parse_interval`) and
+/// `TORII_POOL_SIZE=0` (`boot::parse_pool_size`). A zero-token budget can never
+/// dispatch a single model call: the gate checks already-spent-vs-cap BEFORE every
+/// dispatch (§6.2 of the design), so `spent (0) >= cap (0)` is true from the very
+/// first check and the run would pause immediately, before doing any work at all —
+/// almost certainly not what an operator setting a budget intends, so it is
+/// refused as a precondition rather than accepted and silently useless.
+pub fn parse_budget_tokens(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let v: u64 = t
+        .parse()
+        .map_err(|_| format!("invalid --budget-tokens {t:?}: {t:?} is not a whole number"))?;
+    if v == 0 {
+        return Err(format!(
+            "invalid --budget-tokens {t:?}: a zero-token budget can never dispatch a single \
+             model call — the run would pause immediately, before doing any work"
+        ));
+    }
+    Ok(v)
 }
 
 /// Parse a retention window: `30d`, `12h`, `90m`, `45s`.
@@ -269,6 +367,7 @@ pub async fn submit(
     scheduler: &orchestrator::Scheduler,
     run: RunId,
     graph: orchestrator_core::Graph,
+    budget: Option<TokenBudget>,
     announce: impl FnOnce(),
 ) -> Result<Outcome, CliError> {
     // A run id that already has a schedule record cannot be submitted again. Left to
@@ -295,7 +394,9 @@ pub async fn submit(
         )));
     }
     announce();
-    let outcome = scheduler.submit(run, graph).await?;
+    // SP-DATA-5 Task 5: `submit_budgeted` with `None` is exactly `submit` — the
+    // operator-specified cap (if any) rides on `RunStarted` from here.
+    let outcome = scheduler.submit_budgeted(run, graph, budget).await?;
     if let Some(p) = &outcome.paused {
         return Ok(Outcome::ok(format!(
             "paused: {} at node {} ({})",
@@ -326,8 +427,8 @@ pub async fn submit(
 mod tests {
     use super::*;
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
-    use orchestrator_core::Graph;
-    use orchestrator_store::InMemorySchedulerStore;
+    use orchestrator_core::{EffectClass, EffectId, EffectOutput, Graph, NodeId, TokenUsage};
+    use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
     use std::sync::Arc;
 
     fn now() -> DateTime<Utc> {
@@ -336,6 +437,14 @@ mod tests {
 
     fn empty_graph() -> Graph {
         Graph { nodes: vec![] }
+    }
+
+    /// A journal with nothing on it. `status`/`wake` only touch the journal when a
+    /// run needs its spend folded (`status`, in the `Some(r)` branch) or a raise is
+    /// requested (`wake`, when `budget` is `Some`) — most tests here exercise
+    /// neither, so an empty journal is a safe, inert stand-in.
+    fn empty_journal() -> InMemoryJournal {
+        InMemoryJournal::new()
     }
 
     /// A run enqueued then recorded paused with a deadline.
@@ -351,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn status_of_an_unknown_run_is_a_precondition_failure_not_an_error() {
         let s = InMemorySchedulerStore::default();
-        let out = status(&s, RunId(uuid::Uuid::new_v4()), false)
+        let out = status(&s, &empty_journal(), RunId(uuid::Uuid::new_v4()), false)
             .await
             .expect("no hard error");
         assert_eq!(out.code, EXIT_PRECONDITION);
@@ -364,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn status_of_an_unknown_run_is_still_valid_json_under_json() {
         let s = InMemorySchedulerStore::default();
-        let out = status(&s, RunId(uuid::Uuid::new_v4()), true)
+        let out = status(&s, &empty_journal(), RunId(uuid::Uuid::new_v4()), true)
             .await
             .expect("no hard error");
         assert_eq!(
@@ -444,7 +553,9 @@ mod tests {
     async fn wake_says_queued_never_resumed() {
         let run = RunId(uuid::Uuid::new_v4());
         let s = paused_store(run, None).await;
-        let out = wake(&s, run, now()).await.expect("wakes");
+        let out = wake(&s, &empty_journal(), run, now(), None)
+            .await
+            .expect("wakes");
         assert_eq!(out.code, EXIT_OK);
         assert!(out.text.contains("queued"), "{}", out.text);
         assert!(
@@ -464,13 +575,322 @@ mod tests {
         let run = RunId(uuid::Uuid::new_v4());
         let s = InMemorySchedulerStore::default();
         s.enqueue(run, &empty_graph(), now()).await.unwrap(); // status = waking, not paused
-        let out = wake(&s, run, now()).await.expect("no hard error");
+        let out = wake(&s, &empty_journal(), run, now(), None)
+            .await
+            .expect("no hard error");
         assert_eq!(out.code, EXIT_PRECONDITION);
         assert!(out.text.contains("not queued"), "{}", out.text);
         assert!(
             out.text.contains("waking"),
             "must name the actual state: {}",
             out.text
+        );
+    }
+
+    // ---- SP-DATA-5 Task 5: `--budget-tokens` on submit/wake, spent/budget in status ---
+
+    #[test]
+    fn parse_budget_tokens_rejects_zero_with_an_actionable_message() {
+        let e = parse_budget_tokens("0").expect_err("a zero budget can never dispatch anything");
+        assert!(e.contains("--budget-tokens"), "{e}");
+        assert!(e.contains('0'), "{e}");
+    }
+
+    #[test]
+    fn parse_budget_tokens_accepts_a_positive_value() {
+        assert_eq!(parse_budget_tokens("50000"), Ok(50_000));
+        assert_eq!(parse_budget_tokens(" 12 "), Ok(12), "whitespace is trimmed");
+    }
+
+    #[test]
+    fn parse_budget_tokens_rejects_garbage_loudly() {
+        let e = parse_budget_tokens("many").expect_err("not a number");
+        assert!(e.contains("--budget-tokens"), "{e}");
+        assert!(e.contains("many"), "must echo the offending value: {e}");
+        assert!(
+            parse_budget_tokens("-5").is_err(),
+            "negative is not a token count"
+        );
+        assert!(parse_budget_tokens("").is_err());
+    }
+
+    /// A journal seeded with `RunStarted{budget}` plus two `EffectRecorded{usage}` — the
+    /// DB-free harness the task calls for, proving `status` displays spend without a live
+    /// Postgres.
+    async fn journal_with_budget_and_spend(run: RunId, cap: u64) -> InMemoryJournal {
+        let journal = InMemoryJournal::new();
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: Some(TokenBudget { total_tokens: cap }),
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                run,
+                JournalEvent::EffectRecorded {
+                    node: NodeId("n1".into()),
+                    effect_id: EffectId("e1".into()),
+                    class: EffectClass::Pure,
+                    input_hash: "h".into(),
+                    seq: 0,
+                    output: EffectOutput::Inline(serde_json::Value::Null),
+                    observation: None,
+                    usage: Some(TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                run,
+                JournalEvent::EffectRecorded {
+                    node: NodeId("n2".into()),
+                    effect_id: EffectId("e2".into()),
+                    class: EffectClass::Pure,
+                    input_hash: "h".into(),
+                    seq: 1,
+                    output: EffectOutput::Inline(serde_json::Value::Null),
+                    observation: None,
+                    usage: Some(TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 30,
+                        total_tokens: 50,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        journal
+    }
+
+    #[tokio::test]
+    async fn status_shows_spent_and_budget_when_a_budget_is_set() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let journal = journal_with_budget_and_spend(run, 50_000).await;
+
+        let out = status(&s, &journal, run, false).await.expect("status");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(
+            out.text.contains("200") && out.text.contains("50000"),
+            "spent (150+50 = 200, summed over two distinct effects' total_tokens) and the \
+             50000 cap must both be visible: {}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn status_json_includes_spent_and_budget_when_a_budget_is_set() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let journal = journal_with_budget_and_spend(run, 50_000).await;
+
+        let out = status(&s, &journal, run, true).await.expect("status");
+        assert_eq!(out.code, EXIT_OK);
+        let v: serde_json::Value = serde_json::from_str(&out.text).expect("valid json");
+        assert_eq!(v[0]["spent"], serde_json::json!(200));
+        assert_eq!(v[0]["budget"], serde_json::json!(50_000));
+    }
+
+    /// Additivity, at the command level: an UNBUDGETED run's `status` table must be
+    /// BYTE-IDENTICAL to `render::table` alone — nothing appended, nothing reordered.
+    #[tokio::test]
+    async fn status_table_is_byte_identical_for_an_unbudgeted_run() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        // No `RunStarted` at all ⇒ folds to `budget: None` — the same as a run whose
+        // `RunStarted.budget` is explicitly `None` (Task 1's additivity case).
+        let journal = empty_journal();
+
+        let out = status(&s, &journal, run, false).await.expect("status");
+        let row = s.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            out.text,
+            render::table(&[row]),
+            "an unbudgeted run must render EXACTLY what the pre-SP-DATA-5 table did"
+        );
+    }
+
+    /// The JSON counterpart of the byte-identical guarantee above.
+    #[tokio::test]
+    async fn status_json_is_byte_identical_for_an_unbudgeted_run() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let journal = empty_journal();
+
+        let out = status(&s, &journal, run, true).await.expect("status");
+        let row = s.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            out.text,
+            render::json(&[row]).unwrap(),
+            "an unbudgeted run's --json must be EXACTLY what the pre-SP-DATA-5 render did"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_with_budget_tokens_appends_budget_raised_to_the_journal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let journal = empty_journal();
+
+        let out = wake(
+            &s,
+            &journal,
+            run,
+            now(),
+            Some(TokenBudget {
+                total_tokens: 5_000,
+            }),
+        )
+        .await
+        .expect("wakes");
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                JournalEvent::BudgetRaised {
+                    new_total_tokens: 5_000
+                }
+            )),
+            "the raise must be journaled: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_without_budget_tokens_appends_nothing_to_the_journal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let journal = empty_journal();
+
+        let out = wake(&s, &journal, run, now(), None).await.expect("wakes");
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+        assert!(
+            journal.load(run).await.unwrap().is_empty(),
+            "no --budget-tokens ⇒ no journal write at all — unbudgeted wake stays exactly \
+             the pre-SP-DATA-5 behavior"
+        );
+    }
+
+    /// A `SchedulerStore` that delegates everything to a real `InMemorySchedulerStore`
+    /// EXCEPT `force_wake`, which always fails. This is the discriminator for the
+    /// append-then-wake ORDER, not just its presence: if `wake()` called `force_wake`
+    /// BEFORE appending `BudgetRaised` (the swapped, wrong order), the injected failure
+    /// here would short-circuit via `?` and the append would never run — the journal
+    /// would end up with NO `BudgetRaised` event at all. Because the real order appends
+    /// first, the event lands durably even though the subsequent `force_wake` fails.
+    struct FailingForceWakeStore(InMemorySchedulerStore);
+
+    #[async_trait::async_trait]
+    impl SchedulerStore for FailingForceWakeStore {
+        async fn enqueue(
+            &self,
+            run: RunId,
+            graph: &Graph,
+            now: DateTime<Utc>,
+        ) -> Result<(), OrchestratorError> {
+            self.0.enqueue(run, graph, now).await
+        }
+        async fn record_paused(
+            &self,
+            run: RunId,
+            next_wake: Option<DateTime<Utc>>,
+            reason: &str,
+        ) -> Result<(), OrchestratorError> {
+            self.0.record_paused(run, next_wake, reason).await
+        }
+        async fn record_terminal(
+            &self,
+            run: RunId,
+            status: RunStatus,
+            reason: Option<&str>,
+        ) -> Result<(), OrchestratorError> {
+            self.0.record_terminal(run, status, reason).await
+        }
+        async fn claim_due(
+            &self,
+            now: DateTime<Utc>,
+            lease: chrono::Duration,
+            limit: usize,
+        ) -> Result<Vec<(RunId, Graph)>, OrchestratorError> {
+            self.0.claim_due(now, lease, limit).await
+        }
+        async fn status(
+            &self,
+            run: RunId,
+        ) -> Result<Option<orchestrator_core::ScheduledRun>, OrchestratorError> {
+            self.0.status(run).await
+        }
+        async fn list_paused(
+            &self,
+        ) -> Result<Vec<orchestrator_core::ScheduledRun>, OrchestratorError> {
+            self.0.list_paused().await
+        }
+        async fn cancel(&self, run: RunId) -> Result<(), OrchestratorError> {
+            self.0.cancel(run).await
+        }
+        async fn count_terminal_before(
+            &self,
+            before: DateTime<Utc>,
+        ) -> Result<u64, OrchestratorError> {
+            self.0.count_terminal_before(before).await
+        }
+        async fn prune_terminal(&self, before: DateTime<Utc>) -> Result<u64, OrchestratorError> {
+            self.0.prune_terminal(before).await
+        }
+        async fn force_wake(
+            &self,
+            _run: RunId,
+            _now: DateTime<Utc>,
+        ) -> Result<(), OrchestratorError> {
+            Err(OrchestratorError::Store(
+                "injected: proves append-then-wake ordering".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_appends_budget_raised_before_calling_force_wake() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let inner = paused_store(run, Some(now())).await;
+        let store = FailingForceWakeStore(inner);
+        let journal = empty_journal();
+
+        let result = wake(
+            &store,
+            &journal,
+            run,
+            now(),
+            Some(TokenBudget {
+                total_tokens: 5_000,
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the injected force_wake failure must surface, not be swallowed"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                JournalEvent::BudgetRaised {
+                    new_total_tokens: 5_000
+                }
+            )),
+            "BudgetRaised must already be durable even though force_wake failed — proving \
+             the append happens BEFORE force_wake is called, not after: {events:?}"
         );
     }
 
@@ -791,7 +1211,7 @@ mod tests {
         let sched = scheduler_over(store.clone()).await;
 
         let mut announced = false;
-        let out = submit(&sched, run, empty_graph(), || announced = true)
+        let out = submit(&sched, run, empty_graph(), None, || announced = true)
             .await
             .expect("a duplicate submit is not a transport fault");
 
@@ -827,7 +1247,7 @@ mod tests {
         let sched = scheduler_over(store.clone()).await;
 
         let mut announced = false;
-        let out = submit(&sched, run, empty_graph(), || announced = true)
+        let out = submit(&sched, run, empty_graph(), None, || announced = true)
             .await
             .expect("a fresh submit runs");
 
@@ -986,7 +1406,9 @@ mod tests {
             actor: ConcurrentActor::ClaimsFirst,
         };
 
-        let out = wake(&racing, run, now()).await.expect("no hard error");
+        let out = wake(&racing, &empty_journal(), run, now(), None)
+            .await
+            .expect("no hard error");
 
         assert_eq!(
             out.code, EXIT_PRECONDITION,
@@ -1020,7 +1442,9 @@ mod tests {
             actor: ConcurrentActor::CancelsFirst,
         };
 
-        let out = wake(&racing, run, now()).await.expect("no hard error");
+        let out = wake(&racing, &empty_journal(), run, now(), None)
+            .await
+            .expect("no hard error");
 
         assert_eq!(out.code, EXIT_PRECONDITION);
         assert!(out.text.contains("not queued"), "{}", out.text);
@@ -1052,7 +1476,9 @@ mod tests {
             actor: ConcurrentActor::ReclaimsThenRepausesWithUnrelatedDeadline,
         };
 
-        let out = wake(&racing, run, now()).await.expect("no hard error");
+        let out = wake(&racing, &empty_journal(), run, now(), None)
+            .await
+            .expect("no hard error");
 
         assert_eq!(
             out.code, EXIT_PRECONDITION,

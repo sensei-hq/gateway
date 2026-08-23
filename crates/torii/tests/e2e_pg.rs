@@ -189,7 +189,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
     let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
     // `|| {}` for the announce hook: `main` passes the `submitted: <id>` print, which a
     // test has no use for.
-    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), || {})
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), None, || {})
         .await
         .expect("a paused run is not an error");
     assert_eq!(submitted.code, torii::errors::EXIT_OK, "{}", submitted.text);
@@ -202,6 +202,10 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
     // ---- The operator, light tier: observe A's pause, sharing nothing with A -------
     // A separate pool, and torii's own commands — the operator's real surface.
     let store_b = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    // SP-DATA-5 Task 5: `status`/`wake` need a journal too (spend lives there, not in
+    // the scheduler row) — a fresh handle over its OWN connection, same discipline as
+    // `store_b`: process B shares nothing in-process with A.
+    let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
     let listed = torii::cmd::run::list_paused(store_b.as_ref(), false)
         .await
         .expect("list-paused");
@@ -212,7 +216,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
         listed.text
     );
 
-    let shown = torii::cmd::run::status(store_b.as_ref(), run, true)
+    let shown = torii::cmd::run::status(store_b.as_ref(), journal_b.as_ref(), run, true)
         .await
         .expect("status");
     assert_eq!(shown.code, torii::errors::EXIT_OK, "{}", shown.text);
@@ -233,7 +237,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
     // `queued_at` is well past A's own deadline, so the assertion below cannot be
     // satisfied by the pre-existing timer still sitting in the column.
     let queued_at = deadline + Duration::seconds(600);
-    let woken = torii::cmd::run::wake(store_b.as_ref(), run, queued_at)
+    let woken = torii::cmd::run::wake(store_b.as_ref(), journal_b.as_ref(), run, queued_at, None)
         .await
         .expect("wake");
     assert_eq!(woken.code, torii::errors::EXIT_OK, "{}", woken.text);
@@ -320,7 +324,7 @@ async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
         )))
         .with_clock(clock.clone());
     let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
-    let submitted = torii::cmd::run::submit(&sched_a, run, one_node_graph(&marker), || {})
+    let submitted = torii::cmd::run::submit(&sched_a, run, one_node_graph(&marker), None, || {})
         .await
         .expect("a paused run is not an error");
     assert!(submitted.text.starts_with("paused:"), "{}", submitted.text);
@@ -405,7 +409,7 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
         .with_registry_handle(handle_a)
         .with_clock(clock.clone());
     let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
-    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), || {})
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), None, || {})
         .await
         .expect("a paused run is not an error");
     assert!(
@@ -472,9 +476,15 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
     );
 
     // ---- `torii run wake` afterwards gives an honest answer, not a silent no-op ----
-    let woken = torii::cmd::run::wake(store_a.as_ref(), run, deadline + Duration::seconds(2))
-        .await
-        .expect("wake");
+    let woken = torii::cmd::run::wake(
+        store_a.as_ref(),
+        journal_a.as_ref(),
+        run,
+        deadline + Duration::seconds(2),
+        None,
+    )
+    .await
+    .expect("wake");
     assert_eq!(
         woken.code,
         torii::errors::EXIT_PRECONDITION,

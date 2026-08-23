@@ -61,6 +61,11 @@ enum RunAction {
         gateway_config: PathBuf,
         #[arg(long)]
         workspace_root: Option<PathBuf>,
+        /// SP-DATA-5: cap this run's total token spend. No default: an unbudgeted
+        /// run behaves exactly as before. `0` is rejected — see
+        /// `cmd::run::parse_budget_tokens`.
+        #[arg(long, value_parser = cmd::run::parse_budget_tokens)]
+        budget_tokens: Option<u64>,
     },
     /// Show one run's schedule record
     Status {
@@ -76,7 +81,14 @@ enum RunAction {
     /// Cancel a non-terminal run so it is never woken
     Cancel { run_id: String },
     /// Queue a paused run for the next worker tick
-    Wake { run_id: String },
+    Wake {
+        run_id: String,
+        /// SP-DATA-5: raise (or lower) the run's token cap before waking it. Appended
+        /// to the journal as `BudgetRaised` BEFORE the wake is queued — see
+        /// `cmd::run::wake`'s doc comment for why the order is load-bearing.
+        #[arg(long, value_parser = cmd::run::parse_budget_tokens)]
+        budget_tokens: Option<u64>,
+    },
     /// Delete terminal run records (completed/failed/cancelled) older than a window
     ///
     /// Paused and waking runs are NEVER eligible, at any age.
@@ -235,7 +247,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 // connecting first would make a bad uuid take ~30s to reject.
                 let run = parse_run_id(&run_id)?;
                 let d = boot::light(&env).await?;
-                cmd::run::status(d.scheduler_store.as_ref(), run, json).await
+                cmd::run::status(d.scheduler_store.as_ref(), d.journal.as_ref(), run, json).await
             }
             RunAction::ListPaused { json } => {
                 let d = boot::light(&env).await?;
@@ -246,11 +258,23 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 let d = boot::light(&env).await?;
                 cmd::run::cancel(d.scheduler_store.as_ref(), run).await
             }
-            RunAction::Wake { run_id } => {
+            RunAction::Wake {
+                run_id,
+                budget_tokens,
+            } => {
                 let run = parse_run_id(&run_id)?;
                 let d = boot::light(&env).await?;
                 let now = chrono::Utc::now();
-                cmd::run::wake(d.scheduler_store.as_ref(), run, now).await
+                let budget = budget_tokens
+                    .map(|total_tokens| orchestrator_core::TokenBudget { total_tokens });
+                cmd::run::wake(
+                    d.scheduler_store.as_ref(),
+                    d.journal.as_ref(),
+                    run,
+                    now,
+                    budget,
+                )
+                .await
             }
             RunAction::Prune { older_than, yes } => {
                 let d = boot::light(&env).await?;
@@ -279,6 +303,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 run_id,
                 gateway_config,
                 workspace_root,
+                budget_tokens,
             } => {
                 let run = match run_id {
                     Some(s) => parse_run_id(&s)?,
@@ -291,11 +316,16 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                     CliError::error(format!("{} is not a valid graph: {e}", graph.display()))
                 })?;
                 let d = boot::heavy(&env, &gateway_config, workspace_root.as_deref()).await?;
+                let budget = budget_tokens
+                    .map(|total_tokens| orchestrator_core::TokenBudget { total_tokens });
                 // Print the id BEFORE driving: an operator who loses the terminal
                 // must still be able to find the run. `submit` calls this AFTER its
                 // duplicate pre-check, so a rejected submit no longer announces an
                 // effect that never happened.
-                cmd::run::submit(&d.scheduler, run, g, || println!("submitted: {}", run.0)).await
+                cmd::run::submit(&d.scheduler, run, g, budget, || {
+                    println!("submitted: {}", run.0)
+                })
+                .await
             }
         },
         Command::Worker { action } => match action {
