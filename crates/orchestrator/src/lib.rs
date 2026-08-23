@@ -18,5 +18,5 @@ pub mod scheduler;
 pub mod test_support;
 
 pub use executor::selector::LlmPlannerSelector;
-pub use executor::{Executor, RunOutcome};
+pub use executor::{Executor, RunOutcome, spend_of};
 pub use scheduler::Scheduler;

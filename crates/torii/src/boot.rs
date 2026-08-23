@@ -285,8 +285,18 @@ fn require_agents(
 /// Light tier: everything reachable with just a database. No gateway, no model
 /// credentials, no fence — so an operator can cancel a runaway run or inspect the
 /// wake queue on a box that has none of those.
+///
+/// SP-DATA-5 Task 5 adds `journal`: a run's token spend lives in the JOURNAL
+/// (`EffectRecorded.usage`), not the `scheduled_runs` row, so both `torii run
+/// status` (fold spent/budget for display) and `torii run wake --budget-tokens`
+/// (append `BudgetRaised` before waking) need one. Adding it here costs nothing —
+/// it is just another adapter over the SAME pool this tier already opens
+/// (`light_from_pool` clones it) — and keeping it on the light tier matters: an
+/// operator must be able to inspect AND raise a run's budget on a box with no
+/// model credentials.
 pub struct LightDeps {
     pub scheduler_store: Arc<PostgresSchedulerStore>,
+    pub journal: Arc<PostgresJournal>,
     pub config_source: PostgresConfigSource,
 }
 
@@ -298,6 +308,7 @@ pub struct LightDeps {
 fn light_from_pool(pool: sqlx::PgPool) -> LightDeps {
     LightDeps {
         scheduler_store: Arc::new(PostgresSchedulerStore::new(pool.clone())),
+        journal: Arc::new(PostgresJournal::new(pool.clone())),
         config_source: PostgresConfigSource::new(pool),
     }
 }
@@ -394,12 +405,15 @@ pub async fn heavy(
     )?;
     let gateway = Arc::new(facade.gateway);
 
-    let journal = Arc::new(PostgresJournal::new(pool.clone()));
+    // SP-DATA-5 Task 5: reuse `light.journal` rather than opening a second
+    // `PostgresJournal` over another pool clone — `light_from_pool` already built
+    // one over this exact pool, and the Scheduler needs the SAME journal the
+    // Executor writes to (so `tick`'s pause-deadline read sees what `run` wrote).
     let content = Arc::new(PostgresContentStore::new(pool.clone()));
     let context = Arc::new(PostgresContextStore::new(pool));
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut executor = Executor::new(gateway, journal.clone(), fence)
+    let mut executor = Executor::new(gateway, light.journal.clone(), fence)
         .with_content_store(content)
         .with_context_store(context)
         .with_registry_handle(handle)
@@ -439,7 +453,7 @@ pub async fn heavy(
     let scheduler = Scheduler::new(
         light.scheduler_store.clone(),
         executor,
-        journal,
+        light.journal.clone(),
         clock.clone(),
     );
     Ok(HeavyDeps {

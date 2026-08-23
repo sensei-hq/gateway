@@ -9,7 +9,7 @@ use orchestrator_core::{
     AgentRef, Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId,
     EffectOutput, ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta,
     OrchestratorError, OrchestratorHooks, PLANNER_AREA, Planner, PlannerSelector, Registry,
-    RegistryHandle, RunId, Scope, Seq, SystemClock, effect_id,
+    RegistryHandle, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -185,6 +185,24 @@ impl Fold {
     fn budget(&self) -> Option<u64> {
         self.budget
     }
+}
+
+/// SP-DATA-5 Task 5: a run's folded `(spent, budget)`, exposed so `torii run status`
+/// can display spend without re-deriving it.
+///
+/// Deliberately routes through the SAME `fold_journal`/`Fold` the metered-dispatch
+/// gate (Task 3) itself uses, rather than handing the caller raw events to sum
+/// independently. `fold_journal` keys `EffectRecorded.usage` by effect id
+/// specifically so a duplicate record — reachable via the two-phase Mutation path's
+/// in-doubt `Confirmed` reconcile — counts once, not once per event (see
+/// `Fold::spent`'s doc comment, and the Task 2 test that mutation-verifies it). A
+/// second, independently-written sum over the raw event stream would inevitably
+/// diverge from this one — the exact drift the s2 secret-redactor review warned
+/// about when it found a chokepoint bypassed by one of several call sites — and the
+/// diverged copy would stay silently wrong on every resume, growing with each one.
+pub fn spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
+    let (fold, _, _) = fold_journal(events);
+    (fold.spent(), fold.budget())
 }
 
 /// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
@@ -417,29 +435,54 @@ impl Executor {
     }
 
     /// Execute a fresh linear graph end-to-end: journal `RunStarted`, then drive
-    /// every node with an empty memo (nothing has run yet).
+    /// every node with an empty memo (nothing has run yet). Unbudgeted — delegates
+    /// to [`run_budgeted`](Self::run_budgeted) with `None`, so every pre-SP-DATA-5
+    /// caller (all of them, until Task 5 wired a CLI flag to reach the budgeted
+    /// twin) stays byte-identical.
     pub async fn run(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
+        self.run_budgeted(run, graph, None).await
+    }
+
+    /// SP-DATA-5 Task 5: like [`run`](Self::run), but journals `budget` on
+    /// `RunStarted` so the metered-dispatch gate (Task 3) can pause the run once
+    /// its folded spend meets the cap.
+    ///
+    /// A NEW method rather than a third parameter on `run` itself, deliberately:
+    /// `run(run, &graph)` has on the order of a hundred existing call sites across
+    /// this crate's tests plus `Scheduler::submit`'s own production caller, every
+    /// one of them unbudgeted. Widening `run`'s signature would force each of those
+    /// to thread a `None` through for no behavior change — pure churn — where a
+    /// same-behavior delegating twin costs nothing and touches nothing.
+    pub async fn run_budgeted(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        budget: Option<TokenBudget>,
+    ) -> Result<RunOutcome, OrchestratorError> {
         if let Some(h) = &self.handle {
             let (registry, generation) = h.snapshot();
             return self
                 .clone()
                 .pinned(registry, generation)
-                .run_inner(run, graph)
+                .run_inner(run, graph, budget)
                 .await;
         }
-        self.run_inner(run, graph).await
+        self.run_inner(run, graph, budget).await
     }
 
-    async fn run_inner(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
+    async fn run_inner(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        budget: Option<TokenBudget>,
+    ) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
         let this = self.clone().with_expansion_seed(0, 0);
         this.append(
             run,
             JournalEvent::RunStarted {
                 version: this.version.clone(),
-                // SP-DATA-5 Task 5 threads the operator-specified budget through here
-                // (submit → `RunStarted`).
-                budget: None,
+                budget,
             },
         )
         .await?;
@@ -490,7 +533,12 @@ impl Executor {
         if events.is_empty() {
             // Nothing journaled → a fresh run (appends `RunStarted` itself). Already
             // pinned, so call `run_inner` directly (avoid a redundant handle re-check).
-            return self.run_inner(run, graph).await;
+            // Unbudgeted: `start()` resumes an EXISTING submission — a real budget, if
+            // any, is already journaled by whatever `submit` call created it. This
+            // branch only fires for a run id that was never submitted at all, which is
+            // not a product path `Scheduler::tick` reaches (it only re-drives runs its
+            // own `submit` already journaled `RunStarted` for).
+            return self.run_inner(run, graph, None).await;
         }
 
         // Version fence: the first recorded `RunStarted.version` must match ours.
