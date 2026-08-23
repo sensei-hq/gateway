@@ -19,9 +19,11 @@
 use chrono::{DateTime, Duration, Utc};
 use orchestrator::test_support::{CallLog, FakeClock, gated_gateway, recording_gateway};
 use orchestrator::{Executor, Scheduler};
-use orchestrator_core::{Graph, Node, NodeId, NodeKind, RunId, RunStatus, SchedulerStore};
+use orchestrator_core::{
+    ConfigSource, Graph, Node, NodeId, NodeKind, RegistryHandle, RunId, RunStatus, SchedulerStore,
+};
 use orchestrator_store::postgres::{
-    PostgresContentStore, PostgresJournal, PostgresSchedulerStore, connect,
+    PostgresConfigSource, PostgresContentStore, PostgresJournal, PostgresSchedulerStore, connect,
 };
 use std::sync::Arc;
 
@@ -107,6 +109,31 @@ async fn fresh_executor(
 /// [`fresh_executor`] behind a scheduler — a worker process.
 async fn fresh_worker(url: &str, at: DateTime<Utc>) -> (Scheduler, CallLog) {
     let (exec, journal, clock, calls) = fresh_executor(url, at).await;
+    let store = Arc::new(PostgresSchedulerStore::new(connect(url).await.unwrap()));
+    (Scheduler::new(store, exec, journal, clock), calls)
+}
+
+/// Like [`fresh_worker`], but ALSO wired with a registry handle freshly loaded from the
+/// shared durable config source — exactly how `boot::heavy` wires a real worker
+/// (`RegistryHandle::from_source` then `Executor::with_registry_handle`), so
+/// `Executor::start` pins `self.version` to `"{fence}#cfg{generation}"` using WHATEVER
+/// generation is durably current at the moment this "process" boots, not the raw
+/// unversioned fence base the other e2e tests use. Needed only by the fence-composition
+/// test below: a worker that never pins a generation can never observe a fence drift.
+async fn fresh_worker_pinned(url: &str, at: DateTime<Utc>) -> (Scheduler, CallLog) {
+    let journal = Arc::new(PostgresJournal::new(connect(url).await.unwrap()));
+    let (gw, calls) = recording_gateway().await;
+    let clock = FakeClock::new(at);
+    let config_source = PostgresConfigSource::new(connect(url).await.unwrap());
+    let handle = RegistryHandle::from_source(&config_source)
+        .await
+        .expect("a registry handle over the shared config source");
+    let exec = Executor::new(Arc::new(gw), journal.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(url).await.unwrap(),
+        )))
+        .with_registry_handle(handle)
+        .with_clock(clock.clone());
     let store = Arc::new(PostgresSchedulerStore::new(connect(url).await.unwrap()));
     (Scheduler::new(store, exec, journal, clock), calls)
 }
@@ -327,5 +354,136 @@ async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
         calls_for(&calls_b, &marker),
         0,
         "a cancelled run must cost nothing"
+    );
+}
+
+/// SP-DATA-3's AC8 fence-composition arm, SP-DATA-4.1 Task 6: deferred at s3 ("explicitly
+/// deferred testing it"), and made reachable in PRODUCTION by SP-DATA-4's `torii config
+/// push` — a push that lands while a run is paused now strands it, and the whole-slice
+/// review demonstrated the arm by hand rather than as a test. This is that test.
+///
+/// 1. **Process A** — pinned to the durably current config generation *g* via a real
+///    `RegistryHandle::from_source` (exactly how `boot::heavy` wires a worker) — submits
+///    against a gated gateway and the run pauses, durably, with `RunStarted.version =
+///    "v1#cfg{g}"` journaled.
+/// 2. **The generation is bumped** through `store_and_bump_if` — the same atomic
+///    compare-and-swap `torii config push` uses — to `g+1`, with the config CONTENT left
+///    untouched (only the generation moves, so this cannot be mistaken for a content
+///    change tripping some other check).
+/// 3. **Process B** — a FRESH worker that boots its OWN `RegistryHandle::from_source`
+///    against the NOW-drifted generation — ticks. `Executor::start` computes
+///    `self.version = "v1#cfg{g+1}"`, finds the journal's recorded `"v1#cfg{g}"` does not
+///    match, and refuses with `VersionFenceMismatch` BEFORE touching the graph at all.
+/// 4. The scheduler must record that as terminal-`Failed` (never `Paused`, never silently
+///    dropped), naming both generations, and the run must have cost the gateway NOTHING —
+///    the whole point of a fence is refusing before spending.
+/// 5. Afterwards `torii run wake` on the now-`failed` run must say so plainly, not queue
+///    it as if the fence had never fired.
+#[tokio::test]
+async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_anything() {
+    let Some(url) = db_url() else { return };
+    let _guard = SCHEDULED_RUNS.lock().await;
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let marker = run.0.to_string();
+    let graph = one_node_graph(&marker);
+    let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(4_000_000, 0).unwrap());
+
+    // ---- Process A: submit, PINNED to the config generation at submit time ---------
+    let config_source = PostgresConfigSource::new(connect(&url).await.unwrap());
+    let handle_a = RegistryHandle::from_source(&config_source)
+        .await
+        .expect("a registry handle over the shared config source");
+    let gen_before = handle_a.snapshot().1;
+
+    let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let exec_a = Executor::new(Arc::new(gated_gateway().await), journal_a.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_registry_handle(handle_a)
+        .with_clock(clock.clone());
+    let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), || {})
+        .await
+        .expect("a paused run is not an error");
+    assert!(
+        submitted.text.starts_with("paused:"),
+        "the gated run must PAUSE (resumable): {}",
+        submitted.text
+    );
+    let deadline = store_a
+        .status(run)
+        .await
+        .unwrap()
+        .expect("a schedule record")
+        .next_wake
+        .expect("a timed pause has a next_wake");
+
+    // ---- Bump the generation — the same CAS `torii config push` uses, content held
+    // fixed so ONLY the generation moves ---------------------------------------------
+    let (cfg, current) = config_source.load_versioned().await.unwrap();
+    assert_eq!(
+        current,
+        Some(gen_before),
+        "nothing else may move the shared generation between pin and bump"
+    );
+    let gen_after = config_source
+        .store_and_bump_if(&cfg, gen_before)
+        .await
+        .unwrap()
+        .expect("the CAS bump applies against the generation just read");
+    assert_eq!(gen_after, gen_before + 1);
+
+    // ---- Process B: a FRESH worker, pinned to the NOW-DRIFTED generation, ticks ----
+    let (sched_b, calls_b) = fresh_worker_pinned(&url, deadline + Duration::seconds(1)).await;
+    let served = serve_once(&sched_b).await;
+    assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
+
+    // ---- The run FAILS at the fence — never Completed, never silently re-Paused ----
+    let after = store_a
+        .status(run)
+        .await
+        .unwrap()
+        .expect("the schedule record still exists");
+    assert_eq!(
+        after.status,
+        RunStatus::Failed,
+        "a drifted-generation wake must be recorded terminal-Failed, not completed or \
+         re-paused: {after:?}"
+    );
+    let reason = after.reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("stale"),
+        "the reason must name the fence miss as stale: {reason}"
+    );
+    assert!(
+        reason.contains(&format!("v1#cfg{gen_before}"))
+            && reason.contains(&format!("v1#cfg{gen_after}")),
+        "the reason must name BOTH the recorded and the current generation: {reason}"
+    );
+
+    // ---- Zero gateway spend: it must fail AT THE FENCE, before spending anything ---
+    assert_eq!(
+        calls_for(&calls_b, &marker),
+        0,
+        "a fence miss must refuse before any model call — this run must cost nothing"
+    );
+
+    // ---- `torii run wake` afterwards gives an honest answer, not a silent no-op ----
+    let woken = torii::cmd::run::wake(store_a.as_ref(), run, deadline + Duration::seconds(2))
+        .await
+        .expect("wake");
+    assert_eq!(
+        woken.code,
+        torii::errors::EXIT_PRECONDITION,
+        "{}",
+        woken.text
+    );
+    assert!(
+        woken.text.contains("not queued") && woken.text.contains("failed"),
+        "an operator waking a failed run must be told plainly, not given a silent no-op: {}",
+        woken.text
     );
 }
