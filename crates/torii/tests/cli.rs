@@ -108,6 +108,67 @@ fn an_unparseable_interval_is_rejected_by_the_parser() {
     assert!(err.contains("invalid interval"), "{err}");
 }
 
+/// SP-DATA-4.1 #7: the prune subcommand is actually wired into `run`, not just implemented
+/// in the library. Reuses `help_command_names` for the same reason it exists — asserting
+/// `text.contains("prune")` would also pass on the prose.
+#[test]
+fn run_help_lists_prune() {
+    let out = torii().args(["run", "--help"]).output().expect("runs");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let listed = help_command_names(&text);
+    assert!(
+        listed.iter().any(|c| c == "prune"),
+        "`prune` is not a dispatchable `run` subcommand (found {listed:?}):\n{text}"
+    );
+}
+
+/// The window is rejected by clap's own value parser, i.e. before any connection — and
+/// before anything could be deleted. No `DATABASE_URL` is set here, which is the point:
+/// reaching the "not set" error would mean the parse had already been accepted.
+#[test]
+fn an_unparseable_retention_window_is_rejected_by_the_parser() {
+    let out = torii()
+        .args(["run", "prune", "--older-than", "eventually", "--yes"])
+        .output()
+        .expect("runs");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("invalid retention window"), "{err}");
+    assert!(
+        !err.contains("DATABASE_URL"),
+        "the parse must fail before the environment is even read: {err}"
+    );
+}
+
+/// `prune` is LIGHT tier — the scheduler store is all it needs, so an operator can run it
+/// on a box with no gateway config and no fence version (both removed by `torii()`).
+///
+/// A century-wide window makes this non-destructive by construction: no row in any
+/// developer's database was last changed before 1926, so the count is zero and `--yes`
+/// deletes nothing. It still exercises the whole real path — boot, connect,
+/// `count_terminal_before` — against a live database.
+#[test]
+fn prune_is_a_light_tier_command_and_a_century_window_deletes_nothing() {
+    let Some(url) = db_url() else { return };
+    let out = torii()
+        .env("DATABASE_URL", &url)
+        .args(["run", "prune", "--older-than", "36500d", "--yes"])
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "prune must need nothing but DATABASE_URL:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("nothing to prune"),
+        "a 100-year window can have nothing in scope: {stdout}"
+    );
+}
+
 /// A connect failure must never echo the password. Deliberately uses a port
 /// number out of the valid u16 range (not a refused-connection address like
 /// `127.0.0.1:1`): sqlx's pool treats `ECONNREFUSED` as transient and retries

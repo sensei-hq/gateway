@@ -123,6 +123,135 @@ pub async fn wake(
     }
 }
 
+/// Parse a retention window: `30d`, `12h`, `90m`, `45s`.
+///
+/// A SIBLING of [`crate::cmd::worker::parse_interval`], deliberately, rather than an
+/// extension of it. Extending that one to accept `d` would make `worker serve --interval
+/// 30d` legal — a poll loop that sleeps for a month — and the units a flag accepts are part
+/// of its contract, so widening the shared parser to serve `prune` would quietly loosen
+/// `serve`. The two also have opposite natural ranges (milliseconds-to-minutes for a poll,
+/// hours-to-days for retention), which is why `ms` is rejected here and `d` is rejected
+/// there. `parse_interval` is untouched by this task.
+///
+/// Returns `chrono::Duration` because the only thing the caller does with it is subtract it
+/// from a `DateTime<Utc>`; converting from `std::time::Duration` at the call site would add
+/// a second fallible step for nothing.
+pub fn parse_retention(s: &str) -> Result<chrono::Duration, String> {
+    const UNITS: &str = "expected a number then one of s, m, h, d — e.g. 30d, 12h, 90m";
+    let t = s.trim();
+    // Split on the first non-digit: the number can only be digits, so the remainder is
+    // exactly the unit. This is what turns `500ms` into a named "unknown unit" complaint
+    // instead of a confusing "500m is not a number".
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    if num.is_empty() {
+        return Err(format!("invalid retention window {t:?}: {UNITS}"));
+    }
+    // Digits only, so this can fail only by exceeding i64 — which is an overflow, not a
+    // typo, and is reported as such.
+    let v: i64 = num
+        .parse()
+        .map_err(|_| format!("invalid retention window {t:?}: {num:?} is out of range"))?;
+    let window = match unit {
+        "s" => chrono::Duration::try_seconds(v),
+        "m" => chrono::Duration::try_minutes(v),
+        "h" => chrono::Duration::try_hours(v),
+        "d" => chrono::Duration::try_days(v),
+        "" => return Err(format!("invalid retention window {t:?}: no unit — {UNITS}")),
+        other => {
+            return Err(format!(
+                "invalid retention window {t:?}: unknown unit {other:?} — {UNITS}"
+            ));
+        }
+    }
+    .ok_or_else(|| format!("invalid retention window {t:?}: overflow"))?;
+    if window.is_zero() {
+        return Err(format!(
+            "invalid retention window {t:?}: a zero window would delete a run that went \
+             terminal a moment ago — use 1s if that is genuinely what you want"
+        ));
+    }
+    Ok(window)
+}
+
+fn fmt_cutoff(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Delete terminal run records older than `older_than`, after showing the operator how many
+/// that is and (unless `yes`) asking.
+///
+/// **Only `completed`/`failed`/`cancelled` rows are ever eligible** — the store enforces
+/// that, at any age. A `paused` run is live work awaiting a wake (the in-doubt-mutation
+/// class waits INDEFINITELY, with no deadline at all), and a `waking` row may be a lease
+/// held by an in-flight drive in another process; neither has an age at which forgetting it
+/// is correct.
+///
+/// This is an explicit operator command rather than something `tick()` does on its own:
+/// deleting durable rows as a silent side effect of a poll loop is exactly the kind of
+/// surprise that should not exist, and it would make `tick()`'s contract much harder to
+/// reason about.
+///
+/// The count is taken FIRST and shown before the prompt, using the same cutoff the delete
+/// then uses — but the number reported at the end is the number actually DELETED, which can
+/// differ if a run went terminal, or was pruned by another operator, in between. Reporting
+/// the intent instead of the effect is precisely what the rest of this module refuses to do.
+pub async fn prune(
+    store: &dyn SchedulerStore,
+    older_than: chrono::Duration,
+    now: DateTime<Utc>,
+    yes: bool,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> Result<Outcome, CliError> {
+    // `parse_retention` already bounds the window, so this cannot realistically fire — but
+    // `now - window` is still fallible arithmetic, and a panic in a delete command is not an
+    // acceptable way to find that out.
+    let cutoff = now.checked_sub_signed(older_than).ok_or_else(|| {
+        CliError::error(format!(
+            "retention window {older_than} cannot be subtracted from {}",
+            fmt_cutoff(now)
+        ))
+    })?;
+
+    let counted = store.count_terminal_before(cutoff).await?;
+    if counted == 0 {
+        // Nothing to consent to, so nothing is asked. Exit 0: the state the operator asked
+        // for already holds.
+        return Ok(Outcome::ok(format!(
+            "nothing to prune: no completed, failed or cancelled run last changed before {}",
+            fmt_cutoff(cutoff)
+        )));
+    }
+
+    if !yes {
+        let text = format!(
+            "prune will DELETE {counted} terminal run record(s) — completed, failed or \
+             cancelled — last changed before {}.\nPaused and waking runs are never \
+             eligible and are not counted here.\nThis deletes durable rows and cannot be \
+             undone.",
+            fmt_cutoff(cutoff)
+        );
+        if !confirm(&text) {
+            // `confirm` already showed `text` to the operator — do not repeat it.
+            return Ok(Outcome::precondition(format!(
+                "refused: nothing deleted, {counted} terminal run record(s) still stored"
+            )));
+        }
+    }
+
+    let deleted = store.prune_terminal(cutoff).await?;
+    let mut text = format!(
+        "pruned: {deleted} terminal run record(s) deleted (last changed before {})",
+        fmt_cutoff(cutoff)
+    );
+    if deleted != counted {
+        text.push_str(&format!(
+            " — the preview counted {counted}; the eligible set changed in between"
+        ));
+    }
+    Ok(Outcome::ok(text))
+}
+
 /// Submit a fresh run and drive it inline. Blocks until the run pauses or ends —
 /// there is no `--detach` yet, because `enqueue` stamps the row `waking`, so a
 /// detached run would only be picked up once the lease expired and the crash-reclaim
@@ -345,6 +474,295 @@ mod tests {
         );
     }
 
+    // ---- SP-DATA-4.1 #7: `torii run prune` -------------------------------------------
+
+    /// A confirmer that must never be reached. Used on the paths where asking would itself
+    /// be the bug (`--yes`, and "nothing to prune").
+    fn never_asked() -> impl FnMut(&str) -> bool {
+        |text: &str| panic!("the operator must not be prompted here, but saw: {text}")
+    }
+
+    /// A store holding `n` terminal runs whose `updated_at` is `at` (this store stamps it at
+    /// `enqueue`), plus optionally a paused and a waking run at the same instant.
+    async fn prunable_store(
+        terminal: usize,
+        at: DateTime<Utc>,
+        with_live_runs: bool,
+    ) -> (InMemorySchedulerStore, Vec<RunId>, Vec<RunId>) {
+        let s = InMemorySchedulerStore::default();
+        let mut dead = Vec::new();
+        for _ in 0..terminal {
+            let r = RunId(uuid::Uuid::new_v4());
+            s.enqueue(r, &empty_graph(), at).await.unwrap();
+            s.record_terminal(r, RunStatus::Completed, None)
+                .await
+                .unwrap();
+            dead.push(r);
+        }
+        let mut live = Vec::new();
+        if with_live_runs {
+            let paused = RunId(uuid::Uuid::new_v4());
+            s.enqueue(paused, &empty_graph(), at).await.unwrap();
+            // The in-doubt class: NULL deadline, waits indefinitely for a human.
+            s.record_paused(paused, None, "in-doubt mutation")
+                .await
+                .unwrap();
+            let waking = RunId(uuid::Uuid::new_v4());
+            s.enqueue(waking, &empty_graph(), at).await.unwrap();
+            live.push(paused);
+            live.push(waking);
+        }
+        (s, dead, live)
+    }
+
+    /// A day before `now()`, i.e. comfortably outside any window the tests below use.
+    fn long_ago() -> DateTime<Utc> {
+        now() - chrono::Duration::days(30)
+    }
+
+    #[tokio::test]
+    async fn prune_reports_the_number_actually_deleted() {
+        let (s, dead, _) = prunable_store(3, long_ago(), false).await;
+        let out = prune(
+            &s,
+            chrono::Duration::days(7),
+            now(),
+            true,
+            &mut never_asked(),
+        )
+        .await
+        .expect("prunes");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.text.contains('3'), "must name the effect: {}", out.text);
+        assert!(out.text.starts_with("pruned:"), "{}", out.text);
+        for r in dead {
+            assert!(s.status(r).await.unwrap().is_none(), "the row is gone");
+        }
+    }
+
+    /// THE safety property, at the command level: `prune` must not be able to delete live
+    /// work even when the operator passes `--yes` and a window that every row is older than.
+    #[tokio::test]
+    async fn prune_never_deletes_a_paused_or_waking_run() {
+        let (s, dead, live) = prunable_store(1, long_ago(), true).await;
+        let out = prune(
+            &s,
+            chrono::Duration::seconds(1),
+            now(),
+            true,
+            &mut never_asked(),
+        )
+        .await
+        .expect("prunes");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(
+            out.text.contains('1'),
+            "exactly the one terminal row: {}",
+            out.text
+        );
+        assert!(s.status(dead[0]).await.unwrap().is_none());
+        assert_eq!(
+            s.status(live[0]).await.unwrap().unwrap().status,
+            RunStatus::Paused,
+            "a NULL-deadline pause is live work awaiting a human, at any age"
+        );
+        assert_eq!(
+            s.status(live[1]).await.unwrap().unwrap().status,
+            RunStatus::Waking,
+            "a waking row may be a live lease in another process"
+        );
+    }
+
+    /// Nothing to delete must not put a destructive prompt in front of an operator, and it
+    /// is not a failure — the state they asked for already holds.
+    #[tokio::test]
+    async fn prune_with_nothing_eligible_exits_zero_without_prompting() {
+        let (s, _, live) = prunable_store(0, long_ago(), true).await;
+        let out = prune(
+            &s,
+            chrono::Duration::days(7),
+            now(),
+            false, // NOT --yes: the prompt is only skipped because the count is zero
+            &mut never_asked(),
+        )
+        .await
+        .expect("no hard error");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.text.contains("nothing to prune"), "{}", out.text);
+        assert_eq!(
+            s.status(live[0]).await.unwrap().unwrap().status,
+            RunStatus::Paused
+        );
+    }
+
+    /// A terminal row INSIDE the retention window is not eligible — the window is the whole
+    /// point, so a prune that ignored it would still pass every "deletes terminal rows" test.
+    #[tokio::test]
+    async fn prune_keeps_a_terminal_row_inside_the_retention_window() {
+        let (s, dead, _) = prunable_store(1, now() - chrono::Duration::hours(1), false).await;
+        let out = prune(
+            &s,
+            chrono::Duration::days(7),
+            now(),
+            true,
+            &mut never_asked(),
+        )
+        .await
+        .expect("no hard error");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.text.contains("nothing to prune"), "{}", out.text);
+        assert!(
+            s.status(dead[0]).await.unwrap().is_some(),
+            "an hour-old terminal row is inside a 7-day window"
+        );
+    }
+
+    /// The operator sees the count BEFORE consenting — a confirmation prompt that does not
+    /// disclose the size of the delete is not informed consent.
+    #[tokio::test]
+    async fn prune_shows_the_count_in_the_prompt_before_asking() {
+        let (s, _, _) = prunable_store(4, long_ago(), false).await;
+        let mut prompt = String::new();
+        {
+            let mut confirm = |text: &str| {
+                prompt = text.to_string();
+                true
+            };
+            let out = prune(&s, chrono::Duration::days(7), now(), false, &mut confirm)
+                .await
+                .expect("prunes");
+            assert_eq!(out.code, EXIT_OK);
+        }
+        assert!(prompt.contains('4'), "the count must be shown: {prompt}");
+        assert!(
+            prompt.to_lowercase().contains("delete"),
+            "the prompt must say what it does: {prompt}"
+        );
+        assert!(
+            prompt.contains("cannot be undone"),
+            "a durable delete must say so: {prompt}"
+        );
+    }
+
+    /// Declining must delete nothing. `interactive_confirm` returns false on EOF, so this is
+    /// also the shape a non-interactive `torii run prune` (cron, `< /dev/null`) takes.
+    #[tokio::test]
+    async fn prune_refused_at_the_prompt_deletes_nothing() {
+        let (s, dead, _) = prunable_store(2, long_ago(), false).await;
+        let mut confirm = |_: &str| false;
+        let out = prune(&s, chrono::Duration::days(7), now(), false, &mut confirm)
+            .await
+            .expect("no hard error");
+        assert_eq!(out.code, EXIT_PRECONDITION);
+        assert!(out.text.contains("refused"), "{}", out.text);
+        assert!(out.text.contains("nothing deleted"), "{}", out.text);
+        for r in dead {
+            assert!(
+                s.status(r).await.unwrap().is_some(),
+                "a declined prune must leave every row in place"
+            );
+        }
+    }
+
+    /// The number reported must be the EFFECT, never the preview. `confirm` is the only hook
+    /// that lands between the count and the delete — exactly the window a human spends
+    /// reading the prompt — so another operator's prune runs there, on its own thread and
+    /// runtime (the same technique `cmd::config`'s push-race test uses, `confirm` being
+    /// sync). By the time this prune fires there is nothing left, and reporting the
+    /// previewed 2 would be a lie. Without this, an implementation that simply echoed
+    /// `counted` would pass every other test here.
+    #[tokio::test]
+    async fn prune_reports_what_it_deleted_not_what_it_previewed() {
+        let (s, dead, _) = prunable_store(2, long_ago(), false).await;
+        let window = chrono::Duration::days(7);
+        let cutoff = now() - window;
+        let mut confirm = {
+            let s = s.clone(); // `Clone` shares the one Arc-backed map
+            move |_: &str| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move { s.prune_terminal(cutoff).await.unwrap() })
+                })
+                .join()
+                .expect("the concurrent prune must not panic");
+                true
+            }
+        };
+
+        let out = prune(&s, window, now(), false, &mut confirm)
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_OK);
+        assert!(
+            out.text.contains("pruned: 0"),
+            "must report what it actually deleted, not the 2 it previewed: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("preview counted 2"),
+            "and must say why the two numbers differ: {}",
+            out.text
+        );
+        for r in dead {
+            assert!(
+                s.status(r).await.unwrap().is_none(),
+                "the other operator's prune really did take them"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_retention_accepts_days_hours_minutes_and_seconds() {
+        assert_eq!(parse_retention("30d"), Ok(chrono::Duration::days(30)));
+        assert_eq!(parse_retention("12h"), Ok(chrono::Duration::hours(12)));
+        assert_eq!(parse_retention("90m"), Ok(chrono::Duration::minutes(90)));
+        assert_eq!(parse_retention("45s"), Ok(chrono::Duration::seconds(45)));
+        assert_eq!(parse_retention(" 30d "), Ok(chrono::Duration::days(30)));
+    }
+
+    #[test]
+    fn parse_retention_rejects_garbage_loudly() {
+        assert!(parse_retention("soon").is_err());
+        assert!(parse_retention("30").is_err(), "a bare number has no unit");
+        assert!(parse_retention("").is_err());
+        assert!(parse_retention("d").is_err(), "a bare unit has no number");
+        // Milliseconds are a poll-interval unit, not a retention unit — and the complaint
+        // must name the unit rather than claiming "500m is not a number".
+        let e = parse_retention("500ms").expect_err("ms is not a retention unit");
+        assert!(e.contains("\"ms\""), "{e}");
+    }
+
+    #[test]
+    fn parse_retention_rejects_a_zero_window() {
+        assert!(parse_retention("0d").is_err());
+        assert!(parse_retention("0s").is_err());
+    }
+
+    #[test]
+    fn parse_retention_rejects_an_overflow_instead_of_panicking() {
+        // `chrono::Duration::try_days` returns None rather than panicking on these.
+        assert!(parse_retention("999999999999999999d").is_err());
+        assert!(
+            parse_retention("99999999999999999999999d").is_err(),
+            "past i64 entirely"
+        );
+    }
+
+    /// The reason `parse_retention` is a sibling rather than an extension: `--interval 30d`
+    /// must stay illegal. If someone later "unifies" the two parsers, this fails.
+    #[test]
+    fn the_poll_interval_parser_still_refuses_a_retention_unit() {
+        assert!(
+            crate::cmd::worker::parse_interval("30d").is_err(),
+            "a month-long poll interval must not become legal"
+        );
+    }
+
     // ---- WHOLE-SLICE FIX 4: a duplicate submit ---------------------------------------
 
     /// A real `Scheduler` over in-memory backends. No database, no live provider: the
@@ -498,6 +916,18 @@ mod tests {
         }
         async fn cancel(&self, run: RunId) -> Result<(), orchestrator_core::OrchestratorError> {
             self.inner.cancel(run).await
+        }
+        async fn count_terminal_before(
+            &self,
+            before: DateTime<Utc>,
+        ) -> Result<u64, orchestrator_core::OrchestratorError> {
+            self.inner.count_terminal_before(before).await
+        }
+        async fn prune_terminal(
+            &self,
+            before: DateTime<Utc>,
+        ) -> Result<u64, orchestrator_core::OrchestratorError> {
+            self.inner.prune_terminal(before).await
         }
         async fn force_wake(
             &self,

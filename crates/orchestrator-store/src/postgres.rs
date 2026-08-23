@@ -1032,7 +1032,43 @@ impl SchedulerStore for PostgresSchedulerStore {
         .map_err(store_err)?;
         Ok(())
     }
+
+    async fn count_terminal_before(&self, before: DateTime<Utc>) -> Result<u64, OrchestratorError> {
+        let (n,): (i64,) = sqlx::query_as(&format!(
+            "select count(*) from orchestrator.scheduled_runs
+              where status in ({TERMINAL_STATUS_LITERALS}) and updated_at < $1"
+        ))
+        .bind(before)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_err)?;
+        // `count(*)` is never negative; the clamp exists so a hypothetical negative could
+        // never wrap into an enormous u64 that an operator would read as a real backlog.
+        Ok(n.max(0) as u64)
+    }
+
+    async fn prune_terminal(&self, before: DateTime<Utc>) -> Result<u64, OrchestratorError> {
+        let res = sqlx::query(&format!(
+            "delete from orchestrator.scheduled_runs
+              where status in ({TERMINAL_STATUS_LITERALS}) and updated_at < $1"
+        ))
+        .bind(before)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(res.rows_affected())
+    }
 }
+
+/// The terminal-status ALLOWLIST, written once and interpolated into both the count and the
+/// delete so the operator's preview and the effect can never drift apart. Interpolation is
+/// safe by construction — this is a compile-time `const` of SQL literals, never operator
+/// input; the only bound parameter in either statement is the timestamp.
+///
+/// An allowlist, deliberately, not `status not in ('paused','waking')`: with an exclusion
+/// list a row whose status this build does not recognise (a newer writer, a hand-edited
+/// row, a future non-terminal state) would be DELETED by default. Here it is kept.
+const TERMINAL_STATUS_LITERALS: &str = "'completed','failed','cancelled'";
 
 #[cfg(test)]
 mod tests {
@@ -2572,5 +2608,159 @@ mod tests {
                 .any(|(x, _)| *x == f),
             "force_wake makes it claimable"
         );
+    }
+
+    // ---- SP-DATA-4.1 #7: retention pruning ---------------------------------------------
+
+    /// The SQL allowlist is hand-written text; this pins it to `RunStatus::is_terminal()` so
+    /// the two cannot drift into a `DELETE` that disagrees with the enum. A new `RunStatus`
+    /// variant must be added to this array — the arity assertion is what makes forgetting
+    /// visible, because the literal count and the array's terminal count stop matching.
+    #[test]
+    fn the_prune_allowlist_matches_run_status_is_terminal() {
+        let all = [
+            RunStatus::Waking,
+            RunStatus::Paused,
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ];
+        for st in all {
+            let quoted = format!("'{}'", st.as_str());
+            assert_eq!(
+                TERMINAL_STATUS_LITERALS.contains(&quoted),
+                st.is_terminal(),
+                "{quoted} must appear in the prune allowlist iff it is terminal"
+            );
+        }
+        assert_eq!(
+            TERMINAL_STATUS_LITERALS.matches('\'').count() / 2,
+            all.iter().filter(|s| s.is_terminal()).count(),
+            "the allowlist holds exactly the terminal statuses and nothing else"
+        );
+    }
+
+    /// Force a row's `updated_at`. Every transition stamps the server's `now()`, so writing
+    /// the column directly is the only way to produce a row old enough to be prunable inside
+    /// a test.
+    async fn age_row(s: &PostgresSchedulerStore, r: RunId, at: DateTime<Utc>) {
+        sqlx::query("update orchestrator.scheduled_runs set updated_at=$2 where run_id=$1")
+            .bind(r.0)
+            .bind(at)
+            .execute(&s.pool)
+            .await
+            .expect("age a row");
+    }
+
+    /// Remove this test's OWN surviving rows. The non-terminal ones are deliberately
+    /// unprunable and would otherwise accumulate forever in the dev database — and a
+    /// leftover `paused` row with a 1971 deadline is permanently due, so every other test's
+    /// `claim_due` sweep would keep picking it up.
+    async fn forget_rows(s: &PostgresSchedulerStore, runs: &[RunId]) {
+        for r in runs {
+            sqlx::query("delete from orchestrator.scheduled_runs where run_id=$1")
+                .bind(r.0)
+                .execute(&s.pool)
+                .await
+                .expect("clean up this test's rows");
+        }
+    }
+
+    /// Postgres parity for the in-memory suite, including THE safety property: an ancient
+    /// `paused` row (BOTH classes — a timed deadline and the NULL-deadline in-doubt class)
+    /// and an ancient `waking` row all survive a cutoff decades past them.
+    ///
+    /// Everything is aged into 1971 and the cutoff sits between the two 1971 stamps, so the
+    /// blast radius cannot reach any other test's rows — every one of those carries the live
+    /// server clock.
+    #[tokio::test]
+    async fn pg_prune_terminal_deletes_old_terminal_rows_and_never_a_live_one() {
+        let _guard = scheduler_guard().await;
+        let Some(url) = db_url() else { return };
+        let s = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+
+        let old = ts(45_000_000); // 1971-06-06
+        let cutoff = ts(45_100_000);
+        let recent = ts(45_200_000); // still 1971, but INSIDE the retention window
+
+        let (done, failed, cancelled, fresh) = (run(), run(), run(), run());
+        let (timed, in_doubt, waking) = (run(), run(), run());
+
+        for r in [done, failed, cancelled, fresh, timed, in_doubt, waking] {
+            s.enqueue(r, &sg(), old).await.unwrap();
+        }
+        s.record_terminal(done, RunStatus::Completed, None)
+            .await
+            .unwrap();
+        s.record_terminal(failed, RunStatus::Failed, Some("boom"))
+            .await
+            .unwrap();
+        s.cancel(cancelled).await.unwrap();
+        s.record_terminal(fresh, RunStatus::Completed, None)
+            .await
+            .unwrap();
+        s.record_paused(timed, Some(old), "quota").await.unwrap();
+        s.record_paused(in_doubt, None, "in-doubt mutation")
+            .await
+            .unwrap();
+        // `waking` is left exactly as `enqueue` made it — an in-flight drive holding a lease.
+
+        for r in [done, failed, cancelled, timed, in_doubt, waking] {
+            age_row(&s, r, old).await;
+        }
+        age_row(&s, fresh, recent).await;
+
+        // The preview and the effect must agree. `>=` rather than `==` on the count only
+        // because a PREVIOUS run of this test that panicked mid-way could have left aged
+        // terminal rows behind; the per-row assertions below are the exact ones.
+        let counted = s.count_terminal_before(cutoff).await.unwrap();
+        assert!(
+            counted >= 3,
+            "the three aged terminal rows must be previewed, saw {counted}"
+        );
+        let deleted = s.prune_terminal(cutoff).await.unwrap();
+        assert_eq!(
+            deleted, counted,
+            "the operator's preview must match what is actually deleted"
+        );
+
+        for r in [done, failed, cancelled] {
+            assert!(
+                s.status(r).await.unwrap().is_none(),
+                "an aged terminal row must be gone"
+            );
+        }
+        assert_eq!(
+            s.status(fresh).await.unwrap().unwrap().status,
+            RunStatus::Completed,
+            "a terminal row INSIDE the retention window must survive"
+        );
+        assert_eq!(
+            s.status(timed).await.unwrap().unwrap().status,
+            RunStatus::Paused,
+            "a paused run awaiting a deadline is never prunable, at any age"
+        );
+        let survivor = s.status(in_doubt).await.unwrap().unwrap();
+        assert_eq!(
+            survivor.status,
+            RunStatus::Paused,
+            "a NULL-deadline pause waits indefinitely for a human — deleting it is data loss"
+        );
+        assert_eq!(
+            survivor.next_wake, None,
+            "and it is still the in-doubt class"
+        );
+        assert_eq!(
+            s.status(waking).await.unwrap().unwrap().status,
+            RunStatus::Waking,
+            "a waking row may be a live lease held by another process"
+        );
+        assert_eq!(
+            s.count_terminal_before(cutoff).await.unwrap(),
+            0,
+            "nothing terminal is left in scope after the prune"
+        );
+
+        forget_rows(&s, &[fresh, timed, in_doubt, waking]).await;
     }
 }
