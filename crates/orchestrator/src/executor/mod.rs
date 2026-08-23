@@ -154,6 +154,41 @@ struct Fold {
     /// Planner selections folded from `PlannerSelected` (§4.5). On resume the `Select`
     /// arm reuses the recorded agent — the selector is NOT re-invoked.
     selections: std::collections::HashMap<NodeId, orchestrator_core::AgentRef>,
+    /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
+    /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
+    /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
+    /// it on every resume.
+    usage: HashMap<EffectId, orchestrator_core::TokenUsage>,
+    /// The effective cap: `RunStarted.budget`, then the latest `BudgetRaised` (latest
+    /// wins). `None` for an unbudgeted run — the gate never fires.
+    budget: Option<u64>,
+}
+
+// SP-DATA-5 (2/6): `spent`/`budget` have no non-test caller yet — the
+// metered-dispatch chokepoint that reads them is Task 3. Allowed here rather
+// than deferring the methods themselves, so the fold logic and its tests land
+// as one reviewable unit; drop this attribute when Task 3 wires the gate.
+#[allow(dead_code)]
+impl Fold {
+    /// Total tokens this run has spent, folded from the journal. Idempotent across
+    /// any number of resumes because it sums over effect ids (`usage`'s keys), never
+    /// over raw events.
+    fn spent(&self) -> u64 {
+        // `saturating_add` is deliberate and is the ONE place saturation is right
+        // here: overflowing `u64` from summed `u32` token counts needs ~4 billion
+        // maximal effects, and saturating HIGH makes the gate MORE conservative (it
+        // pauses the run), where a wrapping add could reset the ledger near zero and
+        // let a run spend unbounded past its cap.
+        self.usage
+            .values()
+            .map(|u| u64::from(u.total_tokens))
+            .fold(0u64, |acc, t| acc.saturating_add(t))
+    }
+
+    /// The run's effective token cap, or `None` if unbudgeted.
+    fn budget(&self) -> Option<u64> {
+        self.budget
+    }
 }
 
 /// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
@@ -463,8 +498,12 @@ impl Executor {
         }
 
         // Version fence: the first recorded `RunStarted.version` must match ours.
+        // Explicit `budget: _` (not `..`) so a FUTURE field added to `RunStarted`
+        // forces a compile error here — a conscious decision, not silent absorption.
+        // The fence compares the executor version string only; `budget` is
+        // deliberately not fenced (a config-only change, not a code-version change).
         if let Some(recorded) = events.iter().find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, .. } => Some(version.clone()),
+            JournalEvent::RunStarted { version, budget: _ } => Some(version.clone()),
             _ => None,
         }) && recorded != self.version
         {

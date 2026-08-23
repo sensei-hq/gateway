@@ -6460,7 +6460,7 @@ async fn reload_bumps_the_run_version_and_fences_in_flight_resume() {
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, .. } => Some(version),
+            JournalEvent::RunStarted { version, budget: _ } => Some(version),
             _ => None,
         })
         .unwrap();
@@ -6525,7 +6525,7 @@ async fn each_run_pins_the_generation_live_at_its_start() {
                 .unwrap()
                 .into_iter()
                 .find_map(|(_, e)| match e {
-                    JournalEvent::RunStarted { version, .. } => Some(version),
+                    JournalEvent::RunStarted { version, budget: _ } => Some(version),
                     _ => None,
                 })
                 .unwrap()
@@ -6570,7 +6570,7 @@ async fn handle_wired_executor_resumes_a_partial_run_at_the_same_generation() {
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, .. } => Some(version),
+            JournalEvent::RunStarted { version, budget: _ } => Some(version),
             _ => None,
         })
         .unwrap();
@@ -6681,7 +6681,7 @@ async fn start_on_a_handle_wired_executor_freshly_runs_and_pins_the_generation()
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, .. } => Some(version),
+            JournalEvent::RunStarted { version, budget: _ } => Some(version),
             _ => None,
         })
         .unwrap();
