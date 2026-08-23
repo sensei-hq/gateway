@@ -67,24 +67,81 @@ pub fn parse_interval(s: &str) -> Result<Duration, String> {
 /// mode there is no next attempt to retry on, so a single store fault is fatal
 /// immediately rather than deferred until the cap.
 ///
-/// Shutdown is not raced against an in-flight tick: a tick's duration is
-/// unbounded because `tick()` drives due runs inline via `Executor::start`, and
-/// this loop deliberately lets it finish rather than abandoning a partial drive.
-/// The worst case is bounded by two other mechanisms outside this function: a
-/// second shutdown signal exits immediately (the caller's concern, not this
-/// loop's), and an abandoned `waking` row is reclaimed by the scheduler's lease
-/// if the process is killed mid-tick — so a hard kill is safe by construction.
+/// `shutdown` is a LEVEL, not a one-shot event: the caller increments the
+/// `watch` value once per received signal (SIGINT, or on unix also SIGTERM). A
+/// `watch::Receiver` is what lets a single external signal source be observed
+/// TWICE — a plain `Future` fires once by construction, and `Notify` stores at
+/// most one permit (two signals landing back-to-back before this loop is ever
+/// polled would silently coalesce into one). Reading `*shutdown.borrow()` as a
+/// level rather than counting `changed()` events sidesteps that hazard: even if
+/// both signals land before this loop is polled even once, the value already
+/// reads >= 2 the first time it's checked, and is treated exactly like two
+/// signals observed one after another.
+///
+/// The tick itself is raced against `shutdown`, not just the sleep between
+/// ticks — a tick's duration is unbounded because `tick()` drives due runs
+/// inline via `Executor::start`, so racing only the sleep could never observe a
+/// second signal until the tick had already finished on its own. The FIRST
+/// signal is deliberately NOT acted on while a tick is in flight — it is noted,
+/// and the tick is allowed to finish, so a partial drive is not wasted — and is
+/// honored immediately once that tick completes. The SECOND signal received
+/// before that same tick finishes abandons it: the future is dropped at its
+/// next await point (mid-`claim_due` or mid-`Executor::start`, whichever the
+/// tick happened to be in). That is safe by construction — whatever
+/// `scheduled_runs` row(s) that tick had already claimed stay `waking`, not
+/// terminal, and the scheduler's lease reclaims each of them after its lease
+/// duration — but it is a deliberate act an operator took by signalling twice,
+/// not silent data loss, so the outcome text says so explicitly (without
+/// naming a row count: `tick()` claims a whole batch before driving any of
+/// them, and this loop only ever sees its final `Ok(n)`/`Err`, never how far a
+/// dropped attempt got — a specific number here would be false precision).
+/// The exit code is still 0: an operator who signals twice asked for exactly
+/// this, so it is not an error outcome — an unexpected process death would be
+/// signalled some other way (e.g. a non-zero exit from a crash), and this one
+/// is a clean, deliberate stop.
 pub async fn serve(
     ticker: &dyn Ticker,
     opts: ServeOpts,
-    shutdown: impl std::future::Future<Output = ()> + Send,
+    mut shutdown: tokio::sync::watch::Receiver<u64>,
 ) -> Result<Outcome, CliError> {
-    let mut shutdown = Box::pin(shutdown);
     let mut consecutive_failures: u32 = 0;
     let mut woken_total: usize = 0;
 
     loop {
-        match ticker.tick().await {
+        // Race the SAME tick future against `shutdown` across repeated selects: a
+        // signal that only reaches level 1 must not touch `tick_fut` at all (it
+        // keeps being polled, unmodified, next iteration), so the in-flight drive
+        // survives exactly one signal but not two.
+        let mut tick_fut = ticker.tick();
+        let tick_result = loop {
+            tokio::select! {
+                result = &mut tick_fut => break Some(result),
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() >= 2 {
+                        break None;
+                    }
+                    // Exactly one signal so far: noted, not acted on.
+                }
+            }
+        };
+
+        let Some(tick_result) = tick_result else {
+            // Deliberately no specific count here: `Ticker::tick()` is opaque to this
+            // loop (it returns a run COUNT only on success, never how many it had
+            // claimed so far), and `Scheduler::tick()` claims up to a whole batch in
+            // one `claim_due` call before driving any of them — so an abandoned tick
+            // could be holding anywhere from zero (cancelled mid-claim, before any
+            // row was claimed — confirmed against a live database: the cancelled
+            // claim query reported `rows_affected=0`) up to a full batch. Naming a
+            // specific number here would be false precision.
+            return Ok(Outcome::ok(format!(
+                "shutdown (tick abandoned): {woken_total} run(s) woken this session; \
+                 the in-flight tick was abandoned before it finished — any run(s) it had \
+                 claimed remain 'waking', and the scheduler lease will reclaim them"
+            )));
+        };
+
+        match tick_result {
             Ok(n) => {
                 consecutive_failures = 0;
                 woken_total += n;
@@ -121,6 +178,14 @@ pub async fn serve(
             )));
         }
 
+        // A signal landed during that tick and was allowed to finish gracefully —
+        // honor it now rather than starting another tick or sleeping.
+        if *shutdown.borrow() >= 1 {
+            return Ok(Outcome::ok(format!(
+                "shutdown: {woken_total} run(s) woken this session"
+            )));
+        }
+
         // Back off on failure so a dead database is not hammered; otherwise poll.
         let delay = if consecutive_failures == 0 {
             opts.interval
@@ -130,7 +195,7 @@ pub async fn serve(
         };
 
         tokio::select! {
-            _ = &mut shutdown => {
+            _ = shutdown.changed() => {
                 return Ok(Outcome::ok(format!(
                     "shutdown: {woken_total} run(s) woken this session"
                 )));
@@ -144,6 +209,18 @@ pub async fn serve(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A shutdown receiver that never reaches level 1 — for tests where shutdown
+    /// must not interrupt the loop within the test's own lifetime. The sender is
+    /// returned too and MUST be kept alive by the caller: dropping it closes the
+    /// channel, and a closed `watch::Receiver::changed()` resolves immediately
+    /// (as an `Err`), which `serve`'s `select!` would misread as a signal.
+    fn never_shuts_down() -> (
+        tokio::sync::watch::Sender<u64>,
+        tokio::sync::watch::Receiver<u64>,
+    ) {
+        tokio::sync::watch::channel(0u64)
+    }
 
     struct FakeTicker {
         calls: AtomicUsize,
@@ -222,13 +299,14 @@ mod tests {
     #[tokio::test]
     async fn once_runs_exactly_one_tick() {
         let t = FakeTicker::ok();
+        let (_tx, rx) = never_shuts_down();
         let out = serve(
             &t,
             ServeOpts {
                 interval: Duration::from_secs(5),
                 once: true,
             },
-            std::future::pending(),
+            rx,
         )
         .await
         .expect("serves");
@@ -242,13 +320,14 @@ mod tests {
     #[tokio::test]
     async fn once_propagates_a_store_fault_instead_of_reporting_success() {
         let t = FakeTicker::failing_forever();
+        let (_tx, rx) = never_shuts_down();
         let err = serve(
             &t,
             ServeOpts {
                 interval: Duration::from_secs(5),
                 once: true,
             },
-            std::future::pending(),
+            rx,
         )
         .await
         .expect_err("a store fault during --once must be fatal, not reported as success");
@@ -265,11 +344,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_transient_store_fault_is_retried_not_fatal() {
         let t = FakeTicker::failing_then_ok(2);
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
         let handle = tokio::spawn(async move {
             // Stop once we have seen a success after the failures.
             tokio::time::sleep(Duration::from_secs(60)).await;
-            let _ = tx.send(());
+            tx.send_modify(|n| *n += 1);
         });
         let out = serve(
             &t,
@@ -277,9 +356,7 @@ mod tests {
                 interval: Duration::from_millis(10),
                 once: false,
             },
-            async {
-                rx.await.ok();
-            },
+            rx,
         )
         .await
         .expect("survives transient faults");
@@ -296,13 +373,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_persistent_store_fault_exits_non_zero_after_the_cap() {
         let t = FakeTicker::failing_forever();
+        let (_tx, rx) = never_shuts_down();
         let err = serve(
             &t,
             ServeOpts {
                 interval: Duration::from_millis(10),
                 once: false,
             },
-            std::future::pending(),
+            rx,
         )
         .await
         .expect_err("a dead store must be fatal eventually");
@@ -318,13 +396,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_stops_the_loop_cleanly() {
         let t = FakeTicker::ok();
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tx.send_modify(|n| *n += 1);
+        });
         let out = serve(
             &t,
             ServeOpts {
                 interval: Duration::from_secs(1),
                 once: false,
             },
-            tokio::time::sleep(Duration::from_millis(1500)),
+            rx,
         )
         .await
         .expect("clean shutdown");
@@ -362,13 +445,18 @@ mod tests {
         let t = PeriodicFlakyTicker {
             calls: AtomicUsize::new(0),
         };
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            tx.send_modify(|n| *n += 1);
+        });
         let out = serve(
             &t,
             ServeOpts {
                 interval: Duration::from_millis(10),
                 once: false,
             },
-            tokio::time::sleep(Duration::from_secs(5)),
+            rx,
         )
         .await
         .expect("a periodic, self-recovering failure pattern must never trip the cap");
@@ -378,5 +466,76 @@ mod tests {
             "must have survived multiple 9-call cycles: {}",
             t.calls.load(Ordering::SeqCst)
         );
+    }
+
+    /// A ticker whose `tick()` never returns on its own — the genuine shape of an
+    /// unbounded tick blocked on, e.g., `LOCK TABLE … ACCESS EXCLUSIVE`. Notifies
+    /// `started` right before parking forever, so a test can wait until the tick is
+    /// GENUINELY in flight before racing signals against it.
+    struct BlockingTicker {
+        started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Ticker for BlockingTicker {
+        async fn tick(&self) -> Result<usize, OrchestratorError> {
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves");
+        }
+    }
+
+    /// A tick's duration is unbounded (it drives runs inline), so the FIRST signal
+    /// cannot interrupt it. The second must, or an operator watching a slow tick has
+    /// no way to stop the process short of SIGKILL.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_signal_abandons_an_in_flight_tick() {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ticker = BlockingTicker {
+            started: started.clone(),
+        };
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+
+        let handle = tokio::spawn(async move {
+            serve(
+                &ticker,
+                ServeOpts {
+                    interval: Duration::from_secs(5),
+                    once: false,
+                },
+                rx,
+            )
+            .await
+        });
+
+        // Wait until the tick has GENUINELY started (not just been scheduled).
+        started.notified().await;
+
+        // First signal: must NOT abandon the tick — it is allowed to finish (it
+        // never will, here, which is exactly the point: `serve` must still be
+        // running afterward).
+        tx.send_modify(|n| *n += 1);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "a single signal must not abandon an in-flight tick"
+        );
+
+        // Second signal: must abandon it and return promptly, without the tick ever
+        // completing.
+        tx.send_modify(|n| *n += 1);
+        let out = handle
+            .await
+            .expect("the serve task must not panic")
+            .expect("serve returns Ok even though the tick never finished");
+
+        assert_eq!(out.code, crate::errors::EXIT_OK);
+        assert!(
+            out.text.contains("abandoned"),
+            "the outcome must distinguish an abandoned tick from a clean shutdown: {}",
+            out.text
+        );
+        assert!(out.text.contains("shutdown"), "{}", out.text);
     }
 }

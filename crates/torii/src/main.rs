@@ -126,6 +126,16 @@ fn parse_run_id(s: &str) -> Result<RunId, CliError> {
 /// the scheduler's lease reclaim makes an abrupt kill safe by construction — but an
 /// abrupt kill still strands whatever run was mid-tick for up to the lease duration.
 ///
+/// Returns a `watch::Receiver<u64>` — a LEVEL, not a one-shot event — whose value
+/// this function's background task increments once per received signal. That is
+/// what lets `serve` distinguish a first signal (finish the in-flight tick, then
+/// exit) from a second (abandon it): a plain one-shot `Future` can, by
+/// construction, only ever fire once, so a signal arriving while a tick is in
+/// flight would be consumed and discarded with no way to tell "one" from "two or
+/// more" — which is exactly the false claim this fixes (see `cmd::worker::serve`'s
+/// doc comment for the full reasoning, including why a `watch` value beats
+/// `Notify`'s single-permit coalescing here).
+///
 /// SIGTERM registration happens eagerly here (before `serve`'s loop starts) and its
 /// failure is surfaced loudly rather than swallowed: `signal()` can fail for a
 /// reachable reason (e.g. the process has already exhausted its signal-handling
@@ -134,24 +144,42 @@ fn parse_run_id(s: &str) -> Result<RunId, CliError> {
 /// (discarded) — that path was never surfaced pre-fix and changing it is out of
 /// scope here.
 #[cfg(unix)]
-fn shutdown_signal() -> Result<impl std::future::Future<Output = ()> + Send, CliError> {
+fn shutdown_signal() -> Result<tokio::sync::watch::Receiver<u64>, CliError> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| CliError::error(format!("cannot install a SIGTERM handler: {e}")))?;
-    Ok(async move {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+    let (tx, rx) = tokio::sync::watch::channel(0u64);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            tx.send_modify(|n| *n += 1);
+            // Nobody left to observe further signals (`serve` already returned) —
+            // stop looping rather than holding the signal handlers open forever.
+            if tx.is_closed() {
+                return;
+            }
         }
-    })
+    });
+    Ok(rx)
 }
 
 /// Non-unix fallback: `tokio::signal::unix` does not exist off unix, and there is
 /// no portable SIGTERM equivalent, so SIGINT (`ctrl_c`) is all that's available.
 #[cfg(not(unix))]
-fn shutdown_signal() -> Result<impl std::future::Future<Output = ()> + Send, CliError> {
-    Ok(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+fn shutdown_signal() -> Result<tokio::sync::watch::Receiver<u64>, CliError> {
+    let (tx, rx) = tokio::sync::watch::channel(0u64);
+    tokio::spawn(async move {
+        loop {
+            let _ = tokio::signal::ctrl_c().await;
+            tx.send_modify(|n| *n += 1);
+            if tx.is_closed() {
+                return;
+            }
+        }
+    });
+    Ok(rx)
 }
 
 /// `ExitCode` rather than `std::process::exit`: `process::exit` skips destructors
