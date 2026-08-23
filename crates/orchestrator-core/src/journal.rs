@@ -54,6 +54,11 @@ pub struct ObservationMeta {
 pub enum JournalEvent {
     RunStarted {
         version: String,
+        /// SP-DATA-5: the run's token cap, journaled so a cross-process resume folds
+        /// the SAME cap. `None` (and any pre-SP-DATA-5 journal) ⇒ unbudgeted, and the
+        /// gate never fires — byte-identical to before.
+        #[serde(default)]
+        budget: Option<crate::budget::TokenBudget>,
     },
     NodeStarted {
         node: NodeId,
@@ -71,6 +76,12 @@ pub enum JournalEvent {
         /// Set only for `Observation` effects (§7.1): freshness + provenance so a
         /// resume can decide replay-vs-re-read. `None` for Pure/Mutation.
         observation: Option<ObservationMeta>,
+        /// SP-DATA-5: tokens this effect actually consumed, as reported by the
+        /// provider. Rides on THIS event rather than its own so spend and the effect
+        /// it belongs to land in ONE atomic append — two appends could be torn by a
+        /// crash. `None` for non-model effects and for any pre-SP-DATA-5 journal.
+        #[serde(default)]
+        usage: Option<crate::budget::TokenUsage>,
     },
     /// The intent phase of a two-phase `Mutation` (§7.3), appended BEFORE the side
     /// effect. On resume an `EffectIntent` with no matching `EffectRecorded` is
@@ -147,6 +158,13 @@ pub enum JournalEvent {
     RunPaused {
         reason: String,
         resume_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// SP-DATA-5: an operator raised (or lowered) the run's cap. Required, not
+    /// cosmetic: the budget is journaled on `RunStarted`, so without this a woken run
+    /// folds the ORIGINAL cap and immediately re-pauses — permanently stuck. Latest
+    /// value wins; lowering below current spend is a legitimate way to halt a run.
+    BudgetRaised {
+        new_total_tokens: u64,
     },
 }
 
@@ -233,6 +251,54 @@ mod tests {
     use super::ObservationMeta;
     use crate::{EffectClass, EffectOutput, JournalEvent, NodeId, effect_id};
 
+    /// An OLD journal — serialized before this slice — must still deserialize, with
+    /// the new fields absent rather than erroring. If this fails, the change is a
+    /// format break and FORMAT_VERSION must be bumped; the whole additivity claim
+    /// rests here.
+    ///
+    /// These literals are NOT hand-written guesses: they are the actual output of
+    /// `serde_json::to_string` on `RunStarted`/`EffectRecorded` built against the
+    /// pre-SP-DATA-5 code (captured via a throwaway probe test before the `budget`/
+    /// `usage` fields existed), i.e. genuine old events.
+    #[test]
+    fn an_old_journal_event_deserializes_with_the_new_fields_absent() {
+        let old_started = r#"{"RunStarted":{"version":"v1"}}"#;
+        let e: JournalEvent =
+            serde_json::from_str(old_started).expect("old RunStarted still loads");
+        match e {
+            JournalEvent::RunStarted { budget, .. } => assert!(budget.is_none()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let old_recorded = r#"{"EffectRecorded":{"node":"n1","effect_id":"02e75a6544f3138fc1819276dc04aebeffe74eaf2fe8d4be23265db5cc84cfe3","class":"Pure","input_hash":"h","seq":0,"output":{"Inline":null},"observation":null}}"#;
+        let e: JournalEvent =
+            serde_json::from_str(old_recorded).expect("old EffectRecorded still loads");
+        match e {
+            JournalEvent::EffectRecorded { usage, .. } => assert!(usage.is_none()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_budget_round_trips_through_the_journal() {
+        let e = JournalEvent::RunStarted {
+            version: "v1".into(),
+            budget: Some(crate::budget::TokenBudget {
+                total_tokens: 50_000,
+            }),
+        };
+        let s = serde_json::to_string(&e).expect("serializes");
+        let back: JournalEvent = serde_json::from_str(&s).expect("round-trips");
+        match back {
+            JournalEvent::RunStarted {
+                budget: Some(b), ..
+            } => {
+                assert_eq!(b.total_tokens, 50_000)
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn journal_event_roundtrips() {
         let e = JournalEvent::EffectRecorded {
@@ -243,6 +309,7 @@ mod tests {
             seq: 1,
             output: EffectOutput::Inline(serde_json::json!({"text":"hi"})),
             observation: None,
+            usage: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: JournalEvent = serde_json::from_str(&s).unwrap();
@@ -277,6 +344,7 @@ mod tests {
             seq: 0,
             output: EffectOutput::Inline(serde_json::json!({"x":1})),
             observation: Some(obs),
+            usage: None,
         };
         assert!(matches!(
             serde_json::from_str::<JournalEvent>(&serde_json::to_string(&rec).unwrap()).unwrap(),

@@ -1248,6 +1248,8 @@ mod tests {
     fn started() -> JournalEvent {
         JournalEvent::RunStarted {
             version: "v1".into(),
+            // SP-DATA-5: this store test doesn't exercise a budget.
+            budget: None,
         }
     }
 
