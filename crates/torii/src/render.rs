@@ -1,7 +1,9 @@
 //! Operator output: a human table by default, `--json` for scripting.
 
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Utc};
-use orchestrator_core::ScheduledRun;
+use orchestrator_core::{PatternRedactor, Redactor, ScheduledRun};
 
 /// A NULL `next_wake` means "never auto-woken; needs `torii run wake`" (the s3
 /// in-doubt class). It renders as an em dash in the table and `null` in JSON.
@@ -29,6 +31,72 @@ pub(crate) fn one_line(s: &str) -> String {
         .collect()
 }
 
+/// Built once (SP-DATA-4.1 task 2) — `PatternRedactor::default()` compiles a regex
+/// set, which is not free to redo per row.
+static REASON_REDACTOR: LazyLock<PatternRedactor> = LazyLock::new(PatternRedactor::default);
+
+/// A pause reason is `ScheduledRun.reason`: free text lifted from `PauseInfo.reason`
+/// and provider messages (SP-DATA-3), stored UNREDACTED — the SP-4 s2 `Redactor`
+/// covers effect outputs and model output, not pause reasons, and torii is the first
+/// thing to DISPLAY them. Scrub here, at display time, not at write time in the
+/// scheduler: write-time would mean injecting a `Redactor` into `Scheduler` and
+/// changing what lands in durable storage, which is a larger question about the
+/// redactor's coverage and touches the determinism reasoning s2 was careful about.
+/// Display-time closes the exposure torii itself introduces, costs nothing, and
+/// leaves the durable row truthful. **The durable `scheduled_runs.reason` column
+/// still holds the raw, unredacted text** — anyone querying Postgres directly is
+/// still exposed; that residue is a recorded carry-forward, not fixed by this.
+///
+/// `Redactor::redact` operates on `serde_json::Value`, not `&str`, so a plain string
+/// is wrapped and unwrapped around the call.
+fn redact_reason(s: &str) -> String {
+    match REASON_REDACTOR.redact(&serde_json::Value::String(s.to_string())) {
+        serde_json::Value::String(out) => out,
+        other => {
+            unreachable!("redacting a Value::String must yield a Value::String, got {other:?}")
+        }
+    }
+}
+
+/// Rendered reasons are capped so one unbounded provider message can't wreck the
+/// table's column alignment or scroll an operator's terminal off-screen.
+const REASON_MAX: usize = 300;
+
+/// The table-display transform for a reason: redact, THEN collapse control
+/// characters (`one_line`), THEN cap length.
+///
+/// Order, and what was checked rather than assumed: redact-before-collapse looks
+/// like the obviously safer order on its face — collapse-first could in principle
+/// glue two halves of a newline-split secret into a form that no longer matches a
+/// pattern that only fires on the concatenated text (or, less intuitively, the
+/// reverse: collapsing could join two halves the pattern DOES then match). Checked
+/// against `PatternRedactor`'s actual patterns (`crates/orchestrator-core/src/redact.rs`):
+/// every whole-match pattern is a contiguous character class — `[A-Za-z0-9_-]` and
+/// siblings — that excludes BOTH raw control characters and the space `one_line`
+/// replaces them with, so a secret split across an embedded newline fails to match
+/// EITHER before or after collapsing; the assignment-form pattern's value group
+/// (`[^\s"',&;]{6,}`) excludes whitespace outright for the same reason. The one
+/// pattern that spans newlines on purpose — the PEM private-key block, `[\s\S]*?` —
+/// matches a run of spaces exactly as it matches a run of newlines, so it too is
+/// order-independent. So for this redactor's current pattern set, the two orders are
+/// provably equivalent on the "split secret" scenario. Redact-first is still the
+/// order used below: it is the safer default in general, it costs nothing here, and
+/// it does not depend on today's patterns staying exactly this narrow if more are
+/// added later.
+fn safe_reason(s: &str) -> String {
+    let redacted = redact_reason(s);
+    let collapsed = one_line(&redacted);
+    if collapsed.chars().count() <= REASON_MAX {
+        collapsed
+    } else {
+        // Cap in CHARACTERS, not bytes: a byte-offset slice through a multi-byte
+        // character (anything outside ASCII) would panic at the split point.
+        let mut truncated: String = collapsed.chars().take(REASON_MAX).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
 pub fn table(rows: &[ScheduledRun]) -> String {
     let mut s = String::from(
         "RUN                                   STATUS     NEXT WAKE             REASON\n",
@@ -39,14 +107,30 @@ pub fn table(rows: &[ScheduledRun]) -> String {
             r.run.0,
             r.status.as_str(),
             fmt_wake(r.next_wake),
-            r.reason.as_deref().map(one_line).unwrap_or_default()
+            r.reason.as_deref().map(safe_reason).unwrap_or_default()
         ));
     }
     s
 }
 
+/// JSON keeps the exact stored text otherwise — that is the existing `one_line`
+/// precedent, deliberately NOT applied here, because a script consuming `--json`
+/// wants the raw value and a newline is a display-only concern. A secret is
+/// different: a script should not receive a credential either, so redaction (only —
+/// no control-character collapse, no length cap, both of which stay display-only
+/// concerns) applies on this path too. Rows are mapped through a redacted COPY
+/// before serializing rather than post-processing the serialized JSON string, which
+/// would be fragile and could corrupt escaping around the value it just rewrote.
 pub fn json(rows: &[ScheduledRun]) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(rows)
+    let redacted: Vec<ScheduledRun> = rows
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            r.reason = r.reason.map(|reason| redact_reason(&reason));
+            r
+        })
+        .collect();
+    serde_json::to_string_pretty(&redacted)
 }
 
 #[cfg(test)]
@@ -149,6 +233,45 @@ mod tests {
             !out.contains("\"Paused\""),
             "PascalCase would break scripts: {out}"
         );
+    }
+
+    #[test]
+    fn a_pause_reason_is_redacted_before_display() {
+        let secret = format!("sk-{}", "A".repeat(24));
+        let mut r = row(None, Some(&format!("quota exceeded for {secret}")));
+        let out = table(&[r.clone()]);
+        assert!(
+            !out.contains(&secret),
+            "a secret-shaped reason leaked: {out}"
+        );
+        assert!(out.contains("[REDACTED]"), "{out}");
+
+        r.reason = Some(format!("quota exceeded for {secret}"));
+        let j = json(&[r]).expect("serializes");
+        assert!(!j.contains(&secret), "the JSON path leaked: {j}");
+    }
+
+    #[test]
+    fn an_overlong_pause_reason_is_capped() {
+        let long = "x".repeat(5_000);
+        let out = table(&[row(None, Some(&long))]);
+        let line = out.lines().nth(1).expect("a data row");
+        assert!(
+            line.len() < 400,
+            "an unbounded reason wrecks the table: {} chars",
+            line.len()
+        );
+        assert!(out.contains('…'), "truncation must be visible: {out}");
+    }
+
+    /// The cap must count CHARACTERS, not bytes — a naive byte-boundary slice through
+    /// a multi-byte character panics. Every char here is 3 bytes (`€`), so a byte cap
+    /// at 300 would land mid-character.
+    #[test]
+    fn the_cap_counts_characters_not_bytes_so_multibyte_reasons_do_not_panic() {
+        let long = "€".repeat(500);
+        let out = table(&[row(None, Some(&long))]);
+        assert!(out.contains('…'), "truncation must be visible: {out}");
     }
 
     #[test]
