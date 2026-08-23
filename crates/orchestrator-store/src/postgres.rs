@@ -1394,6 +1394,7 @@ mod tests {
                 status: ChildStatus::Ok,
                 digest: Some(Digest("abc".into())),
                 input_hash: Some("h".into()),
+                usage: None,
             }],
         };
         j.compact(r, &[s1, s2], manifest).await.unwrap();

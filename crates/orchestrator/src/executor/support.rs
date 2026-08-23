@@ -136,10 +136,23 @@ pub(crate) fn fold_journal(
             }
             JournalEvent::MapCompacted { node, children } => {
                 for c in children {
+                    let child = NodeId(format!("{}/{}", node.0, c.index));
+                    // SP-DATA-5: the compacted child's spend re-enters the ledger
+                    // under the SAME key its deleted `EffectRecorded` used —
+                    // `effect_id(child, 0, 0)`, exactly the id the memo below
+                    // reconstructs. Keying (rather than accumulating) is what keeps
+                    // folding idempotent: fold the same `MapCompacted` twice and the
+                    // second `insert` overwrites the first, so it counts ONCE; and if
+                    // a child's own record somehow survived alongside the manifest,
+                    // the identical key still counts it once rather than twice. This
+                    // is the same argument that makes `EffectRecorded`'s own
+                    // `usage.insert` safe against a duplicate `Confirmed` reconcile.
+                    if let Some(u) = c.usage {
+                        fold.usage.insert(effect_id(&child.0, 0, 0), u);
+                    }
                     if c.status == ChildStatus::Ok
                         && let (Some(digest), Some(input_hash)) = (&c.digest, &c.input_hash)
                     {
-                        let child = NodeId(format!("{}/{}", node.0, c.index));
                         let output = EffectOutput::Ref(ContentRef {
                             digest: digest.clone(),
                             size: 0,
@@ -469,6 +482,82 @@ mod tests {
         };
         let (fold, _, _) = fold_journal(&[mk("a", 100, 0), mk("b", 250, 1)]);
         assert_eq!(fold.spent(), 350);
+    }
+
+    /// The compacted-spend analogue of `duplicate_effect_records_count_their_usage_only_once`.
+    /// A `MapCompacted` folded TWICE (or folded alongside a surviving child record)
+    /// must count each child once: the manifest re-enters the ledger under the child's
+    /// ORIGINAL effect id, so the `HashMap` key does the deduping — not a running sum.
+    #[test]
+    fn a_map_compacted_manifest_counts_its_children_once_however_often_it_is_folded() {
+        use orchestrator_core::{
+            ChildStatus, CompactChild, Digest, EffectClass, JournalEvent, NodeId, TokenUsage,
+        };
+        let child = |index: usize, total: u32| CompactChild {
+            index,
+            status: ChildStatus::Ok,
+            digest: Some(Digest("d".into())),
+            input_hash: Some("h".into()),
+            usage: Some(TokenUsage {
+                input_tokens: 0,
+                output_tokens: total,
+                total_tokens: total,
+            }),
+        };
+        let manifest = || JournalEvent::MapCompacted {
+            node: NodeId("m".into()),
+            children: vec![child(0, 100), child(1, 200)],
+        };
+        // A child record that outlived compaction: same effect id as the manifest's
+        // entry for index 0, so it must not be counted a second time.
+        let survivor = JournalEvent::EffectRecorded {
+            node: NodeId("m/0".into()),
+            effect_id: effect_id("m/0", 0, 0),
+            class: EffectClass::Pure,
+            input_hash: "h".into(),
+            seq: 0,
+            output: EffectOutput::Inline(serde_json::Value::Null),
+            observation: None,
+            usage: Some(TokenUsage {
+                input_tokens: 0,
+                output_tokens: 100,
+                total_tokens: 100,
+            }),
+        };
+        let (fold, _, _) = fold_journal(&[(0, manifest())]);
+        assert_eq!(fold.spent(), 300, "each compacted child counts once");
+        let (twice, _, _) = fold_journal(&[(0, manifest()), (1, manifest())]);
+        assert_eq!(
+            twice.spent(),
+            300,
+            "folding the manifest twice is idempotent"
+        );
+        let (mixed, _, _) = fold_journal(&[(0, survivor), (1, manifest())]);
+        assert_eq!(
+            mixed.spent(),
+            300,
+            "a surviving child record and its manifest entry share one effect id"
+        );
+    }
+
+    /// Additivity for the new `CompactChild.usage` field: a `MapCompacted` serialized
+    /// BEFORE it existed still deserializes and folds exactly as it always did —
+    /// memo rebuilt, spend zero (those children's tokens are already gone; the fix
+    /// cannot invent them, and pretending otherwise would be worse than reporting a
+    /// short ledger for a pre-fix run).
+    #[test]
+    fn a_pre_fix_map_compacted_without_usage_still_deserializes_and_folds() {
+        use orchestrator_core::JournalEvent;
+        let json = r#"{"MapCompacted":{"node":"m","children":[
+            {"index":0,"status":"Ok","digest":"abc","input_hash":"h"}]}}"#;
+        let event: JournalEvent = serde_json::from_str(json).expect("old manifest deserializes");
+        let (fold, last, _) = fold_journal(&[(0, event)]);
+        assert_eq!(fold.spent(), 0, "no usage recorded ⇒ no usage folded");
+        assert!(
+            fold.memo.contains_key(&effect_id("m/0", 0, 0))
+                && last.contains_key(&NodeId("m/0".into())),
+            "the memo rebuild is untouched by the added field"
+        );
     }
 
     #[test]

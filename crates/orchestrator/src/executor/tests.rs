@@ -12617,6 +12617,194 @@ async fn a_budgeted_nested_loop_over_a_subgraph_map_does_not_deadlock_on_the_gat
     assert_eq!((spent, budget), (40, Some(10_000)));
 }
 
+// ---- Whole-slice review, Critical 2: compaction must not erase the children's spend ----
+//
+// `compact_map` collects a completed Map's child `EffectRecorded` seqs into
+// `remove_seqs` and REALLY deletes them (both journal impls do), replacing them with
+// a `MapCompacted` manifest. Before the fix `CompactChild` carried no `usage`, so a
+// `Consolidate` over a `ModelCall` Map deleted that Map's spend from the durable
+// ledger permanently — and the next drive folded a base short by exactly the
+// children's tokens, which is the "in-memory counter restarts at zero" failure this
+// slice exists to prevent, wearing a different hat.
+
+/// A Map(3) + Consolidate with a CAS wired, so the Consolidate triggers compaction.
+/// Every one of the 4 calls spends 100 tokens; the durable ledger must still read 400
+/// AFTER the children's records are gone.
+///
+/// *Mutation:* stop populating `CompactChild.usage` (or stop summing it in
+/// `fold_journal`'s `MapCompacted` arm) and this fails with a ledger of 100 — the
+/// Consolidate's own spend and nothing else.
+#[tokio::test]
+async fn compaction_preserves_the_map_children_spend_in_the_ledger() {
+    use orchestrator_store::InMemoryContentStore;
+    let (gateway, calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
+        input_tokens: 60,
+        output_tokens: 40,
+        total_tokens: 100,
+    }))
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["i0", "i1", "i2"]),
+                    concurrency: 4,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("cons".into()),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::soft("m")],
+            },
+        ],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_content_store(Arc::new(InMemoryContentStore::new()))
+        .with_cas_threshold(8);
+    let out = exec.run(run, &graph).await.expect("drives");
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    assert_eq!(calls.lock().unwrap().len(), 4, "3 children + 1 synthesis");
+
+    let events = journal.load(run).await.unwrap();
+    // The premise: compaction really happened and really removed the child records.
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::MapCompacted { .. })),
+        "the Consolidate must have compacted the Map, or this test proves nothing"
+    );
+    assert!(
+        !events.iter().any(|(_, e)| matches!(
+            e,
+            JournalEvent::EffectRecorded { node, .. } if node.0.starts_with("m/")
+        )),
+        "the children's EffectRecorded really are gone — their spend has nowhere \
+         else to live but the manifest"
+    );
+
+    let (spent, _) = crate::spend_of(&events);
+    assert_eq!(
+        spent, 400,
+        "compaction must carry the children's 300 tokens onto the manifest, not drop them"
+    );
+}
+
+/// The consequence the reviewer measured, end to end: with the children's spend
+/// erased, a budgeted run's SECOND drive folds a short base and blows through the cap
+/// with no operator action and nothing loud in the journal.
+///
+/// Map(3) + Consolidate + 2 tail nodes at 150/call under a 700-token cap. Serialised
+/// (Critical 1's gate), the first drive spends 150·5 = 750 and pauses at the node
+/// after the cap is met. Compaction then removes 450 of it. Before the fix the resumed
+/// drive read a base of 300, dispatched the rest, and the run COMPLETED at 1050 real
+/// tokens against a 700 cap. After the fix the resume re-pauses at the same ledger.
+#[tokio::test]
+async fn a_compacted_map_cannot_let_a_budgeted_run_overshoot_across_drives() {
+    use orchestrator_store::InMemoryContentStore;
+    let usage = kernel::types::cost::TokenUsage {
+        input_tokens: 100,
+        output_tokens: 50,
+        total_tokens: 150,
+    };
+    let content = Arc::new(InMemoryContentStore::new());
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["i0", "i1", "i2"]),
+                    concurrency: 4,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("cons".into()),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::soft("m")],
+            },
+            Node {
+                id: NodeId("t1".into()),
+                kind: model_call("c", "t1"),
+                deps: vec![Dep::hard("cons")],
+            },
+            Node {
+                id: NodeId("t2".into()),
+                kind: model_call("c", "t2"),
+                deps: vec![Dep::hard("t1")],
+            },
+        ],
+    };
+
+    // Drive 1: a fresh budgeted run.
+    let (gw1, calls1) = metered_gateway(Some(usage.clone())).await;
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_content_store(content.clone())
+        .with_cas_threshold(8)
+        .run_budgeted(
+            run,
+            &graph,
+            Some(orchestrator_core::TokenBudget { total_tokens: 700 }),
+        )
+        .await
+        .expect("drives");
+    assert!(out1.paused.is_some(), "the cap must stop drive 1");
+    let spent_live = calls1.lock().unwrap().len() as u64 * 150;
+    assert_eq!(
+        spent_live, 750,
+        "5 serialised calls escape before the cap is met"
+    );
+    assert_eq!(
+        crate::spend_of(&journal.load(run).await.unwrap()).0,
+        spent_live,
+        "the DURABLE ledger must equal what was really spent, compaction or not"
+    );
+
+    // Drive 2: a plain worker tick, exactly as the scheduler would issue it.
+    let (gw2, calls2) = metered_gateway(Some(usage.clone())).await;
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_content_store(content.clone())
+        .with_cas_threshold(8)
+        .start(run, &graph)
+        .await
+        .expect("drives");
+    assert_eq!(
+        calls2.lock().unwrap().len(),
+        0,
+        "the resumed drive is already over cap and must spend NOTHING"
+    );
+    assert!(
+        out2.paused.is_some() && out2.completed.iter().all(|n| n.0 != "t2"),
+        "the run must stay paused, not complete past its cap: {out2:?}"
+    );
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a run that has blown its cap must never report RunCompleted"
+    );
+    assert_eq!(crate::spend_of(&events).0, 750);
+}
+
 // ============================= SP-DATA-3 scheduler driver =====================
 
 /// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded
