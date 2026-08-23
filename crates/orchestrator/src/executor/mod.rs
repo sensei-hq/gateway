@@ -163,13 +163,25 @@ struct Fold {
     /// The effective cap: `RunStarted.budget`, then the latest `BudgetRaised` (latest
     /// wins). `None` for an unbudgeted run — the gate never fires.
     budget: Option<u64>,
+    /// SP-DATA-5: tokens dispatched by THIS drive, not yet visible in `usage`.
+    ///
+    /// A `Fold` is built once per drive (from the journal on resume, or empty-but-for-
+    /// the-budget on a fresh run) and shared as `&Fold` by every node, so `usage` alone
+    /// is a snapshot of the ledger as it stood when the drive STARTED. Without this
+    /// counter the gate re-reads that same frozen number before every call — and a
+    /// freshly submitted run, whose journaled spend is 0 by definition, would never gate
+    /// at all. Interior-mutable (and shared with a `Map`'s concurrent children) because
+    /// the fold is handed out immutably; see [`dispatch::Meter`] for the ordering
+    /// rationale.
+    live_spend: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Fold {
-    /// Total tokens this run has spent, folded from the journal. Idempotent across
-    /// any number of resumes because it sums over effect ids (`usage`'s keys), never
-    /// over raw events.
-    fn spent(&self) -> u64 {
+    /// Tokens this run had spent as of the journal this fold was built from.
+    ///
+    /// Idempotent across any number of resumes because it sums over effect ids
+    /// (`usage`'s keys), never over raw events.
+    fn journaled_spend(&self) -> u64 {
         // `saturating_add` is deliberate and is the ONE place saturation is right
         // here: overflowing `u64` from summed `u32` token counts needs ~4 billion
         // maximal effects, and saturating HIGH makes the gate MORE conservative (it
@@ -181,9 +193,25 @@ impl Fold {
             .fold(0u64, |acc, t| acc.saturating_add(t))
     }
 
+    /// Total tokens this run has spent: journaled + in-flight this drive.
+    ///
+    /// The in-flight half is zero at the start of every drive and is subsumed into the
+    /// journaled half by the next fold, so the two can never double-count one call.
+    fn spent(&self) -> u64 {
+        self.journaled_spend()
+            .saturating_add(self.live_spend.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// The run's effective token cap, or `None` if unbudgeted.
     fn budget(&self) -> Option<u64> {
         self.budget
+    }
+
+    /// This fold's ledger as the metered-dispatch chokepoint consumes it. Borrowing the
+    /// live counter (rather than copying two scalars out) is what lets spend accumulate
+    /// WITHIN a drive — see [`dispatch::Meter`].
+    fn meter(&self) -> dispatch::Meter<'_> {
+        dispatch::Meter::new(self.journaled_spend(), self.budget, &self.live_spend)
     }
 }
 
@@ -486,7 +514,16 @@ impl Executor {
             },
         )
         .await?;
-        let outcome = this.drive(run, graph, &Fold::default()).await?;
+        // SP-DATA-5: a FRESH run has nothing journaled to fold, so the cap has to be
+        // seeded into the fold by hand — `Fold::default()` alone would hand the drive
+        // `budget: None` and the gate could never fire on a run's first drive at all,
+        // however small the cap. (A resume gets the same value from `fold_journal`
+        // reading the `RunStarted` this call just appended, plus any `BudgetRaised`.)
+        let fold = Fold {
+            budget: budget.map(|b| b.total_tokens),
+            ..Default::default()
+        };
+        let outcome = this.drive(run, graph, &fold).await?;
         this.finalize_run(run, &outcome).await?;
         Ok(outcome)
     }
@@ -869,10 +906,7 @@ impl Executor {
                 let request = build_request(chain, payload);
                 // SP-DATA-5: the ModelCall producer routes through the single metered
                 // chokepoint — the budget gate cannot be bypassed here.
-                match self
-                    .dispatch_metered(&request, fold.spent(), fold.budget())
-                    .await
-                {
+                match self.dispatch_metered(&request, &fold.meter()).await {
                     Ok(Ok(response)) => {
                         // SP-4 s2: route through the shared redaction chokepoint so a
                         // ModelCall node whose model echoes a secret is scrubbed too.
