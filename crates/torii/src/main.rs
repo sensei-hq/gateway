@@ -61,9 +61,14 @@ enum RunAction {
         gateway_config: PathBuf,
         #[arg(long)]
         workspace_root: Option<PathBuf>,
-        /// SP-DATA-5: cap this run's total token spend. No default: an unbudgeted
-        /// run behaves exactly as before. `0` is rejected — see
-        /// `cmd::run::parse_budget_tokens`.
+        /// Stop this run once it has spent this many tokens, and pause it durably so
+        /// you can raise the cap with `run wake --budget-tokens N`.
+        ///
+        /// This is a floor trigger, not a hard ceiling: a call's output tokens are
+        /// unknowable until it returns, so the run can exceed the number by at most
+        /// one model call. Omit it and the run is unbudgeted, exactly as before.
+        /// A budgeted run runs its model calls one at a time, so a wide fan-out is
+        /// slower than an unbudgeted one. `0` is not a valid budget.
         #[arg(long, value_parser = cmd::run::parse_budget_tokens)]
         budget_tokens: Option<u64>,
     },
@@ -83,9 +88,12 @@ enum RunAction {
     /// Queue a paused run for the next worker tick
     Wake {
         run_id: String,
-        /// SP-DATA-5: raise (or lower) the run's token cap before waking it. Appended
-        /// to the journal as `BudgetRaised` BEFORE the wake is queued — see
-        /// `cmd::run::wake`'s doc comment for why the order is load-bearing.
+        /// Raise (or lower) the run's token cap before waking it — the way to restart
+        /// a run that stopped at its budget. Lowering it below what the run has
+        /// already spent is legitimate, and halts the run at its next model call.
+        //
+        // Recorded as `BudgetRaised` BEFORE the wake is queued; see `cmd::run::wake`'s
+        // doc comment for why that order is load-bearing.
         #[arg(long, value_parser = cmd::run::parse_budget_tokens)]
         budget_tokens: Option<u64>,
     },
