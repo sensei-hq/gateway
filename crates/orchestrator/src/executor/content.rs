@@ -6,6 +6,29 @@ use orchestrator_core::{ContentRef, EffectOutput, OrchestratorError};
 
 use super::Executor;
 
+/// SP-DATA-5: the single conversion from the gateway's reported usage
+/// (`kernel::types::cost::TokenUsage`) to the journal's local mirror
+/// (`orchestrator_core::TokenUsage`, defined without a `kernel` dependency —
+/// see Task 1). Lives beside `model_output`, the sibling OUTPUT-side
+/// chokepoint, because both exist so a new model-call producer picks up the
+/// conversion by construction rather than by remembering to copy it.
+///
+/// A free function, not a `From` impl: both types are foreign to this crate
+/// (`kernel::types::cost::TokenUsage` and `orchestrator_core::TokenUsage`), so
+/// `impl From<A> for B` here would violate the orphan rule — neither type is
+/// local to `orchestrator`. All four producers call
+/// `response.usage.map(convert_usage)`; a field added to the JOURNALED
+/// (`orchestrator_core`) side fails to compile HERE — one fix — instead of
+/// being silently dropped at three of the four call sites the way an inlined
+/// field-by-field copy would leave it.
+pub(super) fn convert_usage(u: kernel::types::cost::TokenUsage) -> orchestrator_core::TokenUsage {
+    orchestrator_core::TokenUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        total_tokens: u.total_tokens,
+    }
+}
+
 impl Executor {
     /// Split an effect output for the journal (§7.4): if a `ContentStore` is
     /// wired and the serialized output exceeds `cas_threshold`, `put` the bytes

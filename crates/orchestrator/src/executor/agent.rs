@@ -520,7 +520,10 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
-                        // SP-DATA-5 Task 4 threads real usage through the reconcile path.
+                        // SP-DATA-5: stays None — `output` comes from a reconciler
+                        // querying the provider's SIDE (`ReconcileOutcome::Confirmed`),
+                        // never from an `InferenceResponse`, so there is no usage to
+                        // thread here.
                         usage: None,
                     },
                 )
@@ -597,8 +600,8 @@ impl Executor {
                 seq: 0,
                 output: recorded,
                 observation: None,
-                // SP-DATA-5 Task 4 threads real usage through here; a denial never
-                // dispatches, so this will stay None.
+                // SP-DATA-5: stays None — a denial never dispatches, so there is no
+                // provider response to report usage from.
                 usage: None,
             },
         )
@@ -772,7 +775,9 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation,
-                        // SP-DATA-5 Task 4 threads real usage through here.
+                        // SP-DATA-5: stays None — this records a TOOL execution
+                        // (`self.tools.execute_ctx`), not a model call, so there is no
+                        // `InferenceResponse` in scope to report usage from.
                         usage: None,
                     },
                 )
@@ -836,9 +841,9 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
-                        // SP-DATA-5 Task 4 threads `response.usage` through here (this is
-                        // the ReAct-turn producer the design calls out).
-                        usage: None,
+                        // SP-DATA-5: the ReAct-turn producer — the real usage the
+                        // provider reported on this turn, converted at the boundary.
+                        usage: response.usage.map(super::content::convert_usage),
                     },
                 )
                 .await?;

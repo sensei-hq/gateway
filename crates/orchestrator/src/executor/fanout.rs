@@ -129,9 +129,9 @@ impl Executor {
                                     seq: 0,
                                     output: recorded,
                                     observation: None,
-                                    // SP-DATA-5 Task 4 threads real usage through the
-                                    // Consolidate producer.
-                                    usage: None,
+                                    // SP-DATA-5: the Consolidate producer — the real usage
+                                    // the provider reported, converted at the boundary.
+                                    usage: response.usage.map(super::content::convert_usage),
                                 },
                             )
                             .await?;
@@ -660,9 +660,9 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
-                        // SP-DATA-5 Task 4 threads real usage through the Map-item
-                        // producer.
-                        usage: None,
+                        // SP-DATA-5: the Map-item producer — the real usage the
+                        // provider reported, converted at the boundary.
+                        usage: response.usage.map(super::content::convert_usage),
                     },
                 )
                 .await?;

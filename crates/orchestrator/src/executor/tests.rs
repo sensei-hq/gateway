@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
     CallLog, content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
-    echo_system_gateway, failing_after_gateway, final_response, recording_gateway,
+    echo_system_gateway, failing_after_gateway, final_response, metered_gateway, recording_gateway,
     scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
@@ -12048,6 +12048,146 @@ async fn budget_gate_stops_the_consolidate_producer() {
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
     let out = exec.start(run, &graph).await.expect("drives");
     assert_budget_paused(&journal.load(run).await.unwrap(), &out, &calls, "cons");
+}
+
+// ============================= SP-DATA-5 Task 4: usage capture =================
+//
+// Task 3 built the `Refusal::Unmetered` chokepoint arm but left it untestable —
+// nothing set a budget until now. Task 4 owns proving both halves of the fail-
+// closed contract (budgeted ⇒ refuse; unbudgeted ⇒ untouched) AND that a real
+// `response.usage` actually lands on the journaled `EffectRecorded`.
+
+/// Fail closed: with a budget set, a provider that reports no usage is refused
+/// rather than spent blind (mirrors the sandbox/`shell`/fence precedent of never
+/// trusting an unenforceable boundary). `recording_gateway` always returns
+/// `usage: None`, so the very first call trips `Refusal::Unmetered` even though
+/// the budget itself is nowhere near exhausted (spent 0 < cap 100) — proving the
+/// refusal is about METERABILITY, not the cap.
+#[tokio::test]
+async fn an_unmetered_call_fails_the_node_when_a_budget_is_set() {
+    let (gateway, calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", "p1"),
+            deps: vec![],
+        }],
+    };
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the call DOES dispatch — the refusal fires only after the response comes back unmetered"
+    );
+    let (node, msg) = out
+        .failed
+        .expect("an unmetered call under a budget fails the node, it does not pause");
+    assert_eq!(node.0, "n1");
+    assert!(
+        msg.contains("unmetered model call") && msg.contains("'m'"),
+        "the failure names the model that reported no usage: {msg}"
+    );
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::NodeFailed { node, .. } if node.0 == "n1")),
+        "the refusal is journaled as a NodeFailed"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunPaused { .. })),
+        "an unmetered call is a hard failure, not the budget-exhausted pause"
+    );
+}
+
+/// The additivity guarantee: an unmetered response is invisible when no budget is
+/// set — every one of the 1312 baseline tests runs a gateway that always reports
+/// `usage: None`, and none of them may start failing because Task 4 exists.
+#[tokio::test]
+async fn an_unmetered_call_is_ignored_when_no_budget_is_set() {
+    let (gateway, calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", "p1"),
+            deps: vec![],
+        }],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.run(run, &graph).await.expect("drives");
+
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert!(out.failed.is_none(), "no budget ⇒ no gate ⇒ no refusal");
+    assert!(out.paused.is_none());
+    assert_eq!(out.completed, vec![NodeId("n1".into())]);
+    let events = journal.load(run).await.unwrap();
+    let usage = events.iter().find_map(|(_, e)| match e {
+        JournalEvent::EffectRecorded { node, usage, .. } if node.0 == "n1" => Some(*usage),
+        _ => None,
+    });
+    assert_eq!(
+        usage,
+        Some(None),
+        "unbudgeted + unmetered: the record exists and its usage stays None, byte-identical to pre-SP-DATA-5"
+    );
+}
+
+/// Usage reported by the provider reaches the journal, proven by reading the
+/// `EffectRecorded` event back — not by inspecting a call counter, which would
+/// pass even if the conversion silently dropped every field.
+#[tokio::test]
+async fn reported_usage_is_journaled_on_the_effect_record() {
+    let reported = kernel::types::cost::TokenUsage {
+        input_tokens: 30,
+        output_tokens: 70,
+        total_tokens: 100,
+    };
+    let (gateway, _calls) = metered_gateway(Some(reported.clone())).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", "p1"),
+            deps: vec![],
+        }],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.run(run, &graph).await.expect("drives");
+    assert!(out.failed.is_none() && out.paused.is_none());
+
+    let events = journal.load(run).await.unwrap();
+    let usage = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded { node, usage, .. } if node.0 == "n1" => Some(*usage),
+            _ => None,
+        })
+        .expect("n1's EffectRecorded is on the journal");
+    assert_eq!(
+        usage,
+        Some(orchestrator_core::TokenUsage {
+            input_tokens: 30,
+            output_tokens: 70,
+            total_tokens: 100,
+        }),
+        "the reported usage reached the journal through the boundary conversion, field for field"
+    );
 }
 
 // ============================= SP-DATA-3 scheduler driver =====================

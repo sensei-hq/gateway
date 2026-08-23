@@ -18,6 +18,7 @@ use kernel::types::capability::Capability;
 use kernel::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
 };
+use kernel::types::cost::TokenUsage;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse};
 use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload, ToolCall};
@@ -176,6 +177,64 @@ pub async fn recording_gateway() -> (Gateway, CallLog) {
 /// errors thereafter — the crash injector for the resume-without-re-spend test.
 pub async fn failing_after_gateway(succeed: usize) -> (Gateway, CallLog) {
     build_gateway(Some(succeed)).await
+}
+
+/// Chat adapter that behaves like [`RecordingAdapter`] (records + always succeeds)
+/// but reports the given `usage` on every response. SP-DATA-5: every OTHER double
+/// in this module hardcodes `usage: None` — so every existing test runs unmetered
+/// by construction (fine; none of them set a budget), but a test that wants to
+/// prove reported usage reaches the journal needs THIS double instead.
+pub struct MeteredAdapter {
+    calls: CallLog,
+    usage: Option<TokenUsage>,
+}
+
+impl Model for MeteredAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for MeteredAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt));
+        Ok(ChatResponse {
+            content: Some("canned-response".into()),
+            tool_calls: Vec::new(),
+            usage: self.usage.clone(),
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway on chain `"c"` whose adapter always succeeds and reports `usage` on
+/// every response (`None` reproduces the other doubles' unmetered behaviour, so a
+/// caller can also use this to exercise the additivity path explicitly).
+pub async fn metered_gateway(usage: Option<TokenUsage>) -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(MeteredAdapter {
+            calls: calls.clone(),
+            usage,
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
 }
 
 /// Chat adapter that replays a scripted queue of responses (one per turn), so a
