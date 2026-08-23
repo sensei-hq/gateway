@@ -156,26 +156,35 @@ everything else, **latest value wins**. It also leaves an audit trail in the jou
 moved. Lowering it below current spend is legitimate and is a reasonable way to halt a runaway run at
 its next call.
 
-> **STATUS — THIS SLICE IS NOT COMPLETE. Two demonstrated defects defeat the headline property.**
-> A whole-slice review reproduced both against live Postgres:
-> 1. **A concurrent `Map` fan-out passes the gate en masse.** Every child reads the ledger before any
->    sibling's response returns — a deterministic check-then-act, not a memory-ordering race. A Map no
->    wider than `min(map.concurrency, executor.concurrency)` (**default 8**) is not gated at all.
->    Measured: 6-item Map, cap 100 → 6 calls, 900 tokens, `Completed`, zero pauses.
-> 2. **Map compaction erases the children's spend.** `CompactChild` carries no `usage`, and compaction
->    removes the child `EffectRecorded` rows, so a `Consolidate` over a `ModelCall` Map deletes that
->    Map's spend from the ledger permanently. Measured: a run completed having spent 1050 against a
->    700 cap, with `torii run status` reporting 600 and no operator action taken.
+> **STATUS — the whole-slice review's two Criticals are CLOSED (§6.5a, §6.5b), and so is the
+> test-infrastructure defect that let them survive six tasks.**
 >
-> **§6.5's "overshoot bounded by at most one call" is therefore FALSE**, as is the same claim repeated
-> in the overview decision log and asserted inside the AC6 test docstring. The honest bound is: one
-> call per sequential path, and `min(map.concurrency, executor.concurrency)` per fan-out — with a
-> narrow Map not gated at all.
+> 1. **A concurrent `Map` fan-out passed the gate en masse** — a deterministic check-then-act, not a
+>    memory-ordering race. Measured before: 6-item Map, cap 100, 150/call → 6 calls, 900 tokens,
+>    `Completed`, zero pauses; a Map no wider than `min(map.concurrency, executor.concurrency)`
+>    (default 8) was not gated at all. After: **1 call, ledger 150, the whole Map pauses.** Fixed by
+>    serialising check→dispatch→charge under a 1-permit gate **when and only when a budget is set**
+>    (§6.5a), which buys the exact "one call" bound at the cost of fan-out throughput for budgeted
+>    runs. Unbudgeted runs keep full concurrency, asserted by call count *and* wall clock.
+> 2. **Map compaction erased the children's spend.** Measured before: Map(3) + Consolidate + 2 tail
+>    nodes at 150/call under a 700 cap — drive 1 really spent 750 but left a durable ledger of 300, a
+>    plain worker tick folded that short base, and the run **completed at 900 real tokens against a
+>    700 cap**, reporting 450, with no operator action and nothing loud in the journal. After: the
+>    ledger reads 750 after compaction, the resumed drive spends **nothing**, and the run never
+>    reports `RunCompleted`. Fixed by making the `MapCompacted` manifest spend-preserving (§6.5b).
 >
-> Root cause of why five tasks and their reviews missed both: **every gateway test double returns
-> without a suspension point**, so `join_all` degenerates to sequential execution and the gate looks
-> tight. A double that awaits, plus one end-to-end assertion that re-reads a fresh journal after each
-> producer, would have caught these and the Task 6 defect alike.
+> With both closed, §6.5's "overshoot bounded by at most one call" is true as built — including under
+> fan-out, which it was not before.
+>
+> **Root cause of why five tasks and their reviews missed both, now fixed first:** every gateway test
+> double returned without a suspension point, so a `Map`'s `join_all` degenerated to strictly
+> sequential execution and any concurrency defect was structurally invisible — the Critical 1
+> reproduction *passes* against the old doubles even with the bug present. `test_support` now carries
+> `metered_latency_gateway`/`LatencyMeteredAdapter`, which actually sleeps before responding, and its
+> doc comment says when to reach for it. The second half of the same root cause — **usage capture at
+> 3 of 4 producers had no test at all**, so mutating any of them to `usage: None` left the whole
+> workspace green including the PG e2e — is closed by one journal-re-reading test per producer (§7
+> AC8), each mutation-verified.
 
 ### 6.5 The gate is a floor-trigger, not a ceiling
 
@@ -283,11 +292,13 @@ the two new tests fail with the whole graph completed. Unbudgeted runs are unaff
 |---|---|
 | Unmetered call, budget set | `NodeFailed`, loud, names the provider |
 | Unmetered call, **no** budget | Unchanged; usage ignored; byte-identical |
-| Overshoot | Bounded by one call (§6.5) |
+| Overshoot | Bounded by one call (§6.5) — including under a `Map` fan-out, which requires §6.5a's serialisation |
 | Old journal | `usage: None` + `budget: None` ⇒ ungated and unmetered. **Verify** no `FORMAT_VERSION` bump is needed rather than assuming it |
 | `--budget-tokens 0` | Rejected at submit, consistent with `--interval 0s` and `TORII_POOL_SIZE=0` |
 | Sum overflow | `u64` **saturating** arithmetic. §7 originally specified *checked*; the implementation deliberately saturates, and the code's reasoning is the better one — saturating HIGH is conservative because it pauses the run, where wrapping could reset the ledger near zero and let it spend unbounded. Corrected here to match the code. |
 | Resume at/over budget | Pauses immediately without dispatching |
+| Spend lands **exactly** on the cap | Stops the run — the gate is `spent >= cap` (AC9) |
+| Compacted `Map` | Spend survives compaction (§6.5b); a pre-fix manifest folds to 0 and is not invented |
 
 **Acceptance criteria.** This slice has a history of tests that did not guard their line — five in
 SP-DATA-4 alone — so each of these names the mutation that must break it.
@@ -308,6 +319,26 @@ SP-DATA-4 alone — so each of these names the mutation that must break it.
   `scheduled_runs` table is shared across tests).
 - **AC7 — additivity.** No budget set anywhere ⇒ `cargo test --workspace` stays at **1302 passed /
   0 failed** plus the new tests, green with and without `DATABASE_URL` at default parallelism.
+- **AC8 — usage CAPTURE at each producer (review, Important).** One test per producer that dispatches
+  for real and then **re-reads the journal**, asserting `EffectRecorded.usage` is `Some(..)` with the
+  right total. *Mutation:* set `usage: None` at each of the four in turn; each must fail its own test.
+  This is a distinct axis from AC2 — AC2's tests resume from a seeded journal and never dispatch, and
+  §6.6's tests watch the live meter, which charges independently of what is journaled. Before AC8,
+  mutating three of the four left the entire workspace green.
+- **AC9 — the `spent == cap` boundary (review, Minor).** A run landing exactly on its cap stops.
+  *Mutation:* `spent >= cap` → `spent > cap`; this must fail. Every other budget test overshoots
+  strictly, so before AC9 that mutation was invisible.
+- **AC10 — fan-out gating and the concurrency trade (review, Critical 1).** A budgeted 6-item Map at
+  concurrency 6 makes exactly ONE call and pauses; an unbudgeted one makes six and stays concurrent
+  (asserted by call count and wall clock). Both must use a double **with a suspension point** —
+  against a non-awaiting double the first test passes even with the defect present. Plus: a budgeted
+  `Loop` → `Subgraph` → `Map` → `Consolidate` under a timeout, proving the gate cannot deadlock
+  through nesting.
+- **AC11 — compaction is spend-preserving (review, Critical 2).** A `Consolidate` over a `ModelCall`
+  Map keeps the children's tokens in the ledger, and a resumed budgeted run cannot complete past its
+  cap on a short base. *Mutations:* stop populating `CompactChild.usage`, or stop summing it in the
+  fold; both must fail. Plus the idempotency guard — one `MapCompacted` folded twice, or alongside a
+  surviving child record, counts each child once.
 
 ## 8. Deferred / carry-forward
 
