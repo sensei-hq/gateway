@@ -12,10 +12,33 @@ use orchestrator_core::{
 };
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
-/// Connect a pool to `database_url` (the dbd-applied `orchestrator.*` schema must exist).
+/// Connect a pool to `database_url` (the dbd-applied `orchestrator.*` schema must exist),
+/// capped at 8 connections.
+///
+/// 8 was chosen (SP-DATA-1) for a world where each Postgres-backed adapter
+/// (`PostgresJournal`/`PostgresContentStore`/`PostgresContextStore`/`PostgresSchedulerStore`/
+/// `PostgresConfigSource`) opened its OWN pool — 8 connections per adapter, comfortably
+/// inside a default Postgres's headroom. SP-DATA-4 then made every adapter in a worker
+/// process share ONE pool (`boot::heavy`/`boot::light`) specifically to avoid four (or
+/// five) separate 8-connection pools per worker, so that default is now the WORKER's
+/// entire connection budget, not one adapter's. Most workers are still fine at 8 — the
+/// journal/CAS/context acquires are short-lived — but a worker under sustained
+/// concurrency, or a fleet of several workers against one Postgres, may want more. Use
+/// [`connect_with_max`] for that; `connect` keeps this default for its many existing
+/// callers, so behaviour is unchanged unless a caller opts in.
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    connect_with_max(database_url, DEFAULT_MAX_CONNECTIONS).await
+}
+
+/// The default [`connect`] delegates to — see its doc comment.
+const DEFAULT_MAX_CONNECTIONS: u32 = 8;
+
+/// Connect a pool to `database_url`, capped at `max` connections. See [`connect`]'s doc
+/// comment for why the default is 8 and when a caller might want more (e.g. torii's
+/// `TORII_POOL_SIZE`, wired in `crates/torii/src/boot.rs`).
+pub async fn connect_with_max(database_url: &str, max: u32) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(max)
         .connect(database_url)
         .await
 }

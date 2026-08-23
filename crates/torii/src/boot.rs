@@ -11,19 +11,36 @@ use orchestrator::{Executor, Scheduler};
 use orchestrator_core::{Clock, PatternRedactor, RegistryHandle, SystemClock};
 use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
-    PostgresSchedulerStore, connect,
+    PostgresSchedulerStore, connect_with_max,
 };
 use std::path::Path;
 use std::sync::Arc;
 
 pub const ENV_DATABASE_URL: &str = "DATABASE_URL";
 pub const ENV_FENCE_VERSION: &str = "TORII_FENCE_VERSION";
+pub const ENV_POOL_SIZE: &str = "TORII_POOL_SIZE";
+
+/// [`connect_with_max`]'s own default, restated here as the fallback when
+/// `TORII_POOL_SIZE` is unset — see that function's doc comment for why 8.
+const DEFAULT_POOL_SIZE: u32 = 8;
+
+/// A sanity ceiling on `TORII_POOL_SIZE`, not an operational policy. Postgres's own
+/// out-of-the-box `max_connections` is 100 (roughly 97 usable once superuser/replication
+/// reservations are subtracted — see `boot::heavy`'s pool-sharing comment); no single
+/// worker process legitimately needs a pool anywhere near that on its own, let alone
+/// past it. This exists purely to catch a fat-fingered value (an extra digit, a copy-paste
+/// of the wrong env var) at boot instead of at a confusing connection-limit error deep in
+/// a run. It is deliberately generous — high enough that it never second-guesses a real
+/// operator's tuning of a fleet against a beefier Postgres — so it rejects that class of
+/// certain-mistake without trying to enforce a capacity policy this code cannot know.
+const MAX_POOL_SIZE: u32 = 1000;
 
 /// The validated environment. `fence_version` is only required by the heavy tier.
 #[derive(PartialEq)]
 pub struct EnvConfig {
     pub database_url: String,
     pub fence_version: Option<String>,
+    pub pool_size: u32,
 }
 
 /// Manual, NOT derived: `#[derive(Debug)]` would put the plaintext database
@@ -36,8 +53,35 @@ impl std::fmt::Debug for EnvConfig {
         f.debug_struct("EnvConfig")
             .field("database_url", &redact_url(&self.database_url))
             .field("fence_version", &self.fence_version)
+            .field("pool_size", &self.pool_size)
             .finish()
     }
+}
+
+/// Parse `TORII_POOL_SIZE`, mirroring `cmd::worker::parse_interval`'s discipline: reject
+/// anything that isn't a plain positive integer, loudly and with the offending value
+/// echoed back. A zero-size pool cannot serve any connection, and anything past
+/// [`MAX_POOL_SIZE`] is treated as a typo rather than an intentional value — see its doc
+/// comment.
+fn parse_pool_size(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    let v: u32 = s
+        .parse()
+        .map_err(|_| format!("invalid {ENV_POOL_SIZE} {s:?}: {s:?} is not a whole number"))?;
+    if v == 0 {
+        return Err(format!(
+            "invalid {ENV_POOL_SIZE} {s:?}: a zero-size pool cannot serve any connection"
+        ));
+    }
+    if v > MAX_POOL_SIZE {
+        return Err(format!(
+            "invalid {ENV_POOL_SIZE} {s:?}: exceeds the sanity ceiling of {MAX_POOL_SIZE} \
+             (almost certainly a typo) — Postgres's own default max_connections is 100, so a \
+             single worker process asking for a pool anywhere near {MAX_POOL_SIZE} is not a \
+             realistic tuning value"
+        ));
+    }
+    Ok(v)
 }
 
 /// Validate the environment through an injected getter, so tests never mutate
@@ -53,9 +97,14 @@ pub fn env_config_from(get: impl Fn(&str) -> Option<String>) -> Result<EnvConfig
             ))
         })?;
     let fence_version = get(ENV_FENCE_VERSION).filter(|s| !s.trim().is_empty());
+    let pool_size = match get(ENV_POOL_SIZE).filter(|s| !s.trim().is_empty()) {
+        Some(raw) => parse_pool_size(&raw).map_err(CliError::error)?,
+        None => DEFAULT_POOL_SIZE,
+    };
     Ok(EnvConfig {
         database_url,
         fence_version,
+        pool_size,
     })
 }
 
@@ -254,7 +303,7 @@ fn light_from_pool(pool: sqlx::PgPool) -> LightDeps {
 }
 
 pub async fn light(env: &EnvConfig) -> Result<LightDeps, CliError> {
-    let pool = connect(&env.database_url)
+    let pool = connect_with_max(&env.database_url, env.pool_size)
         .await
         .map_err(|e| CliError::error(connect_failure(&env.database_url, &e.to_string())))?;
     Ok(light_from_pool(pool))
@@ -290,17 +339,18 @@ pub async fn heavy(
         serde_json::from_str(&raw).map_err(|e| gateway_config_parse_error(gateway_config, &e))?;
 
     // ONE shared pool for the whole heavy tier: `PgPool` is `Pool<DB>(Arc<PoolInner>)`,
-    // so cloning it is an `Arc::clone`, not a new connection. One `connect()` + N
-    // clones caps the whole tier at its single `max_connections(8)`; four separate
-    // `connect()` calls (this function's original shape) would each hold their own
-    // 8, up to 32 backends per worker process. Tradeoff: the four Postgres adapters
-    // now contend over 8 connections total instead of 8 each — with the executor's
-    // default concurrency of 8 and short-lived journal/CAS acquires that should be
-    // fine. If it ever isn't, the correct lever is a pool-size parameter on
-    // `connect()` — currently hardcoded in orchestrator-store, a deliberate
-    // SP-DATA-1 deferral, not something to change here.
+    // so cloning it is an `Arc::clone`, not a new connection. One `connect_with_max()`
+    // + N clones caps the whole tier at its single `max_connections(env.pool_size)`;
+    // four separate `connect()` calls (this function's original shape) would each
+    // hold their own, up to 4x as many backends per worker process. Tradeoff: the
+    // four Postgres adapters contend over `env.pool_size` connections total instead
+    // of that many each — with the executor's default concurrency of 8 and
+    // short-lived journal/CAS acquires, the default of 8 should be fine for most
+    // workers. If it ever isn't, the lever is `TORII_POOL_SIZE` (see
+    // `env_config_from` / `orchestrator_store::postgres::connect`'s doc comment for
+    // why 8 was the original default and what a shared-pool worker should weigh).
     let url = &env.database_url;
-    let pool = connect(url)
+    let pool = connect_with_max(url, env.pool_size)
         .await
         .map_err(|e| CliError::error(connect_failure(url, &e.to_string())))?;
     let light = light_from_pool(pool.clone());
@@ -402,6 +452,11 @@ pub async fn heavy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only this probe test connects unconditionally (production code goes through
+    // `connect_with_max` so `env.pool_size` is honored) — imported here, not at module
+    // scope, so a non-test build of this lib (linked into `main.rs`) doesn't carry an
+    // unused import.
+    use orchestrator_store::postgres::connect;
 
     fn getter<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| {
@@ -424,6 +479,77 @@ mod tests {
         let e = env_config_from(getter(&[(ENV_DATABASE_URL, "postgres://h/db")])).expect("ok");
         assert_eq!(e.database_url, "postgres://h/db");
         assert_eq!(e.fence_version, None);
+    }
+
+    // ---- SP-DATA-4.1 Task 5: TORII_POOL_SIZE -----------------------------------------------
+
+    /// Absent `TORII_POOL_SIZE` must fall back to `connect()`'s own default (8), not some
+    /// independently-chosen torii constant — the two must never drift apart silently.
+    #[test]
+    fn an_absent_pool_size_defaults_to_eight() {
+        let e = env_config_from(getter(&[(ENV_DATABASE_URL, "postgres://h/db")])).expect("ok");
+        assert_eq!(e.pool_size, 8);
+    }
+
+    #[test]
+    fn a_valid_pool_size_is_accepted() {
+        let e = env_config_from(getter(&[
+            (ENV_DATABASE_URL, "postgres://h/db"),
+            (ENV_POOL_SIZE, "16"),
+        ]))
+        .expect("ok");
+        assert_eq!(e.pool_size, 16);
+    }
+
+    /// A zero-size pool cannot serve any connection — reject it loudly rather than let
+    /// `PgPoolOptions` fail obscurely (or silently behave as "unlimited", which it does
+    /// not, but a reader should not have to know that to trust this value).
+    #[test]
+    fn a_zero_pool_size_is_rejected() {
+        let err = env_config_from(getter(&[
+            (ENV_DATABASE_URL, "postgres://h/db"),
+            (ENV_POOL_SIZE, "0"),
+        ]))
+        .expect_err("must refuse");
+        assert_eq!(err.code, crate::errors::EXIT_ERROR);
+        assert!(err.message.contains(ENV_POOL_SIZE), "{}", err.message);
+    }
+
+    #[test]
+    fn an_unparseable_pool_size_is_rejected() {
+        let err = env_config_from(getter(&[
+            (ENV_DATABASE_URL, "postgres://h/db"),
+            (ENV_POOL_SIZE, "abc"),
+        ]))
+        .expect_err("must refuse");
+        assert_eq!(err.code, crate::errors::EXIT_ERROR);
+        assert!(err.message.contains(ENV_POOL_SIZE), "{}", err.message);
+        assert!(err.message.contains("abc"), "{}", err.message);
+    }
+
+    /// An absurdly large value is almost certainly a typo (an extra digit), not a real
+    /// tuning decision — see `MAX_POOL_SIZE`'s doc comment for the reasoning.
+    #[test]
+    fn an_absurdly_large_pool_size_is_rejected() {
+        let err = env_config_from(getter(&[
+            (ENV_DATABASE_URL, "postgres://h/db"),
+            (ENV_POOL_SIZE, "5000000"),
+        ]))
+        .expect_err("must refuse");
+        assert_eq!(err.code, crate::errors::EXIT_ERROR);
+        assert!(err.message.contains(ENV_POOL_SIZE), "{}", err.message);
+    }
+
+    /// A blank value (whitespace only) is treated the same as absent — parity with
+    /// `ENV_FENCE_VERSION`'s handling.
+    #[test]
+    fn a_blank_pool_size_falls_back_to_the_default() {
+        let e = env_config_from(getter(&[
+            (ENV_DATABASE_URL, "postgres://h/db"),
+            (ENV_POOL_SIZE, "   "),
+        ]))
+        .expect("ok");
+        assert_eq!(e.pool_size, 8);
     }
 
     /// The heavy tier must refuse to start without an explicit fence base: deriving
@@ -709,6 +835,7 @@ mod tests {
         let env = EnvConfig {
             database_url: url.clone(),
             fence_version: Some("torii-boot-probe-fence".to_string()),
+            pool_size: DEFAULT_POOL_SIZE,
         };
 
         async fn backend_count(pool: &sqlx::PgPool) -> i64 {
