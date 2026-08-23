@@ -111,16 +111,19 @@ async fn fresh_worker(url: &str, at: DateTime<Utc>) -> (Scheduler, CallLog) {
     (Scheduler::new(store, exec, journal, clock), calls)
 }
 
-/// Exactly one tick through torii's real worker loop. `pending()` for shutdown: `--once`
-/// must not need a signal to stop.
+/// Exactly one tick through torii's real worker loop. A `watch` receiver that never
+/// reaches level 1 for shutdown — `_tx` is kept alive (not dropped) for the duration
+/// of the call so `changed()` genuinely never resolves: `--once` must not need a
+/// signal to stop.
 async fn serve_once(sched: &Scheduler) -> torii::cmd::Outcome {
+    let (_tx, rx) = tokio::sync::watch::channel(0u64);
     torii::cmd::worker::serve(
         sched,
         torii::cmd::worker::ServeOpts {
             interval: std::time::Duration::from_millis(10),
             once: true,
         },
-        std::future::pending(),
+        rx,
     )
     .await
     .expect("one tick against a live database")
