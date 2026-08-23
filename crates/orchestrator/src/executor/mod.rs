@@ -174,6 +174,16 @@ struct Fold {
     /// the fold is handed out immutably; see [`dispatch::Meter`] for the ordering
     /// rationale.
     live_spend: Arc<std::sync::atomic::AtomicU64>,
+    /// SP-DATA-5 (whole-slice review, Critical 1): the 1-permit gate a BUDGETED run
+    /// holds across its whole check→dispatch→charge sequence, so at most one model
+    /// call per run is ever in flight and `live_spend` is current before the next
+    /// gate read. One `Fold` per drive ⇒ one gate per run-drive, shared by every
+    /// node including a `Map`'s concurrent children and any nested Subgraph/Loop
+    /// (which are handed this same `&Fold`).
+    ///
+    /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
+    /// this makes and why an unbudgeted run must never touch it.
+    serial_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Fold {
@@ -211,7 +221,12 @@ impl Fold {
     /// live counter (rather than copying two scalars out) is what lets spend accumulate
     /// WITHIN a drive — see [`dispatch::Meter`].
     fn meter(&self) -> dispatch::Meter<'_> {
-        dispatch::Meter::new(self.journaled_spend(), self.budget, &self.live_spend)
+        dispatch::Meter::new(
+            self.journaled_spend(),
+            self.budget,
+            &self.live_spend,
+            &self.serial_gate,
+        )
     }
 }
 

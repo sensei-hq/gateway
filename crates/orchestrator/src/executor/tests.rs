@@ -1,8 +1,8 @@
 use super::*;
 use crate::test_support::{
     CallLog, content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
-    echo_system_gateway, failing_after_gateway, final_response, metered_gateway, recording_gateway,
-    scripted_gateway, tool_call_response,
+    echo_system_gateway, failing_after_gateway, final_response, metered_gateway,
+    metered_latency_gateway, recording_gateway, scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -12383,6 +12383,238 @@ async fn an_unbudgeted_run_is_never_gated_however_much_it_spends() {
         (4_000_000, None),
         "spend is still ledgered for an unbudgeted run — it is only never ENFORCED"
     );
+}
+
+// ---- Whole-slice review, Critical 1: a CONCURRENT fan-out must not pass the gate en masse ----
+//
+// `dispatch_metered` reads the ledger, awaits the provider, then charges. `run_map`
+// polls all its children under one `join_all`, so before the fix every child that
+// held a semaphore permit read the ledger BEFORE any sibling's response returned —
+// a deterministic check-then-act, not a memory-ordering race. A Map no wider than
+// `min(map.concurrency, executor.concurrency)` (default 8) was never gated at all.
+//
+// These two tests use `metered_latency_gateway`, the ONLY double in `test_support`
+// with a real suspension point. That is the point: against a zero-latency double
+// `join_all` runs the children strictly sequentially and the first test passes even
+// with the defect present. See `LatencyMeteredAdapter`'s doc comment.
+
+/// One call's worth of latency, long enough that 6 sequential calls (6×) are
+/// unmistakably distinguishable from 6 concurrent ones (1×) without being slow.
+const FANOUT_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// A `Map` over 6 items, each of which would spend 150 tokens, under a 100-token cap
+/// and a fan-out wide enough to dispatch every child at once.
+///
+/// Exactly ONE call may escape — the floor-trigger bound of §6.5. Before the fix this
+/// produced **6 calls, 900 tokens, `Completed`, zero pauses**: every child read the
+/// ledger while the others were still awaiting the provider.
+///
+/// *Mutation:* drop the `budget.is_some()` serial gate from `dispatch_metered` and
+/// this fails with 6 calls and a completed run.
+#[tokio::test]
+async fn a_budgeted_map_fanout_dispatches_exactly_one_child_before_the_gate_fires() {
+    let (gateway, calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+        }),
+        FANOUT_DELAY,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("m".into()),
+            kind: NodeKind::Map {
+                body: MapBody::ModelCall { chain: "c".into() },
+                over: map_items(["i0", "i1", "i2", "i3", "i4", "i5"]),
+                concurrency: 6,
+                aggregation: Aggregation::BestEffort,
+            },
+            deps: vec![],
+        }],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec
+        .run_budgeted(
+            run,
+            &graph,
+            Some(orchestrator_core::TokenBudget { total_tokens: 100 }),
+        )
+        .await
+        .expect("drives");
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "a budgeted run serialises check→dispatch→charge, so the first child's 150 \
+         tokens are on the ledger before any sibling checks it"
+    );
+    let pause = out
+        .paused
+        .as_ref()
+        .expect("the remaining children are gated, which pauses the whole Map");
+    assert_eq!(pause.node.0, "m");
+    assert!(pause.reason.starts_with("budget: "), "{}", pause.reason);
+    let events = journal.load(run).await.unwrap();
+    let (spent, budget) = crate::spend_of(&events);
+    assert_eq!(
+        (spent, budget),
+        (150, Some(100)),
+        "overshoot is bounded by ONE call even under fan-out"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a budget-paused Map stays resumable"
+    );
+}
+
+/// The other half of the trade: an UNBUDGETED Map keeps its full concurrency. The
+/// serial gate is taken only when `budget.is_some()`, so the 1329 pre-existing tests
+/// (and every unbudgeted production run) are untouched.
+///
+/// Asserts both halves — all 6 children dispatch, and the wall clock is nearer one
+/// delay than six. The timing assertion has a 4× margin (6 sequential calls take
+/// ≥ 6×60 ms = 360 ms; the bound is 240 ms), which is wide enough not to flake on a
+/// loaded machine while still failing outright if the gate is taken unconditionally.
+#[tokio::test]
+async fn an_unbudgeted_map_fanout_keeps_its_concurrency() {
+    let (gateway, calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+        }),
+        FANOUT_DELAY,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("m".into()),
+            kind: NodeKind::Map {
+                body: MapBody::ModelCall { chain: "c".into() },
+                over: map_items(["i0", "i1", "i2", "i3", "i4", "i5"]),
+                concurrency: 6,
+                aggregation: Aggregation::BestEffort,
+            },
+            deps: vec![],
+        }],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let started = std::time::Instant::now();
+    let out = exec.run(run, &graph).await.expect("drives");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        6,
+        "no cap ⇒ no gate ⇒ no serialisation"
+    );
+    assert!(out.paused.is_none(), "{:?}", out.paused);
+    assert_eq!(out.completed, vec![NodeId("m".into())]);
+    assert!(
+        elapsed < FANOUT_DELAY * 4,
+        "an unbudgeted fan-out must still overlap its calls: {elapsed:?} is closer to \
+         6 sequential {FANOUT_DELAY:?} calls than to one"
+    );
+}
+
+/// The gate is held across an `.await` on the provider, so the obvious hazard is a
+/// path that re-enters `dispatch_metered` from INSIDE another call's critical section
+/// — a nested `Subgraph`/`Loop` child dispatching while an outer holder waits on it
+/// would deadlock permanently.
+///
+/// By construction it cannot: the critical section's only await is
+/// `gateway.execute()`, which never drives executor nodes, and `drive_nested`/
+/// `run_loop` acquire nothing themselves — they hand the SAME `&Fold` (hence the same
+/// gate) down and each dispatcher takes it from its own task. This test is the
+/// empirical half of that argument: the deepest realistic nesting a budgeted run can
+/// take — `Loop` → `Subgraph` → concurrent `Map` → `Consolidate` — driven under a
+/// budget generous enough to complete. A deadlock shows up as the timeout, not as a
+/// hung suite.
+#[tokio::test]
+async fn a_budgeted_nested_loop_over_a_subgraph_map_does_not_deadlock_on_the_gate() {
+    let (gateway, calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            total_tokens: 5,
+        }),
+        std::time::Duration::from_millis(5),
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // Loop body = a Subgraph = [Map(3, concurrent) → Consolidate]. Two iterations
+    // (the pure gate never sees "STOP"), so the gate is taken, released and re-taken
+    // across nesting levels many times over.
+    let inner = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["i0", "i1", "i2"]),
+                    concurrency: 3,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("cons".into()),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::soft("m")],
+            },
+        ],
+    };
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("L".into()),
+            kind: NodeKind::Loop {
+                body: LoopBody::Subgraph(Box::new(inner)),
+                input: serde_json::json!({ "prompt": "go" }),
+                gate: GateSpec::Pure(LoopGate::TextContains("STOP".into())),
+                max_iters: 2,
+            },
+            deps: vec![],
+        }],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        exec.run_budgeted(
+            run,
+            &graph,
+            // 8 calls × 5 tokens = 40; the cap is far above it so the run completes
+            // and the ONLY way this test fails is a hang or an error.
+            Some(orchestrator_core::TokenBudget {
+                total_tokens: 10_000,
+            }),
+        ),
+    )
+    .await
+    .expect("the serial gate must not deadlock across nested Loop/Subgraph/Map dispatch")
+    .expect("drives");
+
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    assert!(out.paused.is_none(), "{:?}", out.paused);
+    // 2 iterations × (3 Map children + 1 Consolidate) = 8 serialised calls.
+    assert_eq!(calls.lock().unwrap().len(), 8);
+    let (spent, budget) = crate::spend_of(&journal.load(run).await.unwrap());
+    assert_eq!((spent, budget), (40, Some(10_000)));
 }
 
 // ============================= SP-DATA-3 scheduler driver =====================
