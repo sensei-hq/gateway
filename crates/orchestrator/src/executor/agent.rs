@@ -207,19 +207,14 @@ impl Executor {
         }
         let request =
             build_chat_request(&ar.chain, &ar.system, messages.to_vec(), ar.tools.clone());
-        // SP-DATA-5: the token budget rides as two scalars rather than the (private,
-        // `mod.rs`-owned) `Fold`, so `dispatch_model_turn` stays independent of the
-        // fold's shape — and matches the chokepoint's own signature.
-        self.dispatch_model_turn(
-            ar.run,
-            ar.node_id,
-            eid,
-            ih,
-            request,
-            ar.fold.spent(),
-            ar.fold.budget(),
-        )
-        .await
+        // SP-DATA-5: the token ledger rides as the chokepoint's own `Meter` view rather
+        // than the (private, `mod.rs`-owned) `Fold`, so `dispatch_model_turn` stays
+        // independent of the fold's shape — and matches the chokepoint's own signature.
+        // It must be the LIVE view and not a pair of scalars: a ReAct node dispatches
+        // once PER TURN inside a single drive, so a frozen `spent` would let an agent
+        // burn all `max_steps` turns against the ledger as it stood before turn 0.
+        self.dispatch_model_turn(ar.run, ar.node_id, eid, ih, request, &ar.fold.meter())
+            .await
     }
 
     /// Finalize a completed agent node: journal `NodeCompleted` once (guarded on
@@ -806,9 +801,9 @@ impl Executor {
     /// gateway error, journal `NodeFailed` and return the failure message. The outer
     /// `Err` is a fatal journal/CAS error.
     ///
-    /// `spent`/`budget` are the run's folded token ledger, passed as scalars so this
-    /// helper does not depend on `Fold`'s shape.
-    // Seven positional inputs, each distinct and read straight through to either the
+    /// `meter` is the run's live token ledger, passed as the chokepoint's borrowed view
+    /// so this helper does not depend on `Fold`'s shape.
+    // Six positional inputs, each distinct and read straight through to either the
     // effect record or the chokepoint; bundling them would only relocate the plumbing.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_model_turn(
@@ -818,10 +813,9 @@ impl Executor {
         eid: EffectId,
         ih: String,
         request: InferenceRequest,
-        spent: u64,
-        budget: Option<u64>,
+        meter: &super::dispatch::Meter<'_>,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
-        match self.dispatch_metered(&request, spent, budget).await {
+        match self.dispatch_metered(&request, meter).await {
             Ok(Ok(response)) => {
                 // SP-4 s2: `model_output` builds `{model, text}` with `text` scrubbed
                 // (the single redaction chokepoint) before journal + feed-back; the

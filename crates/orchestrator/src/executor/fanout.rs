@@ -111,10 +111,7 @@ impl Executor {
                     let request = build_request(chain, &payload);
                     // SP-DATA-5: the Consolidate producer routes through the single
                     // metered chokepoint.
-                    match self
-                        .dispatch_metered(&request, fold.spent(), fold.budget())
-                        .await
-                    {
+                    match self.dispatch_metered(&request, &fold.meter()).await {
                         Ok(Ok(response)) => {
                             // SP-4 s2: scrub the synthesis text via the shared chokepoint.
                             let output = self.model_output(&response);
@@ -642,10 +639,7 @@ impl Executor {
 
         let request = build_request(chain, item);
         // SP-DATA-5: the Map-item producer routes through the single metered chokepoint.
-        match self
-            .dispatch_metered(&request, fold.spent(), fold.budget())
-            .await
-        {
+        match self.dispatch_metered(&request, &fold.meter()).await {
             Ok(Ok(response)) => {
                 // SP-4 s2: scrub the Map-item model text via the shared chokepoint.
                 let output = self.model_output(&response);

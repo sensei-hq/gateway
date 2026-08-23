@@ -12190,6 +12190,201 @@ async fn reported_usage_is_journaled_on_the_effect_record() {
     );
 }
 
+// ---- Task 6: the gate fires WITHIN a drive, not only at a drive boundary ----------
+//
+// Two defects found while writing the AC6 e2e, both of which made a freshly submitted
+// budgeted run un-gateable — it spent its whole reachable graph and completed, however
+// small the cap:
+//
+//   1. `run_inner` drove a FRESH run with `Fold::default()`, whose `budget` is `None`.
+//      The cap was journaled on `RunStarted` and then never consulted on the very drive
+//      it was set for.
+//   2. `Fold` is built ONCE per drive and shared as `&Fold`, so `fold.spent()` was
+//      frozen at the drive's starting value. Even with the cap present, node 2 gated
+//      against node 1's PRE-call ledger — and on a fresh run that value is 0 forever.
+//
+// Together they made spec §6.5's "overshoot is bounded by at most one call" false: the
+// real bound was "everything one drive can reach". These tests pin the fix.
+
+/// A 3-node linear graph under a cap that one call's worth of usage already exceeds.
+/// The gate must stop the run at node 2 — INSIDE the first drive, with nothing resumed
+/// and nothing re-folded — leaving the overshoot at exactly one call.
+///
+/// Mutation-verified two ways: seed the fresh fold with `Fold::default()` (dropping the
+/// budget) or hand the chokepoint `fold.spent()` instead of the live meter, and this
+/// fails with all three nodes completed and 450 tokens spent against a cap of 100.
+#[tokio::test]
+async fn a_fresh_budgeted_run_pauses_mid_drive_after_one_call() {
+    let (gateway, calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
+        input_tokens: 100,
+        output_tokens: 50,
+        total_tokens: 150,
+    }))
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", "p1"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("n2".into()),
+                kind: model_call("c", "p2"),
+                deps: vec![Dep::hard("n1")],
+            },
+            Node {
+                id: NodeId("n3".into()),
+                kind: model_call("c", "p3"),
+                deps: vec![Dep::hard("n2")],
+            },
+        ],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec
+        .run_budgeted(
+            run,
+            &graph,
+            Some(orchestrator_core::TokenBudget { total_tokens: 100 }),
+        )
+        .await
+        .expect("drives");
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the cap is exceeded by the FIRST call, so exactly one call may escape — the \
+         floor-trigger property. More than one means the ledger froze for the drive."
+    );
+    let pause = out
+        .paused
+        .as_ref()
+        .expect("the second node must be gated inside this very drive");
+    assert_eq!(pause.node.0, "n2");
+    assert!(pause.reason.starts_with("budget: "), "{}", pause.reason);
+    assert_eq!(out.completed, vec![NodeId("n1".into())]);
+
+    let events = journal.load(run).await.unwrap();
+    let (spent, budget) = crate::spend_of(&events);
+    assert_eq!((spent, budget), (150, Some(100)));
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "a budget-paused run stays resumable"
+    );
+}
+
+/// The same property one level down: a ReAct agent dispatches once PER TURN inside a
+/// single drive, so a frozen ledger would let it burn every one of `max_steps` turns
+/// against the spend as it stood before turn 0. Turn 0 spends past the cap; turn 1 must
+/// never reach the gateway.
+#[tokio::test]
+async fn a_budgeted_agent_stops_between_react_turns() {
+    let usage = kernel::types::cost::TokenUsage {
+        input_tokens: 100,
+        output_tokens: 50,
+        total_tokens: 150,
+    };
+    // Turn 0 asks for a tool (so the loop would continue); turn 1 would be the final
+    // answer. Both carry usage, so the metering path is exercised, not the unmetered
+    // refusal.
+    let with_usage = |mut r: kernel::types::io::ChatResponse| {
+        r.usage = Some(usage.clone());
+        r
+    };
+    let (gateway, calls) = scripted_gateway(vec![
+        with_usage(tool_call_response(
+            "t0",
+            "calc",
+            "{\"op\":\"add\",\"a\":1,\"b\":1}",
+        )),
+        with_usage(final_response("done")),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: NodeKind::Agent {
+                agent: AgentRef("a".into()),
+                input: serde_json::json!("hi"),
+                phase: None,
+            },
+            deps: vec![],
+        }],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools());
+    let out = exec
+        .run_budgeted(
+            run,
+            &graph,
+            Some(orchestrator_core::TokenBudget { total_tokens: 100 }),
+        )
+        .await
+        .expect("drives");
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "turn 0 spends past the cap; turn 1 must be gated before it dispatches"
+    );
+    let pause = out.paused.as_ref().expect("the agent pauses mid-loop");
+    assert_eq!(pause.node.0, "n1");
+    assert!(pause.reason.starts_with("budget: "), "{}", pause.reason);
+}
+
+/// Additivity, restated at the level the two fixes above touched: with NO budget the
+/// live ledger is inert and a multi-node run behaves exactly as it always did.
+#[tokio::test]
+async fn an_unbudgeted_run_is_never_gated_however_much_it_spends() {
+    let (gateway, calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        total_tokens: 2_000_000,
+    }))
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", "p1"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("n2".into()),
+                kind: model_call("c", "p2"),
+                deps: vec![Dep::hard("n1")],
+            },
+        ],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.run(run, &graph).await.expect("drives");
+
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert!(out.paused.is_none(), "no cap ⇒ no gate, at any spend");
+    assert_eq!(
+        out.completed,
+        vec![NodeId("n1".into()), NodeId("n2".into())]
+    );
+    let (spent, budget) = crate::spend_of(&journal.load(run).await.unwrap());
+    assert_eq!(
+        (spent, budget),
+        (4_000_000, None),
+        "spend is still ledgered for an unbudgeted run — it is only never ENFORCED"
+    );
+}
+
 // ============================= SP-DATA-3 scheduler driver =====================
 
 /// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded

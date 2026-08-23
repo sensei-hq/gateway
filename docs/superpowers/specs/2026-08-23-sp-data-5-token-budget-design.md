@@ -163,6 +163,40 @@ one call — output tokens are unknowable before the call returns. `--budget-tok
 "stop once you have spent this much", not "never exceed this". Documented as such in the CLI help;
 calling it a hard cap would be a lie.
 
+### 6.6 The ledger must be LIVE within a drive — two defects found in Task 6 and closed
+
+Writing AC6 exposed that §6.5's "at most one call" was **not true as built**. The real bound was
+"everything one drive can reach", and a freshly submitted run was **un-gateable entirely**: a
+2-node graph under a 100-token cap spent 300 tokens and reported `Completed`. Two independent causes,
+both in the wiring rather than in any of §6's decisions:
+
+1. **The fresh-run fold had no budget.** `run_inner` journals `RunStarted{budget}` and then drove the
+   graph with `Fold::default()`, whose `budget` is `None`. The cap was durably recorded and then never
+   consulted on the one drive it was set for. (A *resume* was fine — `fold_journal` reads it back.)
+2. **`Fold` is built once per drive and shared as `&Fold`.** So `fold.spent()` — which Task 3's plan
+   named explicitly as the value to pass — is frozen at the drive's starting value. Node 2 gated
+   against node 1's *pre-call* ledger; a ReAct agent would burn every one of `max_steps` turns against
+   the ledger as it stood before turn 0. On a fresh run that frozen value is 0, permanently.
+
+Together these meant the gate could only ever fire at a **drive boundary** — i.e. on a resume of a run
+that had already paused for some *other* reason. The four Task 3 producer tests did not catch it
+because each seeds an already-exhausted journal and resumes, which is exactly the one path that worked.
+
+**The fix keeps the single-chokepoint property.** `dispatch_metered` now takes a `Meter<'_>` — a
+borrowed view of `(journaled_base, budget, &AtomicU64 live)` — instead of two copied scalars, and
+**charges the call back to the ledger itself**, on a successful response, at the same chokepoint that
+reads it. So a producer can neither bypass the gate nor forget to account for what it spent, and the
+by-effect-id idempotency is untouched: the live counter is zero at the start of every drive and is
+subsumed into the journaled base by the next fold, so the two halves can never double-count one call.
+`run_inner` additionally seeds the fresh fold's `budget` from the `RunStarted` it just wrote.
+`Relaxed` ordering, because a `Map` fan-out shares one view across concurrent children and the gate is
+a spend backstop, not a synchronization primitive (§6.3a already accepts concurrent children passing
+together).
+
+Mutation-verified both ways — drop the seeded budget, or stop charging the ledger — and in each case
+the two new tests fail with the whole graph completed. Unbudgeted runs are unaffected (`budget: None`
+⇒ the gate never fires, and the counter is inert), which is why the pre-existing 1325 stayed green.
+
 ## 7. Failure modes and testing
 
 | Case | Behaviour |
