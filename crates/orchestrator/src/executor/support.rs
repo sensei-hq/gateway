@@ -78,6 +78,7 @@ pub(crate) fn fold_journal(
                 input_hash,
                 output,
                 observation,
+                usage,
                 ..
             } => {
                 fold.memo
@@ -87,6 +88,14 @@ pub(crate) fn fold_journal(
                 // a stale re-read (which appends a fresh record) supersedes.
                 if let Some(meta) = observation {
                     fold.observations.insert(effect_id.clone(), meta.clone());
+                }
+                // SP-DATA-5: keyed by effect id, NOT summed over events — the
+                // two-phase Mutation path can append a second `EffectRecorded` for
+                // one effect_id (an in-doubt `Confirmed` reconcile); an `insert`
+                // here overwrites that duplicate rather than double-counting it, so
+                // folding stays idempotent across any number of resumes.
+                if let Some(u) = usage {
+                    fold.usage.insert(effect_id.clone(), *u);
                 }
             }
             JournalEvent::NodeStarted { node } => {
@@ -149,6 +158,20 @@ pub(crate) fn fold_journal(
             }
             JournalEvent::PlannerSelected { node, agent } => {
                 fold.selections.insert(node.clone(), agent.clone());
+            }
+            // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
+            // arm — not the `_` catch-all below — because a budget that silently
+            // never folds is a bug the compiler cannot catch for us (`budget` stays
+            // `Option`-shaped either way), so this must be deliberate, not implicit.
+            JournalEvent::RunStarted { budget, .. } => {
+                fold.budget = budget.map(|b| b.total_tokens);
+            }
+            // SP-DATA-5: an operator-issued raise (or lower). Latest value wins, so
+            // this OVERWRITES rather than accumulates — also an EXPLICIT arm for the
+            // same reason as `RunStarted` above: falling through to `_ => {}` would
+            // compile cleanly and silently make the budget un-raisable.
+            JournalEvent::BudgetRaised { new_total_tokens } => {
+                fold.budget = Some(*new_total_tokens);
             }
             _ => {}
         }
@@ -385,6 +408,116 @@ mod tests {
         )];
         let (fold, _last, _completed) = fold_journal(&events);
         assert_eq!(fold.intents.get(&eid), Some(&"the-key".to_string()));
+    }
+
+    /// THE guard. Two `EffectRecorded` events for the SAME effect_id — reachable via
+    /// the two-phase Mutation path's in-doubt `Confirmed` reconcile — must count ONCE.
+    /// Summing the event stream instead of keying by effect id double-counts here, and
+    /// the overcount compounds on every resume.
+    #[test]
+    fn duplicate_effect_records_count_their_usage_only_once() {
+        use orchestrator_core::{EffectClass, EffectId, JournalEvent, NodeId, TokenUsage};
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+        };
+        let ev = |seq: Seq| {
+            (
+                seq,
+                JournalEvent::EffectRecorded {
+                    node: NodeId("n1".into()),
+                    effect_id: EffectId("same-id".into()),
+                    class: EffectClass::Mutation,
+                    input_hash: "h".into(),
+                    seq,
+                    output: EffectOutput::Inline(serde_json::Value::Null),
+                    observation: None,
+                    usage: Some(usage),
+                },
+            )
+        };
+        let (fold, _, _) = fold_journal(&[ev(0), ev(1)]);
+        assert_eq!(
+            fold.spent(),
+            150,
+            "one effect id must contribute its usage once, not once per event"
+        );
+    }
+
+    #[test]
+    fn distinct_effects_sum_their_usage() {
+        use orchestrator_core::{EffectClass, EffectId, JournalEvent, NodeId, TokenUsage};
+        let mk = |id: &str, total: u32, seq: Seq| {
+            (
+                seq,
+                JournalEvent::EffectRecorded {
+                    node: NodeId("n1".into()),
+                    effect_id: EffectId(id.into()),
+                    class: EffectClass::Pure,
+                    input_hash: "h".into(),
+                    seq,
+                    output: EffectOutput::Inline(serde_json::Value::Null),
+                    observation: None,
+                    usage: Some(TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: total,
+                    }),
+                },
+            )
+        };
+        let (fold, _, _) = fold_journal(&[mk("a", 100, 0), mk("b", 250, 1)]);
+        assert_eq!(fold.spent(), 350);
+    }
+
+    #[test]
+    fn a_budget_is_folded_from_run_started_and_the_latest_raise_wins() {
+        use orchestrator_core::{JournalEvent, TokenBudget};
+        let evs = vec![
+            (
+                0,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: Some(TokenBudget {
+                        total_tokens: 1_000,
+                    }),
+                },
+            ),
+            (
+                1,
+                JournalEvent::BudgetRaised {
+                    new_total_tokens: 5_000,
+                },
+            ),
+            (
+                2,
+                JournalEvent::BudgetRaised {
+                    new_total_tokens: 2_000,
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&evs);
+        assert_eq!(
+            fold.budget(),
+            Some(2_000),
+            "latest wins — lowering is a legitimate way to halt a run"
+        );
+    }
+
+    #[test]
+    fn an_unbudgeted_run_folds_no_budget_and_no_spend() {
+        use orchestrator_core::JournalEvent;
+        let evs = vec![(
+            0,
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+                budget: None,
+            },
+        )];
+        let (fold, _, _) = fold_journal(&evs);
+        assert_eq!(fold.budget(), None);
+        assert_eq!(fold.spent(), 0);
     }
 
     #[test]
