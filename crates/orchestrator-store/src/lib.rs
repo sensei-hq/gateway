@@ -244,6 +244,7 @@ mod tests {
                 status: ChildStatus::Ok,
                 digest: Some(Digest("abc".into())),
                 input_hash: Some("h".into()),
+                usage: None,
             }],
         };
         journal.compact(run, &[s1, s2], manifest).await.unwrap();

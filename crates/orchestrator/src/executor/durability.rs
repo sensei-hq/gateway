@@ -35,12 +35,21 @@ impl Executor {
         let prefix = format!("{}/", map.0);
 
         let mut remove_seqs = Vec::new();
-        let mut children = Vec::new();
+        // Keyed by child index, not pushed, so a child with TWO `EffectRecorded`
+        // events (the two-phase Mutation path's in-doubt `Confirmed` reconcile can
+        // append a second one for the same effect id) collapses to ONE manifest
+        // entry, last-wins — matching what `fold_journal`'s keyed `insert` would have
+        // done with those records. Two entries for one index would have been harmless
+        // for the memo but would DOUBLE-COUNT the child's tokens once the manifest
+        // carries `usage`.
+        let mut children: std::collections::BTreeMap<usize, CompactChild> =
+            std::collections::BTreeMap::new();
         for (seq, event) in &events {
             let JournalEvent::EffectRecorded {
                 node,
                 input_hash,
                 output,
+                usage,
                 ..
             } = event
             else {
@@ -61,13 +70,20 @@ impl Executor {
                 EffectOutput::Ref(r) => r.digest.clone(),
                 EffectOutput::Inline(value) => content.put(&serde_json::to_vec(value)?).await?,
             };
-            children.push(CompactChild {
+            children.insert(
                 index,
-                status: ChildStatus::Ok,
-                digest: Some(digest),
-                input_hash: Some(input_hash.clone()),
-            });
+                CompactChild {
+                    index,
+                    status: ChildStatus::Ok,
+                    digest: Some(digest),
+                    input_hash: Some(input_hash.clone()),
+                    // SP-DATA-5: carry the child's spend onto the manifest — the
+                    // record holding it is about to be deleted.
+                    usage: *usage,
+                },
+            );
         }
+        let mut children: Vec<CompactChild> = children.into_values().collect();
 
         if remove_seqs.is_empty() {
             return Ok(()); // already compacted, or a body kind with no child records
@@ -90,6 +106,9 @@ impl Executor {
                         status: ChildStatus::Failed,
                         digest: None,
                         input_hash: None,
+                        // A failed child journaled no `EffectRecorded`, so it has no
+                        // spend to preserve.
+                        usage: None,
                     });
                 }
             }

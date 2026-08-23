@@ -30,6 +30,22 @@ pub struct CompactChild {
     /// The child effect's determinism key (`Ok` children only) — feeds memo
     /// reconstruction on resume.
     pub input_hash: Option<String>,
+    /// SP-DATA-5: the tokens the child's own `EffectRecorded` carried, kept here
+    /// because that record is being DELETED.
+    ///
+    /// Without it a `Consolidate` over a `ModelCall` `Map` erased that Map's spend
+    /// from the durable ledger permanently: the next drive folded a base short by the
+    /// children's tokens and the run spent past its cap with nothing loud anywhere —
+    /// the same "counter restarts at zero" failure the journal-as-ledger design
+    /// exists to prevent. Compaction is a representation change; it must be
+    /// spend-preserving, exactly as it is already memo-preserving via `digest` +
+    /// `input_hash`.
+    ///
+    /// `None` for a `Failed` child (it journaled no record) and for any pre-fix
+    /// `MapCompacted`, which still deserializes and folds as it always did — those
+    /// runs' children's spend is already gone and this cannot invent it.
+    #[serde(default)]
+    pub usage: Option<crate::budget::TokenUsage>,
 }
 
 /// A compacted child's terminal status.
