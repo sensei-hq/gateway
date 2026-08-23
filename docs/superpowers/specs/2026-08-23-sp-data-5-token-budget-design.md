@@ -214,6 +214,35 @@ themselves — they pass the same `&Fold` down and each dispatcher takes the gat
 `Loop` → `Subgraph` → concurrent `Map` → `Consolidate` budgeted run is tested under a timeout to
 prove it empirically rather than only by inspection.
 
+### 6.5b Compaction must be spend-preserving, not just memo-preserving
+
+`compact_map` really deletes a completed Map's child `EffectRecorded` rows and replaces them with a
+`MapCompacted` manifest. That manifest was designed to preserve everything a resume needs — `digest`
+keeps the content addressable, `input_hash` rebuilds the memo — but it carried no `usage`, so a
+`Consolidate` over a `ModelCall` Map **erased that Map's spend from the durable ledger permanently**
+(the review's Critical 2).
+
+The consequence is not a cosmetic under-report. Measured on a Map(3) + Consolidate + 2 tail nodes at
+150 tokens/call under a 700-token cap: drive 1 really spent 750 and paused, but compaction left a
+durable ledger of **300**; a plain worker tick then folded that short base, dispatched the rest, and
+the run **completed at 900 real tokens against a 700 cap** with the ledger reporting 450 — no pause,
+no operator action, nothing loud anywhere. That is the "in-memory counter restarts at zero" failure
+this slice exists to prevent, arriving through the durability layer instead.
+
+Fix: `CompactChild` gains `usage: Option<TokenUsage>` (`#[serde(default)]`, so a pre-fix
+`MapCompacted` still deserializes and folds — with spend 0, because those children's tokens are
+genuinely gone and inventing them would be worse), populated during compaction from the records being
+removed.
+
+**Idempotency**, since the manifest can be folded any number of times: the compacted child's spend
+re-enters `Fold` under the child's ORIGINAL effect id — `effect_id("{map}/{i}", 0, 0)`, exactly the
+key its deleted record used and exactly the key the memo rebuild already reconstructs — via the same
+keyed `insert` the `EffectRecorded` arm uses. So a `MapCompacted` folded twice counts once, and a
+child record that somehow outlived compaction collides with its own manifest entry rather than
+doubling it. Compaction also now keys its collected children by index (last-wins) rather than pushing,
+so a child with two `EffectRecorded` events cannot emit two manifest entries — harmless for the memo,
+a double-count once the entry carries tokens.
+
 ### 6.6 The ledger must be LIVE within a drive — two defects found in Task 6 and closed
 
 Writing AC6 exposed that §6.5's "at most one call" was **not true as built**. The real bound was
