@@ -237,6 +237,81 @@ pub async fn metered_gateway(usage: Option<TokenUsage>) -> (Gateway, CallLog) {
     (Gateway::new(single_chain_config(), adapters, cb), calls)
 }
 
+/// Chat adapter that behaves like [`MeteredAdapter`] but **actually suspends** —
+/// `tokio::time::sleep(delay)` — before returning.
+///
+/// This is not a convenience. EVERY other double in this module returns without a
+/// single suspension point, which makes a `Map`'s `join_all` degenerate to strictly
+/// SEQUENTIAL execution: each child future runs to completion on its first poll, so
+/// no two children are ever in flight together and any concurrency defect is
+/// structurally invisible to the suite. That is exactly how SP-DATA-5 shipped a
+/// budget gate that a 6-wide fan-out walks straight through — the same test yields
+/// 1 call against this double and 6 against the non-awaiting one.
+///
+/// Reach for this whenever a test's claim is about what happens *between* two
+/// concurrent gateway calls (fan-out gating, shared-state races, ordering); the
+/// zero-latency doubles are fine for everything else.
+pub struct LatencyMeteredAdapter {
+    calls: CallLog,
+    usage: Option<TokenUsage>,
+    delay: std::time::Duration,
+}
+
+impl Model for LatencyMeteredAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for LatencyMeteredAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        // Record BEFORE suspending: a test that counts calls must see a call that is
+        // in flight, not only one that has returned.
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt));
+        tokio::time::sleep(self.delay).await;
+        Ok(ChatResponse {
+            content: Some("canned-response".into()),
+            tool_calls: Vec::new(),
+            usage: self.usage.clone(),
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway on chain `"c"` whose adapter reports `usage` and **awaits** `delay`
+/// before responding — see [`LatencyMeteredAdapter`] for why a suspension point is
+/// load-bearing rather than cosmetic.
+pub async fn metered_latency_gateway(
+    usage: Option<TokenUsage>,
+    delay: std::time::Duration,
+) -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(LatencyMeteredAdapter {
+            calls: calls.clone(),
+            usage,
+            delay,
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
+}
+
 /// Chat adapter that replays a scripted queue of responses (one per turn), so a
 /// test can drive a multi-turn ReAct loop: e.g. [turn0: a `calc` tool_call, turn1:
 /// a final text]. Records each call's prompt like `RecordingAdapter`.
