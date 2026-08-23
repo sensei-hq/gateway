@@ -12190,6 +12190,259 @@ async fn reported_usage_is_journaled_on_the_effect_record() {
     );
 }
 
+// ---- Whole-slice review, Important: usage CAPTURE, at all four producers ----------
+//
+// The test above covers the `ModelCall` node (producer 2/4). The other three —
+// `dispatch_model_turn` (the ReAct turn), the Map item and the Consolidate synthesis
+// — each had `usage: response.usage.map(convert_usage)` on their `EffectRecorded`
+// with NO test: mutating any of them to `usage: None` left the entire workspace
+// green, PG e2e included.
+//
+// Neither existing family could catch it. The four Task 3 gate tests resume from a
+// SEEDED journal and never dispatch, so nothing captures usage in them at all; the
+// Task 6 tests watch the LIVE meter, which charges the ledger at the chokepoint
+// independently of what any producer journals. The loss is therefore invisible until
+// the NEXT drive, where the durable base is short — the exact "counter restarts at
+// zero" failure this slice exists to prevent, and the same shape as Critical 2.
+//
+// So these assert on the journal, re-read after a real dispatch. Nothing else does.
+
+/// The journaled `EffectRecorded.usage` totals for every node the predicate accepts,
+/// in journal order. Reads the DURABLE record — the only thing a later drive sees.
+fn journaled_usage_totals(
+    events: &[(Seq, JournalEvent)],
+    node_pred: impl Fn(&str) -> bool,
+) -> Vec<Option<u32>> {
+    events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded { node, usage, .. } if node_pred(&node.0) => {
+                Some(usage.map(|u| u.total_tokens))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Producer 1/4 — the ReAct turn (`dispatch_model_turn`, `agent.rs`). BOTH turns'
+/// records must carry their usage; a run that ledgers only its last turn is just as
+/// broken as one that ledgers none.
+///
+/// *Mutation:* set `usage: None` on `dispatch_model_turn`'s `EffectRecorded` — this
+/// is the only test in the workspace that fails.
+#[tokio::test]
+async fn the_react_turn_producer_journals_its_reported_usage() {
+    let usage = kernel::types::cost::TokenUsage {
+        input_tokens: 40,
+        output_tokens: 60,
+        total_tokens: 100,
+    };
+    let with_usage = |mut r: kernel::types::io::ChatResponse| {
+        r.usage = Some(usage.clone());
+        r
+    };
+    let (gateway, calls) = scripted_gateway(vec![
+        with_usage(tool_call_response(
+            "t0",
+            "calc",
+            "{\"op\":\"add\",\"a\":1,\"b\":1}",
+        )),
+        with_usage(final_response("done")),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: NodeKind::Agent {
+                agent: AgentRef("a".into()),
+                input: serde_json::json!("hi"),
+                phase: None,
+            },
+            deps: vec![],
+        }],
+    };
+
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .run(run, &graph)
+        .await
+        .expect("drives");
+    assert!(out.failed.is_none() && out.paused.is_none(), "{out:?}");
+    assert_eq!(calls.lock().unwrap().len(), 2, "two live model turns");
+
+    let events = journal.load(run).await.unwrap();
+    // The agent's tool call also journals an effect under `n1`, and it is NOT a model
+    // call — it must stay unmetered. So filter to the model turns by their non-None
+    // expectation being exactly the two turns: assert the two model-turn records carry
+    // usage and that the ledger totals them.
+    let totals = journaled_usage_totals(&events, |n| n == "n1");
+    assert_eq!(
+        totals.iter().filter(|u| **u == Some(100)).count(),
+        2,
+        "both ReAct turns journal their 100 tokens: {totals:?}"
+    );
+    assert_eq!(
+        crate::spend_of(&events).0,
+        200,
+        "the durable ledger — what the NEXT drive folds — carries both turns"
+    );
+}
+
+/// Producer 3/4 — a Map item (`run_map_child_modelcall`, `fanout.rs`). Every child's
+/// own record must carry its own spend.
+///
+/// *Mutation:* set `usage: None` on the Map child's `EffectRecorded` — only this test
+/// (and the compaction tests, which read the same records) fails.
+#[tokio::test]
+async fn the_map_item_producer_journals_its_reported_usage() {
+    let (gateway, _calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
+        input_tokens: 40,
+        output_tokens: 60,
+        total_tokens: 100,
+    }))
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = map_graph("m", map_items(["i0", "i1"]), Aggregation::BestEffort);
+
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("drives");
+    assert!(out.failed.is_none() && out.paused.is_none(), "{out:?}");
+
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        journaled_usage_totals(&events, |n| n.starts_with("m/")),
+        vec![Some(100), Some(100)],
+        "each Map child journals its own spend"
+    );
+    assert_eq!(crate::spend_of(&events).0, 200);
+}
+
+/// Producer 4/4 — the `Consolidate` synthesis (`run_consolidate`, `fanout.rs`). No
+/// CAS is wired, so compaction is skipped and the synthesis record is read directly.
+///
+/// *Mutation:* set `usage: None` on the Consolidate's `EffectRecorded` — only this
+/// test fails.
+#[tokio::test]
+async fn the_consolidate_producer_journals_its_reported_usage() {
+    let (gateway, _calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
+        input_tokens: 40,
+        output_tokens: 60,
+        total_tokens: 100,
+    }))
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["i0"]),
+                    concurrency: 4,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("cons".into()),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::soft("m")],
+            },
+        ],
+    };
+
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .run(run, &graph)
+        .await
+        .expect("drives");
+    assert!(out.failed.is_none() && out.paused.is_none(), "{out:?}");
+
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        journaled_usage_totals(&events, |n| n == "cons"),
+        vec![Some(100)],
+        "the synthesis journals its own spend"
+    );
+    assert_eq!(crate::spend_of(&events).0, 200, "child + synthesis");
+}
+
+// ---- Whole-slice review, Minor: the `spent == cap` boundary ----------------------
+
+/// The gate is `spent >= cap`, but every other budget test overshoots strictly, so
+/// mutating it to `spent > cap` left the workspace green. This lands EXACTLY on the
+/// cap: two calls at 75 tokens against a cap of 150 means node 3 sees `spent == cap`
+/// and must be stopped.
+///
+/// *Mutation:* `spent >= cap` → `spent > cap` and this fails with three calls and a
+/// completed run.
+#[tokio::test]
+async fn spending_exactly_the_cap_stops_the_run() {
+    let (gateway, calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
+        input_tokens: 25,
+        output_tokens: 50,
+        total_tokens: 75,
+    }))
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", "p1"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("n2".into()),
+                kind: model_call("c", "p2"),
+                deps: vec![Dep::hard("n1")],
+            },
+            Node {
+                id: NodeId("n3".into()),
+                kind: model_call("c", "p3"),
+                deps: vec![Dep::hard("n2")],
+            },
+        ],
+    };
+
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .run_budgeted(
+            run,
+            &graph,
+            Some(orchestrator_core::TokenBudget { total_tokens: 150 }),
+        )
+        .await
+        .expect("drives");
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "spending exactly the cap is spending it — the third call must not go out"
+    );
+    let pause = out
+        .paused
+        .as_ref()
+        .expect("landing on the cap pauses the run");
+    assert_eq!(pause.node.0, "n3");
+    assert!(
+        pause.reason.starts_with("budget: 150 of 150"),
+        "the reason reports the boundary honestly: {}",
+        pause.reason
+    );
+    assert_eq!(crate::spend_of(&journal.load(run).await.unwrap()).0, 150);
+}
+
 // ---- Task 6: the gate fires WITHIN a drive, not only at a drive boundary ----------
 //
 // Two defects found while writing the AC6 e2e, both of which made a freshly submitted
