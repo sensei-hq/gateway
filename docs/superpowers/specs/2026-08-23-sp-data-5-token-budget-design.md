@@ -184,6 +184,36 @@ one call — output tokens are unknowable before the call returns. `--budget-tok
 "stop once you have spent this much", not "never exceed this". Documented as such in the CLI help;
 calling it a hard cap would be a lie.
 
+#### 6.5a A budgeted run serialises its model calls — the price of the "one call" bound
+
+"At most one call" is only true if only one call can be *in flight*. The whole-slice review's
+Critical 1 showed it was not: `run_map` polls all its children under one `join_all`, so every child
+read the ledger before any sibling's response returned and a 6-item Map under a 100-token cap spent
+900 tokens and completed. A deterministic check-then-act — no atomic ordering fixes it.
+
+Three candidate fixes, and why only the third works:
+
+1. **Re-check inside the fan-out semaphore.** No: those permits *are* the concurrency, so N holders
+   still check together against an unchanged ledger.
+2. **Reserve tokens before the call.** No: a reservation needs an output-token estimate, which §8
+   deliberately does not have.
+3. **Hold a 1-permit gate across check → dispatch → charge.** Yes. At most one model call per run is
+   in flight, so the ledger is always current when the next call reads it.
+
+So a **budgeted** run takes a per-run `tokio::sync::Mutex` (living beside `Fold::live_spend`, one per
+drive, shared by every node including a `Map`'s children and any nested `Subgraph`/`Loop`) across the
+whole chokepoint body. **The trade, stated plainly: a budgeted run exchanges fan-out throughput for an
+exact cap.** A 6-wide `Map` under a budget dispatches its children one after another. An **unbudgeted**
+run takes no lock at all and keeps full concurrency — behaviour byte-identical, which is what the
+pre-existing suite depends on.
+
+The lock is held across the provider `.await`, so it must be the async mutex and nothing in the
+critical section may re-enter the chokepoint. Nothing can: the only await inside it is
+`gateway.execute()`, which never drives executor nodes, and `drive_nested`/`run_loop` acquire nothing
+themselves — they pass the same `&Fold` down and each dispatcher takes the gate from its own task. A
+`Loop` → `Subgraph` → concurrent `Map` → `Consolidate` budgeted run is tested under a timeout to
+prove it empirically rather than only by inspection.
+
 ### 6.6 The ledger must be LIVE within a drive — two defects found in Task 6 and closed
 
 Writing AC6 exposed that §6.5's "at most one call" was **not true as built**. The real bound was

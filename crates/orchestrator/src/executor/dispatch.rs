@@ -38,11 +38,32 @@ use super::Executor;
 /// counter instead is what makes the design's "overshoot is bounded by ONE call" (spec
 /// §6.5) actually true rather than "bounded by everything one drive can reach".
 ///
-/// The counter is `Relaxed`-atomic because a `Map` fan-out dispatches its children
-/// concurrently over this same shared view. Relaxed is sufficient: the gate is a spend
-/// backstop, not a synchronization primitive, and the only cost of a racing read is that
-/// several concurrent children can pass the gate together — which §6.3a already accepts
-/// as inherent to fan-out.
+/// # A budgeted run serialises its model calls; an unbudgeted one does not
+///
+/// The counter alone is not enough, and the whole-slice review proved it: a `Map`
+/// polls all its children under ONE `join_all`, so every child read the ledger before
+/// any sibling's response returned and a 6-item Map under a 100-token cap spent 900
+/// tokens and completed. That is a deterministic check-then-act, not a memory-ordering
+/// race, so no atomic ordering fixes it. Re-checking inside the fan-out semaphore does
+/// not either — those permits ARE the concurrency, so N holders still check together
+/// against an unchanged ledger. A reservation would need an output-token estimate that
+/// is unknowable before the call (§8).
+///
+/// So a run WITH a budget takes [`gate`](Meter::gate) — a 1-permit `tokio::sync::Mutex`
+/// held across the whole check → dispatch → charge sequence — and therefore has at most
+/// one model call in flight at a time. That is what makes §6.5's "overshoot bounded by
+/// at most one call" true under fan-out, with no estimation.
+///
+/// **The trade, stated plainly: a budgeted run gives up fan-out throughput for an exact
+/// cap.** A 6-wide `Map` under a budget dispatches its children one after another. That
+/// is the price of a cap that holds; a run that does not want it simply does not set a
+/// budget.
+///
+/// An UNBUDGETED run takes no lock at all and keeps full concurrency — the additivity
+/// guarantee the pre-SP-DATA-5 suite depends on.
+///
+/// The counter stays `Relaxed`-atomic: under a budget the mutex already orders every
+/// read and write of it, and without one the counter is never gated on.
 pub(super) struct Meter<'a> {
     /// Folded from the journal by effect id — see `Fold::spent`.
     journaled: u64,
@@ -50,14 +71,22 @@ pub(super) struct Meter<'a> {
     /// Tokens dispatched by this drive and not yet re-folded from the journal. Reset to
     /// zero by construction on the next drive, whose `journaled` base then includes them.
     live: &'a AtomicU64,
+    /// The per-run, per-drive serialisation gate. Acquired only when `budget` is `Some`.
+    gate: &'a tokio::sync::Mutex<()>,
 }
 
 impl<'a> Meter<'a> {
-    pub(super) fn new(journaled: u64, budget: Option<u64>, live: &'a AtomicU64) -> Self {
+    pub(super) fn new(
+        journaled: u64,
+        budget: Option<u64>,
+        live: &'a AtomicU64,
+        gate: &'a tokio::sync::Mutex<()>,
+    ) -> Self {
         Self {
             journaled,
             budget,
             live,
+            gate,
         }
     }
 
@@ -69,6 +98,12 @@ impl<'a> Meter<'a> {
 
     pub(super) fn budget(&self) -> Option<u64> {
         self.budget
+    }
+
+    /// The run's serialisation gate — held by [`Executor::dispatch_metered`] across
+    /// check→dispatch→charge, and ONLY when a budget is set.
+    fn gate(&self) -> &'a tokio::sync::Mutex<()> {
+        self.gate
     }
 
     /// Add a completed call's tokens to the in-drive tally.
@@ -124,11 +159,28 @@ impl Executor {
     /// Tokens are charged on a successful RESPONSE rather than after the caller
     /// journals its `EffectRecorded`: the provider has been paid either way, so a
     /// journal append that fails afterwards must not also lose the accounting.
+    ///
+    /// A BUDGETED run holds the meter's 1-permit gate across this entire body, so the
+    /// check and the charge are atomic with respect to every other model call in the
+    /// run and a concurrent `Map` fan-out cannot walk the gate en masse (see
+    /// [`Meter`]). An unbudgeted run takes no lock. The lock is held across the
+    /// provider `.await` — deliberately, that is the whole point — so it must be the
+    /// async `tokio::sync::Mutex`, and nothing inside the critical section may
+    /// re-enter `dispatch_metered`: the only await here is the gateway call, which
+    /// never drives executor nodes, so a nested `Subgraph`/`Loop`/`Map` child (each of
+    /// which reaches this function only from its OWN task, never from inside another's
+    /// critical section) blocks on the gate and is woken when the holder releases.
     pub(super) async fn dispatch_metered(
         &self,
         request: &InferenceRequest,
         meter: &Meter<'_>,
     ) -> Result<Result<InferenceResponse, Refusal>, GatewayError> {
+        // Bound to a named local: it must live to the end of the function, and only a
+        // budgeted run acquires it at all.
+        let _serialised = match meter.budget() {
+            Some(_) => Some(meter.gate().lock().await),
+            None => None,
+        };
         let spent = meter.spent();
         if let Some(cap) = meter.budget()
             && spent >= cap
