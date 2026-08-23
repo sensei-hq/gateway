@@ -116,10 +116,34 @@ is worse, because an ungated path silently spends past the cap rather than merel
 The gate goes at a single dispatch chokepoint. If one does not exist, creating it is part of this
 slice, and §7's test matrix proves each of the four producers reaches it.
 
-### 6.3 What counts
+### 6.3 What counts — and the one path that does NOT
 
-Everything on the same `run_id`, deliberately: Map children, nested `Subgraph`s, and the planner
-sub-run at `{expand}/__plan__`. A planner that burns the budget must count against it.
+Everything routed through the executor's own gateway on the same `run_id`: Map children, nested
+`Subgraph`s, and the planner sub-run at `{expand}/__plan__`. A planner that burns the budget counts
+against it.
+
+**Known gap, found during Task 3 and deliberately not closed: `LlmPlannerSelector::select` is
+unbudgeted and invisible to the ledger.** It is a fifth model-call site
+(`crates/orchestrator/src/executor/selector.rs:70`) that the chokepoint cannot reach by construction:
+it holds its **own** `Arc<Gateway>` rather than the executor's field, and the `PlannerSelector` trait
+method takes only `(goal, candidates)` — no run, node, or fold context. Its call is also deliberately
+**not a journaled effect** (only the resulting `PlannerSelected` is), so usage capture cannot ledger it
+either. It costs one call per `PlannerRef::Select` node.
+
+Closing it requires changing a core trait signature — a design decision, not mechanical wiring — so it
+is deferred (§8). It is recorded here rather than left implicit because "a producer nobody routed
+through the chokepoint" is precisely the failure this slice's gate exists to prevent, and a spec that
+claimed full coverage while this path existed would be worse than one that names it.
+
+### 6.3a A gated Map fan-out journals one pause per child
+
+Empirically: 3 live children under an exhausted budget produce 3 `RunPaused` events and 0 gateway
+calls. Harmless — `fold_journal` has no `RunPaused` arm, the scheduler reads the last one, all are
+byte-identical, and `apply_node_result` takes the first — but the journal noise is proportional to
+fan-out width. This is the same shape the pre-existing in-doubt Agent-child pause already has; the
+difference is that budget exhaustion hits *every* child at once where an in-doubt Mutation usually hits
+one. Deduping would need either a second gate site outside the chokepoint (the very thing §6.2
+forbids) or shared per-run mutable state, so it is accepted.
 
 ### 6.4 `BudgetRaised`, and why it is required rather than nice-to-have
 
@@ -176,6 +200,10 @@ SP-DATA-4 alone — so each of these names the mutation that must break it.
 - **Money denomination.** `Cost` and `ModelPricing` already exist; what is missing is durable,
   current per-model pricing. The token ledger is designed so a cost model can price it
   retrospectively — the journal records raw counts, which is the honest primitive.
+- **Budgeting `LlmPlannerSelector::select`** (§6.3). It needs a `PlannerSelector` trait signature
+  carrying run/fold context, and a decision about whether the selector's call should become a
+  journaled effect so it can be ledgered at all. Bounded exposure today: one call per
+  `PlannerRef::Select` node.
 - **Fleet-wide / per-tenant budgets**, and a precedence rule against the per-run cap.
 - **Pre-flight estimation** to eliminate the one-call overshoot.
 - **Budget-aware scheduling** — e.g. refusing to wake a run whose remaining budget cannot plausibly
