@@ -207,8 +207,19 @@ impl Executor {
         }
         let request =
             build_chat_request(&ar.chain, &ar.system, messages.to_vec(), ar.tools.clone());
-        self.dispatch_model_turn(ar.run, ar.node_id, eid, ih, request)
-            .await
+        // SP-DATA-5: the token budget rides as two scalars rather than the (private,
+        // `mod.rs`-owned) `Fold`, so `dispatch_model_turn` stays independent of the
+        // fold's shape — and matches the chokepoint's own signature.
+        self.dispatch_model_turn(
+            ar.run,
+            ar.node_id,
+            eid,
+            ih,
+            request,
+            ar.fold.spent(),
+            ar.fold.budget(),
+        )
+        .await
     }
 
     /// Finalize a completed agent node: journal `NodeCompleted` once (guarded on
@@ -783,10 +794,18 @@ impl Executor {
         }
     }
 
-    /// Dispatch one live model turn through the gateway and journal its result:
-    /// on success, record the `{model, text, tool_calls}` output as a Pure effect
-    /// (`eid`) and return it; on a gateway error, journal `NodeFailed` and return
-    /// the failure message. The outer `Err` is a fatal journal/CAS error.
+    /// Dispatch one live model turn through the metered chokepoint and journal its
+    /// result: on success, record the `{model, text, tool_calls}` output as a Pure
+    /// effect (`eid`) and return it; on a refusal (SP-DATA-5 — an exhausted budget,
+    /// or an unmetered call under a budget) return the journaled pause/failure; on a
+    /// gateway error, journal `NodeFailed` and return the failure message. The outer
+    /// `Err` is a fatal journal/CAS error.
+    ///
+    /// `spent`/`budget` are the run's folded token ledger, passed as scalars so this
+    /// helper does not depend on `Fold`'s shape.
+    // Seven positional inputs, each distinct and read straight through to either the
+    // effect record or the chokepoint; bundling them would only relocate the plumbing.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_model_turn(
         &self,
         run: RunId,
@@ -794,9 +813,11 @@ impl Executor {
         eid: EffectId,
         ih: String,
         request: InferenceRequest,
+        spent: u64,
+        budget: Option<u64>,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
-        match self.gateway.execute(&request).await {
-            Ok(response) => {
+        match self.dispatch_metered(&request, spent, budget).await {
+            Ok(Ok(response)) => {
                 // SP-4 s2: `model_output` builds `{model, text}` with `text` scrubbed
                 // (the single redaction chokepoint) before journal + feed-back; the
                 // ReAct path then appends `tool_calls` (the structured call args the
@@ -823,6 +844,13 @@ impl Executor {
                 .await?;
                 Ok(ToolOutcome::Ok(output))
             }
+            // SP-DATA-5: the chokepoint refused before spending. `record_refusal`
+            // journaled it (`RunPaused` for an exhausted budget — the HOTL class —
+            // or `NodeFailed` for an unmetered call), so just carry it out.
+            Ok(Err(refusal)) => match self.record_refusal(run, node_id, refusal).await? {
+                super::dispatch::RefusalKind::Paused(reason) => Ok(ToolOutcome::Paused(reason)),
+                super::dispatch::RefusalKind::Failed(message) => Ok(ToolOutcome::Failed(message)),
+            },
             // A fully-gated chain with a timed re-eligibility (§11.2) is a durable
             // pause (resumable) — on resume the turn re-attempts (no `EffectRecorded`
             // was journaled). Every other gateway error fails the node.
