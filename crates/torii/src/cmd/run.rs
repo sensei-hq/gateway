@@ -282,10 +282,16 @@ pub enum SignalState {
 
 impl SignalState {
     /// The operator-facing state word, for "not delivered: `<node>` is `<state>`".
+    ///
+    /// A bare adjective, carrying no "already"/"still" of its own, because the callers
+    /// supply their own tense — "is `<state>`" and "was already `<state>` before the write
+    /// landed" cannot both be built from one word that already says "already". The
+    /// pre-check's Completed refusal has its own dedicated sentence in [`not_delivered`]
+    /// and does not go through here.
     pub fn as_str(&self) -> &'static str {
         match self {
             SignalState::Awaiting { .. } => "awaiting a signal",
-            SignalState::Completed => "already completed",
+            SignalState::Completed => "completed",
             SignalState::Failed => "failed",
             SignalState::Skipped => "skipped",
             SignalState::NotAwaiting => "not awaiting a signal",
@@ -293,7 +299,25 @@ impl SignalState {
     }
 }
 
-/// Fold every `AwaitSignal` node's state out of a run's journal in ONE pass.
+/// One node's [`SignalState`], plus the journal [`Seq`] of the event that established it.
+///
+/// The seq is what makes the post-write report honest (§6.6). `signal` writes its answer
+/// and then re-reads; if the node is terminal by then, "terminal" alone cannot say
+/// whether the delivery was READ or ORPHANED — the two outcomes are opposite and the
+/// operator needs to know which. The journal ORDER answers it: a terminal marker BEHIND
+/// our appended row means the drive that terminated the node folded a journal that
+/// already contained the answer; a marker AHEAD of it means the node was already dead
+/// when the row landed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalStateAt {
+    pub state: SignalState,
+    /// `None` while the node is still awaiting (nothing has terminated it), and for a
+    /// node that never awaited at all.
+    pub at: Option<Seq>,
+}
+
+/// Fold every `AwaitSignal` node's state — and the seq that established it — out of a
+/// run's journal in ONE pass.
 ///
 /// A node that never journaled `SignalAwaited` is absent from the map (the caller reads
 /// that as [`SignalState::NotAwaiting`]).
@@ -311,11 +335,11 @@ impl SignalState {
 /// (harmless — last-wins) rather than toward reporting `already completed` for a node
 /// that is genuinely still waiting, which would strand a run on a human who was told
 /// their decision had already landed.
-fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalState> {
+fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalStateAt> {
     let mut awaited: HashMap<NodeId, Option<DateTime<Utc>>> = HashMap::new();
-    let mut terminal: HashMap<NodeId, SignalState> = HashMap::new();
-    let mut run_completed = false;
-    for (_, e) in events {
+    let mut terminal: HashMap<NodeId, (Seq, SignalState)> = HashMap::new();
+    let mut run_completed: Option<Seq> = None;
+    for (seq, e) in events {
         match e {
             // FIRST record wins — the same asymmetry the executor's fold enforces, and
             // for the same reason: re-reading a later record would let every resume push
@@ -324,13 +348,13 @@ fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalState>
                 awaited.entry(node.clone()).or_insert(*deadline);
             }
             JournalEvent::NodeCompleted { node } => {
-                terminal.insert(node.clone(), SignalState::Completed);
+                terminal.insert(node.clone(), (*seq, SignalState::Completed));
             }
             JournalEvent::NodeFailed { node, .. } => {
-                terminal.insert(node.clone(), SignalState::Failed);
+                terminal.insert(node.clone(), (*seq, SignalState::Failed));
             }
             JournalEvent::NodeSkipped { node } => {
-                terminal.insert(node.clone(), SignalState::Skipped);
+                terminal.insert(node.clone(), (*seq, SignalState::Skipped));
             }
             // The completion marker for the node kinds that journal no `NodeCompleted`.
             // `or_insert`, not `insert`: a real terminal event above is the stronger
@@ -342,30 +366,55 @@ fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalState>
             } => {
                 terminal
                     .entry(NodeId(key.0.clone()))
-                    .or_insert(SignalState::Completed);
+                    .or_insert((*seq, SignalState::Completed));
             }
-            JournalEvent::RunCompleted => run_completed = true,
+            // FIRST wins, like every other marker here: a run completes once, and the
+            // instant it did is what a delivery has to be ordered against.
+            JournalEvent::RunCompleted => {
+                run_completed.get_or_insert(*seq);
+            }
             _ => {}
         }
     }
     awaited
         .into_iter()
         .map(|(node, deadline)| {
-            let state = match terminal.get(&node) {
-                Some(t) => t.clone(),
-                None if run_completed => SignalState::Completed,
-                None => SignalState::Awaiting { deadline },
+            let at = match terminal.get(&node) {
+                Some((seq, state)) => SignalStateAt {
+                    state: state.clone(),
+                    at: Some(*seq),
+                },
+                // The backstop for a deployment with no `ContextStore` wired: an
+                // `AwaitSignal` node journals no `NodeCompleted`, so with no blackboard
+                // publish to read, `RunCompleted` is the ONLY evidence this node finished.
+                None => match run_completed {
+                    Some(seq) => SignalStateAt {
+                        state: SignalState::Completed,
+                        at: Some(seq),
+                    },
+                    None => SignalStateAt {
+                        state: SignalState::Awaiting { deadline },
+                        at: None,
+                    },
+                },
             };
-            (node, state)
+            (node, at)
         })
         .collect()
 }
 
 /// One node's [`SignalState`], folded from `events`.
 pub fn signal_state(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalState {
-    signal_states(events)
-        .remove(node)
-        .unwrap_or(SignalState::NotAwaiting)
+    signal_state_at(events, node).state
+}
+
+/// One node's [`SignalState`] **with** the seq that established it — what `signal`'s
+/// post-write report needs; see [`SignalStateAt`].
+fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStateAt {
+    signal_states(events).remove(node).unwrap_or(SignalStateAt {
+        state: SignalState::NotAwaiting,
+        at: None,
+    })
 }
 
 /// Every node in this run that is currently awaiting a signal, in node-id order so the
@@ -373,7 +422,7 @@ pub fn signal_state(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStat
 fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
     let mut out: Vec<render::AwaitingNode> = signal_states(events)
         .into_iter()
-        .filter_map(|(node, st)| match st {
+        .filter_map(|(node, st)| match st.state {
             SignalState::Awaiting { deadline } => Some(render::AwaitingNode { node, deadline }),
             _ => None,
         })
@@ -395,9 +444,11 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 ///
 /// 4 KiB is the same boundary the executor already applies to a model call's inline
 /// output, so a journal row produced by a signal can never be larger than one the
-/// executor itself writes inline. It is also far beyond any real use: a signal is a human
-/// DECISION (`{"decision":"approved","note":"…"}`), not a data channel, and 4 KiB is
-/// roughly 600 words of prose.
+/// executor itself writes inline. **That claim is only true because the cap is checked on
+/// the REDACTED value** — the one actually written — see [`Measured`]. It is also far
+/// beyond any real use: a signal is a human DECISION
+/// (`{"decision":"approved","note":"…"}`), not a data channel, and 4 KiB is roughly 600
+/// words of prose.
 ///
 /// **Carry-forward:** this bounds the CLI, not the journal. `SignalReceived` remains
 /// uncapped for any future writer (a webhook/HTTP delivery path, §8's deferred
@@ -405,18 +456,47 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 /// is a format break.
 pub const MAX_PAYLOAD_BYTES: usize = 4096;
 
+/// WHICH size [`check_payload_size`] is measuring — because redaction sits between the
+/// two and can make the second LARGER than the first.
+///
+/// `[REDACTED]` is 10 bytes and the assignment pattern's shortest matched value is 6, so
+/// a payload of many short `token:…` pairs inflates by roughly 1.67x: a measured 4064-byte
+/// payload journals a 5312-byte row. Checking only [`AsGiven`](Measured::AsGiven) let that
+/// through, which falsified the "never larger than an inline executor row" claim above.
+#[derive(Clone, Copy)]
+enum Measured {
+    /// The payload exactly as the operator supplied it. Checked FIRST, and by
+    /// [`parse_payload`] before any connection is opened, so the redactor is never handed
+    /// an unbounded blob.
+    AsGiven,
+    /// The payload as it will actually be journaled. This is the check the cap exists
+    /// for: the durable row is the thing being bounded.
+    AfterRedaction,
+}
+
 /// Refuse an over-limit payload, naming BOTH the limit and the actual size — an operator
 /// who pasted a file needs to know how much to cut, not just that they were over.
-fn check_payload_size(payload: &serde_json::Value) -> Result<(), String> {
+fn check_payload_size(payload: &serde_json::Value, measured: Measured) -> Result<(), String> {
     // `to_vec` (not `to_string().len()`) so the number is bytes on the wire, which is
     // what the journal row actually stores.
     let size = serde_json::to_vec(payload).map_or(usize::MAX, |b| b.len());
     if size > MAX_PAYLOAD_BYTES {
+        // Naming which size this is matters: an operator who sent 4064 bytes and is told
+        // "5312 bytes" with no explanation will assume the tool is broken.
+        let what = match measured {
+            Measured::AsGiven => "",
+            Measured::AfterRedaction => {
+                " once redacted (secret-shaped text is replaced by the longer literal \
+                 `[REDACTED]` before the row is written, so the durable row is bigger \
+                 than what you sent)"
+            }
+        };
         return Err(format!(
-            "--payload is {size} bytes, over the {MAX_PAYLOAD_BYTES}-byte limit. A signal \
-             is a human DECISION, not a data channel — it is journaled durably and folded \
-             into the node's output on every resume. Put the bulk somewhere the graph can \
-             read (a workspace file, the blackboard) and signal a reference to it."
+            "--payload is {size} bytes{what}, over the {MAX_PAYLOAD_BYTES}-byte limit. A \
+             signal is a human DECISION, not a data channel — it is journaled durably and \
+             folded into the node's output on every resume. Put the bulk somewhere the \
+             graph can read (a workspace file, the blackboard) and signal a reference to \
+             it."
         ));
     }
     Ok(())
@@ -441,6 +521,12 @@ fn check_payload_size(payload: &serde_json::Value) -> Result<(), String> {
 /// those reports a category and a position (`expected value at line 1 column 1`) with no
 /// input bytes. The `invalid type: string "sk-live-…"` shape that leaks in `boot` comes
 /// from deserializing into a TYPED struct, which this does not do.
+///
+/// This checks the payload [`AsGiven`](Measured::AsGiven) only. The check that bounds the
+/// durable row — [`AfterRedaction`](Measured::AfterRedaction) — needs the redactor and
+/// lives in [`signal`]; it can refuse a payload this one accepted, after a connection has
+/// been opened. That is the right split: this one exists to fail fast and to keep an
+/// unbounded blob away from the redactor, not to be the authority on the row size.
 pub fn parse_payload(s: &str) -> Result<serde_json::Value, String> {
     let v: serde_json::Value = serde_json::from_str(s).map_err(|e| {
         format!(
@@ -450,7 +536,7 @@ pub fn parse_payload(s: &str) -> Result<serde_json::Value, String> {
              channel and an operator may have pasted one here."
         )
     })?;
-    check_payload_size(&v)?;
+    check_payload_size(&v, Measured::AsGiven)?;
     Ok(v)
 }
 
@@ -475,17 +561,22 @@ pub fn parse_payload(s: &str) -> Result<serde_json::Value, String> {
 /// guarantees any worker that can observe the wake folds a journal that already contains
 /// the answer.
 ///
-/// **Check-then-act.** The node's state is read, and then read AGAIN after the write, and
-/// the report is derived from the SECOND read. The pre-check refuses cheaply; the
-/// post-check is what makes the report honest when a worker drove the run inside the
-/// window (`wake` once reported exactly that lost race as a success). The only
+/// **Check-then-act, ordered by seq.** The node's state is read, and then read AGAIN
+/// after the write, and the report is derived from the SECOND read. The pre-check refuses
+/// cheaply; the post-check is what makes the report honest when a worker drove the run
+/// inside the window (`wake` once reported exactly that lost race as a success). The only
 /// state-changing call, `force_wake`, is itself conditional on the row still being
 /// `paused` in both shipped stores, so a lost race is a no-op there rather than a
 /// double-apply.
 ///
-/// **The payload is redacted before it is journaled** (§6.4) — see
-/// [`render::redact_payload`]. **A signal is not a credential channel; the credential
-/// broker is.**
+/// A terminal state on the second read is NOT by itself a refusal, and treating it as one
+/// was this command's worst bug: the append has already succeeded, so the answer IS
+/// durable, and the live question is whether anything read it. The appended `Seq` against
+/// the terminal marker's `Seq` decides — see [`SignalStateAt`].
+///
+/// **The payload is redacted before it is size-checked and journaled** (§6.4/§6.5) — see
+/// [`render::redact_payload`] and [`Measured`]. **A signal is not a credential channel;
+/// the credential broker is.**
 pub async fn signal(
     store: &dyn SchedulerStore,
     journal: &dyn ExecutionJournal,
@@ -503,7 +594,19 @@ pub async fn signal(
     // "ran fine, nothing to do" — an over-limit payload is invalid INPUT, which is what
     // `parse_run_id` also treats as exit 1. The two entry points must not disagree about
     // the exit code for one violation.
-    check_payload_size(&payload).map_err(CliError::error)?;
+    //
+    // TWO checks, on either side of the redaction, and both are load-bearing. The first
+    // bounds what the redactor is handed. The second is the one the cap actually exists
+    // for: redaction REPLACES secret-shaped spans with a LONGER literal, so it can grow
+    // the payload (a measured 4064-byte payload journals a 5312-byte row) — checking only
+    // the as-given size bounded the wrong value entirely. Redacting up here rather than
+    // inline at the append is what makes the checked bytes and the written bytes the same
+    // bytes; the SAME pure pass the executor applies on the fold-read, so this stays
+    // idempotent (`[REDACTED]` matches no credential shape) and live == journaled ==
+    // replayed (§6.4).
+    check_payload_size(&payload, Measured::AsGiven).map_err(CliError::error)?;
+    let payload = render::redact_payload(&payload);
+    check_payload_size(&payload, Measured::AfterRedaction).map_err(CliError::error)?;
 
     // A node id is operator-supplied free text on this path, and every message below
     // echoes it back to a terminal. `one_line` collapses control characters (Unicode Cc,
@@ -529,25 +632,42 @@ pub async fn signal(
     if before.status != RunStatus::Paused {
         // A `waking` row means a worker holds the lease and is folding this journal right
         // now; a terminal row means nothing will ever read the answer. Neither is a state
-        // to write into.
-        return Ok(Outcome::precondition(format!(
-            "not delivered: {} is awaiting a signal, but the run is {} — only a paused run \
-             can be signalled. Retry once `torii run status {}` shows it paused.",
-            shown,
-            before.status.as_str(),
-            run.0
-        )));
+        // to write into — but they call for OPPOSITE advice, and giving one message for
+        // both handed an operator of a cancelled run "retry once it shows paused", which
+        // is advice to wait forever: no shipped store ever moves a terminal row back to
+        // `paused`. (A terminal run is reachable here with the node still folding as
+        // awaiting, because `cancel`/`record_terminal` journal no node event.)
+        return Ok(Outcome::precondition(
+            if before.status == RunStatus::Waking {
+                format!(
+                    "not delivered: {} is awaiting a signal, but the run is waking — a worker \
+                 holds the lease and is folding this journal right now. Retry once \
+                 `torii run status {}` shows it paused.",
+                    shown, run.0
+                )
+            } else {
+                format!(
+                    "not delivered: {} is awaiting a signal, but the run is {} — a {} run is \
+                 never paused again, so nothing will ever read an answer delivered to it. \
+                 Start a new run.",
+                    shown,
+                    before.status.as_str(),
+                    before.status.as_str()
+                )
+            },
+        ));
     }
 
-    journal
+    // The appended seq is KEPT, not discarded: it is the only thing that can order our
+    // row against a terminal marker the post-check may find. See `SignalStateAt`.
+    let appended = journal
         .append(
             run,
             JournalEvent::SignalReceived {
                 node: node.clone(),
-                // §6.4. The executor applies this SAME pure pass to whatever it folds, so
-                // redacting here as well is idempotent (`[REDACTED]` matches no
-                // credential shape) and keeps live == journaled == replayed.
-                payload: render::redact_payload(&payload),
+                // Already redacted, above — the value checked against the cap and the
+                // value written are the same bytes.
+                payload,
             },
         )
         .await
@@ -565,23 +685,63 @@ pub async fn signal(
         .load(run)
         .await
         .map_err(OrchestratorError::Journal)?;
-    match signal_state(&after_events, &node) {
-        SignalState::Awaiting { .. } => {}
-        SignalState::Completed => {
-            return Ok(Outcome::precondition(format!(
-                "not delivered: {} already completed — it finished while this delivery was \
-                 in flight, so the node had already read its answer.",
-                shown
-            )));
-        }
-        other => {
-            return Ok(Outcome::precondition(format!(
-                "not delivered: {} is {} — it terminated while this delivery was in flight.",
-                shown,
+    // The node is terminal by now, or it is not. If it is, "not delivered" is FALSE — the
+    // row is already durable — and the honest question is whether anything READ it. The
+    // journal order answers that, which is why the append's seq was kept: a terminal
+    // marker BEHIND our row means the drive that terminated the node folded a journal
+    // that already contained the answer; a marker AHEAD of it means the node was already
+    // dead when the row landed and nothing will ever read it.
+    //
+    // The first cut of this reported every terminal post-check as "not delivered" with
+    // exit 2. That inverted §6.6 on the command's most successful path: a worker that
+    // claims a due gate the instant the delivery lands folds the answer, completes the
+    // node and drives the run to completion — the delivery worked perfectly, and the CLI
+    // said it had not happened.
+    let SignalStateAt { state, at } = signal_state_at(&after_events, &node);
+    if let Some(at) = at {
+        return Ok(match (&state, at > appended) {
+            // Terminated AFTER our row landed, by completing: the answer was on the
+            // journal for the fold that completed it. This is a SUCCESS, and the only
+            // difference from the ordinary path is that the run is already moving.
+            //
+            // The wording claims the ordering (which is proven) and not authorship of the
+            // completion (which is not): if a duplicate answer for this node was already
+            // on the journal — §7's last-wins case — the drive may have folded that one.
+            // Both were delivered; both are durable; which one won is not observable from
+            // here, so the sentence does not assert it.
+            (SignalState::Completed, true) => Outcome::ok(format!(
+                "signalled: {shown} (a drive already in flight completed the node after \
+                 the answer landed, so the run is moving without waiting for a tick)"
+            )),
+            // Terminated AFTER our row, but NOT by completing — a deadline that fired, or
+            // a cascade skip. The drive that failed it had loaded the journal before our
+            // row landed, so it never saw the answer. Reporting `signalled` here would
+            // hide a failed gate behind a success.
+            (other, true) => Outcome::precondition(format!(
+                "not read: {shown}'s answer is journaled durably, but {shown} is {} — it \
+                 terminated while this delivery was in flight, and a drive that had \
+                 already loaded the journal would not have seen the answer.",
                 other.as_str()
-            )));
-        }
+            )),
+            // Terminated BEFORE our row landed: a true orphan. Worth saying plainly,
+            // because the residue is durable and consequential — an `AwaitSignal` node
+            // journals no `NodeCompleted` and `NodeFailed` is not folded as a barrier, so
+            // a later re-`start` would re-execute the gate and fold this late answer as
+            // its output, silently converting an expired gate into an answered one.
+            (other, false) => Outcome::precondition(format!(
+                "not read: {shown}'s answer is journaled durably, but {shown} was already \
+                 {} before the write landed, so nothing read it. The answer stays on the \
+                 journal as a last-wins value that a re-`start` of this run would fold as \
+                 the node's output — do not treat this run as answered.",
+                other.as_str()
+            )),
+        });
     }
+
+    // `at: None` ⇒ nothing has terminated the node, so the answer is still there to be
+    // read and the only remaining question is the WAKE. (`NotAwaiting` also folds to
+    // `None`, but is unreachable here: the pre-check read a `SignalAwaited` and the
+    // journal is append-only, so this second, later read is a superset of that one.)
 
     // The wake half, checked exactly as `wake` checks its own: STATUS plus the pinned
     // timestamp, because `claim_due` leaves a stale `next_wake` untouched and an
@@ -2126,9 +2286,103 @@ mod tests {
             "must name the actual state: {}",
             out.text
         );
+        // `waking` is TRANSIENT — the lease resolves into `paused` again or into a
+        // terminal state — so waiting is real advice here, and this is the arm that must
+        // give it. (The terminal arm must not; see the test below.)
+        assert!(
+            out.text.contains("shows it paused"),
+            "a waking run is worth retrying, and the operator must be told so: {}",
+            out.text
+        );
         assert!(
             journaled_signals(&j, run, &gate()).await.is_empty(),
             "a worker holds the lease and is folding this journal — nothing may be written"
+        );
+    }
+
+    /// A terminal run is NEVER paused again by any shipped store, so "retry once `status`
+    /// shows it paused" is advice to wait forever. `cancel`/`record_terminal` journal no
+    /// node event, so the gate still folds as awaiting on a run that is over — which is
+    /// exactly how an operator reaches this path.
+    #[tokio::test]
+    async fn signal_on_a_terminal_run_does_not_advise_waiting_for_a_pause_that_never_comes() {
+        for terminal in [
+            RunStatus::Cancelled,
+            RunStatus::Completed,
+            RunStatus::Failed,
+        ] {
+            let run = RunId(uuid::Uuid::new_v4());
+            let s = InMemorySchedulerStore::default();
+            s.enqueue(run, &empty_graph(), now()).await.unwrap();
+            s.record_terminal(run, terminal, None).await.unwrap();
+            let j = awaiting_journal(run, &gate(), None).await;
+
+            let out = signal(&s, &j, run, gate(), approved(), now())
+                .await
+                .expect("no hard error");
+
+            assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+            assert!(
+                out.text.contains(terminal.as_str()),
+                "must name the actual state: {}",
+                out.text
+            );
+            assert!(
+                !out.text.contains("shows it paused") && !out.text.contains("Retry"),
+                "a {} run never pauses again — this is advice to wait forever: {}",
+                terminal.as_str(),
+                out.text
+            );
+            assert!(
+                journaled_signals(&j, run, &gate()).await.is_empty(),
+                "nothing may be written into a run that is over"
+            );
+        }
+    }
+
+    /// The `RunCompleted` BACKSTOP, alone. An `AwaitSignal` node journals no
+    /// `NodeCompleted`, so the node-keyed completion marker is the blackboard
+    /// `ContextWrite` — which only exists when a `ContextStore` is wired. With none
+    /// wired, `RunCompleted` is the ONLY evidence the node finished, and without it a
+    /// signal would be written into a run that has already ended and reported as
+    /// delivered.
+    #[tokio::test]
+    async fn a_completed_run_marks_its_await_signal_node_completed_without_a_context_write() {
+        let run = RunId(uuid::Uuid::new_v4());
+        // The row stays `paused`, so ONLY the journal fold can refuse this: if the
+        // backstop is removed, the node reads as awaiting and the delivery goes through.
+        let s = paused_store(run, None).await;
+        let j = awaiting_journal(run, &gate(), None).await;
+        j.append(run, JournalEvent::RunCompleted).await.unwrap();
+        assert!(
+            seq_of(&j, run, |e| matches!(e, JournalEvent::ContextWrite { .. }))
+                .await
+                .is_none(),
+            "precondition: no ContextStore was wired, so there is no node-keyed marker"
+        );
+
+        // The fold itself, directly...
+        assert_eq!(
+            signal_state(&j.load(run).await.unwrap(), &gate()),
+            SignalState::Completed,
+            "a finished run finished every node in it"
+        );
+
+        // ...and the refusal it produces.
+        let out = signal(&s, &j, run, gate(), approved(), now())
+            .await
+            .expect("no hard error");
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(out.text.contains("already completed"), "{}", out.text);
+        assert!(
+            journaled_signals(&j, run, &gate()).await.is_empty(),
+            "the run is over — a delivery here can only ever be a last-wins answer for a \
+             node that a re-`start` would re-execute"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and a refused delivery must not queue a wake"
         );
     }
 
@@ -2275,6 +2529,66 @@ mod tests {
         assert_eq!(s.status(run).await.unwrap().unwrap().next_wake, None);
     }
 
+    /// §6.5, and the half the first cut missed: the cap governs the JOURNAL ROW, and the
+    /// row holds the REDACTED payload — which can be LARGER than what the operator sent.
+    /// `[REDACTED]` is 10 bytes and the assignment pattern's shortest matched value is 6,
+    /// so a payload of many short `token:…` pairs inflates by roughly 1.67x. Checking
+    /// only the as-given size therefore let a ~4 KiB payload journal a ~5.3 KiB row.
+    ///
+    /// The pair is assembled at runtime: the repo's Semgrep CWE-798 hook blocks a
+    /// credential-shaped literal in a fixture.
+    #[tokio::test]
+    async fn a_payload_that_only_exceeds_the_cap_after_redaction_is_rejected() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = awaiting_journal(run, &gate(), None).await;
+
+        // `token:abcdef ` — a 6-byte value (the pattern's minimum) that redacts to the
+        // 10-byte placeholder, repeated. The trailing space is load-bearing: without a
+        // separator the value class runs to the end of the string and the whole run
+        // collapses into ONE placeholder, which shrinks rather than grows.
+        let unit = format!("{}:{} ", "token", "abcdef");
+        let raw = serde_json::json!({ "n": unit.repeat(312) });
+        let as_given = serde_json::to_vec(&raw).unwrap().len();
+        let journaled = serde_json::to_vec(&render::redact_payload(&raw))
+            .unwrap()
+            .len();
+        assert!(
+            as_given <= MAX_PAYLOAD_BYTES,
+            "precondition: this passes the as-given check ({as_given} bytes)"
+        );
+        assert!(
+            journaled > MAX_PAYLOAD_BYTES,
+            "precondition: redaction GROWS it past the cap ({as_given} -> {journaled} bytes)"
+        );
+
+        let e = signal(&s, &j, run, gate(), raw, now())
+            .await
+            .expect_err("a row that would exceed the cap once redacted is refused");
+
+        assert_eq!(e.code, crate::errors::EXIT_ERROR, "{}", e.message);
+        assert!(
+            e.message.contains(&journaled.to_string()),
+            "must name the size that would actually be JOURNALED ({journaled}), not the \
+             one the operator sent: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains(&MAX_PAYLOAD_BYTES.to_string()),
+            "must name the limit: {}",
+            e.message
+        );
+        assert!(
+            journaled_signals(&j, run, &gate()).await.is_empty(),
+            "an over-limit row must never reach the journal"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and a refused delivery must not queue a wake"
+        );
+    }
+
     #[test]
     fn parse_payload_rejects_something_that_is_not_json() {
         let e = parse_payload("approved").expect_err("bare prose is not JSON");
@@ -2327,19 +2641,36 @@ mod tests {
         assert!(e.to_lowercase().contains("payload"), "{e}");
     }
 
+    /// What the concurrent worker's drive does to the awaiting node — see
+    /// [`SignalRacingStore`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum RacingDrive {
+        /// It merely claimed the run (`paused -> waking`) and is still driving it.
+        ClaimsOnly,
+        /// It folded the journal — which by then contains our delivery — and completed
+        /// the node with that answer.
+        CompletesTheNode,
+        /// It had loaded the journal BEFORE our delivery landed, found no signal and an
+        /// expired deadline, and failed the node. Our answer is durable but was never
+        /// read.
+        FailsTheDeadline,
+    }
+
     /// A `SchedulerStore` that runs a concurrent worker against `run` at the top of
     /// `force_wake` — i.e. exactly in the window between `signal`'s pre-check and the
     /// point where its effect becomes observable. `signal` appends BEFORE it calls
-    /// `force_wake`, so this models a worker that drove the run after the delivery
-    /// landed. Same technique as `RacingStore` above: single-threaded, deterministic,
-    /// no database.
+    /// `force_wake`, so this models a worker that drove the run AFTER the delivery
+    /// landed (the terminal marker is journaled behind our `SignalReceived`). Same
+    /// technique as `RacingStore` above: single-threaded, deterministic, no database.
+    ///
+    /// The other half of the window — a drive that terminated the node BEFORE our append
+    /// — cannot be modelled here, because `signal` makes no store call between its
+    /// journal read and its journal write; see [`RacingJournal`].
     struct SignalRacingStore {
         inner: InMemorySchedulerStore,
         journal: Arc<InMemoryJournal>,
         run: RunId,
-        /// `true` ⇒ the concurrent drive COMPLETED the awaiting node; `false` ⇒ it merely
-        /// claimed the run (`paused -> waking`) and is still driving it.
-        completes_the_node: bool,
+        drive: RacingDrive,
     }
 
     #[async_trait::async_trait]
@@ -2411,14 +2742,35 @@ mod tests {
             self.inner
                 .claim_due(now, chrono::Duration::seconds(60), 10)
                 .await?;
-            if self.completes_the_node {
-                // ...and its drive folds the journal (which now includes our delivery),
-                // completes the gate, and finishes the run.
-                append_completion(&self.journal, run, &gate()).await;
-                self.journal.append(run, JournalEvent::RunCompleted).await?;
-                self.inner
-                    .record_terminal(run, RunStatus::Completed, None)
-                    .await?;
+            match self.drive {
+                RacingDrive::ClaimsOnly => {}
+                RacingDrive::CompletesTheNode => {
+                    // ...and its drive folds the journal (which now includes our
+                    // delivery), completes the gate, and finishes the run.
+                    append_completion(&self.journal, run, &gate()).await;
+                    self.journal.append(run, JournalEvent::RunCompleted).await?;
+                    self.inner
+                        .record_terminal(run, RunStatus::Completed, None)
+                        .await?;
+                }
+                RacingDrive::FailsTheDeadline => {
+                    // ...but this drive had already loaded the journal before our
+                    // delivery landed (`run_await_signal` reads the fold it was handed),
+                    // so it saw no signal, found the deadline expired, and failed the
+                    // node — behind our row, without ever reading it.
+                    self.journal
+                        .append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: gate(),
+                                error: "await_signal: no signal for node gate by ...".into(),
+                            },
+                        )
+                        .await?;
+                    self.inner
+                        .record_terminal(run, RunStatus::Failed, Some("await_signal"))
+                        .await?;
+                }
             }
             // Our own force_wake: a conditional no-op, because the row is no longer
             // `paused`.
@@ -2426,12 +2778,71 @@ mod tests {
         }
     }
 
-    /// THE check-then-act case. The node was awaiting when `signal` checked, and a
-    /// concurrent worker completed it before the delivery became observable. Reporting
-    /// `signalled` here — on the strength of the pre-check alone — is exactly the lost
-    /// race `run wake` once reported as success.
+    /// The `Seq` of the first event matching `want`. The ORDER of two journal rows is the
+    /// only evidence available for whether a delivery was read or orphaned, so these
+    /// tests assert on it rather than on the exit code alone.
+    async fn seq_of(
+        j: &InMemoryJournal,
+        run: RunId,
+        want: impl Fn(&JournalEvent) -> bool,
+    ) -> Option<Seq> {
+        j.load(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(_, e)| want(e))
+            .map(|(s, _)| s)
+    }
+
+    async fn delivery_seq(j: &InMemoryJournal, run: RunId) -> Option<Seq> {
+        seq_of(
+            j,
+            run,
+            |e| matches!(e, JournalEvent::SignalReceived { node, .. } if node == &gate()),
+        )
+        .await
+    }
+
+    /// A whole journal rendered `seq=<n> <event kind>`, for a failure message that shows
+    /// WHY a report is wrong (which row landed first) rather than only that it is.
+    async fn journal_shape(j: &InMemoryJournal, run: RunId) -> String {
+        j.load(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(s, e)| format!("seq={s} {}", event_kind(&e)))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    }
+
+    fn event_kind(e: &JournalEvent) -> String {
+        match e {
+            JournalEvent::SignalAwaited { node, deadline } => {
+                format!("SignalAwaited node={} deadline={deadline:?}", node.0)
+            }
+            JournalEvent::SignalReceived { node, .. } => {
+                format!("SignalReceived node={}", node.0)
+            }
+            JournalEvent::ContextWrite { key, .. } => format!("ContextWrite key={}", key.0),
+            JournalEvent::NodeFailed { node, .. } => format!("NodeFailed node={}", node.0),
+            JournalEvent::RunCompleted => "RunCompleted".into(),
+            JournalEvent::RunPaused { .. } => "RunPaused".into(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// THE check-then-act case, and the one the first cut of this command got INVERTED.
+    /// The node was awaiting when `signal` checked; a concurrent worker then folded the
+    /// journal — which by that point contained our answer — and completed the node with
+    /// it. The delivery LANDED and was READ, so reporting `not delivered` (exit 2) would
+    /// be a false negative on the most successful outcome this command has.
+    ///
+    /// The discriminator is the journal ORDER: the completion marker sits BEHIND our
+    /// `SignalReceived`, so our row is what the drive folded. That is what this asserts —
+    /// not merely the exit code, which the pre-fix test canonized while never checking
+    /// whether the row was consumed.
     #[tokio::test]
-    async fn signal_reports_not_delivered_when_the_node_completes_mid_delivery() {
+    async fn signal_reports_signalled_when_a_racing_drive_reads_the_answer() {
         let run = RunId(uuid::Uuid::new_v4());
         // A TIMED gate whose deadline has just come due: `next_wake <= now`, so a
         // worker's `claim_due` really can grab it in the delivery window. (The indefinite
@@ -2442,24 +2853,267 @@ mod tests {
             inner: inner.clone(),
             journal: journal.clone(),
             run,
-            completes_the_node: true,
+            drive: RacingDrive::CompletesTheNode,
         };
 
         let out = signal(&racing, journal.as_ref(), run, gate(), approved(), now())
             .await
             .expect("no hard error");
+        // The evidence FIRST: the row is durable and the node completed behind it.
+        let delivered = delivery_seq(&journal, run)
+            .await
+            .expect("the delivery is durable");
+        let completed = seq_of(
+            &journal,
+            run,
+            |e| matches!(e, JournalEvent::ContextWrite { key, .. } if key.0 == gate().0),
+        )
+        .await
+        .expect("the racing drive completed the gate");
+        assert!(
+            delivered < completed,
+            "precondition: the gate completed by folding OUR answer\n  {}",
+            journal_shape(&journal, run).await
+        );
+        assert_eq!(
+            journaled_signals(&journal, run, &gate()).await.len(),
+            1,
+            "and there is no OTHER answer it could have read instead"
+        );
 
         assert_eq!(
-            out.code, EXIT_PRECONDITION,
-            "a node completed by a racing drive must not be reported as signalled: {}",
+            out.code,
+            EXIT_OK,
+            "the answer was delivered, folded and consumed — this is the success case, \
+             not a refusal:\n  {}\n  report was: {}",
+            journal_shape(&journal, run).await,
             out.text
         );
-        assert!(out.text.contains("already completed"), "{}", out.text);
+        assert!(
+            out.text.starts_with("signalled:"),
+            "must report the effect actually achieved: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("gate"),
+            "must name the node: {}",
+            out.text
+        );
         assert_eq!(
             inner.status(run).await.unwrap().unwrap().status,
             RunStatus::Completed,
             "the racing drive really did finish the run"
         );
+    }
+
+    /// The same window, but the racing drive had loaded the journal BEFORE our answer
+    /// landed: it saw no signal, found the deadline expired, and failed the node behind
+    /// our row. The answer is durable and was NEVER read, so `signalled` would be just as
+    /// wrong as `not delivered` was in the test above — and the report must say which.
+    #[tokio::test]
+    async fn signal_does_not_claim_delivery_when_a_racing_drive_fails_the_node_after_the_write() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let inner = paused_store(run, Some(now())).await;
+        let journal = Arc::new(awaiting_journal(run, &gate(), Some(now())).await);
+        let racing = SignalRacingStore {
+            inner: inner.clone(),
+            journal: journal.clone(),
+            run,
+            drive: RacingDrive::FailsTheDeadline,
+        };
+
+        let out = signal(&racing, journal.as_ref(), run, gate(), approved(), now())
+            .await
+            .expect("no hard error");
+        let delivered = delivery_seq(&journal, run)
+            .await
+            .expect("the delivery is durable");
+        let failed = seq_of(
+            &journal,
+            run,
+            |e| matches!(e, JournalEvent::NodeFailed { node, .. } if node == &gate()),
+        )
+        .await
+        .expect("the racing drive failed the gate");
+        assert!(
+            delivered < failed,
+            "precondition: the node terminated AFTER the write landed\n  {}",
+            journal_shape(&journal, run).await
+        );
+        assert!(
+            seq_of(&journal, run, |e| {
+                matches!(e, JournalEvent::ContextWrite { key, .. } if key.0 == gate().0)
+            })
+            .await
+            .is_none(),
+            "precondition: a failed gate published nothing — the answer was not read"
+        );
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "a deadline-failed node never read the answer: {}",
+            out.text
+        );
+        assert!(
+            !out.text.starts_with("signalled"),
+            "the node failed; claiming the answer was delivered would hide it: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("durabl"),
+            "the row IS durable — an operator must not be told it can simply retry: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("is failed"),
+            "must name the state the node is in: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("while this delivery was in flight"),
+            "must say the node died AFTER the row landed — the opposite order is a \
+             different report with different advice, and the two must not read alike: {}",
+            out.text
+        );
+    }
+
+    /// A journal whose FIRST `load` answers from a snapshot taken *before* a concurrent
+    /// worker's drive, and then lets that drive land. This is the ONLY way to model the
+    /// other half of the delivery window — a node that terminated between `signal`'s
+    /// pre-check read and its append — because `signal` makes no store call in between,
+    /// so a `SchedulerStore` double cannot reach it.
+    ///
+    /// The result: the pre-check legitimately sees the node awaiting, and everything
+    /// written afterwards is journaled BEHIND the terminal marker.
+    struct RacingJournal {
+        inner: Arc<InMemoryJournal>,
+        /// The event the racing drive lands, taken on the first `load` so it fires
+        /// exactly once.
+        pending: std::sync::Mutex<Option<JournalEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionJournal for RacingJournal {
+        async fn append(
+            &self,
+            run: RunId,
+            event: JournalEvent,
+        ) -> Result<Seq, orchestrator_core::JournalError> {
+            self.inner.append(run, event).await
+        }
+        async fn load(
+            &self,
+            run: RunId,
+        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+            let snapshot = self.inner.load(run).await?;
+            // Taken (and the guard dropped) before the await: the racing drive lands
+            // AFTER this read has been answered.
+            let pending = self.pending.lock().expect("not poisoned").take();
+            if let Some(e) = pending {
+                self.inner.append(run, e).await?;
+            }
+            Ok(snapshot)
+        }
+    }
+
+    /// The TRUE orphan, on BOTH terminal shapes. The node terminated before the append,
+    /// so the row is durable, unread, and permanent — and, because an `AwaitSignal` node
+    /// journals no `NodeCompleted` and no terminal event is folded as a barrier, a later
+    /// re-`start` would re-execute the gate and fold this late answer as its output,
+    /// silently converting a deadline-expired gate into an approved one — or replacing the
+    /// answer a completed gate actually acted on.
+    ///
+    /// So the report may claim NEITHER "signalled" (nothing read it) NOR "not delivered"
+    /// (the row is durable). It has to say both halves — and it has to say them for the
+    /// COMPLETED marker too, because that is the one shape whose *terminated-after* twin
+    /// is a success, so it is the shape where getting the ORDER wrong reports an orphaned
+    /// answer as delivered.
+    #[tokio::test]
+    async fn signal_reports_the_answer_unread_when_the_node_terminated_before_the_write() {
+        for (marker, state) in [
+            (
+                JournalEvent::NodeFailed {
+                    node: gate(),
+                    error: "await_signal: no signal for node gate by ...".into(),
+                },
+                "failed",
+            ),
+            (
+                JournalEvent::ContextWrite {
+                    scope: orchestrator_core::Scope::Run,
+                    key: orchestrator_core::ContextKey(gate().0.clone()),
+                    content: orchestrator_core::ContentRef {
+                        digest: orchestrator_core::Digest("d".into()),
+                        size: 3,
+                        summary: None,
+                    },
+                    summary: None,
+                    seq: 0,
+                },
+                "completed",
+            ),
+        ] {
+            let run = RunId(uuid::Uuid::new_v4());
+            // The store row is still `paused` throughout — the drive that terminated the
+            // node has not recorded the run terminal yet, which is exactly why the
+            // pre-checks pass and the write goes through. The wake even applies; the node
+            // is simply dead.
+            let s = paused_store(run, Some(now())).await;
+            let inner = Arc::new(awaiting_journal(run, &gate(), Some(now())).await);
+            let j = RacingJournal {
+                inner: inner.clone(),
+                pending: std::sync::Mutex::new(Some(marker)),
+            };
+
+            let out = signal(&s, &j, run, gate(), approved(), now())
+                .await
+                .expect("no hard error");
+
+            let delivered = delivery_seq(&inner, run)
+                .await
+                .expect("the row is durable — it was appended before anything was re-read");
+            let terminated = seq_of(&inner, run, |e| {
+                matches!(e, JournalEvent::NodeFailed { node, .. } if node == &gate())
+                    || matches!(e, JournalEvent::ContextWrite { key, .. } if key.0 == gate().0)
+            })
+            .await
+            .expect("the racing drive terminated the gate");
+            assert!(
+                terminated < delivered,
+                "precondition: the node terminated BEFORE the write landed\n  {}",
+                journal_shape(&inner, run).await
+            );
+
+            assert_eq!(
+                out.code, EXIT_PRECONDITION,
+                "nothing read the answer: {}",
+                out.text
+            );
+            assert!(
+                !out.text.starts_with("signalled"),
+                "the node was already dead when the row landed: {}",
+                out.text
+            );
+            assert!(
+                out.text.contains("durabl"),
+                "the row IS durable and permanent — 'not delivered' would send an operator \
+                 looking for a write that already happened: {}",
+                out.text
+            );
+            assert!(
+                out.text
+                    .contains(&format!("already {state} before the write landed")),
+                "must say the node was terminal BEFORE the row landed — the opposite order \
+                 is the case where the answer WAS read, and the two must not read alike: {}",
+                out.text
+            );
+            assert!(
+                out.text.contains("re-`start`"),
+                "must name the durable residue: this answer is still on the journal for a \
+                 later re-execution of the gate to fold: {}",
+                out.text
+            );
+        }
     }
 
     /// The other half of the race: the run was claimed but not finished, so our
@@ -2478,7 +3132,7 @@ mod tests {
             inner: inner.clone(),
             journal: journal.clone(),
             run,
-            completes_the_node: false,
+            drive: RacingDrive::ClaimsOnly,
         };
 
         let out = signal(&racing, journal.as_ref(), run, gate(), approved(), now())

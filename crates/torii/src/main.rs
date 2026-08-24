@@ -94,14 +94,20 @@ enum RunAction {
     /// prompt. Secret-shaped text is redacted before it is journaled, but that is a
     /// best-effort scrub by shape, not a safe place to put a secret.
     ///
-    /// Reports the effect it achieved: `signalled` only when the node really was awaiting
-    /// and the run really was queued; `not delivered` (exit 2) otherwise.
+    /// Reports the effect it achieved, read back after the write and ordered by journal
+    /// position: `signalled` when the answer is durable and either the run is queued for
+    /// the next tick or a drive already in flight read it and completed the node;
+    /// `not delivered` (exit 2) when nothing was written; and `not read` (exit 2) when the
+    /// answer IS durable but the node had already terminated — never "not delivered",
+    /// which would send you looking for a write that already happened.
     Signal {
         run_id: String,
         /// The awaiting node's id — `torii run list-paused` names it.
         #[arg(long)]
         node: String,
-        /// The decision, as JSON, e.g. '{"decision":"approved"}'. Max 4096 bytes.
+        /// The decision, as JSON, e.g. '{"decision":"approved"}'. Max 4096 bytes as
+        /// journaled — redaction replaces secret-shaped text with the longer literal
+        /// `[REDACTED]`, so a payload can cross the limit on the way to the journal.
         //
         // Taken as a raw `String` and parsed in `dispatch`, NOT through a clap
         // `value_parser` like every other flag in this file. clap wraps a value_parser
