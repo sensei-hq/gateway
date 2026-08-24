@@ -188,9 +188,20 @@ pub(crate) fn fold_journal(
                 node,
                 deadline: Some(d),
             } => {
-                fold.deadlines.entry(node.clone()).or_insert(*d);
+                fold.deadlines.entry(node.clone()).or_insert(Some(*d));
             }
-            JournalEvent::SignalAwaited { deadline: None, .. } => {}
+            // The deadline-LESS gate. `None` is folded as a REAL value, not dropped: the
+            // map's key answers "has this node begun waiting?", which is a different
+            // question from "by when?". Whole-slice review I1 — the arm used to be an
+            // empty `{}`, which made the node's first-execution branch fire on EVERY
+            // drive and re-journal `SignalAwaited` each time. First-wins is unchanged;
+            // only what is remembered got wider.
+            JournalEvent::SignalAwaited {
+                node,
+                deadline: None,
+            } => {
+                fold.deadlines.entry(node.clone()).or_insert(None);
+            }
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
@@ -683,9 +694,46 @@ mod tests {
         let (fold, _, _) = fold_journal(&[ev(0, t0), ev(1, t1)]);
         assert_eq!(
             fold.deadline_for(&NodeId("gate".into())),
-            Some(t0),
+            Some(Some(t0)),
             "the ORIGINAL deadline must survive; a later record must not extend it"
         );
+    }
+
+    /// Whole-slice review I1 — a deadline-LESS `SignalAwaited` folds as a real value, so
+    /// the node reads back as "already waiting" and its first-execution branch (which
+    /// journals the event) fires exactly once. Dropping the `None` here is what let the
+    /// node re-record itself on every drive.
+    #[test]
+    fn a_deadline_less_await_still_records_that_the_node_is_waiting() {
+        let ev = |seq: Seq| {
+            (
+                seq,
+                JournalEvent::SignalAwaited {
+                    node: NodeId("gate".into()),
+                    deadline: None,
+                },
+            )
+        };
+        let (fold, _, _) = fold_journal(&[ev(0)]);
+        assert_eq!(
+            fold.deadline_for(&NodeId("gate".into())),
+            Some(None),
+            "`Some(None)` = began waiting, with no deadline — NOT `None` = never waited"
+        );
+
+        // And first-wins still holds across the two shapes: a later `Some` must not
+        // retro-fit a deadline onto a gate that began waiting without one.
+        let later = (
+            1,
+            JournalEvent::SignalAwaited {
+                node: NodeId("gate".into()),
+                deadline: Some(
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(9_000_000, 0).unwrap(),
+                ),
+            },
+        );
+        let (fold, _, _) = fold_journal(&[ev(0), later]);
+        assert_eq!(fold.deadline_for(&NodeId("gate".into())), Some(None));
     }
 
     #[test]

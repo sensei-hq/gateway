@@ -161,12 +161,21 @@ struct Fold {
     /// mistaken decision before the run resumes, so a later signal supersedes an earlier
     /// one for the same node.
     signals: HashMap<NodeId, serde_json::Value>,
-    /// SP-6 s1: the ABSOLUTE deadline each `AwaitSignal` node recorded, folded from
+    /// SP-6 s1: what each `AwaitSignal` node recorded when it began waiting, folded from
     /// `SignalAwaited`. FIRST record wins — the opposite of `signals`, and deliberately
     /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
     /// deadline forward, and a run force-woken every ten minutes with a one-hour timeout
     /// would NEVER expire.
-    deadlines: HashMap<NodeId, chrono::DateTime<chrono::Utc>>,
+    ///
+    /// The VALUE is itself an `Option`, so the two layers mean different things:
+    /// *key absent* = this node has never begun waiting; `Some(None)` = it began waiting
+    /// with **no deadline** (the indefinite HITL gate). Folding that `None` as a real
+    /// value — rather than dropping it — is what makes the deadline-less arm of
+    /// [`run_await_signal`](Executor::run_await_signal) node-keyed idempotent: without it
+    /// the node re-journals `SignalAwaited` on every drive, and a re-drive is NOT
+    /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
+    /// keeps the whole run auto-wakeable).
+    deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
     /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
     /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
     /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
@@ -247,13 +256,17 @@ impl Fold {
         self.signals.get(node)
     }
 
-    /// SP-6 s1: the folded ABSOLUTE deadline for an `AwaitSignal` node, if it has ever
-    /// started waiting. `None` for a node that has not yet recorded a `SignalAwaited`.
+    /// SP-6 s1: what an `AwaitSignal` node recorded when it began waiting.
+    ///
+    /// Two layers, and they are not the same question:
+    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited` for it).
+    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate).
+    /// - `Some(Some(t))` — it began waiting with the absolute deadline `t`.
     ///
     /// Read by [`run_await_signal`](Executor::run_await_signal) on EVERY execution — it
     /// is the durable half of the never-recompute rule; the caller must not fall back to
-    /// `now + timeout` when this returns `Some`.
-    fn deadline_for(&self, node: &NodeId) -> Option<chrono::DateTime<chrono::Utc>> {
+    /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
+    fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         self.deadlines.get(node).copied()
     }
 }

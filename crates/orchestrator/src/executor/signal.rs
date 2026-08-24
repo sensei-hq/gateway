@@ -14,14 +14,17 @@ use orchestrator_core::{JournalEvent, Node, OrchestratorError, RunId};
 use super::{Executor, Fold, NodeExec};
 
 impl Executor {
-    /// Execute one `AwaitSignal` node: a three-way read of the fold (design §6.2).
+    /// Execute one `AwaitSignal` node: a three-way read of the fold (design §6.2) —
+    /// *signalled* / *not yet waiting* / *already waiting* — the last of which the table
+    /// below splits by the shape of what was recorded.
     ///
     /// | fold state | behaviour |
     /// |---|---|
     /// | signal present | `Completed(payload)` — never re-asks |
-    /// | no signal, no deadline recorded | journal `SignalAwaited`, pause on `deadline` |
+    /// | no signal, nothing recorded | journal `SignalAwaited`, pause on `deadline` |
     /// | no signal, deadline recorded, `now >= deadline` | `NodeFailed` — the timeout, loudly |
     /// | no signal, deadline recorded, `now < deadline` | re-pause on the **same** deadline |
+    /// | no signal, `None` recorded (indefinite gate) | re-pause, journaling nothing further |
     ///
     /// **The deadline is READ from the fold, never recomputed.** The obvious
     /// implementation does `now + timeout` on every execution, and it is wrong in a way
@@ -29,15 +32,30 @@ impl Executor {
     /// force-woken every ten minutes with a one-hour timeout would NEVER expire. The
     /// absolute instant is therefore fixed at the first execution, journaled as
     /// `SignalAwaited`, and folded (first-wins) thereafter. `fold.deadline_for` is the
-    /// durable half; this function is the other half. The last table row exists ONLY
+    /// durable half; this function is the other half. The last two table rows exist ONLY
     /// because of that durability, and it is what makes `torii run wake` on an awaiting
     /// node behave sanely instead of silently resetting the clock.
     ///
+    /// **The deadline belongs to the RUN, not to the graph.** Once the first execution
+    /// has recorded one, editing this node's `timeout` has no effect in EITHER direction:
+    /// a run that recorded `Some(t)` still expires at `t` even if the graph now says
+    /// `timeout: None`, and a run that recorded `None` never expires even if the graph
+    /// now names an hour. That follows from AC1's durability plus the caller-supplied,
+    /// unfenced graph (`Executor::start` takes the graph as a parameter and does not
+    /// journal it — a pre-existing SP-DATA-3 property); it is the correct consequence,
+    /// not a gap. To change a live gate's deadline, fail the run and start a new one.
+    ///
     /// No `EffectRecorded` is written and no gateway call is made — the fold IS this
-    /// node's memo, so a resumed run re-reads its answer for free (zero token re-spend
+    /// node's memo, so a *resuming* run re-reads its answer for free (zero token re-spend
     /// by construction). Like `Branch`/`Subgraph`, it journals no
     /// `NodeStarted`/`NodeCompleted`; the three writes below are exactly the ones §6.2
-    /// specifies.
+    /// specifies. Known limitation (the fresh-vs-terminal asymmetry `run_subgraph`
+    /// documents, and shared with it): because no `EffectRecorded`/`NodeCompleted` is
+    /// journaled, a re-`start` of an already-TERMINAL run rebuilds `outputs`/`completed`
+    /// from exactly those events and so reports this node in neither. The durable
+    /// blackboard is unaffected — the completing drive published the payload under
+    /// `ContextWrite` — and matching the house style is deliberate: journaling a
+    /// `NodeCompleted` for `AwaitSignal` alone would make one node kind divergent.
     pub(super) async fn run_await_signal(
         &self,
         run: RunId,
@@ -64,20 +82,25 @@ impl Executor {
             return Ok(NodeExec::Completed(self.redact(payload)));
         }
 
-        // 2. Not answered. Take the deadline this node ALREADY recorded, or — only on
-        //    the very first execution — compute it once from the timeout duration and
+        // 2. Not answered. Take what this node ALREADY recorded, or — only on the very
+        //    first execution — compute the deadline once from the timeout duration and
         //    journal the absolute instant.
         //
-        //    A timeout-less gate (the common indefinite HITL shape) journals
-        //    `SignalAwaited { deadline: None }`, which the fold deliberately ignores, so
-        //    this arm re-records it on each drive. That is bounded and accepted: with no
-        //    deadline the run is in the never-auto-woken class, so a re-drive only ever
-        //    follows a human `force_wake` — the same rate at which the `RunPaused` below
-        //    is appended anyway. The event is still written because it is the
-        //    NODE-KEYED record of which node is awaiting; `RunPaused` is not node-keyed,
-        //    and a run pauses for many unrelated reasons over its life.
+        //    The match is on `Option<Option<_>>` and both layers carry weight: the OUTER
+        //    one asks "has this node begun waiting?", the inner "by when?". A timeout-
+        //    less gate (the common indefinite HITL shape) journals `SignalAwaited
+        //    { deadline: None }` and the fold remembers that `None` as a real value, so
+        //    this arm fires ONCE per node and never again. Making it node-keyed rather
+        //    than deadline-keyed is what bounds it: a re-drive of a deadline-less gate is
+        //    NOT human-bounded, because `drive` runs every ready node in a round even
+        //    after one pauses — a dep-free sibling that pauses WITH a deadline in the
+        //    same round leaves it as the last `RunPaused`, which is the one the scheduler
+        //    takes `next_wake` from, so the whole run stays auto-wakeable while this gate
+        //    waits on a human. The event is written at all because it is the NODE-KEYED
+        //    record of which node is awaiting; `RunPaused` is not node-keyed, and a run
+        //    pauses for many unrelated reasons over its life.
         let deadline = match fold.deadline_for(&node.id) {
-            Some(recorded) => Some(recorded),
+            Some(recorded) => recorded,
             None => {
                 let fresh = timeout.map(|t| self.clock.now() + t);
                 self.append(
