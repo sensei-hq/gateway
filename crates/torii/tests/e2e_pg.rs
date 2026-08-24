@@ -270,7 +270,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
     // the scheduler row) — a fresh handle over its OWN connection, same discipline as
     // `store_b`: process B shares nothing in-process with A.
     let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
-    let listed = torii::cmd::run::list_paused(store_b.as_ref(), false)
+    let listed = torii::cmd::run::list_paused(store_b.as_ref(), journal_b.as_ref(), false)
         .await
         .expect("list-paused");
     assert_eq!(listed.code, torii::errors::EXIT_OK);
