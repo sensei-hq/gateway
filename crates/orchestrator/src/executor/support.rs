@@ -172,6 +172,25 @@ pub(crate) fn fold_journal(
             JournalEvent::PlannerSelected { node, agent } => {
                 fold.selections.insert(node.clone(), agent.clone());
             }
+            // SP-6 s1: an EXPLICIT arm, never the `_` catch-all below — a
+            // silently-swallowed `SignalReceived` would mean a node that can never be
+            // signalled, and it would compile perfectly. LAST wins: `insert` overwrites,
+            // so an operator can correct a mistaken decision before the run resumes.
+            JournalEvent::SignalReceived { node, payload } => {
+                fold.signals.insert(node.clone(), payload.clone());
+            }
+            // SP-6 s1: also EXPLICIT, for the same reason. FIRST wins —
+            // `entry().or_insert()`, NOT `insert` — the opposite asymmetry from
+            // `SignalReceived` above and deliberately so: overwriting here would let a
+            // later `SignalAwaited` push the deadline forward on every resume, so a run
+            // force-woken every ten minutes with a one-hour timeout would NEVER expire.
+            JournalEvent::SignalAwaited {
+                node,
+                deadline: Some(d),
+            } => {
+                fold.deadlines.entry(node.clone()).or_insert(*d);
+            }
+            JournalEvent::SignalAwaited { deadline: None, .. } => {}
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
@@ -607,6 +626,73 @@ mod tests {
         let (fold, _, _) = fold_journal(&evs);
         assert_eq!(fold.budget(), None);
         assert_eq!(fold.spent(), 0);
+    }
+
+    #[test]
+    fn a_received_signal_is_folded_by_node_id() {
+        let evs = vec![(
+            0,
+            JournalEvent::SignalReceived {
+                node: NodeId("gate".into()),
+                payload: serde_json::json!({"decision": "approved"}),
+            },
+        )];
+        let (fold, _, _) = fold_journal(&evs);
+        assert_eq!(
+            fold.signal_for(&NodeId("gate".into())).unwrap()["decision"],
+            "approved"
+        );
+    }
+
+    /// Last delivery wins while the node is still paused — an operator must be able to
+    /// correct a mistaken decision before the run resumes.
+    #[test]
+    fn a_later_signal_overwrites_an_earlier_one_for_the_same_node() {
+        let sig = |seq: Seq, d: &str| {
+            (
+                seq,
+                JournalEvent::SignalReceived {
+                    node: NodeId("gate".into()),
+                    payload: serde_json::json!({ "decision": d }),
+                },
+            )
+        };
+        let (fold, _, _) = fold_journal(&[sig(0, "rejected"), sig(1, "approved")]);
+        assert_eq!(
+            fold.signal_for(&NodeId("gate".into())).unwrap()["decision"],
+            "approved"
+        );
+    }
+
+    /// THE guard for this slice's trap. The deadline is recorded ONCE and folded
+    /// thereafter; a second `SignalAwaited` must not move it. Recomputing `now + timeout`
+    /// on each execution is the bug this pins.
+    #[test]
+    fn the_first_recorded_deadline_wins_and_is_never_moved() {
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_000_000, 0).unwrap();
+        let t1 = chrono::DateTime::<chrono::Utc>::from_timestamp(9_000_000, 0).unwrap();
+        let ev = |seq: Seq, d| {
+            (
+                seq,
+                JournalEvent::SignalAwaited {
+                    node: NodeId("gate".into()),
+                    deadline: Some(d),
+                },
+            )
+        };
+        let (fold, _, _) = fold_journal(&[ev(0, t0), ev(1, t1)]);
+        assert_eq!(
+            fold.deadline_for(&NodeId("gate".into())),
+            Some(t0),
+            "the ORIGINAL deadline must survive; a later record must not extend it"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_signal_and_no_deadline_folds_to_none() {
+        let (fold, _, _) = fold_journal(&[]);
+        assert_eq!(fold.signal_for(&NodeId("gate".into())), None);
+        assert_eq!(fold.deadline_for(&NodeId("gate".into())), None);
     }
 
     #[test]

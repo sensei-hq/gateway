@@ -155,6 +155,17 @@ struct Fold {
     /// Planner selections folded from `PlannerSelected` (§4.5). On resume the `Select`
     /// arm reuses the recorded agent — the selector is NOT re-invoked.
     selections: std::collections::HashMap<NodeId, orchestrator_core::AgentRef>,
+    /// SP-6 s1: signals delivered per `AwaitSignal` node, folded from `SignalReceived`.
+    /// LAST delivery wins (`insert` overwrites) — an operator must be able to correct a
+    /// mistaken decision before the run resumes, so a later signal supersedes an earlier
+    /// one for the same node.
+    signals: HashMap<NodeId, serde_json::Value>,
+    /// SP-6 s1: the ABSOLUTE deadline each `AwaitSignal` node recorded, folded from
+    /// `SignalAwaited`. FIRST record wins — the opposite of `signals`, and deliberately
+    /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
+    /// deadline forward, and a run force-woken every ten minutes with a one-hour timeout
+    /// would NEVER expire.
+    deadlines: HashMap<NodeId, chrono::DateTime<chrono::Utc>>,
     /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
     /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
     /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
@@ -227,6 +238,22 @@ impl Fold {
             &self.live_spend,
             &self.serial_gate,
         )
+    }
+
+    /// SP-6 s1: the folded signal for an `AwaitSignal` node, if one has been delivered
+    /// (§6.2's three-way read, arm 1). `None` for a node that has never been signalled.
+    /// `#[allow(dead_code)]` until Task 3 calls it from `run_await_signal`.
+    #[allow(dead_code)]
+    fn signal_for(&self, node: &NodeId) -> Option<&serde_json::Value> {
+        self.signals.get(node)
+    }
+
+    /// SP-6 s1: the folded ABSOLUTE deadline for an `AwaitSignal` node, if it has ever
+    /// started waiting. `None` for a node that has not yet recorded a `SignalAwaited`.
+    /// `#[allow(dead_code)]` until Task 3 calls it from `run_await_signal`.
+    #[allow(dead_code)]
+    fn deadline_for(&self, node: &NodeId) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.deadlines.get(node).copied()
     }
 }
 
