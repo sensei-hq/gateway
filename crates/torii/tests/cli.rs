@@ -169,6 +169,121 @@ fn prune_is_a_light_tier_command_and_a_century_window_deletes_nothing() {
     );
 }
 
+// ---- SP-6 s1: `torii run signal` ------------------------------------------------------
+
+/// The subcommand is actually WIRED, not just implemented in the library. Reuses
+/// `help_command_names` for the same reason it exists: `text.contains("signal")` would
+/// also pass on the prose.
+#[test]
+fn run_help_lists_signal() {
+    let out = torii().args(["run", "--help"]).output().expect("runs");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let listed = help_command_names(&text);
+    assert!(
+        listed.iter().any(|c| c == "signal"),
+        "`signal` is not a dispatchable `run` subcommand (found {listed:?}):\n{text}"
+    );
+}
+
+/// §6.4 requires this IN THE HELP, because the failure mode is a human pasting a token
+/// that lands in durable storage *and* in a model prompt. Redaction is a best-effort
+/// scrub by shape; the operator being told not to do it in the first place is the real
+/// control.
+#[test]
+fn signal_help_says_a_signal_is_not_a_credential_channel() {
+    let out = torii()
+        .args(["run", "signal", "--help"])
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    assert!(
+        text.contains("not a credential channel"),
+        "the help must warn that a signal is not a credential channel:\n{text}"
+    );
+    assert!(
+        text.contains("credential broker"),
+        "and must name what IS the credential channel:\n{text}"
+    );
+}
+
+/// Run `torii run signal` with a bogus (never-connectable) `DATABASE_URL`, exactly as
+/// `an_invalid_run_id_is_rejected_before_any_connection` does. The out-of-u16-range port
+/// fails to parse into `PgConnectOptions` before any I/O, so reaching a CONNECT error
+/// instead of the payload error would mean the payload had already been accepted.
+fn signal_with_payload(payload: &str) -> std::process::Output {
+    torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "signal",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "gate",
+            "--payload",
+            payload,
+        ])
+        .output()
+        .expect("runs")
+}
+
+#[test]
+fn an_unparseable_signal_payload_is_rejected_before_any_connection() {
+    let out = signal_with_payload("approved");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("invalid --payload"), "{err}");
+    assert!(
+        !err.contains("cannot connect"),
+        "the parse must fail before the connection is attempted: {err}"
+    );
+}
+
+/// THE leak this flag's whole error-message design exists for. The likeliest way an
+/// operator pastes a credential here is to type the token BARE, which is not valid JSON —
+/// so the invalid-payload path is exactly what would print it to stderr, and thus into
+/// journald and CI logs.
+///
+/// This is asserted at the BINARY level, not just on `parse_payload`, because clap wraps
+/// any `value_parser` failure as `invalid value '<THE VALUE>' for '--payload …'` and
+/// echoes the value itself — a library-level assertion alone would have passed while the
+/// real binary leaked. (Verified: it did, before `--payload` was moved off the value
+/// parser.)
+#[test]
+fn an_invalid_signal_payload_never_echoes_a_pasted_credential() {
+    let secret = format!("sk-{}", "A".repeat(24));
+    let out = signal_with_payload(&secret);
+    assert!(!out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains(&secret),
+        "a pasted credential reached the terminal:\n{combined}"
+    );
+    assert!(
+        !combined.contains(&"A".repeat(8)),
+        "a fragment of it leaked:\n{combined}"
+    );
+}
+
+/// §6.5's cap, at the binary boundary: an over-limit payload never reaches a connection,
+/// let alone a journal row.
+#[test]
+fn an_oversized_signal_payload_is_rejected_before_any_connection() {
+    let out = signal_with_payload(&format!("{{\"n\":\"{}\"}}", "x".repeat(5_000)));
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("4096"), "must name the limit: {err}");
+    assert!(
+        !err.contains("cannot connect"),
+        "the cap must apply before the connection is attempted: {err}"
+    );
+}
+
 /// A connect failure must never echo the password. Deliberately uses a port
 /// number out of the valid u16 range (not a refused-connection address like
 /// `127.0.0.1:1`): sqlx's pool treats `ECONNREFUSED` as transient and retries

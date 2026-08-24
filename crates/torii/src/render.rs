@@ -32,8 +32,31 @@ pub(crate) fn one_line(s: &str) -> String {
 }
 
 /// Built once (SP-DATA-4.1 task 2) — `PatternRedactor::default()` compiles a regex
-/// set, which is not free to redo per row.
-static REASON_REDACTOR: LazyLock<PatternRedactor> = LazyLock::new(PatternRedactor::default);
+/// set, which is not free to redo per row. Shared by every redaction path in this
+/// crate: pause reasons ([`redact_reason`]) and SP-6 s1 signal payloads
+/// ([`redact_payload`]), so there is exactly ONE redactor here, not two.
+static REDACTOR: LazyLock<PatternRedactor> = LazyLock::new(PatternRedactor::default);
+
+/// SP-6 s1 §6.4: scrub a `torii run signal --payload` value with the SP-4 s2 redactor
+/// **before it is journaled**.
+///
+/// Task 3 redacts on the fold-READ side, which covers the node's return and the
+/// blackboard write it derives from it. It does NOT cover the journal ROW, and
+/// [`crate::cmd::run::signal`] is that row's only writer — so without this, a human who
+/// pastes a token has put it into durable storage permanently, where a later fold hands
+/// it to a model prompt. Redacting on both sides is intentional and harmless: the
+/// redactor is idempotent, because `[REDACTED]` matches no credential shape.
+///
+/// Deliberately the PLAIN [`Redactor`] pass, NOT [`redact_reason`]'s stricter
+/// withhold-on-evasion transform. A pause reason is only ever displayed, so discarding it
+/// wholesale costs nothing; a payload BECOMES the node's output, and the executor applies
+/// this same plain pass to whatever it folds. Applying a different transform here would
+/// make the value torii writes disagree with the value the executor would produce from
+/// it — the exact live/journaled/replayed divergence s2's determinism rule exists to
+/// prevent.
+pub(crate) fn redact_payload(v: &serde_json::Value) -> serde_json::Value {
+    REDACTOR.redact(v)
+}
 
 /// The literal placeholder `PatternRedactor` substitutes on a match
 /// (`crates/orchestrator-core/src/redact.rs`, `PLACEHOLDER`). Not exported — it is a
@@ -100,7 +123,7 @@ const WITHHELD_REASON: &str = "[REDACTED: reason withheld]";
 /// rendering to fall back to.
 fn redact_reason(s: &str) -> String {
     let redact_once = |text: &str| -> String {
-        match REASON_REDACTOR.redact(&serde_json::Value::String(text.to_string())) {
+        match REDACTOR.redact(&serde_json::Value::String(text.to_string())) {
             serde_json::Value::String(out) => out,
             other => {
                 unreachable!("redacting a Value::String must yield a Value::String, got {other:?}")
@@ -192,6 +215,62 @@ pub fn table(rows: &[ScheduledRun]) -> String {
             fmt_wake(r.next_wake),
             r.reason.as_deref().map(safe_reason).unwrap_or_default()
         ));
+    }
+    s
+}
+
+/// SP-6 s1: one `AwaitSignal` node currently waiting for `torii run signal`, folded out
+/// of a run's journal (`SignalAwaited`, minus anything that has since terminated the
+/// node). `RunPaused` is not node-keyed, so this is the only way an operator can learn
+/// WHAT to signal without reading the graph.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AwaitingNode {
+    pub node: orchestrator_core::NodeId,
+    /// `None` is the INDEFINITE class: `resume_after: None`, so the durable scheduler
+    /// never auto-wakes it and it waits for a human forever. That is the case an
+    /// operator is most likely to lose track of, so it renders explicitly rather than
+    /// blank.
+    pub deadline: Option<DateTime<Utc>>,
+}
+
+/// A node id is author- (or planner-) supplied free text, so it gets the same
+/// control-character collapse and length cap a pause reason does — for the same reason:
+/// a raw newline would fragment this block into lines that read as separate rows.
+/// It is NOT redacted: an id is structural, not a value, exactly as `PatternRedactor`
+/// leaves object KEYS alone.
+const NODE_MAX: usize = 80;
+
+/// The `AWAITING A SIGNAL` block appended below `run list-paused`'s table.
+///
+/// Returns the EMPTY string when nothing is awaiting, which is what keeps a run with no
+/// `AwaitSignal` node byte-identical to the pre-SP-6 output. A separate block rather than
+/// a fifth column, deliberately: one paused run can have several awaiting children (a Map
+/// fan-out — the accepted shape from SP-DATA-5 §6.3a), which a single-line-per-run table
+/// cannot represent, and widening the shared `table()` would also move `run status`'s
+/// columns.
+pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Vec<AwaitingNode>)]) -> String {
+    let any = rows.iter().any(|(_, a)| !a.is_empty());
+    if !any {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\nAWAITING A SIGNAL — deliver with \
+         `torii run signal <run> --node <node> --payload <json>`\n",
+    );
+    for (run, nodes) in rows {
+        for a in nodes {
+            s.push_str(&format!(
+                "{}  {}  {}\n",
+                run.0,
+                cap_chars(&one_line(&a.node.0), NODE_MAX),
+                match a.deadline {
+                    Some(d) => format!("deadline {}", fmt_wake(Some(d))),
+                    // Says what it MEANS, not just that the field is empty: this run is
+                    // never auto-woken and will wait until a human acts.
+                    None => "no deadline — waits until signalled".to_string(),
+                }
+            ));
+        }
     }
     s
 }

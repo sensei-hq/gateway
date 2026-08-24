@@ -78,10 +78,42 @@ enum RunAction {
         #[arg(long)]
         json: bool,
     },
-    /// List every run awaiting a wake
+    /// List every run awaiting a wake, and any node awaiting a signal
     ListPaused {
         #[arg(long)]
         json: bool,
+    },
+    /// Deliver a decision to a node that is waiting for one (`AwaitSignal`)
+    ///
+    /// This is human-IN-the-loop: `wake` resumes a run, this ANSWERS it. The payload is
+    /// journaled durably, folded as the node's output, and flows into downstream nodes
+    /// and model prompts.
+    ///
+    /// A SIGNAL IS NOT A CREDENTIAL CHANNEL — the credential broker is. Do not paste an
+    /// API key, token or password here: it would land in durable storage and in a model
+    /// prompt. Secret-shaped text is redacted before it is journaled, but that is a
+    /// best-effort scrub by shape, not a safe place to put a secret.
+    ///
+    /// Reports the effect it achieved: `signalled` only when the node really was awaiting
+    /// and the run really was queued; `not delivered` (exit 2) otherwise.
+    Signal {
+        run_id: String,
+        /// The awaiting node's id — `torii run list-paused` names it.
+        #[arg(long)]
+        node: String,
+        /// The decision, as JSON, e.g. '{"decision":"approved"}'. Max 4096 bytes.
+        //
+        // Taken as a raw `String` and parsed in `dispatch`, NOT through a clap
+        // `value_parser` like every other flag in this file. clap wraps a value_parser
+        // failure as `error: invalid value '<THE VALUE>' for '--payload …': <message>` —
+        // it echoes the offending value itself, which no per-arg setting suppresses. That
+        // defeats `parse_payload`'s deliberate non-echo entirely, and this is the one flag
+        // an operator might paste a credential into (typing a token bare is not valid
+        // JSON, so the parse failure is exactly the path that would print it). Parsing in
+        // `dispatch` keeps the whole message torii's to compose. It still happens before
+        // any connection — the property that matters — exactly as `parse_run_id` does.
+        #[arg(long)]
+        payload: String,
     },
     /// Cancel a non-terminal run so it is never woken
     Cancel { run_id: String },
@@ -259,7 +291,36 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
             }
             RunAction::ListPaused { json } => {
                 let d = boot::light(&env).await?;
-                cmd::run::list_paused(d.scheduler_store.as_ref(), json).await
+                // SP-6 s1: the journal is where `SignalAwaited` lives — the scheduler row
+                // is run-level and cannot name the awaiting node.
+                cmd::run::list_paused(d.scheduler_store.as_ref(), d.journal.as_ref(), json).await
+            }
+            RunAction::Signal {
+                run_id,
+                node,
+                payload,
+            } => {
+                // Parse BEFORE connecting, same as `status`: an invalid run id is the
+                // likeliest operator typo and sqlx would otherwise retry a refused
+                // connection for the whole pool-acquire timeout first. The payload is
+                // parsed here too — see its `#[arg]` comment for why it is not a clap
+                // `value_parser` — so an unparseable or over-limit payload also costs no
+                // connection, and its message stays free of the pasted value.
+                let run = parse_run_id(&run_id)?;
+                let payload = cmd::run::parse_payload(&payload).map_err(CliError::error)?;
+                // LIGHT tier: delivering a decision needs the scheduler store and the
+                // journal, nothing else. An operator must be able to answer a waiting run
+                // from a box with no gateway config and no model credentials.
+                let d = boot::light(&env).await?;
+                cmd::run::signal(
+                    d.scheduler_store.as_ref(),
+                    d.journal.as_ref(),
+                    run,
+                    orchestrator_core::NodeId(node),
+                    payload,
+                    chrono::Utc::now(),
+                )
+                .await
             }
             RunAction::Cancel { run_id } => {
                 let run = parse_run_id(&run_id)?;
