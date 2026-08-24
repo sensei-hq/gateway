@@ -121,7 +121,12 @@ const WITHHELD_REASON: &str = "[REDACTED: reason withheld]";
 /// safe to keep: this is a display path, and a legitimate provider message does not
 /// contain a credential bisected by a control byte, so there is no honest partial
 /// rendering to fall back to.
-fn redact_reason(s: &str) -> String {
+///
+/// `pub(crate)` because `run list-paused`'s `--json` path shares it: a per-run journal
+/// fault is rendered into `awaiting_error`, and free text bound for a script gets exactly
+/// the treatment [`json`] already gives `reason` — redaction only, since the
+/// control-character collapse and the length cap are display-only concerns.
+pub(crate) fn redact_reason(s: &str) -> String {
     let redact_once = |text: &str| -> String {
         match REDACTOR.redact(&serde_json::Value::String(text.to_string())) {
             serde_json::Value::String(out) => out,
@@ -240,16 +245,36 @@ pub struct AwaitingNode {
 /// leaves object KEYS alone.
 const NODE_MAX: usize = 80;
 
+/// One run's awaiting set — or, when that run's journal could not be folded, the reason.
+///
+/// **Whole-slice review, Important.** The awaiting set is per-RUN and so is the fault that
+/// hides it: `list-paused` loads one journal per paused run, and a single unreadable
+/// journal (a `format_version` fence during a rolling deploy is the realistic case) used
+/// to abort the whole command with an empty stdout, hiding every OTHER paused run —
+/// including the ones an operator could still signal, wake or cancel. The error is still
+/// never swallowed; it is reported in the row it belongs to. See [`crate::cmd::run::list_paused`].
+pub type Awaiting = Result<Vec<AwaitingNode>, String>;
+
 /// The `AWAITING A SIGNAL` block appended below `run list-paused`'s table.
 ///
-/// Returns the EMPTY string when nothing is awaiting, which is what keeps a run with no
-/// `AwaitSignal` node byte-identical to the pre-SP-6 output. A separate block rather than
-/// a fifth column, deliberately: one paused run can have several awaiting children (a Map
-/// fan-out — the accepted shape from SP-DATA-5 §6.3a), which a single-line-per-run table
-/// cannot represent, and widening the shared `table()` would also move `run status`'s
-/// columns.
-pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Vec<AwaitingNode>)]) -> String {
-    let any = rows.iter().any(|(_, a)| !a.is_empty());
+/// Returns the EMPTY string when nothing is awaiting **and nothing failed**, which is what
+/// keeps a run with no `AwaitSignal` node byte-identical to the pre-SP-6 output. A separate
+/// block rather than a fifth column, deliberately: one paused run can have several awaiting
+/// children (a Map fan-out — the accepted shape from SP-DATA-5 §6.3a), which a
+/// single-line-per-run table cannot represent, and widening the shared `table()` would also
+/// move `run status`'s columns.
+///
+/// An [`Err`] row renders as `unknown: <error>` — never as an absent or empty awaiting set,
+/// which is the one answer that would tell an operator there is nothing to signal on a run
+/// that may be blocked on a human. The message goes through the same [`safe_reason`]
+/// transform a pause reason does (redact, then collapse control characters, then cap): a
+/// journal-backend fault is free text from the driver and can carry a connection string, a
+/// newline that would forge a row, or an ANSI escape.
+pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String {
+    let any = rows.iter().any(|(_, a)| match a {
+        Ok(nodes) => !nodes.is_empty(),
+        Err(_) => true,
+    });
     if !any {
         return String::new();
     }
@@ -257,19 +282,24 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Vec<AwaitingNode>)]) 
         "\nAWAITING A SIGNAL — deliver with \
          `torii run signal <run> --node <node> --payload <json>`\n",
     );
-    for (run, nodes) in rows {
-        for a in nodes {
-            s.push_str(&format!(
-                "{}  {}  {}\n",
-                run.0,
-                cap_chars(&one_line(&a.node.0), NODE_MAX),
-                match a.deadline {
-                    Some(d) => format!("deadline {}", fmt_wake(Some(d))),
-                    // Says what it MEANS, not just that the field is empty: this run is
-                    // never auto-woken and will wait until a human acts.
-                    None => "no deadline — waits until signalled".to_string(),
+    for (run, a) in rows {
+        match a {
+            Ok(nodes) => {
+                for a in nodes {
+                    s.push_str(&format!(
+                        "{}  {}  {}\n",
+                        run.0,
+                        cap_chars(&one_line(&a.node.0), NODE_MAX),
+                        match a.deadline {
+                            Some(d) => format!("deadline {}", fmt_wake(Some(d))),
+                            // Says what it MEANS, not just that the field is empty: this
+                            // run is never auto-woken and will wait until a human acts.
+                            None => "no deadline — waits until signalled".to_string(),
+                        }
+                    ));
                 }
-            ));
+            }
+            Err(e) => s.push_str(&format!("{}  unknown: {}\n", run.0, safe_reason(e))),
         }
     }
     s

@@ -97,47 +97,91 @@ pub async fn status(
 /// the pre-SP-6 render — the table gets no extra block and the JSON no extra key (and,
 /// as in `status`, the JSON path returns `render::json`'s own string untouched rather
 /// than taking a non-idempotent parse/re-serialize detour that would reorder keys).
+///
+/// **A journal fault is scoped to the RUN it belongs to (whole-slice review, Important).**
+/// The per-run `journal.load()` above is new in this slice, and propagating its error
+/// aborted the whole command: one run whose durable `format_version` had been bumped made
+/// `list-paused` exit 1 with an EMPTY stdout, hiding every other paused run — the ones an
+/// operator could still `signal`, `wake` or `cancel`, and precisely when they most need
+/// the list (a fence bump is what a rolling deploy produces). Before this slice the
+/// command read `scheduled_runs` alone and listed every paused run regardless of journal
+/// state, so this was a regression in blast radius, not an inherited limitation.
+///
+/// The error is still never SWALLOWED — reporting an empty awaiting set because the load
+/// failed would tell an operator there is nothing to signal, which is the most damaging
+/// possible answer for a run blocked on a human. It is reported in the row it belongs to
+/// (`unknown: <error>` in the table, `awaiting_error` in `--json`), and the command exits
+/// [`EXIT_PRECONDITION`](crate::errors::EXIT_PRECONDITION) so a script still learns the
+/// listing is incomplete.
+///
+/// **Why exit 2 rather than exit 1.** Exit 1 in this CLI is the [`CliError`] path, and
+/// `main` prints a `CliError` to STDERR and nothing to stdout — so exiting 1 here would
+/// throw away the very listing this fix exists to preserve. Exit 2 is already this
+/// surface's code for "the command ran and its output is on stdout, but the outcome is not
+/// the unqualified success you asked for": `run status <unknown> --json` exits 2 with a
+/// parseable `null` on stdout for exactly that reason. A partially-degraded listing is the
+/// same shape, so it gets the same code.
 pub async fn list_paused(
     store: &dyn SchedulerStore,
     journal: &dyn ExecutionJournal,
     json: bool,
 ) -> Result<Outcome, CliError> {
     let rows = store.list_paused().await?;
-    let mut awaiting: Vec<(RunId, Vec<render::AwaitingNode>)> = Vec::with_capacity(rows.len());
+    let mut awaiting: Vec<(RunId, render::Awaiting)> = Vec::with_capacity(rows.len());
     for r in &rows {
-        // A journal fault PROPAGATES: reporting an empty awaiting set because the load
-        // failed would tell an operator there is nothing to signal, which is the most
-        // damaging possible answer for a run that is blocked on a human.
-        let events = journal
-            .load(r.run)
-            .await
-            .map_err(OrchestratorError::Journal)?;
-        awaiting.push((r.run, awaiting_nodes(&events)));
+        // `to_string`, not the `CliError` mapping: this is a table CELL, not the process's
+        // whole failure, and `JournalError`'s own `Display` already names the run, the
+        // stored format and the expected one. It is rendered through the same redact +
+        // collapse + cap transform a pause reason gets — see `render::awaiting_section`.
+        awaiting.push(match journal.load(r.run).await {
+            Ok(events) => (r.run, Ok(awaiting_nodes(&events))),
+            Err(e) => (r.run, Err(e.to_string())),
+        });
     }
-    let none_awaiting = awaiting.iter().all(|(_, a)| a.is_empty());
+    let degraded = awaiting.iter().any(|(_, a)| a.is_err());
+    // The additive path: every journal folded, and none of them had anything awaiting.
+    // A failure is never "nothing to add", so this implies `!degraded`.
+    let nothing_to_add = awaiting
+        .iter()
+        .all(|(_, a)| matches!(a, Ok(nodes) if nodes.is_empty()));
+    let finish = |text: String| {
+        if degraded {
+            Outcome::precondition(text)
+        } else {
+            Outcome::ok(text)
+        }
+    };
 
     if json {
         let base = render::json(&rows).map_err(|e| CliError::error(e.to_string()))?;
-        if none_awaiting {
+        if nothing_to_add {
             return Ok(Outcome::ok(base));
         }
         let mut v: serde_json::Value =
             serde_json::from_str(&base).map_err(|e| CliError::error(e.to_string()))?;
-        for (i, (_, nodes)) in awaiting.iter().enumerate() {
-            if !nodes.is_empty() {
-                v[i]["awaiting"] =
-                    serde_json::to_value(nodes).map_err(|e| CliError::error(e.to_string()))?;
+        for (i, (_, a)) in awaiting.iter().enumerate() {
+            match a {
+                Ok(nodes) if !nodes.is_empty() => {
+                    v[i]["awaiting"] =
+                        serde_json::to_value(nodes).map_err(|e| CliError::error(e.to_string()))?;
+                }
+                Ok(_) => {}
+                // A SEPARATE key, never `"awaiting": []`: a script must be able to tell
+                // "this run has nothing awaiting" from "this run's awaiting set is
+                // unknown", and an empty array says the first while meaning the second.
+                Err(e) => v[i]["awaiting_error"] = serde_json::json!(render::redact_reason(e)),
             }
         }
-        return Ok(Outcome::ok(
+        return Ok(finish(
             serde_json::to_string_pretty(&v).map_err(|e| CliError::error(e.to_string()))?,
         ));
     }
 
     let mut text = render::table(&rows);
-    // Empty when nothing is awaiting, so this append is a no-op on the additive path.
+    // Empty when nothing is awaiting and nothing failed, so this append is a no-op on the
+    // additive path.
     text.push_str(&render::awaiting_section(&awaiting));
-    Ok(Outcome::ok(text))
+    Ok(finish(text))
 }
 
 pub async fn cancel(store: &dyn SchedulerStore, run: RunId) -> Result<Outcome, CliError> {
@@ -3249,6 +3293,240 @@ mod tests {
         );
     }
 
+    // ---- Whole-slice review, Important: one bad journal must not hide the fleet -------
+
+    /// A journal that FAILS to fold ONE run and delegates every other — the shape a
+    /// durable `format_version` fence takes in a fleet mid-rolling-deploy, where one run
+    /// was journaled by a newer binary.
+    ///
+    /// `fail` is a plain `fn` rather than a stored error so one double covers both the
+    /// fence (the realistic trigger) and a backend fault whose free text is hostile (the
+    /// leak test) — `JournalError` is not `Clone`, so it cannot simply be held.
+    struct FailingLoadJournal {
+        inner: Arc<InMemoryJournal>,
+        fenced: RunId,
+        fail: fn(RunId) -> orchestrator_core::JournalError,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionJournal for FailingLoadJournal {
+        async fn append(
+            &self,
+            run: RunId,
+            event: JournalEvent,
+        ) -> Result<Seq, orchestrator_core::JournalError> {
+            self.inner.append(run, event).await
+        }
+        async fn load(
+            &self,
+            run: RunId,
+        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+            if run == self.fenced {
+                return Err((self.fail)(run));
+            }
+            self.inner.load(run).await
+        }
+    }
+
+    fn fence_error(run: RunId) -> orchestrator_core::JournalError {
+        orchestrator_core::JournalError::IncompatibleFormat {
+            run,
+            stored: 2,
+            expected: 1,
+        }
+    }
+
+    /// A backend fault whose message carries everything a table cell must survive: a
+    /// connection string with a password, a newline that would forge a second row, and an
+    /// ANSI escape that would rewrite what is already on screen. Assembled at runtime —
+    /// the repo's Semgrep CWE-798 hook blocks a credential-shaped literal in a fixture.
+    fn hostile_backend_error(_run: RunId) -> orchestrator_core::JournalError {
+        orchestrator_core::JournalError::Backend(hostile_backend_message())
+    }
+
+    fn hostile_backend_message() -> String {
+        format!(
+            "pool timed out connecting to postgres://operator:{}@db.internal:5432/orch\
+             \n{} is also stuck\u{1b}[2K",
+            hostile_password(),
+            FORGED_RUN
+        )
+    }
+
+    fn hostile_password() -> String {
+        format!("s3cr{}t", "e")
+    }
+
+    /// A uuid an operator could paste into `run cancel` if a forged line read as a row.
+    const FORGED_RUN: &str = "deadbeef-dead-beef-dead-beefdeadbeef";
+
+    /// Two paused runs, one of which cannot be folded, plus a shared journal in which the
+    /// HEALTHY one has a node awaiting a signal.
+    async fn two_paused_runs(
+        healthy: RunId,
+        fenced: RunId,
+    ) -> (InMemorySchedulerStore, Arc<InMemoryJournal>) {
+        let s = InMemorySchedulerStore::default();
+        for (run, reason) in [
+            (healthy, "await_signal: waiting for a signal on node gate"),
+            (fenced, "quota: rate limited"),
+        ] {
+            s.enqueue(run, &empty_graph(), now()).await.unwrap();
+            s.record_paused(run, None, reason).await.unwrap();
+        }
+        let j = Arc::new(InMemoryJournal::new());
+        j.append(
+            healthy,
+            JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline: None,
+            },
+        )
+        .await
+        .unwrap();
+        (s, j)
+    }
+
+    /// THE regression this fix exists for. One run whose durable format was bumped used to
+    /// abort the whole command — exit 1, EMPTY stdout — hiding the healthy run an operator
+    /// could still signal, wake or cancel. A fence bump is exactly what a rolling deploy
+    /// produces, i.e. the moment `list-paused` matters most.
+    #[tokio::test]
+    async fn list_paused_still_lists_every_other_run_when_one_journal_cannot_be_folded() {
+        let healthy = RunId(uuid::Uuid::new_v4());
+        let fenced = RunId(uuid::Uuid::new_v4());
+        let (s, inner) = two_paused_runs(healthy, fenced).await;
+        let j = FailingLoadJournal {
+            inner,
+            fenced,
+            fail: fence_error,
+        };
+
+        let out = list_paused(&s, &j, false)
+            .await
+            .expect("a per-run journal fault must not abort the whole listing");
+
+        assert!(
+            out.text.contains(&healthy.0.to_string()),
+            "the HEALTHY run must still be listed — it is the one an operator can act \
+             on: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("gate"),
+            "and its awaiting node must still be named: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains(&fenced.0.to_string()),
+            "the unfoldable run must still be listed: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("unknown:"),
+            "its awaiting set is UNKNOWN — reporting it as empty would say there is \
+             nothing to signal: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("stored 2, expected 1"),
+            "and the fault itself must not be swallowed: {}",
+            out.text
+        );
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "a script must still learn the listing is incomplete: {}",
+            out.text
+        );
+    }
+
+    /// The same guarantee on the machine-readable path — and it must NOT be expressible as
+    /// `"awaiting": []`, which says "nothing to signal" while meaning "unknown".
+    #[tokio::test]
+    async fn list_paused_json_carries_the_per_run_journal_failure() {
+        let healthy = RunId(uuid::Uuid::new_v4());
+        let fenced = RunId(uuid::Uuid::new_v4());
+        let (s, inner) = two_paused_runs(healthy, fenced).await;
+        let j = FailingLoadJournal {
+            inner,
+            fenced,
+            fail: fence_error,
+        };
+
+        let out = list_paused(&s, &j, true).await.expect("lists");
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        let v: serde_json::Value = serde_json::from_str(&out.text)
+            .unwrap_or_else(|e| panic!("--json emitted non-JSON {:?}: {e}", out.text));
+        let rows = v.as_array().expect("an array of runs");
+        let find = |run: RunId| {
+            rows.iter()
+                .find(|r| r["run"] == serde_json::json!(run.0.to_string()))
+                .unwrap_or_else(|| panic!("run {} is missing from {out:?}", run.0))
+        };
+
+        let ok = find(healthy);
+        assert_eq!(ok["awaiting"][0]["node"], "gate", "{ok}");
+        assert!(ok.get("awaiting_error").is_none(), "{ok}");
+
+        let bad = find(fenced);
+        assert!(
+            bad["awaiting_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("stored 2, expected 1")),
+            "the per-run failure must be machine-readable: {bad}"
+        );
+        assert!(
+            bad.get("awaiting").is_none(),
+            "an empty awaiting array would tell a script there is nothing to signal: {bad}"
+        );
+    }
+
+    /// The new rendering formats a driver's free text into a table CELL, so it inherits
+    /// every hazard `safe_reason` exists for: a connection string with a password, a
+    /// newline that would forge a row carrying a pastable uuid, and an ANSI escape.
+    #[tokio::test]
+    async fn list_paused_never_leaks_a_connection_string_or_forges_a_row_from_a_journal_fault() {
+        let healthy = RunId(uuid::Uuid::new_v4());
+        let fenced = RunId(uuid::Uuid::new_v4());
+        let (s, inner) = two_paused_runs(healthy, fenced).await;
+        let j = FailingLoadJournal {
+            inner,
+            fenced,
+            fail: hostile_backend_error,
+        };
+
+        for json in [false, true] {
+            let out = list_paused(&s, &j, json).await.expect("lists");
+            assert!(
+                !out.text.contains(&hostile_password()),
+                "a journal fault leaked the database password (json={json}): {}",
+                out.text
+            );
+            assert!(
+                out.text.contains("[REDACTED]"),
+                "the credential span must be visibly redacted (json={json}): {}",
+                out.text
+            );
+            if !json {
+                assert!(
+                    !out.text.contains('\u{1b}'),
+                    "a raw escape byte survived into the table: {:?}",
+                    out.text
+                );
+                let forged = out
+                    .text
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with(FORGED_RUN))
+                    .count();
+                assert_eq!(
+                    forged, 0,
+                    "a newline in the fault forged a line that reads as its own run row:\n{}",
+                    out.text
+                );
+            }
+        }
+    }
+
     /// Additivity: a run with no `AwaitSignal` node must render EXACTLY the pre-SP-6
     /// table and JSON — nothing appended, nothing reordered.
     #[tokio::test]
@@ -3262,6 +3540,9 @@ mod tests {
         assert_eq!(text.text, render::table(&rows));
         let json = list_paused(&s, &j, true).await.expect("lists");
         assert_eq!(json.text, render::json(&rows).unwrap());
+        // ...and the exit code stays 0. Only a run whose journal could not be folded
+        // degrades it to 2; nothing else about the listing does.
+        assert_eq!((text.code, json.code), (EXIT_OK, EXIT_OK));
     }
 
     /// The same AC6 claim, against the REAL durable backends rather than in-memory
