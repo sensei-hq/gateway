@@ -2449,8 +2449,6 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::RunPaused { .. } => "RunPaused".to_string(),
         // SP-DATA-5 Task 2 gives this a real label once BudgetRaised is exercised.
         JournalEvent::BudgetRaised { .. } => "BudgetRaised".to_string(),
-        // SP-6 s1 Task 1: inert placeholder to restore compilation — Task 2/3 exercise
-        // these once folding + the node are implemented.
         JournalEvent::SignalAwaited { node, .. } => format!("SignalAwaited({})", node.0),
         JournalEvent::SignalReceived { node, .. } => format!("SignalReceived({})", node.0),
     }
@@ -13181,6 +13179,497 @@ mod scheduler_driver {
         assert_eq!(
             store.status(run).await.unwrap().unwrap().status,
             RunStatus::Cancelled
+        );
+    }
+}
+
+// ============================== SP-6 s1 AwaitSignal ============================
+
+/// The HITL primitive: a node that pauses until an external signal arrives, with an
+/// optional deadline that FAILS it. Every test drives a graph of one `AwaitSignal` node
+/// over a `FakeClock`, so the deadline arithmetic is exact and no test sleeps.
+///
+/// The four rows of the design's §6.2 three-way fold read, one test each:
+///   signal folded                        → `completes_immediately_when_the_signal_is_already_folded`
+///   no signal, no deadline recorded      → `pauses_and_records_its_deadline_when_no_signal_is_present`
+///                                          (+ `without_a_timeout_pauses_with_no_deadline`)
+///   deadline recorded, now >= deadline   → `fails_when_the_deadline_has_passed_with_no_signal`
+///   deadline recorded, now <  deadline   → `repauses_with_the_same_deadline_when_woken_early`
+mod await_signal {
+    use super::*;
+    use crate::test_support::FakeClock;
+    use chrono::{DateTime, Duration, Utc};
+
+    const HOUR: i64 = 3600;
+
+    /// A fixed instant, so every deadline in these tests is an exact literal.
+    fn at(unix_secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(unix_secs, 0).expect("valid timestamp")
+    }
+
+    fn gate() -> NodeId {
+        NodeId("gate".into())
+    }
+
+    /// A one-node graph whose sole node is the `AwaitSignal` under test.
+    fn await_graph(timeout: Option<Duration>) -> Graph {
+        Graph {
+            nodes: vec![Node {
+                id: gate(),
+                kind: NodeKind::AwaitSignal { timeout },
+                deps: vec![],
+            }],
+        }
+    }
+
+    /// Every deadline this run has journaled, in order. THE assertion surface for the
+    /// slice's trap: a correct implementation records exactly one, forever.
+    fn awaited_deadlines(events: &[(Seq, JournalEvent)]) -> Vec<Option<DateTime<Utc>>> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::SignalAwaited { node, deadline } if node == &gate() => {
+                    Some(*deadline)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `RunPaused.resume_after` this run has journaled, in order — what the
+    /// durable scheduler re-arms on after each wake.
+    fn paused_resume_afters(events: &[(Seq, JournalEvent)]) -> Vec<Option<DateTime<Utc>>> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::RunPaused { resume_after, .. } => Some(*resume_after),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has<F: Fn(&JournalEvent) -> bool>(events: &[(Seq, JournalEvent)], f: F) -> bool {
+        events.iter().any(|(_, e)| f(e))
+    }
+
+    /// Seed a journal as if a prior process had already written these events, so a
+    /// `start` folds them exactly as a real resume would. `RunStarted.version` matches
+    /// the executor's, or the fence would refuse the resume.
+    async fn seed(journal: &InMemoryJournal, run: RunId, events: Vec<JournalEvent>) {
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: None,
+                },
+            )
+            .await
+            .expect("seed RunStarted");
+        for e in events {
+            journal.append(run, e).await.expect("seed event");
+        }
+    }
+
+    /// AC3 / §6.3 — the early-signal race resolves itself. A signal journaled BEFORE
+    /// the node ever ran is simply already in the fold when it runs, so the node
+    /// completes on the spot: no buffering, no ordering constraint, and — the point —
+    /// it never waits, so no `SignalAwaited` is journaled at all.
+    #[tokio::test]
+    async fn completes_immediately_when_the_signal_is_already_folded() {
+        let (gw, calls) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        seed(
+            &journal,
+            run,
+            vec![JournalEvent::SignalReceived {
+                node: gate(),
+                payload: serde_json::json!({ "decision": "approved" }),
+            }],
+        )
+        .await;
+
+        let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000_000)))
+            .start(run, &await_graph(Some(Duration::seconds(HOUR))))
+            .await
+            .expect("start");
+
+        assert!(
+            out.paused.is_none() && out.failed.is_none(),
+            "an already-answered gate completes: paused={:?} failed={:?}",
+            out.paused,
+            out.failed
+        );
+        assert_eq!(
+            out.outputs[&gate()]["decision"],
+            "approved",
+            "the signal payload IS the node's output"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            awaited_deadlines(&events).is_empty(),
+            "a node whose answer is already folded never begins waiting: {:?}",
+            events.iter().map(|(_, e)| label(e)).collect::<Vec<_>>()
+        );
+        assert!(has(&events, |e| matches!(e, JournalEvent::RunCompleted)));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "an AwaitSignal node spends no tokens"
+        );
+    }
+
+    /// §6.2 row 2 — the first execution fixes the deadline: `SignalAwaited` carries the
+    /// ABSOLUTE instant, and the pause re-arms the durable scheduler on that same
+    /// instant via `RunPaused.resume_after` (without which the timeout would never be
+    /// auto-woken and the whole deadline branch would be decorative).
+    #[tokio::test]
+    async fn pauses_and_records_its_deadline_when_no_signal_is_present() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000_000);
+        let deadline = t0 + Duration::seconds(HOUR);
+
+        let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(t0))
+            .run(run, &await_graph(Some(Duration::seconds(HOUR))))
+            .await
+            .expect("run");
+
+        let pause = out.paused.as_ref().expect("an unsignalled gate pauses");
+        assert_eq!(pause.node, gate());
+        assert!(out.failed.is_none(), "a wait is not a failure: {out:?}");
+
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            awaited_deadlines(&events),
+            vec![Some(deadline)],
+            "the ABSOLUTE deadline `now + timeout` is journaled once"
+        );
+        assert_eq!(
+            paused_resume_afters(&events),
+            vec![Some(deadline)],
+            "the pause carries the deadline so the scheduler wakes it at that instant"
+        );
+        assert!(
+            !has(&events, |e| matches!(e, JournalEvent::RunCompleted)),
+            "a waiting run does not complete"
+        );
+        assert!(
+            !has(&events, |e| matches!(e, JournalEvent::NodeFailed { .. })),
+            "waiting is not failing"
+        );
+    }
+
+    /// §6.2 row 2, the `None` half — the indefinite HITL gate (the common shape: wait
+    /// for a human, however long). `resume_after: None` is SP-DATA-3's never-auto-woken
+    /// class, so only a `torii run force-wake` (or a signal) moves it — and it must
+    /// NEVER expire, however many times it is re-driven. `SignalAwaited` is still
+    /// journaled with `deadline: None`, because it is the node-keyed record that tells
+    /// an operator WHICH node is awaiting.
+    #[tokio::test]
+    async fn without_a_timeout_pauses_with_no_deadline_and_never_expires() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(at(1_000_000));
+        let graph = await_graph(None);
+        let exec =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+
+        let out = exec.run(run, &graph).await.expect("run");
+        assert_eq!(out.paused.expect("pauses").node, gate());
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            awaited_deadlines(&events),
+            vec![None],
+            "the awaiting node is recorded, with no deadline"
+        );
+        assert_eq!(
+            paused_resume_afters(&events),
+            vec![None],
+            "no deadline ⇒ the never-auto-woken (HOTL) pause class"
+        );
+
+        // A century later it is still waiting, not expired: `None` means no deadline,
+        // and no deadline can ever have passed.
+        clock.set(at(1_000_000 + 100 * 365 * 24 * HOUR));
+        let out2 = exec.start(run, &graph).await.expect("resume");
+        assert!(
+            out2.paused.is_some() && out2.failed.is_none(),
+            "a deadline-less gate never times out: {out2:?}"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            !has(&events, |e| matches!(e, JournalEvent::NodeFailed { .. })),
+            "no deadline ⇒ no timeout failure, ever"
+        );
+    }
+
+    /// AC4 / §6.2 row 3 — the deadline fires LOUDLY. Reaching it with no signal fails
+    /// the node (naming it and the deadline) and the run does NOT complete. Never a
+    /// silent self-approval: there is deliberately no default-payload-on-timeout (§4).
+    #[tokio::test]
+    async fn fails_when_the_deadline_has_passed_with_no_signal() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let deadline = at(1_000_000 + HOUR);
+        seed(
+            &journal,
+            run,
+            vec![JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline: Some(deadline),
+            }],
+        )
+        .await;
+
+        let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            // Exactly ON the deadline: the check is `now >= deadline`.
+            .with_clock(FakeClock::new(deadline))
+            .start(run, &await_graph(Some(Duration::seconds(HOUR))))
+            .await
+            .expect("start");
+
+        let (node, message) = out.failed.expect("the deadline fires");
+        assert_eq!(node, gate());
+        assert!(
+            message.contains("gate") && message.contains(&deadline.to_string()),
+            "the failure names the node and the deadline: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "an expired gate fails, it does not keep waiting"
+        );
+
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            has(
+                &events,
+                |e| matches!(e, JournalEvent::NodeFailed { node, .. } if node == &gate())
+            ),
+            "the timeout is journaled loudly as NodeFailed"
+        );
+        assert!(
+            !has(&events, |e| matches!(e, JournalEvent::RunCompleted)),
+            "a timed-out run does not complete"
+        );
+        assert_eq!(
+            awaited_deadlines(&events),
+            vec![Some(deadline)],
+            "an expiring node does not re-record a deadline"
+        );
+    }
+
+    /// **AC1 — the slice's most important test.** The deadline is journaled ONCE and
+    /// READ thereafter, never recomputed.
+    ///
+    /// An operator force-wakes the awaiting run three times across the hour (the
+    /// SP-DATA-4 HOTL path). Each wake must re-pause on the SAME absolute instant. The
+    /// obvious `now + timeout` implementation pushes the deadline forward on every one
+    /// of them, so a run woken every ten minutes with a one-hour timeout would NEVER
+    /// expire — which is why this test ends by advancing to the ORIGINAL deadline and
+    /// demanding the node expire there. Under the recompute bug the deadline would by
+    /// then sit at t0+70min and the final drive would still be pausing.
+    #[tokio::test]
+    async fn repauses_with_the_same_deadline_when_woken_early() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000_000);
+        let deadline = t0 + Duration::seconds(HOUR);
+        let clock = FakeClock::new(t0);
+        let graph = await_graph(Some(Duration::seconds(HOUR)));
+        let exec =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+
+        assert!(
+            exec.run(run, &graph).await.expect("run").paused.is_some(),
+            "the gate starts waiting"
+        );
+
+        for wake in 1..=3 {
+            clock.set(t0 + Duration::minutes(10 * wake));
+            let out = exec.start(run, &graph).await.expect("force-wake");
+            assert!(
+                out.paused.is_some() && out.failed.is_none(),
+                "wake {wake} re-pauses rather than completing or failing: {out:?}"
+            );
+            let events = journal.load(run).await.unwrap();
+            assert_eq!(
+                awaited_deadlines(&events),
+                vec![Some(deadline)],
+                "wake {wake}: exactly ONE deadline was ever recorded, and it has not moved"
+            );
+            assert!(
+                paused_resume_afters(&events)
+                    .iter()
+                    .all(|r| *r == Some(deadline)),
+                "wake {wake}: every re-pause re-arms the scheduler on the ORIGINAL instant: {:?}",
+                paused_resume_afters(&events)
+            );
+        }
+
+        // The payoff. Three wakes later, the ORIGINAL deadline still governs.
+        clock.set(deadline);
+        let expired = exec
+            .start(run, &graph)
+            .await
+            .expect("resume at the deadline");
+        let (node, message) = expired
+            .failed
+            .expect("the ORIGINAL deadline fires despite three intervening wakes");
+        assert_eq!(node, gate());
+        assert!(
+            message.contains(&deadline.to_string()),
+            "it expires at the instant first recorded, not a rolled-forward one: {message}"
+        );
+    }
+
+    /// AC2 — the answer is folded, so the node never re-asks. A gate that has waited,
+    /// then been signalled, completes on the next drive; the `SignalAwaited` count does
+    /// not grow, and driving the (now terminal) run again neither re-drives it nor
+    /// appends a second `RunCompleted`.
+    #[tokio::test]
+    async fn a_signalled_gate_completes_on_resume_and_never_re_asks() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000_000);
+        let clock = FakeClock::new(t0);
+        let graph = await_graph(Some(Duration::seconds(HOUR)));
+        let exec =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+
+        exec.run(run, &graph)
+            .await
+            .expect("run")
+            .paused
+            .expect("waits");
+
+        // The operator answers (what `torii run signal` will append in Task 4), then a
+        // worker tick re-drives the run.
+        journal
+            .append(
+                run,
+                JournalEvent::SignalReceived {
+                    node: gate(),
+                    payload: serde_json::json!({ "decision": "approved" }),
+                },
+            )
+            .await
+            .unwrap();
+        clock.set(t0 + Duration::minutes(5));
+        let out = exec.start(run, &graph).await.expect("resume");
+        assert!(
+            out.failed.is_none() && out.paused.is_none(),
+            "the signalled gate completes: {out:?}"
+        );
+        assert_eq!(out.outputs[&gate()]["decision"], "approved");
+
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            awaited_deadlines(&events).len(),
+            1,
+            "the answered gate does not begin waiting a second time"
+        );
+        let completions = events
+            .iter()
+            .filter(|(_, e)| matches!(e, JournalEvent::RunCompleted))
+            .count();
+        assert_eq!(completions, 1);
+
+        // A terminal run re-driven is a fold, not an execution — nothing is appended.
+        let before = events.len();
+        exec.start(run, &graph).await.expect("terminal resume");
+        assert_eq!(
+            journal.load(run).await.unwrap().len(),
+            before,
+            "re-driving a completed run journals nothing further"
+        );
+    }
+
+    /// AC6 / §6.4 — a signal payload is not a credential channel, and unlike a pause
+    /// reason it does not merely get *displayed*: it becomes the node's output and flows
+    /// into downstream nodes and model prompts. So the s2 `Redactor` is applied ONCE and
+    /// that single value is BOTH what the node returns AND what is written durably (the
+    /// blackboard blob the journaled `ContextWrite` addresses).
+    ///
+    /// The seeded `SignalReceived` here holds the plaintext — i.e. a producer that did
+    /// NOT redact — precisely so this proves the executor is an independent guard rather
+    /// than inheriting a scrub someone else performed.
+    #[tokio::test]
+    async fn payload_is_redacted_before_both_the_return_and_the_durable_write() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        // Assembled at RUNTIME: the repo's semgrep CWE-798 hook blocks credential-shaped
+        // literals in source. The redactor still matches the built string.
+        let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        seed(
+            &journal,
+            run,
+            vec![JournalEvent::SignalReceived {
+                node: gate(),
+                payload: serde_json::json!({ "decision": "approved", "token": secret }),
+            }],
+        )
+        .await;
+
+        let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone())
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()))
+            .start(run, &await_graph(None))
+            .await
+            .expect("start");
+
+        // (a) THE RETURN — what downstream nodes and model prompts will see.
+        let output = &out.outputs[&gate()];
+        assert_eq!(
+            output["token"],
+            serde_json::json!("[REDACTED]"),
+            "the node's OUTPUT is scrubbed: {output}"
+        );
+        assert_eq!(
+            output["decision"], "approved",
+            "a legitimate decision is untouched — the redactor matches credential SHAPES"
+        );
+        assert!(
+            !serde_json::to_string(output).unwrap().contains(&secret),
+            "no plaintext survives into the node output"
+        );
+
+        // (b) THE DURABLE WRITE — the same single redacted value, not a second scrub.
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            has(
+                &events,
+                |e| matches!(e, JournalEvent::ContextWrite { key, .. } if key.0 == "gate")
+            ),
+            "the completed gate published to the blackboard"
+        );
+        let r = ctx
+            .get(orchestrator_core::Scope::Run, ContextKey("gate".into()))
+            .await
+            .unwrap()
+            .expect("the gate's output is on the blackboard");
+        assert_eq!(
+            ctx.load(&r).await.unwrap()["token"],
+            serde_json::json!("[REDACTED]"),
+            "the durably-stored value is scrubbed too"
+        );
+        let blob = content.get(&r.content.digest).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&blob).contains(&secret),
+            "no plaintext reaches the content store"
         );
     }
 }

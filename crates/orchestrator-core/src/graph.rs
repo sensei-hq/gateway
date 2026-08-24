@@ -332,6 +332,27 @@ impl Graph {
             }
         }
 
+        // 2b-bis. SP-6 s1: an `AwaitSignal`'s timeout is a DURATION, and
+        // `chrono::Duration` happily represents zero and negatives (they even
+        // round-trip through serde). `now + (-1h)` is a deadline already in the past,
+        // so such a node would journal its deadline and immediately report a TIMEOUT —
+        // a confusing failure for what is really a malformed graph. Same argument as
+        // `max_iters == 0` above: reject the degenerate node loudly up front. `None`
+        // (wait indefinitely) is the legitimate way to express "no deadline".
+        for node in &self.nodes {
+            if let NodeKind::AwaitSignal {
+                timeout: Some(timeout),
+            } = &node.kind
+                && *timeout <= chrono::Duration::zero()
+            {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "await_signal node {:?} has a non-positive timeout ({timeout}); \
+                     use `None` to wait indefinitely",
+                    node.id
+                )));
+            }
+        }
+
         // 2c. A `Subgraph`'s nested graph must itself be a valid DAG (recursive).
         // A `Loop` with a `Subgraph` body has a static nested graph too — recurse
         // into it (a `LoopBody::Expand` has no static graph, so no recursion).
@@ -434,6 +455,55 @@ mod tests {
             graph.validate_dag(),
             Err(OrchestratorError::InvalidGraph(_))
         ));
+    }
+
+    /// SP-6 s1: `chrono::Duration` permits negatives and zero, and both round-trip
+    /// through serde perfectly — so a malformed graph reaches the executor, journals a
+    /// deadline that is already in the past (or exactly `now`), and reports a TIMEOUT.
+    /// That is a confusing failure for what is really an authoring mistake, so it is
+    /// rejected loudly up front, exactly as `max_iters == 0` is.
+    #[test]
+    fn validate_dag_rejects_a_non_positive_await_signal_timeout() {
+        for bad in [
+            chrono::Duration::seconds(-3600),
+            chrono::Duration::zero(),
+            chrono::Duration::nanoseconds(-1),
+        ] {
+            let graph = Graph {
+                nodes: vec![Node {
+                    id: NodeId("gate".into()),
+                    kind: NodeKind::AwaitSignal { timeout: Some(bad) },
+                    deps: vec![],
+                }],
+            };
+            let err = graph
+                .validate_dag()
+                .expect_err("a non-positive timeout is a degenerate node");
+            assert!(
+                matches!(err, OrchestratorError::InvalidGraph(_)),
+                "expected InvalidGraph for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// The other half of the guard above: a POSITIVE timeout and an ABSENT one (the
+    /// indefinite HITL gate — the common case) must both still validate, so the
+    /// rejection cannot have been written as a blanket refusal of `AwaitSignal`.
+    #[test]
+    fn validate_dag_accepts_a_positive_or_absent_await_signal_timeout() {
+        for ok in [Some(chrono::Duration::seconds(3600)), None] {
+            let graph = Graph {
+                nodes: vec![Node {
+                    id: NodeId("gate".into()),
+                    kind: NodeKind::AwaitSignal { timeout: ok },
+                    deps: vec![],
+                }],
+            };
+            assert!(
+                graph.validate_dag().is_ok(),
+                "a well-formed AwaitSignal must validate: {ok:?}"
+            );
+        }
     }
 
     #[test]
