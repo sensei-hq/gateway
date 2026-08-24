@@ -20,10 +20,13 @@ use torii::{boot, cmd};
                   `run submit` and `worker serve` additionally need TORII_FENCE_VERSION and \
                   --gateway-config.\n\n\
                   Exit codes: 0 ok, 1 error (including a submitted run that actually executed \
-                  and failed), 2 not-found or precondition-not-met. Note exit 2 is also clap's \
-                  own usage-error code (a missing subcommand, an unknown flag), so it is not \
-                  unique to a business-logic outcome — a script keying off it should also check \
-                  stderr."
+                  and failed), 2 not-found, precondition-not-met, or a result that is complete \
+                  enough to print but not the unqualified success you asked for (`run \
+                  list-paused` with a run whose journal could not be folded). Exit 1 puts a \
+                  message on stderr and nothing on stdout; exit 2 always still prints its \
+                  result. Note exit 2 is also clap's own usage-error code (a missing \
+                  subcommand, an unknown flag), so it is not unique to a business-logic \
+                  outcome — a script keying off it should also check stderr."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -79,6 +82,12 @@ enum RunAction {
         json: bool,
     },
     /// List every run awaiting a wake, and any node awaiting a signal
+    ///
+    /// One journal is folded per PAUSED run, to name the nodes awaiting a signal. A run
+    /// whose journal cannot be folded — a durable `format_version` bumped by a newer
+    /// binary is the realistic case — does not hide the rest of the fleet: its awaiting
+    /// column reads `unknown: <error>` (`awaiting_error` under --json) and every other run
+    /// is still listed, at exit 2.
     ListPaused {
         #[arg(long)]
         json: bool,
