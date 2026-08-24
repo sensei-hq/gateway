@@ -1036,6 +1036,9 @@ impl Executor {
             NodeKind::Subgraph { .. } => self.run_subgraph(run, node, fold).await,
             NodeKind::Branch { .. } => self.run_branch(run, node, prior_outputs, fold).await,
             NodeKind::Expand { .. } => self.run_expand(run, node, fold).await,
+            // SP-6 s1 Task 1: inert placeholder to restore compilation — Task 3
+            // implements this arm (`run_await_signal`, a three-way fold read).
+            NodeKind::AwaitSignal { .. } => unimplemented!("SP-6 s1 Task 3 implements this arm"),
         }
     }
 
