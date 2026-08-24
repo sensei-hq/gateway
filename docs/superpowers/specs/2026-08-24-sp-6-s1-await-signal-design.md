@@ -182,6 +182,11 @@ tests that did not guard the line they appeared to, and every one was caught by 
   node path.
 - **Non-CLI delivery** (webhook/HTTP) — needs the auth model SP-DATA-4 deferred.
 - **Multi-party approval** (N-of-M), and per-signal authorization (who may signal what).
+- **No `OrchestratorHooks` callback fires for `SignalAwaited`/`SignalReceived`.** Both fall through the
+  hook-dispatch catch-all, as several pre-existing events already do (`BudgetRaised`,
+  `EffectRecorded`, `MapExpanded`, `MapCompacted`) — so this is not a regression. But a HITL pause is
+  exactly the event the overview's "real-time flow-tracking UX / alerts / HITL" consumer would want
+  live, so it is recorded as a deliberate deferral rather than left an accident.
 - **A default payload on timeout** — deliberately rejected for s1 (§4); if it is ever added it must be
   opt-in per node and impossible to configure on a `HumanGate`.
 
