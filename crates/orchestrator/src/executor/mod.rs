@@ -22,6 +22,7 @@ mod durability;
 mod expand;
 mod fanout;
 pub(crate) mod selector;
+mod signal;
 mod subgraph;
 mod support;
 use support::{
@@ -242,16 +243,16 @@ impl Fold {
 
     /// SP-6 s1: the folded signal for an `AwaitSignal` node, if one has been delivered
     /// (§6.2's three-way read, arm 1). `None` for a node that has never been signalled.
-    /// `#[allow(dead_code)]` until Task 3 calls it from `run_await_signal`.
-    #[allow(dead_code)]
     fn signal_for(&self, node: &NodeId) -> Option<&serde_json::Value> {
         self.signals.get(node)
     }
 
     /// SP-6 s1: the folded ABSOLUTE deadline for an `AwaitSignal` node, if it has ever
     /// started waiting. `None` for a node that has not yet recorded a `SignalAwaited`.
-    /// `#[allow(dead_code)]` until Task 3 calls it from `run_await_signal`.
-    #[allow(dead_code)]
+    ///
+    /// Read by [`run_await_signal`](Executor::run_await_signal) on EVERY execution — it
+    /// is the durable half of the never-recompute rule; the caller must not fall back to
+    /// `now + timeout` when this returns `Some`.
     fn deadline_for(&self, node: &NodeId) -> Option<chrono::DateTime<chrono::Utc>> {
         self.deadlines.get(node).copied()
     }
@@ -1063,9 +1064,9 @@ impl Executor {
             NodeKind::Subgraph { .. } => self.run_subgraph(run, node, fold).await,
             NodeKind::Branch { .. } => self.run_branch(run, node, prior_outputs, fold).await,
             NodeKind::Expand { .. } => self.run_expand(run, node, fold).await,
-            // SP-6 s1 Task 1: inert placeholder to restore compilation — Task 3
-            // implements this arm (`run_await_signal`, a three-way fold read).
-            NodeKind::AwaitSignal { .. } => unimplemented!("SP-6 s1 Task 3 implements this arm"),
+            NodeKind::AwaitSignal { timeout } => {
+                self.run_await_signal(run, node, *timeout, fold).await
+            }
         }
     }
 
