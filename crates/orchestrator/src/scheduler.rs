@@ -10,7 +10,7 @@
 use crate::executor::{Executor, RunOutcome};
 use orchestrator_core::{
     Clock, ExecutionJournal, Graph, JournalEvent, OrchestratorError, RunId, RunStatus,
-    ScheduledRun, SchedulerStore, TokenBudget,
+    ScheduledRun, SchedulerStore, Seq, TokenBudget,
 };
 use std::sync::Arc;
 
@@ -66,8 +66,9 @@ impl Scheduler {
         budget: Option<TokenBudget>,
     ) -> Result<RunOutcome, OrchestratorError> {
         self.store.enqueue(run, &graph, self.clock.now()).await?;
+        let since = self.watermark(run).await?;
         let outcome = self.executor.run_budgeted(run, &graph, budget).await;
-        self.record(run, &outcome).await?;
+        self.record(run, since, &outcome).await?;
         outcome
     }
 
@@ -80,8 +81,9 @@ impl Scheduler {
             .await?;
         let n = due.len();
         for (run, graph) in due {
+            let since = self.watermark(run).await?;
             let outcome = self.executor.start(run, &graph).await;
-            self.record(run, &outcome).await?;
+            self.record(run, since, &outcome).await?;
         }
         Ok(n)
     }
@@ -101,14 +103,19 @@ impl Scheduler {
 
     /// Classify a drive result into the store. A drive's own error (e.g. a config-fence mismatch) is
     /// recorded terminal-`Failed` (loud in the store, not propagated); only a STORE failure returns `Err`.
+    ///
+    /// `since` is the journal watermark taken BEFORE the drive — see
+    /// [`earliest_resume_after`](Self::earliest_resume_after), which needs it to tell this drive's
+    /// pauses from every pause the run has ever taken.
     async fn record(
         &self,
         run: RunId,
+        since: Seq,
         outcome: &Result<RunOutcome, OrchestratorError>,
     ) -> Result<(), OrchestratorError> {
         match outcome {
             Ok(o) if o.paused.is_some() => {
-                let next_wake = self.last_resume_after(run).await?;
+                let next_wake = self.earliest_resume_after(run, since).await?;
                 let reason = o
                     .paused
                     .as_ref()
@@ -140,23 +147,60 @@ impl Scheduler {
         }
     }
 
-    /// The last journaled `RunPaused.resume_after` — the deadline the executor recorded on this pause.
-    async fn last_resume_after(
-        &self,
-        run: RunId,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, OrchestratorError> {
+    /// The journal's high-water [`Seq`] for `run` right now — the boundary a drive's own events
+    /// begin after. `0` for a run with nothing journaled yet (a fresh `submit`).
+    ///
+    /// Taken from `max`, not `last()`: the trait promises no ordering, and a boundary that is
+    /// accidentally too LOW would silently re-admit older pauses into the window below.
+    async fn watermark(&self, run: RunId) -> Result<Seq, OrchestratorError> {
         let events = self
             .journal
             .load(run)
             .await
             .map_err(OrchestratorError::Journal)?;
+        Ok(events.iter().map(|(seq, _)| *seq).max().unwrap_or(0))
+    }
+
+    /// The EARLIEST non-`None` `RunPaused.resume_after` journaled by **this drive** (events with
+    /// `Seq > since`) — the instant the scheduler must wake this run at.
+    ///
+    /// **Earliest, not last.** `drive` runs every ready node in a round even after one pauses, so a
+    /// single drive can journal several `RunPaused` events; taking the last and `flatten()`ing it
+    /// made `next_wake` depend on which pause happened to come last in graph declaration order. A
+    /// deadline-less `AwaitSignal` declared after a timed one — two parallel human gates, one with
+    /// an SLA and one without, which is a first-class HITL shape — nulled the timed gate's wake
+    /// entirely: the run then sat `paused` with `next_wake` NULL and the deadline fired only if a
+    /// human answered the OTHER gate. A budget pause or an in-doubt Mutation pause landing after a
+    /// timed one does the same thing, which is why this is fixed here, for all pause classes, and
+    /// not inside any one node kind. The earliest deadline is also the only safe choice: waking
+    /// EARLY is free (a resume with nothing to do simply re-pauses, zero re-spend), where waking
+    /// late means a deadline was missed.
+    ///
+    /// **This drive's, not the run's.** The `since` window is load-bearing in the other direction:
+    /// a deadline from an EARLIER drive is, by definition, one this run has already been woken for,
+    /// and it is almost always in the past. Re-adopting it would set a `next_wake` that every
+    /// single `tick()` claims — a hot loop re-driving the run forever. `None` (no pause this drive
+    /// carried a deadline) is SP-DATA-3's never-auto-woken class: correct, and the HOTL path.
+    ///
+    /// Every pause path journals its own `RunPaused` before returning (the gateway gate, the budget
+    /// refusal, the in-doubt reconcile, and `AwaitSignal`), so a paused drive always has at least
+    /// one event in this window.
+    async fn earliest_resume_after(
+        &self,
+        run: RunId,
+        since: Seq,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, OrchestratorError> {
+        let events = self
+            .journal
+            .load_since(run, since)
+            .await
+            .map_err(OrchestratorError::Journal)?;
         Ok(events
             .iter()
-            .rev()
-            .find_map(|(_, e)| match e {
-                JournalEvent::RunPaused { resume_after, .. } => Some(*resume_after),
+            .filter_map(|(_, e)| match e {
+                JournalEvent::RunPaused { resume_after, .. } => *resume_after,
                 _ => None,
             })
-            .flatten())
+            .min())
     }
 }
