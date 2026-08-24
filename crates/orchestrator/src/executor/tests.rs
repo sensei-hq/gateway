@@ -13408,6 +13408,91 @@ mod await_signal {
         );
     }
 
+    /// **I1 (whole-slice review).** A deadline-less gate records `SignalAwaited`
+    /// EXACTLY ONCE, however many times the run is re-driven — and the re-drives are
+    /// NOT human-bounded.
+    ///
+    /// The first implementation re-recorded the event on every drive, justified by "with
+    /// no deadline the run is in the never-auto-woken class, so a re-drive only ever
+    /// follows a human `force_wake`". This test is the disproof of that premise, with no
+    /// human anywhere in it: `drive` runs EVERY ready node in a round even after one
+    /// pauses, so the gate's `RunPaused { resume_after: None }` is followed in the SAME
+    /// drive by a dep-free sibling's `RunPaused { resume_after: Some(t) }` — and
+    /// `Scheduler::record` takes `next_wake` from the LAST `RunPaused`. The run therefore
+    /// keeps a non-NULL `next_wake` and is auto-woken at the provider's re-eligibility
+    /// cadence for the whole human-approval window.
+    #[tokio::test]
+    async fn a_deadline_less_gate_records_itself_once_across_automatic_wakes() {
+        use crate::Scheduler;
+        use crate::test_support::gated_gateway;
+        use orchestrator_core::SchedulerStore;
+        use orchestrator_store::InMemorySchedulerStore;
+
+        let journal = InMemoryJournal::new();
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(at(1_000_000));
+        // The gate carries NO deadline; the sibling `ModelCall` hits a gated provider
+        // and pauses WITH one. Both are dep-free, so both execute in the same round.
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: gate(),
+                    kind: NodeKind::AwaitSignal { timeout: None },
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("n1".into()),
+                    kind: model_call("c", "go"),
+                    deps: vec![],
+                },
+            ],
+        };
+        let exec = Executor::new(
+            Arc::new(gated_gateway().await),
+            Arc::new(journal.clone()),
+            "v1",
+        )
+        .with_clock(clock.clone());
+        let sched = Scheduler::new(
+            store.clone(),
+            exec,
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+
+        sched.submit(run, graph.clone()).await.expect("submit");
+        assert_eq!(
+            awaited_deadlines(&journal.load(run).await.unwrap()),
+            vec![None],
+            "the gate records itself once on the first drive"
+        );
+
+        for wake in 1..=5 {
+            let next = store
+                .status(run)
+                .await
+                .unwrap()
+                .expect("the run is scheduled")
+                .next_wake
+                .expect(
+                    "the sibling's timed pause keeps the run AUTO-wakeable — \
+                     no human is required to re-drive a deadline-less gate",
+                );
+            clock.set(next + Duration::seconds(1));
+            assert_eq!(
+                sched.tick().await.unwrap(),
+                1,
+                "wake {wake} fires automatically, with no operator involved"
+            );
+            assert_eq!(
+                awaited_deadlines(&journal.load(run).await.unwrap()),
+                vec![None],
+                "wake {wake}: the awaiting node is recorded ONCE, not once per drive"
+            );
+        }
+    }
+
     /// AC4 / §6.2 row 3 — the deadline fires LOUDLY. Reaching it with no signal fails
     /// the node (naming it and the deadline) and the run does NOT complete. Never a
     /// silent self-approval: there is deliberately no default-payload-on-timeout (§4).
