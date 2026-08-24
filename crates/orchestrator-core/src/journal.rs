@@ -182,6 +182,27 @@ pub enum JournalEvent {
     BudgetRaised {
         new_total_tokens: u64,
     },
+    /// SP-6 s1: an `AwaitSignal` node began waiting, recording its ABSOLUTE deadline.
+    ///
+    /// This exists as its own node-keyed event rather than relying on
+    /// `RunPaused.resume_after` because that field is not node-keyed and a run pauses
+    /// for many unrelated reasons over its life. Recording the absolute instant here is
+    /// what stops the deadline being recomputed as `now + timeout` on every resume —
+    /// which would push it forward forever, so a run force-woken every ten minutes with
+    /// a one-hour timeout would NEVER expire.
+    SignalAwaited {
+        node: NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// SP-6 s1: an external signal arrived for an `AwaitSignal` node. Folded by node id,
+    /// so the node reads its answer and never re-asks — the same shape
+    /// `PlannerSelected` uses for a planner choice. Last delivery wins while the node is
+    /// still paused; once it has completed, the node is folded complete and never
+    /// re-executes, so a later signal changes nothing.
+    SignalReceived {
+        node: NodeId,
+        payload: serde_json::Value,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
@@ -434,6 +455,46 @@ mod tests {
                 assert_eq!(agent.0, "planner");
             }
             other => panic!("expected PlannerSelected, got {other:?}"),
+        }
+    }
+
+    /// Additivity: this slice adds two NEW VARIANTS, not new fields. An old reader
+    /// cannot know them, but a NEW reader must still load every OLD event unchanged —
+    /// that is what keeps FORMAT_VERSION at 1.
+    #[test]
+    fn adding_the_signal_events_does_not_break_old_event_loading() {
+        let old = r#"{"RunStarted":{"version":"v1"}}"#;
+        let e: JournalEvent = serde_json::from_str(old).expect("old RunStarted still loads");
+        assert!(matches!(e, JournalEvent::RunStarted { .. }));
+    }
+
+    #[test]
+    fn the_signal_events_round_trip() {
+        let awaited = JournalEvent::SignalAwaited {
+            node: NodeId("gate".into()),
+            deadline: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).unwrap()),
+        };
+        let s = serde_json::to_string(&awaited).expect("serializes");
+        let back: JournalEvent = serde_json::from_str(&s).expect("round-trips");
+        match back {
+            JournalEvent::SignalAwaited { node, deadline } => {
+                assert_eq!(node.0, "gate");
+                assert!(deadline.is_some());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let received = JournalEvent::SignalReceived {
+            node: NodeId("gate".into()),
+            payload: serde_json::json!({"decision": "approved"}),
+        };
+        let s = serde_json::to_string(&received).expect("serializes");
+        let back: JournalEvent = serde_json::from_str(&s).expect("round-trips");
+        match back {
+            JournalEvent::SignalReceived { payload, .. } => {
+                assert_eq!(payload["decision"], "approved")
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }

@@ -79,6 +79,13 @@ pub enum NodeKind {
         #[serde(default)]
         planner: PlannerRef,
     },
+    /// SP-6 s1: pause until an external signal arrives for this node (HITL).
+    ///
+    /// `timeout` is a DURATION; the executor converts it to an absolute deadline ONCE,
+    /// at first execution, and journals it (`SignalAwaited`). On the deadline with no
+    /// signal the node FAILS — never a silent self-approval, which is why there is no
+    /// default-payload option (spec §4).
+    AwaitSignal { timeout: Option<chrono::Duration> },
 }
 
 /// How an `Expand` node's plan is produced (SP-3 slice 4A). `Injected` = the
@@ -694,5 +701,30 @@ mod tests {
         let r = PlannerRef::Agent(crate::registry::AgentRef("planner".into()));
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<PlannerRef>(&s).unwrap(), r);
+    }
+
+    /// SP-6 s1: confirms (by actually round-tripping, not just compiling) that
+    /// `chrono::Duration` serializes/deserializes under `serde_json` given this crate's
+    /// `chrono = { features = ["serde"] }` — the fact `AwaitSignal.timeout` relies on.
+    #[test]
+    fn await_signal_timeout_roundtrips_as_a_chrono_duration() {
+        let k = NodeKind::AwaitSignal {
+            timeout: Some(chrono::Duration::seconds(3600)),
+        };
+        let s = serde_json::to_string(&k).unwrap();
+        let back: NodeKind = serde_json::from_str(&s).unwrap();
+        match back {
+            NodeKind::AwaitSignal { timeout } => {
+                assert_eq!(timeout, Some(chrono::Duration::seconds(3600)));
+            }
+            other => panic!("expected AwaitSignal, got {other:?}"),
+        }
+
+        let none = NodeKind::AwaitSignal { timeout: None };
+        let s = serde_json::to_string(&none).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<NodeKind>(&s).unwrap(),
+            NodeKind::AwaitSignal { timeout: None }
+        ));
     }
 }
