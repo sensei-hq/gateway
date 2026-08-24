@@ -105,6 +105,16 @@ pub(crate) fn fold_journal(
                 fold.completed.insert(node.clone());
                 completed.push(node.clone());
             }
+            // SP-6 s1 (whole-slice review): the recorded failure of a node, folded so a
+            // node kind that is TERMINAL on failure can read its own verdict back instead
+            // of re-deriving it. Nothing else consults `fold.failed`, and that is the
+            // point: a `NodeFailed` does NOT make a node terminal in general — a
+            // `ModelCall`/`Agent` whose provider died re-attempts on resume, and there are
+            // tests that require exactly that. FIRST wins, so the verdict a resume reads is
+            // the one the run actually stopped on.
+            JournalEvent::NodeFailed { node, error } => {
+                fold.failed.entry(node.clone()).or_insert(error.clone());
+            }
             // The intent phase of a two-phase Mutation (§7.3). An effect id in
             // `intents` with no matching `EffectRecorded` is in-doubt on resume.
             JournalEvent::EffectIntent {
@@ -741,6 +751,34 @@ mod tests {
         let (fold, _, _) = fold_journal(&[]);
         assert_eq!(fold.signal_for(&NodeId("gate".into())), None);
         assert_eq!(fold.deadline_for(&NodeId("gate".into())), None);
+        assert_eq!(fold.failure_for(&NodeId("gate".into())), None);
+    }
+
+    /// **Whole-slice review, Important.** A `NodeFailed` folds, keyed by node, FIRST wins —
+    /// the verdict a resume reads must be the one the run actually stopped on, not a later
+    /// re-derivation of it. Without this arm an expired `AwaitSignal` gate re-ran on every
+    /// drive: it re-appended its own `NodeFailed`, and a late `SignalReceived` completed it
+    /// as *approved*.
+    ///
+    /// The fold is deliberately inert for every other node kind — see `Fold::failed`.
+    #[test]
+    fn a_node_failure_is_folded_by_node_id_and_the_first_verdict_wins() {
+        let fail = |seq: Seq, error: &str| {
+            (
+                seq,
+                JournalEvent::NodeFailed {
+                    node: NodeId("gate".into()),
+                    error: error.into(),
+                },
+            )
+        };
+        let (fold, _, _) = fold_journal(&[fail(0, "deadline passed"), fail(1, "something else")]);
+        assert_eq!(
+            fold.failure_for(&NodeId("gate".into())),
+            Some("deadline passed"),
+            "the ORIGINAL verdict survives a later one"
+        );
+        assert_eq!(fold.failure_for(&NodeId("other".into())), None);
     }
 
     #[test]
