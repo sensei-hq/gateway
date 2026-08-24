@@ -2449,6 +2449,10 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::RunPaused { .. } => "RunPaused".to_string(),
         // SP-DATA-5 Task 2 gives this a real label once BudgetRaised is exercised.
         JournalEvent::BudgetRaised { .. } => "BudgetRaised".to_string(),
+        // SP-6 s1 Task 1: inert placeholder to restore compilation — Task 2/3 exercise
+        // these once folding + the node are implemented.
+        JournalEvent::SignalAwaited { node, .. } => format!("SignalAwaited({})", node.0),
+        JournalEvent::SignalReceived { node, .. } => format!("SignalReceived({})", node.0),
     }
 }
 
