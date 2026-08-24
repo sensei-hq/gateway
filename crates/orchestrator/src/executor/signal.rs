@@ -20,6 +20,7 @@ impl Executor {
     ///
     /// | fold state | behaviour |
     /// |---|---|
+    /// | failure recorded | `Failed` — the expiry is READ back, never re-derived |
     /// | signal present | `Completed(payload)` — never re-asks |
     /// | no signal, nothing recorded | journal `SignalAwaited`, pause on `deadline` |
     /// | no signal, deadline recorded, `now >= deadline` | `NodeFailed` — the timeout, loudly |
@@ -63,6 +64,42 @@ impl Executor {
         timeout: Option<chrono::Duration>,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
+        // 0. This gate has ALREADY failed ⇒ it stays failed. Read the verdict back from the
+        //    journal; do not re-derive it, and do not re-journal it.
+        //
+        //    **Whole-slice review, Important.** `fold_journal` had no `NodeFailed` arm, so
+        //    an expired gate was not terminal on resume — with two consequences, the second
+        //    serious. (a) The run stays resumable while any OTHER node is paused, so every
+        //    wake re-ran this node, re-derived the same expiry and appended another
+        //    `NodeFailed` for an already-dead node. (b) Worse: append one late
+        //    `SignalReceived` and the re-run took arm 1 below and COMPLETED — a run that had
+        //    terminally failed on its deadline reached `RunCompleted` carrying the
+        //    operator's `{"decision":"approved"}`. That is precisely the silent
+        //    self-approval §4 rejects, arrived at by the back door. It is reachable:
+        //    `torii run signal` pre-checks the gate's state and then appends, and nothing
+        //    makes those two steps atomic — the CLI can report the outcome honestly but
+        //    cannot stop the row existing, so the guard belongs HERE.
+        //
+        //    BEFORE the signal read, unconditionally, and that ordering is the decision: a
+        //    signal is only an answer if it arrives while the gate is still asking. Ordering
+        //    the two by `Seq` instead would let a signal appended microseconds before the
+        //    expiry (an operator answering against a snapshot the mid-flight drive had
+        //    already passed) approve a gate whose deadline had, in fact, run out. The
+        //    deadline is the contract; fail-closed is the only reading that does not turn a
+        //    missed SLA into an approval.
+        //
+        //    This is the ONLY consumer of `fold.failed`, deliberately — see its doc comment:
+        //    a `NodeFailed` does not make a node terminal in general (a `ModelCall`/`Agent`
+        //    whose provider died re-attempts on resume, by design and by test). An
+        //    `AwaitSignal` is the one kind whose failure is irreversible by construction,
+        //    because the thing that failed is an instant that has passed.
+        if let Some(error) = fold.failure_for(&node.id) {
+            return Ok(NodeExec::Failed {
+                message: error.to_string(),
+                output: None,
+            });
+        }
+
         // 1. The answer is already folded ⇒ complete, and never re-ask. This also
         //    resolves the early-signal race for free (§6.3): a signal delivered BEFORE
         //    the node first ran is simply already here, so there is no buffering, no

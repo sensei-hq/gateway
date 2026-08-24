@@ -13714,6 +13714,160 @@ mod await_signal {
         );
     }
 
+    /// How many `NodeFailed` events this run has journaled for the gate.
+    fn gate_failures(events: &[(Seq, JournalEvent)]) -> usize {
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, JournalEvent::NodeFailed { node, .. } if node == &gate()))
+            .count()
+    }
+
+    /// **Whole-slice review, Important — the serious half.** A signal that arrives AFTER
+    /// the deadline must never resurrect an expired gate as *approved*.
+    ///
+    /// `fold_journal` had no `NodeFailed` arm, so an expired gate was not terminal on
+    /// resume: it re-ran, and by then `fold.signals` held the late answer, so it took the
+    /// first arm of §6.2 and completed. The run that had terminally failed on its
+    /// deadline then reached `RunCompleted` carrying `{"decision":"approved"}` — the
+    /// silent self-approval §4 explicitly rejects ("a gate that silently self-approves is
+    /// exactly the footgun this codebase's fail-closed stance argues against").
+    ///
+    /// It is reachable: `torii run signal` pre-checks the gate's state and then appends,
+    /// and nothing makes those two steps atomic. The CLI now reports the outcome honestly
+    /// (`not read`), but it cannot stop the row existing — so the executor must be the
+    /// guard, not the reporter.
+    ///
+    /// The failure wins whatever the relative order of the two events. A signal appended
+    /// just BEFORE the expiry (an operator answering while the drive was mid-flight, off a
+    /// snapshot that predates it) is still an answer that arrived after the deadline
+    /// passed, and the deadline is the contract. Fail-closed is the only reading that does
+    /// not turn a missed SLA into an approval.
+    #[tokio::test]
+    async fn a_late_signal_never_resurrects_an_expired_gate() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let deadline = at(1_000_000 + HOUR);
+        let graph = await_graph(Some(Duration::seconds(HOUR)));
+        seed(
+            &journal,
+            run,
+            vec![JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline: Some(deadline),
+            }],
+        )
+        .await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(deadline));
+
+        assert_eq!(
+            exec.start(run, &graph).await.expect("start").failed,
+            Some((
+                gate(),
+                format!("await_signal: no signal for node gate by {deadline}")
+            )),
+            "the gate expires at its deadline"
+        );
+
+        // The late answer — exactly the row `torii run signal` can append into the race.
+        journal
+            .append(
+                run,
+                JournalEvent::SignalReceived {
+                    node: gate(),
+                    payload: serde_json::json!({ "decision": "approved" }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let out = exec.start(run, &graph).await.expect("resume");
+        let (node, _) = out
+            .failed
+            .expect("an expired gate stays expired — a late signal is not an approval");
+        assert_eq!(node, gate());
+        assert!(
+            !out.outputs.contains_key(&gate()),
+            "the late payload must not become the gate's output: {:?}",
+            out.outputs
+        );
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            !has(&events, |e| matches!(e, JournalEvent::RunCompleted)),
+            "a run that failed on its deadline must never reach RunCompleted: {:?}",
+            events.iter().map(|(_, e)| label(e)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            gate_failures(&events),
+            1,
+            "the expiry is journaled once — the resume READS it, it does not re-fail"
+        );
+    }
+
+    /// The other half: an expired gate does not re-fail on every drive.
+    ///
+    /// A run whose gate has expired stays resumable while any OTHER node is still paused
+    /// (the run is not terminal — `record` files it `paused`, correctly, so the surviving
+    /// gate can still be answered), so it is re-driven on every wake. Without a folded
+    /// `NodeFailed` each of those wakes appended another `NodeFailed` for the same
+    /// already-dead node — a terminal event recorded over and over.
+    ///
+    /// (The cascade-skip of `after` still journals its `NodeSkipped` per drive, as it does
+    /// for any repeatedly-failing node of any kind. That is untouched here deliberately:
+    /// it is general cascade behaviour, not an `AwaitSignal` defect, and it changes no
+    /// growth class — a re-driven paused run appends its `RunPaused` every wake anyway.)
+    #[tokio::test]
+    async fn an_expired_gate_journals_its_failure_once_however_often_it_is_re_driven() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let deadline = at(1_000_000 + HOUR);
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: gate(),
+                    kind: NodeKind::AwaitSignal {
+                        timeout: Some(Duration::seconds(HOUR)),
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("after".into()),
+                    kind: model_call("c", "after"),
+                    deps: vec![Dep::hard("gate")],
+                },
+            ],
+        };
+        seed(
+            &journal,
+            run,
+            vec![JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline: Some(deadline),
+            }],
+        )
+        .await;
+        let clock = FakeClock::new(deadline);
+        let exec =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+
+        for wake in 1..=5 {
+            clock.set(deadline + Duration::seconds(wake * HOUR));
+            let out = exec.start(run, &graph).await.expect("re-drive");
+            assert_eq!(
+                out.failed.map(|(n, _)| n),
+                Some(gate()),
+                "wake {wake}: the gate is still the run's failure"
+            );
+            assert_eq!(
+                gate_failures(&journal.load(run).await.unwrap()),
+                1,
+                "wake {wake}: the expiry is recorded ONCE, not once per drive"
+            );
+        }
+    }
+
     /// **AC1 — the slice's most important test.** The deadline is journaled ONCE and
     /// READ thereafter, never recomputed.
     ///

@@ -176,6 +176,19 @@ struct Fold {
     /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
     /// keeps the whole run auto-wakeable).
     deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
+    /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
+    /// wins. Read by exactly ONE consumer — [`run_await_signal`](Executor::run_await_signal),
+    /// for which a failure is TERMINAL (an expired human gate stays expired).
+    ///
+    /// It is deliberately not consulted anywhere else. A `NodeFailed` does not make a node
+    /// terminal in general: a `ModelCall` or `Agent` node whose provider died journals one
+    /// and RE-ATTEMPTS on the next drive, which is the documented resume contract (see
+    /// `a_paused_gated_run_reattempts_and_completes_on_resume`, and `resolve_context`'s note
+    /// that a failed node "carries no memo and re-runs on resume"). Making this map
+    /// authoritative for every kind would silently delete retry-on-resume, so the
+    /// generalization is refused: only a node kind whose failure is by definition
+    /// irreversible — a deadline that has passed — may read it.
+    failed: HashMap<NodeId, String>,
     /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
     /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
     /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
@@ -268,6 +281,12 @@ impl Fold {
     /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
     fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         self.deadlines.get(node).copied()
+    }
+
+    /// SP-6 s1: the failure this node already journaled, if any — see [`Fold::failed`] for
+    /// why only `run_await_signal` may act on it.
+    fn failure_for(&self, node: &NodeId) -> Option<&str> {
+        self.failed.get(node).map(String::as_str)
     }
 }
 
