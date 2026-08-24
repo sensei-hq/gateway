@@ -88,6 +88,27 @@ pub enum NodeKind {
     AwaitSignal { timeout: Option<chrono::Duration> },
 }
 
+/// The largest [`NodeKind::AwaitSignal`] timeout [`Graph::validate_dag`] accepts:
+/// 100 Julian years.
+///
+/// It exists to bound `now + timeout`, which the executor computes on the node's first
+/// execution. `chrono::Duration` spans ~±292 million years, but `DateTime<Utc>` ends at
+/// +262143-12-31, so a sufficiently large duration makes that addition overflow — a
+/// panic, and a durable one (see the `2b-bis` block in `validate_dag`).
+///
+/// Why a century, specifically:
+///
+/// * **It cannot overflow.** A machine's wall clock reads ~2026; even a clock skewed by
+///   millennia leaves ~260,000 years of headroom above `now + 100y`. The check has to be
+///   pure over the graph (there is no `now` at validation time), so a fixed bound with
+///   six orders of magnitude of slack is the honest form of "addable to any plausible
+///   `now`", and it is stable regardless of when the graph is validated versus run.
+/// * **It costs nobody a real deadline.** The longest deadline this codebase accepts in
+///   anger is `i32::MAX` seconds (~68 years) — already far past any human gate, and still
+///   under this bound. "Wait longer than a century" is not a deadline; it is `None`, which
+///   is the never-auto-woken class and the accurate way to say "no deadline".
+pub const MAX_AWAIT_SIGNAL_TIMEOUT: chrono::Duration = chrono::Duration::days(36_525);
+
 /// How an `Expand` node's plan is produced (SP-3 slice 4A). `Injected` = the
 /// slice-3 `Planner` trait (deterministic/test); `Agent` = a journaled ReAct
 /// planner agent (this slice). Slice 4B adds `Select` (goal-based selection).
@@ -339,15 +360,34 @@ impl Graph {
         // a confusing failure for what is really a malformed graph. Same argument as
         // `max_iters == 0` above: reject the degenerate node loudly up front. `None`
         // (wait indefinitely) is the legitimate way to express "no deadline".
+        //
+        // The far end is worse than confusing. `chrono::Duration` runs to ~292 million
+        // years but `DateTime<Utc>` stops at year 262143, so a large-enough timeout makes
+        // the executor's `now + timeout` **panic**, and a panic here is durable: driven
+        // through `Scheduler::submit` the store row is enqueued BEFORE the drive, so every
+        // later `tick()` reclaims that row's stale lease and panics again — a poison pill
+        // that takes the worker process down. Both callers hand this function
+        // caller-controlled bytes (`torii run submit <graph.json>`, and an untrusted
+        // `Expand` planner's plan via `plan::feasible`), so it is refused here, before
+        // anything durable exists.
         for node in &self.nodes {
-            if let NodeKind::AwaitSignal {
+            let NodeKind::AwaitSignal {
                 timeout: Some(timeout),
             } = &node.kind
-                && *timeout <= chrono::Duration::zero()
-            {
+            else {
+                continue;
+            };
+            if *timeout <= chrono::Duration::zero() {
                 return Err(OrchestratorError::InvalidGraph(format!(
                     "await_signal node {:?} has a non-positive timeout ({timeout}); \
                      use `None` to wait indefinitely",
+                    node.id
+                )));
+            }
+            if *timeout > MAX_AWAIT_SIGNAL_TIMEOUT {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "await_signal node {:?} has a timeout ({timeout}) beyond the \
+                     {MAX_AWAIT_SIGNAL_TIMEOUT} maximum; use `None` to wait indefinitely",
                     node.id
                 )));
             }
@@ -486,12 +526,83 @@ mod tests {
         }
     }
 
+    /// **SP-6 s1 whole-slice review, Critical.** The other end of the same guard.
+    /// `chrono::Duration` reaches ~292 million years, but a `DateTime<Utc>` stops at
+    /// year 262143 — so `now + timeout` does not merely produce a silly deadline, it
+    /// **panics** (`DateTime + TimeDelta overflowed`) inside `run_await_signal`. Driven
+    /// through `Scheduler::submit` the store row is enqueued BEFORE the drive, so the
+    /// panic leaves a durable `(Waking, next_wake: None)` row that every later `tick()`
+    /// reclaims and re-panics on: a poison pill that takes the worker down with it.
+    ///
+    /// This is the JSON the reviewer submitted, verbatim — `TimeDelta::MAX`, i.e.
+    /// `i64::MAX` milliseconds — because both reachable callers hand `validate_dag`
+    /// caller-controlled bytes: `torii run submit <graph.json>` and an `Expand`
+    /// planner's emitted plan (`plan::feasible` validates through this same function).
+    #[test]
+    fn validate_dag_rejects_an_await_signal_timeout_that_cannot_be_added_to_now() {
+        /// Rejected, and rejected FOR THE GATE — a nested case that merely errors (say,
+        /// because the wrapper is malformed) would prove nothing about the recursion.
+        fn assert_rejects_the_gate(graph: &Graph, what: &str) {
+            match graph.validate_dag() {
+                Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                    m.contains("await_signal node") && m.contains("gate"),
+                    "{what}: rejected, but not for the gate's timeout: {m}"
+                ),
+                other => panic!("{what}: expected InvalidGraph, got {other:?}"),
+            }
+        }
+
+        let json = r#"{"nodes":[{"id":"gate","kind":{"AwaitSignal":{"timeout":[9223372036854775,807000000]}},"deps":[]}]}"#;
+        let graph: Graph = serde_json::from_str(json).expect("the reviewer's input parses");
+        assert_rejects_the_gate(&graph, "the reviewer's graph");
+
+        // `validate_dag` recurses into `Subgraph` and a `Loop`'s `Subgraph` body, so the
+        // guard must reject a NESTED offender too — otherwise the poison pill just moves
+        // one level down, which is exactly where a planner-emitted plan lands.
+        assert_rejects_the_gate(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("S".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(graph.clone()),
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Subgraph",
+        );
+        assert_rejects_the_gate(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("L".into()),
+                    kind: NodeKind::Loop {
+                        body: LoopBody::Subgraph(Box::new(graph.clone())),
+                        input: serde_json::json!({}),
+                        gate: GateSpec::Pure(LoopGate::TextContains("x".into())),
+                        max_iters: 3,
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Loop body",
+        );
+    }
+
     /// The other half of the guard above: a POSITIVE timeout and an ABSENT one (the
     /// indefinite HITL gate — the common case) must both still validate, so the
     /// rejection cannot have been written as a blanket refusal of `AwaitSignal`.
+    ///
+    /// The upper bound must not cost anyone a REAL deadline, so the accepted set spans
+    /// from the smallest representable tick to `i32::MAX` seconds (~68 years) — longer
+    /// than any human gate, and still comfortably under the bound.
     #[test]
     fn validate_dag_accepts_a_positive_or_absent_await_signal_timeout() {
-        for ok in [Some(chrono::Duration::seconds(3600)), None] {
+        for ok in [
+            Some(chrono::Duration::nanoseconds(1)),
+            Some(chrono::Duration::seconds(3600)),
+            Some(chrono::Duration::seconds(i64::from(i32::MAX))),
+            None,
+        ] {
             let graph = Graph {
                 nodes: vec![Node {
                     id: NodeId("gate".into()),

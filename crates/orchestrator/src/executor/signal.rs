@@ -99,10 +99,48 @@ impl Executor {
         //    waits on a human. The event is written at all because it is the NODE-KEYED
         //    record of which node is awaiting; `RunPaused` is not node-keyed, and a run
         //    pauses for many unrelated reasons over its life.
+        //
+        //    `checked_add_signed`, not `+`: `chrono::Duration` reaches ~292 million years
+        //    while `DateTime<Utc>` stops at year 262143, so the plain `+` PANICS on a
+        //    large enough timeout — and a panic here is not local. It unwinds through
+        //    `Scheduler::tick` (which has already claimed a batch of runs and taken their
+        //    leases) and out of `worker::serve`'s in-task `ticker.tick()`, killing the
+        //    worker; the claimed row stays `waking`, so the next worker reclaims the stale
+        //    lease and dies the same way. `Graph::validate_dag` rejects such a timeout up
+        //    front (`MAX_AWAIT_SIGNAL_TIMEOUT`) and that is the layer which keeps the
+        //    durable row from ever existing — but `Executor::start` takes the graph as a
+        //    caller parameter and nothing guarantees it was ever validated, so a node kind
+        //    is not allowed to panic on its own. Fail loudly and locally instead: the run
+        //    stops, the worker does not, and NOTHING is journaled first — a `SignalAwaited`
+        //    carrying a nonsense deadline would be folded first-wins forever.
         let deadline = match fold.deadline_for(&node.id) {
             Some(recorded) => recorded,
             None => {
-                let fresh = timeout.map(|t| self.clock.now() + t);
+                let fresh = match timeout {
+                    None => None,
+                    Some(t) => match self.clock.now().checked_add_signed(t) {
+                        Some(instant) => Some(instant),
+                        None => {
+                            let message = format!(
+                                "await_signal: node {} has a timeout ({t}) that overflows \
+                                 the representable instant range when added to now",
+                                node.id.0
+                            );
+                            self.append(
+                                run,
+                                JournalEvent::NodeFailed {
+                                    node: node.id.clone(),
+                                    error: message.clone(),
+                                },
+                            )
+                            .await?;
+                            return Ok(NodeExec::Failed {
+                                message,
+                                output: None,
+                            });
+                        }
+                    },
+                };
                 self.append(
                     run,
                     JournalEvent::SignalAwaited {
@@ -120,8 +158,18 @@ impl Executor {
         //    deliberately rejected (§4) — a gate that approves itself is exactly the
         //    footgun this codebase's fail-closed stance argues against.
         //
-        //    Unreachable on the first execution: `validate_dag` rejects a non-positive
-        //    timeout, so a freshly computed `now + timeout` is always in the future.
+        //    REACHABLE on the first execution — an earlier version of this comment claimed
+        //    otherwise ("`validate_dag` rejects a non-positive timeout, so a freshly
+        //    computed `now + timeout` is always in the future") and a reviewer disproved
+        //    it. `validate_dag` does bound the timeout at both ends, but a positive one is
+        //    still racing a moving clock: step 2 fixes the deadline from one `now`, and
+        //    this check reads the clock AGAIN, after an `await`ed journal append. Any
+        //    timeout shorter than that gap has already elapsed by the time we get here —
+        //    `timeout: Some(1ns)` against a real clock journals `SignalAwaited` and then
+        //    `NodeFailed` in a SINGLE execution (measured: `["RunStarted",
+        //    "SignalAwaited(gate)", "NodeFailed(gate)"]`). That is correct and loud — a
+        //    gate given a nanosecond to answer has genuinely expired — and it is written
+        //    down so nobody re-derives an "unreachable" guarantee this code does not make.
         if let Some(d) = deadline
             && self.clock.now() >= d
         {
