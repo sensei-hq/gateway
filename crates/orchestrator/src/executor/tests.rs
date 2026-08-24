@@ -13493,6 +13493,171 @@ mod await_signal {
         }
     }
 
+    /// A two-gate graph in the caller's declaration order: one gate with `timeout`, one
+    /// with none, both dep-free so `drive` runs BOTH in the same round and journals two
+    /// `RunPaused` events for one drive.
+    fn two_gate_graph(timed_first: bool, timeout: Duration) -> Graph {
+        let timed = Node {
+            id: NodeId("timed".into()),
+            kind: NodeKind::AwaitSignal {
+                timeout: Some(timeout),
+            },
+            deps: vec![],
+        };
+        let indef = Node {
+            id: NodeId("indef".into()),
+            kind: NodeKind::AwaitSignal { timeout: None },
+            deps: vec![],
+        };
+        Graph {
+            nodes: if timed_first {
+                vec![timed, indef]
+            } else {
+                vec![indef, timed]
+            },
+        }
+    }
+
+    /// **Whole-slice review, Important — reproduced independently by two reviewers.**
+    /// A deadline-LESS gate must not erase a timed gate's wake.
+    ///
+    /// "Legal sign-off, 48h SLA" beside "customer confirms, whenever" is a first-class
+    /// HITL shape, and it is exactly the case where the timeout exists to bound an
+    /// otherwise unbounded wait. Both gates are dep-free, so ONE drive journals
+    /// `RunPaused{Some(deadline)}` and `RunPaused{None}` — and `Scheduler::record` used
+    /// to take `next_wake` from the LAST of them and `flatten()` it away, leaving a NULL
+    /// `next_wake` that no `tick()` will ever claim. The 48h deadline then fires only if
+    /// a human answers the OTHER gate, i.e. only when it was never needed.
+    ///
+    /// Both declaration orders are asserted because the defect is *silently* ordered:
+    /// swap the two lines and the timeout works again. A test of the benign order alone
+    /// (which is what shipped) proves nothing about the harmful one.
+    #[tokio::test]
+    async fn a_deadline_less_gate_cannot_erase_a_timed_gates_wake() {
+        use crate::Scheduler;
+        use orchestrator_core::{RunStatus, SchedulerStore};
+        use orchestrator_store::InMemorySchedulerStore;
+
+        for timed_first in [true, false] {
+            let order = if timed_first {
+                "timed declared first"
+            } else {
+                "deadline-less declared first"
+            };
+            let (gw, _c) = recording_gateway().await;
+            let journal = InMemoryJournal::new();
+            let store = Arc::new(InMemorySchedulerStore::new());
+            let run = RunId(uuid::Uuid::new_v4());
+            let t0 = at(1_000_000);
+            let deadline = t0 + Duration::seconds(HOUR);
+            let clock = FakeClock::new(t0);
+            let graph = two_gate_graph(timed_first, Duration::seconds(HOUR));
+            let sched = Scheduler::new(
+                store.clone(),
+                Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+                    .with_clock(clock.clone()),
+                Arc::new(journal.clone()),
+                clock.clone(),
+            );
+
+            let out = sched.submit(run, graph.clone()).await.expect("submit");
+            assert!(out.paused.is_some(), "{order}: both gates wait");
+            let row = store
+                .status(run)
+                .await
+                .unwrap()
+                .expect("the run is scheduled");
+            assert_eq!(
+                row.status,
+                RunStatus::Paused,
+                "{order}: a waiting run is paused"
+            );
+            assert_eq!(
+                row.next_wake,
+                Some(deadline),
+                "{order}: the run must wake at the EARLIEST deadline this drive recorded, \
+                 not at whatever the last pause happened to carry"
+            );
+
+            // The payoff: a tick past the deadline actually claims the run, and the
+            // timed gate expires. A NULL `next_wake` claims nothing, forever.
+            clock.set(deadline + Duration::seconds(27 * HOUR));
+            assert_eq!(
+                sched.tick().await.unwrap(),
+                1,
+                "{order}: the deadline is honoured by an automatic wake"
+            );
+            let events = journal.load(run).await.unwrap();
+            assert!(
+                has(&events, |e| matches!(
+                    e,
+                    JournalEvent::NodeFailed { node, .. } if node == &NodeId("timed".into())
+                )),
+                "{order}: the woken drive expires the timed gate loudly: {:?}",
+                events.iter().map(|(_, e)| label(e)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The other half of the same rule: the earliest deadline is taken from **this
+    /// drive's** pauses, never from the whole journal.
+    ///
+    /// Drive 1 records `Some(t0+1h)` (the timed gate) and `None` (the indefinite one).
+    /// The wake at `t0+1h` expires the timed gate, so drive 2's ONLY pause is the
+    /// deadline-less one — the run is now genuinely in SP-DATA-3's never-auto-woken
+    /// (HOTL) class and `next_wake` must go back to NULL. Scanning the whole journal
+    /// would re-adopt drive 1's now-PAST deadline, and a `next_wake` in the past is
+    /// claimed by every tick: a hot loop that re-drives the run forever.
+    #[tokio::test]
+    async fn a_previous_drives_deadline_is_never_resurrected_as_a_next_wake() {
+        use crate::Scheduler;
+        use orchestrator_core::{RunStatus, SchedulerStore};
+        use orchestrator_store::InMemorySchedulerStore;
+
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000_000);
+        let deadline = t0 + Duration::seconds(HOUR);
+        let clock = FakeClock::new(t0);
+        let graph = two_gate_graph(true, Duration::seconds(HOUR));
+        let sched = Scheduler::new(
+            store.clone(),
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone()),
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+
+        sched.submit(run, graph.clone()).await.expect("submit");
+        assert_eq!(
+            store.status(run).await.unwrap().unwrap().next_wake,
+            Some(deadline)
+        );
+
+        clock.set(deadline + Duration::seconds(1));
+        assert_eq!(sched.tick().await.unwrap(), 1, "the deadline wakes the run");
+
+        let row = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            RunStatus::Paused,
+            "the surviving deadline-less gate keeps the run resumable"
+        );
+        assert_eq!(
+            row.next_wake, None,
+            "with the timed gate expired, this drive paused only WITHOUT a deadline — \
+             a stale past deadline here is claimed by every tick (a hot loop)"
+        );
+        for tick in 1..=3 {
+            assert_eq!(
+                sched.tick().await.unwrap(),
+                0,
+                "tick {tick}: a deadline-less pause is never auto-woken"
+            );
+        }
+    }
+
     /// AC4 / §6.2 row 3 — the deadline fires LOUDLY. Reaching it with no signal fails
     /// the node (naming it and the deadline) and the run does NOT complete. Never a
     /// silent self-approval: there is deliberately no default-payload-on-timeout (§4).
