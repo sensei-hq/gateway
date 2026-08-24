@@ -13868,6 +13868,68 @@ mod await_signal {
         }
     }
 
+    /// **Whole-slice review, Minor — the reviewer's exact collision graph, refused.**
+    ///
+    /// `Subgraph("sg"){gate}` namespaces its inner node to `"sg/gate"`; declare a
+    /// TOP-LEVEL node literally named `sg/gate` beside it and the two share one fold key.
+    /// The graph passed `validate_dag`, and one `SignalReceived{node:"sg/gate"}` completed
+    /// BOTH gates — a human decision intended for one approval silently answering another.
+    ///
+    /// The fix is in the validator (`/` is the executor's path separator and is not the
+    /// author's to use), which is why the assertion here is that the run never starts. It
+    /// is asserted at THIS level as well as in `orchestrator-core` because the collision is
+    /// only observable through the executor's namespacing, and a validator rule with no
+    /// executor-level witness is the kind that gets "simplified" away later.
+    #[tokio::test]
+    async fn a_top_level_id_can_never_alias_a_subgraphs_namespaced_gate() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let colliding = NodeId("sg/gate".into());
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("sg".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(await_graph(None)),
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: colliding.clone(),
+                    kind: NodeKind::AwaitSignal { timeout: None },
+                    deps: vec![],
+                },
+            ],
+        };
+        // The one signal that used to answer both gates at once.
+        seed(
+            &journal,
+            run,
+            vec![JournalEvent::SignalReceived {
+                node: colliding.clone(),
+                payload: serde_json::json!({ "who": "one" }),
+            }],
+        )
+        .await;
+
+        let refused = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000_000)))
+            .start(run, &graph)
+            .await;
+        match refused {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("sg/gate"),
+                "the refusal names the aliasing id: {m}"
+            ),
+            other => panic!(
+                "a top-level id that aliases a namespaced one must be refused before it \
+                 runs; instead it ran and one signal answered these nodes: {:?}",
+                other.map(|o| o.outputs)
+            ),
+        }
+    }
+
     /// **AC1 — the slice's most important test.** The deadline is journaled ONCE and
     /// READ thereafter, never recomputed.
     ///

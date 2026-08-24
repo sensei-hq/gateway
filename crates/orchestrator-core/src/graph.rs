@@ -329,6 +329,48 @@ impl Graph {
             }
         }
 
+        // 1b. SP-6 s1 (whole-slice review): `/` is the executor's node-PATH separator, and
+        // it belongs to the executor, not to the author. Every nested construct namespaces
+        // its inner nodes by `format!("{prefix}/{id}")` (`executor::subgraph::namespace_graph`),
+        // and the runtime paths `{map}/{i}`, `{loop}/{i}`, `{expand}/__plan__` are built the
+        // same way — so an author-supplied id containing `/` is an ALIAS for some nested
+        // node's generated id.
+        //
+        // The reviewer's graph: `Subgraph("sg"){gate}`, whose inner node namespaces to
+        // `"sg/gate"`, declared beside a top-level node literally named `sg/gate`. It
+        // validated, and one `SignalReceived{node:"sg/gate"}` completed BOTH — a HITL
+        // decision meant for one human gate silently answering another. The two ids are
+        // distinct at THIS level (block 1 sees `sg` and `sg/gate`), so nothing here could
+        // catch it after the fact; the collision only exists once nesting has flattened the
+        // namespaces, by which point the fold is keyed and the damage is done.
+        //
+        // Rejecting the separator outright, rather than detecting post-namespacing
+        // collisions, is the less disruptive of the two options the review offered: it is a
+        // pure syntactic rule needing no cross-level analysis, it holds for runtime-produced
+        // plans too (`plan::feasible` validates through this same function, so an untrusted
+        // planner cannot emit an aliasing id either), and it costs nothing — no graph in
+        // this workspace uses `/` in an author-supplied id, and `-`, `_`, `.` and `:` are
+        // all still available. This checks only what the AUTHOR wrote: the executor's own
+        // generated paths are namespaced AFTER validation and are never revalidated.
+        for node in &self.nodes {
+            if node.id.0.contains('/') {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "node id {:?} contains '/', which the executor reserves as the node-path \
+                     separator for nested nodes (it would alias a namespaced node's id)",
+                    node.id
+                )));
+            }
+            for dep in &node.deps {
+                if dep.on.0.contains('/') {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "node {:?} depends on {:?}, which contains the reserved '/' \
+                         node-path separator",
+                        node.id, dep.on
+                    )));
+                }
+            }
+        }
+
         // 2. Every dependency references a declared node.
         for node in &self.nodes {
             for dep in &node.deps {
@@ -476,6 +518,113 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **SP-6 s1 whole-slice review, Minor.** `/` is the executor's node-path separator,
+    /// so an author-supplied id containing one aliases a nested node's generated id.
+    ///
+    /// The reviewer's graph: `Subgraph("sg"){gate}` — whose inner node is namespaced to
+    /// `"sg/gate"` — beside a TOP-LEVEL node literally named `sg/gate`. It passed
+    /// `validate_dag`, and one `SignalReceived{node:"sg/gate"}` completed BOTH: a HITL
+    /// decision meant for one human gate silently answered another.
+    ///
+    /// Rejected at every level `validate_dag` recurses into, because the alias is created
+    /// by nesting and the offender can sit at any depth.
+    #[test]
+    fn validate_dag_rejects_a_path_separator_in_an_author_supplied_node_id() {
+        let offender = || Graph {
+            nodes: vec![node("sg/gate", vec![])],
+        };
+        let assert_rejects = |g: &Graph, what: &str| match g.validate_dag() {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("sg/gate") && m.contains('/'),
+                "{what}: rejected, but not for the id: {m}"
+            ),
+            other => panic!("{what}: expected InvalidGraph, got {other:?}"),
+        };
+
+        assert_rejects(&offender(), "top level");
+        assert_rejects(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("s".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(offender()),
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Subgraph",
+        );
+        assert_rejects(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("L".into()),
+                    kind: NodeKind::Loop {
+                        body: LoopBody::Subgraph(Box::new(offender())),
+                        input: serde_json::json!({}),
+                        gate: GateSpec::Pure(LoopGate::TextContains("x".into())),
+                        max_iters: 3,
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Loop body",
+        );
+        assert_rejects(
+            &Graph {
+                nodes: vec![
+                    node("on", vec![]),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("on".into()),
+                            arms: vec![(BranchCond::FieldTrue("go".into()), offender())],
+                            default: Graph { nodes: vec![] },
+                        },
+                        deps: vec![Dep::hard("on")],
+                    },
+                ],
+            },
+            "nested in a Branch arm",
+        );
+
+        // A dep may not reach INTO a nested namespace either. Such a graph is refused
+        // either way — block 2 would call the id undeclared — so the assertion is on the
+        // MESSAGE: an author who wrote `Dep::hard("sg/gate")` meant the subgraph's inner
+        // node, and "undeclared node" sends them looking for a typo instead of telling them
+        // the separator is reserved and cross-level edges do not exist.
+        match (Graph {
+            nodes: vec![node("a", vec![]), node("b", vec![Dep::hard("sg/gate")])],
+        })
+        .validate_dag()
+        {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("sg/gate") && m.contains("separator"),
+                "a dep into a namespace is refused for the SEPARATOR, not as a typo: {m}"
+            ),
+            other => panic!("expected InvalidGraph, got {other:?}"),
+        }
+    }
+
+    /// The other half: ordinary ids — including the punctuation authors actually use —
+    /// keep validating, so the rejection cannot have been written as a blanket refusal.
+    #[test]
+    fn validate_dag_accepts_ordinary_author_supplied_node_ids() {
+        for id in [
+            "gate",
+            "n1",
+            "review-legal",
+            "review_legal",
+            "gate.2",
+            "gate:2",
+            "gate-c3a9f0e4-1b2d-4c5e-8a7b-9d0e1f2a3b4c",
+        ] {
+            let g = Graph {
+                nodes: vec![node(id, vec![])],
+            };
+            assert!(g.validate_dag().is_ok(), "{id:?} must still validate");
+        }
+    }
 
     #[test]
     fn validate_dag_rejects_a_zero_iteration_loop() {
