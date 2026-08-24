@@ -11,10 +11,14 @@
 //! torii's own `worker serve --once` loop, with zero re-spend of the tokens A already paid
 //! for.
 //!
-//! Both tests drive their process B through the REAL [`torii::cmd::worker::serve`] rather
-//! than calling `Scheduler::tick` directly: asserting a re-implementation of the
+//! Every test here drives its process B through the REAL [`torii::cmd::worker::serve`]
+//! rather than calling `Scheduler::tick` directly: asserting a re-implementation of the
 //! single-tick contract would prove nothing about the command an operator actually runs.
 //! That is the reason this crate is a lib+bin pair.
+//!
+//! SP-6 s1 adds AC7, the HITL counterpart: the pause is not a provider's, it is a
+//! GRAPH's — an `AwaitSignal` node designed to wait for a human — and the operator
+//! command in the middle carries an ANSWER back in rather than merely resuming.
 
 use chrono::{DateTime, Duration, Utc};
 use kernel::types::cost::TokenUsage;
@@ -23,11 +27,12 @@ use orchestrator::test_support::{
 };
 use orchestrator::{Executor, Scheduler};
 use orchestrator_core::{
-    ConfigSource, ExecutionJournal, Graph, Node, NodeId, NodeKind, RegistryHandle, RunId,
-    RunStatus, SchedulerStore, TokenBudget,
+    ConfigSource, ContextKey, ContextStore, ExecutionJournal, Graph, JournalEvent, Node, NodeId,
+    NodeKind, RegistryHandle, RunId, RunStatus, SchedulerStore, Scope, TokenBudget,
 };
 use orchestrator_store::postgres::{
-    PostgresConfigSource, PostgresContentStore, PostgresJournal, PostgresSchedulerStore, connect,
+    PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
+    PostgresSchedulerStore, connect,
 };
 use std::sync::Arc;
 
@@ -105,6 +110,56 @@ fn two_node_graph(marker: &str) -> Graph {
     Graph {
         nodes: vec![node("n1"), node("n2")],
     }
+}
+
+/// SP-6 s1 AC7: `n1 → gate → n2`, where `gate` is an [`NodeKind::AwaitSignal`] — the
+/// smallest graph with all three parts the acceptance criterion names: a PREFIX that
+/// costs real tokens (`n1`, paid for by process A), the human gate itself, and a
+/// SUCCESSOR that can only run once the gate has read its answer (`n2`).
+///
+/// Each `ModelCall`'s prompt IS its node id, and every node id is qualified by the run's
+/// own marker, so a recorded gateway call is attributable to both the run AND the node —
+/// the same technique [`two_node_graph`] uses, and the only way the zero-re-spend
+/// assertion can say "`n1` was replayed, `n2` was driven" rather than merely "one call
+/// happened".
+///
+/// The ids must be run-unique for a second, durable reason: this test wires a
+/// `PostgresContextStore` (as `boot::heavy` does in production), and `context_refs`' primary
+/// key is `(scope_kind, scope_id, ctx_key)` — a `Scope::Run` write carries an EMPTY scope
+/// id, so two runs publishing the same node id collide LOUDLY
+/// (`ContextKeyCollision`). Sharing the bare `n1` of the tests above would make this suite
+/// fail on its second run against a persistent database.
+fn signal_graph(marker: &str, timeout: Option<Duration>) -> Graph {
+    let (n1, gate, n2) = signal_graph_ids(marker);
+    let model = |id: &NodeId, deps: Vec<orchestrator_core::Dep>| Node {
+        id: id.clone(),
+        kind: NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": id.0 }),
+        },
+        deps,
+    };
+    Graph {
+        nodes: vec![
+            model(&n1, vec![]),
+            Node {
+                id: gate.clone(),
+                kind: NodeKind::AwaitSignal { timeout },
+                deps: vec![orchestrator_core::Dep::hard(n1.0.clone())],
+            },
+            model(&n2, vec![orchestrator_core::Dep::hard(gate.0.clone())]),
+        ],
+    }
+}
+
+/// The three node ids of [`signal_graph`], in graph order. A named helper because the test
+/// asserts on all three by name and a drifted literal would silently assert nothing.
+fn signal_graph_ids(marker: &str) -> (NodeId, NodeId, NodeId) {
+    (
+        NodeId(format!("n1-{marker}")),
+        NodeId(format!("gate-{marker}")),
+        NodeId(format!("n2-{marker}")),
+    )
 }
 
 /// How many recorded gateway calls carried `marker` as their prompt.
@@ -198,6 +253,43 @@ async fn fresh_worker_pinned(url: &str, at: DateTime<Utc>) -> (Scheduler, CallLo
         )))
         .with_registry_handle(handle)
         .with_clock(clock.clone());
+    let store = Arc::new(PostgresSchedulerStore::new(connect(url).await.unwrap()));
+    (Scheduler::new(store, exec, journal, clock), calls)
+}
+
+/// SP-6 s1: [`fresh_executor`], but ALSO wired with a durable `PostgresContextStore` —
+/// which is how `boot::heavy` wires every real torii process, and what makes the
+/// blackboard half of the signal path observable.
+///
+/// It matters twice over. A completed node publishes its output to the blackboard
+/// (`Executor::publish_context` → a `ContextWrite` keyed by the node id), so with a store
+/// wired the signalled gate's PAYLOAD becomes a durable row a third process can read back
+/// — the only way to assert the human's answer actually became the node's output without
+/// going through a terminal re-`start`, whose `RunOutcome` is empty for a node kind that
+/// journals no `NodeCompleted` (see the test below). And `torii`'s own `signal_state` fold
+/// treats that same `ContextWrite` as the completion marker for exactly those node kinds,
+/// so a store-less run would exercise only its `RunCompleted` backstop.
+async fn fresh_context_executor(
+    url: &str,
+    at: DateTime<Utc>,
+) -> (Executor, Arc<PostgresJournal>, Arc<FakeClock>, CallLog) {
+    let journal = Arc::new(PostgresJournal::new(connect(url).await.unwrap()));
+    let (gw, calls) = recording_gateway().await;
+    let clock = FakeClock::new(at);
+    let exec = Executor::new(Arc::new(gw), journal.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(url).await.unwrap(),
+        )))
+        .with_context_store(Arc::new(PostgresContextStore::new(
+            connect(url).await.unwrap(),
+        )))
+        .with_clock(clock.clone());
+    (exec, journal, clock, calls)
+}
+
+/// [`fresh_context_executor`] behind a scheduler — the SP-6 s1 worker process.
+async fn fresh_context_worker(url: &str, at: DateTime<Utc>) -> (Scheduler, CallLog) {
+    let (exec, journal, clock, calls) = fresh_context_executor(url, at).await;
     let store = Arc::new(PostgresSchedulerStore::new(connect(url).await.unwrap()));
     (Scheduler::new(store, exec, journal, clock), calls)
 }
@@ -737,5 +829,223 @@ async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fres
         (spent_after, budget_after),
         (u64::from(PER_CALL) * 2, Some(RAISED)),
         "both processes' spend is in ONE durable ledger, folded by effect id"
+    );
+}
+
+/// SP-6 s1 AC7 — the HITL loop, end to end, across a process boundary.
+///
+/// SP-DATA-4's e2e above proves the HOTL loop: an operator *outside* the run resumes it,
+/// and `force_wake` is a RESUME, not a DECISION. This is the other half — a graph that is
+/// DESIGNED to wait for a human, and an operator who carries an ANSWER back into it.
+///
+/// 1. **Process A** submits `n1 → gate → n2`. `n1` costs a real token; `gate` (an
+///    `AwaitSignal` with a one-hour timeout) journals its ABSOLUTE deadline and pauses the
+///    run durably, with `n2` never reached.
+/// 2. **The operator, light tier** (`run list-paused`) names the awaiting NODE and its
+///    deadline — read from the durable journal on its own pool, sharing nothing with A.
+///    The scheduler row alone could not answer this: it is run-level.
+/// 3. **`run signal`** journals the answer and queues the wake. The run is still merely
+///    `paused` afterwards, because signalling queues; it does not drive.
+/// 4. **Process B** — a fresh store/journal/content-store/context-store/gateway — drives
+///    it through torii's real `worker serve --once`.
+/// 5. The run reaches `Completed`, and the human's payload is the gate's durable output.
+/// 6. **Zero re-spend, per node:** B's gateway saw `n2` exactly once and `n1` NEVER.
+///
+/// **Completion is asserted through the scheduler's `RunStatus` and the journal's
+/// `RunCompleted`, never through a terminal re-`start`'s `RunOutcome`.** That is not
+/// squeamishness: `run_await_signal` journals no `NodeCompleted` (matching `Branch` and
+/// `Subgraph`), and a re-`start` of an already-TERMINAL run rebuilds `outputs`/`completed`
+/// from exactly those events — so it would report an empty outcome here for a reason that
+/// has nothing to do with signalling. That is the documented fresh-vs-terminal limitation
+/// `run_subgraph` already carries, and "fixing" it for one node kind would make
+/// `AwaitSignal` divergent from its siblings. The durable blackboard is correct throughout,
+/// which is what the `context_refs` read below actually demonstrates.
+#[tokio::test]
+async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_process() {
+    let Some(url) = db_url() else { return };
+    let _guard = SCHEDULED_RUNS.lock().await;
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let marker = run.0.to_string();
+    let (n1, gate, n2) = signal_graph_ids(&marker);
+    // An hour out, so the deadline is far beyond every instant this test reaches: the run
+    // is due at T+1h and nothing else can make it claimable. That is what turns the
+    // completion assertion into a statement about the SIGNAL — without the delivery below,
+    // process B's tick simply would not claim this run at all.
+    let graph = signal_graph(&marker, Some(Duration::hours(1)));
+    let t0 = DateTime::<Utc>::from_timestamp(6_000_000, 0).unwrap();
+    let clock = FakeClock::new(t0);
+
+    // ---- Process A: the prefix is paid for, then the gate pauses the run -------------
+    let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let (gw_a, calls_a) = recording_gateway().await;
+    let exec_a = Executor::new(Arc::new(gw_a), journal_a.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_context_store(Arc::new(PostgresContextStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_clock(clock.clone());
+    let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), None, || {})
+        .await
+        .expect("a gate-paused run is not an error");
+    assert_eq!(submitted.code, torii::errors::EXIT_OK, "{}", submitted.text);
+    assert!(
+        submitted.text.starts_with("paused:") && submitted.text.contains("await_signal"),
+        "the gate must PAUSE the run (resumable), naming itself as the cause: {}",
+        submitted.text
+    );
+
+    // The prefix is REAL — this is the spend the zero-re-spend assertion later protects.
+    assert_eq!(
+        (calls_for(&calls_a, &n1.0), calls_for(&calls_a, &n2.0)),
+        (1, 0),
+        "n1 spends; n2 is behind the gate and must not have run"
+    );
+
+    let deadline = t0 + Duration::hours(1);
+    let paused = store_a
+        .status(run)
+        .await
+        .unwrap()
+        .expect("a schedule record");
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(
+        paused.next_wake,
+        Some(deadline),
+        "the pause carries the gate's ABSOLUTE deadline, so the scheduler re-arms on the \
+         same instant however often the run is woken early: {paused:?}"
+    );
+
+    // ---- The operator, light tier: WHICH node is waiting, and until when? ------------
+    // A separate pool and a separate journal handle — no gateway, no model credentials,
+    // nothing in-process shared with A.
+    let store_b = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let listed = torii::cmd::run::list_paused(store_b.as_ref(), journal_b.as_ref(), false)
+        .await
+        .expect("list-paused");
+    assert_eq!(listed.code, torii::errors::EXIT_OK, "{}", listed.text);
+    assert!(
+        listed.text.contains("AWAITING A SIGNAL") && listed.text.contains(&gate.0),
+        "list-paused must name the awaiting NODE, folded out of A's durable journal — an \
+         operator cannot signal what they cannot discover: {}",
+        listed.text
+    );
+    assert!(
+        listed.text.contains(&format!(
+            "deadline {}",
+            deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )),
+        "…and the deadline it will fail at: {}",
+        listed.text
+    );
+
+    // ---- The operator answers ---------------------------------------------------------
+    // A minute in — far short of the hour — so the gate is genuinely still waiting and the
+    // completion below cannot be the timeout firing.
+    let signalled_at = t0 + Duration::seconds(60);
+    let payload = serde_json::json!({ "decision": "approved", "note": "reviewed by ops" });
+    let answered = torii::cmd::run::signal(
+        store_b.as_ref(),
+        journal_b.as_ref(),
+        run,
+        gate.clone(),
+        payload.clone(),
+        signalled_at,
+    )
+    .await
+    .expect("signal");
+    assert_eq!(answered.code, torii::errors::EXIT_OK, "{}", answered.text);
+    assert!(
+        answered.text.starts_with("signalled:") && answered.text.contains(&gate.0),
+        "{}",
+        answered.text
+    );
+
+    // Signalling QUEUES; it does not drive — exactly what the message claims.
+    let after_signal = store_b.status(run).await.unwrap().unwrap();
+    assert_eq!(
+        (after_signal.status, after_signal.next_wake),
+        (RunStatus::Paused, Some(signalled_at)),
+        "the answer is journaled and the wake is queued, but a worker tick does the \
+         driving: {after_signal:?}"
+    );
+
+    // ---- Process B: a FRESH worker drives it ------------------------------------------
+    // The only thing carried over from A is the run id; the graph included, everything
+    // else B needs it reads out of Postgres.
+    let (sched_b, calls_b) = fresh_context_worker(&url, signalled_at + Duration::seconds(1)).await;
+    let served = serve_once(&sched_b).await;
+    assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
+
+    // ---- The run completed — asserted at the scheduler AND in the journal --------------
+    assert_eq!(
+        store_b.status(run).await.unwrap().unwrap().status,
+        RunStatus::Completed,
+        "the signalled run runs to completion in the fresh process: {}",
+        served.text
+    );
+    let events = journal_b.load(run).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "…and says so durably, in the journal the scheduler read it from"
+    );
+
+    // ---- ZERO RE-SPEND of the completed prefix, per node --------------------------------
+    // `calls_for` counts the recording gateway's calls whose PROMPT is the node id — so
+    // this is attributable to this run and this node, not a global "did anything happen".
+    // A bare total would be meaningless: `tick()` legitimately drives every due run in the
+    // shared `scheduled_runs` table, leftovers from other suites included.
+    assert_eq!(
+        calls_for(&calls_b, &n1.0),
+        0,
+        "n1 was paid for by process A — B must replay it from the durable journal + CAS, \
+         never call the gateway for it again"
+    );
+    assert_eq!(
+        calls_for(&calls_b, &n2.0),
+        1,
+        "exactly the one node the answer unblocked, driven once"
+    );
+
+    // ---- The gate's deadline was recorded ONCE and never moved --------------------------
+    // Two drives (A's pause, B's completion) and exactly one `SignalAwaited`. A deadline
+    // recomputed as `now + timeout` per execution would journal a second one, an hour
+    // later — the never-expires bug, which no assertion above would notice.
+    let awaited: Vec<_> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::SignalAwaited { node, deadline } if node == &gate => Some(*deadline),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        awaited,
+        vec![Some(deadline)],
+        "the gate records its absolute deadline once, at first execution, and folds it \
+         thereafter"
+    );
+
+    // ---- The human's answer IS the gate's durable output ---------------------------------
+    // Read back through a THIRD context store on its own pool, so this is the durable row,
+    // not B's in-process blackboard. Not asserted via a terminal re-`start`: see this
+    // test's doc comment for why that would be empty here.
+    let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
+    let published = ctx
+        .get(Scope::Run, ContextKey(gate.0.clone()))
+        .await
+        .unwrap()
+        .expect("the completed gate published its output to the durable blackboard");
+    assert_eq!(
+        ctx.load(&published).await.unwrap(),
+        payload,
+        "the operator's payload — unredacted, because a decision matches no credential \
+         shape — is what the gate returned into the graph"
     );
 }
