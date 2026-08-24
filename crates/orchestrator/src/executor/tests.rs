@@ -13757,6 +13757,134 @@ mod await_signal {
             "no plaintext reaches the content store"
         );
     }
+
+    /// **Whole-slice review, Critical — layer 2 of the overflow guard.** A timeout so
+    /// large that `now + timeout` leaves the `DateTime<Utc>` range must FAIL the node,
+    /// never panic.
+    ///
+    /// `validate_dag` now refuses such a graph (layer 1), and this test deliberately
+    /// walks around it: `run_await_signal` is called directly, because
+    /// [`Executor::start`] takes the graph as a caller-supplied parameter and NOTHING
+    /// guarantees anyone validated it — the executor is a public API, `start` is the
+    /// scheduler's resume entry point, and the graph a wake re-drives comes back out of
+    /// the store. A node kind that can panic is unacceptable at any distance from a
+    /// validator, because the panic is not local: it unwinds through `Scheduler::tick`
+    /// (which has already claimed the batch) and out of `worker::serve`'s in-task
+    /// `ticker.tick()`, taking the worker process with it.
+    ///
+    /// The failure must also arrive BEFORE anything is journaled: a `SignalAwaited`
+    /// written with a nonsense deadline would be folded first-wins forever.
+    #[tokio::test]
+    async fn an_unaddable_timeout_fails_the_node_instead_of_panicking() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        seed(&journal, run, vec![]).await;
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000_000)));
+
+        let node = Node {
+            id: gate(),
+            kind: NodeKind::AwaitSignal {
+                timeout: Some(Duration::MAX),
+            },
+            deps: vec![],
+        };
+        let exec_result = exec
+            .run_await_signal(run, &node, Some(Duration::MAX), &Fold::default())
+            .await
+            .expect("an unaddable timeout is a node failure, not an executor error");
+
+        let message = match exec_result {
+            NodeExec::Failed { message, .. } => message,
+            NodeExec::Completed(v) => panic!("expected a loud NodeFailed, got Completed({v})"),
+            NodeExec::Paused { reason } => {
+                panic!("expected a loud NodeFailed, got Paused({reason})")
+            }
+        };
+        assert!(
+            message.contains("gate"),
+            "the failure names the offending node: {message}"
+        );
+
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            has(
+                &events,
+                |e| matches!(e, JournalEvent::NodeFailed { node, .. } if node == &gate())
+            ),
+            "the failure is journaled loudly: {:?}",
+            events.iter().map(|(_, e)| label(e)).collect::<Vec<_>>()
+        );
+        assert!(
+            awaited_deadlines(&events).is_empty(),
+            "no nonsense deadline is recorded — the fold is first-wins, so a bad one is forever"
+        );
+        assert!(
+            paused_resume_afters(&events).is_empty(),
+            "a node that cannot compute a deadline does not pause"
+        );
+    }
+
+    /// The layer-1 payoff, on the exact path the reviewer drove: `Scheduler::submit`
+    /// enqueues the store row BEFORE the drive, so a panicking drive used to leave a
+    /// durable `(Waking, next_wake: None)` row that every later `tick()` reclaimed and
+    /// re-panicked on. Now the drive returns `InvalidGraph`, `record` files the run
+    /// terminal-`Failed`, and no tick ever picks it up again.
+    #[tokio::test]
+    async fn submitting_an_unaddable_timeout_leaves_no_poison_row_in_the_scheduler() {
+        use crate::Scheduler;
+        use orchestrator_core::{RunStatus, SchedulerStore};
+        use orchestrator_store::InMemorySchedulerStore;
+
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(at(1_000_000));
+        // The reviewer's exact input, as `torii run submit <graph.json>` would parse it.
+        let graph: Graph = serde_json::from_str(
+            r#"{"nodes":[{"id":"gate","kind":{"AwaitSignal":{"timeout":[9223372036854775,807000000]}},"deps":[]}]}"#,
+        )
+        .expect("the reviewer's input parses");
+        let sched = Scheduler::new(
+            store.clone(),
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone()),
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+
+        let err = sched
+            .submit(run, graph)
+            .await
+            .expect_err("a graph the validator refuses cannot drive");
+        assert!(
+            matches!(err, OrchestratorError::InvalidGraph(_)),
+            "refused by the validator, not by a panic: {err:?}"
+        );
+
+        let row = store
+            .status(run)
+            .await
+            .unwrap()
+            .expect("submit enqueued a row before driving");
+        assert_eq!(
+            row.status,
+            RunStatus::Failed,
+            "the refused run is filed TERMINAL, not left mid-`Waking` for the next tick to reclaim"
+        );
+
+        // The poison pill's signature: an ancient `waking` lease that every tick reclaims.
+        clock.set(at(1_000_000 + 365 * 24 * 3600));
+        for tick in 1..=3 {
+            sched.tick().await.expect("a tick must never panic");
+            assert_eq!(
+                store.status(run).await.unwrap().map(|r| r.status),
+                Some(RunStatus::Failed),
+                "tick {tick} does not resurrect a terminally-refused run"
+            );
+        }
+    }
 }
 
 /// SP-DATA-1 (5/5) — the HEADLINE: cross-process durable resume + durable in-doubt reconcile,
