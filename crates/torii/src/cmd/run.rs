@@ -488,9 +488,12 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 ///
 /// 4 KiB is the same boundary the executor already applies to a model call's inline
 /// output, so a journal row produced by a signal can never be larger than one the
-/// executor itself writes inline. **That claim is only true because the cap is checked on
-/// the REDACTED value** — the one actually written — see [`Measured`]. It is also far
-/// beyond any real use: a signal is a human DECISION
+/// executor itself writes inline. **That claim holds only because of the two corrections
+/// below, each of which falsified it once — and each was found only by measuring the row
+/// rather than the argument.** The cap is checked on the REDACTED value — the one actually
+/// written, see [`Measured`] — and on a size measured the way the DURABLE backend stores
+/// it rather than the way `serde_json` writes it, see [`jsonb_number_expansion`]. It is
+/// also far beyond any real use: a signal is a human DECISION
 /// (`{"decision":"approved","note":"…"}`), not a data channel, and 4 KiB is roughly 600
 /// words of prose.
 ///
@@ -518,23 +521,74 @@ enum Measured {
     AfterRedaction,
 }
 
+/// The EXTRA bytes this value costs once the durable backend has normalised it — which is
+/// not what `serde_json` wrote.
+///
+/// `journal_events.event` is a Postgres `jsonb` column, and `jsonb` normalises every JSON
+/// number to `numeric`. `serde_json` writes the largest finite `f64` as `1e308` — 5 bytes;
+/// `jsonb` stores and returns it as a 309-digit integer. So the wire size does not bound
+/// the durable size at all, and the gap is unbounded in the operator's favour:
+///
+/// ```text
+/// {"n":[1e308 x 583]}   serde_json::to_vec  ->      4088 bytes   (under the cap, accepted)
+///                       jsonb, as returned  ->   181_320 bytes   (44x the cap)
+///                       jsonb, on disk      ->     9_350 bytes   (still over, post-TOAST)
+/// ```
+///
+/// Measured on `postgres:16`. The 181_320 is the number that matters: it is what every
+/// `journal.load` decodes, on every drive and every `list-paused`, for the life of the run.
+///
+/// Charged to numbers ONLY, and only to those the backend really rewrites — an integer's
+/// wire form already IS its `numeric` form, so a decision object measures identically
+/// before and after. Rust's `Display` for `f64` is positional (never exponential), which
+/// makes it exactly the expansion `numeric` performs, in both directions: `1e-308` expands
+/// too.
+fn jsonb_number_expansion(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Number(n) if !n.is_i64() && !n.is_u64() => {
+            let on_the_wire = n.to_string().len();
+            let as_stored = n.as_f64().map_or(on_the_wire, |f| format!("{f}").len());
+            as_stored.saturating_sub(on_the_wire)
+        }
+        serde_json::Value::Array(a) => a.iter().map(jsonb_number_expansion).sum(),
+        serde_json::Value::Object(o) => o.values().map(jsonb_number_expansion).sum(),
+        _ => 0,
+    }
+}
+
 /// Refuse an over-limit payload, naming BOTH the limit and the actual size — an operator
 /// who pasted a file needs to know how much to cut, not just that they were over.
 fn check_payload_size(payload: &serde_json::Value, measured: Measured) -> Result<(), String> {
-    // `to_vec` (not `to_string().len()`) so the number is bytes on the wire, which is
-    // what the journal row actually stores.
-    let size = serde_json::to_vec(payload).map_or(usize::MAX, |b| b.len());
+    // `to_vec` (not `to_string().len()`) so the number is bytes on the wire, PLUS what the
+    // backend's own normalisation adds on top — see `jsonb_number_expansion`. Measuring
+    // only the wire form bounded a value nobody durably stores.
+    let wire = serde_json::to_vec(payload).map_or(usize::MAX, |b| b.len());
+    let expansion = jsonb_number_expansion(payload);
+    let size = wire.saturating_add(expansion);
     if size > MAX_PAYLOAD_BYTES {
-        // Naming which size this is matters: an operator who sent 4064 bytes and is told
-        // "5312 bytes" with no explanation will assume the tool is broken.
-        let what = match measured {
-            Measured::AsGiven => "",
-            Measured::AfterRedaction => {
+        // Naming which size this is, and WHY it differs from what was sent, matters: an
+        // operator who sent 4064 bytes and is told "5312 bytes" with no explanation will
+        // assume the tool is broken. Both growth causes are named because either one can
+        // be the whole difference — redaction inflates by ~1.67x, the backend's numeric
+        // normalisation by up to ~50x.
+        let mut what = String::new();
+        if matches!(measured, Measured::AfterRedaction) {
+            what.push_str(
                 " once redacted (secret-shaped text is replaced by the longer literal \
-                 `[REDACTED]` before the row is written, so the durable row is bigger \
-                 than what you sent)"
-            }
-        };
+                 `[REDACTED]` before the row is written)",
+            );
+        }
+        if expansion > 0 {
+            let joiner = if what.is_empty() { "" } else { " and" };
+            what.push_str(&format!(
+                "{joiner} once stored (the journal column is `jsonb`, which normalises \
+                 every JSON number to `numeric` — that expands this payload by \
+                 {expansion} bytes)"
+            ));
+        }
+        if !what.is_empty() {
+            what.push_str(", so the durable row is bigger than what you sent");
+        }
         return Err(format!(
             "--payload is {size} bytes{what}, over the {MAX_PAYLOAD_BYTES}-byte limit. A \
              signal is a human DECISION, not a data channel — it is journaled durably and \
@@ -716,19 +770,43 @@ pub async fn signal(
         )
         .await
         .map_err(OrchestratorError::Journal)?;
-    store.force_wake(run, now).await?;
+    // Past this point the answer is DURABLE, and every remaining call is fallible. A `?`
+    // here reported a bare `store error: …` — exit 1, no mention of the row — which is the
+    // one thing §6.6 forbids: it reads as "the signal did not go through" for a write that
+    // has already succeeded. Worse for the INDEFINITE class (`next_wake` NULL, never
+    // auto-woken), where the run then waits forever on an answer nobody knows landed.
+    //
+    // So a post-append fault is a REPORT, not an error: it names the durable row and the
+    // command that unblocks the run, in the same sentence shape the lost-race arm below
+    // already uses.
+    let unread = |what: &str, e: &dyn std::fmt::Display| {
+        Outcome::precondition(format!(
+            "not queued: {shown}'s answer is journaled durably (seq {appended}), but {what} \
+             failed: {e}. Nothing has read it yet and the run is not queued to resume — run \
+             `torii run wake {}` to drive it.",
+            run.0
+        ))
+    };
+    if let Err(e) = store.force_wake(run, now).await {
+        return Ok(unread("the wake", &e));
+    }
 
     // ---- The effect actually achieved, read back rather than assumed ------------------
-    // This row is never deleted by any shipped store, so `None` here would mean a
-    // hypothetical future retention/purge raced us, not a reachable path today.
-    let after = store
-        .status(run)
-        .await?
-        .ok_or_else(|| CliError::error(format!("run {} vanished mid-signal", run.0)))?;
-    let after_events = journal
-        .load(run)
-        .await
-        .map_err(OrchestratorError::Journal)?;
+    // A fault on either READ is less damaging than the wake fault above — the wake may
+    // well have applied — but it is still a durable row the operator has not been told
+    // about, so it takes the same shape rather than a bare `?`.
+    //
+    // The row is never deleted by any shipped store, so `None` would mean a hypothetical
+    // future retention/purge raced us, not a reachable path today.
+    let after = match store.status(run).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(unread("the status re-read", &"the run vanished mid-signal")),
+        Err(e) => return Ok(unread("the status re-read", &e)),
+    };
+    let after_events = match journal.load(run).await {
+        Ok(evs) => evs,
+        Err(e) => return Ok(unread("the journal re-read", &e)),
+    };
     // The node is terminal by now, or it is not. If it is, "not delivered" is FALSE — the
     // row is already durable — and the honest question is whether anything READ it. The
     // journal order answers that, which is why the append's seq was kept: a terminal
@@ -2496,6 +2574,46 @@ mod tests {
         assert!(journaled_signals(&j, run, &gate()).await.is_empty());
     }
 
+    /// A hard dependency failed and cascade-skipped the gate: the node will never
+    /// re-execute, so a signal is not an answer to anything.
+    ///
+    /// The third of the three terminal states §6.6 requires this command to report, and
+    /// the one that shipped unguarded — the `NodeSkipped` arm of [`signal_states`] could
+    /// be deleted with the whole suite green. Without it the gate folds back as
+    /// `Awaiting`, so the pre-check passes, a durable `SignalReceived` is appended, the run
+    /// is force-woken and the operator is told `signalled` with exit 0: a false success,
+    /// plus exactly the last-wins orphan row a re-`start` would fold as the node's output.
+    #[tokio::test]
+    async fn signal_on_a_cascade_skipped_node_reports_not_delivered() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = awaiting_journal(run, &gate(), None).await;
+        j.append(run, JournalEvent::NodeSkipped { node: gate() })
+            .await
+            .unwrap();
+
+        let out = signal(&s, &j, run, gate(), approved(), now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(out.text.contains("not delivered"), "{}", out.text);
+        assert!(
+            out.text.contains("skipped"),
+            "must name the actual state: {}",
+            out.text
+        );
+        assert!(
+            journaled_signals(&j, run, &gate()).await.is_empty(),
+            "a refused delivery must leave no durable orphan behind"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and must not queue a wake for a node that will never re-execute"
+        );
+    }
+
     /// AC6, on the DURABLE side. Task 3 redacts on the fold-READ path, which protects the
     /// node's return and its CAS output — it does NOT protect the journal row, and this
     /// command is that row's only writer. A human who pastes a token must not have put it
@@ -2630,6 +2748,143 @@ mod tests {
             s.status(run).await.unwrap().unwrap().next_wake,
             None,
             "and a refused delivery must not queue a wake"
+        );
+    }
+
+    /// §6.5, and the SECOND thing that falsified [`MAX_PAYLOAD_BYTES`]'s claim: the cap
+    /// governs the DURABLE ROW, and the durable column is `jsonb`, which normalises every
+    /// JSON number to `numeric`. The wire form `1e308` is 5 bytes; `jsonb` stores and reads
+    /// it back as a 309-digit integer. Measured on `postgres:16`, a payload `serde_json`
+    /// reports as 4088 bytes — under the cap, accepted by both checks — occupies 181_320
+    /// bytes of `jsonb`: 44x the bound this cap exists to enforce, reachable from the
+    /// operator CLI with no privilege, and paid again on every `journal.load` for the life
+    /// of the run.
+    #[tokio::test]
+    async fn a_payload_that_only_exceeds_the_cap_once_the_backend_stores_it_is_rejected() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = awaiting_journal(run, &gate(), None).await;
+
+        // 583 copies of the largest finite f64. Each is 5 bytes on the wire and 309 as
+        // `numeric`, so this clears the as-given cap and blows through the durable one.
+        let raw = serde_json::json!({ "n": vec![1e308_f64; 583] });
+        let as_given = serde_json::to_vec(&raw).unwrap().len();
+        let durable = as_given + jsonb_number_expansion(&raw);
+        assert!(
+            as_given <= MAX_PAYLOAD_BYTES,
+            "precondition: this passes the as-given check ({as_given} bytes)"
+        );
+        assert!(
+            durable > MAX_PAYLOAD_BYTES,
+            "precondition: the backend EXPANDS it past the cap ({as_given} -> {durable} bytes)"
+        );
+
+        let e = signal(&s, &j, run, gate(), raw, now())
+            .await
+            .expect_err("a row that only exceeds the cap once stored is refused");
+
+        assert_eq!(e.code, crate::errors::EXIT_ERROR, "{}", e.message);
+        assert!(
+            e.message.contains(&durable.to_string()),
+            "must name the size the BACKEND will store ({durable}), not the one \
+             `serde_json` wrote: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains(&MAX_PAYLOAD_BYTES.to_string()),
+            "must name the limit: {}",
+            e.message
+        );
+        assert!(
+            journaled_signals(&j, run, &gate()).await.is_empty(),
+            "an over-limit row must never reach the journal"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and a refused delivery must not queue a wake"
+        );
+    }
+
+    /// The expansion is charged to NUMBERS only, and only to those the backend really
+    /// rewrites. A decision object — the shape this flag exists for — must measure
+    /// identically before and after, or every ordinary signal pays for this guard.
+    #[test]
+    fn jsonb_expansion_is_zero_for_a_decision_and_for_plain_integers() {
+        assert_eq!(jsonb_number_expansion(&approved()), 0);
+        assert_eq!(
+            jsonb_number_expansion(&serde_json::json!({ "attempts": 3, "score": -12 })),
+            0,
+            "an integer's wire form IS its numeric form"
+        );
+        assert_eq!(
+            jsonb_number_expansion(&serde_json::json!({ "ratio": 0.5 })),
+            0,
+            "a float that needs no expansion is charged nothing"
+        );
+        assert_eq!(
+            jsonb_number_expansion(&serde_json::json!(1e308_f64)),
+            309 - 6,
+            "`serde_json` writes `1e+308` (6 bytes); `numeric` stores 309 digits"
+        );
+        assert_eq!(
+            jsonb_number_expansion(&serde_json::json!(1e-308_f64)),
+            310 - 6,
+            "and it expands in the other direction too: `1e-308` -> `0.000…1`"
+        );
+        assert!(
+            jsonb_number_expansion(&serde_json::json!({ "deep": [[{ "n": 1e308_f64 }]] })) > 0,
+            "the walk must reach a number nested under arrays and objects"
+        );
+    }
+
+    /// §6.6, on the one path where getting it wrong is irreversible: once the append has
+    /// succeeded the answer IS durable, and no later fault may be reported in a way that
+    /// reads as "the signal did not go through".
+    ///
+    /// `force_wake` faulting on a transient backend error (pool-acquire timeout, failover)
+    /// used to `?`-propagate as a bare `store error: …`. For the INDEFINITE class — the
+    /// gate with no deadline, whose `next_wake` is NULL so no tick will ever claim it —
+    /// that is the worst possible report: the decision is on the journal, the run will
+    /// never be driven again, and the operator has been told only that something errored.
+    /// This command already refuses to say `not delivered` for a durable row on every
+    /// MODELLED outcome; a fault must not be the one exception.
+    #[tokio::test]
+    async fn a_wake_fault_after_the_append_still_reports_the_durable_answer() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = FailingForceWakeStore(paused_store(run, None).await);
+        let j = awaiting_journal(run, &gate(), None).await;
+
+        let out = signal(&store, &j, run, gate(), approved(), now())
+            .await
+            .expect("a post-append fault is a REPORT, not a bare error");
+
+        assert_eq!(
+            out.code,
+            crate::errors::EXIT_PRECONDITION,
+            "ran, wrote, but not the unqualified success asked for: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("not delivered"),
+            "the row IS durable — `not delivered` sends the operator looking for a write \
+             that already happened: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("journaled durably"),
+            "must say the answer survived: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains(&format!("torii run wake {}", run.0)),
+            "must name the command that unblocks it: {}",
+            out.text
+        );
+        assert_eq!(
+            journaled_signals(&j, run, &gate()).await,
+            vec![approved()],
+            "and the answer really is on the journal"
         );
     }
 
@@ -3201,23 +3456,32 @@ mod tests {
         );
     }
 
-    /// A store fault must PROPAGATE, never be flattened into a green no-op — and the
-    /// append must already be durable when it does, proving `signal` writes the answer
-    /// BEFORE it queues the wake (the same ordering, and the same reason, as `wake`'s
+    /// A store fault must SURFACE, never be flattened into a green no-op — and the append
+    /// must already be durable when it does, proving `signal` writes the answer BEFORE it
+    /// queues the wake (the same ordering, and the same reason, as `wake`'s
     /// `BudgetRaised`: any worker that can observe the wake folds a journal that already
     /// contains the signal).
+    ///
+    /// This is the ORDER discriminator: swap the two calls and the injected failure
+    /// short-circuits before the append, leaving zero `SignalReceived` rows. What the
+    /// fault is REPORTED as is a separate property, pinned by
+    /// [`a_wake_fault_after_the_append_still_reports_the_durable_answer`].
     #[tokio::test]
-    async fn signal_appends_the_answer_before_calling_force_wake_and_propagates_its_failure() {
+    async fn signal_appends_the_answer_before_calling_force_wake_and_surfaces_its_failure() {
         let run = RunId(uuid::Uuid::new_v4());
         let inner = paused_store(run, None).await;
         let store = FailingForceWakeStore(inner);
         let j = awaiting_journal(run, &gate(), None).await;
 
-        let result = signal(&store, &j, run, gate(), approved(), now()).await;
+        let out = signal(&store, &j, run, gate(), approved(), now())
+            .await
+            .expect("a post-append fault is reported, not returned as a bare error");
 
-        assert!(
-            result.is_err(),
-            "the injected force_wake failure must surface, not be swallowed"
+        assert_ne!(
+            out.code, EXIT_OK,
+            "the injected force_wake failure must surface, not be swallowed into a green \
+             success: {}",
+            out.text
         );
         assert_eq!(
             journaled_signals(&j, run, &gate()).await.len(),
