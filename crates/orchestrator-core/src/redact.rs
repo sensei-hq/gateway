@@ -119,8 +119,16 @@ impl PatternRedactor {
     ///
     /// So: secret-shaped key + a string value at least [`MIN_KEYED_VALUE_LEN`] long ⇒ the
     /// WHOLE value goes (the key already said what it is; there is no label worth
-    /// keeping, unlike the in-string form). Any other key, or a non-string value,
-    /// recurses exactly as before — a nested object under `"secret"` is still walked
+    /// keeping, unlike the in-string form). Any other key recurses exactly as before.
+    ///
+    /// **The key carries into an ARRAY, and must.** `{"tokens": ["<secret>"]}` is the
+    /// plural an operator writes for more than one value, and its elements are bare
+    /// strings with nothing for the in-string rules to match — the same disclosure, one
+    /// array deep. Recursing with [`redact`](Redactor::redact) there dropped the key, so
+    /// the evidence was gone by the time the element was reached.
+    ///
+    /// A nested OBJECT is deliberately NOT carried into: its members bring their own keys,
+    /// and a subtree under `"secret"` is not wholly secret — it is still walked
     /// leaf-by-leaf rather than flattened to the placeholder.
     fn redact_keyed(&self, key: &str, value: &Value) -> Value {
         match value {
@@ -129,6 +137,7 @@ impl PatternRedactor {
             {
                 Value::String(PLACEHOLDER.to_string())
             }
+            Value::Array(a) => Value::Array(a.iter().map(|v| self.redact_keyed(key, v)).collect()),
             other => self.redact(other),
         }
     }
@@ -350,6 +359,55 @@ mod tests {
         let out = r.redact(&obj("tokens", json!([{ "password": pw }, "clean"])));
         assert_eq!(out["tokens"][0]["password"], json!(PLACEHOLDER));
         assert_eq!(out["tokens"][1], json!("clean"));
+    }
+
+    /// The key is evidence about the whole SUBTREE of strings it introduces, not just
+    /// about a string sitting directly under it.
+    ///
+    /// An array under a secret-shaped key is the plural an operator naturally writes for
+    /// more than one value (`"tokens"`, `"api_keys"`), and its elements are bare strings
+    /// with nothing in them for the in-string rules to match — the same disclosure the
+    /// object rule exists to catch, one array deep. Recursing with `redact` there dropped
+    /// the key, so the evidence was gone by the time the element was reached and an
+    /// unprefixed credential went to the journal, the CAS blob and the next model prompt
+    /// verbatim.
+    ///
+    /// A nested OBJECT still recurses on its own keys (asserted above): its members carry
+    /// their own evidence and a subtree under `"secret"` is not wholly secret.
+    #[test]
+    fn a_secret_shaped_key_carries_into_the_array_it_introduces() {
+        let r = PatternRedactor::default();
+        let secret = unprefixed_secret();
+
+        for key in ["tokens", "api_keys", "passwords"] {
+            let out = r.redact(&obj(key, json!([secret, "clean"])));
+            assert_eq!(
+                out[key][0],
+                json!(PLACEHOLDER),
+                "a bare string under {key:?} leaked"
+            );
+            assert!(
+                !out.to_string().contains(&secret),
+                "the secret survived somewhere under {key:?}: {out}"
+            );
+            assert_eq!(
+                out[key][1],
+                json!("clean"),
+                "a short value stays below the {MIN_KEYED_VALUE_LEN}-char floor"
+            );
+        }
+
+        // Nested arrays carry it too — the evidence does not stop at the first level.
+        let out = r.redact(&obj("token", json!([[secret]])));
+        assert_eq!(out["token"][0][0], json!(PLACEHOLDER));
+
+        // And a NON-secret key is unaffected: this must not become "redact every array".
+        let out = r.redact(&obj("notes", json!([secret])));
+        assert_eq!(
+            out["notes"][0],
+            json!(secret),
+            "an ordinary key must not gain the keyed rule"
+        );
     }
 
     #[test]
