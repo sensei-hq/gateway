@@ -78,10 +78,12 @@ pub trait Redactor: Send + Sync {
 }
 ```
 `PatternRedactor` (default impl) walks a `serde_json::Value` recursively — objects, arrays,
-and **string leaves** (object keys are NOT redacted; non-string scalars pass through) — and
-replaces each substring matching its curated pattern set with the fixed placeholder
-`[REDACTED]`. The default set (extensible; `PatternRedactor::new(patterns)` + a
-`PatternRedactor::default()` with the built-ins):
+and **string leaves** (a secret-shaped object key is preserved as a LABEL, never replaced;
+non-string scalars pass through) — and replaces each substring matching its curated pattern
+set with the fixed placeholder `[REDACTED]`. **One rule is not a substring match**: the
+key-evidence rule below replaces a whole value that matches no pattern at all, on the
+evidence of the key that introduces it. The default set (extensible;
+`PatternRedactor::new(patterns)` + a `PatternRedactor::default()` with the built-ins):
 - **Provider key prefixes:** `sk-ant-[A-Za-z0-9_-]{20,}` (Anthropic), `sk-[A-Za-z0-9]{20,}`
   (OpenAI), `AKIA[0-9A-Z]{16}` (AWS), `ghp_[A-Za-z0-9]{36}` (GitHub PAT), `xox[baprs]-[A-Za-z0-9-]{10,}`
   (Slack), `AIza[0-9A-Za-z_-]{35}` (Google).
@@ -90,6 +92,27 @@ replaces each substring matching its curated pattern set with the fixed placehol
 - **Assignment forms:** `(?i)(api[_-]?key|secret|token|password|passwd)("?\s*[=:]\s*"?)([^\s"',]{6,})`
   — redacts **only the value** (capture group 3 → `[REDACTED]`), preserving the key label
   (`api_key=[REDACTED]`).
+- **URL userinfo** (added SP-6 s1): `(?i)[a-z][a-z0-9+.-]*://[^/\s:@]+:[^\s]*[^/\s]@` — a
+  whole-pattern match on `scheme://user:password@`. The password class deliberately permits
+  `:`, `@` and (bar the final character) `/`: a class stopping at the first `@` leaves the
+  tail of `pw@word` or `p@ss://word` in the clear, which is exactly how
+  `torii::errors::redact_url` leaked before it switched to `rsplit_once('@')`. Excluding
+  only `/@` keeps `host:port/@scope/pkg` intact.
+- **Secret-shaped object KEYS** (added SP-6 s1) — the **key-evidence** rule, and the one
+  departure from substring matching. A key matching the same alternation as the assignment
+  form, introducing a string of at least `MIN_KEYED_VALUE_LEN` (6) characters, replaces the
+  **whole value**. `{"token": "<secret>"}` and `"token=<secret>"` are the same disclosure,
+  but JSON puts the two halves into separate `Value`s where the assignment rule — the only
+  rule that catches a secret with **no vendor prefix** — can never see them together; the
+  object form was journaled in plaintext until this rule landed. The key carries into an
+  **array** it introduces (`{"tokens": ["<secret>"]}`, the natural plural) but deliberately
+  **not** into a nested object, whose members bring their own keys — a subtree under
+  `"secret"` is still walked leaf-by-leaf rather than flattened.
+  **Scope note:** this is a workspace-wide change to every `Redactor` consumer (tool
+  results, all four model-output producers, the reconcile-`Confirmed` output, `torii` pause
+  reasons and signal payloads), not a torii-local one. Do not add a second, differently
+  shaped pass on top — §4.4's determinism argument requires live == journaled == replayed
+  to be the SAME pure pass.
 
 **No generic entropy/length heuristic** in slice 2 (false-positive risk — would redact hashes,
 digests, base64 payloads); deferred. **ReDoS-safe by construction:** Rust's `regex` crate uses
