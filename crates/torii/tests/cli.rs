@@ -334,3 +334,141 @@ fn a_light_tier_command_runs_with_only_a_database_url() {
         "the light tier must need nothing but DATABASE_URL:\n{stderr}"
     );
 }
+
+/// The one sink `--payload`'s redaction cannot reach: the process's own argv.
+///
+/// This flag is, by this codebase's own reckoning, the place an operator is most likely to
+/// paste a credential — `main.rs`'s `Signal` doc says so, and `parse_payload` goes to
+/// deliberate lengths never to echo the value. But a flag value is argv, and argv is read
+/// by `ps auxww`, by `/proc/<pid>/cmdline`, by the shell's history file and by the echo of
+/// any CI job that shells out — all of them BEFORE any redaction runs. This file's sibling
+/// `a_connect_failure_does_not_leak_the_password` guards the same property for
+/// `DATABASE_URL`, which is env-only for exactly this reason (`main.rs`: "a flag would leak
+/// the password into `ps`"). The rule was not applied to the flag more likely to carry a
+/// secret.
+///
+/// `--payload-file` is the non-argv path. The assertion is on the CHILD's argv, read while
+/// it is alive, so it fails if the file's contents ever get re-expanded onto a command line.
+#[test]
+fn a_payload_file_keeps_the_decision_out_of_argv() {
+    let sentinel = format!("SENTINEL{}", "9f2b7c1e4a8d3b5f");
+    let dir = std::env::temp_dir().join(format!("torii-payload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("decision.json");
+    std::fs::write(&path, format!(r#"{{"decision":"{sentinel}"}}"#)).expect("write payload");
+
+    let child = torii()
+        // Never-connectable, so the child lives long enough to be observed but performs
+        // no I/O — the same out-of-u16-range trick `signal_with_payload` uses.
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "signal",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "gate",
+            "--payload-file",
+            path.to_str().expect("utf-8 path"),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawns");
+
+    let argv = Command::new("ps")
+        .args(["-o", "args=", "-p", &child.id().to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let out = child.wait_with_output().expect("runs");
+
+    assert!(
+        !argv.contains(&sentinel),
+        "the decision reached the child's command line: {argv}"
+    );
+    // And the flag really did deliver it — otherwise the assertion above is vacuous.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("unexpected argument"),
+        "--payload-file must be a real flag: {combined}"
+    );
+    assert!(
+        !combined.contains("invalid --payload"),
+        "the file's contents must parse as the payload: {combined}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Exactly one source, or the operator does not know which one won.
+#[test]
+fn payload_and_payload_file_are_mutually_exclusive_and_one_is_required() {
+    let both = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "signal",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "gate",
+            "--payload",
+            r#"{"decision":"approved"}"#,
+            "--payload-file",
+            "/nonexistent",
+        ])
+        .output()
+        .expect("runs");
+    let both_err = String::from_utf8_lossy(&both.stderr);
+    assert!(!both.status.success(), "two sources must be refused");
+    assert!(
+        both_err.contains("cannot be used with"),
+        "must be refused AS A CONFLICT, not incidentally: {both_err}"
+    );
+
+    let neither = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "signal",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "gate",
+        ])
+        .output()
+        .expect("runs");
+    let neither_err = String::from_utf8_lossy(&neither.stderr);
+    assert!(!neither.status.success(), "no source must be refused");
+    assert!(
+        neither_err.contains("required") && neither_err.contains("payload"),
+        "must be refused for the MISSING PAYLOAD specifically: {neither_err}"
+    );
+}
+
+/// An unreadable file is an operator typo, and must be reported before any connection —
+/// and without echoing whatever was read.
+#[test]
+fn an_unreadable_payload_file_is_rejected_before_any_connection() {
+    let out = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "signal",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "gate",
+            "--payload-file",
+            "/nonexistent/decision.json",
+        ])
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--payload-file"), "must name the flag: {err}");
+    assert!(
+        !err.contains("cannot connect"),
+        "must fail before the connection is attempted: {err}"
+    );
+}

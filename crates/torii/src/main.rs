@@ -109,14 +109,22 @@ enum RunAction {
     /// `not delivered` (exit 2) when nothing was written; and `not read` (exit 2) when the
     /// answer IS durable but the node had already terminated — never "not delivered",
     /// which would send you looking for a write that already happened.
+    #[command(group(
+        clap::ArgGroup::new("payload_src").required(true).multiple(false)
+    ))]
     Signal {
         run_id: String,
         /// The awaiting node's id — `torii run list-paused` names it.
         #[arg(long)]
         node: String,
         /// The decision, as JSON, e.g. '{"decision":"approved"}'. Max 4096 bytes as
-        /// journaled — redaction replaces secret-shaped text with the longer literal
-        /// `[REDACTED]`, so a payload can cross the limit on the way to the journal.
+        /// stored — redaction replaces secret-shaped text with the longer literal
+        /// `[REDACTED]` and the journal's `jsonb` column expands numbers, so a payload can
+        /// cross the limit on the way to the journal.
+        ///
+        /// This is argv: it is visible to `ps`, to your shell history and to a CI job's
+        /// command echo, none of which redaction can reach. For anything you would rather
+        /// not have on a command line, use --payload-file.
         //
         // Taken as a raw `String` and parsed in `dispatch`, NOT through a clap
         // `value_parser` like every other flag in this file. clap wraps a value_parser
@@ -127,8 +135,17 @@ enum RunAction {
         // JSON, so the parse failure is exactly the path that would print it). Parsing in
         // `dispatch` keeps the whole message torii's to compose. It still happens before
         // any connection — the property that matters — exactly as `parse_run_id` does.
-        #[arg(long)]
-        payload: String,
+        #[arg(long, group = "payload_src")]
+        payload: Option<String>,
+        /// Read the decision from a file instead of the command line.
+        ///
+        /// The same JSON, and the same cap — but the value never becomes an argv entry, so
+        /// it cannot be read out of `ps`, `/proc/<pid>/cmdline`, a shell history file or a
+        /// CI job's command echo. `DATABASE_URL` is environment-only for this same reason.
+        /// A signal is still NOT a credential channel; this only closes the sink that
+        /// redaction cannot.
+        #[arg(long, group = "payload_src", value_name = "PATH")]
+        payload_file: Option<std::path::PathBuf>,
     },
     /// Cancel a non-terminal run so it is never woken
     Cancel { run_id: String },
@@ -314,6 +331,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 run_id,
                 node,
                 payload,
+                payload_file,
             } => {
                 // Parse BEFORE connecting, same as `status`: an invalid run id is the
                 // likeliest operator typo and sqlx would otherwise retry a refused
@@ -322,7 +340,23 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 // `value_parser` — so an unparseable or over-limit payload also costs no
                 // connection, and its message stays free of the pasted value.
                 let run = parse_run_id(&run_id)?;
-                let payload = cmd::run::parse_payload(&payload).map_err(CliError::error)?;
+                // Exactly one source: clap's `payload_src` group makes that a parse error,
+                // so the `unwrap_or_default` below is unreachable rather than a silent
+                // empty payload.
+                let raw = match (payload, payload_file) {
+                    (Some(inline), _) => inline,
+                    (None, Some(path)) => std::fs::read_to_string(&path).map_err(|e| {
+                        // The PATH is echoed (an operator typo is the whole point of this
+                        // message) but never anything read from it.
+                        CliError::error(format!(
+                            "--payload-file {}: {e}. The file holds the decision as JSON, \
+                             e.g. {{\"decision\":\"approved\"}}.",
+                            path.display()
+                        ))
+                    })?,
+                    (None, None) => String::new(),
+                };
+                let payload = cmd::run::parse_payload(raw.trim()).map_err(CliError::error)?;
                 // LIGHT tier: delivering a decision needs the scheduler store and the
                 // journal, nothing else. An operator must be able to answer a waiting run
                 // from a box with no gateway config and no model credentials.
