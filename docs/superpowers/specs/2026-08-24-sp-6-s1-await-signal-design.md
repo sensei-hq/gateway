@@ -51,7 +51,7 @@ decision. That gap is this slice.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Addressing | **By node id** | Already path-qualified and unique (`{map}/{i}`, `{loop}/{i}/…`), so a Map child awaiting its own signal is unambiguous. A business key is deferred until an external system needs to address a node without knowing its path. |
+| Addressing | **By node id** | Already path-qualified and unique (`{loop}/{i}/…`, `Subgraph`'s `{node}/…`), so a gate nested inside a loop iteration or a subgraph is unambiguous. (**Not** `{map}/{i}` — `MapBody` is `ModelCall`/`Agent` only, so a Map child can never *be* an `AwaitSignal`.) `validate_dag` reserves `/` in author-supplied ids, so no authored id can alias a generated path. A business key is deferred until an external system needs to address a node without knowing its path. |
 | Timeout | **Optional deadline that FAILS the node** | Composes with the durable scheduler (`resume_after: Some`). A default-payload-on-timeout was rejected: a gate that silently self-approves is exactly the footgun this codebase's fail-closed stance argues against. |
 | Duplicate signal | **Last wins, reported honestly** | Lets an operator correct a mistaken decision before the run resumes. Once the node has completed it is folded complete and never re-executes, so a later signal changes nothing — and `torii` must say so rather than implying it landed. |
 | Payload secrets | **Redacted at production** | §6.4. |
@@ -92,10 +92,11 @@ field is not node-keyed and a run pauses for many unrelated reasons over its lif
 This is the same failure shape as SP-DATA-5's frozen `Fold::default()` spend, and it is called out
 here because that one survived five tasks and their reviews before an e2e caught it.
 
-### 6.2 The node is a three-way fold read
+### 6.2 The node is a fold read, terminal check FIRST
 
 | Fold state | Behaviour |
 |---|---|
+| **a `NodeFailed` is folded for this node** | **`Failed` — checked FIRST, unconditionally, before the signal is read** |
 | signal present | `Completed(payload)` — never re-asks |
 | no signal, no deadline recorded | journal `SignalAwaited`, `Paused { resume_after: deadline }` |
 | no signal, deadline recorded, `now >= deadline` | `NodeFailed` — the timeout fired, loudly |
@@ -103,6 +104,19 @@ here because that one survived five tasks and their reviews before an e2e caught
 
 The last row exists only because the deadline is durable, and it is what makes `torii run wake` on an
 awaiting node behave sanely instead of silently resetting the clock.
+
+**The first row is not an optimisation — it is the §4 fail-closed rule, and this table shipped
+without it.** Without that arm an expired gate is not terminal on resume: `torii run signal`
+pre-checks and appends non-atomically, so a late `SignalReceived` landing after the deadline made the
+re-run take the signal arm and drive a run that had *terminally failed on its SLA* to `RunCompleted`
+carrying `{"decision":"approved"}` — the silent self-approval §4 explicitly rejects, reached by the
+back door. A signal is only an answer if it arrives while the gate is still asking.
+
+Narrow by construction: `fold.failed` is folded for every node but read by exactly one consumer.
+`NodeFailed` does **not** mean terminal in general — a `ModelCall`/`Agent` whose provider died
+re-attempts on the next drive, which is the documented resume contract — and `AwaitSignal` is the one
+kind whose failure is irreversible, because the thing that failed is an instant that has passed.
+`HumanGate` (s2) inherits this arm; it must not be rebuilt from the four-row read.
 
 ### 6.3 The early-signal race resolves itself
 
@@ -147,8 +161,9 @@ the existing convention rather than invent a second one.
 | Signal to a completed node | No effect; reported as not delivered |
 | Duplicate signal while paused | Last wins |
 | Deadline fires, no signal | `NodeFailed`, loud |
+| Late signal, after the deadline fired | No effect: the gate stays `Failed` (§6.2 arm 0). The row is durable and `torii` reports it unread, never `not delivered` |
 | Force-woken before the deadline | Re-pauses with the same absolute deadline |
-| `AwaitSignal` in a Map fan-out | One pause per awaiting child — the accepted shape from SP-DATA-5 §6.3a |
+| Two `AwaitSignal` gates ready in one round | One `RunPaused` each; the scheduler's `next_wake` is the **earliest** deadline of the drive, not the last one journaled |
 | No `AwaitSignal` in the graph | Byte-identical; the workspace suite stays at 1340 |
 
 **Acceptance criteria.** Each names the mutation that must break it — this project has produced nine

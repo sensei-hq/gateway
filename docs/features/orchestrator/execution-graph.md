@@ -4,18 +4,28 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-3
+spec: SP-1, SP-3, SP-6
 source: crates/orchestrator*
 ---
 
 # Execution Graph
 
-> **Status: Partial (Phase 3 · SP-1/3).** Design §10. Implemented node kinds:
+> **Status: Partial (Phase 3 · SP-1/3 · SP-6-1).** Design §10. Implemented node kinds:
 > `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`** (leaf + graph bodies +
-> gate-agent), **`Subgraph`**, **`Branch`**, and **`Expand`** (runtime
-> PlanDelta / planner-driven).
+> gate-agent), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
+> PlanDelta / planner-driven), and **`AwaitSignal`** (SP-6 s1 — the HITL primitive).
 > Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
-> scheduler are live. **`Loop`** (SP-1 loop-node
+> scheduler are live.
+>
+> **`validate_dag` rules that apply to EVERY node kind** (SP-6 s1): an
+> author-supplied node id, and any dep on one, may not contain **`/`** — that is the
+> executor's node-path separator, so an id containing one is an ALIAS for some nested
+> construct's generated id (`Subgraph("sg")`'s inner `gate` is `"sg/gate"`, and a
+> top-level node literally named `sg/gate` used to validate beside it, so ONE
+> `SignalReceived` completed both). The rule is purely syntactic, checks only what the
+> author wrote — the executor's own `{map}/{i}`, `{loop}/{i}/__gate__`,
+> `{expand}/__plan__` paths are generated after validation — and holds for runtime plans
+> too, since `plan::feasible` validates through the same function. **`Loop`** (SP-1 loop-node
 > [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)
 > + SP-3 slice 5 loops-of-graphs
 > [`../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md`](../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md)):
@@ -80,6 +90,26 @@ source: crates/orchestrator*
 >   `max_expansions`/`max_nodes`/`max_depth` caps backstop self-DoS (a breach is a hard
 >   `GlobalCapExceeded`). Output = the spliced subgraph's sink map; failure/pause propagate
 >   like `Subgraph`.
+> - **`AwaitSignal { timeout: Option<Duration> }`** (SP-6 s1) — the **HITL primitive**: a
+>   node that PAUSES until an external signal arrives, with an optional deadline that
+>   **fails** it. `HumanGate` (s2) and human-as-Agent (s3) are typed wrappers over it. A
+>   three-way fold read over two node-keyed journal events (`SignalAwaited{node,deadline}`
+>   · `SignalReceived{node,payload}`, both new variants ⇒ `FORMAT_VERSION` stays 1),
+>   **preceded by a terminal check**: a folded `NodeFailed` for this node returns `Failed`
+>   unconditionally, so a signal arriving after the deadline can never resurrect an expired
+>   gate. Otherwise: *signal folded* ⇒ `Completed(payload)`, never re-asks; *nothing
+>   recorded* ⇒ journal `SignalAwaited` + pause on the deadline; *deadline recorded and
+>   `now >= deadline`* ⇒ `NodeFailed`, loud; *deadline recorded and `now < deadline`* ⇒
+>   re-pause on the **same absolute instant**. The deadline is journaled rather than
+>   recomputed because `now + timeout` per execution means every resume pushes it forward —
+>   a run force-woken every ten minutes with a one-hour timeout never expires. Signals fold
+>   **last-wins** (an operator can correct a decision) and deadlines **first-wins**
+>   (overwriting IS the never-expires bug). `validate_dag` rejects a non-positive timeout
+>   and one over **`MAX_AWAIT_SIGNAL_TIMEOUT`** (100 Julian years) — `DateTime<Utc>` stops
+>   at year 262143 while `chrono::Duration` reaches ~292 million, so an unbounded timeout
+>   PANICKED the executor on `now + timeout`; longer than a century is not a deadline, it is
+>   `None`. Operator surface: **`torii run signal <run> --node <id> (--payload | --payload-file)`**;
+>   `torii run list-paused` names every awaiting node and its deadline.
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed

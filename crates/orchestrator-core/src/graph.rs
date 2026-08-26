@@ -1057,4 +1057,53 @@ mod tests {
             NodeKind::AwaitSignal { timeout: None }
         ));
     }
+
+    /// Every node kind an author can write must be named on the feature doc that promises
+    /// to enumerate them.
+    ///
+    /// `execution-graph.md`'s first line is "Implemented node kinds: …", and every
+    /// node-kind slice before this one updated it (`Subgraph`, `Branch`, `Loop` bodies).
+    /// SP-6 s1 edited the module README row that LINKS to that page — marking the feature
+    /// "SP-1/3 · SP-6-1" with `AwaitSignal` — while leaving the page itself at eight of
+    /// nine, so the two surfaces contradicted each other and a graph author following the
+    /// link concluded HITL was not available.
+    ///
+    /// Asserted against the enum rather than against a hand-kept list, so the next node
+    /// kind cannot ship undocumented either.
+    #[test]
+    fn every_node_kind_is_named_in_the_execution_graph_feature_doc() {
+        // The variant names, read off the source of truth rather than restated.
+        let src = include_str!("graph.rs");
+        let decl = src
+            .split_once("pub enum NodeKind {")
+            .expect("the enum is declared here")
+            .1;
+        let body = decl.split_once("\n}\n").expect("the enum ends").0;
+        let variants: Vec<&str> = body
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                // A variant line is four-space-indented and starts a `Name {` or `Name(`.
+                if l.starts_with("    ") && !l.starts_with("     ") && !t.starts_with("//") {
+                    t.split(|c: char| !c.is_alphanumeric())
+                        .next()
+                        .filter(|n| n.chars().next().is_some_and(char::is_uppercase))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            variants.len() >= 9,
+            "the variant scrape broke — found {variants:?}"
+        );
+
+        let doc = include_str!("../../../docs/features/orchestrator/execution-graph.md");
+        let missing: Vec<&&str> = variants.iter().filter(|v| !doc.contains(**v)).collect();
+        assert!(
+            missing.is_empty(),
+            "node kinds implemented but absent from docs/features/orchestrator/\
+             execution-graph.md: {missing:?}"
+        );
+    }
 }
