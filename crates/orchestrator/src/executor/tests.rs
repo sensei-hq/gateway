@@ -13181,6 +13181,124 @@ mod scheduler_driver {
             RunStatus::Cancelled
         );
     }
+
+    /// A journal that is unloadable for ONE run and healthy for every other — the
+    /// `format_version` fence a rolling deploy trips, which is exactly the shape
+    /// `torii run list-paused` was fixed for in this same slice.
+    struct OneFencedJournal {
+        inner: Arc<InMemoryJournal>,
+        fenced: RunId,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionJournal for OneFencedJournal {
+        async fn append(
+            &self,
+            run: RunId,
+            event: JournalEvent,
+        ) -> Result<Seq, orchestrator_core::JournalError> {
+            self.inner.append(run, event).await
+        }
+        async fn load(
+            &self,
+            run: RunId,
+        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+            if run == self.fenced {
+                return Err(orchestrator_core::JournalError::IncompatibleFormat {
+                    run,
+                    stored: 2,
+                    expected: 1,
+                });
+            }
+            self.inner.load(run).await
+        }
+        async fn load_since(
+            &self,
+            run: RunId,
+            since: Seq,
+        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+            if run == self.fenced {
+                return Err(orchestrator_core::JournalError::IncompatibleFormat {
+                    run,
+                    stored: 2,
+                    expected: 1,
+                });
+            }
+            self.inner.load_since(run, since).await
+        }
+    }
+
+    /// One unreadable journal must not take the whole claimed batch down with it.
+    ///
+    /// `tick`'s contract (and its doc): "A STORE failure aborts loudly; a drive's own
+    /// failure is recorded (terminal), not propagated." A journal that will not load is a
+    /// DRIVE failure — before this slice `Executor::start` hit the same fenced `load`,
+    /// returned `Err`, and `record` filed the run terminal-`Failed`, so it left the due set
+    /// and the batch carried on. The pre-drive watermark this slice added propagated
+    /// instead, which turns one poisoned run into a fleet-wide stall: the run is never
+    /// recorded terminal, `claim_due` leaves its `next_wake` in the past, its stale
+    /// `waking` lease is reclaimed on every later tick, and `worker serve` exits after
+    /// `MAX_CONSECUTIVE_FAILURES`.
+    #[tokio::test]
+    async fn one_unloadable_journal_does_not_abort_the_claimed_batch() {
+        let inner = Arc::new(InMemoryJournal::new());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let healthy = RunId(uuid::Uuid::new_v4());
+        let fenced = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap());
+
+        // Two paused runs, both due. Seeded at the store level: the fault under test is on
+        // the journal read, so neither needs to have really been driven.
+        for run in [fenced, healthy] {
+            store
+                .enqueue(run, &one_node_graph(), clock.now())
+                .await
+                .unwrap();
+            store
+                .record_paused(run, Some(clock.now() + Duration::seconds(10)), "gated")
+                .await
+                .unwrap();
+        }
+
+        let journal = Arc::new(OneFencedJournal {
+            inner: inner.clone(),
+            fenced,
+        });
+        let (gw, _c) = recording_gateway().await;
+        let sched = Scheduler::new(
+            store.clone(),
+            Executor::new(Arc::new(gw), journal.clone(), "v1").with_clock(clock.clone()),
+            journal.clone(),
+            clock.clone(),
+        );
+
+        clock.set(clock.now() + Duration::seconds(100));
+        let n = sched
+            .tick()
+            .await
+            .expect("one unloadable journal must not abort the tick");
+        assert_eq!(n, 2, "both due runs were claimed");
+
+        // The poisoned run is classified, not left waking — so it leaves the due set.
+        assert_eq!(
+            store.status(fenced).await.unwrap().unwrap().status,
+            RunStatus::Failed,
+            "a run whose journal will not load is recorded terminal, exactly as a drive \
+             failure is"
+        );
+        // The healthy run behind it in the batch was still driven.
+        assert_eq!(
+            store.status(healthy).await.unwrap().unwrap().status,
+            RunStatus::Completed,
+            "the run claimed after the poisoned one must still be driven"
+        );
+        // And the poison does not come back on the next tick.
+        assert_eq!(
+            sched.tick().await.unwrap(),
+            0,
+            "neither run is re-claimed once both are terminal"
+        );
+    }
 }
 
 // ============================== SP-6 s1 AwaitSignal ============================

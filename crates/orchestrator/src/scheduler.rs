@@ -66,7 +66,17 @@ impl Scheduler {
         budget: Option<TokenBudget>,
     ) -> Result<RunOutcome, OrchestratorError> {
         self.store.enqueue(run, &graph, self.clock.now()).await?;
-        let since = self.watermark(run).await?;
+        let since = match self.watermark(run).await {
+            Ok(s) => s,
+            // The row is already enqueued, so returning here without recording would leave
+            // it durably unclassified. See `tick` for why a journal fault is a DRIVE
+            // failure and not a store one.
+            Err(e) => {
+                let outcome = Err(e);
+                self.record(run, 0, &outcome).await?;
+                return outcome;
+            }
+        };
         let outcome = self.executor.run_budgeted(run, &graph, budget).await;
         self.record(run, since, &outcome).await?;
         outcome
@@ -81,7 +91,27 @@ impl Scheduler {
             .await?;
         let n = due.len();
         for (run, graph) in due {
-            let since = self.watermark(run).await?;
+            // A journal that will not load is a DRIVE failure, not a store failure, and the
+            // distinction is the whole contract above. `?`-ing it here aborted the entire
+            // CLAIMED batch on one bad run: the run was never recorded terminal, so
+            // `claim_due` left its `next_wake` in the past and reclaimed its stale `waking`
+            // lease on every later tick — a poison pill — while every run behind it in the
+            // batch sat undriven and `worker serve` exited on `MAX_CONSECUTIVE_FAILURES`.
+            // One run whose durable `format_version` a rolling deploy had bumped therefore
+            // stalled the whole paused fleet, which is the same blast radius the same
+            // fence produced in `torii run list-paused`.
+            //
+            // Before this slice there was no pre-drive load and the drive's own `load` hit
+            // the identical error, which `record`'s `Err` arm filed terminal-`Failed`; that
+            // is the behaviour restored here. `since` is unread on the `Err` arm, so `0` is
+            // inert rather than a window claim.
+            let since = match self.watermark(run).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.record(run, 0, &Err(e)).await?;
+                    continue;
+                }
+            };
             let outcome = self.executor.start(run, &graph).await;
             self.record(run, since, &outcome).await?;
         }
