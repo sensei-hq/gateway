@@ -391,6 +391,19 @@ fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalStateA
             JournalEvent::SignalAwaited { node, deadline } => {
                 awaited.entry(node.clone()).or_insert(*deadline);
             }
+            // SP-6 s2: a gate is awaiting for LISTING purposes too, and this arm is what
+            // makes it visible at all — without it `awaiting_nodes` finds nothing for a
+            // `HumanGate` and the node never appears in `list-paused`, which is the worst
+            // available outcome: an operator cannot decide what they cannot see, and the
+            // run waits on a human who was never told. FIRST wins, exactly as for
+            // `SignalAwaited` above and for the same reason.
+            //
+            // It does NOT make a gate answerable by `run signal` — that command refuses a
+            // node with a journaled menu before it ever reaches this fold (`gate_menu`),
+            // and `signal_state` is consulted only after that refusal.
+            JournalEvent::GateAwaited { node, deadline, .. } => {
+                awaited.entry(node.clone()).or_insert(*deadline);
+            }
             JournalEvent::NodeCompleted { node } => {
                 terminal.insert(node.clone(), (*seq, SignalState::Completed));
             }
@@ -461,13 +474,40 @@ fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalState
     })
 }
 
-/// Every node in this run that is currently awaiting a signal, in node-id order so the
+/// Every node in this run that is currently awaiting a human, in node-id order so the
 /// rendering is deterministic run to run.
+///
+/// Covers BOTH waiting kinds: an `AwaitSignal` (no menu) and a `HumanGate` (its menu, so
+/// an operator can see the choices without reading the graph).
 fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
+    let menus: HashMap<NodeId, Vec<String>> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            // FIRST wins, matching both the executor's fold and `gate_menu`: the menu a
+            // human was ACTUALLY shown is the first one published, and a later
+            // `GateAwaited` must never be able to restate it.
+            JournalEvent::GateAwaited { node, options, .. } => Some((
+                node.clone(),
+                options.iter().map(|o| o.name.clone()).collect(),
+            )),
+            _ => None,
+        })
+        .fold(HashMap::new(), |mut acc, (n, m)| {
+            acc.entry(n).or_insert(m);
+            acc
+        });
+
     let mut out: Vec<render::AwaitingNode> = signal_states(events)
         .into_iter()
         .filter_map(|(node, st)| match st.state {
-            SignalState::Awaiting { deadline } => Some(render::AwaitingNode { node, deadline }),
+            SignalState::Awaiting { deadline } => {
+                let options = menus.get(&node).cloned();
+                Some(render::AwaitingNode {
+                    node,
+                    deadline,
+                    options,
+                })
+            }
             _ => None,
         })
         .collect();
@@ -1179,6 +1219,9 @@ pub async fn submit(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    // The `GateAwaited` fixtures live beside `cmd::gate`'s own tests — see that module's
+    // doc comment for why the reuse runs in both directions.
+    use crate::cmd::gate::tests::{gate_journal, release};
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::{EffectClass, EffectId, EffectOutput, Graph, NodeId, TokenUsage};
     use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
@@ -3639,6 +3682,168 @@ pub(crate) mod tests {
             !out.text.contains("gate"),
             "a completed gate must not be advertised as awaiting: {}",
             out.text
+        );
+    }
+
+    // ---- SP-6 s2 Task 8: `list-paused` shows a gate's MENU ----------------------------
+
+    /// An operator must be able to see WHAT to decide without reading the graph. The menu
+    /// comes from the journaled `GateAwaited`, so no graph load is needed.
+    #[tokio::test]
+    async fn list_paused_names_a_gates_menu() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship", "hold", "escalate"]).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.text.contains("release"), "{}", out.text);
+        for o in ["ship", "hold", "escalate"] {
+            assert!(
+                out.text.contains(o),
+                "the menu must be shown so an operator knows the choices: {}",
+                out.text
+            );
+        }
+    }
+
+    /// The two waiting kinds must be TOLD APART in the listing, not merely both listed: a
+    /// gate takes `torii run gate decide --option <name>` and refuses raw JSON, while an
+    /// `AwaitSignal` takes `torii run signal --payload` and has no menu at all. An
+    /// operator who cannot tell which is which will reach for the wrong command, and the
+    /// cross-refusals that catch that mistake are a rescue, not a substitute for saying so
+    /// here.
+    #[tokio::test]
+    async fn list_paused_distinguishes_a_gate_from_an_await_signal() {
+        let gated = RunId(uuid::Uuid::new_v4());
+        let signalled = RunId(uuid::Uuid::new_v4());
+        let s = InMemorySchedulerStore::default();
+        for run in [gated, signalled] {
+            s.enqueue(run, &empty_graph(), now()).await.unwrap();
+            s.record_paused(run, None, "waiting for a human")
+                .await
+                .unwrap();
+        }
+        // ONE journal holding both runs, as a real durable journal does.
+        let j = gate_journal(gated, &release(), None, &["ship", "hold"]).await;
+        j.append(
+            signalled,
+            JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let line = |run: RunId| {
+            out.text
+                .lines()
+                .filter(|l| l.starts_with(&run.0.to_string()))
+                .find(|l| l.contains("release") || l.contains("gate"))
+                .unwrap_or_else(|| panic!("no awaiting row for {}:\n{}", run.0, out.text))
+                .to_string()
+        };
+        let gate_row = line(gated);
+        assert!(
+            gate_row.contains("ship") && gate_row.contains("hold"),
+            "the gate's own row must carry its menu: {gate_row}"
+        );
+        let signal_row = line(signalled);
+        assert!(
+            !signal_row.contains("ship") && !signal_row.contains("hold"),
+            "an AwaitSignal has no menu and must not borrow another node's: {signal_row}"
+        );
+        assert!(
+            signal_row.contains("signal"),
+            "…and must still say what it IS waiting for: {signal_row}"
+        );
+    }
+
+    /// An option name is AUTHOR free text that reaches a line-oriented table, so it
+    /// carries exactly the hazards a pause reason does: a raw newline would forge a line
+    /// that reads as its own awaiting row — carrying a uuid an operator could paste into
+    /// `run cancel` — and an ANSI escape could rewrite what is already on screen. This is
+    /// the guard on `render::one_line` in the menu cell; without it the forged line is
+    /// real.
+    #[tokio::test]
+    async fn a_hostile_option_name_cannot_forge_an_awaiting_row_or_move_the_cursor() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let hostile = format!("ship\n{FORGED_RUN}  release  approved\u{1b}[2K");
+        let j = gate_journal(run, &release(), None, &[&hostile]).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert!(
+            !out.text.contains('\u{1b}'),
+            "a raw escape byte survived into the table: {:?}",
+            out.text
+        );
+        let forged = out
+            .text
+            .lines()
+            .filter(|l| l.trim_start().starts_with(FORGED_RUN))
+            .count();
+        assert_eq!(
+            forged, 0,
+            "a newline in an option name forged a line that reads as its own row:\n{}",
+            out.text
+        );
+    }
+
+    /// The cell is CAPPED as well as collapsed, for the same reason a node id is: an
+    /// option name is unbounded by `validate_dag` (it checks non-empty, unique and
+    /// outcome-reachable, never length), so one overlong name — or a fifty-option menu —
+    /// would wreck the alignment of every other row in the block.
+    #[tokio::test]
+    async fn an_overlong_menu_is_capped_so_it_cannot_wreck_the_block() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let long = "s".repeat(5_000);
+        let j = gate_journal(run, &release(), None, &[&long]).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let row = out
+            .text
+            .lines()
+            .find(|l| l.contains("release"))
+            .unwrap_or_else(|| panic!("no awaiting row:\n{}", out.text));
+        assert!(
+            row.chars().count() < 400,
+            "an unbounded menu wrecks the block: {} chars",
+            row.chars().count()
+        );
+        assert!(row.contains('…'), "truncation must be visible: {row}");
+    }
+
+    /// `--json` is the scripting surface, so the menu must reach it too — and, for a run
+    /// with no gate, the s1 shape must be UNCHANGED: the key is absent rather than `null`,
+    /// so a script written against s1 sees byte-identical output.
+    #[tokio::test]
+    async fn list_paused_json_carries_the_menu_and_omits_it_for_a_signal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship", "hold"]).await;
+
+        let out = list_paused(&s, &j, true).await.expect("lists");
+        let v: serde_json::Value = serde_json::from_str(&out.text)
+            .unwrap_or_else(|e| panic!("--json emitted non-JSON {:?}: {e}", out.text));
+        assert_eq!(v[0]["awaiting"][0]["node"], "release", "{v}");
+        assert_eq!(
+            v[0]["awaiting"][0]["options"],
+            serde_json::json!(["ship", "hold"]),
+            "a script must be able to read the menu without the graph: {v}"
+        );
+
+        let signal_run = RunId(uuid::Uuid::new_v4());
+        let s2 = paused_store(signal_run, None).await;
+        let j2 = awaiting_journal(signal_run, &gate(), None).await;
+        let out2 = list_paused(&s2, &j2, true).await.expect("lists");
+        let v2: serde_json::Value = serde_json::from_str(&out2.text).expect("valid json");
+        assert!(
+            v2[0]["awaiting"][0].get("options").is_none(),
+            "an AwaitSignal has no menu, and `null` would change s1's JSON shape: {v2}"
         );
     }
 
