@@ -103,6 +103,15 @@ pub enum NodeKind {
     /// ONLY by a `GateDecided` naming one of `options`; an ordinary `SignalReceived` —
     /// the `AwaitSignal` answer — does NOT complete a gate, because it carries no menu
     /// choice to resolve against `Complete`/`Fail`.
+    ///
+    /// **`actor` is ATTRIBUTION, not AUTHENTICATION** (spec §7). It is whatever string the
+    /// caller supplied (`torii run gate --as`, defaulting to `$USER`), so the output field
+    /// records who CLAIMED to decide — anyone who can reach the journal can write any
+    /// actor. It must NOT be branched on as an access control: nothing stops
+    /// `BranchCond::FieldEquals("actor", "alice")`, and the `2b-quater` exhaustiveness
+    /// check filters arms on `field == "decision"` only, so an actor-keyed arm validates
+    /// silently and would give an author a two-person sign-off they do not have. Only
+    /// `decision` is a decision.
     HumanGate {
         options: Vec<GateOption>,
         timeout: Option<chrono::Duration>,
@@ -1645,15 +1654,26 @@ mod tests {
     /// variant, and the RED the slice plan predicted never happened. A guard that passes
     /// while the thing it guards is absent is worse than no guard, because it is believed.
     ///
-    /// So this asks for one of the two shapes the page actually uses to document a kind:
+    /// So this asks for the two shapes the page actually uses to document a kind, and it
+    /// asks for them **cumulatively**:
     ///
-    /// * **Its own bullet** — a line whose HEAD is ``> - **`Name …`**`` — the form every
-    ///   kind added since `Subgraph` uses, and the only form accepted for a NEW kind.
-    ///   Matching the head, not the line, is what makes the forward reference inside
-    ///   another kind's bullet body insufficient.
-    /// * **A backticked name in the "Implemented node kinds:" paragraph**, bounded to that
-    ///   one markdown paragraph and accepted only for the kinds in `GRANDFATHERED` — the
-    ///   five that predate the bullet convention and have no bullet to find.
+    /// * **Rule 1, every variant** — a backticked name in the "Implemented node kinds:"
+    ///   paragraph, bounded to that one markdown paragraph. That paragraph is a CLOSED
+    ///   enumeration: it opens by promising to list the implemented kinds, so a kind it
+    ///   omits is a kind the page states does not exist.
+    /// * **Rule 2, additionally, every kind added since `Subgraph`** — its own bullet, a
+    ///   line whose HEAD is ``> - **`Name …`**``. Matching the head, not the line, is what
+    ///   makes the forward reference inside another kind's bullet body insufficient. The
+    ///   five kinds in `GRANDFATHERED` predate the bullet convention and have no bullet to
+    ///   find, so rule 1 alone documents them.
+    ///
+    /// **The two rules were ALTERNATIVES until SP-6 s2's review, and that is how the
+    /// enumeration went stale.** `HumanGate` shipped with a full bullet and satisfied the
+    /// `has_own_bullet || (grandfathered && in the enumeration)` test, so the guard stayed
+    /// green while the sentence a reader hits FIRST — "Implemented node kinds: …" — still
+    /// listed nine of ten and still carried the marker `SP-6-1`. An author reading it top
+    /// to bottom concluded the kind did not exist, which is the exact failure the guard was
+    /// written for, one paragraph away from where it was found.
     ///
     /// Neither shape is reachable from prose, which is the whole point: `Tool` is the
     /// standing proof that a mention on this page is not a promise about the code.
@@ -1727,13 +1747,29 @@ mod tests {
             })
         };
 
+        // RULE 1, and it applies to EVERY variant including the ones with a bullet. The
+        // paragraph promises to enumerate the implemented kinds, so an omission is not a
+        // gap in the docs — it is the page stating the kind does not exist.
+        let unlisted: Vec<&str> = variants
+            .iter()
+            .copied()
+            .filter(|v| !status.contains(&format!("`{v}`")))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "node kinds implemented but MISSING FROM THE ENUMERATION in \
+             docs/features/orchestrator/execution-graph.md: {unlisted:?} — the \
+             \"Implemented node kinds:\" paragraph is a CLOSED list and must name every \
+             variant backticked (a bullet further down does not excuse the omission; see \
+             this test's doc comment)"
+        );
+
+        // RULE 2, ADDITIONAL to rule 1 rather than an alternative to it: every kind added
+        // since `Subgraph` also owns a bullet that says what it DOES.
         let undocumented: Vec<&str> = variants
             .iter()
             .copied()
-            .filter(|&v| {
-                !has_own_bullet(v)
-                    && !(GRANDFATHERED.contains(&v) && status.contains(&format!("`{v}`")))
-            })
+            .filter(|&v| !GRANDFATHERED.contains(&v) && !has_own_bullet(v))
             .collect();
         assert!(
             undocumented.is_empty(),

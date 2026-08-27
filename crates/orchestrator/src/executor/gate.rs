@@ -22,7 +22,7 @@ impl Executor {
     /// |---|---|
     /// | failure recorded | `Failed` — shared arm 0, checked FIRST |
     /// | not yet asking | journal `GateAwaited`, then continue below |
-    /// | asking, deadline passed | `NodeFailed` — the timeout, before any answer is read |
+    /// | asking, deadline passed (whatever was decided) | `NodeFailed` — the timeout, before any answer is read |
     /// | decided, option in the menu, `Complete` | `Completed({decision,actor,note})` |
     /// | decided, option in the menu, `Fail` | `NodeFailed`, naming who and why |
     /// | decided, option NOT in the menu | `NodeFailed`, loudly |
@@ -123,15 +123,31 @@ impl Executor {
             // gate decide` pre-checks the deadline too — against the journaled instant,
             // with the same `now >= d` boundary — but non-atomically, so it narrows the
             // window and never closes it. This arm remains the authority.) A default
-            // "approved" payload
-            // on timeout was deliberately rejected (§4): a gate that approves itself is
-            // the footgun this codebase's fail-closed stance argues against.
+            // "approved" payload on timeout was deliberately rejected (§4): a gate that
+            // approves itself is the footgun this codebase's fail-closed stance argues
+            // against.
+            //
+            // **The message names the DEADLINE, never "no decision"** — this arm has not
+            // read the fold and so cannot know whether one exists. `AwaitSignal`'s "no
+            // signal … by {d}" is accurate for the opposite reason: it reads its answer
+            // BEFORE it checks expiry, so reaching its expiry proves the absence. Here the
+            // ordering is reversed (that is what closes the self-approval-after-expiry
+            // hole), and its accepted cost is that a decision delivered inside the SLA is
+            // discarded if no drive folds it before the deadline. Telling THAT operator
+            // "no decision" — the wording this arm shipped with — would send them hunting
+            // a delivery bug that does not exist, in a durable message `torii run status`
+            // renders and every later drive re-emits from the fold.
             Ok(WaitState::Expired(d)) => {
                 return self
                     .fail_gate(
                         run,
                         node,
-                        format!("human_gate: no decision for node {} by {d}", node.id.0),
+                        format!(
+                            "human_gate: node {} passed its deadline {d}; the gate fails on \
+                             the deadline BEFORE any decision is read, so a decision that \
+                             had already landed does not approve it",
+                            node.id.0
+                        ),
                     )
                     .await;
             }
