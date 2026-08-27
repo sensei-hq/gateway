@@ -161,6 +161,14 @@ pub async fn decide(
     // into downstream nodes and model prompts. Double-scrubbing is a non-issue —
     // `[REDACTED]` matches no credential shape, so the pass is idempotent.
     //
+    // "The same pass" is literal, not approximate, and it is worth stating WHY rather than
+    // assuming it: `Executor`'s redactor is opt-in and defaults to `None`, so the two
+    // agree only because `boot::heavy` wires `PatternRedactor::default()` — the very
+    // redactor `render::redact_payload` holds. The determinism argument does not actually
+    // DEPEND on that (this scrub happens before the write, so every reader folds the same
+    // journaled bytes either way); what depends on it is the claim that a note torii wrote
+    // is byte-identical to one the executor would have produced from the raw text.
+    //
     // The non-string arm is fail-CLOSED, unlike the executor's `redact_text` (which keeps
     // the original message). `Redactor::redact(&Value) -> Value` promises nothing about
     // preserving the variant, and only `PatternRedactor` happens to map a string to a
