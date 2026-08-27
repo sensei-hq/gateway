@@ -38,10 +38,13 @@ impl Executor {
     /// just published: the early decision is still honoured in the same execution, and
     /// there is never a decision without a menu.
     ///
-    /// **Validation is enforced HERE even though the CLI already checks.** `torii`'s
-    /// check is non-atomic (it pre-checks, then appends) and the library entry point
-    /// bypasses it entirely, so the CLI can report honestly but cannot stop the row
-    /// existing. Same conclusion s1 reached for the terminal guard.
+    /// **Validation is enforced HERE, and it is the ONLY layer that enforces it today.**
+    /// `torii run gate decide` does not exist yet — Task 7 adds it, and it WILL pre-check
+    /// the option against the journaled menu. That will make an undeclared option rare;
+    /// it will not make this check redundant, because the CLI's pre-check and its append
+    /// are not atomic and the library entry point bypasses the CLI entirely, so it can
+    /// report honestly but cannot stop the row existing. Same conclusion s1 reached for
+    /// the terminal guard. Until Task 7 lands there is no first layer at all.
     ///
     /// **The `options` parameter is used for the very first ask and NOWHERE else.** Every
     /// later drive resolves the decision against `fold.menu_for`, so an author editing the
@@ -117,8 +120,9 @@ impl Executor {
             }
             // The recorded deadline has passed ⇒ FAIL, loudly, naming the node and the
             // instant — and BEFORE any decision is read, so a decision appended after the
-            // deadline (which `torii`'s non-atomic pre-check cannot prevent) can never
-            // approve a gate whose SLA had in fact run out. A default "approved" payload
+            // deadline can never approve a gate whose SLA had in fact run out. (Task 7's
+            // CLI will pre-check the deadline too, but non-atomically, so it will narrow
+            // the window and never close it.) A default "approved" payload
             // on timeout was deliberately rejected (§4): a gate that approves itself is
             // the footgun this codebase's fail-closed stance argues against.
             Ok(WaitState::Expired(d)) => {
@@ -179,36 +183,38 @@ impl Executor {
                     .await;
             };
 
-            // SP-4 s2 (§6.4): redact ONCE and hand that one value to BOTH the node's
-            // return AND — via `apply_node_result` → `publish_context` — the durable
-            // blackboard write. Deriving both from a single application is the determinism
-            // rule: live == journaled == replayed. Redacting on only one of the two paths
-            // makes a live run and a replayed run disagree about this node's output, which
-            // surfaces later as a false `DeterminismViolation`; that exact defect has been
-            // shipped and caught twice in this codebase already. `note` is operator free
-            // text and becomes this node's output, flowing into downstream nodes and model
-            // prompts — it is not merely displayed.
-            let output = self.redact(&serde_json::json!({
-                "decision": decision.option,
-                "actor": decision.actor,
-                "note": decision.note,
-            }));
-
             return match chosen.outcome {
-                GateOutcome::Complete => Ok(NodeExec::Completed(output)),
+                // SP-4 s2 (§6.4): redact ONCE and hand that one value to BOTH the node's
+                // return AND — via `apply_node_result` → `publish_context` — the durable
+                // blackboard write. Deriving both from a single application is the
+                // determinism rule: live == journaled == replayed. Redacting on only one
+                // of the two paths makes a live run and a replayed run disagree about this
+                // node's output, which surfaces later as a false `DeterminismViolation`;
+                // that exact defect has been shipped and caught twice in this codebase
+                // already. `note` is operator free text and becomes this node's output,
+                // flowing into downstream nodes and model prompts — it is not merely
+                // displayed. Guarded by
+                // `a_decision_is_redacted_before_both_the_return_and_the_durable_write`.
+                //
+                // Built INSIDE this arm: the `Fail` arm below never reads it, so hoisting
+                // it made every rejection pay a full regex scan for a value it discards.
+                GateOutcome::Complete => Ok(NodeExec::Completed(self.redact(&serde_json::json!({
+                    "decision": decision.option,
+                    "actor": decision.actor,
+                    "note": decision.note,
+                })))),
                 GateOutcome::Fail => {
                     // WHO and WHY, both named: a rejection whose cause is unrecorded is
                     // useless in ops, and this text is what `torii run status` renders.
-                    // Redacted for the same reason the output is — the note is free text
-                    // and this message reaches the journal — but redacted SEPARATELY,
-                    // because a secret split across the template's boundaries is a
-                    // different string from the one in the output object.
+                    // The note is operator free text, so it is a leak surface — but the
+                    // scrub lives in `fail_gate`, not here, so that no failure arm can
+                    // skip it.
                     let reason = decision.note.as_deref().unwrap_or("no reason given");
                     let message = format!(
                         "human_gate: node {} rejected by {} ({}): {reason}",
                         node.id.0, decision.actor, decision.option
                     );
-                    self.fail_gate(run, node, self.redact_text(message)).await
+                    self.fail_gate(run, node, message).await
                 }
             };
         }
@@ -232,12 +238,27 @@ impl Executor {
     ///
     /// `output: None` on every one of them, and that is the AC5 property: an expired or
     /// rejected gate produces NO output, defaulted or otherwise.
+    ///
+    /// **The redaction is HERE, at the chokepoint, not at the call sites** — the same
+    /// reason SP-4 s2 put it in `model_output` rather than in each of the four producers
+    /// that feed it. Two of these messages interpolate operator-controlled text, and the
+    /// second was missed when each arm scrubbed for itself: the `note` on a `Fail` option
+    /// is free text by design, and the OPTION NAME on the undeclared path is arbitrary by
+    /// definition, since it matched nothing in the menu. That one shipped a plaintext
+    /// credential into the durable journal, into `RunOutcome.failed`, and into what
+    /// `torii run status` renders — and because `fold.failed` is read back by
+    /// `gate_precheck`, it was re-emitted on every later drive. Scrubbing once, where the
+    /// journal write happens, is what makes a future failure arm safe by construction.
+    ///
+    /// Double-scrubbing a message that was already clean is a non-issue: `[REDACTED]`
+    /// does not re-match any of the patterns.
     async fn fail_gate(
         &self,
         run: RunId,
         node: &Node,
         message: String,
     ) -> Result<NodeExec, OrchestratorError> {
+        let message = self.redact_text(message);
         self.append(
             run,
             JournalEvent::NodeFailed {
@@ -255,9 +276,18 @@ impl Executor {
     /// Run one operator-facing STRING through the configured redactor.
     ///
     /// [`Executor::redact`] is typed over `serde_json::Value`, so a bare message has to be
-    /// wrapped and unwrapped. A non-string result cannot happen (the redactor is a
-    /// value-preserving scrub) but is handled by keeping the original rather than by an
-    /// `unwrap` — this file's rule is that no arm of a node kind may panic.
+    /// wrapped and unwrapped. The non-string arm is not dead defensiveness:
+    /// `Redactor::redact(&Value) -> Value` promises nothing about preserving the variant,
+    /// and a third-party impl is free to return anything — only `PatternRedactor` happens
+    /// to map a string to a string. That property must not be ASSUMED here, and an
+    /// `unwrap` would turn a legal impl into a panic, which this file's rule forbids: a
+    /// panic in a node kind unwinds through `Scheduler::tick` and poisons the worker.
+    ///
+    /// Keeping the original message is a deliberate TRADEOFF, not a safe default: against
+    /// a redactor that changed the variant it would journal the unscrubbed text. The
+    /// alternatives are worse — panicking is forbidden, and discarding the message loses
+    /// the only record of why the run failed. A variant-changing redactor is malformed;
+    /// the shipped `PatternRedactor` is not one, so this arm is unreachable in practice.
     fn redact_text(&self, message: String) -> String {
         match self.redact(&serde_json::Value::String(message.clone())) {
             serde_json::Value::String(scrubbed) => scrubbed,
