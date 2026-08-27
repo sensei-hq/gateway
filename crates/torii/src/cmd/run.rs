@@ -520,7 +520,7 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
     out
 }
 
-/// The largest `--payload` this command will journal, in bytes of serialized JSON.
+/// The largest human answer torii will journal, in bytes of serialized JSON.
 ///
 /// §6.5: an unbounded JSON blob in a journal row is a durable footgun. The executor's own
 /// convention for "too big to sit inline in a journal row" is `split_output`'s
@@ -528,24 +528,30 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 /// reused here, because it routes over-threshold values to the `ContentStore` as an
 /// `EffectOutput::Ref`, and `SignalReceived.payload` is a bare `serde_json::Value` with
 /// no ref-or-inline alternative. Changing that shape would break the journal format and
-/// force a `FORMAT_VERSION` bump for a size cap, so the cap is enforced HERE, at the only
-/// writer, by rejecting.
+/// force a `FORMAT_VERSION` bump for a size cap, so the cap is enforced in the CLI, at
+/// every writer, by rejecting.
+///
+/// **Writers, plural, since SP-6 s2.** [`signal`] bounds `SignalReceived.payload` and
+/// `cmd::gate::decide` bounds `GateDecided.note` — the same durable column, the same
+/// number, through the same [`check_payload_size`]. That is deliberate: an enforcement
+/// each writer re-derives for itself is two bounds that drift, and `decide` shipped with
+/// no bound at all while this doc said there was only one writer to have.
 ///
 /// 4 KiB is the same boundary the executor already applies to a model call's inline
-/// output, so a journal row produced by a signal can never be larger than one the
+/// output, so a journal row torii writes can never be larger than one the
 /// executor itself writes inline. **That claim holds only because of the two corrections
 /// below, each of which falsified it once — and each was found only by measuring the row
 /// rather than the argument.** The cap is checked on the REDACTED value — the one actually
 /// written, see [`Measured`] — and on a size measured the way the DURABLE backend stores
 /// it rather than the way `serde_json` writes it, see [`jsonb_number_expansion`]. It is
-/// also far beyond any real use: a signal is a human DECISION
+/// also far beyond any real use: both are a human DECISION
 /// (`{"decision":"approved","note":"…"}`), not a data channel, and 4 KiB is roughly 600
 /// words of prose.
 ///
-/// **Carry-forward:** this bounds the CLI, not the journal. `SignalReceived` remains
-/// uncapped for any future writer (a webhook/HTTP delivery path, §8's deferred
-/// non-CLI delivery). A durable-side cap needs the payload to become ref-or-inline, which
-/// is a format break.
+/// **Carry-forward:** this bounds the CLI, not the journal. `SignalReceived` and
+/// `GateDecided` remain uncapped for any future writer (a webhook/HTTP delivery path,
+/// §8's deferred non-CLI delivery). A durable-side cap needs the payload to become
+/// ref-or-inline, which is a format break.
 pub const MAX_PAYLOAD_BYTES: usize = 4096;
 
 /// WHICH size [`check_payload_size`] is measuring — because redaction sits between the
@@ -556,7 +562,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 4096;
 /// payload journals a 5312-byte row. Checking only [`AsGiven`](Measured::AsGiven) let that
 /// through, which falsified the "never larger than an inline executor row" claim above.
 #[derive(Clone, Copy)]
-enum Measured {
+pub(crate) enum Measured {
     /// The payload exactly as the operator supplied it. Checked FIRST, and by
     /// [`parse_payload`] before any connection is opened, so the redactor is never handed
     /// an unbounded blob.
@@ -603,7 +609,22 @@ fn jsonb_number_expansion(value: &serde_json::Value) -> usize {
 
 /// Refuse an over-limit payload, naming BOTH the limit and the actual size — an operator
 /// who pasted a file needs to know how much to cut, not just that they were over.
-fn check_payload_size(payload: &serde_json::Value, measured: Measured) -> Result<(), String> {
+///
+/// `what` NAMES the offending input (`--payload`, `--note`), because there is now more
+/// than one writer to the durable column this bounds: `cmd::gate::decide` journals a
+/// decision note through the same cap. Telling a `gate decide --note` operator to shorten
+/// their `--payload` would send them to a flag that command does not have. `pub(crate)`
+/// for the same reason — the bound is reused, never re-derived, so the two writers cannot
+/// drift on the number OR on how it is measured (wire bytes plus
+/// [`jsonb_number_expansion`]).
+///
+/// The value itself is NEVER echoed, only its size: this is the one input an operator
+/// might paste a credential into, and stderr reaches journald and CI logs.
+pub(crate) fn check_payload_size(
+    payload: &serde_json::Value,
+    measured: Measured,
+    what: &str,
+) -> Result<(), String> {
     // `to_vec` (not `to_string().len()`) so the number is bytes on the wire, PLUS what the
     // backend's own normalisation adds on top — see `jsonb_number_expansion`. Measuring
     // only the wire form bounded a value nobody durably stores.
@@ -616,30 +637,29 @@ fn check_payload_size(payload: &serde_json::Value, measured: Measured) -> Result
         // assume the tool is broken. Both growth causes are named because either one can
         // be the whole difference — redaction inflates by ~1.67x, the backend's numeric
         // normalisation by up to ~50x.
-        let mut what = String::new();
+        let mut growth = String::new();
         if matches!(measured, Measured::AfterRedaction) {
-            what.push_str(
+            growth.push_str(
                 " once redacted (secret-shaped text is replaced by the longer literal \
                  `[REDACTED]` before the row is written)",
             );
         }
         if expansion > 0 {
-            let joiner = if what.is_empty() { "" } else { " and" };
-            what.push_str(&format!(
+            let joiner = if growth.is_empty() { "" } else { " and" };
+            growth.push_str(&format!(
                 "{joiner} once stored (the journal column is `jsonb`, which normalises \
                  every JSON number to `numeric` — that expands this payload by \
                  {expansion} bytes)"
             ));
         }
-        if !what.is_empty() {
-            what.push_str(", so the durable row is bigger than what you sent");
+        if !growth.is_empty() {
+            growth.push_str(", so the durable row is bigger than what you sent");
         }
         return Err(format!(
-            "--payload is {size} bytes{what}, over the {MAX_PAYLOAD_BYTES}-byte limit. A \
-             signal is a human DECISION, not a data channel — it is journaled durably and \
-             folded into the node's output on every resume. Put the bulk somewhere the \
-             graph can read (a workspace file, the blackboard) and signal a reference to \
-             it."
+            "{what} is {size} bytes{growth}, over the {MAX_PAYLOAD_BYTES}-byte limit. This \
+             is a human DECISION, not a data channel — it is journaled durably and folded \
+             into the node's output on every resume. Put the bulk somewhere the graph can \
+             read (a workspace file, the blackboard) and reference it here."
         ));
     }
     Ok(())
@@ -679,7 +699,7 @@ pub fn parse_payload(s: &str) -> Result<serde_json::Value, String> {
              channel and an operator may have pasted one here."
         )
     })?;
-    check_payload_size(&v, Measured::AsGiven)?;
+    check_payload_size(&v, Measured::AsGiven, "--payload")?;
     Ok(v)
 }
 
@@ -747,9 +767,9 @@ pub async fn signal(
     // bytes; the SAME pure pass the executor applies on the fold-read, so this stays
     // idempotent (`[REDACTED]` matches no credential shape) and live == journaled ==
     // replayed (§6.4).
-    check_payload_size(&payload, Measured::AsGiven).map_err(CliError::error)?;
+    check_payload_size(&payload, Measured::AsGiven, "--payload").map_err(CliError::error)?;
     let payload = render::redact_payload(&payload);
-    check_payload_size(&payload, Measured::AfterRedaction).map_err(CliError::error)?;
+    check_payload_size(&payload, Measured::AfterRedaction, "--payload").map_err(CliError::error)?;
 
     // A node id is operator-supplied free text on this path, and every message below
     // echoes it back to a terminal. `one_line` collapses control characters (Unicode Cc,
@@ -3935,7 +3955,7 @@ pub(crate) mod tests {
     }
 
     /// A uuid an operator could paste into `run cancel` if a forged line read as a row.
-    const FORGED_RUN: &str = "deadbeef-dead-beef-dead-beefdeadbeef";
+    pub(crate) const FORGED_RUN: &str = "deadbeef-dead-beef-dead-beefdeadbeef";
 
     /// Two paused runs, one of which cannot be folded, plus a shared journal in which the
     /// HEALTHY one has a node awaiting a signal.

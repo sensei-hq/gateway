@@ -187,7 +187,7 @@ fn safe_reason(s: &str) -> String {
 /// the placeholder was already replaced before this function ever sees it — but a
 /// straddled cut renders a confusing shard like `[REDA…` in scrollback, which reads
 /// as a truncated SECRET rather than a truncated placeholder.
-fn cap_chars(s: &str, max: usize) -> String {
+pub(crate) fn cap_chars(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         return s.to_string();
@@ -267,7 +267,11 @@ const NODE_MAX: usize = 80;
 /// otherwise wreck the alignment of every other row in this block. Wider than a node id
 /// because it holds several names joined together, and still well under the 300 a pause
 /// reason is allowed.
-const MENU_MAX: usize = 160;
+///
+/// `pub(crate)` because [`crate::cmd::gate::decide`] recites the SAME journaled option
+/// names when it refuses an undeclared one, and had no cap at all — one bound for one
+/// class of value, not two that can drift.
+pub(crate) const MENU_MAX: usize = 160;
 
 /// One run's awaiting set — or, when that run's journal could not be folded, the reason.
 ///
