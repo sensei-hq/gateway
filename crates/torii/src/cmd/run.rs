@@ -467,7 +467,12 @@ pub fn signal_state(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStat
 
 /// One node's [`SignalState`] **with** the seq that established it — what `signal`'s
 /// post-write report needs; see [`SignalStateAt`].
-fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStateAt {
+///
+/// `pub(crate)` for `cmd::gate::decide`, whose post-append arm has the identical question
+/// to answer and must not answer it with a second fold: was our row READ by the drive that
+/// terminated the node, or ORPHANED behind it? Only the journal ORDER can tell those apart,
+/// and only this function reports it.
+pub(crate) fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStateAt {
     signal_states(events).remove(node).unwrap_or(SignalStateAt {
         state: SignalState::NotAwaiting,
         at: None,
@@ -2364,7 +2369,12 @@ pub(crate) mod tests {
     /// The blackboard publish an executor writes when a node COMPLETES
     /// (`publish_context`, keyed by node id) — the durable, node-keyed marker torii reads
     /// to tell a completed `AwaitSignal` node from one still awaiting.
-    async fn append_completion(j: &InMemoryJournal, run: RunId, node: &NodeId) {
+    /// The durable marker that a waiting node COMPLETED — the blackboard publish every
+    /// completed node makes, since neither an `AwaitSignal` nor a `HumanGate` journals a
+    /// `NodeCompleted`. `pub(crate)` so `cmd::gate`'s racing test models a drive exactly as
+    /// this module's does; two hand-rolled `ContextWrite` shapes would be two places for
+    /// the completion marker `signal_states` reads to drift.
+    pub(crate) async fn append_completion(j: &InMemoryJournal, run: RunId, node: &NodeId) {
         j.append(
             run,
             JournalEvent::ContextWrite {
