@@ -135,13 +135,25 @@ s1's `run_await_signal` is six arms and the review found defects in two of them.
 
 | piece | shared | what |
 |---|---|---|
-| `gate_precheck` | **yes** | arm 0 — a folded `NodeFailed` ⇒ stays failed, checked before any answer is read |
+| `gate_precheck` | **yes** | arm 0 — a folded `NodeFailed` ⇒ stays failed, checked before anything else |
+| `wait_or_expire` | **yes** | arms 2–4 — read-or-journal the absolute deadline, expire loudly, else carry the recorded instant |
 | answer-read | per-kind | `signal_for` vs `gate_decision_for` + option→outcome mapping |
-| `wait_or_expire` | **yes** | arms 2–4 — read-or-journal the deadline, expire loudly, else re-pause on the same instant |
 
 The two bug-prone parts — the fail-closed terminal guard and the deadline durability — exist **once**.
-`wait_or_expire` is parameterised by the awaiting-event constructor so `AwaitSignal` journals
-`SignalAwaited` and `HumanGate` journals `GateAwaited`.
+`wait_or_expire` REPORTS a `WaitState` and leaves the append to its caller rather than taking an
+event constructor, because the awaiting event is the one genuinely per-kind write (`SignalAwaited`
+vs `GateAwaited`, the latter also carrying the menu).
+
+**Those rows are in `run_human_gate`'s execution order, and where the answer-read sits is the one
+thing the two kinds do differently.** `run_human_gate` reads its decision **last**, after
+`wait_or_expire` has had its chance to return `Expired`, so a decision can never approve a gate whose
+recorded deadline has passed — whichever order the two rows landed on the journal.
+`run_await_signal` reads its signal **second**, between the precheck and `wait_or_expire`, so a
+folded signal completes the node even if the deadline has since passed, provided no earlier drive had
+already expired it (once one has, `gate_precheck` makes it terminal for both kinds). s2 takes the
+stricter order deliberately: a gate whose SLA ran out must not be approvable, and the typed command
+is able to say "too late" up front — `torii run gate decide` pre-checks the same journaled instant
+with the same `now >= d` boundary, where `torii run signal` has no deadline pre-check at all.
 
 ### 6.2 The fold read
 
@@ -149,11 +161,22 @@ The two bug-prone parts — the fail-closed terminal guard and the deadline dura
 |---|---|
 | failure recorded | `Failed` — arm 0, shared, checked **first** |
 | **no menu journaled yet** | **journal `GateAwaited` FIRST, then continue to the rows below** |
+| **deadline passed (whatever was decided)** | `NodeFailed` — the timeout, **before any decision is read** |
 | decided, option in the journaled menu, `Complete` | `Completed({decision, actor, note})` |
-| decided, option in the journaled menu, `Fail` | `NodeFailed("gate <id>: rejected by <actor>: <reason>")` |
+| decided, option in the journaled menu, `Fail` | `NodeFailed("human_gate: node <id> rejected by <actor> (<option>): <reason>")` |
 | decided, option **not** in the journaled menu | `NodeFailed`, loudly — §6.3 |
-| no decision, deadline passed | `NodeFailed` — the timeout, unchanged from s1 |
-| no decision, deadline not passed | re-pause on the **same** absolute instant |
+| not decided, deadline not passed | re-pause on the **same** absolute instant |
+
+**The accepted cost of that row order, stated rather than buried.** A decision delivered *inside* the
+SLA is DISCARDED if no drive folds it before the deadline: the gate fails on the deadline having
+never looked at the fold. The window is not zero — `torii run gate decide` appends and then
+`force_wake`s, so it is however long a worker takes to claim that wake. Buying the window back means
+reading the decision first, as `run_await_signal` does, and that is exactly the
+self-approval-after-expiry hole s1's whole-slice review closed; fail-closed wins. Note that the
+failure text says the **deadline** passed and NOT "no decision" — the wording this arm shipped with
+said the latter, which is factually false in precisely this case (a decision does exist) and would
+send an operator hunting a delivery bug that does not exist, in a durable message `torii run status`
+renders and every later drive re-emits. Corrected in `executor/gate.rs`.
 
 **The ask always happens before the answer is read, and that ordering is load-bearing.** s1's
 early-signal race "resolves itself for free" because a signal delivered before the node first ran is
@@ -277,13 +300,23 @@ the line they appeared to, and every one was caught by asking that question.
 **Placement.** `graph.rs` for AC1/AC6 · `executor/tests.rs` for AC2–AC5, AC11, AC14 · `cmd/run.rs` +
 `tests/cli.rs` for AC7/AC8/AC10 · `redact.rs` + executor for AC9 · `e2e_pg.rs` for AC12.
 
-**AC12 is dev/CI-gated.** It requires Docker Postgres and is `#[ignore]`d without `DATABASE_URL`, so
-it does **not** run in the default suite. Stated because s1's review flagged exactly this pattern —
-an acceptance criterion covered only by a test that does not normally run.
+**AC12 is dev/CI-gated, and the mechanism is WEAKER than `#[ignore]` — worth stating precisely,
+because an earlier revision of this paragraph named a mechanism that does not exist.** It requires
+Docker Postgres. There is no `#[ignore]` anywhere in `crates/torii` (`rg '#\[ignore' crates/torii`
+returns nothing), and there could not be: `#[ignore]` is a compile-time attribute and cannot be
+conditioned on an environment variable. What the test actually does is call `db_url()`, which returns
+`None` when `DATABASE_URL` is unset or blank, and **return early**. So AC12 is `DATABASE_URL`-guarded
+and is **counted among the PASSING tests while having exercised nothing** — the green total says
+nothing about whether it ran. The only signal that it skipped is a `SKIP <test name>: DATABASE_URL
+not set` line written to the RAW stderr (deliberately not `eprintln!`, which libtest captures and
+discards for a passing test). Stated because s1's review flagged exactly this pattern — an acceptance
+criterion covered only by a test that does not normally run — and a pass that proves nothing is the
+sharper version of it.
 
 **AC13's 1427 is measured**, from `env -u DATABASE_URL cargo test --workspace` at
 `103ef28` — not carried forward from a previous slice's spec. s1's spec recorded a baseline that was
-wrong by 77 tests, and the next slice would have inherited it.
+wrong by 77 tests, and the next slice would have inherited it. **Landed: 1497 passed / 0 failed /
+7 ignored, exit 0** — measured the same way, on the branch tip, and the baseline s3 must not regress.
 
 ## 10. Deferred / carry-forward
 
