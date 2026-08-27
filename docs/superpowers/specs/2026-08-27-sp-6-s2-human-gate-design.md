@@ -108,9 +108,15 @@ through the SP-4 s2 redactor at the fold-read, exactly as s1's payload does.
 **Journal (both new variants; `FORMAT_VERSION` stays 1):**
 
 ```rust
-GateAwaited  { node: NodeId, deadline: Option<DateTime<Utc>>, options: Vec<String> }
+GateAwaited  { node: NodeId, deadline: Option<DateTime<Utc>>, options: Vec<GateOption> }
 GateDecided  { node: NodeId, option: String, actor: String, note: Option<String> }
 ```
+
+`GateAwaited` carries the full `GateOption`s, **not just their names**. Writing AC1's test
+surfaced why: with names alone, the executor could check *membership* against the journaled menu but
+would still have to read the **outcome** from the graph — so an author flipping `reject` from `Fail`
+to `Complete` after a human rejected would silently change what their recorded answer meant. The
+outcome the human was shown ("reject stops the run") is as much a part of the offer as the name.
 
 `GateAwaited` replaces `SignalAwaited` for this node kind and carries the durable menu. `Fold` gains
 `gate_decisions: HashMap<NodeId, GateDecision>`, folded **last-wins** like signals so an operator can
