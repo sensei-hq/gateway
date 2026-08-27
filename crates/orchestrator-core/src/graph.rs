@@ -109,6 +109,41 @@ pub enum NodeKind {
 ///   is the never-auto-woken class and the accurate way to say "no deadline".
 pub const MAX_AWAIT_SIGNAL_TIMEOUT: chrono::Duration = chrono::Duration::days(36_525);
 
+/// One choice a [`NodeKind::HumanGate`] offers, and what picking it does to the run.
+///
+/// Not to be confused with [`GateSpec`]/[`LoopGate`] — those name a `Loop`'s stop
+/// predicate (continue vs. halt the iteration); this `Gate` is the unrelated HITL
+/// sense, a human picking one of a named menu.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateOption {
+    /// What the operator types: `torii run gate decide … --option <name>`.
+    pub name: String,
+    pub outcome: GateOutcome,
+}
+
+/// What choosing a [`GateOption`] does to the run.
+///
+/// Per-option rather than a fixed approve/reject pair, so a three-way gate
+/// (`ship | hold | escalate`) needs no special case — and deliberately reusing the
+/// EXISTING terminal machinery, so this slice needs no new `RunStatus`, no
+/// `SchedulerStore` change and no dbd migration.
+///
+/// **Accepted cost:** a `Fail` option and a dead provider both surface as the SAME
+/// `RunStatus::Failed` — indistinguishable BY STATUS, distinguishable only by the reason
+/// text `torii run status` renders. Neither one ever appears in `torii run list-paused`
+/// (both are terminal, and that command filters on `status == Paused`); the cost falls
+/// on anything else that filters on status alone — a script, or the terminal allowlist
+/// `count_terminal_before`/`prune_terminal` use to decide what a retention sweep may
+/// delete. A distinct `Rejected` status would be more truthful but reaches both store
+/// impls, the dbd CHECK constraint and torii's rendering — deferred, not overlooked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateOutcome {
+    /// The decision becomes this node's output; dependents run.
+    Complete,
+    /// `NodeFailed`; hard-edge dependents cascade-skip.
+    Fail,
+}
+
 /// How an `Expand` node's plan is produced (SP-3 slice 4A). `Injected` = the
 /// slice-3 `Planner` trait (deterministic/test); `Agent` = a journaled ReAct
 /// planner agent (this slice). Slice 4B adds `Select` (goal-based selection).

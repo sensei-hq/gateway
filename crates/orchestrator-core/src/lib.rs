@@ -28,8 +28,8 @@ pub use credential::{CredentialBroker, Secret};
 pub use effect::{EffectClass, EffectId, effect_id};
 pub use error::{JournalError, OrchestratorError};
 pub use graph::{
-    Aggregation, BranchCond, Dep, EdgeKind, GateSpec, Graph, LoopBody, LoopGate, MapBody, Node,
-    NodeKind, PlannerRef,
+    Aggregation, BranchCond, Dep, EdgeKind, GateOption, GateOutcome, GateSpec, Graph, LoopBody,
+    LoopGate, MapBody, Node, NodeKind, PlannerRef,
 };
 pub use hooks::OrchestratorHooks;
 pub use ids::{NodeId, RunId, Seq};
