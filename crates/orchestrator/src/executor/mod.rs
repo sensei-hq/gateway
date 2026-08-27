@@ -6,17 +6,24 @@ use std::sync::Arc;
 
 use gateway::Gateway;
 use orchestrator_core::{
-    Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId, EffectOutput,
-    ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta, OrchestratorError,
-    OrchestratorHooks, Registry, RegistryHandle, RunId, Scope, Seq, SystemClock, effect_id,
+    AgentRef, Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId,
+    EffectOutput, ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta,
+    OrchestratorError, OrchestratorHooks, PLANNER_AREA, Planner, PlannerSelector, Registry,
+    RegistryHandle, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
 
 mod agent;
+mod branch;
 mod content;
+mod dispatch;
 mod durability;
+mod expand;
 mod fanout;
+pub(crate) mod selector;
+mod signal;
+mod subgraph;
 mod support;
 use support::{
     GatewayDisposition, build_request, classify_gateway_error, consolidate_compaction_target,
@@ -32,6 +39,8 @@ pub struct Executor {
     registry: Arc<Registry>,
     tools: Arc<ToolRegistry>,
     max_steps: usize,
+    /// Max nesting depth (Subgraph levels; SP-3 self-DoS backstop). Default 8.
+    max_depth: usize,
     concurrency: usize,
     /// The content-addressed store (§7.4) an over-threshold effect output is
     /// split into. `None` (the default) means no CAS is wired, so every output
@@ -39,6 +48,23 @@ pub struct Executor {
     /// via [`with_content_store`](Self::with_content_store) to enable the split —
     /// shared across the crash/resume boundary so a resume reads blobs back.
     content: Option<Arc<dyn ContentStore>>,
+    /// An optional secret [`Redactor`](orchestrator_core::Redactor) (SP-4 s2) applied
+    /// to every effect output at the two LEAF sites BEFORE it is journaled or fed back
+    /// to the agent. `None` (the default) ⇒ outputs pass through verbatim (the slice-1
+    /// behavior, byte-identical). Pure ⇒ live == journaled == replayed, so a resume
+    /// reproduces the scrub exactly (no determinism drift).
+    redactor: Option<Arc<dyn orchestrator_core::Redactor>>,
+    /// An optional [`CredentialBroker`](orchestrator_core::CredentialBroker) (SP-4) the
+    /// executor resolves a tool's declared credential refs against, injecting the secrets
+    /// into the per-call `ToolContext` (Task 3). `None` (the default) ⇒ no credentials are
+    /// resolved — inert until wired.
+    credential_broker: Option<Arc<dyn orchestrator_core::CredentialBroker>>,
+    /// SP-4 s3: base dir for the per-run workspace jail (`base/<run_id>/`). `None` ⇒ no fs
+    /// tools / byte-identical. Set via [`with_workspace_root`](Self::with_workspace_root).
+    workspace_root_base: Option<std::path::PathBuf>,
+    /// SP-4 s4: the injected OS-confinement backend for the `shell` tool (default `None` ⇒
+    /// the tool refuses loud). Set via [`with_sandbox`](Self::with_sandbox).
+    sandbox: Option<Arc<dyn crate::agent::sandbox::Sandbox>>,
     /// The serialized-byte size **above which** an effect output is stored in the
     /// `ContentStore` (as a [`ContentRef`]) instead of inline. Only consulted
     /// when a `content` store is wired.
@@ -57,6 +83,20 @@ pub struct Executor {
     /// A hot-reload handle (SP-2 slice 5). When wired, each run pins the handle's
     /// current registry + config generation at entry. `None` ⇒ the fixed `registry`.
     handle: Option<RegistryHandle>,
+    /// The injected planner an `Expand` node produces its subgraph from (SP-3
+    /// slice 3). `None` ⇒ an `Expand` node fails loudly (byte-identical for graphs
+    /// without `Expand`).
+    planner: Option<Arc<dyn Planner>>,
+    /// The injected selector a `PlannerRef::Select` node uses to pick a planner agent
+    /// (slice 4B). `None` ⇒ a `Select` node fails loudly.
+    selector: Option<Arc<dyn PlannerSelector>>,
+    /// Max runtime expansions (`PlanDelta`s) per run — a self-DoS cap. Default 32.
+    max_expansions: usize,
+    /// Max cumulative spliced-node count per run — a self-DoS cap. Default 512.
+    max_nodes: usize,
+    /// Run-scoped expansion counters (seeded from the journal on resume) the caps
+    /// are checked against. Reset per run by `run_inner`/`start_inner`.
+    expansion_counters: Arc<ExpansionCounters>,
 }
 
 /// The terminal outcome of a run: the nodes that completed, the first failure,
@@ -96,9 +136,10 @@ struct Fold {
     memo: HashMap<EffectId, (String, EffectOutput)>,
     started: std::collections::HashSet<NodeId>,
     completed: std::collections::HashSet<NodeId>,
-    /// Effect ids that journaled an `EffectIntent` (§7.3). An id in `intents` but
-    /// NOT in `memo` (no `EffectRecorded`) is an **in-doubt** Mutation on resume.
-    intents: std::collections::HashSet<EffectId>,
+    /// Effect ids that journaled an `EffectIntent` → the journaled idempotency key
+    /// (§7.3, SP-4 s5). An id here with no matching `EffectRecorded` is in-doubt on
+    /// resume; reconcile queries the provider by THIS key.
+    intents: std::collections::HashMap<EffectId, String>,
     /// Each `Observation` effect's recorded freshness + provenance (§7.1). A memo
     /// hit whose `fetched_at + ttl` has lapsed (per the injected `Clock`) is
     /// re-read instead of replayed.
@@ -108,6 +149,173 @@ struct Fold {
     /// whose key is already here is NOT re-published — the guard against a
     /// memoized replay re-`put`ting (which would collide) or re-journaling.
     context: HashMap<(Scope, ContextKey), ContextRef>,
+    /// Runtime graph expansions folded from `PlanExpanded` events (§4.4). The
+    /// structural analog of `memo`: on resume, `run_expand` replays the journaled
+    /// subgraph for a node found here — never re-invoking the planner.
+    expansions: HashMap<NodeId, Graph>,
+    /// Planner selections folded from `PlannerSelected` (§4.5). On resume the `Select`
+    /// arm reuses the recorded agent — the selector is NOT re-invoked.
+    selections: std::collections::HashMap<NodeId, orchestrator_core::AgentRef>,
+    /// SP-6 s1: signals delivered per `AwaitSignal` node, folded from `SignalReceived`.
+    /// LAST delivery wins (`insert` overwrites) — an operator must be able to correct a
+    /// mistaken decision before the run resumes, so a later signal supersedes an earlier
+    /// one for the same node.
+    signals: HashMap<NodeId, serde_json::Value>,
+    /// SP-6 s1: what each `AwaitSignal` node recorded when it began waiting, folded from
+    /// `SignalAwaited`. FIRST record wins — the opposite of `signals`, and deliberately
+    /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
+    /// deadline forward, and a run force-woken every ten minutes with a one-hour timeout
+    /// would NEVER expire.
+    ///
+    /// The VALUE is itself an `Option`, so the two layers mean different things:
+    /// *key absent* = this node has never begun waiting; `Some(None)` = it began waiting
+    /// with **no deadline** (the indefinite HITL gate). Folding that `None` as a real
+    /// value — rather than dropping it — is what makes the deadline-less arm of
+    /// [`run_await_signal`](Executor::run_await_signal) node-keyed idempotent: without it
+    /// the node re-journals `SignalAwaited` on every drive, and a re-drive is NOT
+    /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
+    /// keeps the whole run auto-wakeable).
+    deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
+    /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
+    /// wins. Read by exactly ONE consumer — [`run_await_signal`](Executor::run_await_signal),
+    /// for which a failure is TERMINAL (an expired human gate stays expired).
+    ///
+    /// It is deliberately not consulted anywhere else. A `NodeFailed` does not make a node
+    /// terminal in general: a `ModelCall` or `Agent` node whose provider died journals one
+    /// and RE-ATTEMPTS on the next drive, which is the documented resume contract (see
+    /// `a_paused_gated_run_reattempts_and_completes_on_resume`, and `resolve_context`'s note
+    /// that a failed node "carries no memo and re-runs on resume"). Making this map
+    /// authoritative for every kind would silently delete retry-on-resume, so the
+    /// generalization is refused: only a node kind whose failure is by definition
+    /// irreversible — a deadline that has passed — may read it.
+    failed: HashMap<NodeId, String>,
+    /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
+    /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
+    /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
+    /// it on every resume.
+    usage: HashMap<EffectId, orchestrator_core::TokenUsage>,
+    /// The effective cap: `RunStarted.budget`, then the latest `BudgetRaised` (latest
+    /// wins). `None` for an unbudgeted run — the gate never fires.
+    budget: Option<u64>,
+    /// SP-DATA-5: tokens dispatched by THIS drive, not yet visible in `usage`.
+    ///
+    /// A `Fold` is built once per drive (from the journal on resume, or empty-but-for-
+    /// the-budget on a fresh run) and shared as `&Fold` by every node, so `usage` alone
+    /// is a snapshot of the ledger as it stood when the drive STARTED. Without this
+    /// counter the gate re-reads that same frozen number before every call — and a
+    /// freshly submitted run, whose journaled spend is 0 by definition, would never gate
+    /// at all. Interior-mutable (and shared with a `Map`'s concurrent children) because
+    /// the fold is handed out immutably; see [`dispatch::Meter`] for the ordering
+    /// rationale.
+    live_spend: Arc<std::sync::atomic::AtomicU64>,
+    /// SP-DATA-5 (whole-slice review, Critical 1): the 1-permit gate a BUDGETED run
+    /// holds across its whole check→dispatch→charge sequence, so at most one model
+    /// call per run is ever in flight and `live_spend` is current before the next
+    /// gate read. One `Fold` per drive ⇒ one gate per run-drive, shared by every
+    /// node including a `Map`'s concurrent children and any nested Subgraph/Loop
+    /// (which are handed this same `&Fold`).
+    ///
+    /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
+    /// this makes and why an unbudgeted run must never touch it.
+    serial_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Fold {
+    /// Tokens this run had spent as of the journal this fold was built from.
+    ///
+    /// Idempotent across any number of resumes because it sums over effect ids
+    /// (`usage`'s keys), never over raw events.
+    fn journaled_spend(&self) -> u64 {
+        // `saturating_add` is deliberate and is the ONE place saturation is right
+        // here: overflowing `u64` from summed `u32` token counts needs ~4 billion
+        // maximal effects, and saturating HIGH makes the gate MORE conservative (it
+        // pauses the run), where a wrapping add could reset the ledger near zero and
+        // let a run spend unbounded past its cap.
+        self.usage
+            .values()
+            .map(|u| u64::from(u.total_tokens))
+            .fold(0u64, |acc, t| acc.saturating_add(t))
+    }
+
+    /// Total tokens this run has spent: journaled + in-flight this drive.
+    ///
+    /// The in-flight half is zero at the start of every drive and is subsumed into the
+    /// journaled half by the next fold, so the two can never double-count one call.
+    fn spent(&self) -> u64 {
+        self.journaled_spend()
+            .saturating_add(self.live_spend.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The run's effective token cap, or `None` if unbudgeted.
+    fn budget(&self) -> Option<u64> {
+        self.budget
+    }
+
+    /// This fold's ledger as the metered-dispatch chokepoint consumes it. Borrowing the
+    /// live counter (rather than copying two scalars out) is what lets spend accumulate
+    /// WITHIN a drive — see [`dispatch::Meter`].
+    fn meter(&self) -> dispatch::Meter<'_> {
+        dispatch::Meter::new(
+            self.journaled_spend(),
+            self.budget,
+            &self.live_spend,
+            &self.serial_gate,
+        )
+    }
+
+    /// SP-6 s1: the folded signal for an `AwaitSignal` node, if one has been delivered
+    /// (§6.2's three-way read, arm 1). `None` for a node that has never been signalled.
+    fn signal_for(&self, node: &NodeId) -> Option<&serde_json::Value> {
+        self.signals.get(node)
+    }
+
+    /// SP-6 s1: what an `AwaitSignal` node recorded when it began waiting.
+    ///
+    /// Two layers, and they are not the same question:
+    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited` for it).
+    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate).
+    /// - `Some(Some(t))` — it began waiting with the absolute deadline `t`.
+    ///
+    /// Read by [`run_await_signal`](Executor::run_await_signal) on EVERY execution — it
+    /// is the durable half of the never-recompute rule; the caller must not fall back to
+    /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
+    fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+        self.deadlines.get(node).copied()
+    }
+
+    /// SP-6 s1: the failure this node already journaled, if any — see [`Fold::failed`] for
+    /// why only `run_await_signal` may act on it.
+    fn failure_for(&self, node: &NodeId) -> Option<&str> {
+        self.failed.get(node).map(String::as_str)
+    }
+}
+
+/// SP-DATA-5 Task 5: a run's folded `(spent, budget)`, exposed so `torii run status`
+/// can display spend without re-deriving it.
+///
+/// Deliberately routes through the SAME `fold_journal`/`Fold` the metered-dispatch
+/// gate (Task 3) itself uses, rather than handing the caller raw events to sum
+/// independently. `fold_journal` keys `EffectRecorded.usage` by effect id
+/// specifically so a duplicate record — reachable via the two-phase Mutation path's
+/// in-doubt `Confirmed` reconcile — counts once, not once per event (see
+/// `Fold::spent`'s doc comment, and the Task 2 test that mutation-verifies it). A
+/// second, independently-written sum over the raw event stream would inevitably
+/// diverge from this one — the exact drift the s2 secret-redactor review warned
+/// about when it found a chokepoint bypassed by one of several call sites — and the
+/// diverged copy would stay silently wrong on every resume, growing with each one.
+pub fn spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
+    let (fold, _, _) = fold_journal(events);
+    (fold.spent(), fold.budget())
+}
+
+/// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
+/// sequential top-level drive loop (a `Map`'s concurrency wraps `ModelCall`/`Agent`
+/// bodies, never an `Expand`), so `Relaxed` ordering is sufficient — the check is a
+/// self-DoS backstop, not a synchronization primitive.
+#[derive(Default)]
+struct ExpansionCounters {
+    expansions: std::sync::atomic::AtomicUsize,
+    nodes: std::sync::atomic::AtomicUsize,
 }
 
 /// The mutable scheduling state threaded through a `drive` loop: the accumulating
@@ -135,14 +343,24 @@ impl Executor {
             registry: Arc::new(Registry::default()),
             tools: Arc::new(ToolRegistry::default()),
             max_steps: 8,
+            max_depth: 8,
             concurrency: 8,
             content: None,
+            redactor: None,
+            credential_broker: None,
+            workspace_root_base: None,
+            sandbox: None,
             cas_threshold: 4096,
             clock: Arc::new(SystemClock),
             reconcilers: Arc::new(ReconcileRegistry::default()),
             context: None,
             hooks: None,
             handle: None,
+            planner: None,
+            selector: None,
+            max_expansions: 32,
+            max_nodes: 512,
+            expansion_counters: Arc::new(ExpansionCounters::default()),
         }
     }
 
@@ -152,6 +370,41 @@ impl Executor {
     /// store as the original run — the crash/resume seam the CAS blobs live in.
     pub fn with_content_store(mut self, content: Arc<dyn ContentStore>) -> Self {
         self.content = Some(content);
+        self
+    }
+
+    /// Wire a secret [`Redactor`](orchestrator_core::Redactor) (SP-4 s2). Default
+    /// none ⇒ effect outputs are journaled/fed-back verbatim (byte-identical).
+    /// Recommended for production: `.with_redactor(Arc::new(PatternRedactor::default()))`.
+    pub fn with_redactor(mut self, redactor: Arc<dyn orchestrator_core::Redactor>) -> Self {
+        self.redactor = Some(redactor);
+        self
+    }
+
+    /// Wire a [`CredentialBroker`](orchestrator_core::CredentialBroker) (SP-4). Default none.
+    /// (Task 3 wires the resolve+inject: a tool that declares a credential ref the broker
+    /// can't resolve — or with no broker wired — will fail loud, never a silent missing
+    /// credential. In THIS commit the field is inert.)
+    pub fn with_credential_broker(
+        mut self,
+        broker: Arc<dyn orchestrator_core::CredentialBroker>,
+    ) -> Self {
+        self.credential_broker = Some(broker);
+        self
+    }
+
+    /// SP-4 s3: root a durable per-run workspace jail at `base/<run_id>/`. Default none ⇒
+    /// byte-identical, no fs tools. Confined `fs_write`/`fs_read` tools resolve their targets
+    /// within the canonical per-run dir; the executor pre-checks each declared path.
+    pub fn with_workspace_root(mut self, base: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace_root_base = Some(base.into());
+        self
+    }
+
+    /// SP-4 s4: wire the subprocess sandbox backend (e.g. `MacosSandbox`) used by the `shell`
+    /// tool. Default `None` ⇒ `shell` refuses loud (fail-closed — never an unconfined run).
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn crate::agent::sandbox::Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 
@@ -199,6 +452,36 @@ impl Executor {
         self
     }
 
+    /// Set the max nesting depth (Subgraph self-DoS cap; default 8).
+    pub fn with_max_depth(mut self, n: usize) -> Self {
+        self.max_depth = n;
+        self
+    }
+
+    /// Attach the planner an `Expand` node produces its subgraph from (SP-3 slice 3).
+    pub fn with_planner(mut self, planner: Arc<dyn Planner>) -> Self {
+        self.planner = Some(planner);
+        self
+    }
+
+    /// Attach the planner selector a `PlannerRef::Select` node uses (slice 4B).
+    pub fn with_planner_selector(mut self, selector: Arc<dyn PlannerSelector>) -> Self {
+        self.selector = Some(selector);
+        self
+    }
+
+    /// Set the max runtime expansions (`PlanDelta`s) per run (self-DoS cap; default 32).
+    pub fn with_max_expansions(mut self, n: usize) -> Self {
+        self.max_expansions = n;
+        self
+    }
+
+    /// Set the max cumulative spliced-node count per run (self-DoS cap; default 512).
+    pub fn with_max_nodes(mut self, n: usize) -> Self {
+        self.max_nodes = n;
+        self
+    }
+
     /// Inject the wall-clock (default `SystemClock`) — Observation TTL reads it.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
@@ -242,30 +525,82 @@ impl Executor {
         self
     }
 
+    /// A per-run clone with FRESH expansion counters seeded to `(expansions, nodes)`
+    /// — 0/0 for a fresh `run`, or the journal's expansion tally for a resume — so the
+    /// caps span the crash seam and every nested `run_expand` shares one counter.
+    fn with_expansion_seed(mut self, expansions: usize, nodes: usize) -> Self {
+        use std::sync::atomic::AtomicUsize;
+        self.expansion_counters = Arc::new(ExpansionCounters {
+            expansions: AtomicUsize::new(expansions),
+            nodes: AtomicUsize::new(nodes),
+        });
+        self
+    }
+
     /// Execute a fresh linear graph end-to-end: journal `RunStarted`, then drive
-    /// every node with an empty memo (nothing has run yet).
+    /// every node with an empty memo (nothing has run yet). Unbudgeted — delegates
+    /// to [`run_budgeted`](Self::run_budgeted) with `None`, so every pre-SP-DATA-5
+    /// caller (all of them, until Task 5 wired a CLI flag to reach the budgeted
+    /// twin) stays byte-identical.
     pub async fn run(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
+        self.run_budgeted(run, graph, None).await
+    }
+
+    /// SP-DATA-5 Task 5: like [`run`](Self::run), but journals `budget` on
+    /// `RunStarted` so the metered-dispatch gate (Task 3) can pause the run once
+    /// its folded spend meets the cap.
+    ///
+    /// A NEW method rather than a third parameter on `run` itself, deliberately:
+    /// `run(run, &graph)` has on the order of a hundred existing call sites across
+    /// this crate's tests plus `Scheduler::submit`'s own production caller, every
+    /// one of them unbudgeted. Widening `run`'s signature would force each of those
+    /// to thread a `None` through for no behavior change — pure churn — where a
+    /// same-behavior delegating twin costs nothing and touches nothing.
+    pub async fn run_budgeted(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        budget: Option<TokenBudget>,
+    ) -> Result<RunOutcome, OrchestratorError> {
         if let Some(h) = &self.handle {
             let (registry, generation) = h.snapshot();
             return self
                 .clone()
                 .pinned(registry, generation)
-                .run_inner(run, graph)
+                .run_inner(run, graph, budget)
                 .await;
         }
-        self.run_inner(run, graph).await
+        self.run_inner(run, graph, budget).await
     }
 
-    async fn run_inner(&self, run: RunId, graph: &Graph) -> Result<RunOutcome, OrchestratorError> {
+    async fn run_inner(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        budget: Option<TokenBudget>,
+    ) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
-        self.append(
+        let this = self.clone().with_expansion_seed(0, 0);
+        this.append(
             run,
             JournalEvent::RunStarted {
-                version: self.version.clone(),
+                version: this.version.clone(),
+                budget,
             },
         )
         .await?;
-        self.drive(run, graph, &Fold::default()).await
+        // SP-DATA-5: a FRESH run has nothing journaled to fold, so the cap has to be
+        // seeded into the fold by hand — `Fold::default()` alone would hand the drive
+        // `budget: None` and the gate could never fire on a run's first drive at all,
+        // however small the cap. (A resume gets the same value from `fold_journal`
+        // reading the `RunStarted` this call just appended, plus any `BudgetRaised`.)
+        let fold = Fold {
+            budget: budget.map(|b| b.total_tokens),
+            ..Default::default()
+        };
+        let outcome = this.drive(run, graph, &fold).await?;
+        this.finalize_run(run, &outcome).await?;
+        Ok(outcome)
     }
 
     /// Resume (or freshly start) a run from its durable journal — the headline
@@ -310,12 +645,21 @@ impl Executor {
         if events.is_empty() {
             // Nothing journaled → a fresh run (appends `RunStarted` itself). Already
             // pinned, so call `run_inner` directly (avoid a redundant handle re-check).
-            return self.run_inner(run, graph).await;
+            // Unbudgeted: `start()` resumes an EXISTING submission — a real budget, if
+            // any, is already journaled by whatever `submit` call created it. This
+            // branch only fires for a run id that was never submitted at all, which is
+            // not a product path `Scheduler::tick` reaches (it only re-drives runs its
+            // own `submit` already journaled `RunStarted` for).
+            return self.run_inner(run, graph, None).await;
         }
 
         // Version fence: the first recorded `RunStarted.version` must match ours.
+        // Explicit `budget: _` (not `..`) so a FUTURE field added to `RunStarted`
+        // forces a compile error here — a conscious decision, not silent absorption.
+        // The fence compares the executor version string only; `budget` is
+        // deliberately not fenced (a config-only change, not a code-version change).
         if let Some(recorded) = events.iter().find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version } => Some(version.clone()),
+            JournalEvent::RunStarted { version, budget: _ } => Some(version.clone()),
             _ => None,
         }) && recorded != self.version
         {
@@ -355,11 +699,17 @@ impl Executor {
         // Rehydrate the blackboard from folded `ContextWrite`s (§8) so a resumed
         // Agent node reads its dependencies' context identically to the original
         // run (deterministic prompt → memoized turns replay).
-        self.rehydrate_context(&fold).await?;
-
-        // Resume the tail: `drive`'s memo branch replays the completed prefix
-        // (no gateway call, no new `EffectRecorded`) and finishes the run.
-        self.drive(run, graph, &fold).await
+        //
+        // Seed the expansion counters from the journaled expansions so the caps span
+        // the crash seam, then rehydrate + resume off that per-run clone.
+        let seed_nodes: usize = fold.expansions.values().map(|g| g.nodes.len()).sum();
+        let this = self
+            .clone()
+            .with_expansion_seed(fold.expansions.len(), seed_nodes);
+        this.rehydrate_context(&fold).await?;
+        let outcome = this.drive(run, graph, &fold).await?;
+        this.finalize_run(run, &outcome).await?;
+        Ok(outcome)
     }
 
     /// Shared node loop for both `run` (an empty [`Fold`]) and `start` (a `Fold`
@@ -402,12 +752,12 @@ impl Executor {
             if ready.is_empty() {
                 break;
             }
-            for (index, node) in ready {
+            for node in ready {
                 // The immutable borrow of `state.outcome.outputs` (a Consolidate
                 // reads its Map's result from it) ends when the future resolves,
                 // before `apply_node_result` mutates `state`.
                 let result = self
-                    .run_node(run, index, node, fold, &state.outcome.outputs)
+                    .run_node(run, node, fold, &state.outcome.outputs)
                     .await?;
                 self.apply_node_result(run, graph, node, result, fold, &mut state)
                     .await?;
@@ -418,13 +768,29 @@ impl Executor {
             // unless the run later crashes and resumes.
             self.write_snapshot(run, &state.outcome).await?;
         }
-        // A run with any failure OR a durable pause is not marked complete — it
-        // stays resumable (the slice-1/2 contract), even though soft-dependent
-        // branches ran.
-        if state.outcome.failed.is_none() && state.outcome.paused.is_none() {
+        // NOTE: `drive` does NOT append `RunCompleted` — that is a RUN-level event,
+        // appended once by the run-level callers (`run_inner`/`start_inner`) via
+        // [`finalize_run`]. This matters for a `Subgraph` node, which drives its
+        // nested DAG through `drive` in the SAME run (SP-3): a completing nested
+        // drive must not emit a premature/duplicate `RunCompleted` for the whole
+        // run. `drive` just returns the outcome; the finalizer decides completion.
+        Ok(state.outcome)
+    }
+
+    /// Append `RunCompleted` iff the run's outcome is clean (no failure, no durable
+    /// pause) — a RUN-level finalization done once by the top-level `run_inner`/
+    /// `start_inner`, NOT inside [`drive`] (so a nested `Subgraph` drive can't emit
+    /// a premature/duplicate one). A failed or paused run is left unmarked so it
+    /// stays resumable (the slice-1/2 contract).
+    async fn finalize_run(
+        &self,
+        run: RunId,
+        outcome: &RunOutcome,
+    ) -> Result<(), OrchestratorError> {
+        if outcome.failed.is_none() && outcome.paused.is_none() {
             self.append(run, JournalEvent::RunCompleted).await?;
         }
-        Ok(state.outcome)
+        Ok(())
     }
 
     /// Fold one scheduled node's run result into the drive `state`. A
@@ -530,27 +896,65 @@ impl Executor {
         Ok(())
     }
 
-    /// Execute one node to a terminal result. `index` is the node's declaration
-    /// position, which keys a `ModelCall`'s structural effect id
-    /// (`effect_id("", 0, index)` — the slice-1 scheme, preserved). A memoized
-    /// `ModelCall` replays with no gateway call and no new journal event; a
-    /// live one journals `NodeStarted → EffectRecorded → NodeCompleted`. An
-    /// `Agent` node delegates to [`drive_agent`](Self::drive_agent), which owns
-    /// its own per-turn journaling. A determinism violation propagates as `Err`
-    /// (halting the run before any gateway call). `prior_outputs` carries the
-    /// outputs of already-completed nodes this round advances past — a
-    /// `Consolidate` reads its Map's result from it.
+    /// The sorted planner library: registry agents whose `area == PLANNER_AREA`, as
+    /// `AgentRef`s (sorted by name for deterministic selection).
+    fn planner_candidates(&self) -> Vec<AgentRef> {
+        let mut c: Vec<AgentRef> = self
+            .registry
+            .agents()
+            .filter(|a| a.area == PLANNER_AREA)
+            .map(|a| AgentRef(a.name.clone()))
+            .collect();
+        c.sort_by(|x, y| x.0.cmp(&y.0));
+        c
+    }
+
+    /// Enforce the expansion caps (§4.5) against the run-scoped counters, then tally
+    /// the new expansion. A breach is a hard `Err` (self-DoS backstop); on success the
+    /// counters advance by one expansion + `g.nodes.len()` nodes.
+    fn check_expansion_budget(&self, g: &Graph) -> Result<(), OrchestratorError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.expansion_counters.expansions.load(Relaxed) + 1 > self.max_expansions {
+            return Err(OrchestratorError::GlobalCapExceeded {
+                cap: "max_expansions".into(),
+                limit: self.max_expansions,
+            });
+        }
+        if self.expansion_counters.nodes.load(Relaxed) + g.nodes.len() > self.max_nodes {
+            return Err(OrchestratorError::GlobalCapExceeded {
+                cap: "max_nodes".into(),
+                limit: self.max_nodes,
+            });
+        }
+        self.expansion_counters.expansions.fetch_add(1, Relaxed);
+        self.expansion_counters
+            .nodes
+            .fetch_add(g.nodes.len(), Relaxed);
+        Ok(())
+    }
+
+    /// Execute one node to a terminal result. A `ModelCall`'s structural effect id
+    /// is keyed by the node's **id** (`effect_id(&node.id.0, 0, 0)` — node ids are
+    /// unique within a graph and namespaced across nesting, e.g. `"{sub}/n1"`), so
+    /// a nested `Subgraph`'s inner `ModelCall` can never collide with an outer one
+    /// (an empty-prefix, index-based id would, since each fresh `drive`'s ready-set
+    /// index restarts at 0). A memoized `ModelCall` replays with no gateway call and
+    /// no new journal event; a live one journals `NodeStarted → EffectRecorded →
+    /// NodeCompleted`. An `Agent` node delegates to [`drive_agent`](Self::drive_agent),
+    /// which owns its own per-turn journaling. A determinism violation propagates as
+    /// `Err` (halting the run before any gateway call). `prior_outputs` carries the
+    /// outputs of already-completed nodes this round advances past — a `Consolidate`
+    /// reads its Map's result from it.
     async fn run_node(
         &self,
         run: RunId,
-        index: usize,
         node: &orchestrator_core::Node,
         fold: &Fold,
         prior_outputs: &HashMap<NodeId, serde_json::Value>,
     ) -> Result<NodeExec, OrchestratorError> {
         match &node.kind {
             NodeKind::ModelCall { chain, payload } => {
-                let eid = effect_id("", 0, index);
+                let eid = effect_id(&node.id.0, 0, 0);
                 let ih = input_hash(chain, payload)?;
 
                 if let Some((recorded_ih, output)) = fold.memo.get(&eid) {
@@ -575,12 +979,13 @@ impl Executor {
                 .await?;
 
                 let request = build_request(chain, payload);
-                match self.gateway.execute(&request).await {
-                    Ok(response) => {
-                        let output = serde_json::json!({
-                            "model": response.model,
-                            "text": response.content.clone().unwrap_or_default(),
-                        });
+                // SP-DATA-5: the ModelCall producer routes through the single metered
+                // chokepoint — the budget gate cannot be bypassed here.
+                match self.dispatch_metered(&request, &fold.meter()).await {
+                    Ok(Ok(response)) => {
+                        // SP-4 s2: route through the shared redaction chokepoint so a
+                        // ModelCall node whose model echoes a secret is scrubbed too.
+                        let output = self.model_output(&response);
                         // `EffectRecorded.seq` is advisory: `append` assigns the
                         // authoritative outer `Seq`, and the resume fold orders
                         // events by that outer `(Seq, event)` from `load` — never by
@@ -597,6 +1002,9 @@ impl Executor {
                                 seq: 0,
                                 output: recorded,
                                 observation: None,
+                                // SP-DATA-5: the ModelCall producer — the real usage the
+                                // provider reported, converted at the boundary.
+                                usage: response.usage.map(content::convert_usage),
                             },
                         )
                         .await?;
@@ -609,6 +1017,16 @@ impl Executor {
                         .await?;
                         Ok(NodeExec::Completed(output))
                     }
+                    // SP-DATA-5: the chokepoint refused before spending (budget
+                    // exhausted ⇒ a durable HOTL pause; unmetered ⇒ a node failure).
+                    // `record_refusal` already journaled it.
+                    Ok(Err(refusal)) => match self.record_refusal(run, &node.id, refusal).await? {
+                        dispatch::RefusalKind::Paused(reason) => Ok(NodeExec::Paused { reason }),
+                        dispatch::RefusalKind::Failed(message) => Ok(NodeExec::Failed {
+                            message,
+                            output: None,
+                        }),
+                    },
                     Err(error) => match classify_gateway_error(&error) {
                         // A fully-gated chain with a timed re-eligibility (§11.2):
                         // durable pause (resumable), never a bare fail. On resume
@@ -675,6 +1093,12 @@ impl Executor {
                 self.run_consolidate(run, node, prior_outputs, fold).await
             }
             NodeKind::Loop { .. } => self.run_loop(run, node, fold).await,
+            NodeKind::Subgraph { .. } => self.run_subgraph(run, node, fold).await,
+            NodeKind::Branch { .. } => self.run_branch(run, node, prior_outputs, fold).await,
+            NodeKind::Expand { .. } => self.run_expand(run, node, fold).await,
+            NodeKind::AwaitSignal { timeout } => {
+                self.run_await_signal(run, node, *timeout, fold).await
+            }
         }
     }
 
@@ -707,6 +1131,14 @@ impl Executor {
                 JournalEvent::NodeSkipped { node } => h.on_node_skipped(run, node).await,
                 JournalEvent::ContextWrite { scope, key, .. } => {
                     h.on_context_write(run, scope, key).await
+                }
+                JournalEvent::PlanExpanded {
+                    node,
+                    subgraph,
+                    node_plans,
+                } => h.on_plan_expanded(run, node, subgraph, node_plans).await,
+                JournalEvent::PlannerSelected { node, agent } => {
+                    h.on_planner_selected(run, node, agent).await
                 }
                 _ => {}
             }

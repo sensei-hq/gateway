@@ -1,8 +1,13 @@
 //! Best-effort observability hooks (§15). No-op defaults; a wired impl observes
 //! run/node/agent/context lifecycle. Hooks never affect execution or determinism.
 
+use std::collections::HashMap;
+
 use crate::context::{ContextKey, Scope};
+use crate::graph::Graph;
 use crate::ids::{NodeId, RunId};
+use crate::plan::NodePlan;
+use crate::registry::AgentRef;
 
 /// Observation callbacks fired by the executor at lifecycle points. Every method
 /// defaults to a no-op, so an impl overrides only what it cares about. Best-effort
@@ -21,6 +26,15 @@ pub trait OrchestratorHooks: Send + Sync {
     async fn on_agent_turn(&self, _run: RunId, _node: &NodeId, _turn: usize) {}
     async fn on_agent_tool_call(&self, _run: RunId, _node: &NodeId, _tool: &str) {}
     async fn on_context_write(&self, _run: RunId, _scope: &Scope, _key: &ContextKey) {}
+    async fn on_plan_expanded(
+        &self,
+        _run: RunId,
+        _node: &NodeId,
+        _graph: &Graph,
+        _node_plans: &HashMap<NodeId, NodePlan>,
+    ) {
+    }
+    async fn on_planner_selected(&self, _run: RunId, _node: &NodeId, _agent: &AgentRef) {}
 }
 
 #[cfg(test)]

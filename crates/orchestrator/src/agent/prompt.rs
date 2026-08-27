@@ -136,6 +136,7 @@ mod tests {
                 source: None,
                 permissions: Permissions::default(),
                 activation: Activation::default(),
+                credentials: vec![],
             });
         (reg, agent)
     }
@@ -209,6 +210,7 @@ mod tests {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::OnKeywords(vec!["query".into()]),
+            credentials: vec![],
         });
         agent.tools.push("sql".into());
 

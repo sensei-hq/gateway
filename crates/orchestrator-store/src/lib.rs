@@ -11,9 +11,14 @@ use std::sync::{Arc, Mutex};
 use orchestrator_core::{ExecutionJournal, JournalError, JournalEvent, RunId, Seq, Snapshot};
 
 mod config_source;
+mod scheduler_store;
 mod stores;
 pub use config_source::{FilesystemConfigSource, InMemoryConfigSource};
+pub use scheduler_store::InMemorySchedulerStore;
 pub use stores::{InMemoryContentStore, InMemoryContextStore};
+
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 /// The shared, `Seq`-stamped event log keyed by run, guarded for concurrent
 /// appends and clonable across executors.
@@ -109,6 +114,8 @@ mod tests {
     fn run_started() -> JournalEvent {
         JournalEvent::RunStarted {
             version: "v".into(),
+            // SP-DATA-5: this store test doesn't exercise a budget.
+            budget: None,
         }
     }
 
@@ -237,6 +244,7 @@ mod tests {
                 status: ChildStatus::Ok,
                 digest: Some(Digest("abc".into())),
                 input_hash: Some("h".into()),
+                usage: None,
             }],
         };
         journal.compact(run, &[s1, s2], manifest).await.unwrap();

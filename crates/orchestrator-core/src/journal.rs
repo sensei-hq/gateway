@@ -1,9 +1,18 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentRef, Digest, EffectOutput};
 use crate::effect::{EffectClass, EffectId};
 use crate::error::JournalError;
+use crate::graph::Graph;
 use crate::ids::{NodeId, RunId, Seq};
+use crate::plan::NodePlan;
+
+/// The durable journal format / effect-id scheme version. A persisted journal stamped with a
+/// different value fences loudly on resume (never a silent mis-fold). Bump on any effect-id or
+/// journal-serialization break.
+pub const FORMAT_VERSION: i32 = 1;
 
 /// A compacted per-child record (§5.3): after a `Map`'s `Consolidate` completes,
 /// each child's full `EffectRecorded` collapses to this small shape and leaves
@@ -21,6 +30,22 @@ pub struct CompactChild {
     /// The child effect's determinism key (`Ok` children only) — feeds memo
     /// reconstruction on resume.
     pub input_hash: Option<String>,
+    /// SP-DATA-5: the tokens the child's own `EffectRecorded` carried, kept here
+    /// because that record is being DELETED.
+    ///
+    /// Without it a `Consolidate` over a `ModelCall` `Map` erased that Map's spend
+    /// from the durable ledger permanently: the next drive folded a base short by the
+    /// children's tokens and the run spent past its cap with nothing loud anywhere —
+    /// the same "counter restarts at zero" failure the journal-as-ledger design
+    /// exists to prevent. Compaction is a representation change; it must be
+    /// spend-preserving, exactly as it is already memo-preserving via `digest` +
+    /// `input_hash`.
+    ///
+    /// `None` for a `Failed` child (it journaled no record) and for any pre-fix
+    /// `MapCompacted`, which still deserializes and folds as it always did — those
+    /// runs' children's spend is already gone and this cannot invent it.
+    #[serde(default)]
+    pub usage: Option<crate::budget::TokenUsage>,
 }
 
 /// A compacted child's terminal status.
@@ -45,6 +70,11 @@ pub struct ObservationMeta {
 pub enum JournalEvent {
     RunStarted {
         version: String,
+        /// SP-DATA-5: the run's token cap, journaled so a cross-process resume folds
+        /// the SAME cap. `None` (and any pre-SP-DATA-5 journal) ⇒ unbudgeted, and the
+        /// gate never fires — byte-identical to before.
+        #[serde(default)]
+        budget: Option<crate::budget::TokenBudget>,
     },
     NodeStarted {
         node: NodeId,
@@ -62,6 +92,12 @@ pub enum JournalEvent {
         /// Set only for `Observation` effects (§7.1): freshness + provenance so a
         /// resume can decide replay-vs-re-read. `None` for Pure/Mutation.
         observation: Option<ObservationMeta>,
+        /// SP-DATA-5: tokens this effect actually consumed, as reported by the
+        /// provider. Rides on THIS event rather than its own so spend and the effect
+        /// it belongs to land in ONE atomic append — two appends could be torn by a
+        /// crash. `None` for non-model effects and for any pre-SP-DATA-5 journal.
+        #[serde(default)]
+        usage: Option<crate::budget::TokenUsage>,
     },
     /// The intent phase of a two-phase `Mutation` (§7.3), appended BEFORE the side
     /// effect. On resume an `EffectIntent` with no matching `EffectRecorded` is
@@ -103,6 +139,26 @@ pub enum JournalEvent {
         node: NodeId,
         children: Vec<CompactChild>,
     },
+    /// A runtime graph expansion (§7.2/§7.6/§10.3): node `node` produced `subgraph`.
+    /// Journaled BEFORE the nested graph is driven, so a crash mid-expansion resumes
+    /// with the identical structure. The resume fold reconstructs the spliced graph
+    /// from this — the memo, but for graph structure. `subgraph` carries LOCAL ids
+    /// (namespaced under `node` at drive time), so the event is position-independent.
+    PlanExpanded {
+        node: NodeId,
+        subgraph: Graph,
+        /// Per-node plan metadata (local ids) — the self-describing side-map (§4.1).
+        /// Serde-default so a pre-4A `PlanExpanded` (no field) still deserializes.
+        #[serde(default)]
+        node_plans: HashMap<NodeId, NodePlan>,
+    },
+    /// The planner-selection decision (SP-3 s4B): node `node` selected planner
+    /// `agent`. Journaled BEFORE driving the planner, so a mid-plan resume reuses the
+    /// same planner — the memo for the selection (symmetric with `PlanExpanded`).
+    PlannerSelected {
+        node: NodeId,
+        agent: crate::registry::AgentRef,
+    },
     /// A shared-scope blackboard publish (§8). Journaled so a resume rebuilds the
     /// `ContextStore` (as refs, no blob load) via
     /// [`ContextStore::insert_ref`](crate::context::ContextStore::insert_ref). The
@@ -118,6 +174,34 @@ pub enum JournalEvent {
     RunPaused {
         reason: String,
         resume_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// SP-DATA-5: an operator raised (or lowered) the run's cap. Required, not
+    /// cosmetic: the budget is journaled on `RunStarted`, so without this a woken run
+    /// folds the ORIGINAL cap and immediately re-pauses — permanently stuck. Latest
+    /// value wins; lowering below current spend is a legitimate way to halt a run.
+    BudgetRaised {
+        new_total_tokens: u64,
+    },
+    /// SP-6 s1: an `AwaitSignal` node began waiting, recording its ABSOLUTE deadline.
+    ///
+    /// This exists as its own node-keyed event rather than relying on
+    /// `RunPaused.resume_after` because that field is not node-keyed and a run pauses
+    /// for many unrelated reasons over its life. Recording the absolute instant here is
+    /// what stops the deadline being recomputed as `now + timeout` on every resume —
+    /// which would push it forward forever, so a run force-woken every ten minutes with
+    /// a one-hour timeout would NEVER expire.
+    SignalAwaited {
+        node: NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// SP-6 s1: an external signal arrived for an `AwaitSignal` node. Folded by node id,
+    /// so the node reads its answer and never re-asks — the same shape
+    /// `PlannerSelected` uses for a planner choice. Last delivery wins while the node is
+    /// still paused; once it has completed, the node is folded complete and never
+    /// re-executes, so a later signal changes nothing.
+    SignalReceived {
+        node: NodeId,
+        payload: serde_json::Value,
     },
 }
 
@@ -204,6 +288,54 @@ mod tests {
     use super::ObservationMeta;
     use crate::{EffectClass, EffectOutput, JournalEvent, NodeId, effect_id};
 
+    /// An OLD journal — serialized before this slice — must still deserialize, with
+    /// the new fields absent rather than erroring. If this fails, the change is a
+    /// format break and FORMAT_VERSION must be bumped; the whole additivity claim
+    /// rests here.
+    ///
+    /// These literals are NOT hand-written guesses: they are the actual output of
+    /// `serde_json::to_string` on `RunStarted`/`EffectRecorded` built against the
+    /// pre-SP-DATA-5 code (captured via a throwaway probe test before the `budget`/
+    /// `usage` fields existed), i.e. genuine old events.
+    #[test]
+    fn an_old_journal_event_deserializes_with_the_new_fields_absent() {
+        let old_started = r#"{"RunStarted":{"version":"v1"}}"#;
+        let e: JournalEvent =
+            serde_json::from_str(old_started).expect("old RunStarted still loads");
+        match e {
+            JournalEvent::RunStarted { budget, .. } => assert!(budget.is_none()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let old_recorded = r#"{"EffectRecorded":{"node":"n1","effect_id":"02e75a6544f3138fc1819276dc04aebeffe74eaf2fe8d4be23265db5cc84cfe3","class":"Pure","input_hash":"h","seq":0,"output":{"Inline":null},"observation":null}}"#;
+        let e: JournalEvent =
+            serde_json::from_str(old_recorded).expect("old EffectRecorded still loads");
+        match e {
+            JournalEvent::EffectRecorded { usage, .. } => assert!(usage.is_none()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_budget_round_trips_through_the_journal() {
+        let e = JournalEvent::RunStarted {
+            version: "v1".into(),
+            budget: Some(crate::budget::TokenBudget {
+                total_tokens: 50_000,
+            }),
+        };
+        let s = serde_json::to_string(&e).expect("serializes");
+        let back: JournalEvent = serde_json::from_str(&s).expect("round-trips");
+        match back {
+            JournalEvent::RunStarted {
+                budget: Some(b), ..
+            } => {
+                assert_eq!(b.total_tokens, 50_000)
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn journal_event_roundtrips() {
         let e = JournalEvent::EffectRecorded {
@@ -214,6 +346,7 @@ mod tests {
             seq: 1,
             output: EffectOutput::Inline(serde_json::json!({"text":"hi"})),
             observation: None,
+            usage: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: JournalEvent = serde_json::from_str(&s).unwrap();
@@ -248,6 +381,7 @@ mod tests {
             seq: 0,
             output: EffectOutput::Inline(serde_json::json!({"x":1})),
             observation: Some(obs),
+            usage: None,
         };
         assert!(matches!(
             serde_json::from_str::<JournalEvent>(&serde_json::to_string(&rec).unwrap()).unwrap(),
@@ -278,5 +412,89 @@ mod tests {
             serde_json::from_str::<JournalEvent>(&s).unwrap(),
             JournalEvent::ContextWrite { .. }
         ));
+    }
+
+    #[test]
+    fn plan_expanded_event_roundtrips() {
+        use crate::graph::{Graph, Node, NodeKind};
+        let e = JournalEvent::PlanExpanded {
+            node: NodeId("e".into()),
+            subgraph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("n1".into()),
+                    kind: NodeKind::ModelCall {
+                        chain: "c".into(),
+                        payload: serde_json::json!({ "prompt": "hi" }),
+                    },
+                    deps: vec![],
+                }],
+            },
+            node_plans: std::collections::HashMap::new(),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let back: JournalEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            JournalEvent::PlanExpanded { node, subgraph, .. } => {
+                assert_eq!(node, NodeId("e".into()));
+                assert_eq!(subgraph.nodes.len(), 1);
+            }
+            other => panic!("expected PlanExpanded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn planner_selected_event_roundtrips() {
+        let e = JournalEvent::PlannerSelected {
+            node: NodeId("e".into()),
+            agent: crate::registry::AgentRef("planner".into()),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        match serde_json::from_str::<JournalEvent>(&s).unwrap() {
+            JournalEvent::PlannerSelected { node, agent } => {
+                assert_eq!(node, NodeId("e".into()));
+                assert_eq!(agent.0, "planner");
+            }
+            other => panic!("expected PlannerSelected, got {other:?}"),
+        }
+    }
+
+    /// Additivity: this slice adds two NEW VARIANTS, not new fields. An old reader
+    /// cannot know them, but a NEW reader must still load every OLD event unchanged —
+    /// that is what keeps FORMAT_VERSION at 1.
+    #[test]
+    fn adding_the_signal_events_does_not_break_old_event_loading() {
+        let old = r#"{"RunStarted":{"version":"v1"}}"#;
+        let e: JournalEvent = serde_json::from_str(old).expect("old RunStarted still loads");
+        assert!(matches!(e, JournalEvent::RunStarted { .. }));
+    }
+
+    #[test]
+    fn the_signal_events_round_trip() {
+        let awaited = JournalEvent::SignalAwaited {
+            node: NodeId("gate".into()),
+            deadline: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).unwrap()),
+        };
+        let s = serde_json::to_string(&awaited).expect("serializes");
+        let back: JournalEvent = serde_json::from_str(&s).expect("round-trips");
+        match back {
+            JournalEvent::SignalAwaited { node, deadline } => {
+                assert_eq!(node.0, "gate");
+                assert!(deadline.is_some());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let received = JournalEvent::SignalReceived {
+            node: NodeId("gate".into()),
+            payload: serde_json::json!({"decision": "approved"}),
+        };
+        let s = serde_json::to_string(&received).expect("serializes");
+        let back: JournalEvent = serde_json::from_str(&s).expect("round-trips");
+        match back {
+            JournalEvent::SignalReceived { payload, .. } => {
+                assert_eq!(payload["decision"], "approved")
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }
