@@ -722,6 +722,26 @@ pub async fn signal(
         .await
         .map_err(OrchestratorError::Journal)?;
 
+    // SP-6 s2 AC7: a `HumanGate` is answerable ONLY by `GateDecided`. Without this
+    // refusal a raw `--payload '{}'` would bypass every validation s2 adds — the menu
+    // check, the outcome mapping and the required reason — and would do it silently: the
+    // executor's `run_human_gate` reads only `GateDecided`, so the row would be journaled,
+    // never read, and reported here as `signalled`.
+    //
+    // Checked BEFORE `signal_state`, not after, because a gate does not fold as
+    // `Awaiting` at all (that fold reads `SignalAwaited`, and a gate journals
+    // `GateAwaited`) — reaching the generic arm would refuse it as "not awaiting a
+    // signal", which is true and useless: it sends an operator to check the node id when
+    // the id was right and the COMMAND was wrong.
+    if crate::cmd::gate::gate_menu(&events, &node).is_some() {
+        return Ok(Outcome::precondition(format!(
+            "not delivered: {shown} is a HumanGate, not an AwaitSignal — it accepts a \
+             named option, not arbitrary JSON. Use: torii run gate decide {} --node \
+             {shown} --option <name>",
+            run.0
+        )));
+    }
+
     match signal_state(&events, &node) {
         SignalState::Awaiting { .. } => {}
         // Everything else is a no-op at the node, so say so instead of writing.
@@ -1148,15 +1168,23 @@ pub async fn submit(
     )))
 }
 
+/// `pub(crate)` **only so `cmd::gate`'s tests can reuse four fixtures** — `now`,
+/// `paused_store`, `awaiting_journal` and `FailingForceWakeStore`. There is no
+/// `tests_support` module in this crate and inventing one would mean moving fixtures
+/// away from the tests that own them; re-exporting the four that a second module needs
+/// is the smaller change. Copying them into `cmd::gate` was the alternative and is
+/// worse: `FailingForceWakeStore` is the append-then-`force_wake` ORDER discriminator
+/// for both commands, and two copies of it are two places for that guard to rot
+/// independently.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::{EffectClass, EffectId, EffectOutput, Graph, NodeId, TokenUsage};
     use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
     use std::sync::Arc;
 
-    fn now() -> DateTime<Utc> {
+    pub(crate) fn now() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(3_000_000, 0).unwrap()
     }
 
@@ -1173,7 +1201,10 @@ mod tests {
     }
 
     /// A run enqueued then recorded paused with a deadline.
-    async fn paused_store(run: RunId, next_wake: Option<DateTime<Utc>>) -> InMemorySchedulerStore {
+    pub(crate) async fn paused_store(
+        run: RunId,
+        next_wake: Option<DateTime<Utc>>,
+    ) -> InMemorySchedulerStore {
         let s = InMemorySchedulerStore::default();
         s.enqueue(run, &empty_graph(), now()).await.unwrap();
         s.record_paused(run, next_wake, "quota: rate limited")
@@ -1518,7 +1549,7 @@ mod tests {
     /// here would short-circuit via `?` and the append would never run — the journal
     /// would end up with NO `BudgetRaised` event at all. Because the real order appends
     /// first, the event lands durably even though the subsequent `force_wake` fails.
-    struct FailingForceWakeStore(InMemorySchedulerStore);
+    pub(crate) struct FailingForceWakeStore(pub(crate) InMemorySchedulerStore);
 
     #[async_trait::async_trait]
     impl SchedulerStore for FailingForceWakeStore {
@@ -2236,7 +2267,7 @@ mod tests {
 
     /// A journal seeded with a node that has begun awaiting a signal — the state the
     /// executor's `run_await_signal` leaves behind on its first execution.
-    async fn awaiting_journal(
+    pub(crate) async fn awaiting_journal(
         run: RunId,
         node: &NodeId,
         deadline: Option<DateTime<Utc>>,
@@ -2654,6 +2685,60 @@ mod tests {
         assert_eq!(
             signals[0]["decision"], "approved",
             "the DECISION must survive redaction: {durable}"
+        );
+    }
+
+    /// AC7, half two: a `HumanGate` is answerable ONLY by `GateDecided`, so `run signal`
+    /// must refuse one — and point at the command that works.
+    ///
+    /// This is not a politeness. Without it a raw `--payload '{}'` writes a
+    /// `SignalReceived` for a gate node and bypasses every validation s2 adds: the menu
+    /// check, the outcome mapping and the required reason. (The executor would not honour
+    /// that row — `run_human_gate` reads only `GateDecided` — so the operator would be
+    /// told "signalled" for a delivery that can never be read, which is the reporting
+    /// failure §6.6 forbids as much as the bypass itself.)
+    #[tokio::test]
+    async fn signal_on_a_human_gate_is_refused_and_points_at_run_gate() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = InMemoryJournal::new();
+        j.append(
+            run,
+            JournalEvent::GateAwaited {
+                node: gate(),
+                deadline: None,
+                options: vec![orchestrator_core::GateOption {
+                    name: "ship".into(),
+                    outcome: orchestrator_core::GateOutcome::Complete,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = signal(&s, &j, run, gate(), approved(), now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("HumanGate"),
+            "must name what the node actually is: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("run gate"),
+            "must name the command that would work: {}",
+            out.text
+        );
+        assert!(
+            journaled_signals(&j, run, &gate()).await.is_empty(),
+            "a raw payload must never become a durable answer to a gate"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and must not queue a wake"
         );
     }
 
