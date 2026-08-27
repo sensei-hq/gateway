@@ -21,6 +21,7 @@ mod dispatch;
 mod durability;
 mod expand;
 mod fanout;
+mod gate;
 pub(crate) mod selector;
 mod signal;
 mod subgraph;
@@ -310,9 +311,10 @@ impl Fold {
     }
 
     /// SP-6 s2: the decision folded for this `HumanGate`, if a human has answered.
-    /// `#[allow(dead_code)]` until Task 5 calls it from `run_human_gate` — the same
-    /// staging s1 used for `signal_for`/`deadline_for` (see that slice's Task 2).
-    #[allow(dead_code)]
+    ///
+    /// Read by [`run_human_gate`](Executor::run_human_gate) only AFTER the ask has been
+    /// journaled and only AFTER `gate_precheck`/`wait_or_expire` have had their say — an
+    /// answer counts only while the node was still asking.
     fn gate_decision_for(&self, node: &NodeId) -> Option<&GateDecision> {
         self.gate_decisions.get(node)
     }
@@ -325,8 +327,10 @@ impl Fold {
     /// against the GRAPH in that one path would reintroduce exactly the non-durable menu
     /// §4 rejects, so the ask is unconditional and the answer is read against the menu it
     /// just published.
-    /// `#[allow(dead_code)]` until Task 5 calls it from `run_human_gate`.
-    #[allow(dead_code)]
+    ///
+    /// It is therefore read by [`run_human_gate`](Executor::run_human_gate) only on the
+    /// `Waiting` arm — the drive that FIRST asks resolves against the menu it just
+    /// journaled, which this snapshot of the journal cannot yet see.
     fn menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::GateOption]> {
         self.menus.get(node).map(Vec::as_slice)
     }
@@ -1141,38 +1145,16 @@ impl Executor {
             NodeKind::AwaitSignal { timeout } => {
                 self.run_await_signal(run, node, *timeout, fold).await
             }
-            // SP-6 s2 Task 2: placeholder arm — Task 5 implements this for real
-            // (`run_human_gate`). The s1 Task 1 precedent for `AwaitSignal` used
-            // `unimplemented!()` here; a code-quality review of THIS slice found that
-            // unsound, because it is a REACHABLE worker panic on a graph `validate_dag`
-            // just certified well-formed (`run_inner`/`start_inner` both call it before
-            // ever reaching this match). A panic here is not local: `Scheduler::submit`
-            // enqueues the durable store row BEFORE the drive, so it leaves a
-            // `(Waking, next_wake: None)` row that every later `tick()` reclaims and
-            // panics on again — the exact poison-pill shape `signal.rs`'s
-            // `checked_add_signed` step already exists to prevent for `AwaitSignal`, and
-            // this repo's rule (`signal.rs`: "a node kind is not allowed to panic on its
-            // own") applies to an unimplemented arm exactly as it does to an overflow.
-            // Fail the NODE loudly and locally instead — the run stops, the worker does
-            // not — until Task 5 gives it a real implementation.
-            NodeKind::HumanGate { .. } => {
-                let message = format!(
-                    "human_gate: node {} is not yet executable (SP-6 s2 Task 5 implements \
-                     this arm)",
-                    node.id.0
-                );
-                self.append(
-                    run,
-                    JournalEvent::NodeFailed {
-                        node: node.id.clone(),
-                        error: message.clone(),
-                    },
-                )
-                .await?;
-                Ok(NodeExec::Failed {
-                    message,
-                    output: None,
-                })
+            // SP-6 s2: the typed gate, over the SAME shared waiting machinery as
+            // `AwaitSignal` above (`gate_precheck`/`wait_or_expire`/`pause_awaiting`).
+            // Like every other arm here it fails the NODE rather than panicking — a panic
+            // in this match is not local: it unwinds through `Scheduler::tick`, which has
+            // already claimed a batch of runs and taken their leases, leaving
+            // `(Waking, next_wake: None)` rows that every later `tick()` reclaims and
+            // dies on again.
+            NodeKind::HumanGate { options, timeout } => {
+                self.run_human_gate(run, node, options, *timeout, fold)
+                    .await
             }
         }
     }
