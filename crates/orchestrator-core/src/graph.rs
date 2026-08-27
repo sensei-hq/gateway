@@ -610,13 +610,26 @@ impl Graph {
             let Some(options) = gates.get(on) else {
                 continue;
             };
-            let armed: HashSet<&str> = arms
+            // The arms in DECLARATION order, kept alongside the set. Both are needed and
+            // they are not interchangeable: the set answers membership, the vector decides
+            // what the message SAYS. Reporting off a `HashSet` walk — which this block did
+            // — made the arm named vary between processes on identical input, and the same
+            // applies to the `options` recital below. That is not cosmetic: `feasible`
+            // wraps this text as `PlanError::Structural`, `ValidatePlan` (a **Pure** tool)
+            // returns it as its memoized output, and `drive_expand` journals it in a
+            // `NodeFailed` — so a per-process ordering is a resume `DeterminismViolation`.
+            // `feasible` itself sorts its errors for exactly this reason, and its sort key
+            // is `format!("{a:?}")` OVER THESE STRINGS, so a varying message also reorders
+            // the vector around it. Block 2b-ter already keeps its `HashSet` for
+            // membership only (`seen`); this is the same discipline.
+            let armed_in_order: Vec<&str> = arms
                 .iter()
                 .filter_map(|(cond, _)| match cond {
                     BranchCond::FieldEquals(field, value) if field == "decision" => value.as_str(),
                     _ => None,
                 })
                 .collect();
+            let armed: HashSet<&str> = armed_in_order.iter().copied().collect();
             for o in options
                 .iter()
                 .filter(|o| o.outcome == GateOutcome::Complete)
@@ -631,7 +644,7 @@ impl Graph {
                 }
             }
             let declared: HashSet<&str> = options.iter().map(|o| o.name.as_str()).collect();
-            for a in &armed {
+            for a in &armed_in_order {
                 if !declared.contains(a) {
                     return Err(OrchestratorError::InvalidGraph(format!(
                         "branch node {:?} has an arm for {:?}, which human_gate {:?} does \
@@ -639,7 +652,11 @@ impl Graph {
                         node.id,
                         a,
                         on,
-                        declared.iter().copied().collect::<Vec<_>>().join(", ")
+                        options
+                            .iter()
+                            .map(|o| o.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )));
                 }
             }
@@ -1064,6 +1081,65 @@ mod tests {
             .validate_dag()
             .expect_err("shipp is undeclared");
         assert!(format!("{e}").contains("shipp"), "{e}");
+    }
+
+    /// **This message must be byte-identical across processes**, because it does not stay
+    /// a message: `feasible` wraps it as `PlanError::Structural(e.to_string())`, which
+    /// `ValidatePlan::call` returns as its output — and `ValidatePlan` is a **Pure** tool,
+    /// whose memoized output must be deterministic or a resume raises a
+    /// `DeterminismViolation`. `Executor::drive_expand` journals the same text as
+    /// `NodeFailed { error: "… infeasible plan: {errs:?}" }`. `feasible`'s own error sort
+    /// (`errs.sort_by(format!("{a:?}"))`) is keyed on these strings too, so a varying
+    /// message reorders the whole vector as well as itself.
+    ///
+    /// Both halves used to iterate `HashSet`s, and both varied. Measured across six
+    /// consecutive processes: six different orderings of the recited menu, and — with two
+    /// undeclared arms — the arm NAMED alternated between runs on identical input.
+    /// `plan.rs` already sorts `feasible`'s errors for exactly this stated reason; this is
+    /// the same rule one layer down.
+    ///
+    /// The two literals are pinned in DECLARATION order specifically because neither is
+    /// alphabetical: `ship, hold, escalate, reject` sorts to `escalate, hold, reject,
+    /// ship`, and `zzz_first` precedes `aaa_second` only in the order the author wrote the
+    /// arms. A `HashSet` walk, or a sort, fails both.
+    #[test]
+    fn an_undeclared_arm_is_reported_deterministically_in_declaration_order() {
+        let options = vec![
+            opt("ship", GateOutcome::Complete),
+            opt("hold", GateOutcome::Complete),
+            opt("escalate", GateOutcome::Complete),
+            opt("reject", GateOutcome::Fail),
+        ];
+
+        // (a) the recited MENU is the gate's `options`, in the order they are declared.
+        let e = gate_then_branch(vec!["ship", "hold", "escalate", "typo"], options.clone())
+            .validate_dag()
+            .expect_err("`typo` is undeclared");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("its options are: ship, hold, escalate, reject"),
+            "the menu must be recited in DECLARATION order — this string is journaled and \
+             memoized by a Pure tool, so a per-process ordering is a resume divergence: \
+             {msg}"
+        );
+
+        // (b) with TWO undeclared arms, the one NAMED is the first in `arms` order.
+        let e = gate_then_branch(
+            vec!["ship", "hold", "escalate", "zzz_first", "aaa_second"],
+            options,
+        )
+        .validate_dag()
+        .expect_err("both extra arms are undeclared");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("zzz_first"),
+            "the FIRST offending arm in declaration order is the one reported: {msg}"
+        );
+        assert!(
+            !msg.contains("aaa_second"),
+            "…and only that one — reporting whichever the set happened to yield is what \
+             made the arm named alternate between processes: {msg}"
+        );
     }
 
     /// A gate with NO Branch downstream is legal: approve-or-stop is the common shape and
