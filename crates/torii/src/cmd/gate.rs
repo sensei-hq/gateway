@@ -51,6 +51,15 @@ use orchestrator_core::{
 /// folded `NodeFailed` before the decision was ever read. The operator was told their
 /// approval landed; it provably had not.
 ///
+/// **And the gate's own DEADLINE is checked against `now`.** `run_human_gate` takes
+/// `WaitState::Expired` before it reads any decision, so a decision appended after the
+/// recorded instant can never approve the gate — it only makes the next tick terminally
+/// fail the run, having reported success here. This is not an unavoidable race: the
+/// deadline is durable on `GateAwaited` and `now` is a parameter, so the answer is
+/// deterministic at this layer. It is still not ATOMIC (the executor re-checks on its own
+/// clock at fold time), so it NARROWS the window rather than closing it — exactly what
+/// `run_human_gate`'s `Expired` arm says this command does.
+///
 /// **What it deliberately does NOT check: whether a SECOND decision is redundant.** A gate
 /// that already COMPLETED is caught by the `signal_state` arm; but two decisions delivered
 /// while the node is still awaiting both land, and the later one is a last-wins value the
@@ -120,6 +129,24 @@ pub async fn decide(
     // matched by the same catch-all rather than special-cased, because it must never be
     // able to report success.
     match signal_state(&events, &node) {
+        // The SLA has run out. `>=`, and `now` against the JOURNALED instant, because that
+        // is exactly `wait_or_expire`'s test (`Some(d) if self.clock.now() >= d` ⇒
+        // `WaitState::Expired`) — a boundary invented here instead of copied would accept
+        // decisions the executor is about to reject, which is the failure this arm exists
+        // to stop. Refusing is the whole gain: the alternative is a journaled decision, an
+        // exit 0 reading `decided:`, and a next tick that terminally fails the run.
+        //
+        // Deterministic, not a race: the deadline is durable and `now` is a parameter.
+        // Still not ATOMIC — the executor re-checks on its own clock at fold time, and a
+        // decision that leaves here validly can arrive after that clock has passed the
+        // instant — so this NARROWS the window and the executor stays the authority.
+        SignalState::Awaiting { deadline: Some(d) } if now >= d => {
+            return Ok(Outcome::precondition(format!(
+                "not delivered: {shown}'s deadline passed at {d} — an expired gate is \
+                 failed before any decision is read, so this would terminally fail the \
+                 run rather than approve it. Start a new run."
+            )));
+        }
         SignalState::Awaiting { .. } => {}
         other => return Ok(Outcome::precondition(not_delivered(&shown, &other))),
     }
@@ -748,6 +775,75 @@ pub(crate) mod tests {
             None,
             "and the run must not be woken for a decision nothing will read"
         );
+    }
+
+    /// A gate whose SLA has run out cannot be approved, and this command can say so
+    /// DETERMINISTICALLY rather than leaving it to the next tick: the deadline is on the
+    /// journal (`GateAwaited.deadline`) and `now` is a parameter, so nothing here is a
+    /// race. Without the check the decision is journaled and reported exit 0, and the next
+    /// drive takes `WaitState::Expired` and terminally fails the run — the same lie about a
+    /// landed approval as the terminal-node case above, one tick earlier.
+    #[tokio::test]
+    async fn a_decision_after_the_gates_deadline_is_refused() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(
+            run,
+            &release(),
+            Some(now() - chrono::Duration::hours(1)),
+            &["ship"],
+        )
+        .await;
+
+        let out = decide(&s, &j, run, release(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "the deadline is an hour behind `now` — the executor will fail this gate \
+             before it reads any decision: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("deadline"),
+            "must name what ran out, so the operator does not simply retry: {}",
+            out.text
+        );
+        assert!(
+            journaled_decisions(&j, run, &release()).await.is_empty(),
+            "an expired gate must leave NOTHING durable — a late decision on the journal \
+             is what a re-`start` would fold as an approval"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and must not queue a wake"
+        );
+    }
+
+    /// The boundary the refusal above sits on is the EXECUTOR's (`now >= deadline` ⇒
+    /// `WaitState::Expired`), not one invented here, and a deadline still in the future is
+    /// the other side of it. Without this, refusing every timed gate outright would leave
+    /// the suite green while making the whole timed class undecidable.
+    #[tokio::test]
+    async fn a_decision_before_the_gates_deadline_is_delivered() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(
+            run,
+            &release(),
+            Some(now() + chrono::Duration::seconds(1)),
+            &["ship"],
+        )
+        .await;
+
+        let out = decide(&s, &j, run, release(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+        assert_eq!(journaled_decisions(&j, run, &release()).await.len(), 1);
     }
 
     /// `waking` is TRANSIENT — a worker holds the lease and is folding this journal right

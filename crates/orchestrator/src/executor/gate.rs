@@ -38,13 +38,12 @@ impl Executor {
     /// just published: the early decision is still honoured in the same execution, and
     /// there is never a decision without a menu.
     ///
-    /// **Validation is enforced HERE, and it is the ONLY layer that enforces it today.**
-    /// `torii run gate decide` does not exist yet — Task 7 adds it, and it WILL pre-check
-    /// the option against the journaled menu. That will make an undeclared option rare;
-    /// it will not make this check redundant, because the CLI's pre-check and its append
-    /// are not atomic and the library entry point bypasses the CLI entirely, so it can
-    /// report honestly but cannot stop the row existing. Same conclusion s1 reached for
-    /// the terminal guard. Until Task 7 lands there is no first layer at all.
+    /// **Validation is enforced HERE, and this is the layer that DECIDES it.** `torii run
+    /// gate decide` now pre-checks the option against the journaled menu, which makes an
+    /// undeclared option rare; it does not make this check redundant, because the CLI's
+    /// pre-check and its append are not atomic and the library entry point bypasses the
+    /// CLI entirely, so the CLI can report honestly but cannot stop the row existing. Same
+    /// conclusion s1 reached for the terminal guard.
     ///
     /// **The `options` parameter is used for the very first ask and NOWHERE else.** Every
     /// later drive resolves the decision against `fold.menu_for`, so an author editing the
@@ -120,9 +119,11 @@ impl Executor {
             }
             // The recorded deadline has passed ⇒ FAIL, loudly, naming the node and the
             // instant — and BEFORE any decision is read, so a decision appended after the
-            // deadline can never approve a gate whose SLA had in fact run out. (Task 7's
-            // CLI will pre-check the deadline too, but non-atomically, so it will narrow
-            // the window and never close it.) A default "approved" payload
+            // deadline can never approve a gate whose SLA had in fact run out. (`torii run
+            // gate decide` pre-checks the deadline too — against the journaled instant,
+            // with the same `now >= d` boundary — but non-atomically, so it narrows the
+            // window and never closes it. This arm remains the authority.) A default
+            // "approved" payload
             // on timeout was deliberately rejected (§4): a gate that approves itself is
             // the footgun this codebase's fail-closed stance argues against.
             Ok(WaitState::Expired(d)) => {
