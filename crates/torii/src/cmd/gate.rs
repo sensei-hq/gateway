@@ -50,7 +50,9 @@ pub enum GateAction {
         #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
         r#as: String,
         /// Free text recorded alongside the decision. It becomes part of this node's
-        /// output, so it flows into downstream nodes and model prompts.
+        /// output, so it flows into downstream nodes and model prompts. Max 4096 bytes
+        /// as stored — redaction replaces secret-shaped text with the longer literal
+        /// `[REDACTED]`, so a note can cross the limit on the way to the journal.
         #[arg(long)]
         note: Option<String>,
     },
@@ -67,6 +69,8 @@ pub enum GateAction {
         #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
         r#as: String,
         /// Why. Required: failing a run without recording why is a bare `catch {}`.
+        /// Recorded as the decision's note, and bounded the same way: max 4096 bytes as
+        /// stored.
         #[arg(long)]
         reason: String,
     },
@@ -87,7 +91,9 @@ pub enum GateAction {
         #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
         r#as: String,
         /// Free text recorded alongside the decision. It becomes part of this node's
-        /// output, so it flows into downstream nodes and model prompts.
+        /// output, so it flows into downstream nodes and model prompts. Max 4096 bytes
+        /// as stored — redaction replaces secret-shaped text with the longer literal
+        /// `[REDACTED]`, so a note can cross the limit on the way to the journal.
         #[arg(long)]
         note: Option<String>,
     },
@@ -306,16 +312,38 @@ pub async fn decide(
     }
 
     let Some(chosen) = menu.iter().find(|o| o.name == option) else {
-        return Ok(Outcome::precondition(format!(
-            "not delivered: gate {shown} has no option {option:?}. Its options are: {}. \
-             Use: torii run gate decide {} --node {shown} --option <name>",
-            menu.iter()
-                .map(|o| o.name.as_str())
+        // The recited menu gets the SAME collapse and cap `render::awaiting_section`
+        // gives these very values, and for the same reasons: an option name is AUTHOR
+        // free text (a `run submit` file, a `scheduled_runs.graph` row, or a runtime
+        // `Expand` subgraph from a planner model), and `validate_dag` checks a gate's
+        // options only for non-emptiness, uniqueness and a reachable outcome — never for
+        // content or length. So a raw newline here would forge a line that reads as its
+        // own awaiting row, an ESC could rewrite what is already on screen, and one
+        // 5,000-character name would flood the refusal an operator has to read.
+        //
+        // `{option:?}` is left as Debug on purpose: it is the operator's OWN input and
+        // Debug already escapes it. The menu is Display and was not guarded at all.
+        let menu_shown = render::cap_chars(
+            &menu
+                .iter()
+                .map(|o| render::one_line(&o.name))
                 .collect::<Vec<_>>()
                 .join(", "),
+            render::MENU_MAX,
+        );
+        return Ok(Outcome::precondition(format!(
+            "not delivered: gate {shown} has no option {option:?}. Its options are: \
+             {menu_shown}. Use: torii run gate decide {} --node {shown} --option <name>",
             run.0
         )));
     };
+
+    // The option is echoed back on every SUCCESS line below, and by this point it is a
+    // journaled option name (it was matched against the menu), i.e. the same author free
+    // text the refusal above collapses — so it gets the same collapse. Display-only: the
+    // value journaled on `GateDecided.option` is the one the operator supplied, because
+    // that is what the executor re-matches against the menu.
+    let chosen_shown = render::one_line(&chosen.name);
 
     // A Fail option must record WHY. CLI-layer only, deliberately: `GateDecided.note`
     // stays `Option` because a `Complete` decision legitimately has none, and an absent
@@ -389,6 +417,33 @@ pub async fn decide(
             .unwrap_or("[REDACTED]")
             .to_string()
     });
+
+    // §6.5, the same cap `cmd::run::signal` enforces on the same durable column, through
+    // the same helper — never a second bound that could drift from it. `GateDecided.note`
+    // was appended with no length check at all, and `ARG_MAX` permits a ~120 KB `--note`:
+    // 30x this limit, journaled durably, reloaded on every drive, folded into the gate's
+    // output on a `Complete` option and carried in every downstream Agent's prompt for the
+    // life of the run.
+    //
+    // Measured AFTER the redaction and checked BEFORE the append, so the bytes bounded are
+    // exactly the bytes written. Checking the raw note would bound a value nobody stores:
+    // `[REDACTED]` is longer than the shortest span it replaces, so redaction can GROW the
+    // note past the cap — the defect `signal` shipped once and fixed, recorded on
+    // `Measured`. There is no as-given pre-check here (`signal` has one) because a note is
+    // a `String`, not arbitrary JSON: the redactor is ReDoS-safe by construction and the
+    // only thing left to bound is the row.
+    //
+    // A hard error (exit 1), matching `signal` exactly: exit 2 in this taxonomy means "ran
+    // fine, nothing to do", and an over-limit note is invalid INPUT. Two writers to one
+    // column must not disagree about the exit code for one violation.
+    if let Some(n) = &note {
+        crate::cmd::run::check_payload_size(
+            &serde_json::json!(n),
+            crate::cmd::run::Measured::AfterRedaction,
+            "the decision note",
+        )
+        .map_err(CliError::error)?;
+    }
 
     // The appended seq is KEPT, not discarded: it is what names the durable row in the
     // post-append fault report below, so an operator can find the write that succeeded.
@@ -466,8 +521,9 @@ pub async fn decide(
             // completion (not proven): a duplicate decision already on the journal is
             // last-wins, so which one the drive folded is not observable from here.
             (SignalState::Completed, true) => Outcome::ok(format!(
-                "decided: {shown} = {option} (a drive already in flight completed the node \
-                 after the decision landed, so the run is moving without waiting for a tick)"
+                "decided: {shown} = {chosen_shown} (a drive already in flight completed the \
+                 node after the decision landed, so the run is moving without waiting for a \
+                 tick)"
             )),
             // Terminated AFTER our row, but NOT by completing — an expired deadline, or a
             // cascade skip. That drive had loaded the journal before our row landed, so it
@@ -513,7 +569,7 @@ pub async fn decide(
         // Says QUEUED, never RESUMED: `force_wake` only sets `next_wake`; a worker tick
         // does the driving.
         Outcome::ok(format!(
-            "decided: {shown} = {option} (the run will resume on the next worker tick)"
+            "decided: {shown} = {chosen_shown} (the run will resume on the next worker tick)"
         ))
     } else if after.status.is_terminal() {
         // The run is over while the node itself never terminated — `cancel`/
@@ -602,7 +658,9 @@ fn actor_or(supplied: &str, from_env: Option<&str>) -> String {
 pub(crate) mod tests {
     use super::*;
 
-    use crate::cmd::run::tests::{FailingForceWakeStore, awaiting_journal, now, paused_store};
+    use crate::cmd::run::tests::{
+        FORGED_RUN, FailingForceWakeStore, awaiting_journal, now, paused_store,
+    };
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::{
         GateOption, GateOutcome, Graph, JournalEvent, NodeId, RunId, RunStatus, SchedulerStore,
@@ -1422,6 +1480,190 @@ pub(crate) mod tests {
             !out.text.contains("once it is paused again"),
             "a cancelled run never pauses again — this is advice to wait forever: {}",
             out.text
+        );
+    }
+
+    /// Neither hazard an option name carries may survive into `decide`'s stdout: no raw
+    /// ESC (which could rewrite what is already on screen) and no line that reads as an
+    /// awaiting row an operator might paste into `run cancel`.
+    fn assert_clean(what: &str, text: &str) {
+        assert!(
+            !text.contains('\u{1b}'),
+            "{what}: a raw escape byte survived into the output: {text:?}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.trim_start().starts_with(FORGED_RUN))
+                .count(),
+            0,
+            "{what}: a newline in an option name forged a line that reads as its own \
+             awaiting row:\n{text}"
+        );
+    }
+
+    /// An option name is AUTHOR free text and it reaches this command's stdout on TWO
+    /// paths — so both get the collapse `render::awaiting_section` already applies to the
+    /// very same values (`one_line` + `cap_chars`), which `decide` did not.
+    ///
+    /// "Author free text" is not hypothetical here: a menu arrives from a `run submit`
+    /// JSON file, a `scheduled_runs.graph` row, or a runtime `Expand` subgraph produced by
+    /// a planner model — and `validate_dag` checks a `HumanGate`'s options only for
+    /// non-emptiness, uniqueness and a reachable outcome, never for content. So
+    /// `"ship\n<uuid>  release  approved\u{1b}[2K"` is accepted, journaled verbatim, and
+    /// recited back here.
+    ///
+    /// The `{option:?}` interpolations elsewhere in this function are Debug-escaped and
+    /// already safe; these two are Display.
+    #[tokio::test]
+    async fn a_hostile_option_name_cannot_forge_a_line_or_move_the_cursor() {
+        let hostile = format!("ship\n{FORGED_RUN}  release  approved\u{1b}[2K");
+
+        // (a) THE REFUSAL, which recites the whole journaled menu back so the operator
+        // can retype it.
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &[&hostile]).await;
+        let refused = decide(&s, &j, run, release(), "nope", "alice", None, now())
+            .await
+            .expect("no hard error");
+        assert_eq!(refused.code, EXIT_PRECONDITION, "{}", refused.text);
+        assert_clean("the recited menu", &refused.text);
+
+        // (b) THE SUCCESS LINE, which echoes the option that was picked — and it is
+        // picked BY MATCHING the journaled menu, so it is the same author free text, not
+        // something the operator invented.
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &[&hostile]).await;
+        let ok = decide(&s, &j, run, release(), &hostile, "alice", None, now())
+            .await
+            .expect("no hard error");
+        assert_eq!(ok.code, EXIT_OK, "{}", ok.text);
+        assert_clean("the success line", &ok.text);
+    }
+
+    /// The recited menu is CAPPED as well as collapsed, for the reason `MENU_MAX` exists:
+    /// `validate_dag` bounds neither an option name's length nor how many there are, so
+    /// one 5,000-character name turns a refusal an operator has to READ into a screenful
+    /// of scrollback. `list-paused` guards the identical values with
+    /// `an_overlong_menu_is_capped_so_it_cannot_wreck_the_block`.
+    #[tokio::test]
+    async fn an_overlong_menu_is_capped_in_the_refusal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let long = "s".repeat(5_000);
+        let j = gate_journal(run, &release(), None, &[&long]).await;
+
+        let out = decide(&s, &j, run, release(), "nope", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.chars().count() < 700,
+            "an unbounded menu floods the refusal: {} chars",
+            out.text.chars().count()
+        );
+        assert!(
+            out.text.contains('…'),
+            "truncation must be visible: {}",
+            out.text
+        );
+    }
+
+    /// §6.5 for the OTHER writer to the same durable column. `cmd::run::signal` enforces
+    /// `MAX_PAYLOAD_BYTES` because "an unbounded JSON blob in a journal row is a durable
+    /// footgun … the cap is enforced HERE, at the only writer, by rejecting" — and
+    /// `GateDecided.note` was appended with no length check at all. `ARG_MAX` permits a
+    /// ~120 KB `--note`, which is 30x the sibling's limit, and the row is durable: it is
+    /// reloaded on every drive, folded into the gate's output on a `Complete` option, and
+    /// carried in every downstream Agent's prompt for the life of the run.
+    ///
+    /// Exit 1, matching `signal` exactly: exit 2 in this taxonomy means "ran fine, nothing
+    /// to do", and an over-limit note is invalid INPUT. The two writers must not disagree
+    /// about the exit code for one violation.
+    #[tokio::test]
+    async fn an_oversized_note_is_rejected_before_anything_is_journaled() {
+        use crate::cmd::run::MAX_PAYLOAD_BYTES;
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship"]).await;
+        let huge = "x".repeat(MAX_PAYLOAD_BYTES + 1000);
+
+        let e = decide(&s, &j, run, release(), "ship", "alice", Some(&huge), now())
+            .await
+            .expect_err("an over-limit note is refused");
+
+        assert_eq!(e.code, crate::errors::EXIT_ERROR, "{}", e.message);
+        assert!(
+            e.message.contains(&MAX_PAYLOAD_BYTES.to_string()),
+            "must name the limit: {}",
+            e.message
+        );
+        assert!(
+            !e.message.contains(&huge),
+            "and must not echo the note back: {}",
+            e.message
+        );
+        assert!(
+            journaled_decisions(&j, run, &release()).await.is_empty(),
+            "an over-limit note must never reach the journal"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and a refused decision must not queue a wake"
+        );
+    }
+
+    /// The cap is measured on the REDACTED note — the bytes actually written — not on
+    /// what the operator typed. `[REDACTED]` is 10 bytes and the assignment pattern's
+    /// shortest matched value is 6, so redaction GROWS a note of short `token:…` pairs by
+    /// roughly 1.67x; a check placed before the scrub bounds a value nobody stores. That
+    /// is a defect `signal` shipped once and fixed, and its `Measured` doc records the
+    /// measurement.
+    ///
+    /// The pair is assembled at runtime: the repo's Semgrep CWE-798 hook blocks a
+    /// credential-shaped literal in a fixture.
+    #[tokio::test]
+    async fn a_note_that_only_exceeds_the_cap_after_redaction_is_rejected() {
+        use crate::cmd::run::MAX_PAYLOAD_BYTES;
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship"]).await;
+
+        // The trailing space is load-bearing: without a separator the value class runs to
+        // the end of the string and the whole run collapses into ONE placeholder, which
+        // shrinks rather than grows.
+        let unit = format!("{}:{} ", "token", "abcdef");
+        let raw = unit.repeat(310);
+        let as_given = serde_json::to_vec(&serde_json::json!(raw)).unwrap().len();
+        let journaled = serde_json::to_vec(&render::redact_payload(&serde_json::json!(raw)))
+            .unwrap()
+            .len();
+        assert!(
+            as_given <= MAX_PAYLOAD_BYTES,
+            "precondition: this note is under the cap as typed ({as_given} bytes)"
+        );
+        assert!(
+            journaled > MAX_PAYLOAD_BYTES,
+            "precondition: redaction GROWS it past the cap ({as_given} -> {journaled} bytes)"
+        );
+
+        let e = decide(&s, &j, run, release(), "ship", "alice", Some(&raw), now())
+            .await
+            .expect_err("a note that would exceed the cap once redacted is refused");
+
+        assert_eq!(e.code, crate::errors::EXIT_ERROR, "{}", e.message);
+        assert!(
+            e.message.contains(&journaled.to_string()),
+            "must name the size that would actually be JOURNALED ({journaled}), not the \
+             one the operator typed: {}",
+            e.message
+        );
+        assert!(
+            journaled_decisions(&j, run, &release()).await.is_empty(),
+            "an over-limit row must never reach the journal"
         );
     }
 
