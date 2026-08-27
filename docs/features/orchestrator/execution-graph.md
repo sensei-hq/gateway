@@ -10,10 +10,11 @@ source: crates/orchestrator*
 
 # Execution Graph
 
-> **Status: Partial (Phase 3 · SP-1/3 · SP-6-1).** Design §10. Implemented node kinds:
+> **Status: Partial (Phase 3 · SP-1/3 · SP-6-2).** Design §10. Implemented node kinds:
 > `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`** (leaf + graph bodies +
 > gate-agent), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
-> PlanDelta / planner-driven), and **`AwaitSignal`** (SP-6 s1 — the HITL primitive).
+> PlanDelta / planner-driven), **`AwaitSignal`** (SP-6 s1 — the HITL primitive) and
+> **`HumanGate`** (SP-6 s2 — the typed menu over it).
 > Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
 > scheduler are live.
 >
@@ -92,7 +93,8 @@ source: crates/orchestrator*
 >   like `Subgraph`.
 > - **`AwaitSignal { timeout: Option<Duration> }`** (SP-6 s1) — the **HITL primitive**: a
 >   node that PAUSES until an external signal arrives, with an optional deadline that
->   **fails** it. `HumanGate` (s2) and human-as-Agent (s3) are typed wrappers over it. A
+>   **fails** it. `HumanGate` (s2, landed) and human-as-Agent (s3, planned) are the typed
+>   wrappers over it. A
 >   three-way fold read over two node-keyed journal events (`SignalAwaited{node,deadline}`
 >   · `SignalReceived{node,payload}`, both new variants ⇒ `FORMAT_VERSION` stays 1),
 >   **preceded by a terminal check**: a folded `NodeFailed` for this node returns `Failed`
@@ -110,21 +112,33 @@ source: crates/orchestrator*
 >   PANICKED the executor on `now + timeout`; longer than a century is not a deadline, it is
 >   `None`. Operator surface: **`torii run signal <run> --node <id> (--payload | --payload-file)`**;
 >   `torii run list-paused` names every awaiting node and its deadline.
-> - **`HumanGate { options, timeout }`** (SP-6 s2, landing — the kind and its
->   `validate_dag` rules are in; the executor arm, the fold and the CLI land later in
->   this slice, so an author who writes one today gets a loud `NodeFailed`, not a run,
->   until Task 5 lands). The TYPED layer over `AwaitSignal`: a human picks one of an
->   enumerated menu, and each `GateOption` declares its own
+> - **`HumanGate { options, timeout }`** (SP-6 s2) — the TYPED layer over `AwaitSignal`: a
+>   human picks one of an enumerated menu, and each `GateOption` declares its own
 >   `GateOutcome` — `Complete` (the decision becomes the node's output, dependents run)
 >   or `Fail` (`NodeFailed`, hard-edge dependents cascade-skip). Output on `Complete` is
 >   `{"decision","actor","note"}`, which `BranchCond::FieldEquals("decision", …)` matches
->   directly, so `Branch` is reused unchanged. The MENU IS DURABLE: `GateAwaited` journals
+>   directly, so `Branch` is reused unchanged. **`actor` is ATTRIBUTION, not
+>   AUTHENTICATION**: it is whatever string the caller supplied (`--as`, defaulting to
+>   `$USER`), so it records who *claimed* to decide, and it must NOT be branched on as an
+>   access control — nothing rejects `FieldEquals("actor", "alice")`, because the
+>   exhaustiveness rule below filters arms on `field == "decision"` only, so an actor-keyed
+>   arm validates silently and an author could believe they had written two-person
+>   sign-off. The MENU IS DURABLE: `GateAwaited` journals
 >   the options the human was actually shown, so editing the graph cannot retroactively
 >   change what their answer meant. Answerable ONLY by `GateDecided` — a raw
->   `SignalReceived` on a gate is ignored. `validate_dag` rejects an empty menu, duplicate
+>   `SignalReceived` on a gate is ignored. A recorded deadline is checked BEFORE any
+>   decision is read, so a decision that lands late cannot approve an expired gate (its
+>   accepted cost: a decision delivered inside the SLA is discarded if no drive folds it
+>   before the deadline). `validate_dag` rejects an empty menu, duplicate
 >   or empty option names, a menu with no `Complete` option (a guaranteed dead end), and
->   the same timeout bounds as `AwaitSignal`. Operator surface:
->   `torii run gate approve|reject|decide`.
+>   the same timeout bounds as `AwaitSignal` — plus **conditional exhaustiveness**: when a
+>   `Branch.on` names a `HumanGate`, that Branch's arms must cover every `Complete` option
+>   and may name no option the gate does not declare. `Fail` options are exempt (a failing
+>   option never produces an output for a `Branch` to switch on) and a gate with NO
+>   `Branch` is legal — the rule fires only on the coupling. It is the only rule in this
+>   slice that rejects a graph whose `HumanGate` is itself correct. Operator surface:
+>   `torii run gate approve|reject|decide`; `torii run list-paused` renders each gate's
+>   menu (`gate: ship|hold`) beside its deadline.
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed
