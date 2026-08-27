@@ -7,12 +7,16 @@
 //! [`decide`]'s `AwaitSignal` arm and `signal`'s `HumanGate` arm.
 //!
 //! Everything that was hard-won in `signal` is reproduced here rather than re-derived:
-//! append THEN `force_wake`, the effect read back rather than assumed, and a post-append
-//! fault reported as a durable-but-unqueued answer instead of a bare store error. Read
-//! that function before changing this one.
+//! append THEN `force_wake`; a post-append fault reported as a durable-but-unqueued answer
+//! instead of a bare store error; the effect read back rather than assumed — from the
+//! JOURNAL as well as the scheduler row, because only the journal is node-keyed and only
+//! its ORDER says whether a racing drive READ the answer or orphaned it; and no refusal
+//! that advises waiting for a pause a terminal run will never reach. Each of those four is
+//! a defect `signal` shipped and fixed, and the first cut of this command re-derived three
+//! of them wrongly anyway. Read that function before changing this one.
 
 use crate::cmd::Outcome;
-use crate::cmd::run::{SignalState, not_delivered, signal_state};
+use crate::cmd::run::{SignalState, SignalStateAt, not_delivered, signal_state, signal_state_at};
 use crate::errors::CliError;
 use crate::render;
 use chrono::{DateTime, Utc};
@@ -283,6 +287,68 @@ pub async fn decide(
         Err(e) => return Ok(unread("the status re-read", &e)),
     };
 
+    // The JOURNAL is re-read too, not just the scheduler row — and that is the whole
+    // point. The scheduler row is RUN-level: it says the run is no longer paused, never
+    // whether THIS node read the decision. Reporting off the row alone inverted this
+    // command on its most successful path, exactly as it once did `signal`'s: a worker
+    // that claims the run the instant the decision lands folds our `GateDecided`,
+    // completes the gate and drives the run to completion — the decision worked
+    // perfectly — and the report said `not queued`, exit 2, advising `torii run wake`,
+    // which refuses every non-paused run and which no shipped store can ever satisfy.
+    let after_events = match journal.load(run).await {
+        Ok(evs) => evs,
+        Err(e) => return Ok(unread("the journal re-read", &e)),
+    };
+    // Terminal by now, or not. If it is, "not delivered" is FALSE — the row is already
+    // durable — and the honest question is whether anything READ it. The journal ORDER
+    // answers it, which is why the append's seq was kept: a terminal marker BEHIND our row
+    // means the drive that terminated the node folded a journal that already contained the
+    // decision; a marker AHEAD of it means the node was already dead when the row landed.
+    let SignalStateAt { state, at } = signal_state_at(&after_events, &node);
+    if let Some(at) = at {
+        return Ok(match (&state, at > appended) {
+            // Terminated AFTER our row, by completing: the decision was on the journal for
+            // the fold that completed it. A SUCCESS — the only difference from the
+            // ordinary path is that the run is already moving, so there is no tick to wait
+            // for and nothing for the operator to do.
+            //
+            // The wording claims the ORDERING (proven) and not authorship of the
+            // completion (not proven): a duplicate decision already on the journal is
+            // last-wins, so which one the drive folded is not observable from here.
+            (SignalState::Completed, true) => Outcome::ok(format!(
+                "decided: {shown} = {option} (a drive already in flight completed the node \
+                 after the decision landed, so the run is moving without waiting for a tick)"
+            )),
+            // Terminated AFTER our row, but NOT by completing — an expired deadline, or a
+            // cascade skip. That drive had loaded the journal before our row landed, so it
+            // never saw the decision. Reporting `decided` here would hide a failed gate
+            // behind a success.
+            (other, true) => Outcome::precondition(format!(
+                "not read: {shown}'s decision is journaled durably, but {shown} is {} — it \
+                 terminated while this decision was in flight, and a drive that had \
+                 already loaded the journal would not have seen it.",
+                other.as_str()
+            )),
+            // Terminated BEFORE our row landed: a true orphan. The pre-check refuses this
+            // shape, so reaching it means the node died inside the write window — worth
+            // saying plainly, because the residue is durable: a `HumanGate` journals no
+            // `NodeCompleted` and `NodeFailed` is not folded as a barrier, so a re-`start`
+            // would re-execute the gate and fold this late decision as its answer.
+            (other, false) => Outcome::precondition(format!(
+                "not read: {shown}'s decision is journaled durably, but {shown} was already \
+                 {} before the write landed, so nothing read it. The decision stays on the \
+                 journal as a last-wins value that a re-`start` of this run would fold as \
+                 the node's answer — do not treat this gate as decided.",
+                other.as_str()
+            )),
+        });
+    }
+
+    // `at: None` ⇒ nothing has terminated the node, so the decision is still there to be
+    // read and the only remaining question is the WAKE. (`NotAwaiting` also folds to
+    // `None`, but is unreachable: the pre-check read a `GateAwaited` and the journal is
+    // append-only, so this later read is a superset of that one.)
+
     // The effect actually achieved, read back rather than assumed. STATUS plus the pinned
     // timestamp, exactly as `wake` and `signal` check their own: `claim_due` leaves a
     // stale `next_wake` untouched and an unrelated re-pause can restore `paused` inside
@@ -299,10 +365,23 @@ pub async fn decide(
         Outcome::ok(format!(
             "decided: {shown} = {option} (the run will resume on the next worker tick)"
         ))
+    } else if after.status.is_terminal() {
+        // The run is over while the node itself never terminated — `cancel`/
+        // `record_terminal` journal no node event, so this is reachable. "Retry once it is
+        // paused again" would be advice to wait forever, the same dead end the pre-check
+        // arm above was already fixed for; the post-append arm must not reintroduce it.
+        Outcome::precondition(format!(
+            "not read: {shown}'s decision is journaled durably, but the run is {} — a {} \
+             run is never paused again, so nothing will ever read it. Start a new run.",
+            after.status.as_str(),
+            after.status.as_str()
+        ))
     } else {
         Outcome::precondition(format!(
             "not queued: {shown}'s decision is journaled durably, but the run is {} and \
-             the wake did not apply. Run `torii run wake {}` once it is paused again.",
+             the wake did not apply — the drive that claimed it may have folded the \
+             journal before the decision landed. Run `torii run wake {}` once it is paused \
+             again.",
             after.status.as_str(),
             run.0
         ))
@@ -904,6 +983,294 @@ pub(crate) mod tests {
         assert!(
             out.text.contains("run wake"),
             "must name what unblocks the run: {}",
+            out.text
+        );
+    }
+
+    /// A `SchedulerStore` that runs a concurrent worker against `run` at the top of
+    /// `force_wake` — i.e. exactly in the window between `decide`'s append and the point
+    /// where its effect becomes observable. `decide` appends BEFORE it calls `force_wake`,
+    /// so this models a worker that drove the run AFTER the decision landed: the drive
+    /// folds a journal that already contains our `GateDecided`, completes the gate
+    /// (`ContextWrite` under the node id — a `HumanGate` journals no `NodeCompleted`) and
+    /// finishes the run. The `force_wake` itself SUCCEEDS; it is simply a no-op, because
+    /// the row is no longer `paused`. Same technique as `cmd::run`'s `SignalRacingStore`:
+    /// single-threaded, deterministic, no database.
+    struct GateRacingStore {
+        inner: InMemorySchedulerStore,
+        journal: std::sync::Arc<InMemoryJournal>,
+        run: RunId,
+        drive: GateRacingDrive,
+    }
+
+    /// What the concurrent worker does to the run inside the delivery window — see
+    /// [`GateRacingStore`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum GateRacingDrive {
+        /// It folded the journal — which by then contains our decision — and completed the
+        /// gate with it, finishing the run.
+        CompletesTheNode,
+        /// An operator cancelled the run. `cancel` journals no NODE event, so the gate
+        /// still folds as awaiting while the run is over: the decision is durable, the
+        /// node never terminated, and nothing will ever read it.
+        CancelsTheRun,
+    }
+
+    #[async_trait::async_trait]
+    impl SchedulerStore for GateRacingStore {
+        async fn enqueue(
+            &self,
+            run: RunId,
+            graph: &Graph,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.enqueue(run, graph, now).await
+        }
+        async fn record_paused(
+            &self,
+            run: RunId,
+            next_wake: Option<chrono::DateTime<chrono::Utc>>,
+            reason: &str,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.record_paused(run, next_wake, reason).await
+        }
+        async fn record_terminal(
+            &self,
+            run: RunId,
+            status: RunStatus,
+            reason: Option<&str>,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.record_terminal(run, status, reason).await
+        }
+        async fn claim_due(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+            lease: chrono::Duration,
+            limit: usize,
+        ) -> Result<Vec<(RunId, Graph)>, orchestrator_core::OrchestratorError> {
+            self.inner.claim_due(now, lease, limit).await
+        }
+        async fn status(
+            &self,
+            run: RunId,
+        ) -> Result<Option<orchestrator_core::ScheduledRun>, orchestrator_core::OrchestratorError>
+        {
+            self.inner.status(run).await
+        }
+        async fn list_paused(
+            &self,
+        ) -> Result<Vec<orchestrator_core::ScheduledRun>, orchestrator_core::OrchestratorError>
+        {
+            self.inner.list_paused().await
+        }
+        async fn cancel(&self, run: RunId) -> Result<(), orchestrator_core::OrchestratorError> {
+            self.inner.cancel(run).await
+        }
+        async fn count_terminal_before(
+            &self,
+            before: chrono::DateTime<chrono::Utc>,
+        ) -> Result<u64, orchestrator_core::OrchestratorError> {
+            self.inner.count_terminal_before(before).await
+        }
+        async fn prune_terminal(
+            &self,
+            before: chrono::DateTime<chrono::Utc>,
+        ) -> Result<u64, orchestrator_core::OrchestratorError> {
+            self.inner.prune_terminal(before).await
+        }
+        async fn force_wake(
+            &self,
+            run: RunId,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<(), orchestrator_core::OrchestratorError> {
+            if run != self.run {
+                return self.inner.force_wake(run, now).await;
+            }
+            match self.drive {
+                GateRacingDrive::CompletesTheNode => {
+                    // A worker's tick claims the run (`paused -> waking`), and its drive
+                    // folds the journal — which by now contains our decision — completes
+                    // the gate and finishes the run.
+                    self.inner
+                        .claim_due(now, chrono::Duration::seconds(60), 10)
+                        .await?;
+                    crate::cmd::run::tests::append_completion(&self.journal, run, &release()).await;
+                    self.journal.append(run, JournalEvent::RunCompleted).await?;
+                    self.inner
+                        .record_terminal(run, RunStatus::Completed, None)
+                        .await?;
+                }
+                // No claim and no journal write at all: `cancel` is unconditional and
+                // node-blind, which is exactly what leaves the gate folding as awaiting on
+                // a run that is over.
+                GateRacingDrive::CancelsTheRun => self.inner.cancel(run).await?,
+            }
+            // Our own force_wake: succeeds, but is a conditional no-op now that the row is
+            // no longer `paused`.
+            self.inner.force_wake(run, now).await
+        }
+    }
+
+    /// THE check-then-act case on the post-append arm, and the one this command had
+    /// INVERTED on its most successful path — the same defect `run signal` fixed, whose
+    /// own comment calls it "the delivery worked perfectly, and the CLI said it had not
+    /// happened".
+    ///
+    /// `decide`'s post-append arm re-read only the SCHEDULER row, never the journal. A
+    /// worker that claims the run inside the delivery window folds our `GateDecided`,
+    /// completes the gate and files the run `Completed` — so the re-read sees a non-paused
+    /// row and the command reported `not queued … Run torii run wake <id> once it is
+    /// paused again`: exit 2 on a decision that was delivered AND read, plus advice `wake`
+    /// refuses for every non-paused run and that no shipped store can ever satisfy. This
+    /// module already enforces the no-dead-end-advice rule on its PRE-check arm
+    /// (`a_decision_on_a_terminal_run_does_not_advise_waiting_for_a_pause`) and violated it
+    /// on the post-append arm of the same function.
+    #[tokio::test]
+    async fn a_decision_a_racing_worker_already_folded_is_not_reported_as_a_failure() {
+        let run = RunId(uuid::Uuid::new_v4());
+        // A TIMED gate already due: `next_wake <= now`, so a worker's `claim_due` really
+        // can grab it in the delivery window. (Still in the future, so the deadline
+        // pre-check does not refuse it first.)
+        let inner = paused_store(run, Some(now())).await;
+        let journal = std::sync::Arc::new(
+            gate_journal(
+                run,
+                &release(),
+                Some(now() + chrono::Duration::seconds(1)),
+                &["ship"],
+            )
+            .await,
+        );
+        let racing = GateRacingStore {
+            inner: inner.clone(),
+            journal: journal.clone(),
+            run,
+            drive: GateRacingDrive::CompletesTheNode,
+        };
+
+        let out = decide(
+            &racing,
+            journal.as_ref(),
+            run,
+            release(),
+            "ship",
+            "alice",
+            None,
+            now(),
+        )
+        .await
+        .expect("no hard error");
+
+        // The evidence FIRST: our row is durable and the completion sits BEHIND it, so the
+        // drive that completed the gate folded OUR decision.
+        let events = journal.load(run).await.unwrap();
+        let decided = events
+            .iter()
+            .find(
+                |(_, e)| matches!(e, JournalEvent::GateDecided { node, .. } if node == &release()),
+            )
+            .map(|(s, _)| *s)
+            .expect("the decision is durable");
+        let completed = events
+            .iter()
+            .find(|(_, e)| {
+                matches!(e, JournalEvent::ContextWrite { key, .. } if key.0 == release().0)
+            })
+            .map(|(s, _)| *s)
+            .expect("the racing drive completed the gate");
+        assert!(
+            decided < completed,
+            "precondition: the gate completed by folding OUR decision (decided={decided} \
+             completed={completed})"
+        );
+        assert_eq!(
+            journaled_decisions(&journal, run, &release()).await.len(),
+            1,
+            "and there is no OTHER decision it could have read instead"
+        );
+
+        assert_eq!(
+            out.code, EXIT_OK,
+            "the decision was delivered, folded and consumed — this is the success case, \
+             not a refusal: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("run wake"),
+            "`wake` refuses every non-paused run, so this advice is a dead end no shipped \
+             store can satisfy: {}",
+            out.text
+        );
+        assert_eq!(
+            inner.status(run).await.unwrap().unwrap().status,
+            RunStatus::Completed,
+            "the racing drive really did finish the run"
+        );
+    }
+
+    /// The other half of the post-append window: the run went TERMINAL while the node
+    /// itself never did. `cancel` is node-blind and journals no node event, so the gate
+    /// still folds as awaiting — `at: None` — and the run will never be paused again.
+    ///
+    /// "Run `torii run wake <id>` once it is paused again" is a dead end here for exactly
+    /// the reason the PRE-check arm was already fixed
+    /// (`a_decision_on_a_terminal_run_does_not_advise_waiting_for_a_pause`): `wake` refuses
+    /// every non-paused run and no shipped store moves a terminal row back to `paused`.
+    /// The rule has to hold on BOTH arms of the same function.
+    #[tokio::test]
+    async fn a_decision_orphaned_by_a_cancel_does_not_advise_waiting_for_a_pause() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let inner = paused_store(run, Some(now())).await;
+        let journal = std::sync::Arc::new(
+            gate_journal(
+                run,
+                &release(),
+                Some(now() + chrono::Duration::seconds(1)),
+                &["ship"],
+            )
+            .await,
+        );
+        let racing = GateRacingStore {
+            inner: inner.clone(),
+            journal: journal.clone(),
+            run,
+            drive: GateRacingDrive::CancelsTheRun,
+        };
+
+        let out = decide(
+            &racing,
+            journal.as_ref(),
+            run,
+            release(),
+            "ship",
+            "alice",
+            None,
+            now(),
+        )
+        .await
+        .expect("no hard error");
+
+        assert_eq!(
+            inner.status(run).await.unwrap().unwrap().status,
+            RunStatus::Cancelled,
+            "precondition: the run really was cancelled inside the window"
+        );
+        assert_eq!(
+            journaled_decisions(&journal, run, &release()).await.len(),
+            1,
+            "precondition: the decision is durable — this is a post-append report, not a \
+             refusal"
+        );
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("cancelled"),
+            "must name the actual state: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("once it is paused again"),
+            "a cancelled run never pauses again — this is advice to wait forever: {}",
             out.text
         );
     }
