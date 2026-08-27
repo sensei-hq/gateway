@@ -14743,8 +14743,9 @@ mod human_gate {
     }
 
     /// An executor over a caller-owned journal, so a test can append a decision BETWEEN
-    /// two drives exactly as `torii run gate decide` does from another process. The
-    /// clock is handed back so a test can move time past a deadline.
+    /// two drives — the shape `torii run gate decide` will have when Task 7 adds it, and
+    /// the shape any library caller has today. The clock is handed back so a test can
+    /// move time past a deadline.
     async fn exec_at(journal: &InMemoryJournal, now: DateTime<Utc>) -> (Executor, Arc<FakeClock>) {
         let clock = FakeClock::new(now);
         let (gw, _calls) = recording_gateway().await;
@@ -14926,11 +14927,12 @@ mod human_gate {
     /// COMPLETES carrying "ship": s1's self-approval-by-the-back-door, in the node kind
     /// whose entire purpose is a human decision.
     ///
-    /// The operator-facing cost is real and deliberate: a mistyped option is TERMINAL,
-    /// because a `NodeFailed` on a waiting node is irreversible by construction. That is
-    /// why `torii run gate decide` validates the option against the journaled menu before
-    /// it appends anything — the CLI is what keeps this path rare; the executor is what
-    /// keeps it safe when the CLI is bypassed.
+    /// The operator-facing cost is real, deliberate, and CURRENTLY UNMITIGATED: a mistyped
+    /// option is TERMINAL, because a `NodeFailed` on a waiting node is irreversible by
+    /// construction. Task 7's `torii run gate decide` will validate the option against the
+    /// journaled menu before appending anything, which is what will keep this path rare —
+    /// it does not exist yet, so at this commit a typo from any caller kills the run. The
+    /// executor is what keeps it SAFE either way; the CLI is what will keep it RARE.
     #[tokio::test]
     async fn a_corrected_decision_does_not_resurrect_a_failed_gate() {
         let journal = InMemoryJournal::new();
@@ -15084,8 +15086,25 @@ mod human_gate {
         );
     }
 
-    /// AC11: a decided gate replays from the fold — no gateway call, so zero token
-    /// re-spend by construction.
+    /// AC11: a decided gate re-derives its answer from the fold on every later drive —
+    /// no gateway call, so zero token re-spend by construction.
+    ///
+    /// The OUTPUT assertion is what makes `calls == 0` mean anything. On its own the call
+    /// count cannot fail: no gateway path is reachable from `run_human_gate` at all, so it
+    /// passes whether the gate works or is completely broken (demonstrated —
+    /// `gate_decision_for(..).filter(|_| false)` reddens six tests and left this one
+    /// green). Pairing them turns it into "re-derived free from the fold" rather than "no
+    /// gateway wired".
+    ///
+    /// **It is asserted on the RESUMING drive, not on the third one, and that is forced.**
+    /// The second drive is the resume whose freeness is the actual claim; it completes the
+    /// gate, so `finalize_run` appends `RunCompleted` and the run is terminal. A third
+    /// `start` then takes `start_inner`'s terminal path, which rebuilds `outputs` from
+    /// `EffectRecorded`/`NodeCompleted` alone — and this node kind journals NEITHER (the
+    /// fresh-vs-terminal asymmetry `run_human_gate` documents, shared with `AwaitSignal`,
+    /// `Branch` and `Subgraph`). So `o3.outputs[&release()]` is a missing key and panics;
+    /// measured, not assumed. The third drive stays because re-driving a terminal run must
+    /// itself be free and non-failing, which is asserted below.
     #[tokio::test]
     async fn a_decided_gate_costs_nothing_on_resume() {
         let journal = InMemoryJournal::new();
@@ -15100,15 +15119,25 @@ mod human_gate {
             .append(run, decided(&release(), "ship", "alice", None))
             .await
             .unwrap();
-        ex.start(run, &gate_graph(None)).await.expect("resumes");
-        ex.start(run, &gate_graph(None))
+        let o2 = ex.start(run, &gate_graph(None)).await.expect("resumes");
+        let o3 = ex
+            .start(run, &gate_graph(None))
             .await
             .expect("resumes again");
 
         assert_eq!(
+            o2.outputs[&release()]["decision"],
+            serde_json::json!("ship"),
+            "the resuming drive still produces the decision: {o2:?}"
+        );
+        assert!(
+            o3.failed.is_none() && o3.paused.is_none(),
+            "re-driving a terminal run neither fails nor re-asks: {o3:?}"
+        );
+        assert_eq!(
             calls.lock().unwrap().len(),
             0,
-            "a gate must never call the gateway"
+            "...and none of it cost anything — a gate never calls the gateway"
         );
     }
 
@@ -15165,6 +15194,242 @@ mod human_gate {
         assert!(
             !o.outputs.contains_key(&release()),
             "no output may be derived from a menu that was never published"
+        );
+    }
+
+    /// SP-4 s2 §6.4, the split-redaction guard: ONE application of the redactor feeds
+    /// BOTH the node's return AND the durable blackboard write.
+    ///
+    /// s1 ships the same test for `AwaitSignal` (`payload_is_redacted_before_both_the_
+    /// return_and_the_durable_write`) precisely because the split defect "has been
+    /// shipped and caught twice in this codebase". `run_human_gate` restates that
+    /// reasoning in an eight-line comment; a comment is not a guard. If a future edit
+    /// redacts on only one of the two paths, a live run and a replayed run disagree about
+    /// this node's output and it surfaces as a false `DeterminismViolation` — never as a
+    /// red test — unless this test exists.
+    ///
+    /// The decision `note` is the leak surface: operator free text becomes this node's
+    /// OUTPUT and flows into downstream nodes and model prompts.
+    #[tokio::test]
+    async fn a_decision_is_redacted_before_both_the_return_and_the_durable_write() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        // Assembled at RUNTIME: the repo's semgrep CWE-798 hook blocks credential-shaped
+        // literals in source. The redactor still matches the built string.
+        let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (gw, _c) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone())
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(
+                run,
+                decided(&release(), "ship", "alice", Some(&format!("key {secret}"))),
+            )
+            .await
+            .unwrap();
+        let o = ex.start(run, &gate_graph(None)).await.expect("resumes");
+
+        // (a) THE RETURN — what downstream nodes and model prompts will see.
+        let output = &o.outputs[&release()];
+        assert!(
+            !serde_json::to_string(output).unwrap().contains(&secret),
+            "no plaintext survives into the node output: {output}"
+        );
+        assert_eq!(
+            output["decision"], "ship",
+            "a legitimate decision is untouched — the redactor matches credential SHAPES"
+        );
+
+        // (b) THE DURABLE WRITE — the same single redacted value, not a second scrub.
+        let r = ctx
+            .get(orchestrator_core::Scope::Run, ContextKey("release".into()))
+            .await
+            .unwrap()
+            .expect("the completed gate published its decision to the blackboard");
+        let stored = ctx.load(&r).await.unwrap();
+        assert!(
+            !serde_json::to_string(&stored).unwrap().contains(&secret),
+            "the durably-stored value is scrubbed too: {stored}"
+        );
+        assert_eq!(
+            stored, *output,
+            "ONE redaction feeds both: live == journaled == replayed"
+        );
+        let blob = content.get(&r.content.digest).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&blob).contains(&secret),
+            "no plaintext reaches the content store"
+        );
+    }
+
+    /// The same rule for the FAILURE text, which is a sink the output assertions above do
+    /// not cover: a `NodeFailed` reaches the durable journal, `RunOutcome.failed` and
+    /// whatever `torii run status` renders — and because `fold.failed` is read back by
+    /// `gate_precheck`, it is re-emitted on EVERY later drive.
+    ///
+    /// Both operator-controlled interpolations are covered, because they leak for
+    /// different reasons and one of them was missed on the first pass:
+    ///   * the `note` on a Fail option — free text by design;
+    ///   * the OPTION NAME on the undeclared path — arbitrary by definition, since it
+    ///     matched nothing in the menu. That one shipped unredacted; the fix moved the
+    ///     scrub into `fail_gate`, the chokepoint every failure arm already routes
+    ///     through, so a future arm cannot skip it (the `model_output` precedent).
+    #[tokio::test]
+    async fn a_failure_message_is_redacted_before_it_reaches_the_journal() {
+        let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+        let redacted = |ex: &Executor, journal: &InMemoryJournal, run: RunId| {
+            let (ex, journal) = (ex.clone(), journal.clone());
+            async move {
+                let o = ex.start(run, &gate_graph(None)).await.expect("resumes");
+                let (_n, message) = o.failed.expect("the gate fails");
+                let journaled = journal
+                    .load(run)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .find_map(|(_, e)| match e {
+                        JournalEvent::NodeFailed { node, error } if node == &release() => {
+                            Some(error.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("the failure is journaled");
+                assert_eq!(
+                    journaled, message,
+                    "the journaled and returned messages cannot drift"
+                );
+                message
+            }
+        };
+
+        // (a) the note on a Fail option.
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (gw, _c) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(
+                run,
+                decided(&release(), "reject", "bob", Some(&format!("key {secret}"))),
+            )
+            .await
+            .unwrap();
+        let message = redacted(&ex, &journal, run).await;
+        assert!(
+            !message.contains(&secret),
+            "a Fail option's note must not reach the journal in plaintext: {message}"
+        );
+        assert!(
+            message.contains("bob"),
+            "the actor is still named — redaction is by credential SHAPE, not blanket: {message}"
+        );
+
+        // (b) the option NAME on the undeclared path.
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (gw, _c) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(
+                run,
+                decided(&release(), &format!("ship {secret}"), "bob", None),
+            )
+            .await
+            .unwrap();
+        let message = redacted(&ex, &journal, run).await;
+        assert!(
+            !message.contains(&secret),
+            "an undeclared option name must not reach the journal in plaintext: {message}"
+        );
+    }
+
+    /// Composition 1 (`NodeKind::HumanGate`'s doc, and `GateOutcome::Fail`'s): a `Fail`
+    /// option reuses the EXISTING terminal machinery, so hard-edge dependents cascade-skip
+    /// exactly as they do for any other node failure. Every other test in this module
+    /// drives a single-node graph, where a cascade cannot be observed at all.
+    #[tokio::test]
+    async fn a_fail_option_cascade_skips_hard_edge_dependents() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(at(1_000));
+        let (gw, calls) = recording_gateway().await;
+        let ex =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+
+        let mut graph = gate_graph(None);
+        graph.nodes.push(mc("ship_it", Some("release")));
+
+        ex.start(run, &graph).await.expect("asks");
+        journal
+            .append(run, decided(&release(), "reject", "bob", Some("no DPA")))
+            .await
+            .unwrap();
+        let o = ex.start(run, &graph).await.expect("resumes");
+
+        assert!(o.failed.is_some(), "the Fail option failed the gate: {o:?}");
+        assert!(
+            o.skipped.contains(&NodeId("ship_it".into())),
+            "a hard-edge dependent of a rejected gate is SKIPPED: {o:?}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "and it never ran, so a rejection spends nothing downstream"
+        );
+    }
+
+    /// Composition 2: the output shape is the one `BranchCond::FieldEquals("decision", …)`
+    /// already matches, so a human's choice routes the graph with `Branch` UNCHANGED —
+    /// the claim `NodeKind::HumanGate`'s doc makes, now executed rather than asserted in
+    /// prose. Task 6 adds a `validate_dag` rule coupling exactly these two node kinds.
+    #[tokio::test]
+    async fn a_decision_routes_a_branch_unchanged() {
+        use orchestrator_core::BranchCond;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        let br = NodeId("br".into());
+        let mut graph = gate_graph(None);
+        graph.nodes.push(Node {
+            id: br.clone(),
+            kind: NodeKind::Branch {
+                on: release(),
+                arms: vec![(
+                    BranchCond::FieldEquals("decision".into(), serde_json::json!("ship")),
+                    arm("shipped"),
+                )],
+                default: arm("held"),
+            },
+            deps: vec![Dep::hard("release")],
+        });
+
+        ex.start(run, &graph).await.expect("asks");
+        journal
+            .append(run, decided(&release(), "ship", "alice", None))
+            .await
+            .unwrap();
+        let o = ex.start(run, &graph).await.expect("resumes");
+
+        assert!(o.failed.is_none(), "{o:?}");
+        let b = &o.outputs[&br];
+        assert!(
+            b.get("shipped").is_some() && b.get("held").is_none(),
+            "the human's choice selected the arm: {b}"
         );
     }
 
