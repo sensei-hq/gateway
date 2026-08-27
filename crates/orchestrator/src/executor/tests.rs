@@ -14763,6 +14763,35 @@ mod human_gate {
         }
     }
 
+    /// Every deadline this gate has journaled on `GateAwaited`, in order — the durable
+    /// home of the SLA. A correct implementation records exactly one, forever.
+    fn gate_deadlines(events: &[(Seq, JournalEvent)]) -> Vec<Option<DateTime<Utc>>> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::GateAwaited { node, deadline, .. } if node == &release() => {
+                    Some(*deadline)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `RunPaused.resume_after` this run has journaled, in order — what the durable
+    /// scheduler actually re-arms on after each wake. `mod await_signal` keeps the same
+    /// helper for the same reason; see
+    /// [`a_timed_gate_pauses_on_the_absolute_deadline_it_recorded`] for what its absence
+    /// from this module let through.
+    fn paused_resume_afters(events: &[(Seq, JournalEvent)]) -> Vec<Option<DateTime<Utc>>> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::RunPaused { resume_after, .. } => Some(*resume_after),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every `NodeFailed` this run journaled for the gate, in order.
     async fn failures(journal: &InMemoryJournal, run: RunId) -> Vec<String> {
         journal
@@ -14991,6 +15020,106 @@ mod human_gate {
         assert!(
             !o.outputs.contains_key(&release()),
             "expiry must produce NO output, defaulted or otherwise"
+        );
+    }
+
+    /// **The pause carries the deadline** — the property that makes the whole timed gate
+    /// class work, and the one this module asserted NOWHERE.
+    ///
+    /// `run_human_gate` ends on `pause_awaiting(run, reason, deadline)`, and changing that
+    /// third argument to `None` left the ENTIRE workspace green: not one test in this
+    /// module read a `RunPaused`, and the only coverage was the `DATABASE_URL`-gated e2e,
+    /// which does not run by default. The consequence is silent and total — every
+    /// `HumanGate` pause would land in SP-DATA-3's never-auto-woken class (`next_wake`
+    /// NULL), so a `timeout: Some(1h)` gate is never woken, the expiry check above never
+    /// runs, and the SLA never fires. `pause_awaiting`'s own doc names that outcome: "the
+    /// whole timed branch would be decorative". `mod await_signal`'s
+    /// `pauses_and_records_its_deadline_when_no_signal_is_present` is the sibling guard
+    /// this mirrors.
+    ///
+    /// **The second drive is not decoration either.** It is what separates "carries A
+    /// deadline" from "carries the RECORDED one": recomputing `now + timeout` on each
+    /// execution passes the first assertion and pushes the SLA forward on every wake, so
+    /// a gate force-woken every twenty minutes with a one-hour timeout would never expire
+    /// — the s1 defect `wait_or_expire` reads the fold to prevent, here at the pause.
+    #[tokio::test]
+    async fn a_timed_gate_pauses_on_the_absolute_deadline_it_recorded() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let deadline = t0 + Duration::hours(1);
+        let (ex, clock) = exec_at(&journal, t0).await;
+        let graph = gate_graph(Some(Duration::hours(1)));
+
+        let o1 = ex.start(run, &graph).await.expect("asks");
+        assert!(
+            o1.paused.is_some() && o1.failed.is_none(),
+            "an undecided gate pauses: {o1:?}"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            gate_deadlines(&events),
+            vec![Some(deadline)],
+            "the ABSOLUTE instant `now + timeout` is journaled on the ask"
+        );
+        assert_eq!(
+            paused_resume_afters(&events),
+            vec![Some(deadline)],
+            "and the pause re-arms the durable scheduler on it — `None` here is the \
+             never-auto-woken class, which would make the timeout decorative"
+        );
+
+        // An operator force-wakes it twenty minutes in. Still no decision, so it re-pauses
+        // — and it must re-pause on the SAME instant, not on a fresh `now + timeout`.
+        clock.set(t0 + Duration::minutes(20));
+        let o2 = ex.start(run, &graph).await.expect("re-pauses");
+        assert!(
+            o2.paused.is_some() && o2.failed.is_none(),
+            "the deadline has not passed, so it is still waiting: {o2:?}"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            gate_deadlines(&events),
+            vec![Some(deadline)],
+            "the ask is not repeated — the deadline is recorded ONCE"
+        );
+        assert_eq!(
+            paused_resume_afters(&events),
+            vec![Some(deadline), Some(deadline)],
+            "the re-pause re-arms on the recorded instant; `now + timeout` here would \
+             push the SLA forward on every wake and a gate woken hourly would never expire"
+        );
+        assert!(
+            !paused_resume_afters(&events)
+                .contains(&Some(t0 + Duration::minutes(20) + Duration::hours(1))),
+            "explicitly: never `now + timeout` recomputed on this drive"
+        );
+    }
+
+    /// The `None` half of the pause, for the INDEFINITE gate — the common HITL shape. It
+    /// must land in the never-auto-woken class deliberately (only a decision or a
+    /// `torii run force-wake` moves it), which is the same `resume_after` field the test
+    /// above pins in the other direction. Without this, hardcoding a deadline into every
+    /// pause would satisfy that test while quietly giving every indefinite gate an
+    /// invented SLA.
+    #[tokio::test]
+    async fn an_indefinite_gate_pauses_with_no_deadline_at_all() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        let o = ex.start(run, &gate_graph(None)).await.expect("asks");
+        assert!(o.paused.is_some(), "an undecided gate pauses: {o:?}");
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            gate_deadlines(&events),
+            vec![None],
+            "the ask is recorded with no deadline"
+        );
+        assert_eq!(
+            paused_resume_afters(&events),
+            vec![None],
+            "no deadline ⇒ the never-auto-woken (HOTL) pause class"
         );
     }
 

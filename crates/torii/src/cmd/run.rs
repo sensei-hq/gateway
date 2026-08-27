@@ -3730,21 +3730,23 @@ pub(crate) mod tests {
     /// operator who cannot tell which is which will reach for the wrong command, and the
     /// cross-refusals that catch that mistake are a rescue, not a substitute for saying so
     /// here.
+    ///
+    /// **Both waiting nodes sit in ONE run**, and that is what makes the negative
+    /// assertion mean anything. The fixture originally split them across two runs, and
+    /// [`list_paused`] folds one journal PER RUN — so a menu could not have leaked between
+    /// them however `awaiting_nodes` was written. Mutating its `menus.get(&node)` to
+    /// `menus.values().next()` — the literal "borrow another node's menu" this test names
+    /// — left the whole suite green. With both nodes in one fold, the negative assertion
+    /// depends on the per-node keying it claims to check.
     #[tokio::test]
     async fn list_paused_distinguishes_a_gate_from_an_await_signal() {
-        let gated = RunId(uuid::Uuid::new_v4());
-        let signalled = RunId(uuid::Uuid::new_v4());
-        let s = InMemorySchedulerStore::default();
-        for run in [gated, signalled] {
-            s.enqueue(run, &empty_graph(), now()).await.unwrap();
-            s.record_paused(run, None, "waiting for a human")
-                .await
-                .unwrap();
-        }
-        // ONE journal holding both runs, as a real durable journal does.
-        let j = gate_journal(gated, &release(), None, &["ship", "hold"]).await;
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        // ONE run, two waiting nodes: a `HumanGate` with a menu and an `AwaitSignal`
+        // without one — the shape a graph with both kinds actually produces.
+        let j = gate_journal(run, &release(), None, &["ship", "hold"]).await;
         j.append(
-            signalled,
+            run,
             JournalEvent::SignalAwaited {
                 node: gate(),
                 deadline: None,
@@ -3754,23 +3756,27 @@ pub(crate) mod tests {
         .unwrap();
 
         let out = list_paused(&s, &j, false).await.expect("lists");
-        let line = |run: RunId| {
+        // Keyed on the NODE COLUMN, not `contains`: a gate's menu cell is rendered
+        // `gate: ship|hold`, so `contains("gate")` matches the `release` row too and the
+        // two rows could not be told apart at all.
+        let row_for = |node: &str| {
             out.text
                 .lines()
                 .filter(|l| l.starts_with(&run.0.to_string()))
-                .find(|l| l.contains("release") || l.contains("gate"))
-                .unwrap_or_else(|| panic!("no awaiting row for {}:\n{}", run.0, out.text))
+                .find(|l| l.split_whitespace().nth(1) == Some(node))
+                .unwrap_or_else(|| panic!("no awaiting row for {node}:\n{}", out.text))
                 .to_string()
         };
-        let gate_row = line(gated);
+        let gate_row = row_for("release");
         assert!(
             gate_row.contains("ship") && gate_row.contains("hold"),
             "the gate's own row must carry its menu: {gate_row}"
         );
-        let signal_row = line(signalled);
+        let signal_row = row_for("gate");
         assert!(
             !signal_row.contains("ship") && !signal_row.contains("hold"),
-            "an AwaitSignal has no menu and must not borrow another node's: {signal_row}"
+            "an AwaitSignal has no menu and must not borrow the gate's — they are in the \
+             SAME fold, so only the per-node keying stops it: {signal_row}"
         );
         assert!(
             signal_row.contains("signal"),

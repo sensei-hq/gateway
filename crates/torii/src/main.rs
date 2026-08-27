@@ -164,8 +164,12 @@ enum RunAction {
     /// journaled, but that is a best-effort scrub by shape — a decision note is not a
     /// credential channel.
     Gate {
+        // The enum and its verb→option mapping live in the LIBRARY (`cmd::gate`), not
+        // here: this binary has no test module, and while the mapping sat in `dispatch`
+        // below, swapping the `approve` and `reject` literals left every test in the crate
+        // green — see `cmd::gate::each_verb_maps_to_the_option_that_names_it`.
         #[command(subcommand)]
-        action: GateAction,
+        action: cmd::gate::GateAction,
     },
     /// Cancel a non-terminal run so it is never woken
     Cancel { run_id: String },
@@ -194,78 +198,6 @@ enum RunAction {
         yes: bool,
     },
 }
-
-/// The three verbs of `run gate`. `approve` and `reject` are sugar for `decide --option
-/// approve|reject`, and they work only when the gate actually declares options by those
-/// names — when it does not, the refusal names the REAL menu, read from the journaled
-/// `GateAwaited`, so the operator is told what the human was offered rather than what
-/// this CLI assumed.
-#[derive(Subcommand)]
-enum GateAction {
-    /// Pick the `approve` option
-    Approve {
-        run_id: String,
-        /// The waiting node's id — `torii run list-paused` names it.
-        #[arg(long)]
-        node: String,
-        // `hide_default_value`: the clap default is the empty string, but the
-        // EFFECTIVE default is $USER (`cmd::gate::actor_or_user` resolves it), so
-        // rendering `[default: ""]` next to a sentence that says "defaulting to
-        // $USER" contradicts it on the one surface the trust boundary is stated.
-        #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
-        r#as: String,
-        /// Free text recorded alongside the decision. It becomes part of this node's
-        /// output, so it flows into downstream nodes and model prompts.
-        #[arg(long)]
-        note: Option<String>,
-    },
-    /// Pick the `reject` option — `--reason` is required
-    Reject {
-        run_id: String,
-        /// The waiting node's id — `torii run list-paused` names it.
-        #[arg(long)]
-        node: String,
-        // `hide_default_value`: the clap default is the empty string, but the
-        // EFFECTIVE default is $USER (`cmd::gate::actor_or_user` resolves it), so
-        // rendering `[default: ""]` next to a sentence that says "defaulting to
-        // $USER" contradicts it on the one surface the trust boundary is stated.
-        #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
-        r#as: String,
-        /// Why. Required: failing a run without recording why is a bare `catch {}`.
-        #[arg(long)]
-        reason: String,
-    },
-    /// Pick a named option — the general form
-    Decide {
-        run_id: String,
-        /// The waiting node's id — `torii run list-paused` names it.
-        #[arg(long)]
-        node: String,
-        /// One of the options the gate published. An undeclared name is refused before
-        /// anything is written.
-        #[arg(long)]
-        option: String,
-        // `hide_default_value`: the clap default is the empty string, but the
-        // EFFECTIVE default is $USER (`cmd::gate::actor_or_user` resolves it), so
-        // rendering `[default: ""]` next to a sentence that says "defaulting to
-        // $USER" contradicts it on the one surface the trust boundary is stated.
-        #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
-        r#as: String,
-        /// Free text recorded alongside the decision. It becomes part of this node's
-        /// output, so it flows into downstream nodes and model prompts.
-        #[arg(long)]
-        note: Option<String>,
-    },
-}
-
-/// One text for all three `--as` flags. A doc comment cannot be shared between fields, and
-/// the trust boundary has to be on the surface an operator reads when they type the flag —
-/// three hand-copied paragraphs would be three chances for one of them to lose the second
-/// sentence, which is the sentence that matters.
-const ACTOR_HELP: &str = "Who decided. ATTRIBUTION, NOT AUTHENTICATION: it is whatever \
-                          string you supply (defaulting to $USER), so it records who \
-                          CLAIMED to decide. Anyone who can reach the database can write \
-                          any actor.";
 
 #[derive(Subcommand)]
 enum WorkerAction {
@@ -465,38 +397,19 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
             }
             RunAction::Gate { action } => {
                 // The three verbs differ only in how the option and note are SOURCED, so
-                // they are normalised to one shape here and there is exactly one call to
+                // they are normalised to one shape and there is exactly one call to
                 // `decide` — a second dispatch arm per verb would be three places for the
-                // argument order to be got wrong.
-                let (run_id, node, option, actor, note) = match action {
-                    GateAction::Approve {
-                        run_id,
-                        node,
-                        r#as,
-                        note,
-                    } => (run_id, node, "approve".to_string(), r#as, note),
-                    // `--reason` is clap-required, so this is always `Some` — but it may
-                    // still be blank, and `decide` re-checks the trimmed value. The
-                    // required flag costs no connection; the trim is what actually holds.
-                    GateAction::Reject {
-                        run_id,
-                        node,
-                        r#as,
-                        reason,
-                    } => (run_id, node, "reject".to_string(), r#as, Some(reason)),
-                    GateAction::Decide {
-                        run_id,
-                        node,
-                        option,
-                        r#as,
-                        note,
-                    } => (run_id, node, option, r#as, note),
-                };
+                // argument order to be got wrong. The normalisation itself lives in the
+                // LIBRARY (`cmd::gate::decision_of`) because this binary has no test
+                // module: while it sat inline here, swapping the `approve` and `reject`
+                // literals left the whole crate green, and `gate reject` would have
+                // shipped the release it was refusing.
+                let d0 = cmd::gate::decision_of(action);
                 // Parse BEFORE connecting, same as `status` and `signal`: an invalid run
                 // id is the likeliest operator typo and sqlx would otherwise retry a
                 // refused connection for the whole pool-acquire timeout first.
-                let run = parse_run_id(&run_id)?;
-                let actor = cmd::gate::actor_or_user(&actor);
+                let run = parse_run_id(&d0.run_id)?;
+                let actor = cmd::gate::actor_or_user(&d0.actor);
                 // LIGHT tier: deciding a gate needs the scheduler store and the journal,
                 // nothing else. An operator must be able to answer a waiting run from a
                 // box with no gateway config and no model credentials.
@@ -505,10 +418,10 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                     d.scheduler_store.as_ref(),
                     d.journal.as_ref(),
                     run,
-                    orchestrator_core::NodeId(node),
-                    &option,
+                    orchestrator_core::NodeId(d0.node),
+                    &d0.option,
                     &actor,
-                    note.as_deref(),
+                    d0.note.as_deref(),
                     chrono::Utc::now(),
                 )
                 .await
