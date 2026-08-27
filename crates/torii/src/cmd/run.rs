@@ -533,7 +533,7 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 ///
 /// **Writers, plural, since SP-6 s2.** [`signal`] bounds `SignalReceived.payload`, and
 /// `cmd::gate::decide` bounds BOTH operator-supplied fields of `GateDecided` — the `note`
-/// and the `actor` — through the same [`check_payload_size`], on the same number. That is
+/// and the `actor` — through the same `check_payload_size`, on the same number. That is
 /// deliberate: an enforcement each writer re-derives for itself is bounds that drift, and
 /// `decide` shipped with no bound at all while this doc said there was only one writer to
 /// have. The `actor` is the correction after that: it is the SIBLING field on the same
@@ -556,6 +556,11 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 /// `GateDecided` remain uncapped for any future writer (a webhook/HTTP delivery path,
 /// §8's deferred non-CLI delivery). A durable-side cap needs the payload to become
 /// ref-or-inline, which is a format break.
+// `check_payload_size` above is deliberately NOT bracketed as an intra-doc link. It is
+// `pub(crate)` and this item is `pub`, so a link makes `cargo doc` emit a
+// `rustdoc::private_intra_doc_links` warning for something that cannot resolve in the
+// public docs anyway — SP-6 s2 added exactly one such warning to this crate (8 -> 9) by
+// bracketing it. Eight others pre-date the slice and are left alone here.
 pub const MAX_PAYLOAD_BYTES: usize = 4096;
 
 /// WHICH size [`check_payload_size`] is measuring — because redaction sits between the

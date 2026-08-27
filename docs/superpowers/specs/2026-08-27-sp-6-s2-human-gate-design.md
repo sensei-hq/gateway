@@ -144,8 +144,11 @@ The two bug-prone parts — the fail-closed terminal guard and the deadline dura
 event constructor, because the awaiting event is the one genuinely per-kind write (`SignalAwaited`
 vs `GateAwaited`, the latter also carrying the menu).
 
-**Those rows are in `run_human_gate`'s execution order, and where the answer-read sits is the one
-thing the two kinds do differently.** `run_human_gate` reads its decision **last**, after
+**Those rows are in `run_human_gate`'s execution order, and the two kinds differ in exactly TWO
+places — both about WHEN the clock and the answer are consulted. Whoever builds s3, the third
+waiting kind, inherits both.**
+
+**Difference 1 — where the answer-read sits.** `run_human_gate` reads its decision **last**, after
 `wait_or_expire` has had its chance to return `Expired`, so a decision can never approve a gate whose
 recorded deadline has passed — whichever order the two rows landed on the journal.
 `run_await_signal` reads its signal **second**, between the precheck and `wait_or_expire`, so a
@@ -155,13 +158,25 @@ stricter order deliberately: a gate whose SLA ran out must not be approvable, an
 is able to say "too late" up front — `torii run gate decide` pre-checks the same journaled instant
 with the same `now >= d` boundary, where `torii run signal` has no deadline pre-check at all.
 
+**Difference 2 — whether the clock is re-read after journaling a FRESH deadline.**
+`run_await_signal` has a second expiry site (`executor/signal.rs`, the `if let Some(d) = deadline &&
+self.clock.now() >= d` block after the `SignalAwaited` append), so a node given a nanosecond to
+answer fails in the SAME execution. `run_human_gate` deliberately has no such site — the
+`waiting_node_helpers` tests exist precisely because two expiry sites mask each other's defects — so
+a gate whose fresh deadline elapses during its own journal append **pauses once on an instant already
+behind it**; the scheduler wakes it immediately and the next drive takes `WaitState::Expired`. One
+extra wake, never a resurrection: the answer is still never read ahead of the expiry check. Recorded
+on `run_human_gate` in `executor/gate.rs`; it is a real behavioural difference between the two kinds,
+not an implementation detail, and it is why "the one thing the two kinds do differently" — the
+wording this section shipped with — was wrong.
+
 ### 6.2 The fold read
 
 | fold state | behaviour |
 |---|---|
 | failure recorded | `Failed` — arm 0, shared, checked **first** |
 | **no menu journaled yet** | **journal `GateAwaited` FIRST, then continue to the rows below** |
-| **deadline passed (whatever was decided)** | `NodeFailed` — the timeout, **before any decision is read** |
+| **asking, deadline passed (whatever was decided)** | `NodeFailed` — the timeout, **before any decision is read** |
 | decided, option in the journaled menu, `Complete` | `Completed({decision, actor, note})` |
 | decided, option in the journaled menu, `Fail` | `NodeFailed("human_gate: node <id> rejected by <actor> (<option>): <reason>")` |
 | decided, option **not** in the journaled menu | `NodeFailed`, loudly — §6.3 |
