@@ -14684,73 +14684,544 @@ mod waiting_node_helpers {
     }
 }
 
-// ================================ SP-6 s2 HumanGate (Task 2) ============================
+// ================================ SP-6 s2 HumanGate ============================
 
-/// `HumanGate` has no executor arm yet — Task 5 adds `run_human_gate`. This is Task 2's
-/// code-quality review, Important 1: `NodeKind::HumanGate { .. } => unimplemented!()` was
-/// a REACHABLE worker panic on a graph `validate_dag` had just certified well-formed
-/// (`run_inner`/`start_inner` both call it before ever reaching the `run_node` match),
-/// which is the exact poison-pill shape `submitting_an_unaddable_timeout_leaves_no_poison_row_in_the_scheduler`
-/// above already fixed once for `AwaitSignal`: `Scheduler::submit` enqueues the durable
-/// store row BEFORE the drive, so a panicking drive leaves a `(Waking, next_wake: None)`
-/// row that every later `tick()` reclaims and panics on again. `run_node` now fails the
-/// NODE loudly instead. This test pins the property that matters across the
-/// implementation boundary — "this node kind never panics" — not the specific `Failed`
-/// outcome: Task 5 replaces that expectation with a real decision-driven outcome, but
-/// must not reintroduce a panic to do it.
+/// SP-6 s2: the TYPED gate — a human picks one of an enumerated menu, and each option
+/// carries its own outcome, so a rejection has real semantics instead of being a value
+/// the author must remember to test for. Every test drives a graph over a `FakeClock`,
+/// so the deadline arithmetic is exact and no test sleeps.
+///
+/// The rows of design §6.2's fold read, one test each:
+///   failure recorded              → `a_late_decision_never_resurrects_an_expired_gate`
+///                                   + `a_corrected_decision_does_not_resurrect_a_failed_gate`
+///   decided, in the menu, Complete → `a_complete_option_becomes_the_nodes_output`
+///   decided, in the menu, Fail     → `a_fail_option_fails_the_node_naming_who_and_why`
+///   decided, NOT in the menu       → `an_undeclared_option_fails_the_node_loudly`
+///   no decision, deadline passed   → `an_expired_gate_never_self_approves`
+///   no decision, still in time     → `a_well_formed_human_gate_never_panics_it_pauses_for_a_human`
 mod human_gate {
     use super::*;
+    use crate::test_support::FakeClock;
+    use chrono::{DateTime, Duration, Utc};
     use orchestrator_core::{GateOption, GateOutcome};
 
-    fn gate() -> NodeId {
-        NodeId("gate".into())
+    /// A fixed instant, so every deadline in these tests is an exact literal.
+    fn at(unix_secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(unix_secs, 0).expect("valid timestamp")
     }
 
+    fn release() -> NodeId {
+        NodeId("release".into())
+    }
+
+    fn opt(name: &str, outcome: GateOutcome) -> GateOption {
+        GateOption {
+            name: name.to_string(),
+            outcome,
+        }
+    }
+
+    /// ship = Complete, reject = Fail — the shape every test below uses.
+    fn menu() -> Vec<GateOption> {
+        vec![
+            opt("ship", GateOutcome::Complete),
+            opt("reject", GateOutcome::Fail),
+        ]
+    }
+
+    fn gate_graph(timeout: Option<Duration>) -> Graph {
+        Graph {
+            nodes: vec![Node {
+                id: release(),
+                kind: NodeKind::HumanGate {
+                    options: menu(),
+                    timeout,
+                },
+                deps: vec![],
+            }],
+        }
+    }
+
+    /// An executor over a caller-owned journal, so a test can append a decision BETWEEN
+    /// two drives exactly as `torii run gate decide` does from another process. The
+    /// clock is handed back so a test can move time past a deadline.
+    async fn exec_at(journal: &InMemoryJournal, now: DateTime<Utc>) -> (Executor, Arc<FakeClock>) {
+        let clock = FakeClock::new(now);
+        let (gw, _calls) = recording_gateway().await;
+        let ex =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+        (ex, clock)
+    }
+
+    fn decided(node: &NodeId, option: &str, actor: &str, note: Option<&str>) -> JournalEvent {
+        JournalEvent::GateDecided {
+            node: node.clone(),
+            option: option.to_string(),
+            actor: actor.to_string(),
+            note: note.map(str::to_string),
+        }
+    }
+
+    /// Every `NodeFailed` this run journaled for the gate, in order.
+    async fn failures(journal: &InMemoryJournal, run: RunId) -> Vec<String> {
+        journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::NodeFailed { node, error } if node == &release() => {
+                    Some(error.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC2, the Complete half: the decision becomes the node's output, in the exact shape
+    /// `BranchCond::FieldEquals("decision", …)` matches — so `Branch` is reused unchanged.
     #[tokio::test]
-    async fn a_well_formed_human_gate_fails_loudly_instead_of_panicking() {
-        let (gw, _c) = recording_gateway().await;
+    async fn a_complete_option_becomes_the_nodes_output() {
         let journal = InMemoryJournal::new();
         let run = RunId(uuid::Uuid::new_v4());
-        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1");
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
 
-        let graph = Graph {
+        // First drive: the gate asks and pauses.
+        let o1 = ex.start(run, &gate_graph(None)).await.expect("drives");
+        assert!(o1.paused.is_some(), "the gate pauses on the first drive");
+
+        journal
+            .append(run, decided(&release(), "ship", "alice", Some("cleared")))
+            .await
+            .unwrap();
+
+        let o2 = ex.start(run, &gate_graph(None)).await.expect("resumes");
+        assert!(o2.paused.is_none(), "answered: {o2:?}");
+        let out = o2
+            .outputs
+            .get(&release())
+            .expect("the gate produced output");
+        assert_eq!(out["decision"], serde_json::json!("ship"));
+        assert_eq!(out["actor"], serde_json::json!("alice"));
+        assert_eq!(out["note"], serde_json::json!("cleared"));
+    }
+
+    /// AC2, the Fail half: a Fail option terminates the node, and the reason NAMES the
+    /// actor and their reason — a rejection whose cause is unrecorded is useless in ops.
+    #[tokio::test]
+    async fn a_fail_option_fails_the_node_naming_who_and_why() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(
+                run,
+                decided(&release(), "reject", "bob", Some("missing DPA")),
+            )
+            .await
+            .unwrap();
+
+        let o = ex.start(run, &gate_graph(None)).await.expect("resumes");
+        let (node, message) = o.failed.clone().expect("a Fail option fails the node");
+        assert_eq!(node, release());
+        assert!(message.contains("bob"), "must name the actor: {message}");
+        assert!(
+            message.contains("missing DPA"),
+            "must carry the reason: {message}"
+        );
+        assert!(
+            !o.outputs.contains_key(&release()),
+            "a rejected gate produces no output for dependents to read: {o:?}"
+        );
+    }
+
+    /// AC3: an undeclared option FAILS the node loudly. Never ignored — ignoring would
+    /// leave the gate waiting while the operator was told their decision landed, which is
+    /// the silently-ineffective shape s1's review kept finding.
+    #[tokio::test]
+    async fn an_undeclared_option_fails_the_node_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(run, decided(&release(), "shipp", "alice", None))
+            .await
+            .unwrap();
+
+        let o = ex.start(run, &gate_graph(None)).await.expect("resumes");
+        let (_node, message) = o.failed.expect("an undeclared option must fail the node");
+        assert!(message.contains("shipp"), "must name the option: {message}");
+        assert!(
+            message.contains("ship") && message.contains("reject"),
+            "must name the journaled menu so the operator can see the real choices: {message}"
+        );
+    }
+
+    /// AC4: s1's exact regression, re-guarded one layer up. A decision arriving after the
+    /// deadline must NEVER resurrect the gate — `torii` pre-checks then appends, and those
+    /// two steps are not atomic, so the row can exist.
+    ///
+    /// The journaled-failure count is part of the assertion, not decoration: it is what
+    /// pins `gate_precheck`'s "read the verdict back, never re-derive it" half here. The
+    /// OUTCOME alone cannot — `wait_or_expire` reports `Expired` before the decision is
+    /// ever read, so it re-derives the same failure and masks a missing precheck exactly
+    /// as s1's two expiry sites masked each other. A second `NodeFailed` for a node that
+    /// is already dead is that mask made visible.
+    #[tokio::test]
+    async fn a_late_decision_never_resurrects_an_expired_gate() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, clock) = exec_at(&journal, at(1_000)).await;
+
+        ex.start(run, &gate_graph(Some(Duration::hours(1))))
+            .await
+            .expect("asks");
+
+        // The deadline passes with no answer.
+        clock.set(at(1_000) + Duration::hours(2));
+        let expired = ex
+            .start(run, &gate_graph(Some(Duration::hours(1))))
+            .await
+            .expect("drives");
+        assert!(expired.failed.is_some(), "the deadline fired");
+
+        // A late approval lands anyway.
+        journal
+            .append(run, decided(&release(), "ship", "alice", None))
+            .await
+            .unwrap();
+
+        let after = ex
+            .start(run, &gate_graph(Some(Duration::hours(1))))
+            .await
+            .expect("drives");
+        let (_n, message) = after.failed.expect("the gate STAYS failed");
+        assert!(
+            message.contains("no decision"),
+            "the expiry is read back, not replaced by the late answer: {message}"
+        );
+        assert!(
+            !after.outputs.contains_key(&release()),
+            "a late decision must not produce output"
+        );
+        assert_eq!(
+            failures(&journal, run).await.len(),
+            1,
+            "the expiry is READ BACK from the fold: re-deriving it appends a second \
+             NodeFailed for an already-dead node on every drive"
+        );
+    }
+
+    /// AC4's sibling, and the guard that pins `gate_precheck` for this node kind by an
+    /// OUTCOME flip rather than by a journal count: a gate that has already failed stays
+    /// failed even when a perfectly valid decision lands afterwards.
+    ///
+    /// Reachable with no deadline at all, which is the point — the expiry path cannot
+    /// isolate the precheck (see the note above), and here nothing else can stand in for
+    /// it. Delete the `gate_precheck` call at the top of `run_human_gate` and this run
+    /// COMPLETES carrying "ship": s1's self-approval-by-the-back-door, in the node kind
+    /// whose entire purpose is a human decision.
+    ///
+    /// The operator-facing cost is real and deliberate: a mistyped option is TERMINAL,
+    /// because a `NodeFailed` on a waiting node is irreversible by construction. That is
+    /// why `torii run gate decide` validates the option against the journaled menu before
+    /// it appends anything — the CLI is what keeps this path rare; the executor is what
+    /// keeps it safe when the CLI is bypassed.
+    #[tokio::test]
+    async fn a_corrected_decision_does_not_resurrect_a_failed_gate() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(run, decided(&release(), "shipp", "alice", None))
+            .await
+            .unwrap();
+        let failed = ex.start(run, &gate_graph(None)).await.expect("drives");
+        assert!(
+            failed.failed.is_some(),
+            "the typo fails the gate: {failed:?}"
+        );
+
+        // The operator corrects themselves. Too late: the node is terminal.
+        journal
+            .append(run, decided(&release(), "ship", "alice", None))
+            .await
+            .unwrap();
+        let after = ex.start(run, &gate_graph(None)).await.expect("drives");
+        let (_n, message) = after
+            .failed
+            .expect("a gate that has already failed STAYS failed");
+        assert!(
+            message.contains("shipp"),
+            "the ORIGINAL failure is read back verbatim: {message}"
+        );
+        assert!(
+            !after.outputs.contains_key(&release()),
+            "a corrected decision must not produce output for a dead gate"
+        );
+    }
+
+    /// AC5: expiry produces a failure and NEVER an output. A gate that self-approves on
+    /// timeout is the footgun this codebase's fail-closed stance exists against, and s1 §8
+    /// mandates that it stay impossible to configure here.
+    #[tokio::test]
+    async fn an_expired_gate_never_self_approves() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, clock) = exec_at(&journal, at(1_000)).await;
+
+        ex.start(run, &gate_graph(Some(Duration::hours(1))))
+            .await
+            .expect("asks");
+        clock.set(at(1_000) + Duration::hours(2));
+
+        let o = ex
+            .start(run, &gate_graph(Some(Duration::hours(1))))
+            .await
+            .expect("drives");
+        assert!(o.failed.is_some(), "expiry fails");
+        assert!(
+            !o.outputs.contains_key(&release()),
+            "expiry must produce NO output, defaulted or otherwise"
+        );
+    }
+
+    /// AC14: the ask precedes the answer, unconditionally.
+    ///
+    /// A durable menu BREAKS s1's "the early-signal race resolves itself for free"
+    /// property: a decision folded with no menu has nothing to validate against. Resolved
+    /// by journaling the ask FIRST, then reading the pending decision against the menu
+    /// just published — so the early decision is honoured in the SAME execution and there
+    /// is never a decision without a menu.
+    #[tokio::test]
+    async fn a_decision_delivered_before_the_gate_first_runs_still_resolves() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        // The answer lands BEFORE the node has ever executed.
+        journal
+            .append(run, decided(&release(), "ship", "alice", None))
+            .await
+            .unwrap();
+
+        let o = ex.start(run, &gate_graph(None)).await.expect("drives");
+        assert!(o.paused.is_none(), "the early decision resolves it: {o:?}");
+        assert_eq!(
+            o.outputs.get(&release()).expect("output")["decision"],
+            serde_json::json!("ship")
+        );
+
+        // ...and the menu was still published, so the audit trail records what was offered.
+        let kinds: Vec<&str> = journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| match e {
+                JournalEvent::GateAwaited { .. } => "GateAwaited",
+                JournalEvent::GateDecided { .. } => "GateDecided",
+                _ => "other",
+            })
+            .collect();
+        assert!(
+            kinds.contains(&"GateAwaited"),
+            "the ask must be journaled even when the answer arrived first: {kinds:?}"
+        );
+    }
+
+    /// AC1: THE MENU IS DURABLE. The decision is validated against the menu journaled in
+    /// `GateAwaited`, never against the graph handed to this drive.
+    ///
+    /// A human was shown a menu; validating their answer against a DIFFERENT menu later
+    /// is simply wrong. This is the same argument s1 made for the deadline ("the deadline
+    /// belongs to the RUN, not to the graph"), and it is reachable for the same reason:
+    /// `Executor::start` takes the graph as a caller parameter and never journals it.
+    #[tokio::test]
+    async fn a_decision_is_validated_against_the_journaled_menu_not_the_graph() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        // Ask with the real menu: ship | reject.
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(run, decided(&release(), "ship", "alice", None))
+            .await
+            .unwrap();
+
+        // The author now edits the graph, dropping `ship` entirely. The human's recorded
+        // answer must STILL resolve — it was valid when they gave it.
+        let edited = Graph {
             nodes: vec![Node {
-                id: gate(),
+                id: release(),
                 kind: NodeKind::HumanGate {
-                    options: vec![GateOption {
-                        name: "approve".into(),
-                        outcome: GateOutcome::Complete,
-                    }],
+                    options: vec![
+                        opt("escalate", GateOutcome::Complete),
+                        opt("reject", GateOutcome::Fail),
+                    ],
                     timeout: None,
                 },
                 deps: vec![],
             }],
         };
+
+        let o = ex.start(run, &edited).await.expect("resumes");
+        assert!(
+            o.failed.is_none(),
+            "an edited graph must not retroactively invalidate a recorded decision: {o:?}"
+        );
+        assert_eq!(
+            o.outputs.get(&release()).expect("output")["decision"],
+            serde_json::json!("ship"),
+            "the answer resolves against the menu the human was SHOWN"
+        );
+    }
+
+    /// AC11: a decided gate replays from the fold — no gateway call, so zero token
+    /// re-spend by construction.
+    #[tokio::test]
+    async fn a_decided_gate_costs_nothing_on_resume() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(at(1_000));
+        let (gw, calls) = recording_gateway().await;
+        let ex =
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone());
+
+        ex.start(run, &gate_graph(None)).await.expect("asks");
+        journal
+            .append(run, decided(&release(), "ship", "alice", None))
+            .await
+            .unwrap();
+        ex.start(run, &gate_graph(None)).await.expect("resumes");
+        ex.start(run, &gate_graph(None))
+            .await
+            .expect("resumes again");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "a gate must never call the gateway"
+        );
+    }
+
+    /// A gate whose node id already recorded a wait but published NO menu — the one shape
+    /// that can reach the answer read with nothing durable to validate against. It is
+    /// reachable only by editing a live run's graph to swap a waiting node's KIND
+    /// (`AwaitSignal` → `HumanGate`), because both kinds fold their "has this node begun
+    /// asking?" record into the same map while only `GateAwaited` carries a menu.
+    ///
+    /// It fails loudly rather than falling back to the graph's `options`: that fallback
+    /// would be a menu no human was ever shown, which is precisely the non-durable menu
+    /// §4 rejects — and it would be silent.
+    #[tokio::test]
+    async fn a_gate_that_recorded_a_wait_without_a_menu_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock) = exec_at(&journal, at(1_000)).await;
+
+        // As if this node had begun waiting as an `AwaitSignal` before the graph was
+        // edited: a recorded wait, no menu.
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                run,
+                JournalEvent::SignalAwaited {
+                    node: release(),
+                    deadline: None,
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .append(run, decided(&release(), "ship", "alice", None))
+            .await
+            .unwrap();
+
+        let o = ex.start(run, &gate_graph(None)).await.expect("drives");
+        let (_n, message) = o
+            .failed
+            .expect("a decision with no journaled menu must fail, not resolve");
+        assert!(
+            message.contains("release") && message.contains("menu"),
+            "the failure names the node and what is missing: {message}"
+        );
+        assert!(
+            !o.outputs.contains_key(&release()),
+            "no output may be derived from a menu that was never published"
+        );
+    }
+
+    /// The never-panics property, carried across the implementation boundary.
+    ///
+    /// Task 2's code-quality review, Important 1: `NodeKind::HumanGate { .. } =>
+    /// unimplemented!()` was a REACHABLE worker panic on a graph `validate_dag` had just
+    /// certified well-formed (`run_inner`/`start_inner` both call it before ever reaching
+    /// the `run_node` match) — the exact poison-pill shape
+    /// `submitting_an_unaddable_timeout_leaves_no_poison_row_in_the_scheduler` already
+    /// fixed once for `AwaitSignal`: `Scheduler::submit` enqueues the durable store row
+    /// BEFORE the drive, so a panicking drive leaves a `(Waking, next_wake: None)` row
+    /// that every later `tick()` reclaims and panics on again.
+    ///
+    /// Task 2 satisfied that by failing the node loudly; Task 5 replaces the expectation
+    /// with the real behaviour — an unanswered gate PAUSES for its human — and the
+    /// property itself is unchanged and still guarded: this node kind never panics, and
+    /// the executor call itself never errors.
+    #[tokio::test]
+    async fn a_well_formed_human_gate_never_panics_it_pauses_for_a_human() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1");
+
+        let graph = gate_graph(None);
         graph.validate_dag().expect(
             "a well-formed HumanGate is a valid graph — the panic this test guards \
              against only happens on a graph validate_dag has certified",
         );
 
         let outcome = exec.run(run, &graph).await.expect(
-            "a not-yet-executable node kind fails the RUN; it must not error (let alone \
-             panic) the executor call itself",
+            "an unanswered gate pauses the RUN; it must not error (let alone panic) the \
+             executor call itself",
         );
 
-        let (node, message) = outcome
-            .failed
-            .expect("the node fails loudly rather than completing or hanging paused");
-        assert_eq!(node, gate());
+        let pause = outcome
+            .paused
+            .expect("an unanswered gate waits for its human rather than failing or completing");
+        assert_eq!(pause.node, release());
         assert!(
-            message.contains("gate"),
-            "the failure names the node: {message}"
+            pause.reason.contains("release"),
+            "the pause names the node an operator must answer: {}",
+            pause.reason
+        );
+        assert!(
+            outcome.failed.is_none(),
+            "waiting for a human is not a failure: {:?}",
+            outcome.failed
         );
 
         let events = journal.load(run).await.unwrap();
         assert!(
             events.iter().any(
-                |(_, e)| matches!(e, JournalEvent::NodeFailed { node, .. } if node == &gate())
+                |(_, e)| matches!(e, JournalEvent::GateAwaited { node, .. } if node == &release())
             ),
-            "the failure is journaled loudly, exactly as any other node failure is"
+            "the ask is journaled with the menu the human is being shown"
         );
     }
 }
