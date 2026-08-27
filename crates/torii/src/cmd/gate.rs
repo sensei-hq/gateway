@@ -25,6 +25,156 @@ use orchestrator_core::{
     RunStatus, SchedulerStore, Seq,
 };
 
+/// The three verbs of `run gate`. `approve` and `reject` are sugar for `decide --option
+/// approve|reject`, and they work only when the gate actually declares options by those
+/// names — when it does not, the refusal names the REAL menu, read from the journaled
+/// `GateAwaited`, so the operator is told what the human was offered rather than what
+/// this CLI assumed.
+///
+/// **Lives in the library, not in `main.rs`, so [`decision_of`] is testable.** The binary
+/// has no test module, and while this enum sat there the verb→option mapping was asserted
+/// by nothing at any layer — see `each_verb_maps_to_the_option_that_names_it` for what
+/// that let through. Same reason [`actor_or_user`] lives here.
+#[derive(clap::Subcommand)]
+pub enum GateAction {
+    /// Pick the `approve` option
+    Approve {
+        run_id: String,
+        /// The waiting node's id — `torii run list-paused` names it.
+        #[arg(long)]
+        node: String,
+        // `hide_default_value`: the clap default is the empty string, but the
+        // EFFECTIVE default is $USER (`cmd::gate::actor_or_user` resolves it), so
+        // rendering `[default: ""]` next to a sentence that says "defaulting to
+        // $USER" contradicts it on the one surface the trust boundary is stated.
+        #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
+        r#as: String,
+        /// Free text recorded alongside the decision. It becomes part of this node's
+        /// output, so it flows into downstream nodes and model prompts.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Pick the `reject` option — `--reason` is required
+    Reject {
+        run_id: String,
+        /// The waiting node's id — `torii run list-paused` names it.
+        #[arg(long)]
+        node: String,
+        // `hide_default_value`: the clap default is the empty string, but the
+        // EFFECTIVE default is $USER (`cmd::gate::actor_or_user` resolves it), so
+        // rendering `[default: ""]` next to a sentence that says "defaulting to
+        // $USER" contradicts it on the one surface the trust boundary is stated.
+        #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
+        r#as: String,
+        /// Why. Required: failing a run without recording why is a bare `catch {}`.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Pick a named option — the general form
+    Decide {
+        run_id: String,
+        /// The waiting node's id — `torii run list-paused` names it.
+        #[arg(long)]
+        node: String,
+        /// One of the options the gate published. An undeclared name is refused before
+        /// anything is written.
+        #[arg(long)]
+        option: String,
+        // `hide_default_value`: the clap default is the empty string, but the
+        // EFFECTIVE default is $USER (`cmd::gate::actor_or_user` resolves it), so
+        // rendering `[default: ""]` next to a sentence that says "defaulting to
+        // $USER" contradicts it on the one surface the trust boundary is stated.
+        #[arg(long, default_value = "", hide_default_value = true, help = ACTOR_HELP)]
+        r#as: String,
+        /// Free text recorded alongside the decision. It becomes part of this node's
+        /// output, so it flows into downstream nodes and model prompts.
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+/// One text for all three `--as` flags. A doc comment cannot be shared between fields, and
+/// the trust boundary has to be on the surface an operator reads when they type the flag —
+/// three hand-copied paragraphs would be three chances for one of them to lose the second
+/// sentence, which is the sentence that matters.
+const ACTOR_HELP: &str = "Who decided. ATTRIBUTION, NOT AUTHENTICATION: it is whatever \
+                          string you supply (defaulting to $USER), so it records who \
+                          CLAIMED to decide. Anyone who can reach the database can write \
+                          any actor.";
+
+/// The one shape all three [`GateAction`] verbs reduce to — [`decide`]'s arguments, still
+/// unparsed and unresolved.
+///
+/// NAMED fields, not a tuple: every one is a `String`, so a shuffled destructuring would
+/// compile silently. That is the second thing normalising three verbs into one call site
+/// exists to prevent, and the first (`approve` delivering `reject`) is the defect that put
+/// this type here.
+pub struct Decision {
+    pub run_id: String,
+    pub node: String,
+    /// The option name that will be matched against the journaled `GateAwaited` menu.
+    /// `approve`/`reject` are the two verbs' literals; `decide` passes the operator's own
+    /// through untouched.
+    pub option: String,
+    /// Still RAW — [`actor_or_user`] resolves the `$USER` fallback at the call site.
+    pub actor: String,
+    pub note: Option<String>,
+}
+
+/// Normalise a verb into the one shape [`decide`] takes.
+///
+/// The three verbs differ only in how the option and the note are SOURCED, so they are
+/// reduced here and `dispatch` has exactly ONE call to [`decide`] — a second dispatch arm
+/// per verb would be three places for the argument order to be got wrong.
+///
+/// Pure, and in the library, precisely so the mapping can be asserted: while this lived in
+/// the binary's `dispatch`, swapping `"approve"` and `"reject"` left every test in this
+/// crate green.
+pub fn decision_of(action: GateAction) -> Decision {
+    match action {
+        GateAction::Approve {
+            run_id,
+            node,
+            r#as,
+            note,
+        } => Decision {
+            run_id,
+            node,
+            option: "approve".to_string(),
+            actor: r#as,
+            note,
+        },
+        // `--reason` is clap-required, so the note is always `Some` — but it may still be
+        // blank, and `decide` re-checks the trimmed value. The required flag costs no
+        // connection; the trim is what actually holds.
+        GateAction::Reject {
+            run_id,
+            node,
+            r#as,
+            reason,
+        } => Decision {
+            run_id,
+            node,
+            option: "reject".to_string(),
+            actor: r#as,
+            note: Some(reason),
+        },
+        GateAction::Decide {
+            run_id,
+            node,
+            option,
+            r#as,
+            note,
+        } => Decision {
+            run_id,
+            node,
+            option,
+            actor: r#as,
+            note,
+        },
+    }
+}
+
 /// Deliver a typed decision to a `HumanGate` (SP-6 s2).
 ///
 /// **The menu comes from the JOURNAL, not the graph.** `GateAwaited` records what the
@@ -1273,6 +1423,73 @@ pub(crate) mod tests {
             "a cancelled run never pauses again — this is advice to wait forever: {}",
             out.text
         );
+    }
+
+    /// **The mapping every other test in this crate took on trust.** Swapping the
+    /// `"approve"` and `"reject"` literals used to leave the ENTIRE torii suite green —
+    /// lib, `cli.rs` and the e2e alike — because `cli.rs` only proves the three verbs are
+    /// LISTED and that clap requires `--reason`, and every library test calls [`decide`]
+    /// with an option string it passed in itself. Nothing anywhere read what a VERB
+    /// produces.
+    ///
+    /// The consequence of that gap is the exact inversion this slice's fail-closed design
+    /// exists to prevent: `torii run gate reject --reason "security hole"` would deliver
+    /// the `approve` option, a gate whose `approve` is `Complete` would SHIP, and the
+    /// report would read `decided: release = approve` — so nothing looks wrong at any
+    /// layer. A human's rejection becomes an approval, silently.
+    ///
+    /// The passthrough fields are asserted with three DISTINCT values on purpose: they are
+    /// all `String`, so a shuffled destructuring is invisible to the compiler, and that is
+    /// the second thing collapsing three verbs into one call site was supposed to prevent.
+    #[test]
+    fn each_verb_maps_to_the_option_that_names_it() {
+        let approve = decision_of(GateAction::Approve {
+            run_id: "the-run".into(),
+            node: "release".into(),
+            r#as: "alice".into(),
+            note: Some("canary is green".into()),
+        });
+        assert_eq!(approve.option, "approve", "`gate approve` picks `approve`");
+        assert_eq!(approve.run_id, "the-run");
+        assert_eq!(approve.node, "release");
+        assert_eq!(approve.actor, "alice");
+        assert_eq!(approve.note.as_deref(), Some("canary is green"));
+
+        // `--reason` is where a rejection's note comes from, and it is not optional.
+        let reject = decision_of(GateAction::Reject {
+            run_id: "the-run".into(),
+            node: "release".into(),
+            r#as: "bob".into(),
+            reason: "security hole".into(),
+        });
+        assert_eq!(
+            reject.option, "reject",
+            "`gate reject` must NEVER deliver `approve` — that is a rejection shipping the \
+             release"
+        );
+        assert_eq!(reject.run_id, "the-run");
+        assert_eq!(reject.node, "release");
+        assert_eq!(reject.actor, "bob");
+        assert_eq!(
+            reject.note.as_deref(),
+            Some("security hole"),
+            "`--reason` IS the note — `decide` refuses a Fail option without one"
+        );
+
+        // The general form passes the operator's own option through untouched, including
+        // one that happens to be spelled like a verb.
+        for option in ["hold", "approve", "reject"] {
+            let decide = decision_of(GateAction::Decide {
+                run_id: "the-run".into(),
+                node: "release".into(),
+                option: option.into(),
+                r#as: "carol".into(),
+                note: None,
+            });
+            assert_eq!(decide.option, option);
+            assert_eq!(decide.actor, "carol");
+            assert_eq!(decide.note, None, "an omitted --note stays absent");
+        }
     }
 
     /// `--as` is resolved once, at the CLI edge. Pure over the environment lookup so the
