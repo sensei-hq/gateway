@@ -14392,6 +14392,298 @@ mod await_signal {
     }
 }
 
+// ======================= SP-6 s2 shared waiting machinery (Task 3) ======================
+
+/// Direct unit tests on [`Executor::wait_or_expire`], the shared helper Task 3 extracted
+/// from `run_await_signal` for `HumanGate` to reuse.
+///
+/// **Why these exist, and why they are NOT in the `await_signal` module.** Task 3's review
+/// mutation-tested the extraction and found the 15 s1 tests guard `gate_precheck` but NOT
+/// the expiry decision. The reason is structural, not an oversight in s1: `run_await_signal`
+/// decides expiry in TWO places — `WaitState::Expired`, and the retained post-match check
+/// that catches a freshly computed deadline which has already passed — and the two emit
+/// byte-identical events and returns. They therefore MASK each other, and no black-box test
+/// driven through `run_await_signal` can distinguish them:
+///
+/// | mutation | s1 suite |
+/// |---|---|
+/// | `wait_or_expire` never returns `Expired` | GREEN, 15 passed |
+/// | the post-match check deleted, `Expired` kept | GREEN, 15 passed |
+/// | both disabled | RED, 6 failures |
+///
+/// Only the aggregate was guarded. That is tolerable while one function owns both sites,
+/// and NOT tolerable now: Task 5's `run_human_gate` consumes `WaitState::Expired` and has
+/// no duplicate post-match check to mask a bug in it, so a broken `Expired` arm would ship
+/// with every s1 test green. These tests call the helper directly — the only way to observe
+/// one site independently of the other — and the module is named so that it does not join
+/// the `await_signal` filter, whose count is a deliberate gate.
+mod waiting_node_helpers {
+    use super::signal::WaitState;
+    use super::*;
+    use crate::test_support::FakeClock;
+    use chrono::{DateTime, Duration, Utc};
+
+    fn at(unix_secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(unix_secs, 0).expect("valid timestamp")
+    }
+
+    fn gate() -> NodeId {
+        NodeId("gate".into())
+    }
+
+    fn gate_node() -> Node {
+        Node {
+            id: gate(),
+            kind: NodeKind::AwaitSignal { timeout: None },
+            deps: vec![],
+        }
+    }
+
+    /// An executor whose only relevant wiring is the clock — `wait_or_expire` reads nothing
+    /// else off `self`.
+    async fn exec_at(now: DateTime<Utc>) -> Executor {
+        let (gw, _c) = recording_gateway().await;
+        Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+            .with_clock(FakeClock::new(now))
+    }
+
+    /// A fold in which the gate has already begun asking, with the given deadline —
+    /// built through the real `fold_journal` rather than by poking private fields, so
+    /// these tests break if the folding contract changes under them.
+    fn folded_await(deadline: Option<DateTime<Utc>>) -> Fold {
+        let (fold, _, _) = fold_journal(&[(
+            0,
+            JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline,
+            },
+        )]);
+        fold
+    }
+
+    /// The arm with no independent guard before this test, and the one Task 5 depends on.
+    #[tokio::test]
+    async fn a_recorded_deadline_that_has_passed_reports_expired_with_that_exact_instant() {
+        let deadline = at(2_000_000);
+        let exec = exec_at(deadline).await;
+
+        match exec.wait_or_expire(&gate_node(), None, &folded_await(Some(deadline))) {
+            Ok(WaitState::Expired(d)) => assert_eq!(
+                d, deadline,
+                "the failure must name the instant the run actually recorded"
+            ),
+            other => panic!("expected Expired, got {}", describe(&other)),
+        }
+
+        // `now >= deadline` is inclusive: expiring exactly ON the deadline is the
+        // fail-closed reading, and the boundary is where an off-by-one would live.
+        let exec = exec_at(deadline + Duration::seconds(1)).await;
+        assert!(
+            matches!(
+                exec.wait_or_expire(&gate_node(), None, &folded_await(Some(deadline))),
+                Ok(WaitState::Expired(_))
+            ),
+            "a deadline in the past is expired"
+        );
+    }
+
+    /// THE never-expires guard, at the helper level: the recorded deadline is READ BACK,
+    /// and the `timeout` argument is ignored once anything is recorded. Recomputing
+    /// `now + timeout` here is what made a run force-woken every ten minutes with a
+    /// one-hour timeout never expire.
+    #[tokio::test]
+    async fn a_future_deadline_is_read_back_and_the_timeout_argument_is_ignored() {
+        let recorded = at(2_000_000);
+        let exec = exec_at(at(1_000_000)).await;
+
+        // A timeout that, if recomputed, would produce a visibly different instant.
+        let got = exec.wait_or_expire(
+            &gate_node(),
+            Some(Duration::seconds(9_999)),
+            &folded_await(Some(recorded)),
+        );
+        match got {
+            Ok(WaitState::Waiting(Some(d))) => assert_eq!(
+                d,
+                recorded,
+                "the ORIGINAL deadline survives; recomputing it from `now + timeout` \
+                 would return {}",
+                at(1_000_000) + Duration::seconds(9_999)
+            ),
+            other => panic!("expected Waiting(Some(recorded)), got {}", describe(&other)),
+        }
+    }
+
+    /// The indefinite human gate that has already begun asking: `Some(None)` is a REAL
+    /// recorded value, so it must report as waiting forever — never as "not yet asking",
+    /// which would re-journal its awaited event on every drive.
+    #[tokio::test]
+    async fn an_indefinite_gate_that_has_begun_asking_waits_with_no_deadline() {
+        let exec = exec_at(at(1_000_000)).await;
+        match exec.wait_or_expire(&gate_node(), Some(Duration::hours(1)), &folded_await(None)) {
+            Ok(WaitState::Waiting(None)) => {}
+            other => panic!("expected Waiting(None), got {}", describe(&other)),
+        }
+    }
+
+    /// Nothing recorded ⇒ the ONE execution that computes a deadline, from this `now`.
+    #[tokio::test]
+    async fn nothing_recorded_computes_the_deadline_once_from_now_plus_the_timeout() {
+        let now = at(1_000_000);
+        let exec = exec_at(now).await;
+        match exec.wait_or_expire(&gate_node(), Some(Duration::hours(1)), &Fold::default()) {
+            Ok(WaitState::NotYetAsking(Some(d))) => {
+                assert_eq!(d, now + Duration::hours(1));
+            }
+            other => panic!("expected NotYetAsking(Some(..)), got {}", describe(&other)),
+        }
+    }
+
+    /// A timeout-less node records `None` — which the caller journals as a real value, so
+    /// the node reads back as "already waiting" forever after.
+    #[tokio::test]
+    async fn nothing_recorded_and_no_timeout_computes_no_deadline_at_all() {
+        let exec = exec_at(at(1_000_000)).await;
+        match exec.wait_or_expire(&gate_node(), None, &Fold::default()) {
+            Ok(WaitState::NotYetAsking(None)) => {}
+            other => panic!("expected NotYetAsking(None), got {}", describe(&other)),
+        }
+    }
+
+    /// Layer 2 of the overflow guard, at the helper. `chrono::Duration` reaches ~292
+    /// million years and `DateTime<Utc>` stops at year 262143, so the plain `+` panics —
+    /// and a panic in a node kind is not local, it takes the worker down through
+    /// `Scheduler::tick`. The helper must report, not panic, and must journal nothing
+    /// (it cannot: it has no journal handle).
+    #[tokio::test]
+    async fn an_unaddable_timeout_reports_an_error_rather_than_panicking() {
+        let exec = exec_at(at(1_000_000)).await;
+        match exec.wait_or_expire(&gate_node(), Some(Duration::MAX), &Fold::default()) {
+            Err(message) => assert!(
+                message.contains("gate") && message.contains("overflows"),
+                "the error names the offending node and the reason: {message}"
+            ),
+            other => panic!("expected Err, got {}", describe(&other)),
+        }
+    }
+
+    fn describe(state: &Result<WaitState, String>) -> String {
+        match state {
+            Err(m) => format!("Err({m})"),
+            Ok(WaitState::NotYetAsking(d)) => format!("NotYetAsking({d:?})"),
+            Ok(WaitState::Expired(d)) => format!("Expired({d})"),
+            Ok(WaitState::Waiting(d)) => format!("Waiting({d:?})"),
+        }
+    }
+
+    /// A clock that reads one instant ONCE and a later one thereafter — the minimum needed
+    /// to pin the second expiry site, and deliberately not a change to the `Clock` trait.
+    ///
+    /// `run_await_signal` reads the clock exactly twice on the fresh-deadline path
+    /// (`wait_or_expire` fixes the deadline, then the post-match check re-reads it after an
+    /// `await`ed journal append — `Executor::append` itself reads no clock), and under
+    /// `FakeClock` both reads return the same instant, which is why the deterministic suite
+    /// could not reach that path at all.
+    struct SteppingClock {
+        first: DateTime<Utc>,
+        then: DateTime<Utc>,
+        reads: AtomicUsize,
+    }
+    impl Clock for SteppingClock {
+        fn now(&self) -> DateTime<Utc> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first
+            } else {
+                self.then
+            }
+        }
+    }
+
+    /// Pins the SECOND expiry site — the post-match check in `run_await_signal` — which no
+    /// s1 test reaches, because it fires only when the clock moves between the two reads.
+    ///
+    /// The comment above that check documents this as "measured": `timeout: Some(1ns)`
+    /// against a REAL clock journals `SignalAwaited` and then `NodeFailed` in a single
+    /// execution. A measurement nothing re-runs is a claim, not a guard, and against a real
+    /// clock it would be a race. A stepping clock makes it deterministic: the deadline is
+    /// fixed from `first`, and the check re-reads `then`, which is past it.
+    ///
+    /// Correct and loud — a gate given a nanosecond to answer has genuinely expired. The
+    /// order matters as much as the outcome: the awaited event is journaled BEFORE the
+    /// failure, because the node did begin asking, and the run must not pause.
+    #[tokio::test]
+    async fn a_deadline_that_passes_between_the_two_clock_reads_fails_the_node_and_never_pauses() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: None,
+                },
+            )
+            .await
+            .expect("seed RunStarted");
+
+        let first = at(1_000_000);
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(
+            Arc::new(SteppingClock {
+                first,
+                then: first + Duration::seconds(1),
+                reads: AtomicUsize::new(0),
+            }),
+        );
+
+        let node = Node {
+            id: gate(),
+            kind: NodeKind::AwaitSignal {
+                timeout: Some(Duration::milliseconds(1)),
+            },
+            deps: vec![],
+        };
+        let result = exec
+            .run_await_signal(
+                run,
+                &node,
+                Some(Duration::milliseconds(1)),
+                &Fold::default(),
+            )
+            .await
+            .expect("an expiry is a node failure, not an executor error");
+
+        match result {
+            NodeExec::Failed { message, .. } => assert!(
+                message.contains("no signal for node gate"),
+                "the failure names the node: {message}"
+            ),
+            NodeExec::Paused { reason } => panic!(
+                "a deadline that has passed must NOT pause — the scheduler would re-arm on \
+                 an instant already behind it: Paused({reason})"
+            ),
+            NodeExec::Completed(v) => panic!("expected a loud failure, got Completed({v})"),
+        }
+
+        let events = journal.load(run).await.unwrap();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|(_, e)| match e {
+                JournalEvent::RunStarted { .. } => "RunStarted",
+                JournalEvent::SignalAwaited { .. } => "SignalAwaited",
+                JournalEvent::NodeFailed { .. } => "NodeFailed",
+                JournalEvent::RunPaused { .. } => "RunPaused",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["RunStarted", "SignalAwaited", "NodeFailed"],
+            "the node records that it began asking, then fails — and pauses on nothing"
+        );
+    }
+}
+
 // ================================ SP-6 s2 HumanGate (Task 2) ============================
 
 /// `HumanGate` has no executor arm yet — Task 5 adds `run_human_gate`. This is Task 2's

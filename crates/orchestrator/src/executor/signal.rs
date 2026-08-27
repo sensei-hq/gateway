@@ -343,6 +343,20 @@ impl Executor {
         // A FRESHLY recorded deadline can ALREADY have passed, so the expiry check runs
         // once more here, over the deadline whichever arm produced.
         //
+        // This is the SECOND site that decides expiry (`WaitState::Expired` is the first),
+        // and the two read the clock at different moments. For an ALREADY-recorded deadline
+        // that makes this check a re-read, which is harmless in the direction that matters:
+        // if the two reads disagree it is because time moved between them, and the later
+        // read is the truthful one — which is the one this check uses.
+        //
+        // Do NOT restate that as "the clock is monotonic". It is not: `SystemClock::now()`
+        // is `Utc::now()`, wall time, so an NTP step BACKWARD can make read 1 land past the
+        // deadline and read 2 before it. `wait_or_expire` has already returned `Expired` by
+        // then and this code never runs — the node fails. That is the right direction for a
+        // deadline (fail-closed: a gate whose SLA was observed to have run out does not get
+        // un-expired by the clock being corrected), but it is a fail-closed property, not a
+        // monotonicity guarantee, and nothing downstream may assume the latter.
+        //
         // REACHABLE on the first execution — an earlier version of this comment claimed
         // otherwise ("`validate_dag` rejects a non-positive timeout, so a freshly computed
         // `now + timeout` is always in the future") and a reviewer disproved it.
