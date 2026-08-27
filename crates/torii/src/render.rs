@@ -171,7 +171,16 @@ const REASON_MAX: usize = 300;
 /// of order and withholds the whole reason when it detects one. Redact-first is kept
 /// here anyway as the safer general default — it costs nothing — but this function
 /// does not need to (and does not) carry the split-secret defense itself.
-fn safe_reason(s: &str) -> String {
+///
+/// `pub(crate)` because a pause reason is not the only free text this crate renders to a
+/// terminal. `cmd::run::signal` and `cmd::gate::decide` both report a POST-APPEND fault —
+/// a `JournalError` or an `OrchestratorError` — inline in their `unread` message, and
+/// `PostgresJournal::load` builds those from `sqlx::Error` and `serde_json::Error`: the
+/// same connection strings, the same newlines that forge a pastable run row, the same
+/// ANSI escapes. They reached stdout raw. One transform for one class of value, applied
+/// at every sink, rather than a habit each writer re-derives — the argument [`MENU_MAX`]
+/// already records for a menu.
+pub(crate) fn safe_reason(s: &str) -> String {
     let redacted = redact_reason(s);
     let collapsed = one_line(&redacted);
     cap_chars(&collapsed, REASON_MAX)

@@ -470,7 +470,19 @@ pub async fn decide(
     // for an indefinite gate (`next_wake` NULL, never auto-woken) the run would then wait
     // forever on a decision nobody knows landed. Identical in shape and in reason to
     // `cmd::run::signal`'s `unread` closure.
+    //
+    // The error goes through `render::safe_reason` — redact, collapse control characters,
+    // cap — because a backend fault is FREE TEXT FROM THE DRIVER, not a message this
+    // crate wrote. `PostgresJournal::load` builds it from both `sqlx::Error` (a pool
+    // timeout carries the whole connection string, password included) and
+    // `serde_json::Error` (over a TYPED `JournalEvent`, which quotes the offending row —
+    // the `invalid type: string "sk-live-…"` shape `parse_payload` documents). Interpolated
+    // raw it also let a newline forge a line beginning with a pastable uuid and an ANSI
+    // escape rewrite what was already on screen. This is the same transform, on the same
+    // error class, that `render::awaiting_section` already applies to a per-run journal
+    // fault in `list-paused` — one guard, every sink.
     let unread = |what: &str, e: &dyn std::fmt::Display| {
+        let e = render::safe_reason(&e.to_string());
         Outcome::precondition(format!(
             "not queued: {shown}'s decision is journaled durably (seq {appended}), but \
              {what} failed: {e}. Nothing has read it yet and the run is not queued to \
@@ -525,10 +537,41 @@ pub async fn decide(
                  node after the decision landed, so the run is moving without waiting for a \
                  tick)"
             )),
-            // Terminated AFTER our row, but NOT by completing — an expired deadline, or a
-            // cascade skip. That drive had loaded the journal before our row landed, so it
-            // never saw the decision. Reporting `decided` here would hide a failed gate
-            // behind a success.
+            // Terminated AFTER our row by a REJECTION — a decision that WAS read, and
+            // honoured. A `GateOutcome::Fail` option's whole purpose is to fail the node,
+            // so this `NodeFailed` is the decision working, not the decision being missed.
+            //
+            // This arm exists because the generic one below was imported from
+            // `cmd::run::signal`, where its premise HOLDS: `run_await_signal` completes on
+            // any folded payload and never fails a node because of one, so for an
+            // `AwaitSignal` a terminal-Failed ahead of the delivery really does mean
+            // nothing read it. `HumanGate` breaks that premise, and without this arm
+            // `torii run gate reject` reported exit 2 — "it terminated while this decision
+            // was in flight, and a drive that had already loaded the journal would not
+            // have seen it" — on a rejection that had done precisely what it was asked to.
+            //
+            // `chosen.outcome == Fail` is NOT the discriminator, and that is the whole
+            // subtlety: `wait_or_expire` takes `Expired` BEFORE any decision is read, so a
+            // deadline firing in the same window journals its own `NodeFailed` at the same
+            // place, for the same `Fail` option, and must keep the "not read" text. What
+            // separates them is the journaled MESSAGE — `fail_gate`'s rejection form
+            // against its expiry form — so that is what is matched, at the exact seq the
+            // fold said established the state.
+            //
+            // The wording claims the ORDERING (proven) and not authorship (not proven),
+            // exactly as the `Completed` arm above: a duplicate decision already on the
+            // journal is last-wins, so which one the drive folded is not observable here.
+            (SignalState::Failed, true) if rejected_at(&after_events, at, &node) => {
+                Outcome::ok(format!(
+                    "decided: {shown} = {chosen_shown} (a drive already in flight read a \
+                     decision after this one landed and rejected the node — stopping the \
+                     run is what a Fail option does, so there is nothing further to do)"
+                ))
+            }
+            // Terminated AFTER our row, but NOT by completing and NOT by an honoured
+            // rejection — an expired deadline, or a cascade skip. That drive had loaded
+            // the journal before our row landed, so it never saw the decision. Reporting
+            // `decided` here would hide a failed gate behind a success.
             (other, true) => Outcome::precondition(format!(
                 "not read: {shown}'s decision is journaled durably, but {shown} is {} — it \
                  terminated while this decision was in flight, and a drive that had \
@@ -591,6 +634,38 @@ pub async fn decide(
             after.status.as_str(),
             run.0
         ))
+    })
+}
+
+/// Did the `NodeFailed` that terminated this node at seq `at` come from a REJECTION the
+/// executor read and honoured, rather than from the deadline firing?
+///
+/// The two are indistinguishable by state — both are `SignalState::Failed` on the same
+/// node, and a `Fail` option is involved either way — and they are opposite outcomes for
+/// the operator: one says the rejection landed, the other says nothing ever looked at it.
+/// Only the journaled MESSAGE separates them, so only the message is consulted.
+///
+/// Matched against `Executor::fail_gate`'s rejection form,
+/// `"human_gate: node {id} rejected by {actor} ({option}): {reason}"`
+/// (`crates/orchestrator/src/executor/gate.rs`), anchored on the node id this command was
+/// given rather than on the bare word "rejected" — the id is the one part of that prefix
+/// the caller already knows, so a `NodeFailed` a DIFFERENT node's rejection wrote cannot
+/// match, and neither can operator prose that happens to contain the word.
+///
+/// **Conservative in the safe direction.** Every failure text goes through the executor's
+/// redactor, so a node id or actor of secret SHAPE would be rewritten and this returns
+/// `false` — which falls through to the generic "not read" report. That is the fail-safe
+/// answer: it under-claims (an operator is told to check a decision that in fact landed)
+/// rather than over-claiming a rejection that never happened. Matching by seq as well as
+/// by node is what keeps this reading the event the FOLD chose, not some other failure.
+fn rejected_at(events: &[(Seq, JournalEvent)], at: Seq, node: &NodeId) -> bool {
+    let prefix = format!("human_gate: node {} rejected by ", node.0);
+    events.iter().any(|(seq, e)| {
+        matches!(
+            e,
+            JournalEvent::NodeFailed { node: n, error }
+                if *seq == at && n == node && error.starts_with(&prefix)
+        )
     })
 }
 
@@ -1109,6 +1184,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// The boundary itself, at the ONE instant that distinguishes `>=` from `>`. The two
+    /// tests either side of this one pin it an hour out in each direction, which `now > d`
+    /// satisfies just as well — so without this the boundary the refusal claims to copy
+    /// from `wait_or_expire` (`Some(d) if self.clock.now() >= d` ⇒ `WaitState::Expired`)
+    /// is asserted by nothing, and a CLI that accepted a decision exactly at the deadline
+    /// would journal a row the executor is about to reject.
+    #[tokio::test]
+    async fn a_decision_exactly_at_the_gates_deadline_is_refused() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), Some(now()), &["ship"]).await;
+
+        let out = decide(&s, &j, run, release(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "`now == deadline` is EXPIRED for the executor, so it must be expired here: \
+             {}",
+            out.text
+        );
+        assert!(out.text.contains("deadline"), "{}", out.text);
+        assert!(
+            journaled_decisions(&j, run, &release()).await.is_empty(),
+            "an expired gate must leave NOTHING durable"
+        );
+    }
+
     /// The boundary the refusal above sits on is the EXECUTOR's (`now >= deadline` ⇒
     /// `WaitState::Expired`), not one invented here, and a deadline still in the future is
     /// the other side of it. Without this, refusing every timed gate outright would leave
@@ -1218,11 +1322,35 @@ pub(crate) mod tests {
         /// It folded the journal — which by then contains our decision — and completed the
         /// gate with it, finishing the run.
         CompletesTheNode,
+        /// It folded the journal and FAILED the gate, journaling the carried `NodeFailed`
+        /// message verbatim and filing the run `Failed`. The message is the discriminator
+        /// the report depends on, so it is supplied by the test rather than invented here:
+        /// `fail_gate`'s REJECTION form means the decision was read and honoured, its
+        /// EXPIRY form means `wait_or_expire` took `Expired` before any decision was read.
+        /// Both land on `(SignalState::Failed, at > appended)` and they are opposite
+        /// outcomes.
+        FailsTheNode(&'static str),
         /// An operator cancelled the run. `cancel` journals no NODE event, so the gate
         /// still folds as awaiting while the run is over: the decision is durable, the
         /// node never terminated, and nothing will ever read it.
         CancelsTheRun,
     }
+
+    /// The EXACT `NodeFailed` text `Executor::run_human_gate` journals for a decision it
+    /// read and honoured on a `Fail` option — `fail_gate`'s rejection form,
+    /// `"human_gate: node {id} rejected by {actor} ({option}): {reason}"`
+    /// (`crates/orchestrator/src/executor/gate.rs`). Copied verbatim rather than
+    /// paraphrased: it is what `decide` matches on to tell a honoured rejection from an
+    /// expiry, so a paraphrase would test a string this repo never writes.
+    const EXECUTOR_REJECTION: &str =
+        "human_gate: node release rejected by alice (reject): the canary suite is red";
+
+    /// The EXACT `NodeFailed` text the same function journals when `wait_or_expire`
+    /// returns `Expired` — which happens BEFORE any decision is read. Same node, same
+    /// seq ordering, opposite meaning.
+    const EXECUTOR_EXPIRY: &str = "human_gate: node release passed its deadline \
+         1970-02-04T17:20:01Z; the gate fails on the deadline BEFORE any decision is \
+         read, so a decision that had already landed does not approve it";
 
     #[async_trait::async_trait]
     impl SchedulerStore for GateRacingStore {
@@ -1306,6 +1434,28 @@ pub(crate) mod tests {
                     self.journal.append(run, JournalEvent::RunCompleted).await?;
                     self.inner
                         .record_terminal(run, RunStatus::Completed, None)
+                        .await?;
+                }
+                // Same claim, same ordering — the drive folds a journal that already
+                // holds our decision — but it FAILS the gate rather than completing it.
+                // A `HumanGate` journals a real `NodeFailed` on every failure arm
+                // (`fail_gate`), so unlike the completion above there is no inferred
+                // marker involved.
+                GateRacingDrive::FailsTheNode(error) => {
+                    self.inner
+                        .claim_due(now, chrono::Duration::seconds(60), 10)
+                        .await?;
+                    self.journal
+                        .append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: release(),
+                                error: error.to_string(),
+                            },
+                        )
+                        .await?;
+                    self.inner
+                        .record_terminal(run, RunStatus::Failed, None)
                         .await?;
                 }
                 // No claim and no journal write at all: `cancel` is unconditional and
@@ -1416,6 +1566,228 @@ pub(crate) mod tests {
         );
     }
 
+    /// Deliver `reject --reason "the canary suite is red"` against a worker that claims
+    /// the run inside the delivery window and FAILS the gate with `error`.
+    ///
+    /// One fixture for both post-append failure tests, and the decision is IDENTICAL in
+    /// both: only the journaled `NodeFailed` text differs. That is the point — the
+    /// option's outcome is `Fail` either way, so `chosen.outcome` alone cannot tell a
+    /// honoured rejection from a deadline that fired in the same window, and a report that
+    /// tried to would be wrong exactly half the time.
+    ///
+    /// Returns the outcome, the seq of our `GateDecided` and the seq of the drive's
+    /// `NodeFailed`, so each test can pin the ORDERING its claim depends on.
+    async fn decide_against_a_failing_drive(error: &'static str) -> (Outcome, Seq, Seq) {
+        let run = RunId(uuid::Uuid::new_v4());
+        // A TIMED gate already due, so a worker's `claim_due` really can grab it in the
+        // window; the deadline itself is still ahead of `now`, so the pre-check does not
+        // refuse first.
+        let inner = paused_store(run, Some(now())).await;
+        let journal = std::sync::Arc::new(
+            gate_journal(
+                run,
+                &release(),
+                Some(now() + chrono::Duration::seconds(1)),
+                &["ship", "reject"],
+            )
+            .await,
+        );
+        let racing = GateRacingStore {
+            inner: inner.clone(),
+            journal: journal.clone(),
+            run,
+            drive: GateRacingDrive::FailsTheNode(error),
+        };
+
+        let out = decide(
+            &racing,
+            journal.as_ref(),
+            run,
+            release(),
+            "reject",
+            "alice",
+            Some("the canary suite is red"),
+            now(),
+        )
+        .await
+        .expect("no hard error");
+
+        let events = journal.load(run).await.unwrap();
+        let seq_of = |p: fn(&JournalEvent) -> bool| {
+            events
+                .iter()
+                .find(|(_, e)| p(e))
+                .map(|(s, _)| *s)
+                .expect("the event is on the journal")
+        };
+        let decided = seq_of(|e| matches!(e, JournalEvent::GateDecided { .. }));
+        let failed = seq_of(|e| matches!(e, JournalEvent::NodeFailed { .. }));
+        assert_eq!(
+            journaled_decisions(&journal, run, &release()).await.len(),
+            1,
+            "precondition: exactly one decision is durable"
+        );
+        assert_eq!(
+            inner.status(run).await.unwrap().unwrap().status,
+            RunStatus::Failed,
+            "precondition: the racing drive really did fail the run"
+        );
+        (out, decided, failed)
+    }
+
+    /// A rejection that a racing worker READ AND HONOURED is a SUCCESS, not a lost
+    /// delivery.
+    ///
+    /// The generic `(other, true)` arm was imported wholesale from `cmd::run::signal`,
+    /// where it is sound: `run_await_signal` completes on ANY folded payload and never
+    /// fails a node BECAUSE of one, so for an `AwaitSignal` a `NodeFailed` ahead of the
+    /// delivery really does mean nothing read it. `HumanGate` breaks that premise —
+    /// `GateOutcome::Fail` makes a `NodeFailed` the CORRECT, requested outcome of a
+    /// decision that was read — and the arm's own comment enumerated only "an expired
+    /// deadline, or a cascade skip".
+    ///
+    /// So `torii run gate reject --reason "the canary suite is red"`, raced by a worker
+    /// claiming the run inside the window `force_wake` itself opens, exited 2 saying the
+    /// decision "terminated while this decision was in flight, and a drive that had
+    /// already loaded the journal would not have seen it" — every clause of which is
+    /// false here: the drive loaded the journal AFTER our row, read the decision, and
+    /// failed the node BECAUSE of it. The operator is told their rejection was lost, and
+    /// the retry they are pushed toward is refused by the node-state pre-check.
+    #[tokio::test]
+    async fn a_rejection_a_racing_worker_already_folded_is_not_reported_as_not_read() {
+        let (out, decided, failed) = decide_against_a_failing_drive(EXECUTOR_REJECTION).await;
+
+        // The evidence FIRST: the failure sits BEHIND our row, so the drive that failed
+        // the node folded a journal that already contained the decision.
+        assert!(
+            decided < failed,
+            "precondition: the gate failed by folding OUR decision (decided={decided} \
+             failed={failed})"
+        );
+
+        assert_eq!(
+            out.code, EXIT_OK,
+            "the rejection was delivered, folded and honoured — the run stopped because \
+             of it, which is what a Fail option is for: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("would not have seen it"),
+            "the drive DID see it — this sentence is false on every clause: {}",
+            out.text
+        );
+    }
+
+    /// The other side of that discriminator, and the reason it cannot be
+    /// `chosen.outcome == Fail`: `wait_or_expire` takes `Expired` BEFORE any decision is
+    /// read, so a deadline firing inside the same window journals a `NodeFailed` at the
+    /// same place with the same `(Failed, at > appended)` shape — for a decision nothing
+    /// looked at.
+    ///
+    /// Reported as decided, this would tell an operator their rejection stopped a run
+    /// that in fact died of its SLA, and would hide the far more useful fact that the
+    /// gate expired. This test and its sibling above are also what stops the whole
+    /// post-append classification collapsing to `if at.is_some() { ok("decided") }`,
+    /// which left 192 tests green.
+    #[tokio::test]
+    async fn a_decision_a_racing_expiry_failed_past_is_not_reported_as_decided() {
+        let (out, decided, failed) = decide_against_a_failing_drive(EXECUTOR_EXPIRY).await;
+
+        assert!(
+            decided < failed,
+            "precondition: identical ORDERING to the honoured rejection — only the \
+             journaled reason differs (decided={decided} failed={failed})"
+        );
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "the deadline fired before any decision was read — reporting this as decided \
+             claims a rejection landed that nothing ever looked at: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("not read"),
+            "must say plainly that nothing read it: {}",
+            out.text
+        );
+    }
+
+    /// The `(other, false)` arm — a node that died INSIDE the write window, so our row
+    /// landed behind a marker that was already there. Reached with a journal whose
+    /// `append` slips the `NodeFailed` in first: the store hook fires on `force_wake`,
+    /// which is post-append by construction, so no `SchedulerStore` fixture can produce
+    /// this ordering.
+    ///
+    /// It must never report success: the residue is durable and consequential — a
+    /// `HumanGate` journals no `NodeCompleted` and `NodeFailed` is not folded as a
+    /// barrier, so a re-`start` would re-execute the gate and fold this late decision as
+    /// its answer.
+    #[tokio::test]
+    async fn a_decision_the_node_died_before_is_reported_as_an_orphan_not_as_decided() {
+        struct DiesInsideTheWindow {
+            inner: std::sync::Arc<InMemoryJournal>,
+        }
+        #[async_trait::async_trait]
+        impl ExecutionJournal for DiesInsideTheWindow {
+            async fn append(
+                &self,
+                run: RunId,
+                event: JournalEvent,
+            ) -> Result<Seq, orchestrator_core::JournalError> {
+                if matches!(event, JournalEvent::GateDecided { .. }) {
+                    self.inner
+                        .append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: release(),
+                                error: EXECUTOR_EXPIRY.to_string(),
+                            },
+                        )
+                        .await?;
+                }
+                self.inner.append(run, event).await
+            }
+            async fn load(
+                &self,
+                run: RunId,
+            ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+                self.inner.load(run).await
+            }
+        }
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let inner = std::sync::Arc::new(gate_journal(run, &release(), None, &["ship"]).await);
+        let j = DiesInsideTheWindow {
+            inner: inner.clone(),
+        };
+
+        let out = decide(&s, &j, run, release(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        let events = inner.load(run).await.unwrap();
+        let seq_of = |p: fn(&JournalEvent) -> bool| {
+            events
+                .iter()
+                .find(|(_, e)| p(e))
+                .map(|(s, _)| *s)
+                .expect("the event is on the journal")
+        };
+        assert!(
+            seq_of(|e| matches!(e, JournalEvent::NodeFailed { .. }))
+                < seq_of(|e| matches!(e, JournalEvent::GateDecided { .. })),
+            "precondition: the node was already dead when the row landed"
+        );
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("was already") && out.text.contains("nothing read it"),
+            "must say the row is a durable orphan, not a delivery: {}",
+            out.text
+        );
+    }
+
     /// The other half of the post-append window: the run went TERMINAL while the node
     /// itself never did. `cancel` is node-blind and journals no node event, so the gate
     /// still folds as awaiting — `at: None` — and the run will never be paused again.
@@ -1479,6 +1851,102 @@ pub(crate) mod tests {
         assert!(
             !out.text.contains("once it is paused again"),
             "a cancelled run never pauses again — this is advice to wait forever: {}",
+            out.text
+        );
+    }
+
+    /// A journal fault raised AFTER the append reaches stdout as an operator report
+    /// rather than as an error — and a backend message is free text from the driver, so
+    /// it gets the SAME transform `list-paused` already gives the identical error class:
+    /// redact, collapse control characters, cap.
+    ///
+    /// `PostgresJournal::load` builds this message from both `sqlx::Error` and
+    /// `serde_json::Error`, so it can carry a connection string with a password (the
+    /// realistic pool-timeout case) and — over a TYPED `JournalEvent` — quoted row
+    /// content, which is the `invalid type: string "sk-live-…"` shape this crate
+    /// documents at `parse_payload`. Unguarded it also carries a newline that forges a
+    /// pastable run row and a raw ESC that rewrites what is already on screen.
+    ///
+    /// `run list-paused` proves the same property on the same fixture
+    /// (`list_paused_never_leaks_a_connection_string_or_forges_a_row_from_a_journal_fault`),
+    /// which is why the fixture is shared rather than copied.
+    #[tokio::test]
+    async fn a_journal_fault_after_the_append_is_not_echoed_raw() {
+        /// Folds cleanly for the PRE-check and faults on the post-append re-read — the
+        /// one window in which a backend message reaches this command's stdout.
+        struct FaultingReloadJournal {
+            inner: std::sync::Arc<InMemoryJournal>,
+            loads: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ExecutionJournal for FaultingReloadJournal {
+            async fn append(
+                &self,
+                run: RunId,
+                event: JournalEvent,
+            ) -> Result<Seq, orchestrator_core::JournalError> {
+                self.inner.append(run, event).await
+            }
+            async fn load(
+                &self,
+                run: RunId,
+            ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+                if self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return self.inner.load(run).await;
+                }
+                Err(crate::cmd::run::tests::hostile_backend_error(run))
+            }
+        }
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let inner = std::sync::Arc::new(gate_journal(run, &release(), None, &["ship"]).await);
+        let j = FaultingReloadJournal {
+            inner: inner.clone(),
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let out = decide(&s, &j, run, release(), "ship", "alice", None, now())
+            .await
+            .expect("a post-append fault is reported, not returned as a bare error");
+
+        assert_eq!(
+            journaled_decisions(&inner, run, &release()).await.len(),
+            1,
+            "precondition: the decision is durable, so this really is the post-append \
+             report and not a refusal"
+        );
+        assert!(
+            out.text.contains("journaled durably"),
+            "precondition: the fault must be reported on the unread path: {}",
+            out.text
+        );
+
+        assert!(
+            !out.text
+                .contains(&crate::cmd::run::tests::hostile_password()),
+            "a journal fault leaked the database password: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("[REDACTED]"),
+            "the credential span must be visibly redacted — dropping the message \
+             entirely would pass the leak assertion while telling the operator nothing: \
+             {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains('\u{1b}'),
+            "a raw escape byte survived into the report: {:?}",
+            out.text
+        );
+        assert_eq!(
+            out.text
+                .lines()
+                .filter(|l| l.trim_start().starts_with(FORGED_RUN))
+                .count(),
+            0,
+            "a newline in the fault forged a line that reads as its own run row:\n{}",
             out.text
         );
     }
@@ -1603,6 +2071,21 @@ pub(crate) mod tests {
         assert!(
             !e.message.contains(&huge),
             "and must not echo the note back: {}",
+            e.message
+        );
+        // The `what` parameter exists for exactly this: `check_payload_size` is shared
+        // with `run signal`, and its message named `--payload` unconditionally until this
+        // command started calling it. Telling a `gate decide --note` operator to shorten
+        // their `--payload` sends them to a flag this command does not have.
+        assert!(
+            e.message.contains("the decision note"),
+            "must name the input the operator actually supplied: {}",
+            e.message
+        );
+        assert!(
+            !e.message.contains("--payload"),
+            "`gate decide` has no `--payload` flag — naming it is advice to edit \
+             something that does not exist: {}",
             e.message
         );
         assert!(

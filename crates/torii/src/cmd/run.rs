@@ -864,7 +864,19 @@ pub async fn signal(
     // So a post-append fault is a REPORT, not an error: it names the durable row and the
     // command that unblocks the run, in the same sentence shape the lost-race arm below
     // already uses.
+    //
+    // The error goes through `render::safe_reason` — redact, collapse control characters,
+    // cap — for all three call sites at once, because it is FREE TEXT FROM THE DRIVER and
+    // not a message this crate wrote. `PostgresJournal::load` builds it from both
+    // `sqlx::Error` (a pool timeout carries the whole connection string, password
+    // included) and `serde_json::Error` (over a TYPED `JournalEvent`, which quotes the
+    // offending row — the `invalid type: string "sk-live-…"` shape `parse_payload`
+    // documents). Interpolated raw it also let a newline forge a line beginning with a
+    // pastable uuid and an ANSI escape rewrite what was already on screen. Same
+    // transform, same error class, as `render::awaiting_section` applies to a per-run
+    // journal fault in `list_paused` — and `cmd::gate::decide` has the identical closure.
     let unread = |what: &str, e: &dyn std::fmt::Display| {
+        let e = render::safe_reason(&e.to_string());
         Outcome::precondition(format!(
             "not queued: {shown}'s answer is journaled durably (seq {appended}), but {what} \
              failed: {e}. Nothing has read it yet and the run is not queued to resume — run \
@@ -3655,6 +3667,92 @@ pub(crate) mod tests {
         );
     }
 
+    /// `signal`'s post-append `unread` closure renders a backend fault to stdout, and a
+    /// backend message is free text from the driver — the same class `list-paused` puts
+    /// through `safe_reason`, and it was echoed here with no redaction, no
+    /// control-character collapse and no cap.
+    ///
+    /// `PostgresJournal::load` builds that message from both `sqlx::Error` and
+    /// `serde_json::Error`, so it can carry a connection string with a password, a
+    /// newline that forges a pastable run row, and a raw ESC. `cmd::gate::decide` has the
+    /// identical closure and the identical test — the guard has to hold at every sink,
+    /// which is exactly why it is one shared helper rather than a habit.
+    #[tokio::test]
+    async fn signal_does_not_echo_a_raw_journal_fault_after_the_append() {
+        /// Folds cleanly for the pre-check, faults on the post-append re-read.
+        struct FaultingReloadJournal {
+            inner: Arc<InMemoryJournal>,
+            loads: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ExecutionJournal for FaultingReloadJournal {
+            async fn append(
+                &self,
+                run: RunId,
+                event: JournalEvent,
+            ) -> Result<Seq, orchestrator_core::JournalError> {
+                self.inner.append(run, event).await
+            }
+            async fn load(
+                &self,
+                run: RunId,
+            ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+                if self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return self.inner.load(run).await;
+                }
+                Err(hostile_backend_error(run))
+            }
+        }
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let inner = Arc::new(awaiting_journal(run, &gate(), None).await);
+        let j = FaultingReloadJournal {
+            inner: inner.clone(),
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let out = signal(&s, &j, run, gate(), approved(), now())
+            .await
+            .expect("a post-append fault is reported, not returned as a bare error");
+
+        assert_eq!(
+            journaled_signals(&inner, run, &gate()).await.len(),
+            1,
+            "precondition: the answer is durable, so this is the post-append report"
+        );
+        assert!(
+            out.text.contains("journaled durably"),
+            "precondition: the fault must be reported on the unread path: {}",
+            out.text
+        );
+
+        assert!(
+            !out.text.contains(&hostile_password()),
+            "a journal fault leaked the database password: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("[REDACTED]"),
+            "the credential span must be visibly redacted, not dropped: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains('\u{1b}'),
+            "a raw escape byte survived into the report: {:?}",
+            out.text
+        );
+        assert_eq!(
+            out.text
+                .lines()
+                .filter(|l| l.trim_start().starts_with(FORGED_RUN))
+                .count(),
+            0,
+            "a newline in the fault forged a line that reads as its own run row:\n{}",
+            out.text
+        );
+    }
+
     // ---- SP-6 s1 Task 4: `list-paused` names the awaiting node ------------------------
 
     /// An operator must be able to discover WHAT to signal without reading the graph.
@@ -3937,7 +4035,11 @@ pub(crate) mod tests {
     /// connection string with a password, a newline that would forge a second row, and an
     /// ANSI escape that would rewrite what is already on screen. Assembled at runtime —
     /// the repo's Semgrep CWE-798 hook blocks a credential-shaped literal in a fixture.
-    fn hostile_backend_error(_run: RunId) -> orchestrator_core::JournalError {
+    ///
+    /// `pub(crate)` for `cmd::gate`'s tests: `decide`'s post-append `unread` closure
+    /// renders the SAME error class to stdout and needed the same guard. One hostile
+    /// fixture, so the two commands cannot disagree about what a backend fault may carry.
+    pub(crate) fn hostile_backend_error(_run: RunId) -> orchestrator_core::JournalError {
         orchestrator_core::JournalError::Backend(hostile_backend_message())
     }
 
@@ -3950,7 +4052,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn hostile_password() -> String {
+    pub(crate) fn hostile_password() -> String {
         format!("s3cr{}t", "e")
     }
 
