@@ -171,7 +171,16 @@ const REASON_MAX: usize = 300;
 /// of order and withholds the whole reason when it detects one. Redact-first is kept
 /// here anyway as the safer general default — it costs nothing — but this function
 /// does not need to (and does not) carry the split-secret defense itself.
-fn safe_reason(s: &str) -> String {
+///
+/// `pub(crate)` because a pause reason is not the only free text this crate renders to a
+/// terminal. `cmd::run::signal` and `cmd::gate::decide` both report a POST-APPEND fault —
+/// a `JournalError` or an `OrchestratorError` — inline in their `unread` message, and
+/// `PostgresJournal::load` builds those from `sqlx::Error` and `serde_json::Error`: the
+/// same connection strings, the same newlines that forge a pastable run row, the same
+/// ANSI escapes. They reached stdout raw. One transform for one class of value, applied
+/// at every sink, rather than a habit each writer re-derives — the argument [`MENU_MAX`]
+/// already records for a menu.
+pub(crate) fn safe_reason(s: &str) -> String {
     let redacted = redact_reason(s);
     let collapsed = one_line(&redacted);
     cap_chars(&collapsed, REASON_MAX)
@@ -187,7 +196,7 @@ fn safe_reason(s: &str) -> String {
 /// the placeholder was already replaced before this function ever sees it — but a
 /// straddled cut renders a confusing shard like `[REDA…` in scrollback, which reads
 /// as a truncated SECRET rather than a truncated placeholder.
-fn cap_chars(s: &str, max: usize) -> String {
+pub(crate) fn cap_chars(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         return s.to_string();
@@ -224,10 +233,10 @@ pub fn table(rows: &[ScheduledRun]) -> String {
     s
 }
 
-/// SP-6 s1: one `AwaitSignal` node currently waiting for `torii run signal`, folded out
-/// of a run's journal (`SignalAwaited`, minus anything that has since terminated the
-/// node). `RunPaused` is not node-keyed, so this is the only way an operator can learn
-/// WHAT to signal without reading the graph.
+/// SP-6 s1: one node currently waiting for a human, folded out of a run's journal
+/// (`SignalAwaited`/`GateAwaited`, minus anything that has since terminated the node).
+/// `RunPaused` is not node-keyed, so this is the only way an operator can learn WHAT to
+/// answer without reading the graph.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AwaitingNode {
     pub node: orchestrator_core::NodeId,
@@ -236,6 +245,21 @@ pub struct AwaitingNode {
     /// operator is most likely to lose track of, so it renders explicitly rather than
     /// blank.
     pub deadline: Option<DateTime<Utc>>,
+    /// SP-6 s2: the menu, for a `HumanGate`. `None` = an `AwaitSignal`, which takes
+    /// arbitrary JSON and so has no menu to show.
+    ///
+    /// Read from the journaled `GateAwaited`, so `list-paused` needs no graph load —
+    /// which matters because `list-paused` folds one journal per paused run and has no
+    /// graph in hand.
+    ///
+    /// **Skipped when absent rather than serialized as `null`**, so a run with no gate
+    /// produces byte-identical `--json` to the pre-s2 output and a script written against
+    /// s1 is unaffected. Key PRESENCE is the discriminator on that path — the same
+    /// technique `list_paused` uses for `awaiting_error`, and for the same reason: a
+    /// script must be able to tell the two waiting kinds apart, and it needs the menu to
+    /// build a `gate decide` without loading the graph either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
 }
 
 /// A node id is author- (or planner-) supplied free text, so it gets the same
@@ -244,6 +268,19 @@ pub struct AwaitingNode {
 /// It is NOT redacted: an id is structural, not a value, exactly as `PatternRedactor`
 /// leaves object KEYS alone.
 const NODE_MAX: usize = 80;
+
+/// The same cap for a rendered MENU, which is author free text on the same line and
+/// bounded by nothing upstream: `Graph::validate_dag` checks a `HumanGate`'s options for
+/// non-emptiness, uniqueness and a reachable outcome — never for LENGTH, and never for
+/// how many there are. One 5,000-character option name, or a fifty-option menu, would
+/// otherwise wreck the alignment of every other row in this block. Wider than a node id
+/// because it holds several names joined together, and still well under the 300 a pause
+/// reason is allowed.
+///
+/// `pub(crate)` because [`crate::cmd::gate::decide`] recites the SAME journaled option
+/// names when it refuses an undeclared one, and had no cap at all — one bound for one
+/// class of value, not two that can drift.
+pub(crate) const MENU_MAX: usize = 160;
 
 /// One run's awaiting set — or, when that run's journal could not be folded, the reason.
 ///
@@ -264,6 +301,13 @@ pub type Awaiting = Result<Vec<AwaitingNode>, String>;
 /// single-line-per-run table cannot represent, and widening the shared `table()` would also
 /// move `run status`'s columns.
 ///
+/// **SP-6 s2: the block now holds BOTH waiting kinds, so each row says which it is** — a
+/// gate renders its menu (`gate: ship|hold`), an `AwaitSignal` renders `signal`. The two
+/// take different commands and refuse each other's, so listing them identically would
+/// send an operator to a refusal for a node they had correctly identified. The extra
+/// `gate decide` line in the header appears only when a gate is present, so the s1 output
+/// is unchanged for a fleet that has none.
+///
 /// An [`Err`] row renders as `unknown: <error>` — never as an absent or empty awaiting set,
 /// which is the one answer that would tell an operator there is nothing to signal on a run
 /// that may be blocked on a human. The message goes through the same [`safe_reason`]
@@ -282,14 +326,41 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
         "\nAWAITING A SIGNAL — deliver with \
          `torii run signal <run> --node <node> --payload <json>`\n",
     );
+    let any_gate = rows
+        .iter()
+        .any(|(_, a)| matches!(a, Ok(nodes) if nodes.iter().any(|n| n.options.is_some())));
+    if any_gate {
+        s.push_str(
+            "                   a `gate:` row takes a named option instead — \
+             `torii run gate decide <run> --node <node> --option <name>`\n",
+        );
+    }
     for (run, a) in rows {
         match a {
             Ok(nodes) => {
                 for a in nodes {
+                    // Option names are author free text reaching a line-oriented table, so
+                    // they get the same control-character collapse and cap a node id does:
+                    // a raw newline would forge an extra row, and an ESC could rewrite what
+                    // is already on screen.
+                    let cell = match &a.options {
+                        Some(opts) => cap_chars(
+                            &format!(
+                                "gate: {}",
+                                opts.iter()
+                                    .map(|o| one_line(o))
+                                    .collect::<Vec<_>>()
+                                    .join("|")
+                            ),
+                            MENU_MAX,
+                        ),
+                        None => "signal".to_string(),
+                    };
                     s.push_str(&format!(
-                        "{}  {}  {}\n",
+                        "{}  {}  {}  {}\n",
                         run.0,
                         cap_chars(&one_line(&a.node.0), NODE_MAX),
+                        cell,
                         match a.deadline {
                             Some(d) => format!("deadline {}", fmt_wake(Some(d))),
                             // Says what it MEANS, not just that the field is empty: this

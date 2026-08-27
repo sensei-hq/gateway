@@ -21,6 +21,7 @@ mod dispatch;
 mod durability;
 mod expand;
 mod fanout;
+mod gate;
 pub(crate) mod selector;
 mod signal;
 mod subgraph;
@@ -161,8 +162,10 @@ struct Fold {
     /// mistaken decision before the run resumes, so a later signal supersedes an earlier
     /// one for the same node.
     signals: HashMap<NodeId, serde_json::Value>,
-    /// SP-6 s1: what each `AwaitSignal` node recorded when it began waiting, folded from
-    /// `SignalAwaited`. FIRST record wins — the opposite of `signals`, and deliberately
+    /// SP-6 s1: what each WAITING node recorded when it began waiting, folded from
+    /// `SignalAwaited` and — since SP-6 s2 — from `GateAwaited` too, so that "has this node
+    /// begun asking?" has ONE answer for both kinds.
+    /// FIRST record wins — the opposite of `signals`, and deliberately
     /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
     /// deadline forward, and a run force-woken every ten minutes with a one-hour timeout
     /// would NEVER expire.
@@ -176,13 +179,30 @@ struct Fold {
     /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
     /// keeps the whole run auto-wakeable).
     deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
-    /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
-    /// wins. Read by exactly ONE consumer — [`run_await_signal`](Executor::run_await_signal),
-    /// for which a failure is TERMINAL (an expired human gate stays expired).
+    /// SP-6 s2: each `HumanGate`'s decision, folded from `GateDecided`. LAST wins, like
+    /// `signals` and for the same reason: an operator must be able to correct a mistaken
+    /// decision before the run resumes.
+    gate_decisions: HashMap<NodeId, GateDecision>,
+    /// SP-6 s2: the MENU each `HumanGate` published when it began asking, folded from
+    /// `GateAwaited`. FIRST wins — the human was shown THIS menu, and a later ask must
+    /// not retroactively change what their answer meant.
     ///
-    /// It is deliberately not consulted anywhere else. A `NodeFailed` does not make a node
-    /// terminal in general: a `ModelCall` or `Agent` node whose provider died journals one
-    /// and RE-ATTEMPTS on the next drive, which is the documented resume contract (see
+    /// `deadlines` is folded from `GateAwaited` too, so the "has this node begun asking?"
+    /// question stays in one place for both waiting kinds.
+    menus: HashMap<NodeId, Vec<orchestrator_core::GateOption>>,
+    /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
+    /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
+    /// the shared arm 0 of the two WAITING node kinds, for which a failure is TERMINAL (an
+    /// expired gate stays expired). SP-6 s2 moved that read out of `run_await_signal` and
+    /// into the shared helper, so it now has two CALLERS —
+    /// [`run_await_signal`](Executor::run_await_signal) and
+    /// [`run_human_gate`](Executor::run_human_gate) — but still one reader.
+    ///
+    /// It is deliberately not consulted anywhere else, and the fence is on the READER, not
+    /// on the caller count: a third node kind may read this map only by being a waiting
+    /// kind that calls `gate_precheck` first. A `NodeFailed` does not make a node terminal
+    /// in general: a `ModelCall` or `Agent` node whose provider died journals one and
+    /// RE-ATTEMPTS on the next drive, which is the documented resume contract (see
     /// `a_paused_gated_run_reattempts_and_completes_on_resume`, and `resolve_context`'s note
     /// that a failed node "carries no memo and re-runs on resume"). Making this map
     /// authoritative for every kind would silently delete retry-on-resume, so the
@@ -218,6 +238,15 @@ struct Fold {
     /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
     /// this makes and why an unbudgeted run must never touch it.
     serial_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// SP-6 s2: a folded `GateDecided`.
+#[derive(Debug, Clone, PartialEq)]
+struct GateDecision {
+    option: String,
+    /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::GateDecided`.
+    actor: String,
+    note: Option<String>,
 }
 
 impl Fold {
@@ -269,24 +298,51 @@ impl Fold {
         self.signals.get(node)
     }
 
-    /// SP-6 s1: what an `AwaitSignal` node recorded when it began waiting.
+    /// SP-6 s1: what a waiting node recorded when it began waiting.
     ///
     /// Two layers, and they are not the same question:
-    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited` for it).
+    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited`/`GateAwaited`).
     /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate).
     /// - `Some(Some(t))` — it began waiting with the absolute deadline `t`.
     ///
-    /// Read by [`run_await_signal`](Executor::run_await_signal) on EVERY execution — it
-    /// is the durable half of the never-recompute rule; the caller must not fall back to
+    /// Read through [`wait_or_expire`](Executor::wait_or_expire) — SP-6 s2's shared arm,
+    /// called on EVERY execution by BOTH `run_await_signal` and `run_human_gate`. It is the
+    /// durable half of the never-recompute rule; the caller must not fall back to
     /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
     fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         self.deadlines.get(node).copied()
     }
 
     /// SP-6 s1: the failure this node already journaled, if any — see [`Fold::failed`] for
-    /// why only `run_await_signal` may act on it.
+    /// why only [`gate_precheck`](Executor::gate_precheck), on behalf of the two waiting
+    /// node kinds, may act on it.
     fn failure_for(&self, node: &NodeId) -> Option<&str> {
         self.failed.get(node).map(String::as_str)
+    }
+
+    /// SP-6 s2: the decision folded for this `HumanGate`, if a human has answered.
+    ///
+    /// Read by [`run_human_gate`](Executor::run_human_gate) only AFTER the ask has been
+    /// journaled and only AFTER `gate_precheck`/`wait_or_expire` have had their say — an
+    /// answer counts only while the node was still asking.
+    fn gate_decision_for(&self, node: &NodeId) -> Option<&GateDecision> {
+        self.gate_decisions.get(node)
+    }
+
+    /// SP-6 s2: the menu this gate published when it began asking.
+    ///
+    /// `None` = it has not asked yet — the trigger for `run_human_gate` to journal
+    /// `GateAwaited` FIRST, before it reads any decision (§6.2). That ordering is why a
+    /// decision-without-a-menu never arises, rather than something to detect: validating
+    /// against the GRAPH in that one path would reintroduce exactly the non-durable menu
+    /// §4 rejects, so the ask is unconditional and the answer is read against the menu it
+    /// just published.
+    ///
+    /// It is therefore read by [`run_human_gate`](Executor::run_human_gate) only on the
+    /// `Waiting` arm — the drive that FIRST asks resolves against the menu it just
+    /// journaled, which this snapshot of the journal cannot yet see.
+    fn menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::GateOption]> {
+        self.menus.get(node).map(Vec::as_slice)
     }
 }
 
@@ -1098,6 +1154,17 @@ impl Executor {
             NodeKind::Expand { .. } => self.run_expand(run, node, fold).await,
             NodeKind::AwaitSignal { timeout } => {
                 self.run_await_signal(run, node, *timeout, fold).await
+            }
+            // SP-6 s2: the typed gate, over the SAME shared waiting machinery as
+            // `AwaitSignal` above (`gate_precheck`/`wait_or_expire`/`pause_awaiting`).
+            // Like every other arm here it fails the NODE rather than panicking — a panic
+            // in this match is not local: it unwinds through `Scheduler::tick`, which has
+            // already claimed a batch of runs and taken their leases, leaving
+            // `(Waking, next_wake: None)` rows that every later `tick()` reclaims and
+            // dies on again.
+            NodeKind::HumanGate { options, timeout } => {
+                self.run_human_gate(run, node, options, *timeout, fold)
+                    .await
             }
         }
     }
