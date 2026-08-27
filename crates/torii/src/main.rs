@@ -147,6 +147,30 @@ enum RunAction {
         #[arg(long, group = "payload_src", value_name = "PATH")]
         payload_file: Option<std::path::PathBuf>,
     },
+    /// Decide a `HumanGate` — approve, reject, or pick a named option
+    ///
+    /// The typed counterpart to `run signal`. A `HumanGate` declares a menu, and this
+    /// picks one of it; `run signal` delivers arbitrary JSON to an `AwaitSignal` and is
+    /// refused on a gate. The menu is read from the journal — what the human was actually
+    /// shown — not from the graph, so an undeclared option is refused here rather than
+    /// terminally failing the node.
+    ///
+    /// `--as` records WHO decided. It is ATTRIBUTION, NOT AUTHENTICATION: it is whatever
+    /// string you supply (defaulting to $USER), so it answers "who claimed to decide".
+    /// Anyone who can reach the database can write any actor.
+    ///
+    /// `--note` and `--reason` are argv, so they are visible to `ps`, your shell history
+    /// and any CI job's command echo. Secret-shaped text is redacted before it is
+    /// journaled, but that is a best-effort scrub by shape — a decision note is not a
+    /// credential channel.
+    Gate {
+        // The enum and its verb→option mapping live in the LIBRARY (`cmd::gate`), not
+        // here: this binary has no test module, and while the mapping sat in `dispatch`
+        // below, swapping the `approve` and `reject` literals left every test in the crate
+        // green — see `cmd::gate::each_verb_maps_to_the_option_that_names_it`.
+        #[command(subcommand)]
+        action: cmd::gate::GateAction,
+    },
     /// Cancel a non-terminal run so it is never woken
     Cancel { run_id: String },
     /// Queue a paused run for the next worker tick
@@ -367,6 +391,37 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                     run,
                     orchestrator_core::NodeId(node),
                     payload,
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+            RunAction::Gate { action } => {
+                // The three verbs differ only in how the option and note are SOURCED, so
+                // they are normalised to one shape and there is exactly one call to
+                // `decide` — a second dispatch arm per verb would be three places for the
+                // argument order to be got wrong. The normalisation itself lives in the
+                // LIBRARY (`cmd::gate::decision_of`) because this binary has no test
+                // module: while it sat inline here, swapping the `approve` and `reject`
+                // literals left the whole crate green, and `gate reject` would have
+                // shipped the release it was refusing.
+                let d0 = cmd::gate::decision_of(action);
+                // Parse BEFORE connecting, same as `status` and `signal`: an invalid run
+                // id is the likeliest operator typo and sqlx would otherwise retry a
+                // refused connection for the whole pool-acquire timeout first.
+                let run = parse_run_id(&d0.run_id)?;
+                let actor = cmd::gate::actor_or_user(&d0.actor);
+                // LIGHT tier: deciding a gate needs the scheduler store and the journal,
+                // nothing else. An operator must be able to answer a waiting run from a
+                // box with no gateway config and no model credentials.
+                let d = boot::light(&env).await?;
+                cmd::gate::decide(
+                    d.scheduler_store.as_ref(),
+                    d.journal.as_ref(),
+                    run,
+                    orchestrator_core::NodeId(d0.node),
+                    &d0.option,
+                    &actor,
+                    d0.note.as_deref(),
                     chrono::Utc::now(),
                 )
                 .await
