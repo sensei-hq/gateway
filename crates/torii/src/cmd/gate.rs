@@ -2067,8 +2067,10 @@ pub(crate) mod tests {
 
     /// §6.5 for the OTHER writer to the same durable column. `cmd::run::signal` enforces
     /// `MAX_PAYLOAD_BYTES` because "an unbounded JSON blob in a journal row is a durable
-    /// footgun … the cap is enforced HERE, at the only writer, by rejecting" — and
-    /// `GateDecided.note` was appended with no length check at all. `ARG_MAX` permits a
+    /// footgun … the cap is enforced in the CLI, at every writer, by rejecting" — wording
+    /// that read "at the ONLY writer" until this command became the second one, which is
+    /// the drift this test exists to stop — and `GateDecided.note` was appended with no
+    /// length check at all. `ARG_MAX` permits a
     /// ~120 KB `--note`, which is 30x the sibling's limit, and the row is durable: it is
     /// reloaded on every drive, folded into the gate's output on a `Complete` option, and
     /// carried in every downstream Agent's prompt for the life of the run.
