@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::content::{ContentRef, Digest, EffectOutput};
 use crate::effect::{EffectClass, EffectId};
 use crate::error::JournalError;
-use crate::graph::Graph;
+use crate::graph::{GateOption, Graph};
 use crate::ids::{NodeId, RunId, Seq};
 use crate::plan::NodePlan;
 
@@ -202,6 +202,47 @@ pub enum JournalEvent {
     SignalReceived {
         node: NodeId,
         payload: serde_json::Value,
+    },
+    /// SP-6 s2: a `HumanGate` has begun asking, carrying the MENU the human was shown.
+    ///
+    /// The options are journaled rather than re-read from the graph for the same reason
+    /// s1 journals the deadline: a human was shown a menu, and validating their answer
+    /// against a *different* menu later is simply wrong. Nothing BINDS the graph handed
+    /// to a later `Executor::start` to the one the human was shown: there is no graph
+    /// fence (the SP-DATA-2 config-version fence covers the registry, not the graph),
+    /// and the executor cannot see `SchedulerStore` at all — so an author who edits the
+    /// graph between drives silently rewrites the menu unless the offer is journaled
+    /// here. (`scheduled_runs.graph` happens to hold a copy on the `worker serve` path,
+    /// but the executor cannot read it — that table is the scheduler's, not the
+    /// executor's.)
+    ///
+    /// The full [`GateOption`]s, not just their names: the OUTCOME the human was shown
+    /// ("reject will stop the run") is as much a part of the offer as the name. If only
+    /// names were journaled, an author flipping `reject` from `Fail` to `Complete` after
+    /// a human rejected would silently change what their recorded answer MEANT.
+    ///
+    /// FIRST record wins when folded, exactly as `SignalAwaited` does — overwriting the
+    /// deadline is the never-expires bug.
+    GateAwaited {
+        node: NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        options: Vec<GateOption>,
+    },
+    /// SP-6 s2: a human picked one of a `HumanGate`'s options.
+    ///
+    /// A `HumanGate` is answerable ONLY by this event, never by `SignalReceived` — if a
+    /// raw signal could answer one, `torii run signal --payload '{}'` would bypass every
+    /// validation the slice adds.
+    ///
+    /// `actor` is ATTRIBUTION, NOT AUTHENTICATION: it is whatever string the caller
+    /// supplied, so this answers "who claimed to decide", not "who decided". `note` is
+    /// `Option` because a `Complete` decision legitimately has none; the CLI separately
+    /// requires one for a `Fail` option (a documentation rule, not a safety rule).
+    GateDecided {
+        node: NodeId,
+        option: String,
+        actor: String,
+        note: Option<String>,
     },
 }
 
@@ -496,5 +537,78 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// SP-6 s2: both new variants round-trip, and — the load-bearing half — they are
+    /// new VARIANTS, so an event written by an older binary still loads. That is what
+    /// keeps `FORMAT_VERSION` at 1.
+    #[test]
+    fn the_gate_events_round_trip_without_a_format_bump() {
+        use crate::graph::{GateOption, GateOutcome};
+
+        let awaited = JournalEvent::GateAwaited {
+            node: NodeId("release".into()),
+            deadline: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).unwrap()),
+            options: vec![
+                GateOption {
+                    name: "ship".into(),
+                    outcome: GateOutcome::Complete,
+                },
+                GateOption {
+                    name: "hold".into(),
+                    outcome: GateOutcome::Fail,
+                },
+            ],
+        };
+        let s = serde_json::to_string(&awaited).expect("serializes");
+        match serde_json::from_str::<JournalEvent>(&s).expect("round-trips") {
+            JournalEvent::GateAwaited {
+                node,
+                deadline,
+                options,
+            } => {
+                assert_eq!(node.0, "release");
+                assert!(deadline.is_some());
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].name, "ship");
+                // Both outcomes are durable AND DISTINCT — a menu whose options are all
+                // `Complete` passes even if the two variants collapse into one on the wire.
+                assert_eq!(options[0].outcome, GateOutcome::Complete);
+                assert_eq!(options[1].outcome, GateOutcome::Fail);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let decided = JournalEvent::GateDecided {
+            node: NodeId("release".into()),
+            option: "ship".into(),
+            actor: "alice".into(),
+            note: Some("capped at 5k".into()),
+        };
+        let s = serde_json::to_string(&decided).expect("serializes");
+        match serde_json::from_str::<JournalEvent>(&s).expect("round-trips") {
+            JournalEvent::GateDecided {
+                node,
+                option,
+                actor,
+                note,
+            } => {
+                assert_eq!(node.0, "release");
+                assert_eq!(option, "ship");
+                assert_eq!(actor, "alice");
+                assert_eq!(note.as_deref(), Some("capped at 5k"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // A `note`-less decision is legal: a Complete option needs no reason.
+        let terse = JournalEvent::GateDecided {
+            node: NodeId("release".into()),
+            option: "ship".into(),
+            actor: "ci".into(),
+            note: None,
+        };
+        let s = serde_json::to_string(&terse).expect("serializes");
+        assert!(serde_json::from_str::<JournalEvent>(&s).is_ok());
     }
 }

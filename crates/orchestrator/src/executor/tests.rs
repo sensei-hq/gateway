@@ -2451,6 +2451,12 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::BudgetRaised { .. } => "BudgetRaised".to_string(),
         JournalEvent::SignalAwaited { node, .. } => format!("SignalAwaited({})", node.0),
         JournalEvent::SignalReceived { node, .. } => format!("SignalReceived({})", node.0),
+        // SP-6 s2 (Task 1): no test exercises these yet (Task 5 adds the executor
+        // node that journals them), but this labeler is exhaustive by design — an
+        // explicit arm now means a future test gets a real label instead of a
+        // compile error silently avoided by a wildcard.
+        JournalEvent::GateAwaited { node, .. } => format!("GateAwaited({})", node.0),
+        JournalEvent::GateDecided { node, .. } => format!("GateDecided({})", node.0),
     }
 }
 
