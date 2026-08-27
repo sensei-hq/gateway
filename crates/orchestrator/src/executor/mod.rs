@@ -233,11 +233,11 @@ struct Fold {
 
 /// SP-6 s2: a folded `GateDecided`.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct GateDecision {
-    pub option: String,
+struct GateDecision {
+    option: String,
     /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::GateDecided`.
-    pub actor: String,
-    pub note: Option<String>,
+    actor: String,
+    note: Option<String>,
 }
 
 impl Fold {
@@ -317,8 +317,14 @@ impl Fold {
         self.gate_decisions.get(node)
     }
 
-    /// SP-6 s2: the menu this gate published when it began asking. `None` = it has not
-    /// asked yet, which is what makes a decision-without-a-menu detectable.
+    /// SP-6 s2: the menu this gate published when it began asking.
+    ///
+    /// `None` = it has not asked yet — the trigger for `run_human_gate` to journal
+    /// `GateAwaited` FIRST, before it reads any decision (§6.2). That ordering is why a
+    /// decision-without-a-menu never arises, rather than something to detect: validating
+    /// against the GRAPH in that one path would reintroduce exactly the non-durable menu
+    /// §4 rejects, so the ask is unconditional and the answer is read against the menu it
+    /// just published.
     /// `#[allow(dead_code)]` until Task 5 calls it from `run_human_gate`.
     #[allow(dead_code)]
     fn menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::GateOption]> {
