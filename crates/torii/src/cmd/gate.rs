@@ -12,6 +12,7 @@
 //! that function before changing this one.
 
 use crate::cmd::Outcome;
+use crate::cmd::run::{SignalState, not_delivered, signal_state};
 use crate::errors::CliError;
 use crate::render;
 use chrono::{DateTime, Utc};
@@ -38,13 +39,22 @@ use orchestrator_core::{
 /// an expired gate). So at the durable layer a mistyped option is a terminal typo, and
 /// this pre-check is the only thing between an operator and it.
 ///
-/// **What it deliberately does NOT check: whether this gate has already been answered or
-/// has already terminated.** A run whose gate failed is itself terminal, so the status
-/// check below catches that case; a gate that already COMPLETED inside a run still paused
-/// elsewhere is not detected, and a second decision would sit on the journal as a
-/// last-wins value that a re-`start` of the run would fold. That residue is identical to
-/// `signal`'s — see its `not read` arm — and telling the two apart needs a gate-state
-/// fold that does not exist yet.
+/// **The NODE's state is checked, not just the RUN's** — see the `signal_state` arm below.
+/// This was once left to the run-status check, on the reasoning that "a run whose gate
+/// failed is itself terminal". That reasoning is FALSE, and the review that caught it
+/// reproduced the consequence against the real `Executor`: `Scheduler::record` matches
+/// `Ok(o) if o.paused.is_some()` BEFORE `Ok(o) if o.failed.is_some()`, so a drive that
+/// fails one node while another is still waiting records the run **paused**. A gate whose
+/// deadline had already fired therefore passed every guard here — menu present, option
+/// declared, run paused — and this command journaled the decision, force-woke the run and
+/// reported `decided: …` with exit 0, while the next drive's `gate_precheck` returned the
+/// folded `NodeFailed` before the decision was ever read. The operator was told their
+/// approval landed; it provably had not.
+///
+/// **What it deliberately does NOT check: whether a SECOND decision is redundant.** A gate
+/// that already COMPLETED is caught by the `signal_state` arm; but two decisions delivered
+/// while the node is still awaiting both land, and the later one is a last-wins value the
+/// fold reads. That residue is identical to `signal`'s — see its `not read` arm.
 ///
 /// **Order: append, THEN `force_wake`** — never the reverse, for the same reason
 /// `signal` and `wake` do it: `force_wake` only flips `next_wake`, and a worker in another
@@ -97,6 +107,22 @@ pub async fn decide(
             )
         }));
     };
+
+    // The NODE's own state, folded from the journal, and checked BEFORE the menu is
+    // validated: a dead gate's options are not a useful thing to recite back. The fold is
+    // `cmd::run`'s, not a second one — `signal_state` already classifies a `HumanGate`
+    // correctly (its `GateAwaited` arm, added by this slice, is what puts a gate in the
+    // awaited set at all), and the refusal text is `signal`'s so the two commands cannot
+    // drift on a condition they share exactly.
+    //
+    // `NotAwaiting` is unreachable from here — a journaled `GateAwaited` is what produced
+    // the menu above, and that is precisely what puts the node in the fold — but it is
+    // matched by the same catch-all rather than special-cased, because it must never be
+    // able to report success.
+    match signal_state(&events, &node) {
+        SignalState::Awaiting { .. } => {}
+        other => return Ok(Outcome::precondition(not_delivered(&shown, &other))),
+    }
 
     let Some(chosen) = menu.iter().find(|o| o.name == option) else {
         return Ok(Outcome::precondition(format!(
@@ -673,6 +699,55 @@ pub(crate) mod tests {
                 "nothing may be written into a run that is over"
             );
         }
+    }
+
+    /// The RUN's status is not the NODE's, and conflating them let this command report a
+    /// green `decided:` for a gate that can never read the decision. A `HumanGate` whose
+    /// deadline fired is TERMINAL — `gate_precheck` reads its `NodeFailed` back on every
+    /// later drive and returns `Failed` before any decision is looked at — while the run
+    /// itself stays `paused` whenever some OTHER node is still waiting, because
+    /// `Scheduler::record` matches `paused` BEFORE `failed`. So "the run is paused"
+    /// proves nothing about this node, and the refusal has to come from the node's own
+    /// fold.
+    #[tokio::test]
+    async fn a_decision_on_a_terminally_failed_gate_is_refused() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship", "reject"]).await;
+        j.append(
+            run,
+            JournalEvent::NodeFailed {
+                node: release(),
+                error: "human_gate: no decision for node release by 2026-08-26T00:00:00Z".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = decide(&s, &j, run, release(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "the gate is dead — reporting exit 0 tells an operator their approval landed \
+             when the next drive will never read it: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("never re-executes"),
+            "must say WHY it can never be read, in `run signal`'s words: {}",
+            out.text
+        );
+        assert!(
+            journaled_decisions(&j, run, &release()).await.is_empty(),
+            "nothing may be written for a node that is already terminal"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and the run must not be woken for a decision nothing will read"
+        );
     }
 
     /// `waking` is TRANSIENT — a worker holds the lease and is folding this journal right
