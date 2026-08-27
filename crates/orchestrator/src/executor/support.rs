@@ -212,6 +212,39 @@ pub(crate) fn fold_journal(
             } => {
                 fold.deadlines.entry(node.clone()).or_insert(None);
             }
+            // SP-6 s2: the ask. Deliberately EXPLICIT rather than folded with
+            // `SignalAwaited` by a catch-all — the menu has no analogue there, and a
+            // catch-all would silently absorb a future variant.
+            //
+            // FIRST wins for BOTH the deadline and the menu (`entry().or_insert`, never
+            // `insert`). For the deadline that is s1's never-expires fix. For the menu it
+            // is the §4 rule: a human was shown a menu, and a later ask must not change
+            // what their answer meant.
+            JournalEvent::GateAwaited {
+                node,
+                deadline,
+                options,
+            } => {
+                fold.deadlines.entry(node.clone()).or_insert(*deadline);
+                fold.menus.entry(node.clone()).or_insert(options.clone());
+            }
+            // SP-6 s2: the answer. LAST wins (`insert` overwrites) — an operator can
+            // correct a mistaken decision while the run is still paused.
+            JournalEvent::GateDecided {
+                node,
+                option,
+                actor,
+                note,
+            } => {
+                fold.gate_decisions.insert(
+                    node.clone(),
+                    super::GateDecision {
+                        option: option.clone(),
+                        actor: actor.clone(),
+                        note: note.clone(),
+                    },
+                );
+            }
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
@@ -779,6 +812,107 @@ mod tests {
             "the ORIGINAL verdict survives a later one"
         );
         assert_eq!(fold.failure_for(&NodeId("other".into())), None);
+    }
+
+    fn at(unix_secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(unix_secs, 0).expect("valid timestamp")
+    }
+
+    fn gopt(name: &str, outcome: orchestrator_core::GateOutcome) -> orchestrator_core::GateOption {
+        orchestrator_core::GateOption {
+            name: name.to_string(),
+            outcome,
+        }
+    }
+
+    /// The two fold asymmetries are OPPOSITE and both load-bearing, exactly as s1's are.
+    #[test]
+    fn gate_decisions_are_last_wins_and_the_menu_is_first_wins() {
+        use orchestrator_core::GateOutcome;
+        let events = vec![
+            (
+                1,
+                JournalEvent::GateAwaited {
+                    node: NodeId("release".into()),
+                    deadline: Some(at(1_000)),
+                    options: vec![
+                        gopt("ship", GateOutcome::Complete),
+                        gopt("hold", GateOutcome::Complete),
+                    ],
+                },
+            ),
+            (
+                2,
+                JournalEvent::GateDecided {
+                    node: NodeId("release".into()),
+                    option: "hold".into(),
+                    actor: "alice".into(),
+                    note: None,
+                },
+            ),
+            // An operator corrects themselves before the run resumes: LAST wins.
+            (
+                3,
+                JournalEvent::GateDecided {
+                    node: NodeId("release".into()),
+                    option: "ship".into(),
+                    actor: "alice".into(),
+                    note: Some("legal cleared it".into()),
+                },
+            ),
+            // A second ask must NOT move the deadline or the menu: FIRST wins.
+            // Overwriting the deadline IS the never-expires bug.
+            (
+                4,
+                JournalEvent::GateAwaited {
+                    node: NodeId("release".into()),
+                    deadline: Some(at(9_999)),
+                    options: vec![gopt("escalate", GateOutcome::Complete)],
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&events);
+
+        let d = fold
+            .gate_decision_for(&NodeId("release".into()))
+            .expect("decided");
+        assert_eq!(d.option, "ship", "LAST decision wins");
+        assert_eq!(d.actor, "alice");
+        assert_eq!(d.note.as_deref(), Some("legal cleared it"));
+
+        assert_eq!(
+            fold.deadline_for(&NodeId("release".into())),
+            Some(Some(at(1_000))),
+            "FIRST ask wins — a later one must not push the deadline forward"
+        );
+        assert_eq!(
+            fold.menu_for(&NodeId("release".into())).map(|m| m.len()),
+            Some(2),
+            "FIRST menu wins — the human was shown THIS menu, not the later one-option ask"
+        );
+        assert_eq!(
+            fold.menu_for(&NodeId("release".into())).unwrap()[0].name,
+            "ship"
+        );
+    }
+
+    /// The indefinite gate: `None` is folded as a REAL value, so the node's "have I begun
+    /// asking?" question is answered by the KEY, not by the value. Without this the node
+    /// re-journals `GateAwaited` on every drive.
+    #[test]
+    fn a_deadline_less_gate_records_that_it_began_asking() {
+        use orchestrator_core::GateOutcome;
+        let events = vec![(
+            1,
+            JournalEvent::GateAwaited {
+                node: NodeId("release".into()),
+                deadline: None,
+                options: vec![gopt("approve", GateOutcome::Complete)],
+            },
+        )];
+        let (fold, _, _) = fold_journal(&events);
+        assert_eq!(fold.deadline_for(&NodeId("release".into())), Some(None));
+        assert!(fold.menu_for(&NodeId("release".into())).is_some());
     }
 
     #[test]
