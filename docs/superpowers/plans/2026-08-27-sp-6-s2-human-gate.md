@@ -461,15 +461,29 @@ env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib a_degenerate_ga
 
 Expected: `test result: ok. 2 passed`.
 
-- [ ] **Step 5: Fix the doc guard this WILL break**
+- [ ] **Step 5: Fix the doc guard — and note that it does NOT fail first**
 
-`every_node_kind_is_named_in_the_execution_graph_feature_doc` (added in the s1 review) scrapes `NodeKind` and asserts each variant appears in the feature doc. It now fails on `HumanGate` — by design.
+`every_node_kind_is_documented_in_the_execution_graph_feature_doc` scrapes `NodeKind` and
+asserts each variant is documented in the feature doc.
+
+**An earlier revision of this plan predicted it would go RED on `HumanGate` here. It did
+not, and the reason is the finding.** The guard as originally written (in the s1 review)
+was `doc.contains(variant_name)` — a bare substring search over the whole file — and
+`HumanGate` was already named twice: once as a forward reference inside the `AwaitSignal`
+bullet's body, and once in a pre-existing aspirational sentence that also names `Tool`, a
+kind that has never been a variant. So it was GREEN across the entire commit that
+introduced the variant. A guard that passes while the thing it guards is absent is worse
+than no guard, because it is believed.
+
+The guard has since been strengthened to require a real bullet (head-matched, so a mention
+inside another kind's bullet does not count) or, for the five kinds predating the bullet
+convention, a backticked name inside the "Implemented node kinds:" paragraph specifically.
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_named
+env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_documented
 ```
 
-Expected: **FAIL** with `node kinds implemented but absent from docs/…: ["HumanGate"]`.
+Expected: **FAIL** with `node kinds implemented but not DOCUMENTED in docs/…: ["HumanGate"]`.
 
 Add to `docs/features/orchestrator/execution-graph.md`, in the `> - **\`Expand …\`**` bullet list:
 
@@ -491,7 +505,7 @@ Add to `docs/features/orchestrator/execution-graph.md`, in the `> - **\`Expand �
 Re-run:
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_named
+env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_documented
 ```
 
 Expected: `ok. 1 passed`.
