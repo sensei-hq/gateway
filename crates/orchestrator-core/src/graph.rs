@@ -504,11 +504,16 @@ impl Graph {
         // arithmetic leaving the representable `DateTime<Utc>` range (`chrono::Duration`
         // reaches ~292 million years; `DateTime<Utc>` stops at year 262143) — see
         // `signal.rs`'s `run_await_signal` step 2 for the full argument. This check is
-        // layer 1: it keeps a durable row carrying such a timeout from ever existing.
-        // Layer 2 lives where the addition actually happens — `checked_add_signed`, not
-        // `+` — because `Executor::start` takes the graph as a caller parameter and
-        // nothing guarantees it was ever validated, so the executor does not trust this
-        // check alone and fails loudly instead of computing an unrepresentable instant.
+        // layer 1: it refuses the graph up front, so a submit never enqueues a run whose
+        // gate carries an unrepresentable deadline. Layer 2 lives where the addition
+        // actually happens — `checked_add_signed`, not `+`. Layer 2 is NOT there because
+        // validation might have been skipped: `run_inner` and `start_inner` both call
+        // `validate_dag` before any node runs. It is there because validation and the
+        // arithmetic are separate code, and a node kind must not panic on its own however
+        // it was reached — a panic unwinds through `Scheduler::tick`, which has already
+        // claimed a batch and taken its leases, so it takes the worker down and abandons
+        // every other run in that batch. Defence in depth is cheap; a poisoned worker is
+        // not.
         for node in &self.nodes {
             let NodeKind::HumanGate { options, timeout } = &node.kind else {
                 continue;
