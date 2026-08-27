@@ -2,6 +2,7 @@
 //! every command is unit-testable without capturing stdout.
 
 pub mod config;
+pub mod gate;
 pub mod run;
 pub mod worker;
 

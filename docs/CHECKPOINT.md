@@ -1,44 +1,40 @@
 # Checkpoint
 
-**Slice:** SP-6 s1 — `AwaitSignal`, the HITL primitive. **COMPLETE and on `main`.**
+**Slice:** SP-6 s2 — `HumanGate`, the typed menu over `AwaitSignal`. **Code-complete, reviewed, on
+`feat/sp-6-s2-human-gate`.** Spec + plan on disk under `docs/superpowers/{specs,plans}/2026-08-27-sp-6-s2-human-gate*`.
 
 ## Done / remaining
 
-- **SP-6 s1 ✅** — `AwaitSignal` node, `SignalAwaited`/`SignalReceived` events (FORMAT_VERSION stays 1),
-  `torii run signal`, `run list-paused` awaiting-node reporting. Merged to `main` via PR #46.
-- **SP-DATA 1–5 ✅**, SP-3 ✅, SP-4 ✅ — all on `main` via the same PR.
-- **Whole-slice review ✅** — 5 parallel reviewers, 13 findings deduped, **12 fixed red-first**, 1 LOW carried.
-  Fixes: scheduler poison-pill (one unloadable journal stalled the whole paused fleet); the payload cap
-  measured `serde_json` bytes while the durable column is `jsonb` (4088 accepted → **181,320 stored**,
-  measured on postgres:16); `--payload-file` (the flag was argv-only, leaking a pasted secret to
-  `ps`/history/CI); `redact_keyed` missed arrays (`{"tokens":["<secret>"]}` journaled in the clear);
-  six doc/spec conformance corrections.
-- **SP-6 s2 `HumanGate` ⬜** — not started. **No spec, no plan on disk.**
+- **SP-6 s2 ✅ tasks 1–8** — `GateOption`/`GateOutcome` + `GateAwaited`/`GateDecided`
+  (new variants ⇒ `FORMAT_VERSION` stays 1) · `NodeKind::HumanGate` + its `validate_dag` rules ·
+  s1's waiting node split into the shared `gate_precheck`/`wait_or_expire`/`pause_awaiting` ·
+  the gate fold (decisions last-wins, menus first-wins) · `run_human_gate` · conditional
+  exhaustiveness for a `Branch` on a gate · `torii run gate approve|reject|decide` ·
+  `run list-paused` showing the menu + the cross-process Postgres e2e.
+- **Whole-slice review ✅** — 1 Critical (`decide` checked the RUN, not the NODE), 1 HIGH
+  (two untested properties), 5 Medium, all fixed; then 11 doc/spec conformance findings fixed.
+- **SP-6 s1 ✅ · SP-DATA 1–5 ✅ · SP-3 ✅ · SP-4 ✅** — all on `main` via PR #46.
+- **SP-6 s3 human-as-Agent ⬜** — the last SP-6 slice. No spec, no plan on disk.
 
 ## Next command
 
-Nothing is queued — SP-6 s2 needs design before code:
+Merge the finished slice to `develop`, then push (no PR needed for develop):
 
 ```
-/sensei:brainstorm SP-6 s2 HumanGate — typed approve/reject/choose over AwaitSignal
+git checkout develop && git merge --no-ff feat/sp-6-s2-human-gate && git push origin develop
 ```
 
 ## Open questions
 
-- **LOW finding, unfixed by design.** `adding_the_signal_events_does_not_break_old_event_loading`
-  (`crates/orchestrator-core/src/journal.rs:465`) only deserialises `RunStarted`, so no mutation confined
-  to the two new variants can break it. Rename it, or make it fold a mixed journal.
-- 6 pre-existing unresolved rustdoc links (`InMemoryJournal` ×2, `ContentRef`, +3). None from this slice.
-- Deferred from s1 §8: business-level signal key, non-CLI delivery (needs an auth model), N-of-M approval,
-  no `OrchestratorHooks` callback for either signal event.
+- **`AwaitSignal` and `HumanGate` order their answer-read differently** (spec §6.1): a gate is
+  expired BEFORE its decision is read, an `AwaitSignal` completes on a folded signal even past its
+  deadline (unless a drive already expired it). Deliberate for s2; s1 was left as-is. Revisit in s3.
+- **AC12 passes without running** — it is `DATABASE_URL`-guarded and returns early, so it is counted
+  green having exercised nothing; the raw-stderr `SKIP` line is the only signal (spec §9).
+- Deferred from §10: authorization (`actor` is attribution, not authentication), `RunStatus::Rejected`,
+  non-CLI delivery, N-of-M approval, no `OrchestratorHooks` callback for either gate event.
 
 ## Known-broken
 
-None. **1427 passed / 0 failed / 7 ignored, exit 0.** `clippy -D warnings` clean, `fmt` clean, tree clean.
-
-## Repo state
-
-All history re-authored to `Sensei-HQ <hi@sensei-hq.com>` — 664 commits, all branches + 28 tags,
-force-pushed. `main` protection (ruleset 20638300) **active**, 4 rules, 0 bypass actors, verified via
-`rules/branches/main`. Backups: `~/Developer/gateway-backups/` (pre-rewrite bundle + ruleset JSON).
-**Every SHA changed — other clones must `reset --hard`, not `pull`.**
+None. **1497 passed / 0 failed / 7 ignored, exit 0** (`env -u DATABASE_URL cargo test --workspace`).
+`cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --all` clean.

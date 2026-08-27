@@ -27,8 +27,9 @@ use orchestrator::test_support::{
 };
 use orchestrator::{Executor, Scheduler};
 use orchestrator_core::{
-    ConfigSource, ContextKey, ContextStore, ExecutionJournal, Graph, JournalEvent, Node, NodeId,
-    NodeKind, RegistryHandle, RunId, RunStatus, SchedulerStore, Scope, TokenBudget,
+    ConfigSource, ContextKey, ContextStore, ExecutionJournal, GateOption, GateOutcome, Graph,
+    JournalEvent, Node, NodeId, NodeKind, RegistryHandle, RunId, RunStatus, SchedulerStore, Scope,
+    TokenBudget,
 };
 use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
@@ -158,6 +159,64 @@ fn signal_graph_ids(marker: &str) -> (NodeId, NodeId, NodeId) {
     (
         NodeId(format!("n1-{marker}")),
         NodeId(format!("gate-{marker}")),
+        NodeId(format!("n2-{marker}")),
+    )
+}
+
+/// SP-6 s2 AC12: [`signal_graph`]'s shape with the middle node a [`NodeKind::HumanGate`]
+/// instead — `n1 → release → n2`, where `release` offers an enumerated menu rather than
+/// accepting arbitrary JSON.
+///
+/// The menu carries BOTH outcomes (`ship` completes, `hold` fails) even though the test
+/// only ever picks `ship`: a one-outcome menu would let a `HumanGate` that ignored
+/// `GateOutcome` entirely — completing on whatever it was handed — pass the whole e2e.
+///
+/// Everything else is [`signal_graph`]'s reasoning verbatim, including the run-unique node
+/// ids: each `ModelCall`'s prompt IS its node id (so a recorded call is attributable to
+/// the run AND the node), and `context_refs`' `(scope_kind, scope_id, ctx_key)` primary
+/// key makes a shared bare `n1` collide LOUDLY on this suite's second run against a
+/// persistent database.
+fn gate_graph(marker: &str, timeout: Option<Duration>) -> Graph {
+    let (n1, release, n2) = gate_graph_ids(marker);
+    let model = |id: &NodeId, deps: Vec<orchestrator_core::Dep>| Node {
+        id: id.clone(),
+        kind: NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": id.0 }),
+        },
+        deps,
+    };
+    Graph {
+        nodes: vec![
+            model(&n1, vec![]),
+            Node {
+                id: release.clone(),
+                kind: NodeKind::HumanGate {
+                    options: vec![
+                        GateOption {
+                            name: "ship".into(),
+                            outcome: GateOutcome::Complete,
+                        },
+                        GateOption {
+                            name: "hold".into(),
+                            outcome: GateOutcome::Fail,
+                        },
+                    ],
+                    timeout,
+                },
+                deps: vec![orchestrator_core::Dep::hard(n1.0.clone())],
+            },
+            model(&n2, vec![orchestrator_core::Dep::hard(release.0.clone())]),
+        ],
+    }
+}
+
+/// The three node ids of [`gate_graph`], in graph order — a named helper for the same
+/// reason [`signal_graph_ids`] is one.
+fn gate_graph_ids(marker: &str) -> (NodeId, NodeId, NodeId) {
+    (
+        NodeId(format!("n1-{marker}")),
+        NodeId(format!("release-{marker}")),
         NodeId(format!("n2-{marker}")),
     )
 }
@@ -1047,5 +1106,300 @@ async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_pr
         payload,
         "the operator's payload — unredacted, because a decision matches no credential \
          shape — is what the gate returned into the graph"
+    );
+}
+
+/// SP-6 s2 AC12 — a `HumanGate` decided in one process is honoured by a FRESH worker in
+/// another, over real Postgres, with zero token re-spend.
+///
+/// **DEV/CI-GATED: this test requires `DATABASE_URL` and is skipped without it, so it does
+/// NOT run in the default `cargo test --workspace`.** That is why the in-process tests in
+/// `cmd::gate` and `cmd::run` cover the same arms — the menu validation, the required
+/// reason, the cross-refusals, the fold. This test exists for the one property none of
+/// them can express: that the menu, the decision and the memoized prefix are all DURABLE,
+/// read back by a process that shares nothing in-memory with the one that wrote them.
+///
+/// 1. **Process A** submits `n1 → release → n2`. `n1` costs a real token; `release` (a
+///    `HumanGate` with a one-hour timeout and a `ship | hold` menu) journals its menu and
+///    its ABSOLUTE deadline, and pauses the run durably with `n2` never reached.
+/// 2. **The operator, light tier** (`run list-paused`) names the awaiting node AND ITS
+///    MENU on its OWN pool — folded out of A's durable `GateAwaited`, with no graph in
+///    hand. An operator cannot decide what they cannot see.
+/// 3. **Discrimination: a bare `run wake` is a RESUME, not a DECISION.** A worker tick
+///    after it re-pauses the run untouched — which is what makes step 5's completion a
+///    statement about the DECISION rather than about the wake that accompanied it.
+/// 4. **`run gate decide --option ship`** delivers on a THIRD pool, journaling
+///    `GateDecided` and queuing the wake.
+/// 5. **Process B** — a fresh store/journal/content-store/context-store/gateway — drives
+///    it through torii's real `worker serve --once` to `Completed`.
+/// 6. **Zero re-spend is ATTRIBUTABLE, not an empty log:** B's gateway calls are filtered
+///    by PROMPT, which IS the node id, and the same filter returns 1 for `n2` and 0 for
+///    `n1`. A bare total would prove nothing — `tick()` legitimately drives every due run
+///    in the shared `scheduled_runs` table.
+///
+/// Completion is asserted through the scheduler's `RunStatus`, the journal's
+/// `RunCompleted` and the durable blackboard — never through a terminal re-`start`'s
+/// `RunOutcome`, which is empty for this node-kind family for reasons that have nothing to
+/// do with gating. See the `AwaitSignal` e2e above for that argument in full.
+#[tokio::test]
+async fn a_human_gate_decided_in_another_process_completes_the_run() {
+    let Some(url) = db_url() else { return };
+    let _guard = SCHEDULED_RUNS.lock().await;
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let marker = run.0.to_string();
+    let (n1, release, n2) = gate_graph_ids(&marker);
+    // An hour out, so the deadline is far beyond every instant this test reaches: nothing
+    // but an operator can make this run claimable, which is what turns the completion
+    // below into a statement about the DECISION.
+    let graph = gate_graph(&marker, Some(Duration::hours(1)));
+    let t0 = DateTime::<Utc>::from_timestamp(7_000_000, 0).unwrap();
+    let clock = FakeClock::new(t0);
+
+    // ---- Process A: the prefix is paid for, then the gate asks and pauses -------------
+    let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let (gw_a, calls_a) = recording_gateway().await;
+    let exec_a = Executor::new(Arc::new(gw_a), journal_a.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_context_store(Arc::new(PostgresContextStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_clock(clock.clone());
+    let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), None, || {})
+        .await
+        .expect("a gate-paused run is not an error");
+    assert_eq!(submitted.code, torii::errors::EXIT_OK, "{}", submitted.text);
+    assert!(
+        submitted.text.starts_with("paused:") && submitted.text.contains("human_gate"),
+        "the gate must PAUSE the run (resumable), naming itself as the cause: {}",
+        submitted.text
+    );
+
+    // The prefix is REAL — this is the spend the zero-re-spend assertion later protects.
+    assert_eq!(
+        (calls_for(&calls_a, &n1.0), calls_for(&calls_a, &n2.0)),
+        (1, 0),
+        "n1 spends; n2 is behind the gate and must not have run"
+    );
+
+    let deadline = t0 + Duration::hours(1);
+    let paused = store_a
+        .status(run)
+        .await
+        .unwrap()
+        .expect("a schedule record");
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(
+        paused.next_wake,
+        Some(deadline),
+        "the pause carries the gate's ABSOLUTE deadline, so the scheduler re-arms on the \
+         same instant however often the run is woken early: {paused:?}"
+    );
+
+    // ---- The operator, light tier: WHICH node is waiting, and on WHAT choices? --------
+    // A separate pool and a separate journal handle — no gateway, no model credentials,
+    // nothing in-process shared with A. The menu comes out of the durable `GateAwaited`;
+    // `list-paused` has no graph in hand and must not need one.
+    let store_b = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let listed = torii::cmd::run::list_paused(store_b.as_ref(), journal_b.as_ref(), false)
+        .await
+        .expect("list-paused");
+    assert_eq!(listed.code, torii::errors::EXIT_OK, "{}", listed.text);
+    // The MENU is asserted on the gate's OWN row INSIDE the awaiting block, never merely
+    // somewhere in the output — and both halves of that are load-bearing. `scheduled_runs`
+    // is global, so a bare `contains("ship")` could be satisfied by a leftover row from
+    // another suite; and this run's own TABLE row already carries the menu incidentally,
+    // because the executor's pause reason lists it (`human_gate: waiting for a decision on
+    // node release-… (ship | hold)`). Searching the whole output found that line first and
+    // passed with the awaiting block missing the menu entirely — the assertion has to be
+    // anchored past the header to mean anything.
+    let block = listed
+        .text
+        .split_once("AWAITING A SIGNAL")
+        .unwrap_or_else(|| {
+            panic!(
+                "list-paused must render the awaiting block for a gate:\n{}",
+                listed.text
+            )
+        })
+        .1;
+    let row = block
+        .lines()
+        .find(|l| l.starts_with(&marker) && l.contains(&release.0))
+        .unwrap_or_else(|| {
+            panic!(
+                "the awaiting block must name the awaiting NODE — an operator cannot \
+                 decide on what they cannot discover:\n{}",
+                listed.text
+            )
+        });
+    assert!(
+        row.contains("gate:"),
+        "…and must mark it a GATE, which takes a named option rather than the raw JSON \
+         `run signal` delivers: {row}"
+    );
+    assert!(
+        row.contains("ship") && row.contains("hold"),
+        "…and its MENU, so the choices are visible without reading the graph: {row}"
+    );
+    assert!(
+        row.contains(&format!(
+            "deadline {}",
+            deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )),
+        "…and the deadline it will FAIL at: {row}"
+    );
+
+    // ---- Discrimination: a bare `wake` is a RESUME, not a DECISION --------------------
+    // Without this the completion below would be ambiguous: `gate decide` also queues a
+    // wake, so a `HumanGate` that completed on ANY resume would pass every assertion after
+    // it. Here the very same run is woken with no decision on the journal, driven by a
+    // real worker tick, and must come back untouched.
+    let woken_at = t0 + Duration::seconds(60);
+    let woken = torii::cmd::run::wake(store_b.as_ref(), journal_b.as_ref(), run, woken_at, None)
+        .await
+        .expect("wake");
+    assert_eq!(woken.code, torii::errors::EXIT_OK, "{}", woken.text);
+    let (sched_w, calls_w) = fresh_context_worker(&url, woken_at + Duration::seconds(1)).await;
+    let served_w = serve_once(&sched_w).await;
+    assert_eq!(served_w.code, torii::errors::EXIT_OK, "{}", served_w.text);
+    let after_wake = store_b.status(run).await.unwrap().unwrap();
+    assert_eq!(
+        (after_wake.status, after_wake.next_wake),
+        (RunStatus::Paused, Some(deadline)),
+        "a wake with no decision must leave the gate waiting, re-armed on the deadline it \
+         RECORDED — never completed, never failed: {after_wake:?}"
+    );
+    assert_eq!(
+        (calls_for(&calls_w, &n1.0), calls_for(&calls_w, &n2.0)),
+        (0, 0),
+        "and it must cost nothing: n1 replays from the durable journal + CAS, and n2 is \
+         still behind an unanswered gate"
+    );
+
+    // ---- The operator decides, on a THIRD pool ---------------------------------------
+    // Two minutes in — far short of the hour — so the gate is genuinely still waiting and
+    // the completion below cannot be the timeout firing.
+    let decided_at = t0 + Duration::seconds(120);
+    let store_c = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_c = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let decided = torii::cmd::gate::decide(
+        store_c.as_ref(),
+        journal_c.as_ref(),
+        run,
+        release.clone(),
+        "ship",
+        "ops",
+        Some("reviewed by ops"),
+        decided_at,
+    )
+    .await
+    .expect("decide");
+    assert_eq!(decided.code, torii::errors::EXIT_OK, "{}", decided.text);
+    assert!(
+        decided.text.starts_with("decided:") && decided.text.contains(&release.0),
+        "{}",
+        decided.text
+    );
+
+    // Deciding QUEUES; it does not drive — exactly what the message claims.
+    let after_decide = store_c.status(run).await.unwrap().unwrap();
+    assert_eq!(
+        (after_decide.status, after_decide.next_wake),
+        (RunStatus::Paused, Some(decided_at)),
+        "the decision is journaled and the wake is queued, but a worker tick does the \
+         driving: {after_decide:?}"
+    );
+
+    // ---- Process B: a FRESH worker drives it -----------------------------------------
+    // The only thing carried over from A is the run id; everything else B needs — the
+    // graph included — it reads out of Postgres.
+    let (sched_b, calls_b) = fresh_context_worker(&url, decided_at + Duration::seconds(1)).await;
+    let served = serve_once(&sched_b).await;
+    assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
+
+    // ---- The run completed — asserted at the scheduler AND in the journal --------------
+    assert_eq!(
+        store_b.status(run).await.unwrap().unwrap().status,
+        RunStatus::Completed,
+        "the decided run runs to completion in the fresh process: {}",
+        served.text
+    );
+    let events = journal_b.load(run).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "…and says so durably, in the journal the scheduler read it from"
+    );
+
+    // ---- ZERO RE-SPEND of the completed prefix, per node --------------------------------
+    // Attributable, not an empty log: `calls_for` counts the recording gateway's calls
+    // whose PROMPT is the node id, so the SAME filter that returns 1 for `n2` returns 0 for
+    // `n1`. A bare total would be meaningless — `tick()` legitimately drives every due run
+    // in the shared `scheduled_runs` table, leftovers from other suites included.
+    assert_eq!(
+        calls_for(&calls_b, &n1.0),
+        0,
+        "n1 was paid for by process A — B must replay it from the durable journal + CAS, \
+         never call the gateway for it again"
+    );
+    assert_eq!(
+        calls_for(&calls_b, &n2.0),
+        1,
+        "exactly the one node the decision unblocked, driven once"
+    );
+
+    // ---- The gate asked ONCE: one menu, one deadline, across three drives ---------------
+    // A's pause, the bare wake's re-pause and B's completion — and exactly one
+    // `GateAwaited`. A menu re-published per execution would let an author edit a live
+    // run's graph and retroactively change what a human's recorded answer meant; a
+    // deadline recomputed as `now + timeout` would be the never-expires bug. Neither is
+    // visible to any assertion above.
+    let awaited: Vec<_> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::GateAwaited {
+                node,
+                deadline,
+                options,
+            } if node == &release => Some((
+                *deadline,
+                options.iter().map(|o| o.name.clone()).collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        awaited,
+        vec![(Some(deadline), vec!["ship".to_string(), "hold".to_string()])],
+        "the gate publishes its menu and its absolute deadline once, at first execution, \
+         and folds them thereafter"
+    );
+
+    // ---- The human's decision IS the gate's durable output ------------------------------
+    // Read back through a THIRD context store on its own pool, so this is the durable row,
+    // not B's in-process blackboard. `{decision, actor, note}` is the shape a downstream
+    // `Branch` matches on, which is why the whole object is asserted rather than the name.
+    let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
+    let published = ctx
+        .get(Scope::Run, ContextKey(release.0.clone()))
+        .await
+        .unwrap()
+        .expect("the completed gate published its decision to the durable blackboard");
+    assert_eq!(
+        ctx.load(&published).await.unwrap(),
+        serde_json::json!({
+            "decision": "ship",
+            "actor": "ops",
+            "note": "reviewed by ops",
+        }),
+        "the operator's decision — who, what and why — is what the gate returned into the \
+         graph"
     );
 }

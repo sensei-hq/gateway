@@ -447,6 +447,103 @@ fn payload_and_payload_file_are_mutually_exclusive_and_one_is_required() {
     );
 }
 
+// ---- SP-6 s2: `torii run gate` --------------------------------------------------------
+
+/// The subcommand is actually WIRED, not just implemented in the library. Reuses
+/// `help_command_names` for the same reason it exists: `text.contains("gate")` would also
+/// pass on the prose.
+#[test]
+fn run_help_lists_gate() {
+    let out = torii().args(["run", "--help"]).output().expect("runs");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let listed = help_command_names(&text);
+    assert!(
+        listed.iter().any(|c| c == "gate"),
+        "`gate` is not a dispatchable `run` subcommand (found {listed:?}):\n{text}"
+    );
+}
+
+/// All three verbs dispatch, not just the general one — `approve`/`reject` are the forms
+/// an operator actually types, and wiring only `decide` would leave them as documentation.
+#[test]
+fn gate_help_lists_all_three_verbs() {
+    let out = torii()
+        .args(["run", "gate", "--help"])
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let listed = help_command_names(&text);
+    for verb in ["approve", "reject", "decide"] {
+        assert!(
+            listed.iter().any(|c| c == verb),
+            "`{verb}` is not a dispatchable `run gate` subcommand (found {listed:?}):\n{text}"
+        );
+    }
+}
+
+/// AC10 at the binary level: clap itself must refuse a reject with no reason, before any
+/// connection is opened.
+#[test]
+fn gate_reject_requires_a_reason() {
+    let out = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "gate",
+            "reject",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "release",
+        ])
+        .output()
+        .expect("runs");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--reason"),
+        "must name the missing flag: {err}"
+    );
+    assert!(
+        !err.contains("cannot connect"),
+        "must fail before the connection is attempted: {err}"
+    );
+}
+
+/// The help must state the trust boundary, because an operator reading `--as` will
+/// otherwise reasonably assume it is authenticated. Anyone who can reach the database can
+/// write any actor string, so the flag answers "who CLAIMED to decide" and nothing more.
+///
+/// Asserted on BOTH surfaces, and with `&&` rather than `||`: the group help is what an
+/// operator browses, `run gate decide --help` is what they read when they type the flag,
+/// and half the sentence ("attribution" alone) does not warn anybody.
+#[test]
+fn gate_help_says_attribution_is_not_authentication() {
+    for args in [
+        vec!["run", "gate", "--help"],
+        vec!["run", "gate", "decide", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("attribution") && lower.contains("not authentication"),
+            "`{}` must not let --as read as authenticated:\n{text}",
+            args.join(" ")
+        );
+        // clap's own `[default: ""]` rendering contradicts the sentence above on the very
+        // surface that states the trust boundary — the effective default is $USER, which
+        // `cmd::gate::actor_or_user` resolves, not the empty string clap holds.
+        assert!(
+            !text.contains(r#"[default: ""]"#),
+            "`{}` advertises an empty default that is not what actually happens:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
 /// An unreadable file is an operator typo, and must be reported before any connection —
 /// and without echoing whatever was read.
 #[test]

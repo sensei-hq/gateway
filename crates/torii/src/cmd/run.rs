@@ -391,6 +391,19 @@ fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalStateA
             JournalEvent::SignalAwaited { node, deadline } => {
                 awaited.entry(node.clone()).or_insert(*deadline);
             }
+            // SP-6 s2: a gate is awaiting for LISTING purposes too, and this arm is what
+            // makes it visible at all — without it `awaiting_nodes` finds nothing for a
+            // `HumanGate` and the node never appears in `list-paused`, which is the worst
+            // available outcome: an operator cannot decide what they cannot see, and the
+            // run waits on a human who was never told. FIRST wins, exactly as for
+            // `SignalAwaited` above and for the same reason.
+            //
+            // It does NOT make a gate answerable by `run signal` — that command refuses a
+            // node with a journaled menu before it ever reaches this fold (`gate_menu`),
+            // and `signal_state` is consulted only after that refusal.
+            JournalEvent::GateAwaited { node, deadline, .. } => {
+                awaited.entry(node.clone()).or_insert(*deadline);
+            }
             JournalEvent::NodeCompleted { node } => {
                 terminal.insert(node.clone(), (*seq, SignalState::Completed));
             }
@@ -454,20 +467,52 @@ pub fn signal_state(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStat
 
 /// One node's [`SignalState`] **with** the seq that established it — what `signal`'s
 /// post-write report needs; see [`SignalStateAt`].
-fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStateAt {
+///
+/// `pub(crate)` for `cmd::gate::decide`, whose post-append arm has the identical question
+/// to answer and must not answer it with a second fold: was our row READ by the drive that
+/// terminated the node, or ORPHANED behind it? Only the journal ORDER can tell those apart,
+/// and only this function reports it.
+pub(crate) fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> SignalStateAt {
     signal_states(events).remove(node).unwrap_or(SignalStateAt {
         state: SignalState::NotAwaiting,
         at: None,
     })
 }
 
-/// Every node in this run that is currently awaiting a signal, in node-id order so the
+/// Every node in this run that is currently awaiting a human, in node-id order so the
 /// rendering is deterministic run to run.
+///
+/// Covers BOTH waiting kinds: an `AwaitSignal` (no menu) and a `HumanGate` (its menu, so
+/// an operator can see the choices without reading the graph).
 fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
+    let menus: HashMap<NodeId, Vec<String>> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            // FIRST wins, matching both the executor's fold and `gate_menu`: the menu a
+            // human was ACTUALLY shown is the first one published, and a later
+            // `GateAwaited` must never be able to restate it.
+            JournalEvent::GateAwaited { node, options, .. } => Some((
+                node.clone(),
+                options.iter().map(|o| o.name.clone()).collect(),
+            )),
+            _ => None,
+        })
+        .fold(HashMap::new(), |mut acc, (n, m)| {
+            acc.entry(n).or_insert(m);
+            acc
+        });
+
     let mut out: Vec<render::AwaitingNode> = signal_states(events)
         .into_iter()
         .filter_map(|(node, st)| match st.state {
-            SignalState::Awaiting { deadline } => Some(render::AwaitingNode { node, deadline }),
+            SignalState::Awaiting { deadline } => {
+                let options = menus.get(&node).cloned();
+                Some(render::AwaitingNode {
+                    node,
+                    deadline,
+                    options,
+                })
+            }
             _ => None,
         })
         .collect();
@@ -475,7 +520,7 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
     out
 }
 
-/// The largest `--payload` this command will journal, in bytes of serialized JSON.
+/// The largest human answer torii will journal, in bytes of serialized JSON.
 ///
 /// §6.5: an unbounded JSON blob in a journal row is a durable footgun. The executor's own
 /// convention for "too big to sit inline in a journal row" is `split_output`'s
@@ -483,24 +528,30 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 /// reused here, because it routes over-threshold values to the `ContentStore` as an
 /// `EffectOutput::Ref`, and `SignalReceived.payload` is a bare `serde_json::Value` with
 /// no ref-or-inline alternative. Changing that shape would break the journal format and
-/// force a `FORMAT_VERSION` bump for a size cap, so the cap is enforced HERE, at the only
-/// writer, by rejecting.
+/// force a `FORMAT_VERSION` bump for a size cap, so the cap is enforced in the CLI, at
+/// every writer, by rejecting.
+///
+/// **Writers, plural, since SP-6 s2.** [`signal`] bounds `SignalReceived.payload` and
+/// `cmd::gate::decide` bounds `GateDecided.note` — the same durable column, the same
+/// number, through the same [`check_payload_size`]. That is deliberate: an enforcement
+/// each writer re-derives for itself is two bounds that drift, and `decide` shipped with
+/// no bound at all while this doc said there was only one writer to have.
 ///
 /// 4 KiB is the same boundary the executor already applies to a model call's inline
-/// output, so a journal row produced by a signal can never be larger than one the
+/// output, so a journal row torii writes can never be larger than one the
 /// executor itself writes inline. **That claim holds only because of the two corrections
 /// below, each of which falsified it once — and each was found only by measuring the row
 /// rather than the argument.** The cap is checked on the REDACTED value — the one actually
 /// written, see [`Measured`] — and on a size measured the way the DURABLE backend stores
 /// it rather than the way `serde_json` writes it, see [`jsonb_number_expansion`]. It is
-/// also far beyond any real use: a signal is a human DECISION
+/// also far beyond any real use: both are a human DECISION
 /// (`{"decision":"approved","note":"…"}`), not a data channel, and 4 KiB is roughly 600
 /// words of prose.
 ///
-/// **Carry-forward:** this bounds the CLI, not the journal. `SignalReceived` remains
-/// uncapped for any future writer (a webhook/HTTP delivery path, §8's deferred
-/// non-CLI delivery). A durable-side cap needs the payload to become ref-or-inline, which
-/// is a format break.
+/// **Carry-forward:** this bounds the CLI, not the journal. `SignalReceived` and
+/// `GateDecided` remain uncapped for any future writer (a webhook/HTTP delivery path,
+/// §8's deferred non-CLI delivery). A durable-side cap needs the payload to become
+/// ref-or-inline, which is a format break.
 pub const MAX_PAYLOAD_BYTES: usize = 4096;
 
 /// WHICH size [`check_payload_size`] is measuring — because redaction sits between the
@@ -511,7 +562,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 4096;
 /// payload journals a 5312-byte row. Checking only [`AsGiven`](Measured::AsGiven) let that
 /// through, which falsified the "never larger than an inline executor row" claim above.
 #[derive(Clone, Copy)]
-enum Measured {
+pub(crate) enum Measured {
     /// The payload exactly as the operator supplied it. Checked FIRST, and by
     /// [`parse_payload`] before any connection is opened, so the redactor is never handed
     /// an unbounded blob.
@@ -558,7 +609,22 @@ fn jsonb_number_expansion(value: &serde_json::Value) -> usize {
 
 /// Refuse an over-limit payload, naming BOTH the limit and the actual size — an operator
 /// who pasted a file needs to know how much to cut, not just that they were over.
-fn check_payload_size(payload: &serde_json::Value, measured: Measured) -> Result<(), String> {
+///
+/// `what` NAMES the offending input (`--payload`, `--note`), because there is now more
+/// than one writer to the durable column this bounds: `cmd::gate::decide` journals a
+/// decision note through the same cap. Telling a `gate decide --note` operator to shorten
+/// their `--payload` would send them to a flag that command does not have. `pub(crate)`
+/// for the same reason — the bound is reused, never re-derived, so the two writers cannot
+/// drift on the number OR on how it is measured (wire bytes plus
+/// [`jsonb_number_expansion`]).
+///
+/// The value itself is NEVER echoed, only its size: this is the one input an operator
+/// might paste a credential into, and stderr reaches journald and CI logs.
+pub(crate) fn check_payload_size(
+    payload: &serde_json::Value,
+    measured: Measured,
+    what: &str,
+) -> Result<(), String> {
     // `to_vec` (not `to_string().len()`) so the number is bytes on the wire, PLUS what the
     // backend's own normalisation adds on top — see `jsonb_number_expansion`. Measuring
     // only the wire form bounded a value nobody durably stores.
@@ -571,30 +637,29 @@ fn check_payload_size(payload: &serde_json::Value, measured: Measured) -> Result
         // assume the tool is broken. Both growth causes are named because either one can
         // be the whole difference — redaction inflates by ~1.67x, the backend's numeric
         // normalisation by up to ~50x.
-        let mut what = String::new();
+        let mut growth = String::new();
         if matches!(measured, Measured::AfterRedaction) {
-            what.push_str(
+            growth.push_str(
                 " once redacted (secret-shaped text is replaced by the longer literal \
                  `[REDACTED]` before the row is written)",
             );
         }
         if expansion > 0 {
-            let joiner = if what.is_empty() { "" } else { " and" };
-            what.push_str(&format!(
+            let joiner = if growth.is_empty() { "" } else { " and" };
+            growth.push_str(&format!(
                 "{joiner} once stored (the journal column is `jsonb`, which normalises \
                  every JSON number to `numeric` — that expands this payload by \
                  {expansion} bytes)"
             ));
         }
-        if !what.is_empty() {
-            what.push_str(", so the durable row is bigger than what you sent");
+        if !growth.is_empty() {
+            growth.push_str(", so the durable row is bigger than what you sent");
         }
         return Err(format!(
-            "--payload is {size} bytes{what}, over the {MAX_PAYLOAD_BYTES}-byte limit. A \
-             signal is a human DECISION, not a data channel — it is journaled durably and \
-             folded into the node's output on every resume. Put the bulk somewhere the \
-             graph can read (a workspace file, the blackboard) and signal a reference to \
-             it."
+            "{what} is {size} bytes{growth}, over the {MAX_PAYLOAD_BYTES}-byte limit. This \
+             is a human DECISION, not a data channel — it is journaled durably and folded \
+             into the node's output on every resume. Put the bulk somewhere the graph can \
+             read (a workspace file, the blackboard) and reference it here."
         ));
     }
     Ok(())
@@ -634,7 +699,7 @@ pub fn parse_payload(s: &str) -> Result<serde_json::Value, String> {
              channel and an operator may have pasted one here."
         )
     })?;
-    check_payload_size(&v, Measured::AsGiven)?;
+    check_payload_size(&v, Measured::AsGiven, "--payload")?;
     Ok(v)
 }
 
@@ -702,9 +767,9 @@ pub async fn signal(
     // bytes; the SAME pure pass the executor applies on the fold-read, so this stays
     // idempotent (`[REDACTED]` matches no credential shape) and live == journaled ==
     // replayed (§6.4).
-    check_payload_size(&payload, Measured::AsGiven).map_err(CliError::error)?;
+    check_payload_size(&payload, Measured::AsGiven, "--payload").map_err(CliError::error)?;
     let payload = render::redact_payload(&payload);
-    check_payload_size(&payload, Measured::AfterRedaction).map_err(CliError::error)?;
+    check_payload_size(&payload, Measured::AfterRedaction, "--payload").map_err(CliError::error)?;
 
     // A node id is operator-supplied free text on this path, and every message below
     // echoes it back to a terminal. `one_line` collapses control characters (Unicode Cc,
@@ -721,6 +786,26 @@ pub async fn signal(
         .load(run)
         .await
         .map_err(OrchestratorError::Journal)?;
+
+    // SP-6 s2 AC7: a `HumanGate` is answerable ONLY by `GateDecided`. Without this
+    // refusal a raw `--payload '{}'` would bypass every validation s2 adds — the menu
+    // check, the outcome mapping and the required reason — and would do it silently: the
+    // executor's `run_human_gate` reads only `GateDecided`, so the row would be journaled,
+    // never read, and reported here as `signalled`.
+    //
+    // Checked BEFORE `signal_state`, not after, because a gate does not fold as
+    // `Awaiting` at all (that fold reads `SignalAwaited`, and a gate journals
+    // `GateAwaited`) — reaching the generic arm would refuse it as "not awaiting a
+    // signal", which is true and useless: it sends an operator to check the node id when
+    // the id was right and the COMMAND was wrong.
+    if crate::cmd::gate::gate_menu(&events, &node).is_some() {
+        return Ok(Outcome::precondition(format!(
+            "not delivered: {shown} is a HumanGate, not an AwaitSignal — it accepts a \
+             named option, not arbitrary JSON. Use: torii run gate decide {} --node \
+             {shown} --option <name>",
+            run.0
+        )));
+    }
 
     match signal_state(&events, &node) {
         SignalState::Awaiting { .. } => {}
@@ -897,7 +982,14 @@ pub async fn signal(
 /// The pre-check refusal text for a node that is not awaiting. Split out so the exact
 /// wording cannot drift between the state variants.
 /// `node` is the DISPLAY form (control characters already collapsed) — see `signal`.
-fn not_delivered(node: &str, state: &SignalState) -> String {
+///
+/// `pub(crate)` for `cmd::gate::decide`, which refuses a non-awaiting node on the SAME
+/// fold and must give the same answer: a `HumanGate` and an `AwaitSignal` are terminal for
+/// identical reasons, and two wordings for one condition is two places for it to rot. The
+/// text says "signal" where a gate would say "decision"; that is the price of one source
+/// of truth, and it is the cheaper half of the trade — the sentence that matters ("a
+/// terminal node never re-executes") is exactly the same fact in both commands.
+pub(crate) fn not_delivered(node: &str, state: &SignalState) -> String {
     match state {
         SignalState::Completed => format!(
             "not delivered: {node} already completed — the node has read its answer and a \
@@ -1148,15 +1240,26 @@ pub async fn submit(
     )))
 }
 
+/// `pub(crate)` **only so `cmd::gate`'s tests can reuse four fixtures** — `now`,
+/// `paused_store`, `awaiting_journal` and `FailingForceWakeStore`. There is no
+/// `tests_support` module in this crate and inventing one would mean moving fixtures
+/// away from the tests that own them; re-exporting the four that a second module needs
+/// is the smaller change. Copying them into `cmd::gate` was the alternative and is
+/// worse: `FailingForceWakeStore` is the append-then-`force_wake` ORDER discriminator
+/// for both commands, and two copies of it are two places for that guard to rot
+/// independently.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    // The `GateAwaited` fixtures live beside `cmd::gate`'s own tests — see that module's
+    // doc comment for why the reuse runs in both directions.
+    use crate::cmd::gate::tests::{gate_journal, release};
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::{EffectClass, EffectId, EffectOutput, Graph, NodeId, TokenUsage};
     use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
     use std::sync::Arc;
 
-    fn now() -> DateTime<Utc> {
+    pub(crate) fn now() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(3_000_000, 0).unwrap()
     }
 
@@ -1173,7 +1276,10 @@ mod tests {
     }
 
     /// A run enqueued then recorded paused with a deadline.
-    async fn paused_store(run: RunId, next_wake: Option<DateTime<Utc>>) -> InMemorySchedulerStore {
+    pub(crate) async fn paused_store(
+        run: RunId,
+        next_wake: Option<DateTime<Utc>>,
+    ) -> InMemorySchedulerStore {
         let s = InMemorySchedulerStore::default();
         s.enqueue(run, &empty_graph(), now()).await.unwrap();
         s.record_paused(run, next_wake, "quota: rate limited")
@@ -1518,7 +1624,7 @@ mod tests {
     /// here would short-circuit via `?` and the append would never run — the journal
     /// would end up with NO `BudgetRaised` event at all. Because the real order appends
     /// first, the event lands durably even though the subsequent `force_wake` fails.
-    struct FailingForceWakeStore(InMemorySchedulerStore);
+    pub(crate) struct FailingForceWakeStore(pub(crate) InMemorySchedulerStore);
 
     #[async_trait::async_trait]
     impl SchedulerStore for FailingForceWakeStore {
@@ -2236,7 +2342,7 @@ mod tests {
 
     /// A journal seeded with a node that has begun awaiting a signal — the state the
     /// executor's `run_await_signal` leaves behind on its first execution.
-    async fn awaiting_journal(
+    pub(crate) async fn awaiting_journal(
         run: RunId,
         node: &NodeId,
         deadline: Option<DateTime<Utc>>,
@@ -2283,7 +2389,12 @@ mod tests {
     /// The blackboard publish an executor writes when a node COMPLETES
     /// (`publish_context`, keyed by node id) — the durable, node-keyed marker torii reads
     /// to tell a completed `AwaitSignal` node from one still awaiting.
-    async fn append_completion(j: &InMemoryJournal, run: RunId, node: &NodeId) {
+    /// The durable marker that a waiting node COMPLETED — the blackboard publish every
+    /// completed node makes, since neither an `AwaitSignal` nor a `HumanGate` journals a
+    /// `NodeCompleted`. `pub(crate)` so `cmd::gate`'s racing test models a drive exactly as
+    /// this module's does; two hand-rolled `ContextWrite` shapes would be two places for
+    /// the completion marker `signal_states` reads to drift.
+    pub(crate) async fn append_completion(j: &InMemoryJournal, run: RunId, node: &NodeId) {
         j.append(
             run,
             JournalEvent::ContextWrite {
@@ -2654,6 +2765,60 @@ mod tests {
         assert_eq!(
             signals[0]["decision"], "approved",
             "the DECISION must survive redaction: {durable}"
+        );
+    }
+
+    /// AC7, half two: a `HumanGate` is answerable ONLY by `GateDecided`, so `run signal`
+    /// must refuse one — and point at the command that works.
+    ///
+    /// This is not a politeness. Without it a raw `--payload '{}'` writes a
+    /// `SignalReceived` for a gate node and bypasses every validation s2 adds: the menu
+    /// check, the outcome mapping and the required reason. (The executor would not honour
+    /// that row — `run_human_gate` reads only `GateDecided` — so the operator would be
+    /// told "signalled" for a delivery that can never be read, which is the reporting
+    /// failure §6.6 forbids as much as the bypass itself.)
+    #[tokio::test]
+    async fn signal_on_a_human_gate_is_refused_and_points_at_run_gate() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = InMemoryJournal::new();
+        j.append(
+            run,
+            JournalEvent::GateAwaited {
+                node: gate(),
+                deadline: None,
+                options: vec![orchestrator_core::GateOption {
+                    name: "ship".into(),
+                    outcome: orchestrator_core::GateOutcome::Complete,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = signal(&s, &j, run, gate(), approved(), now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("HumanGate"),
+            "must name what the node actually is: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("run gate"),
+            "must name the command that would work: {}",
+            out.text
+        );
+        assert!(
+            journaled_signals(&j, run, &gate()).await.is_empty(),
+            "a raw payload must never become a durable answer to a gate"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and must not queue a wake"
         );
     }
 
@@ -3557,6 +3722,174 @@ mod tests {
         );
     }
 
+    // ---- SP-6 s2 Task 8: `list-paused` shows a gate's MENU ----------------------------
+
+    /// An operator must be able to see WHAT to decide without reading the graph. The menu
+    /// comes from the journaled `GateAwaited`, so no graph load is needed.
+    #[tokio::test]
+    async fn list_paused_names_a_gates_menu() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship", "hold", "escalate"]).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.text.contains("release"), "{}", out.text);
+        for o in ["ship", "hold", "escalate"] {
+            assert!(
+                out.text.contains(o),
+                "the menu must be shown so an operator knows the choices: {}",
+                out.text
+            );
+        }
+    }
+
+    /// The two waiting kinds must be TOLD APART in the listing, not merely both listed: a
+    /// gate takes `torii run gate decide --option <name>` and refuses raw JSON, while an
+    /// `AwaitSignal` takes `torii run signal --payload` and has no menu at all. An
+    /// operator who cannot tell which is which will reach for the wrong command, and the
+    /// cross-refusals that catch that mistake are a rescue, not a substitute for saying so
+    /// here.
+    ///
+    /// **Both waiting nodes sit in ONE run**, and that is what makes the negative
+    /// assertion mean anything. The fixture originally split them across two runs, and
+    /// [`list_paused`] folds one journal PER RUN — so a menu could not have leaked between
+    /// them however `awaiting_nodes` was written. Mutating its `menus.get(&node)` to
+    /// `menus.values().next()` — the literal "borrow another node's menu" this test names
+    /// — left the whole suite green. With both nodes in one fold, the negative assertion
+    /// depends on the per-node keying it claims to check.
+    #[tokio::test]
+    async fn list_paused_distinguishes_a_gate_from_an_await_signal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        // ONE run, two waiting nodes: a `HumanGate` with a menu and an `AwaitSignal`
+        // without one — the shape a graph with both kinds actually produces.
+        let j = gate_journal(run, &release(), None, &["ship", "hold"]).await;
+        j.append(
+            run,
+            JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        // Keyed on the NODE COLUMN, not `contains`: a gate's menu cell is rendered
+        // `gate: ship|hold`, so `contains("gate")` matches the `release` row too and the
+        // two rows could not be told apart at all.
+        let row_for = |node: &str| {
+            out.text
+                .lines()
+                .filter(|l| l.starts_with(&run.0.to_string()))
+                .find(|l| l.split_whitespace().nth(1) == Some(node))
+                .unwrap_or_else(|| panic!("no awaiting row for {node}:\n{}", out.text))
+                .to_string()
+        };
+        let gate_row = row_for("release");
+        assert!(
+            gate_row.contains("ship") && gate_row.contains("hold"),
+            "the gate's own row must carry its menu: {gate_row}"
+        );
+        let signal_row = row_for("gate");
+        assert!(
+            !signal_row.contains("ship") && !signal_row.contains("hold"),
+            "an AwaitSignal has no menu and must not borrow the gate's — they are in the \
+             SAME fold, so only the per-node keying stops it: {signal_row}"
+        );
+        assert!(
+            signal_row.contains("signal"),
+            "…and must still say what it IS waiting for: {signal_row}"
+        );
+    }
+
+    /// An option name is AUTHOR free text that reaches a line-oriented table, so it
+    /// carries exactly the hazards a pause reason does: a raw newline would forge a line
+    /// that reads as its own awaiting row — carrying a uuid an operator could paste into
+    /// `run cancel` — and an ANSI escape could rewrite what is already on screen. This is
+    /// the guard on `render::one_line` in the menu cell; without it the forged line is
+    /// real.
+    #[tokio::test]
+    async fn a_hostile_option_name_cannot_forge_an_awaiting_row_or_move_the_cursor() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let hostile = format!("ship\n{FORGED_RUN}  release  approved\u{1b}[2K");
+        let j = gate_journal(run, &release(), None, &[&hostile]).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert!(
+            !out.text.contains('\u{1b}'),
+            "a raw escape byte survived into the table: {:?}",
+            out.text
+        );
+        let forged = out
+            .text
+            .lines()
+            .filter(|l| l.trim_start().starts_with(FORGED_RUN))
+            .count();
+        assert_eq!(
+            forged, 0,
+            "a newline in an option name forged a line that reads as its own row:\n{}",
+            out.text
+        );
+    }
+
+    /// The cell is CAPPED as well as collapsed, for the same reason a node id is: an
+    /// option name is unbounded by `validate_dag` (it checks non-empty, unique and
+    /// outcome-reachable, never length), so one overlong name — or a fifty-option menu —
+    /// would wreck the alignment of every other row in the block.
+    #[tokio::test]
+    async fn an_overlong_menu_is_capped_so_it_cannot_wreck_the_block() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let long = "s".repeat(5_000);
+        let j = gate_journal(run, &release(), None, &[&long]).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let row = out
+            .text
+            .lines()
+            .find(|l| l.contains("release"))
+            .unwrap_or_else(|| panic!("no awaiting row:\n{}", out.text));
+        assert!(
+            row.chars().count() < 400,
+            "an unbounded menu wrecks the block: {} chars",
+            row.chars().count()
+        );
+        assert!(row.contains('…'), "truncation must be visible: {row}");
+    }
+
+    /// `--json` is the scripting surface, so the menu must reach it too — and, for a run
+    /// with no gate, the s1 shape must be UNCHANGED: the key is absent rather than `null`,
+    /// so a script written against s1 sees byte-identical output.
+    #[tokio::test]
+    async fn list_paused_json_carries_the_menu_and_omits_it_for_a_signal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship", "hold"]).await;
+
+        let out = list_paused(&s, &j, true).await.expect("lists");
+        let v: serde_json::Value = serde_json::from_str(&out.text)
+            .unwrap_or_else(|e| panic!("--json emitted non-JSON {:?}: {e}", out.text));
+        assert_eq!(v[0]["awaiting"][0]["node"], "release", "{v}");
+        assert_eq!(
+            v[0]["awaiting"][0]["options"],
+            serde_json::json!(["ship", "hold"]),
+            "a script must be able to read the menu without the graph: {v}"
+        );
+
+        let signal_run = RunId(uuid::Uuid::new_v4());
+        let s2 = paused_store(signal_run, None).await;
+        let j2 = awaiting_journal(signal_run, &gate(), None).await;
+        let out2 = list_paused(&s2, &j2, true).await.expect("lists");
+        let v2: serde_json::Value = serde_json::from_str(&out2.text).expect("valid json");
+        assert!(
+            v2[0]["awaiting"][0].get("options").is_none(),
+            "an AwaitSignal has no menu, and `null` would change s1's JSON shape: {v2}"
+        );
+    }
+
     // ---- Whole-slice review, Important: one bad journal must not hide the fleet -------
 
     /// A journal that FAILS to fold ONE run and delegates every other — the shape a
@@ -3622,7 +3955,7 @@ mod tests {
     }
 
     /// A uuid an operator could paste into `run cancel` if a forged line read as a row.
-    const FORGED_RUN: &str = "deadbeef-dead-beef-dead-beefdeadbeef";
+    pub(crate) const FORGED_RUN: &str = "deadbeef-dead-beef-dead-beefdeadbeef";
 
     /// Two paused runs, one of which cannot be folded, plus a shared journal in which the
     /// HEALTHY one has a node awaiting a signal.

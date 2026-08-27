@@ -57,12 +57,14 @@ Add to `crates/orchestrator-core/src/journal.rs`, inside `mod tests`:
     /// keeps `FORMAT_VERSION` at 1.
     #[test]
     fn the_gate_events_round_trip_without_a_format_bump() {
+        use crate::graph::{GateOption, GateOutcome};
+
         let awaited = JournalEvent::GateAwaited {
             node: NodeId("release".into()),
             deadline: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).unwrap()),
             options: vec![
                 GateOption { name: "ship".into(), outcome: GateOutcome::Complete },
-                GateOption { name: "hold".into(), outcome: GateOutcome::Complete },
+                GateOption { name: "hold".into(), outcome: GateOutcome::Fail },
             ],
         };
         let s = serde_json::to_string(&awaited).expect("serializes");
@@ -76,8 +78,11 @@ Add to `crates/orchestrator-core/src/journal.rs`, inside `mod tests`:
                 assert!(deadline.is_some());
                 assert_eq!(options.len(), 2);
                 assert_eq!(options[0].name, "ship");
-                // The OUTCOME is durable too, not just the name.
-                assert_eq!(options[1].outcome, GateOutcome::Complete);
+                // Both outcomes are durable AND DISTINCT. A menu whose options are all
+                // `Complete` passes even if the two variants collapse into one on the
+                // wire — which would make every rejected gate resume as an approval.
+                assert_eq!(options[0].outcome, GateOutcome::Complete);
+                assert_eq!(options[1].outcome, GateOutcome::Fail);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -114,8 +119,6 @@ Add to `crates/orchestrator-core/src/journal.rs`, inside `mod tests`:
         let s = serde_json::to_string(&terse).expect("serializes");
         assert!(serde_json::from_str::<JournalEvent>(&s).is_ok());
 
-        // FORMAT_VERSION is untouched — new variants, not new fields.
-        assert_eq!(FORMAT_VERSION, 1, "adding variants must not bump the format");
     }
 ```
 
@@ -127,7 +130,52 @@ env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib the_gate_events
 
 Expected: **compile error** — `no variant named GateAwaited found for enum JournalEvent`.
 
-- [ ] **Step 3: Add the variants**
+- [ ] **Step 3: Add the two data types the events carry**
+
+`GateAwaited` carries `Vec<GateOption>`, so the type must exist before the event does.
+These are pure data with no behaviour — the `NodeKind` variant that USES them, and its
+validation, are Task 2.
+
+In `crates/orchestrator-core/src/graph.rs`, after the `MAX_AWAIT_SIGNAL_TIMEOUT` const:
+
+```rust
+/// One choice a [`NodeKind::HumanGate`] offers, and what picking it does to the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateOption {
+    /// What the operator types: `torii run gate decide … --option <name>`.
+    pub name: String,
+    pub outcome: GateOutcome,
+}
+
+/// What choosing a [`GateOption`] does to the run.
+///
+/// Per-option rather than a fixed approve/reject pair, so a three-way gate
+/// (`ship | hold | escalate`) needs no special case — and deliberately reusing the
+/// EXISTING terminal machinery, so this slice needs no new `RunStatus`, no
+/// `SchedulerStore` change and no dbd migration.
+///
+/// **Accepted cost:** a `Fail` option and a dead provider both surface as
+/// `RunStatus::Failed`, so they are indistinguishable BY STATUS — only the reason text
+/// tells them apart, and only `torii run status` renders it. Anything filtering on status
+/// conflates them: a script, or the terminal allowlist in
+/// `count_terminal_before`/`prune_terminal`. (NOT `list-paused`: it filters
+/// `status='paused'` and both cases are terminal, so neither appears there at all.)
+/// A distinct `Rejected` status would be more truthful but reaches both store impls, the
+/// dbd CHECK constraint and torii's rendering — deferred, not overlooked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateOutcome {
+    /// The decision becomes this node's output; dependents run.
+    Complete,
+    /// `NodeFailed`; hard-edge dependents cascade-skip.
+    Fail,
+}
+```
+
+Re-export them from the crate root alongside the other graph types so
+`orchestrator_core::GateOption` resolves (match however `NodeKind`/`BranchCond` are
+re-exported in `crates/orchestrator-core/src/lib.rs`).
+
+- [ ] **Step 4: Add the variants**
 
 In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalReceived` variant:
 
@@ -136,8 +184,12 @@ In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalRecei
     ///
     /// The options are journaled rather than re-read from the graph for the same reason
     /// s1 journals the deadline: a human was shown a menu, and validating their answer
-    /// against a *different* menu later is simply wrong. The graph is caller-supplied and
-    /// never journaled (SP-DATA-3), so nothing else makes the menu durable.
+    /// against a *different* menu later is simply wrong. Nothing BINDS the graph a later
+    /// drive is handed to the one the human was shown — `Executor::start` takes it as a
+    /// caller parameter, no fence covers it (the config-version fence covers the registry),
+    /// and the executor cannot see `SchedulerStore`. So an author who edits the graph
+    /// between drives silently rewrites the menu. `scheduled_runs.graph` happens to hold a
+    /// copy on the scheduler path, but the executor cannot read it.
     ///
     /// The full [`GateOption`]s, not just their names: the OUTCOME the human was shown
     /// ("reject will stop the run") is as much a part of the offer as the name. If only
@@ -149,7 +201,7 @@ In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalRecei
     GateAwaited {
         node: NodeId,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
-        options: Vec<crate::graph::GateOption>,
+        options: Vec<GateOption>,   // `use crate::graph::{GateOption, Graph};` at the top
     },
     /// SP-6 s2: a human picked one of a `HumanGate`'s options.
     ///
@@ -169,7 +221,7 @@ In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalRecei
     },
 ```
 
-- [ ] **Step 4: Run it and watch it pass**
+- [ ] **Step 5: Run it and watch it pass**
 
 ```bash
 env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib the_gate_events_round_trip
@@ -185,13 +237,13 @@ env -u DATABASE_URL cargo test -p sensei-orchestrator-core
 
 If other crates fail to compile on a non-exhaustive match, add the arms in Task 2/3 — do not add a catch-all `_ =>`, which would silently swallow future variants.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
-git add crates/orchestrator-core/src/journal.rs
+git add crates/orchestrator-core/src/journal.rs crates/orchestrator-core/src/graph.rs crates/orchestrator-core/src/lib.rs
 git commit -F - <<'MSGEOF'
-feat(core): SP-6 s2 (1/7) — GateAwaited/GateDecided events
+feat(core): SP-6 s2 (1/8) — GateOption/GateOutcome + the two gate events
 
 Two new variants, not new fields, so FORMAT_VERSION stays 1 and an event written
 by an older binary still loads — the same additivity trick s1 used.
@@ -332,36 +384,8 @@ In `crates/orchestrator-core/src/graph.rs`, add to `NodeKind` after `AwaitSignal
     },
 ```
 
-Then, after the `MAX_AWAIT_SIGNAL_TIMEOUT` const:
-
-```rust
-/// One choice a [`NodeKind::HumanGate`] offers, and what picking it does to the run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GateOption {
-    /// What the operator types: `torii run gate decide … --option <name>`.
-    pub name: String,
-    pub outcome: GateOutcome,
-}
-
-/// What choosing a [`GateOption`] does to the run.
-///
-/// Per-option rather than a fixed approve/reject pair, so a three-way gate
-/// (`ship | hold | escalate`) needs no special case — and deliberately reusing the
-/// EXISTING terminal machinery, so this slice needs no new `RunStatus`, no
-/// `SchedulerStore` change and no dbd migration.
-///
-/// **Accepted cost:** a `Fail` option and a dead provider both surface as
-/// `RunStatus::Failed`. The reason string distinguishes them; `torii run list-paused`
-/// does not. A distinct `Rejected` status would be more truthful but reaches both store
-/// impls, the dbd CHECK constraint and torii's rendering — deferred, not overlooked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GateOutcome {
-    /// The decision becomes this node's output; dependents run.
-    Complete,
-    /// `NodeFailed`; hard-edge dependents cascade-skip.
-    Fail,
-}
-```
+`GateOption` and `GateOutcome` already exist — Task 1 added them, because `GateAwaited`
+carries them. This task adds only the node kind that USES them, and its validation.
 
 In `validate_dag`, immediately after the existing `2b-bis` block:
 
@@ -437,15 +461,29 @@ env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib a_degenerate_ga
 
 Expected: `test result: ok. 2 passed`.
 
-- [ ] **Step 5: Fix the doc guard this WILL break**
+- [ ] **Step 5: Fix the doc guard — and note that it does NOT fail first**
 
-`every_node_kind_is_named_in_the_execution_graph_feature_doc` (added in the s1 review) scrapes `NodeKind` and asserts each variant appears in the feature doc. It now fails on `HumanGate` — by design.
+`every_node_kind_is_documented_in_the_execution_graph_feature_doc` scrapes `NodeKind` and
+asserts each variant is documented in the feature doc.
+
+**An earlier revision of this plan predicted it would go RED on `HumanGate` here. It did
+not, and the reason is the finding.** The guard as originally written (in the s1 review)
+was `doc.contains(variant_name)` — a bare substring search over the whole file — and
+`HumanGate` was already named twice: once as a forward reference inside the `AwaitSignal`
+bullet's body, and once in a pre-existing aspirational sentence that also names `Tool`, a
+kind that has never been a variant. So it was GREEN across the entire commit that
+introduced the variant. A guard that passes while the thing it guards is absent is worse
+than no guard, because it is believed.
+
+The guard has since been strengthened to require a real bullet (head-matched, so a mention
+inside another kind's bullet does not count) or, for the five kinds predating the bullet
+convention, a backticked name inside the "Implemented node kinds:" paragraph specifically.
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_named
+env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_documented
 ```
 
-Expected: **FAIL** with `node kinds implemented but absent from docs/…: ["HumanGate"]`.
+Expected: **FAIL** with `node kinds implemented but not DOCUMENTED in docs/…: ["HumanGate"]`.
 
 Add to `docs/features/orchestrator/execution-graph.md`, in the `> - **\`Expand …\`**` bullet list:
 
@@ -467,7 +505,7 @@ Add to `docs/features/orchestrator/execution-graph.md`, in the `> - **\`Expand �
 Re-run:
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_named
+env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib every_node_kind_is_documented
 ```
 
 Expected: `ok. 1 passed`.
@@ -494,9 +532,14 @@ The timeout bounds are s1's, applied to this kind too, because a HumanGate
 computes `now + timeout` through the SAME shared wait path and so overflows
 DateTime<Utc> and poisons a worker identically.
 
-The s1-review doc guard (every_node_kind_is_named_in_the_execution_graph_feature_doc)
-failed on HumanGate exactly as designed, and the feature doc is updated. That
-guard scrapes the enum, so the next node kind cannot ship undocumented either.
+The s1-review doc guard did NOT fail on HumanGate, and that is itself the finding:
+it was `doc.contains(variant_name)`, a bare substring search, and HumanGate was
+already named twice in prose — once as a forward reference inside the AwaitSignal
+bullet, once in an aspirational sentence that also names Tool, never a variant. So
+it was green across the whole commit that introduced the variant. It is now
+strengthened to require a real bullet (head-matched) or, for the five kinds
+predating that convention, a name bounded to the "Implemented node kinds:"
+paragraph. Proven red three ways.
 MSGEOF
 ```
 
@@ -523,9 +566,15 @@ In `crates/orchestrator/src/executor/signal.rs`, add above `run_await_signal`:
 
 ```rust
 /// What a waiting node's shared machinery decided, when no answer is present.
+///
+/// There is deliberately NO `AlreadyFailed` variant. An earlier revision of this plan had
+/// one, plus a duplicate `fold.failure_for` check inside `wait_or_expire`. Task 3's review
+/// established that the duplicate cannot do the job it advertises: both callers read their
+/// ANSWER between `gate_precheck` and `wait_or_expire`, so a failure re-check at that point
+/// runs AFTER the answer read and therefore does nothing about the late-answer
+/// self-approval the guard exists for. Its only effect would be to imply `gate_precheck` is
+/// optional. Every caller MUST call `gate_precheck` first — that is the contract.
 pub(super) enum WaitState {
-    /// The node already failed and stays failed — the fail-closed arm.
-    AlreadyFailed(String),
     /// Nothing is recorded for this node yet; the caller must journal its own
     /// "now asking" event, then re-enter. Carries the deadline to record.
     NotYetAsking(Option<chrono::DateTime<chrono::Utc>>),
@@ -578,9 +627,6 @@ impl Executor {
         timeout: Option<chrono::Duration>,
         fold: &Fold,
     ) -> Result<WaitState, String> {
-        if let Some(error) = fold.failure_for(&node.id) {
-            return Ok(WaitState::AlreadyFailed(error.to_string()));
-        }
         let Some(recorded) = fold.deadline_for(&node.id) else {
             let fresh = match timeout {
                 None => None,
@@ -655,12 +701,6 @@ Replace the body of `run_await_signal` (keep the whole existing doc comment — 
                     },
                 )
                 .await?;
-                return Ok(NodeExec::Failed {
-                    message,
-                    output: None,
-                });
-            }
-            Ok(WaitState::AlreadyFailed(message)) => {
                 return Ok(NodeExec::Failed {
                     message,
                     output: None,
@@ -871,7 +911,8 @@ If `at()` does not already exist in that test module, add:
 - [ ] **Step 2: Run and watch it fail**
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins a_deadline_less_gate_records
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib a_deadline_less_gate_records
 ```
 
 Expected: **compile error** — `no method named gate_decision_for`.
@@ -963,7 +1004,8 @@ In `crates/orchestrator/src/executor/support.rs`, add the arms next to the `Sign
 - [ ] **Step 4: Run and watch them pass**
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins a_deadline_less_gate_records
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib a_deadline_less_gate_records
 env -u DATABASE_URL cargo test --workspace
 ```
 
@@ -1399,12 +1441,6 @@ impl Executor {
         // The ask, first and unconditionally — see the doc comment.
         let deadline = match self.wait_or_expire(node, timeout, fold) {
             Err(message) => return self.fail_gate(run, node, format!("human_gate: {message}")).await,
-            Ok(WaitState::AlreadyFailed(message)) => {
-                return Ok(NodeExec::Failed {
-                    message,
-                    output: None,
-                });
-            }
             Ok(WaitState::NotYetAsking(fresh)) => {
                 self.append(
                     run,
