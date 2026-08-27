@@ -532,9 +532,14 @@ The timeout bounds are s1's, applied to this kind too, because a HumanGate
 computes `now + timeout` through the SAME shared wait path and so overflows
 DateTime<Utc> and poisons a worker identically.
 
-The s1-review doc guard (every_node_kind_is_named_in_the_execution_graph_feature_doc)
-failed on HumanGate exactly as designed, and the feature doc is updated. That
-guard scrapes the enum, so the next node kind cannot ship undocumented either.
+The s1-review doc guard did NOT fail on HumanGate, and that is itself the finding:
+it was `doc.contains(variant_name)`, a bare substring search, and HumanGate was
+already named twice in prose — once as a forward reference inside the AwaitSignal
+bullet, once in an aspirational sentence that also names Tool, never a variant. So
+it was green across the whole commit that introduced the variant. It is now
+strengthened to require a real bullet (head-matched) or, for the five kinds
+predating that convention, a name bounded to the "Implemented node kinds:"
+paragraph. Proven red three ways.
 MSGEOF
 ```
 
