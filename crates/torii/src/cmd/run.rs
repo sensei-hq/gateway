@@ -531,11 +531,15 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 /// force a `FORMAT_VERSION` bump for a size cap, so the cap is enforced in the CLI, at
 /// every writer, by rejecting.
 ///
-/// **Writers, plural, since SP-6 s2.** [`signal`] bounds `SignalReceived.payload` and
-/// `cmd::gate::decide` bounds `GateDecided.note` — the same durable column, the same
-/// number, through the same [`check_payload_size`]. That is deliberate: an enforcement
-/// each writer re-derives for itself is two bounds that drift, and `decide` shipped with
-/// no bound at all while this doc said there was only one writer to have.
+/// **Writers, plural, since SP-6 s2.** [`signal`] bounds `SignalReceived.payload`, and
+/// `cmd::gate::decide` bounds BOTH operator-supplied fields of `GateDecided` — the `note`
+/// and the `actor` — through the same [`check_payload_size`], on the same number. That is
+/// deliberate: an enforcement each writer re-derives for itself is bounds that drift, and
+/// `decide` shipped with no bound at all while this doc said there was only one writer to
+/// have. The `actor` is the correction after that: it is the SIBLING field on the same
+/// durable row, it was capped by nothing while its neighbour was capped at 4096, and it
+/// is not display-only — the executor interpolates it into the rejection `NodeFailed`
+/// that `torii run status` renders and every later drive re-emits from the fold.
 ///
 /// 4 KiB is the same boundary the executor already applies to a model call's inline
 /// output, so a journal row torii writes can never be larger than one the
