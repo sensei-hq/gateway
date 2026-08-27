@@ -8,12 +8,199 @@
 //! with a `None` `resume_after` is the never-auto-woken class, and the durable
 //! scheduler wakes a timed one. What did not exist was a way to carry an *answer*
 //! back in: `force_wake` is a resume, not a decision. `SignalReceived` is.
+//!
+//! SP-6 s2 splits this node into the parts that are GENERIC to any waiting node kind —
+//! [`Executor::gate_precheck`], [`Executor::wait_or_expire`], [`Executor::pause_awaiting`]
+//! — and the part that is specific to `AwaitSignal`, which is only ever *what counts as
+//! an answer* (here, a folded `SignalReceived` payload; for `HumanGate`, a folded
+//! `GateDecided` outcome). The split is not tidiness. s1's whole-slice review found real
+//! defects in exactly two of the arms below — the fail-closed terminal guard and the
+//! deadline durability — and a copy of either in a second node kind is a second place for
+//! those defects to come back.
 
 use orchestrator_core::{JournalEvent, Node, OrchestratorError, RunId};
 
 use super::{Executor, Fold, NodeExec};
 
+/// What a waiting node's shared machinery decided, when no answer is present.
+///
+/// Deliberately reports rather than acts: every variant leaves the JOURNALING to the
+/// caller, because the event a node writes when it begins asking is the one thing that
+/// is genuinely per-kind (`SignalAwaited` for `AwaitSignal`, `GateAwaited` — which also
+/// carries the menu — for `HumanGate`). Folding that write into the shared helper would
+/// force it to know every node kind, which is the coupling this split exists to avoid.
+///
+/// There is no `AlreadyFailed` variant, and that absence is a decision — see
+/// [`Executor::wait_or_expire`]'s precondition.
+pub(super) enum WaitState {
+    /// Nothing is recorded for this node yet; the caller must journal its own
+    /// "now asking" event, then continue with the deadline carried here.
+    ///
+    /// The payload is the FRESHLY COMPUTED absolute deadline (`None` for an indefinite
+    /// gate). It is computed here and journaled by the caller precisely so that it is
+    /// computed exactly ONCE in the node's whole life.
+    NotYetAsking(Option<chrono::DateTime<chrono::Utc>>),
+    /// The node is asking, the deadline it recorded has passed, and no answer arrived.
+    /// Carries the recorded instant so the caller can name it in the failure.
+    Expired(chrono::DateTime<chrono::Utc>),
+    /// The node is asking and still has time — `None` for the indefinite human gate,
+    /// which has no time to run out of. Carries the RECORDED deadline, which is what the
+    /// caller must pause on; recomputing it is the defect this whole type exists to stop.
+    Waiting(Option<chrono::DateTime<chrono::Utc>>),
+}
+
 impl Executor {
+    /// Arm 0 of §6.2, shared by BOTH waiting node kinds: a folded `NodeFailed` for this
+    /// node is TERMINAL, read back rather than re-derived, and — this is the load-bearing
+    /// part — checked BEFORE the caller reads its answer.
+    ///
+    /// **Whole-slice review, Important.** `fold_journal` originally had no `NodeFailed`
+    /// arm, so an expired gate was not terminal on resume, with two consequences, the
+    /// second serious. (a) The run stays resumable while any OTHER node is paused, so
+    /// every wake re-ran the gate, re-derived the same expiry and appended another
+    /// `NodeFailed` for an already-dead node. (b) Worse: append one late `SignalReceived`
+    /// and the re-run took the answer arm and COMPLETED — a run that had terminally failed
+    /// on its deadline reached `RunCompleted` carrying the operator's
+    /// `{"decision":"approved"}`. That is precisely the silent self-approval §4 rejects,
+    /// arrived at by the back door. It is reachable: `torii run signal` pre-checks the
+    /// gate's state and then appends, and nothing makes those two steps atomic — the CLI
+    /// can report the outcome honestly but cannot stop the row existing, so the guard
+    /// belongs HERE, in the executor.
+    ///
+    /// **Call this FIRST, before reading the node's answer.** That ordering is the whole
+    /// decision, not an implementation detail: a signal (or a gate decision) is only an
+    /// answer if it arrived while the node was still asking. Ordering the two by `Seq`
+    /// instead would let an answer appended microseconds before the expiry — an operator
+    /// answering against a snapshot the mid-flight drive had already passed — approve a
+    /// gate whose deadline had in fact run out. The deadline is the contract; fail-closed
+    /// is the only reading that does not turn a missed SLA into an approval.
+    ///
+    /// Shared rather than copied deliberately: a second copy of this is a second place for
+    /// (b) to come back, in a node kind whose entire purpose is a human decision.
+    ///
+    /// This is the ONLY consumer family of `fold.failed` — see [`Fold::failed`]'s doc
+    /// comment. A `NodeFailed` does NOT make a node terminal in general: a `ModelCall` or
+    /// `Agent` whose provider died re-attempts on resume, by design and by test. A waiting
+    /// node is the one kind whose failure is irreversible by construction, because the
+    /// thing that failed is an instant that has passed.
+    ///
+    /// Returns `Some(Failed)` to be returned verbatim by the caller, or `None` to carry
+    /// on. It journals NOTHING — the verdict is read back from the journal, so re-writing
+    /// it is exactly consequence (a).
+    pub(super) fn gate_precheck(&self, node: &Node, fold: &Fold) -> Option<NodeExec> {
+        fold.failure_for(&node.id).map(|error| NodeExec::Failed {
+            message: error.to_string(),
+            output: None,
+        })
+    }
+
+    /// Arms 2–4 of §6.2, shared: read the recorded deadline or compute a fresh one, and
+    /// report whether the node has begun asking, has expired, or is still waiting.
+    ///
+    /// **Precondition: the caller has already called [`Executor::gate_precheck`] and
+    /// returned early on `Some`.** This function therefore does NOT re-check
+    /// `fold.failure_for`, and that is a deliberate decision rather than an oversight. A
+    /// copy of the check here would be strictly worse than none, because both callers read
+    /// their answer BETWEEN the precheck and this call — so a check at this point runs
+    /// *after* the answer read and does nothing whatsoever about the late-answer
+    /// self-approval that motivated the guard. Its only effect would be to advertise a
+    /// protection it does not provide, inviting a future node kind to treat
+    /// `gate_precheck` as optional. The guard is only a guard where it currently is: first,
+    /// unconditionally, ahead of the answer.
+    ///
+    /// **The deadline is READ from the fold, never recomputed.** The obvious implementation
+    /// does `now + timeout` on every execution, and it is wrong in a way a naive test does
+    /// not catch: every resume pushes the deadline forward, so a run force-woken every ten
+    /// minutes with a one-hour timeout would NEVER expire. The absolute instant is fixed at
+    /// the first execution, journaled by the caller, and folded (first-wins) thereafter.
+    /// [`Fold::deadline_for`] is the durable half; this is the other half. It is also what
+    /// makes `torii run wake` on a waiting node behave sanely instead of silently resetting
+    /// the clock.
+    ///
+    /// `deadline_for` returns `Option<Option<_>>` and both layers carry weight: the OUTER
+    /// one asks "has this node begun waiting?", the inner "by when?". A timeout-less gate
+    /// (the common indefinite HITL shape) journals its awaited event with `deadline: None`
+    /// and the fold remembers that `None` as a REAL value, so [`WaitState::NotYetAsking`]
+    /// fires ONCE per node and never again. Making that node-keyed rather than
+    /// deadline-keyed is what bounds it: a re-drive of a deadline-less gate is NOT
+    /// human-bounded, because `drive` runs every ready node in a round even after one
+    /// pauses — a dep-free sibling that pauses WITH a deadline in the same round leaves it
+    /// as the last `RunPaused`, which is the one the scheduler takes `next_wake` from, so
+    /// the whole run stays auto-wakeable while this gate waits on a human.
+    ///
+    /// `checked_add_signed`, not `+`: `chrono::Duration` reaches ~292 million years while
+    /// `DateTime<Utc>` stops at year 262143, so the plain `+` PANICS on a large enough
+    /// timeout — and a panic here is not local. It unwinds through `Scheduler::tick` (which
+    /// has already claimed a batch of runs and taken their leases) and out of
+    /// `worker::serve`'s in-task `ticker.tick()`, killing the worker; the claimed row stays
+    /// `waking`, so the next worker reclaims the stale lease and dies the same way.
+    /// `Graph::validate_dag` rejects such a timeout up front (`MAX_AWAIT_SIGNAL_TIMEOUT`)
+    /// and that is the layer which keeps the durable row from ever existing — but
+    /// `Executor::start` takes the graph as a caller parameter and nothing guarantees it
+    /// was ever validated, so a node kind is not allowed to panic on its own. This is the
+    /// second layer, which turns a slip past validation into a failed run rather than a
+    /// killed worker.
+    ///
+    /// The overflow is reported as `Err(message)` — UNPREFIXED, so each caller can name
+    /// its own node kind — and nothing is journaled by either side before the caller's
+    /// `NodeFailed`. That ordering matters: an awaited event carrying a nonsense deadline
+    /// would be folded first-wins forever.
+    pub(super) fn wait_or_expire(
+        &self,
+        node: &Node,
+        timeout: Option<chrono::Duration>,
+        fold: &Fold,
+    ) -> Result<WaitState, String> {
+        let Some(recorded) = fold.deadline_for(&node.id) else {
+            let fresh = match timeout {
+                None => None,
+                Some(t) => match self.clock.now().checked_add_signed(t) {
+                    Some(instant) => Some(instant),
+                    None => {
+                        return Err(format!(
+                            "node {} has a timeout ({t}) that overflows the representable \
+                             instant range when added to now",
+                            node.id.0
+                        ));
+                    }
+                },
+            };
+            return Ok(WaitState::NotYetAsking(fresh));
+        };
+        match recorded {
+            Some(d) if self.clock.now() >= d => Ok(WaitState::Expired(d)),
+            other => Ok(WaitState::Waiting(other)),
+        }
+    }
+
+    /// The durable pause both waiting kinds end on.
+    ///
+    /// `resume_after` carries the ORIGINAL absolute deadline (not `now + timeout`), so the
+    /// durable scheduler re-arms on the same instant however many times the run is woken
+    /// early — without which the whole timed branch would be decorative, never auto-woken,
+    /// and the timeout would exist only on paper. `None` is SP-DATA-3's never-auto-woken
+    /// class: only an answer or a `force_wake` moves it, which is precisely the indefinite
+    /// human gate.
+    ///
+    /// The `reason` is echoed into `NodeExec::Paused` so the two can never disagree; it is
+    /// operator-facing text (`torii run status` prints it), not a machine contract.
+    pub(super) async fn pause_awaiting(
+        &self,
+        run: RunId,
+        reason: String,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<NodeExec, OrchestratorError> {
+        self.append(
+            run,
+            JournalEvent::RunPaused {
+                reason: reason.clone(),
+                resume_after: deadline,
+            },
+        )
+        .await?;
+        Ok(NodeExec::Paused { reason })
+    }
+
     /// Execute one `AwaitSignal` node: a three-way read of the fold (design §6.2) —
     /// *signalled* / *not yet waiting* / *already waiting* — the last of which the table
     /// below splits by the shape of what was recorded.
@@ -33,9 +220,9 @@ impl Executor {
     /// force-woken every ten minutes with a one-hour timeout would NEVER expire. The
     /// absolute instant is therefore fixed at the first execution, journaled as
     /// `SignalAwaited`, and folded (first-wins) thereafter. `fold.deadline_for` is the
-    /// durable half; this function is the other half. The last two table rows exist ONLY
-    /// because of that durability, and it is what makes `torii run wake` on an awaiting
-    /// node behave sanely instead of silently resetting the clock.
+    /// durable half; [`Executor::wait_or_expire`] is the other half. The last two table
+    /// rows exist ONLY because of that durability, and it is what makes `torii run wake` on
+    /// an awaiting node behave sanely instead of silently resetting the clock.
     ///
     /// **The deadline belongs to the RUN, not to the graph.** Once the first execution
     /// has recorded one, editing this node's `timeout` has no effect in EITHER direction:
@@ -64,46 +251,21 @@ impl Executor {
         timeout: Option<chrono::Duration>,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        // 0. This gate has ALREADY failed ⇒ it stays failed. Read the verdict back from the
-        //    journal; do not re-derive it, and do not re-journal it.
-        //
-        //    **Whole-slice review, Important.** `fold_journal` had no `NodeFailed` arm, so
-        //    an expired gate was not terminal on resume — with two consequences, the second
-        //    serious. (a) The run stays resumable while any OTHER node is paused, so every
-        //    wake re-ran this node, re-derived the same expiry and appended another
-        //    `NodeFailed` for an already-dead node. (b) Worse: append one late
-        //    `SignalReceived` and the re-run took arm 1 below and COMPLETED — a run that had
-        //    terminally failed on its deadline reached `RunCompleted` carrying the
-        //    operator's `{"decision":"approved"}`. That is precisely the silent
-        //    self-approval §4 rejects, arrived at by the back door. It is reachable:
-        //    `torii run signal` pre-checks the gate's state and then appends, and nothing
-        //    makes those two steps atomic — the CLI can report the outcome honestly but
-        //    cannot stop the row existing, so the guard belongs HERE.
-        //
-        //    BEFORE the signal read, unconditionally, and that ordering is the decision: a
-        //    signal is only an answer if it arrives while the gate is still asking. Ordering
-        //    the two by `Seq` instead would let a signal appended microseconds before the
-        //    expiry (an operator answering against a snapshot the mid-flight drive had
-        //    already passed) approve a gate whose deadline had, in fact, run out. The
-        //    deadline is the contract; fail-closed is the only reading that does not turn a
-        //    missed SLA into an approval.
-        //
-        //    This is the ONLY consumer of `fold.failed`, deliberately — see its doc comment:
-        //    a `NodeFailed` does not make a node terminal in general (a `ModelCall`/`Agent`
-        //    whose provider died re-attempts on resume, by design and by test). An
-        //    `AwaitSignal` is the one kind whose failure is irreversible by construction,
-        //    because the thing that failed is an instant that has passed.
-        if let Some(error) = fold.failure_for(&node.id) {
-            return Ok(NodeExec::Failed {
-                message: error.to_string(),
-                output: None,
-            });
+        // 0. This gate has ALREADY failed ⇒ it stays failed. Shared with `HumanGate`, and
+        //    FIRST — ahead of the signal read — for the fail-closed reason spelled out on
+        //    `gate_precheck`.
+        if let Some(failed) = self.gate_precheck(node, fold) {
+            return Ok(failed);
         }
 
         // 1. The answer is already folded ⇒ complete, and never re-ask. This also
         //    resolves the early-signal race for free (§6.3): a signal delivered BEFORE
         //    the node first ran is simply already here, so there is no buffering, no
         //    ordering constraint and no special case.
+        //
+        //    This is the ONE arm that is genuinely per-node-kind — what counts as an
+        //    answer — which is why it stays here rather than moving into the shared
+        //    helpers around it.
         //
         //    SP-4 s2 (§6.4): redact ONCE, here, and hand that one value to BOTH the
         //    node's return AND — via `apply_node_result` → `publish_context` — the
@@ -120,64 +282,32 @@ impl Executor {
         }
 
         // 2. Not answered. Take what this node ALREADY recorded, or — only on the very
-        //    first execution — compute the deadline once from the timeout duration and
-        //    journal the absolute instant.
-        //
-        //    The match is on `Option<Option<_>>` and both layers carry weight: the OUTER
-        //    one asks "has this node begun waiting?", the inner "by when?". A timeout-
-        //    less gate (the common indefinite HITL shape) journals `SignalAwaited
-        //    { deadline: None }` and the fold remembers that `None` as a real value, so
-        //    this arm fires ONCE per node and never again. Making it node-keyed rather
-        //    than deadline-keyed is what bounds it: a re-drive of a deadline-less gate is
-        //    NOT human-bounded, because `drive` runs every ready node in a round even
-        //    after one pauses — a dep-free sibling that pauses WITH a deadline in the
-        //    same round leaves it as the last `RunPaused`, which is the one the scheduler
-        //    takes `next_wake` from, so the whole run stays auto-wakeable while this gate
-        //    waits on a human. The event is written at all because it is the NODE-KEYED
-        //    record of which node is awaiting; `RunPaused` is not node-keyed, and a run
-        //    pauses for many unrelated reasons over its life.
-        //
-        //    `checked_add_signed`, not `+`: `chrono::Duration` reaches ~292 million years
-        //    while `DateTime<Utc>` stops at year 262143, so the plain `+` PANICS on a
-        //    large enough timeout — and a panic here is not local. It unwinds through
-        //    `Scheduler::tick` (which has already claimed a batch of runs and taken their
-        //    leases) and out of `worker::serve`'s in-task `ticker.tick()`, killing the
-        //    worker; the claimed row stays `waking`, so the next worker reclaims the stale
-        //    lease and dies the same way. `Graph::validate_dag` rejects such a timeout up
-        //    front (`MAX_AWAIT_SIGNAL_TIMEOUT`) and that is the layer which keeps the
-        //    durable row from ever existing — but `Executor::start` takes the graph as a
-        //    caller parameter and nothing guarantees it was ever validated, so a node kind
-        //    is not allowed to panic on its own. Fail loudly and locally instead: the run
-        //    stops, the worker does not, and NOTHING is journaled first — a `SignalAwaited`
-        //    carrying a nonsense deadline would be folded first-wins forever.
-        let deadline = match fold.deadline_for(&node.id) {
-            Some(recorded) => recorded,
-            None => {
-                let fresh = match timeout {
-                    None => None,
-                    Some(t) => match self.clock.now().checked_add_signed(t) {
-                        Some(instant) => Some(instant),
-                        None => {
-                            let message = format!(
-                                "await_signal: node {} has a timeout ({t}) that overflows \
-                                 the representable instant range when added to now",
-                                node.id.0
-                            );
-                            self.append(
-                                run,
-                                JournalEvent::NodeFailed {
-                                    node: node.id.clone(),
-                                    error: message.clone(),
-                                },
-                            )
-                            .await?;
-                            return Ok(NodeExec::Failed {
-                                message,
-                                output: None,
-                            });
-                        }
+        //    first execution — compute the deadline once and journal the absolute instant.
+        //    `wait_or_expire` decides; the journaling stays here because `SignalAwaited` is
+        //    this kind's own event.
+        let deadline = match self.wait_or_expire(node, timeout, fold) {
+            // The overflow guard's second layer. Nothing has been journaled yet and
+            // nothing is, beyond the failure itself: a `SignalAwaited` carrying a nonsense
+            // deadline would be folded first-wins forever.
+            Err(message) => {
+                let message = format!("await_signal: {message}");
+                self.append(
+                    run,
+                    JournalEvent::NodeFailed {
+                        node: node.id.clone(),
+                        error: message.clone(),
                     },
-                };
+                )
+                .await?;
+                return Ok(NodeExec::Failed {
+                    message,
+                    output: None,
+                });
+            }
+            // The node-keyed record of WHICH node is awaiting, and the durable home of the
+            // deadline. It is written at all because `RunPaused` is not node-keyed, and a
+            // run pauses for many unrelated reasons over its life.
+            Ok(WaitState::NotYetAsking(fresh)) => {
                 self.append(
                     run,
                     JournalEvent::SignalAwaited {
@@ -188,25 +318,43 @@ impl Executor {
                 .await?;
                 fresh
             }
+            // 3. The recorded deadline has passed with no signal ⇒ FAIL, loudly, naming
+            //    the node and the instant. Never a silent self-approval: a default payload
+            //    on timeout was deliberately rejected (§4) — a gate that approves itself is
+            //    exactly the footgun this codebase's fail-closed stance argues against.
+            Ok(WaitState::Expired(d)) => {
+                let message = format!("await_signal: no signal for node {} by {d}", node.id.0);
+                self.append(
+                    run,
+                    JournalEvent::NodeFailed {
+                        node: node.id.clone(),
+                        error: message.clone(),
+                    },
+                )
+                .await?;
+                return Ok(NodeExec::Failed {
+                    message,
+                    output: None,
+                });
+            }
+            Ok(WaitState::Waiting(d)) => d,
         };
 
-        // 3. The deadline has passed with no signal ⇒ FAIL, loudly, naming the node and
-        //    the instant. Never a silent self-approval: a default payload on timeout was
-        //    deliberately rejected (§4) — a gate that approves itself is exactly the
-        //    footgun this codebase's fail-closed stance argues against.
+        // A FRESHLY recorded deadline can ALREADY have passed, so the expiry check runs
+        // once more here, over the deadline whichever arm produced.
         //
-        //    REACHABLE on the first execution — an earlier version of this comment claimed
-        //    otherwise ("`validate_dag` rejects a non-positive timeout, so a freshly
-        //    computed `now + timeout` is always in the future") and a reviewer disproved
-        //    it. `validate_dag` does bound the timeout at both ends, but a positive one is
-        //    still racing a moving clock: step 2 fixes the deadline from one `now`, and
-        //    this check reads the clock AGAIN, after an `await`ed journal append. Any
-        //    timeout shorter than that gap has already elapsed by the time we get here —
-        //    `timeout: Some(1ns)` against a real clock journals `SignalAwaited` and then
-        //    `NodeFailed` in a SINGLE execution (measured: `["RunStarted",
-        //    "SignalAwaited(gate)", "NodeFailed(gate)"]`). That is correct and loud — a
-        //    gate given a nanosecond to answer has genuinely expired — and it is written
-        //    down so nobody re-derives an "unreachable" guarantee this code does not make.
+        // REACHABLE on the first execution — an earlier version of this comment claimed
+        // otherwise ("`validate_dag` rejects a non-positive timeout, so a freshly computed
+        // `now + timeout` is always in the future") and a reviewer disproved it.
+        // `validate_dag` does bound the timeout at both ends, but a positive one is still
+        // racing a moving clock: `wait_or_expire` fixes the deadline from one `now`, and
+        // this reads the clock AGAIN, after an `await`ed journal append. Any timeout
+        // shorter than that gap has already elapsed by the time we get here —
+        // `timeout: Some(1ns)` against a real clock journals `SignalAwaited` and then
+        // `NodeFailed` in a SINGLE execution (measured: `["RunStarted",
+        // "SignalAwaited(gate)", "NodeFailed(gate)"]`). That is correct and loud — a gate
+        // given a nanosecond to answer has genuinely expired — and it is written down so
+        // nobody re-derives an "unreachable" guarantee this code does not make.
         if let Some(d) = deadline
             && self.clock.now() >= d
         {
@@ -225,13 +373,9 @@ impl Executor {
             });
         }
 
-        // 4. Still waiting ⇒ a durable pause. `resume_after` carries the ORIGINAL
-        //    absolute deadline (not `now + timeout`), so the durable scheduler re-arms
-        //    on the same instant however many times the run is woken early — without
-        //    which the whole `Some(deadline)` branch would be decorative, never
-        //    auto-woken, and the timeout would exist only on paper. `None` (no timeout)
-        //    is SP-DATA-3's never-auto-woken class: only a signal or a `force_wake`
-        //    moves it, which is precisely the indefinite human gate.
+        // 4. Still waiting ⇒ a durable pause on the ORIGINAL deadline. See
+        //    `pause_awaiting` for why re-arming on the same instant is what keeps the
+        //    timed branch from being decorative.
         let reason = format!(
             "await_signal: waiting for a signal on node {}{}",
             node.id.0,
@@ -239,14 +383,6 @@ impl Executor {
                 .map(|d| format!(" (deadline {d})"))
                 .unwrap_or_default()
         );
-        self.append(
-            run,
-            JournalEvent::RunPaused {
-                reason: reason.clone(),
-                resume_after: deadline,
-            },
-        )
-        .await?;
-        Ok(NodeExec::Paused { reason })
+        self.pause_awaiting(run, reason, deadline).await
     }
 }
