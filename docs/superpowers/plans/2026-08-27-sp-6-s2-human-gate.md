@@ -57,6 +57,8 @@ Add to `crates/orchestrator-core/src/journal.rs`, inside `mod tests`:
     /// keeps `FORMAT_VERSION` at 1.
     #[test]
     fn the_gate_events_round_trip_without_a_format_bump() {
+        use crate::graph::{GateOption, GateOutcome};
+
         let awaited = JournalEvent::GateAwaited {
             node: NodeId("release".into()),
             deadline: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).unwrap()),
@@ -127,7 +129,48 @@ env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib the_gate_events
 
 Expected: **compile error** — `no variant named GateAwaited found for enum JournalEvent`.
 
-- [ ] **Step 3: Add the variants**
+- [ ] **Step 3: Add the two data types the events carry**
+
+`GateAwaited` carries `Vec<GateOption>`, so the type must exist before the event does.
+These are pure data with no behaviour — the `NodeKind` variant that USES them, and its
+validation, are Task 2.
+
+In `crates/orchestrator-core/src/graph.rs`, after the `MAX_AWAIT_SIGNAL_TIMEOUT` const:
+
+```rust
+/// One choice a [`NodeKind::HumanGate`] offers, and what picking it does to the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateOption {
+    /// What the operator types: `torii run gate decide … --option <name>`.
+    pub name: String,
+    pub outcome: GateOutcome,
+}
+
+/// What choosing a [`GateOption`] does to the run.
+///
+/// Per-option rather than a fixed approve/reject pair, so a three-way gate
+/// (`ship | hold | escalate`) needs no special case — and deliberately reusing the
+/// EXISTING terminal machinery, so this slice needs no new `RunStatus`, no
+/// `SchedulerStore` change and no dbd migration.
+///
+/// **Accepted cost:** a `Fail` option and a dead provider both surface as
+/// `RunStatus::Failed`. The reason string distinguishes them; `torii run list-paused`
+/// does not. A distinct `Rejected` status would be more truthful but reaches both store
+/// impls, the dbd CHECK constraint and torii's rendering — deferred, not overlooked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateOutcome {
+    /// The decision becomes this node's output; dependents run.
+    Complete,
+    /// `NodeFailed`; hard-edge dependents cascade-skip.
+    Fail,
+}
+```
+
+Re-export them from the crate root alongside the other graph types so
+`orchestrator_core::GateOption` resolves (match however `NodeKind`/`BranchCond` are
+re-exported in `crates/orchestrator-core/src/lib.rs`).
+
+- [ ] **Step 4: Add the variants**
 
 In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalReceived` variant:
 
@@ -169,7 +212,7 @@ In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalRecei
     },
 ```
 
-- [ ] **Step 4: Run it and watch it pass**
+- [ ] **Step 5: Run it and watch it pass**
 
 ```bash
 env -u DATABASE_URL cargo test -p sensei-orchestrator-core --lib the_gate_events_round_trip
@@ -185,13 +228,13 @@ env -u DATABASE_URL cargo test -p sensei-orchestrator-core
 
 If other crates fail to compile on a non-exhaustive match, add the arms in Task 2/3 — do not add a catch-all `_ =>`, which would silently swallow future variants.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
-git add crates/orchestrator-core/src/journal.rs
+git add crates/orchestrator-core/src/journal.rs crates/orchestrator-core/src/graph.rs crates/orchestrator-core/src/lib.rs
 git commit -F - <<'MSGEOF'
-feat(core): SP-6 s2 (1/7) — GateAwaited/GateDecided events
+feat(core): SP-6 s2 (1/8) — GateOption/GateOutcome + the two gate events
 
 Two new variants, not new fields, so FORMAT_VERSION stays 1 and an event written
 by an older binary still loads — the same additivity trick s1 used.
@@ -332,36 +375,8 @@ In `crates/orchestrator-core/src/graph.rs`, add to `NodeKind` after `AwaitSignal
     },
 ```
 
-Then, after the `MAX_AWAIT_SIGNAL_TIMEOUT` const:
-
-```rust
-/// One choice a [`NodeKind::HumanGate`] offers, and what picking it does to the run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GateOption {
-    /// What the operator types: `torii run gate decide … --option <name>`.
-    pub name: String,
-    pub outcome: GateOutcome,
-}
-
-/// What choosing a [`GateOption`] does to the run.
-///
-/// Per-option rather than a fixed approve/reject pair, so a three-way gate
-/// (`ship | hold | escalate`) needs no special case — and deliberately reusing the
-/// EXISTING terminal machinery, so this slice needs no new `RunStatus`, no
-/// `SchedulerStore` change and no dbd migration.
-///
-/// **Accepted cost:** a `Fail` option and a dead provider both surface as
-/// `RunStatus::Failed`. The reason string distinguishes them; `torii run list-paused`
-/// does not. A distinct `Rejected` status would be more truthful but reaches both store
-/// impls, the dbd CHECK constraint and torii's rendering — deferred, not overlooked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GateOutcome {
-    /// The decision becomes this node's output; dependents run.
-    Complete,
-    /// `NodeFailed`; hard-edge dependents cascade-skip.
-    Fail,
-}
-```
+`GateOption` and `GateOutcome` already exist — Task 1 added them, because `GateAwaited`
+carries them. This task adds only the node kind that USES them, and its validation.
 
 In `validate_dag`, immediately after the existing `2b-bis` block:
 
