@@ -176,6 +176,17 @@ struct Fold {
     /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
     /// keeps the whole run auto-wakeable).
     deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
+    /// SP-6 s2: each `HumanGate`'s decision, folded from `GateDecided`. LAST wins, like
+    /// `signals` and for the same reason: an operator must be able to correct a mistaken
+    /// decision before the run resumes.
+    gate_decisions: HashMap<NodeId, GateDecision>,
+    /// SP-6 s2: the MENU each `HumanGate` published when it began asking, folded from
+    /// `GateAwaited`. FIRST wins — the human was shown THIS menu, and a later ask must
+    /// not retroactively change what their answer meant.
+    ///
+    /// `deadlines` is folded from `GateAwaited` too, so the "has this node begun asking?"
+    /// question stays in one place for both waiting kinds.
+    menus: HashMap<NodeId, Vec<orchestrator_core::GateOption>>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read by exactly ONE consumer — [`run_await_signal`](Executor::run_await_signal),
     /// for which a failure is TERMINAL (an expired human gate stays expired).
@@ -218,6 +229,15 @@ struct Fold {
     /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
     /// this makes and why an unbudgeted run must never touch it.
     serial_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// SP-6 s2: a folded `GateDecided`.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct GateDecision {
+    pub option: String,
+    /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::GateDecided`.
+    pub actor: String,
+    pub note: Option<String>,
 }
 
 impl Fold {
@@ -287,6 +307,22 @@ impl Fold {
     /// why only `run_await_signal` may act on it.
     fn failure_for(&self, node: &NodeId) -> Option<&str> {
         self.failed.get(node).map(String::as_str)
+    }
+
+    /// SP-6 s2: the decision folded for this `HumanGate`, if a human has answered.
+    /// `#[allow(dead_code)]` until Task 5 calls it from `run_human_gate` — the same
+    /// staging s1 used for `signal_for`/`deadline_for` (see that slice's Task 2).
+    #[allow(dead_code)]
+    fn gate_decision_for(&self, node: &NodeId) -> Option<&GateDecision> {
+        self.gate_decisions.get(node)
+    }
+
+    /// SP-6 s2: the menu this gate published when it began asking. `None` = it has not
+    /// asked yet, which is what makes a decision-without-a-menu detectable.
+    /// `#[allow(dead_code)]` until Task 5 calls it from `run_human_gate`.
+    #[allow(dead_code)]
+    fn menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::GateOption]> {
+        self.menus.get(node).map(Vec::as_slice)
     }
 }
 
