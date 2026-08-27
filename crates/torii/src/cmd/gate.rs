@@ -309,8 +309,15 @@ fn actor_or(supplied: &str, from_env: Option<&str>) -> String {
         .to_string()
 }
 
+/// `pub(crate)` **only so `cmd::run`'s tests can reuse two fixtures** — `release` and
+/// `gate_journal`. The reuse runs in BOTH directions (this module already imports four
+/// fixtures from `cmd::run::tests`), which is deliberate rather than accidental: a
+/// fixture belongs beside the tests that own it, and `gate_journal` builds the
+/// `GateAwaited` menu shape that `list-paused` and `gate decide` must agree about. Two
+/// copies of it would be two places for that agreement to rot independently — the same
+/// argument `cmd::run::tests` records for its own four.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::cmd::run::tests::{FailingForceWakeStore, awaiting_journal, now, paused_store};
@@ -320,7 +327,7 @@ mod tests {
     };
     use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
 
-    fn release() -> NodeId {
+    pub(crate) fn release() -> NodeId {
         NodeId("release".into())
     }
 
@@ -334,7 +341,7 @@ mod tests {
     /// A journal in which `node` has already ASKED, with the given menu. Every option is
     /// `Complete` except one literally named "reject", which is `Fail` — enough to
     /// exercise the required-reason rule without a second helper.
-    async fn gate_journal(
+    pub(crate) async fn gate_journal(
         run: RunId,
         node: &NodeId,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
