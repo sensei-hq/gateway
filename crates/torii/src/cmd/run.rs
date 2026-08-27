@@ -957,7 +957,14 @@ pub async fn signal(
 /// The pre-check refusal text for a node that is not awaiting. Split out so the exact
 /// wording cannot drift between the state variants.
 /// `node` is the DISPLAY form (control characters already collapsed) — see `signal`.
-fn not_delivered(node: &str, state: &SignalState) -> String {
+///
+/// `pub(crate)` for `cmd::gate::decide`, which refuses a non-awaiting node on the SAME
+/// fold and must give the same answer: a `HumanGate` and an `AwaitSignal` are terminal for
+/// identical reasons, and two wordings for one condition is two places for it to rot. The
+/// text says "signal" where a gate would say "decision"; that is the price of one source
+/// of truth, and it is the cheaper half of the trade — the sentence that matters ("a
+/// terminal node never re-executes") is exactly the same fact in both commands.
+pub(crate) fn not_delivered(node: &str, state: &SignalState) -> String {
     match state {
         SignalState::Completed => format!(
             "not delivered: {node} already completed — the node has read its answer and a \
