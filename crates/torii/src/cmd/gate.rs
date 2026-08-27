@@ -340,10 +340,16 @@ pub async fn decide(
 
     // The option is echoed back on every SUCCESS line below, and by this point it is a
     // journaled option name (it was matched against the menu), i.e. the same author free
-    // text the refusal above collapses — so it gets the same collapse. Display-only: the
-    // value journaled on `GateDecided.option` is the one the operator supplied, because
-    // that is what the executor re-matches against the menu.
-    let chosen_shown = render::one_line(&chosen.name);
+    // text the refusal above collapses — so it gets the same collapse AND the same cap.
+    // Display-only: the value journaled on `GateDecided.option` is the one the operator
+    // supplied, because that is what the executor re-matches against the menu.
+    //
+    // `MENU_MAX`, never a second number: it is `pub(crate)` precisely so this crate has
+    // one bound for one class of value rather than two that can drift. Collapsing without
+    // capping left the refusal path at 324 chars with a visible ellipsis and the SUCCESS
+    // path — the one an operator always reaches — at 5065 with none, for the same
+    // journaled name.
+    let chosen_shown = render::cap_chars(&render::one_line(&chosen.name), render::MENU_MAX);
 
     // A Fail option must record WHY. CLI-layer only, deliberately: `GateDecided.note`
     // stays `Option` because a `Complete` decision legitimately has none, and an absent
@@ -445,6 +451,31 @@ pub async fn decide(
         .map_err(CliError::error)?;
     }
 
+    // Collapsed on the way IN, not just on the way out — unlike the node id, which is
+    // journaled as given. `actor` is interpolated by the executor into a `NodeFailed`
+    // message that `torii run status` renders and that a later drive re-emits from the
+    // fold, so an escape sequence smuggled through `--as` would be replayed at every
+    // operator who reads the run.
+    let actor = render::one_line(actor);
+
+    // The SIBLING field on the same durable row, held to the same bound. `--as` was
+    // capped by nothing while `--note` was capped at 4096, so `ARG_MAX` permitted a
+    // ~131 KB actor — 32x the limit — accepted with exit 0 and journaled into the very
+    // row the note is bounded in. `GateDecided.actor` is not merely displayed either: the
+    // executor interpolates it into the rejection `NodeFailed` above, so an unbounded one
+    // is reloaded on every drive and re-rendered by every `torii run status`.
+    //
+    // Measured on the COLLAPSED value, for the same reason the note is measured after
+    // redaction: these are the bytes actually written. `Measured::AsGiven` because,
+    // unlike the note, an actor is not redacted — labelling it `AfterRedaction` would
+    // print a growth explanation naming a transform this value never went through.
+    crate::cmd::run::check_payload_size(
+        &serde_json::json!(actor),
+        crate::cmd::run::Measured::AsGiven,
+        "the decision actor (--as)",
+    )
+    .map_err(CliError::error)?;
+
     // The appended seq is KEPT, not discarded: it is what names the durable row in the
     // post-append fault report below, so an operator can find the write that succeeded.
     let appended = journal
@@ -453,12 +484,7 @@ pub async fn decide(
             JournalEvent::GateDecided {
                 node: node.clone(),
                 option: option.to_string(),
-                // Collapsed on the way IN, not just on the way out — unlike the node id,
-                // which is journaled as given. `actor` is interpolated by the executor
-                // into a `NodeFailed` message that `torii run status` renders and that a
-                // later drive re-emits from the fold, so an escape sequence smuggled
-                // through `--as` would be replayed at every operator who reads the run.
-                actor: render::one_line(actor),
+                actor,
                 note,
             },
         )
@@ -2096,6 +2122,88 @@ pub(crate) mod tests {
             s.status(run).await.unwrap().unwrap().next_wake,
             None,
             "and a refused decision must not queue a wake"
+        );
+    }
+
+    /// **The SIBLING field on the same durable row.** `--as` was bounded by nothing while
+    /// `--note` was held to 4096 bytes, so `ARG_MAX` permitted a ~131 KB actor — 32x the
+    /// cap — accepted with exit 0 and journaled, in the same `GateDecided` the note is
+    /// bounded in. `GateDecided.actor` is not merely displayed: the executor interpolates
+    /// it into the `NodeFailed` message that `torii run status` renders and that every
+    /// later drive re-emits from the fold.
+    ///
+    /// Exit 1 and the same helper as the note, so the two fields of one row cannot
+    /// disagree about the number, the measurement or the exit code.
+    #[tokio::test]
+    async fn an_oversized_actor_is_rejected_before_anything_is_journaled() {
+        use crate::cmd::run::MAX_PAYLOAD_BYTES;
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship"]).await;
+        let huge = "a".repeat(MAX_PAYLOAD_BYTES + 1000);
+
+        let e = decide(&s, &j, run, release(), "ship", &huge, Some("ok"), now())
+            .await
+            .expect_err("an over-limit actor is refused");
+
+        assert_eq!(e.code, crate::errors::EXIT_ERROR, "{}", e.message);
+        assert!(
+            e.message.contains(&MAX_PAYLOAD_BYTES.to_string()),
+            "must name the limit: {}",
+            e.message
+        );
+        assert!(
+            !e.message.contains(&huge),
+            "and must not echo the actor back: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("--as"),
+            "must name the flag the operator actually typed: {}",
+            e.message
+        );
+        assert!(
+            journaled_decisions(&j, run, &release()).await.is_empty(),
+            "an over-limit actor must never reach the journal"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and a refused decision must not queue a wake"
+        );
+    }
+
+    /// The success line echoes the chosen option, and it is the path an operator ALWAYS
+    /// reaches — yet it was the only one of the two echoes left uncapped. Measured before
+    /// the fix: the refusal path rendered 324 chars with an ellipsis and the success path
+    /// 5065 with none, for the same journaled value.
+    ///
+    /// Same `MENU_MAX`, not a second bound: it was made `pub(crate)` in the very commit
+    /// that capped the refusal, with the rationale "one bound for one class of value, not
+    /// two that can drift". An option name is author free text from a `run submit` file, a
+    /// `scheduled_runs.graph` row or a planner's `Expand` subgraph, and `validate_dag`
+    /// bounds neither its length nor how many there are.
+    #[tokio::test]
+    async fn an_overlong_option_name_is_capped_in_the_success_line() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let long = "s".repeat(5_000);
+        let j = gate_journal(run, &release(), None, &[&long]).await;
+
+        let out = decide(&s, &j, run, release(), &long, "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+        assert!(
+            out.text.chars().count() < 400,
+            "an unbounded option name floods the line an operator always reads: {} chars",
+            out.text.chars().count()
+        );
+        assert!(
+            out.text.contains('…'),
+            "truncation must be visible: {}",
+            out.text
         );
     }
 
