@@ -566,9 +566,15 @@ In `crates/orchestrator/src/executor/signal.rs`, add above `run_await_signal`:
 
 ```rust
 /// What a waiting node's shared machinery decided, when no answer is present.
+///
+/// There is deliberately NO `AlreadyFailed` variant. An earlier revision of this plan had
+/// one, plus a duplicate `fold.failure_for` check inside `wait_or_expire`. Task 3's review
+/// established that the duplicate cannot do the job it advertises: both callers read their
+/// ANSWER between `gate_precheck` and `wait_or_expire`, so a failure re-check at that point
+/// runs AFTER the answer read and therefore does nothing about the late-answer
+/// self-approval the guard exists for. Its only effect would be to imply `gate_precheck` is
+/// optional. Every caller MUST call `gate_precheck` first — that is the contract.
 pub(super) enum WaitState {
-    /// The node already failed and stays failed — the fail-closed arm.
-    AlreadyFailed(String),
     /// Nothing is recorded for this node yet; the caller must journal its own
     /// "now asking" event, then re-enter. Carries the deadline to record.
     NotYetAsking(Option<chrono::DateTime<chrono::Utc>>),
@@ -621,9 +627,6 @@ impl Executor {
         timeout: Option<chrono::Duration>,
         fold: &Fold,
     ) -> Result<WaitState, String> {
-        if let Some(error) = fold.failure_for(&node.id) {
-            return Ok(WaitState::AlreadyFailed(error.to_string()));
-        }
         let Some(recorded) = fold.deadline_for(&node.id) else {
             let fresh = match timeout {
                 None => None,
@@ -698,12 +701,6 @@ Replace the body of `run_await_signal` (keep the whole existing doc comment — 
                     },
                 )
                 .await?;
-                return Ok(NodeExec::Failed {
-                    message,
-                    output: None,
-                });
-            }
-            Ok(WaitState::AlreadyFailed(message)) => {
                 return Ok(NodeExec::Failed {
                     message,
                     output: None,
@@ -1442,12 +1439,6 @@ impl Executor {
         // The ask, first and unconditionally — see the doc comment.
         let deadline = match self.wait_or_expire(node, timeout, fold) {
             Err(message) => return self.fail_gate(run, node, format!("human_gate: {message}")).await,
-            Ok(WaitState::AlreadyFailed(message)) => {
-                return Ok(NodeExec::Failed {
-                    message,
-                    output: None,
-                });
-            }
             Ok(WaitState::NotYetAsking(fresh)) => {
                 self.append(
                     run,
