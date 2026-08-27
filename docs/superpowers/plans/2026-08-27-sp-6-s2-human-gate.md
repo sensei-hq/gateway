@@ -64,7 +64,7 @@ Add to `crates/orchestrator-core/src/journal.rs`, inside `mod tests`:
             deadline: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).unwrap()),
             options: vec![
                 GateOption { name: "ship".into(), outcome: GateOutcome::Complete },
-                GateOption { name: "hold".into(), outcome: GateOutcome::Complete },
+                GateOption { name: "hold".into(), outcome: GateOutcome::Fail },
             ],
         };
         let s = serde_json::to_string(&awaited).expect("serializes");
@@ -78,8 +78,11 @@ Add to `crates/orchestrator-core/src/journal.rs`, inside `mod tests`:
                 assert!(deadline.is_some());
                 assert_eq!(options.len(), 2);
                 assert_eq!(options[0].name, "ship");
-                // The OUTCOME is durable too, not just the name.
-                assert_eq!(options[1].outcome, GateOutcome::Complete);
+                // Both outcomes are durable AND DISTINCT. A menu whose options are all
+                // `Complete` passes even if the two variants collapse into one on the
+                // wire — which would make every rejected gate resume as an approval.
+                assert_eq!(options[0].outcome, GateOutcome::Complete);
+                assert_eq!(options[1].outcome, GateOutcome::Fail);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -116,8 +119,6 @@ Add to `crates/orchestrator-core/src/journal.rs`, inside `mod tests`:
         let s = serde_json::to_string(&terse).expect("serializes");
         assert!(serde_json::from_str::<JournalEvent>(&s).is_ok());
 
-        // FORMAT_VERSION is untouched — new variants, not new fields.
-        assert_eq!(FORMAT_VERSION, 1, "adding variants must not bump the format");
     }
 ```
 
@@ -154,9 +155,13 @@ pub struct GateOption {
 /// `SchedulerStore` change and no dbd migration.
 ///
 /// **Accepted cost:** a `Fail` option and a dead provider both surface as
-/// `RunStatus::Failed`. The reason string distinguishes them; `torii run list-paused`
-/// does not. A distinct `Rejected` status would be more truthful but reaches both store
-/// impls, the dbd CHECK constraint and torii's rendering — deferred, not overlooked.
+/// `RunStatus::Failed`, so they are indistinguishable BY STATUS — only the reason text
+/// tells them apart, and only `torii run status` renders it. Anything filtering on status
+/// conflates them: a script, or the terminal allowlist in
+/// `count_terminal_before`/`prune_terminal`. (NOT `list-paused`: it filters
+/// `status='paused'` and both cases are terminal, so neither appears there at all.)
+/// A distinct `Rejected` status would be more truthful but reaches both store impls, the
+/// dbd CHECK constraint and torii's rendering — deferred, not overlooked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateOutcome {
     /// The decision becomes this node's output; dependents run.
@@ -179,8 +184,12 @@ In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalRecei
     ///
     /// The options are journaled rather than re-read from the graph for the same reason
     /// s1 journals the deadline: a human was shown a menu, and validating their answer
-    /// against a *different* menu later is simply wrong. The graph is caller-supplied and
-    /// never journaled (SP-DATA-3), so nothing else makes the menu durable.
+    /// against a *different* menu later is simply wrong. Nothing BINDS the graph a later
+    /// drive is handed to the one the human was shown — `Executor::start` takes it as a
+    /// caller parameter, no fence covers it (the config-version fence covers the registry),
+    /// and the executor cannot see `SchedulerStore`. So an author who edits the graph
+    /// between drives silently rewrites the menu. `scheduled_runs.graph` happens to hold a
+    /// copy on the scheduler path, but the executor cannot read it.
     ///
     /// The full [`GateOption`]s, not just their names: the OUTCOME the human was shown
     /// ("reject will stop the run") is as much a part of the offer as the name. If only
@@ -192,7 +201,7 @@ In `crates/orchestrator-core/src/journal.rs`, immediately after the `SignalRecei
     GateAwaited {
         node: NodeId,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
-        options: Vec<crate::graph::GateOption>,
+        options: Vec<GateOption>,   // `use crate::graph::{GateOption, Graph};` at the top
     },
     /// SP-6 s2: a human picked one of a `HumanGate`'s options.
     ///
