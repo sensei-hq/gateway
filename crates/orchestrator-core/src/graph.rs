@@ -567,6 +567,84 @@ impl Graph {
             }
         }
 
+        // 2b-quater. SP-6 s2: CONDITIONAL exhaustiveness. Only when the author has
+        // already coupled a `Branch` to a `HumanGate` do we require the arms to cover
+        // every `Complete` option, and forbid an arm naming an option that was never
+        // declared.
+        //
+        // Conditional, not mandatory, and that is the whole design. `validate_dag` is
+        // deliberately syntactic — the `/` node-id ban was chosen over post-namespacing
+        // collision detection precisely to avoid cross-node analysis — so an
+        // unconditional rule would break that stance. And requiring a `Branch` on every
+        // gate would put ceremony on approve-or-stop, which is the common shape.
+        //
+        // `Fail` options are exempt: a failing option never produces an output for a
+        // `Branch` to switch on, so demanding an arm for one would be asking the author
+        // to handle a value that cannot exist.
+        //
+        // This block, like 2b/2b-bis/2b-ter, only walks `self.nodes` at ONE level — it
+        // does not itself recurse. A `Branch` and the `HumanGate` it switches on must
+        // both be visible in the SAME `self.nodes` slice for this rule to fire: `on` is
+        // a bare `NodeId`, not a path, so a gate nested one level down (inside a
+        // `Subgraph`/`Loop` body) is invisible to a `Branch` at the outer level, and vice
+        // versa — nothing in this codebase lets a `Branch` name a node outside its own
+        // graph anyway (block 2's "undeclared node" check would already reject that
+        // dependency). So a `Branch` and its `HumanGate` split across a nesting boundary
+        // is not a hole this rule silently misses: it is a shape the rest of `validate_dag`
+        // already forbids before this block would ever get the chance. Where both DO sit
+        // together at some depth, block 2c's/2d's recursive `validate_dag()` calls run
+        // this block again at that level, so the rule still fires wherever the pairing
+        // exists.
+        let gates: std::collections::HashMap<&NodeId, &Vec<GateOption>> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::HumanGate { options, .. } => Some((&n.id, options)),
+                _ => None,
+            })
+            .collect();
+        for node in &self.nodes {
+            let NodeKind::Branch { on, arms, .. } = &node.kind else {
+                continue;
+            };
+            let Some(options) = gates.get(on) else {
+                continue;
+            };
+            let armed: HashSet<&str> = arms
+                .iter()
+                .filter_map(|(cond, _)| match cond {
+                    BranchCond::FieldEquals(field, value) if field == "decision" => value.as_str(),
+                    _ => None,
+                })
+                .collect();
+            for o in options
+                .iter()
+                .filter(|o| o.outcome == GateOutcome::Complete)
+            {
+                if !armed.contains(o.name.as_str()) {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "branch node {:?} switches on human_gate {:?} but has no arm for \
+                         its Complete option {:?}; add an arm or the decision falls to \
+                         `default` unnoticed",
+                        node.id, on, o.name
+                    )));
+                }
+            }
+            let declared: HashSet<&str> = options.iter().map(|o| o.name.as_str()).collect();
+            for a in &armed {
+                if !declared.contains(a) {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "branch node {:?} has an arm for {:?}, which human_gate {:?} does \
+                         not declare; its options are: {}",
+                        node.id,
+                        a,
+                        on,
+                        declared.iter().copied().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+            }
+        }
+
         // 2c. A `Subgraph`'s nested graph must itself be a valid DAG (recursive).
         // A `Loop` with a `Subgraph` body has a static nested graph too — recurse
         // into it (a `LoopBody::Expand` has no static graph, so no recursion).
@@ -913,6 +991,110 @@ mod tests {
             name: name.to_string(),
             outcome,
         }
+    }
+
+    fn gate_then_branch(arms: Vec<&str>, options: Vec<GateOption>) -> Graph {
+        Graph {
+            nodes: vec![
+                Node {
+                    id: NodeId("release".into()),
+                    kind: NodeKind::HumanGate {
+                        options,
+                        timeout: None,
+                    },
+                    deps: vec![],
+                },
+                Node {
+                    id: NodeId("route".into()),
+                    kind: NodeKind::Branch {
+                        on: NodeId("release".into()),
+                        arms: arms
+                            .into_iter()
+                            .map(|a| {
+                                (
+                                    BranchCond::FieldEquals(
+                                        "decision".into(),
+                                        serde_json::json!(a),
+                                    ),
+                                    Graph { nodes: vec![] },
+                                )
+                            })
+                            .collect(),
+                        default: Graph { nodes: vec![] },
+                    },
+                    deps: vec![Dep::hard(NodeId("release".into()))],
+                },
+            ],
+        }
+    }
+
+    /// AC6. The check is CONDITIONAL — it fires only when the author has ALREADY coupled
+    /// a Branch to a gate. `validate_dag` is deliberately syntactic (the `/` id ban was
+    /// chosen over cross-level collision detection for exactly that reason), so an
+    /// unconditional cross-node rule would break that stance, and requiring a Branch on
+    /// every gate would put ceremony on the common approve-or-stop shape.
+    #[test]
+    fn a_branch_on_a_gate_must_cover_every_complete_option() {
+        let three = vec![
+            opt("ship", GateOutcome::Complete),
+            opt("hold", GateOutcome::Complete),
+            opt("reject", GateOutcome::Fail),
+        ];
+
+        // Covers both Complete options — legal. A Fail option needs no arm: it never
+        // produces an output for a Branch to switch on.
+        gate_then_branch(vec!["ship", "hold"], three.clone())
+            .validate_dag()
+            .expect("both Complete options are handled");
+
+        // Missing an arm for `hold` — the exact bug this exists to catch: someone adds a
+        // third option and forgets the arm, and it silently falls to `default`.
+        let e = gate_then_branch(vec!["ship"], three.clone())
+            .validate_dag()
+            .expect_err("hold is unhandled");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("hold"),
+            "must name the unhandled option: {msg}"
+        );
+        assert!(msg.contains("release"), "must name the gate: {msg}");
+
+        // An arm naming an option the gate never declares — a typo, caught statically.
+        let e = gate_then_branch(vec!["ship", "hold", "shipp"], three)
+            .validate_dag()
+            .expect_err("shipp is undeclared");
+        assert!(format!("{e}").contains("shipp"), "{e}");
+    }
+
+    /// A gate with NO Branch downstream is legal: approve-or-stop is the common shape and
+    /// must not be forced to add ceremony.
+    #[test]
+    fn a_gate_without_a_branch_is_legal() {
+        gate(
+            vec![
+                opt("approve", GateOutcome::Complete),
+                opt("reject", GateOutcome::Fail),
+            ],
+            None,
+        )
+        .validate_dag()
+        .expect("a gate needs no Branch");
+    }
+
+    /// A `Fail` option never produces an output for a `Branch` to switch on, so it needs
+    /// no arm — only `Complete` options are exhaustiveness-checked. Guards the `filter(|o|
+    /// o.outcome == GateOutcome::Complete)` above: widening that filter to cover `Fail`
+    /// options too would ask the author to handle a value that cannot exist, and must
+    /// turn this test RED.
+    #[test]
+    fn a_fail_option_needs_no_arm() {
+        let opts = vec![
+            opt("ship", GateOutcome::Complete),
+            opt("reject", GateOutcome::Fail),
+        ];
+        gate_then_branch(vec!["ship"], opts)
+            .validate_dag()
+            .expect("Fail option `reject` needs no arm");
     }
 
     /// A gate must offer a real choice, and at least one way FORWARD. Same principle as
