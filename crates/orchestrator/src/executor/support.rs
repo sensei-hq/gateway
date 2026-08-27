@@ -13,7 +13,7 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::Fold;
+use super::{Fold, GateDecision};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -238,7 +238,7 @@ pub(crate) fn fold_journal(
             } => {
                 fold.gate_decisions.insert(
                     node.clone(),
-                    super::GateDecision {
+                    GateDecision {
                         option: option.clone(),
                         actor: actor.clone(),
                         note: note.clone(),
@@ -837,7 +837,7 @@ mod tests {
                     deadline: Some(at(1_000)),
                     options: vec![
                         gopt("ship", GateOutcome::Complete),
-                        gopt("hold", GateOutcome::Complete),
+                        gopt("hold", GateOutcome::Fail),
                     ],
                 },
             ),
@@ -893,6 +893,13 @@ mod tests {
         assert_eq!(
             fold.menu_for(&NodeId("release".into())).unwrap()[0].name,
             "ship"
+        );
+        // The OUTCOME survives the fold too, not just the name — §5 calls it "as much a
+        // part of the offer as the name", because a menu whose options all read as
+        // `Complete` would make every rejected gate resume as an approval.
+        assert_eq!(
+            fold.menu_for(&NodeId("release".into())).unwrap()[1].outcome,
+            GateOutcome::Fail
         );
     }
 

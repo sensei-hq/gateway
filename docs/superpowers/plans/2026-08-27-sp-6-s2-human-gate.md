@@ -911,7 +911,8 @@ If `at()` does not already exist in that test module, add:
 - [ ] **Step 2: Run and watch it fail**
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins a_deadline_less_gate_records
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib a_deadline_less_gate_records
 ```
 
 Expected: **compile error** — `no method named gate_decision_for`.
@@ -1003,7 +1004,8 @@ In `crates/orchestrator/src/executor/support.rs`, add the arms next to the `Sign
 - [ ] **Step 4: Run and watch them pass**
 
 ```bash
-env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins a_deadline_less_gate_records
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib gate_decisions_are_last_wins
+env -u DATABASE_URL cargo test -p sensei-orchestrator --lib a_deadline_less_gate_records
 env -u DATABASE_URL cargo test --workspace
 ```
 
