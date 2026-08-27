@@ -70,8 +70,12 @@ composition does not give:
 | Timeout | **Fail-closed, no default payload, not configurable** | s1 §8 mandates it: *"if it is ever added it must be opt-in per node and impossible to configure on a `HumanGate`."* |
 
 **The accepted cost, stated rather than buried.** A `Fail` option and a dead provider both surface as
-`RunStatus::Failed`. `torii run status`'s reason string distinguishes them; `run list-paused` does
-not. A distinct `Rejected` status would be more truthful but reaches `orchestrator-core`,
+`RunStatus::Failed`, so they are indistinguishable **by status** — distinguishable only by the reason
+text, which `torii run status` renders. That matters for anything filtering on status: a script, or
+the terminal allowlist in `count_terminal_before`/`prune_terminal`. (An earlier revision of this
+paragraph said `run list-paused` fails to distinguish them. That was a category error caught in
+review: `list_paused` filters `status='paused'` and both cases are TERMINAL, so neither ever appears
+there at all.) A distinct `Rejected` status would be more truthful but reaches `orchestrator-core`,
 both `SchedulerStore` impls, the dbd `CHECK` constraint (a real migration) and torii's rendering —
 which would stop s2 being a layer over s1. Deferred deliberately, not overlooked.
 
