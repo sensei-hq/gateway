@@ -1,12 +1,15 @@
 //! Test-only fixtures for the executor's tests: a recording chat adapter plus a
 //! minimal single-chain [`Gateway`], modeled on the gateway crate's own
 //! adapter/reference-chain test harness (`gateway::engine::tests` /
-//! `gateway::catalog::presets`). Kept behind `#[cfg(test)]`.
+//! `gateway::catalog::presets`). Compiled only under `#[cfg(test)]` or the dev-only
+//! `test-support` feature, which lets another crate's dev-dependencies reuse the same
+//! doubles (torii's cross-process e2e).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use gateway::Gateway;
 use gateway::adapters::AdapterRegistry;
 use gateway::adapters::capability::{ChatModel, Model};
@@ -15,9 +18,11 @@ use kernel::types::capability::Capability;
 use kernel::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
 };
+use kernel::types::cost::TokenUsage;
 use kernel::types::error::GatewayError;
 use kernel::types::io::{ChatRequest, ChatResponse};
-use kernel::types::request::{MessageRole, ToolCall};
+use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload, ToolCall};
+use orchestrator_core::Clock;
 
 /// One recorded gateway call: the resolved model id the adapter was dispatched
 /// with, plus a fingerprint of the payload (the first user message's text).
@@ -172,6 +177,139 @@ pub async fn recording_gateway() -> (Gateway, CallLog) {
 /// errors thereafter — the crash injector for the resume-without-re-spend test.
 pub async fn failing_after_gateway(succeed: usize) -> (Gateway, CallLog) {
     build_gateway(Some(succeed)).await
+}
+
+/// Chat adapter that behaves like [`RecordingAdapter`] (records + always succeeds)
+/// but reports the given `usage` on every response. SP-DATA-5: every OTHER double
+/// in this module hardcodes `usage: None` — so every existing test runs unmetered
+/// by construction (fine; none of them set a budget), but a test that wants to
+/// prove reported usage reaches the journal needs THIS double instead.
+pub struct MeteredAdapter {
+    calls: CallLog,
+    usage: Option<TokenUsage>,
+}
+
+impl Model for MeteredAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for MeteredAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt));
+        Ok(ChatResponse {
+            content: Some("canned-response".into()),
+            tool_calls: Vec::new(),
+            usage: self.usage.clone(),
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway on chain `"c"` whose adapter always succeeds and reports `usage` on
+/// every response (`None` reproduces the other doubles' unmetered behaviour, so a
+/// caller can also use this to exercise the additivity path explicitly).
+pub async fn metered_gateway(usage: Option<TokenUsage>) -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(MeteredAdapter {
+            calls: calls.clone(),
+            usage,
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
+}
+
+/// Chat adapter that behaves like [`MeteredAdapter`] but **actually suspends** —
+/// `tokio::time::sleep(delay)` — before returning.
+///
+/// This is not a convenience. EVERY other double in this module returns without a
+/// single suspension point, which makes a `Map`'s `join_all` degenerate to strictly
+/// SEQUENTIAL execution: each child future runs to completion on its first poll, so
+/// no two children are ever in flight together and any concurrency defect is
+/// structurally invisible to the suite. That is exactly how SP-DATA-5 shipped a
+/// budget gate that a 6-wide fan-out walks straight through — the same test yields
+/// 1 call against this double and 6 against the non-awaiting one.
+///
+/// Reach for this whenever a test's claim is about what happens *between* two
+/// concurrent gateway calls (fan-out gating, shared-state races, ordering); the
+/// zero-latency doubles are fine for everything else.
+pub struct LatencyMeteredAdapter {
+    calls: CallLog,
+    usage: Option<TokenUsage>,
+    delay: std::time::Duration,
+}
+
+impl Model for LatencyMeteredAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for LatencyMeteredAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let prompt = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        // Record BEFORE suspending: a test that counts calls must see a call that is
+        // in flight, not only one that has returned.
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.model.clone(), prompt));
+        tokio::time::sleep(self.delay).await;
+        Ok(ChatResponse {
+            content: Some("canned-response".into()),
+            tool_calls: Vec::new(),
+            usage: self.usage.clone(),
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway on chain `"c"` whose adapter reports `usage` and **awaits** `delay`
+/// before responding — see [`LatencyMeteredAdapter`] for why a suspension point is
+/// load-bearing rather than cosmetic.
+pub async fn metered_latency_gateway(
+    usage: Option<TokenUsage>,
+    delay: std::time::Duration,
+) -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(LatencyMeteredAdapter {
+            calls: calls.clone(),
+            usage,
+            delay,
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
 }
 
 /// Chat adapter that replays a scripted queue of responses (one per turn), so a
@@ -550,4 +688,59 @@ pub async fn timeout_gateway() -> Gateway {
     adapters.register_chat(Arc::new(TimeoutAdapter)).await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     Gateway::new(single_chain_config(), adapters, cb)
+}
+
+/// A [`timeout_gateway`] that has ALREADY been warmed: one `execute` against chain `"c"`
+/// is spent cooling its sole router, so the very NEXT `execute` finds every candidate
+/// gated and returns `AllGated { resume_after }` — which is what makes a run over this
+/// gateway *pause* (resumable, with a deadline) instead of failing outright.
+///
+/// The warm-up belongs with the fixture rather than at each call site: a caller that
+/// forgets it silently gets a FAILED run instead of a paused one, which is a different
+/// test. The request must target the same chain and capability the executor's own
+/// `build_request` compiles a `ModelCall` into, since that is what decides which router
+/// cools — hence the deliberate mirroring below (the executor's helper is private to its
+/// module, and widening that module's visibility for a test fixture would make a private
+/// type reachable at `pub(crate)`).
+pub async fn gated_gateway() -> Gateway {
+    let gw = timeout_gateway().await;
+    let _ = gw
+        .execute(&InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("c".to_string()),
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "warm")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+        })
+        .await;
+    gw
+}
+
+/// A settable [`Clock`] for deterministic scheduler/wake tests — advance time by hand (no real
+/// sleeps) to make a `Scheduler::tick` fire.
+pub struct FakeClock(Mutex<DateTime<Utc>>);
+impl FakeClock {
+    pub fn new(t: DateTime<Utc>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(t)))
+    }
+    pub fn set(&self, t: DateTime<Utc>) {
+        *self.0.lock().unwrap() = t;
+    }
+}
+impl Clock for FakeClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().unwrap()
+    }
 }

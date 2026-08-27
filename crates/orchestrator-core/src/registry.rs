@@ -25,8 +25,9 @@ pub struct AgentDefinition {
     /// Per-phase chain overrides (phase → chain-id); empty when unused.
     #[serde(default)]
     pub chains: HashMap<String, String>,
-    /// Per-tool permission grants (tool name → granted scope, §287). Checked
-    /// against each tool's declared `permissions` at load; empty when unused.
+    /// Per-tool permission grants (tool name → granted scope, §287) — the
+    /// runtime ceiling. NOT checked at load; enforced per-call at runtime against
+    /// `Tool::required(args)` (ceiling model, SP-4 s1). Empty when unused.
     #[serde(default)]
     pub grants: HashMap<String, Permissions>,
     pub tools: Vec<String>,
@@ -58,13 +59,20 @@ pub struct ToolSpec {
     pub ttl_secs: Option<u64>,
     /// Provenance `source` label recorded with an Observation. Defaults to the tool name.
     pub source: Option<String>,
-    /// The capabilities this tool declares it needs (§132). Enforcement = SP-4;
-    /// this slice only validates an agent's grant covers it.
+    /// The tool's declared **maximum surface** (§132) — for disclosure. The
+    /// agent's grant is the runtime ceiling, and each call is authorized against
+    /// `Tool::required(args)` at runtime (SP-4 s1); `validate` no longer checks
+    /// that a grant covers this.
     #[serde(default)]
     pub permissions: Permissions,
     /// When this tool's schema is exposed to the model (§129); default `Always`.
     #[serde(default)]
     pub activation: Activation,
+    /// Credential refs this tool needs (SP-4 broker); resolved by the injected
+    /// `CredentialBroker` and injected into the call's `ToolContext.credentials`
+    /// (ephemeral). Empty ⇒ the tool needs no credentials.
+    #[serde(default)]
+    pub credentials: Vec<String>,
 }
 
 /// A capability declaration — used BOTH as a tool's required needs
@@ -111,7 +119,7 @@ impl Permissions {
     pub fn covers(&self, need: &Permissions) -> bool {
         need.paths
             .iter()
-            .all(|p| self.paths.iter().any(|g| p.starts_with(g)))
+            .all(|p| self.paths.iter().any(|g| path_covers(g, p)))
             && need.commands.iter().all(|c| self.commands.contains(c))
             && self.network.covers(&need.network)
             && self.caps.covers(&need.caps)
@@ -125,7 +133,9 @@ impl NetworkPolicy {
         match (self, need) {
             (NetworkPolicy::Any, _) => true,
             (_, NetworkPolicy::Deny) => true,
-            (NetworkPolicy::Hosts(g), NetworkPolicy::Hosts(n)) => n.iter().all(|h| g.contains(h)),
+            (NetworkPolicy::Hosts(g), NetworkPolicy::Hosts(n)) => {
+                n.iter().all(|h| g.iter().any(|gh| host_covers(gh, h)))
+            }
             _ => false,
         }
     }
@@ -146,6 +156,44 @@ fn cap_covers(grant: Option<u64>, need: Option<u64>) -> bool {
         (_, None) => true,
         (None, Some(_)) => true,
         (Some(g), Some(n)) => g >= n,
+    }
+}
+
+/// Does the grant path `g` cover the need path `n`? Component-aware: `g`'s path
+/// segments must be a prefix of `n`'s. `/workspace` covers `/workspace/sub` but not
+/// `/workspace-secret`. An empty grant covers nothing; a need containing `..` is
+/// rejected (no traversal). Lexical only — symlink/realpath confinement is the
+/// sandbox's job (SP-4 slice 4).
+/// Paths are assumed absolute and normalized (canonicalization is the sandbox's
+/// job); a grant of `/` covers the whole tree.
+fn path_covers(g: &str, n: &str) -> bool {
+    if g.is_empty() {
+        return false;
+    }
+    if n.split('/').any(|s| s == "..") {
+        return false;
+    }
+    let gs: Vec<&str> = g
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    let ns: Vec<&str> = n
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    gs.len() <= ns.len() && gs.iter().zip(&ns).all(|(a, b)| a == b)
+}
+
+/// Does the grant host `g` cover the need host `n`? Exact match, or a `*.suffix`
+/// wildcard grant matching any subdomain of `suffix` (not the bare domain).
+/// Case-insensitive.
+fn host_covers(g: &str, n: &str) -> bool {
+    let (g, n) = (g.to_lowercase(), n.to_lowercase());
+    match g.strip_prefix("*.") {
+        Some(suffix) => n
+            .strip_suffix(&suffix)
+            .is_some_and(|prefix| prefix.ends_with('.')),
+        None => g == n,
     }
 }
 
@@ -205,6 +253,47 @@ pub struct RegistryConfig {
 pub trait ConfigSource: Send + Sync {
     /// Load the whole registry config (a one-shot snapshot; hot-reload re-calls it).
     async fn load(&self) -> Result<RegistryConfig, OrchestratorError>;
+
+    /// The durable config generation, if this source is versioned. Default `None`
+    /// ⇒ [`RegistryHandle`] keeps its local monotonic counter (filesystem / in-memory
+    /// are unversioned). A versioned backend (`PostgresConfigSource`) returns
+    /// `Some(n)` so the generation is globally meaningful across processes.
+    async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+        Ok(None)
+    }
+
+    /// Load the config AND its generation as ONE consistent pair.
+    ///
+    /// The default performs the two reads separately — correct for unversioned
+    /// sources (`version()` is `None`, so there is no generation for the content
+    /// to be inconsistent with). A **versioned** backend MUST override this with
+    /// a single-snapshot read: otherwise a concurrent writer can hand back a torn
+    /// (stale config, fresh generation) pair, a run stamps a fresh-generation
+    /// fence over stale config, and a later resume matches the fence and silently
+    /// continues under different config (SP-DATA-2 carry-forward).
+    /// A tripwire guards the footgun: reaching this default WITH a `Some(_)`
+    /// version means a versioned backend forgot to override it, which otherwise
+    /// fails silently (no compile error, no runtime signal) and reopens the
+    /// hazard above. It is a hard error, not a `debug_assert!` — the latter
+    /// compiles out in release, which is precisely where a torn pair would do
+    /// its damage unobserved. Reaching it is always a programming error, and
+    /// this codebase fails loud on those (`IncompatibleFormat`,
+    /// `VersionFenceMismatch`, `ContentDigestMiss`).
+    async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+        // `load()` first, so a source whose load fails propagates ITS error rather
+        // than being masked by the tripwire.
+        let cfg = self.load().await?;
+        let ver = self.version().await?;
+        if ver.is_some() {
+            return Err(OrchestratorError::RegistryLoad(
+                "ConfigSource::version() returned Some(_) through the DEFAULT load_versioned() — a \
+                 versioned source MUST override load_versioned with a single atomic snapshot, or it \
+                 reopens the torn (stale config, fresh generation) read hazard"
+                    .into(),
+            ));
+        }
+        Ok((cfg, ver))
+    }
 }
 
 /// In-memory registry of agents/skills/tool-specs, built by a demo/preset
@@ -238,6 +327,36 @@ impl Registry {
     }
     pub fn tool(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.get(name)
+    }
+    /// Enumerate all agent definitions (for planner discovery + feasibility).
+    pub fn agents(&self) -> impl Iterator<Item = &AgentDefinition> {
+        self.agents.values()
+    }
+    /// Enumerate all skill definitions.
+    pub fn skills(&self) -> impl Iterator<Item = &SkillDef> {
+        self.skills.values()
+    }
+    /// Enumerate all tool specs.
+    pub fn tools(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.tools.values()
+    }
+    /// Distinct chain ids the registry references (agent `chain`, per-phase
+    /// `chains`, and `(area,kind)` bindings), sorted. Best-effort menu — the full
+    /// gateway catalog is not registry-visible.
+    pub fn chain_names(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for a in self.agents.values() {
+            if let Some(c) = &a.chain {
+                set.insert(c.clone());
+            }
+            for c in a.chains.values() {
+                set.insert(c.clone());
+            }
+        }
+        for c in self.chain_bindings.values() {
+            set.insert(c.clone());
+        }
+        set.into_iter().collect()
     }
     pub fn with_chain_binding(mut self, b: ChainBinding) -> Self {
         self.chain_bindings.insert((b.area, b.kind), b.chain);
@@ -324,7 +443,10 @@ impl Registry {
         Ok(reg)
     }
 
-    /// Fail loud if any agent references a skill/tool the registry doesn't hold.
+    /// Fail loud on *structural* unresolvability only: any agent that references
+    /// a skill/tool the registry doesn't hold, or an unroutable chain. Grants are
+    /// NOT checked here — a grant narrower than a tool's declared permission
+    /// surface is legal and is enforced per-call at runtime (ceiling model, SP-4 s1).
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         for agent in self.agents.values() {
             for skill in &agent.skills {
@@ -336,18 +458,8 @@ impl Registry {
                 }
             }
             for tool in &agent.tools {
-                let Some(spec) = self.tools.get(tool) else {
+                if !self.tools.contains_key(tool) {
                     return Err(OrchestratorError::UnknownToolRef {
-                        agent: agent.name.clone(),
-                        tool: tool.clone(),
-                    });
-                };
-                // grant⊇need: a missing grant is treated as the (deny/empty) default,
-                // which covers a permissionless tool but not one that declares needs.
-                let no_grant = Permissions::default();
-                let grant = agent.grants.get(tool).unwrap_or(&no_grant);
-                if !grant.covers(&spec.permissions) {
-                    return Err(OrchestratorError::PermissionNotGranted {
                         agent: agent.name.clone(),
                         tool: tool.clone(),
                     });
@@ -400,18 +512,42 @@ impl RegistryHandle {
         (g.0.clone(), g.1)
     }
 
-    /// Reload from `source`, atomically swapping in the new registry and bumping
+    /// Reload from `source`, atomically swapping in the new registry and setting
     /// the generation (returns the new generation). Validated + last-good: the
     /// load + `Registry::from_config` (which validates) run BEFORE the swap, so a
     /// failed load/validate returns `Err` with the old registry still live. The
-    /// `.await` is OUTSIDE the lock.
+    /// `.await` is OUTSIDE the lock. Config and generation are read as ONE atomic
+    /// pair via `ConfigSource::load_versioned` — never as two separate reads —
+    /// so a concurrent writer can never hand back a torn (stale config, fresh
+    /// generation) snapshot. A versioned source (`Some(v)`) pins its durable
+    /// generation; an unversioned source (`None` — filesystem/in-memory) keeps
+    /// bumping the local monotonic counter.
     pub async fn reload(&self, source: &dyn ConfigSource) -> Result<u64, OrchestratorError> {
-        let cfg = source.load().await?;
+        let (cfg, ver) = source.load_versioned().await?;
         let next = Registry::from_config(cfg)?;
         let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
         w.0 = Arc::new(next);
-        w.1 += 1;
+        // A versioned source pins its durable generation; an unversioned one increments locally.
+        w.1 = match ver {
+            Some(v) => v,
+            None => w.1 + 1,
+        };
         Ok(w.1)
+    }
+
+    /// Boot a handle at a source's durable generation. A versioned source pins its
+    /// version; an unversioned source (filesystem/in-memory) boots at 0 — identical
+    /// to [`new`](Self::new). Config and generation are read as ONE atomic pair via
+    /// `ConfigSource::load_versioned` (see [`reload`](Self::reload) for why). The
+    /// `load_versioned`/`from_config` run before the handle exists, so a failed
+    /// load/validate returns `Err` (no half-built handle).
+    pub async fn from_source(source: &dyn ConfigSource) -> Result<Self, OrchestratorError> {
+        let (cfg, ver) = source.load_versioned().await?;
+        let ver = ver.unwrap_or(0);
+        let registry = Registry::from_config(cfg)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new((Arc::new(registry), ver))),
+        })
     }
 }
 
@@ -672,6 +808,7 @@ mod tests {
             source: None,
             permissions: Permissions::default(),
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
@@ -809,39 +946,29 @@ mod tests {
             source: None,
             permissions: need,
             activation: Activation::default(),
+            credentials: vec![],
         }
     }
 
     #[test]
-    fn validate_requires_a_grant_covering_a_tools_declared_needs() {
-        let need = Permissions {
-            paths: vec!["/workspace".into()],
-            ..Default::default()
-        };
-        let tool = tool_needing("fs.write", need.clone());
-
-        // Agent references the tool but grants nothing → PermissionNotGranted.
-        let mut agent = role_agent("coding", "reasoning", Some("c"));
-        agent.tools = vec!["fs.write".into()];
-        let reg = Registry::default()
-            .with_agent(agent.clone())
-            .with_tool(tool.clone());
-        assert!(matches!(
-            reg.validate(),
-            Err(OrchestratorError::PermissionNotGranted { agent, tool })
-                if agent == "role" && tool == "fs.write"
-        ));
-
-        // With a covering grant → ok.
-        agent.grants.insert(
-            "fs.write".into(),
+    fn validate_accepts_a_grant_narrower_than_the_tool_surface() {
+        // SP-4: a grant narrower than a tool's declared surface is now LEGAL
+        // (enforced per-call at runtime), so `validate` no longer errors at load.
+        // The tool declares a path need; the agent lists it but grants nothing.
+        let tool = tool_needing(
+            "fs.write",
             Permissions {
                 paths: vec!["/workspace".into()],
                 ..Default::default()
             },
         );
-        let ok = Registry::default().with_agent(agent).with_tool(tool);
-        assert!(ok.validate().is_ok());
+        let mut agent = role_agent("coding", "reasoning", Some("c"));
+        agent.tools = vec!["fs.write".into()]; // lists the tool, grants nothing
+        let reg = Registry::default().with_agent(agent).with_tool(tool);
+        assert!(
+            reg.validate().is_ok(),
+            "a narrower-than-surface (here: absent) grant is legal now"
+        );
     }
 
     #[test]
@@ -1118,6 +1245,103 @@ mod tests {
     }
 
     #[test]
+    fn covers_paths_are_component_aware() {
+        let grant = Permissions {
+            paths: vec!["/workspace".into()],
+            ..Default::default()
+        };
+        let inside = Permissions {
+            paths: vec!["/workspace/sub/a.txt".into()],
+            ..Default::default()
+        };
+        let sibling = Permissions {
+            paths: vec!["/workspace-secret".into()],
+            ..Default::default()
+        };
+        let outside = Permissions {
+            paths: vec!["/etc/passwd".into()],
+            ..Default::default()
+        };
+        assert!(grant.covers(&inside));
+        assert!(grant.covers(&grant), "a path covers itself");
+        assert!(
+            !grant.covers(&sibling),
+            "/workspace must NOT cover /workspace-secret"
+        );
+        assert!(!grant.covers(&outside));
+        let empty_grant = Permissions {
+            paths: vec!["".into()],
+            ..Default::default()
+        };
+        assert!(
+            !empty_grant.covers(&inside),
+            "an empty grant path covers nothing"
+        );
+        let traversal = Permissions {
+            paths: vec!["/workspace/../etc".into()],
+            ..Default::default()
+        };
+        assert!(
+            !grant.covers(&traversal),
+            "a `..` traversal need is rejected"
+        );
+    }
+
+    #[test]
+    fn covers_hosts_support_wildcards() {
+        let wild = Permissions {
+            network: NetworkPolicy::Hosts(vec!["*.example.com".into()]),
+            ..Default::default()
+        };
+        let sub = Permissions {
+            network: NetworkPolicy::Hosts(vec!["api.example.com".into()]),
+            ..Default::default()
+        };
+        let evil = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.evil.com".into()]),
+            ..Default::default()
+        };
+        let bare = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.com".into()]),
+            ..Default::default()
+        };
+        assert!(wild.covers(&sub));
+        assert!(
+            !wild.covers(&evil),
+            "*.example.com must not cover example.evil.com"
+        );
+        assert!(
+            !wild.covers(&bare),
+            "*.example.com does not match the bare domain"
+        );
+        let no_dot = Permissions {
+            network: NetworkPolicy::Hosts(vec!["notexample.com".into()]),
+            ..Default::default()
+        };
+        let left_label = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.com.attacker.com".into()]),
+            ..Default::default()
+        };
+        assert!(
+            !wild.covers(&no_dot),
+            "*.example.com must not cover notexample.com (no dot boundary)"
+        );
+        assert!(
+            !wild.covers(&left_label),
+            "*.example.com must not cover example.com.attacker.com"
+        );
+        let exact = Permissions {
+            network: NetworkPolicy::Hosts(vec!["example.com".into()]),
+            ..Default::default()
+        };
+        assert!(exact.covers(&bare));
+        assert!(
+            !exact.covers(&sub),
+            "an exact host grant does not cover a subdomain"
+        );
+    }
+
+    #[test]
     fn activation_is_active_matches_keywords_case_insensitively() {
         assert!(Activation::Always.is_active(""));
         assert!(Activation::Always.is_active("anything"));
@@ -1191,6 +1415,14 @@ mod tests {
         assert_eq!(t2.activation, Activation::OnKeywords(vec!["sql".into()]));
     }
 
+    #[test]
+    fn tool_spec_credentials_default_empty() {
+        let spec: ToolSpec =
+            serde_json::from_str(r#"{"name":"t","input_schema":{},"effect_class":"Pure"}"#)
+                .unwrap();
+        assert!(spec.credentials.is_empty());
+    }
+
     // A minimal in-core ConfigSource for handle tests (yields a fixed config).
     struct FixedSource(RegistryConfig);
     #[async_trait::async_trait]
@@ -1211,6 +1443,25 @@ mod tests {
             }],
             tools: vec![],
             chain_bindings: vec![],
+        }
+    }
+
+    /// A ConfigSource that reports a durable generation (mirrors PostgresConfigSource).
+    /// Overrides `load_versioned` for the same reason the real backend must: a versioned
+    /// source owes callers ONE consistent (config, generation) pair, and the default's two
+    /// separate reads are the torn-pair hazard. Its own fields are immutable, so returning
+    /// them together IS the atomic snapshot.
+    struct VersionedSource(RegistryConfig, u64);
+    #[async_trait::async_trait]
+    impl ConfigSource for VersionedSource {
+        async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+            Ok(self.0.clone())
+        }
+        async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+            Ok(Some(self.1))
+        }
+        async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+            Ok((self.0.clone(), Some(self.1)))
         }
     }
 
@@ -1260,5 +1511,167 @@ mod tests {
         // Last-good preserved: old registry still live, generation unchanged.
         assert_eq!(h.generation(), 0);
         assert!(h.current().skill("s0").is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_from_a_versioned_source_pins_the_durable_version_not_a_blind_increment() {
+        let h = RegistryHandle::new(Registry::from_config(cfg_with_skill("s0")).unwrap());
+        assert_eq!(h.generation(), 0);
+        let g = h
+            .reload(&VersionedSource(cfg_with_skill("s1"), 5))
+            .await
+            .unwrap();
+        assert_eq!(g, 5, "the durable version is pinned as the generation");
+        assert_eq!(h.generation(), 5);
+        assert!(h.current().skill("s1").is_some(), "new config is live");
+    }
+
+    #[tokio::test]
+    async fn reload_from_an_unversioned_source_keeps_the_local_increment() {
+        let h = RegistryHandle::new(Registry::from_config(cfg_with_skill("s0")).unwrap());
+        assert_eq!(
+            h.reload(&FixedSource(cfg_with_skill("s1"))).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            h.reload(&FixedSource(cfg_with_skill("s2"))).await.unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn from_source_boots_at_the_durable_version_and_unversioned_at_zero() {
+        let h = RegistryHandle::from_source(&VersionedSource(cfg_with_skill("s0"), 7))
+            .await
+            .unwrap();
+        assert_eq!(h.generation(), 7);
+        assert!(h.current().skill("s0").is_some());
+        let h0 = RegistryHandle::from_source(&FixedSource(cfg_with_skill("s0")))
+            .await
+            .unwrap();
+        assert_eq!(h0.generation(), 0);
+    }
+
+    /// A source that counts how many times each read method is called, so we can
+    /// prove `reload` uses the ATOMIC pair method rather than the two separate reads.
+    struct CountingSource {
+        cfg: RegistryConfig,
+        version: u64,
+        loads: std::sync::atomic::AtomicUsize,
+        versions: std::sync::atomic::AtomicUsize,
+        pairs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSource {
+        fn new(cfg: RegistryConfig, version: u64) -> Self {
+            Self {
+                cfg,
+                version,
+                loads: Default::default(),
+                versions: Default::default(),
+                pairs: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigSource for CountingSource {
+        async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.cfg.clone())
+        }
+        async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+            self.versions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.version))
+        }
+        async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+            self.pairs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((self.cfg.clone(), Some(self.version)))
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_reads_config_and_version_through_the_atomic_pair_method() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let src = CountingSource::new(cfg_with_skill("s1"), 9);
+        let h = RegistryHandle::new(Registry::default());
+        let g = h.reload(&src).await.expect("reloads");
+        assert_eq!(g, 9, "the durable version is pinned as the generation");
+        assert_eq!(src.pairs.load(SeqCst), 1, "reload must use load_versioned");
+        assert_eq!(
+            (src.loads.load(SeqCst), src.versions.load(SeqCst)),
+            (0, 0),
+            "reload must NOT issue the two separate reads (that is the TOCTOU)"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_source_also_uses_the_atomic_pair_method() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let src = CountingSource::new(cfg_with_skill("s1"), 4);
+        let h = RegistryHandle::from_source(&src).await.expect("boots");
+        assert_eq!(h.generation(), 4);
+        assert_eq!(src.pairs.load(SeqCst), 1);
+        assert_eq!((src.loads.load(SeqCst), src.versions.load(SeqCst)), (0, 0));
+    }
+
+    /// The DEFAULT impl must keep today's behavior for unversioned sources, whose
+    /// `version()` is None — so there is no generation for the content to be
+    /// inconsistent with, and the non-atomic default is harmless.
+    #[tokio::test]
+    async fn the_default_load_versioned_delegates_to_load_and_version() {
+        let src = FixedSource(cfg_with_skill("s0"));
+        let (cfg, ver) = src.load_versioned().await.expect("pair");
+        assert_eq!(ver, None, "an unversioned source reports no generation");
+        assert_eq!(cfg.skills.len(), 1);
+    }
+
+    /// A source whose `load` fails (a transport/IO failure), so the DEFAULT
+    /// `load_versioned` propagates the error through its `?` — the path `reload`
+    /// and `from_source` now take through the chokepoint. Does NOT override
+    /// `load_versioned`: the point is proving the default's propagation, not a
+    /// bespoke one.
+    struct FailingSource;
+    #[async_trait::async_trait]
+    impl ConfigSource for FailingSource {
+        async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+            Err(OrchestratorError::RegistryLoad("transport failure".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_from_a_failing_source_leaves_the_previous_registry_live() {
+        let h = RegistryHandle::new(Registry::default());
+        let g0 = h
+            .reload(&FixedSource(cfg_with_skill("known-good")))
+            .await
+            .expect("first reload succeeds");
+        assert_eq!(g0, 1);
+
+        let err = h.reload(&FailingSource).await;
+        assert!(err.is_err(), "a failing source must not silently succeed");
+
+        // Previous registry still live — a failed reload never tears down the last-good state.
+        assert!(
+            h.current().skill("known-good").is_some(),
+            "the previously-loaded config remains resolvable"
+        );
+        // Generation did not advance — a partial commit that bumped the counter while
+        // leaving the old registry would be a silent fence drift.
+        assert_eq!(
+            h.generation(),
+            g0,
+            "a failed reload must not advance the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_source_on_a_failing_source_yields_err_and_no_handle() {
+        let err = RegistryHandle::from_source(&FailingSource).await;
+        assert!(
+            matches!(err, Err(OrchestratorError::RegistryLoad(_))),
+            "a failing source must yield Err, never a half-built handle"
+        );
     }
 }

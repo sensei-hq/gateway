@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use orchestrator_core::{
-    Aggregation, EffectClass, JournalEvent, MapBody, NodeId, NodeKind, OrchestratorError, RunId,
-    effect_id,
+    Aggregation, EffectClass, GateSpec, JournalEvent, LoopBody, MapBody, NodeId, NodeKind,
+    OrchestratorError, RunId, effect_id,
 };
 
 use super::support::{build_request, input_hash};
@@ -109,12 +109,12 @@ impl Executor {
                     self.materialize(recorded).await?
                 } else {
                     let request = build_request(chain, &payload);
-                    match self.gateway.execute(&request).await {
-                        Ok(response) => {
-                            let output = serde_json::json!({
-                                "model": response.model,
-                                "text": response.content.clone().unwrap_or_default(),
-                            });
+                    // SP-DATA-5: the Consolidate producer routes through the single
+                    // metered chokepoint.
+                    match self.dispatch_metered(&request, &fold.meter()).await {
+                        Ok(Ok(response)) => {
+                            // SP-4 s2: scrub the synthesis text via the shared chokepoint.
+                            let output = self.model_output(&response);
                             let recorded = self.split_output(&output).await?;
                             self.append(
                                 run,
@@ -126,10 +126,29 @@ impl Executor {
                                     seq: 0,
                                     output: recorded,
                                     observation: None,
+                                    // SP-DATA-5: the Consolidate producer — the real usage
+                                    // the provider reported, converted at the boundary.
+                                    usage: response.usage.map(super::content::convert_usage),
                                 },
                             )
                             .await?;
                             output
+                        }
+                        // SP-DATA-5: refused before spending — already journaled by
+                        // `record_refusal`. A budget pause halts the Consolidate
+                        // resumably; an unmetered call fails the node.
+                        Ok(Err(refusal)) => {
+                            return match self.record_refusal(run, &node.id, refusal).await? {
+                                super::dispatch::RefusalKind::Paused(reason) => {
+                                    Ok(NodeExec::Paused { reason })
+                                }
+                                super::dispatch::RefusalKind::Failed(message) => {
+                                    Ok(NodeExec::Failed {
+                                        message,
+                                        output: None,
+                                    })
+                                }
+                            };
                         }
                         Err(error) => {
                             let message = error.to_string();
@@ -370,14 +389,52 @@ impl Executor {
         }
     }
 
-    /// Run a `Loop` node (§10.3): iterate `body` at `"{loop}/{i}"`, threading each
-    /// iteration's output into the next as input (refine), until `gate` says Stop
-    /// or `max_iters` is reached. Cap-without-Stop completes best-effort
-    /// (`converged: false`), never a bare fail; a body failure fails the Loop; an
-    /// Agent-body pause pauses the Loop. Resume replays completed iterations
-    /// (memo-hit, no re-spend) and recomputes the (pure) gate, so it stops at the
-    /// same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are fold-guarded
-    /// (like `run_map`) so a replayed completed Loop does not re-journal them.
+    /// Fail a `Loop` node: journal its `NodeFailed` and return the matching
+    /// [`NodeExec::Failed`]`{ output: None }`. Colocating the append-then-return
+    /// pairing keeps the invariant in ONE place — a `Failed` return from `run_loop`
+    /// must always be preceded by the `NodeFailed` append (skipping it would corrupt
+    /// replay). Both `run_loop` failure paths (a body-iteration failure and a
+    /// gate-agent failure) go through here. (A `Map` aggregation failure carries its
+    /// manifest out via `output: Some(..)`, so it does NOT use this helper.)
+    pub(super) async fn fail_loop(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        message: String,
+    ) -> Result<NodeExec, OrchestratorError> {
+        self.append(
+            run,
+            JournalEvent::NodeFailed {
+                node: node.clone(),
+                error: message.clone(),
+            },
+        )
+        .await?;
+        Ok(NodeExec::Failed {
+            message,
+            output: None,
+        })
+    }
+
+    /// Run a `Loop` node (§10.3): drive `body` at `"{loop}/{i}"` each iteration until
+    /// `gate` says Stop or `max_iters` is reached. A leaf `ModelCall`/`Agent` body
+    /// threads its answer TEXT forward as the next iteration's input (refine); a
+    /// `Subgraph` body drives an authored graph fresh per iteration (no thread —
+    /// each iteration re-runs over the same `input`); an `Expand` body plans+executes
+    /// per iteration and threads its whole output (the sink map) as the next planner
+    /// input. A graph-body
+    /// Failed/Paused fails/pauses the Loop exactly like a leaf body. The `gate` is
+    /// either `Pure` (an SP-1 pure predicate over the iteration output, no journaling)
+    /// or `Agent` — a gate-agent driven over the output at `"{loop}/{i}/__gate__"`,
+    /// whose journaled answer feeds the pure `stop_when` (a gate-agent Failed fails the
+    /// Loop, a gate-agent Paused pauses it). Cap-without-Stop
+    /// completes best-effort (`converged: false`), never a bare fail; a body failure
+    /// fails the Loop; a body pause pauses the Loop. Resume replays completed
+    /// iterations (memo-hit, no re-spend) and recomputes the gate — a pure gate from
+    /// the memoized output, a gate-agent from its memoized turns — so it stops at the
+    /// same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are
+    /// fold-guarded (like `run_map`) so a replayed completed Loop does not re-journal
+    /// them.
     pub(super) async fn run_loop(
         &self,
         run: RunId,
@@ -409,12 +466,25 @@ impl Executor {
         let mut ran = 0usize;
         for i in 0..*max_iters {
             let path = format!("{}/{}", loop_node.id.0, i);
-            let result = match body {
-                MapBody::ModelCall { chain } => {
-                    self.run_map_child_modelcall(run, &path, chain, &current_input, fold)
-                        .await?
+            let output_res: Result<serde_json::Value, String> = match body {
+                LoopBody::ModelCall { chain } => {
+                    match self
+                        .run_map_child_modelcall(run, &path, chain, &current_input, fold)
+                        .await
+                    {
+                        Ok(inner) => inner,
+                        // SP-DATA-5: a `ModelCall` body shares the Map child's pause
+                        // channel (`MapChildPaused`). Pause the Loop — exactly like an
+                        // `Agent` body's `AgentStep::Paused` below — rather than
+                        // letting it escape `?` as a FATAL error, which would abort the
+                        // whole run instead of leaving it resumable.
+                        Err(OrchestratorError::MapChildPaused { reason, .. }) => {
+                            return Ok(NodeExec::Paused { reason });
+                        }
+                        Err(fatal) => return Err(fatal),
+                    }
                 }
-                MapBody::Agent(agent_ref) => match self
+                LoopBody::Agent(agent_ref) => match self
                     .drive_agent(
                         run,
                         &NodeId(path.clone()),
@@ -430,28 +500,74 @@ impl Executor {
                     AgentStep::Failed(m) => Err(m),
                     AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
                 },
+                // A graph body: drive the authored graph fresh under `"{loop}/{i}"`
+                // (its inner nodes journal there); the `Completed` sink map is this
+                // iteration's output, a failure fails the Loop, a pause pauses it.
+                LoopBody::Subgraph(g) => {
+                    match self.drive_nested(run, "loop", &path, g, fold).await? {
+                        NodeExec::Completed(o) => Ok(o),
+                        NodeExec::Failed { message, .. } => Err(message),
+                        NodeExec::Paused { reason } => return Ok(NodeExec::Paused { reason }),
+                    }
+                }
+                // An Expand body: plan+execute a fresh graph under `"{loop}/{i}"` each
+                // iteration (shared `drive_expand_with` — resume/cap/journal), the
+                // `Completed` sink map is this iteration's output; a failure fails the
+                // Loop, a pause pauses it.
+                LoopBody::Expand { planner } => {
+                    match self
+                        .drive_expand_with(
+                            run,
+                            &NodeId(path.clone()),
+                            &current_input,
+                            planner,
+                            fold,
+                        )
+                        .await?
+                    {
+                        NodeExec::Completed(o) => Ok(o),
+                        NodeExec::Failed { message, .. } => Err(message),
+                        NodeExec::Paused { reason } => return Ok(NodeExec::Paused { reason }),
+                    }
+                }
             };
-            let output = match result {
+            let output = match output_res {
                 Ok(o) => o,
                 Err(message) => {
                     let msg = format!("loop {:?} failed at iteration {i}: {message}", loop_node.id);
-                    self.append(
-                        run,
-                        JournalEvent::NodeFailed {
-                            node: loop_node.id.clone(),
-                            error: msg.clone(),
-                        },
-                    )
-                    .await?;
-                    return Ok(NodeExec::Failed {
-                        message: msg,
-                        output: None,
-                    });
+                    return self.fail_loop(run, &loop_node.id, msg).await;
                 }
             };
             ran = i + 1;
             last_output = output.clone();
-            if gate.should_stop(&output) {
+            let stop = match gate {
+                GateSpec::Pure(g) => g.should_stop(&output),
+                // A gate-agent (§4.3/D3): drive it over this iteration's `output` at the
+                // reserved path `"{loop}/{i}/__gate__"`, then apply the pure `stop_when`
+                // to ITS answer (not the body output). The agent's own ReAct turns are
+                // journaled/memoized — no separate gate journaling — so a resume replays
+                // the identical Stop/Continue decision from the memo (no gateway re-call).
+                GateSpec::Agent { agent, stop_when } => {
+                    let gate_path = NodeId(format!("{path}/__gate__"));
+                    match self
+                        .drive_agent(run, &gate_path, agent, &output, &[], fold, None)
+                        .await?
+                    {
+                        AgentStep::Completed(ans) => stop_when.should_stop(&ans),
+                        // A gate-agent failure fails the Loop (like a body-iteration failure).
+                        AgentStep::Failed(m) => {
+                            let msg = format!(
+                                "loop {:?} gate agent failed at iteration {i}: {m}",
+                                loop_node.id
+                            );
+                            return self.fail_loop(run, &loop_node.id, msg).await;
+                        }
+                        // A gate-agent pause (in-doubt Mutation / quota) pauses the Loop.
+                        AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
+                    }
+                }
+            };
+            if stop {
                 converged = true;
                 break;
             }
@@ -460,14 +576,19 @@ impl Executor {
             // (so wrap as `{prompt: text}`), an `Agent` body renders its input
             // directly (so pass the text string). Threading the raw `{model, text}`
             // object instead would leave a ModelCall body with no `prompt` (an
-            // empty request every iteration) — a silent no-op refine.
+            // empty request every iteration) — a silent no-op refine. A `Subgraph`
+            // body does not thread (each iteration is a fresh re-run over `input`);
+            // an `Expand` body threads the whole output (its sink map) as the next
+            // planner input.
             let text = output
                 .get("text")
                 .cloned()
                 .unwrap_or_else(|| output.clone());
             current_input = match body {
-                MapBody::ModelCall { .. } => serde_json::json!({ "prompt": text }),
-                MapBody::Agent(_) => text,
+                LoopBody::ModelCall { .. } => serde_json::json!({ "prompt": text }),
+                LoopBody::Agent(_) => text,
+                LoopBody::Subgraph(_) => current_input,
+                LoopBody::Expand { .. } => output.clone(),
             };
         }
 
@@ -517,12 +638,11 @@ impl Executor {
         }
 
         let request = build_request(chain, item);
-        match self.gateway.execute(&request).await {
-            Ok(response) => {
-                let output = serde_json::json!({
-                    "model": response.model,
-                    "text": response.content.clone().unwrap_or_default(),
-                });
+        // SP-DATA-5: the Map-item producer routes through the single metered chokepoint.
+        match self.dispatch_metered(&request, &fold.meter()).await {
+            Ok(Ok(response)) => {
+                // SP-4 s2: scrub the Map-item model text via the shared chokepoint.
+                let output = self.model_output(&response);
                 let recorded = self.split_output(&output).await?;
                 self.append(
                     run,
@@ -534,10 +654,34 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
+                        // SP-DATA-5: the Map-item producer — the real usage the
+                        // provider reported, converted at the boundary.
+                        usage: response.usage.map(super::content::convert_usage),
                     },
                 )
                 .await?;
                 Ok(Ok(output))
+            }
+            // SP-DATA-5: refused before spending. A child has no pause channel in its
+            // inner `Result` (that carries only a manifest error message), so a budget
+            // pause rides OUT on `MapChildPaused` — the SAME signal an in-doubt
+            // Agent-child Mutation uses, which `run_map` folds into a whole-Map pause
+            // and `run_loop` into a Loop pause. Never swallowed into the manifest:
+            // that would let the Map complete over an un-run child. An unmetered call
+            // is an ordinary child failure and does land in the manifest.
+            Ok(Err(refusal)) => {
+                match self
+                    .record_refusal(run, &NodeId(path.to_string()), refusal)
+                    .await?
+                {
+                    super::dispatch::RefusalKind::Paused(reason) => {
+                        Err(OrchestratorError::MapChildPaused {
+                            node: NodeId(path.to_string()),
+                            reason,
+                        })
+                    }
+                    super::dispatch::RefusalKind::Failed(message) => Ok(Err(message)),
+                }
             }
             Err(error) => Ok(Err(error.to_string())),
         }

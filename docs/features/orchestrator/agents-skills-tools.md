@@ -47,12 +47,11 @@ source: crates/orchestrator*
 > (`PermissionNotGranted`); `Permissions::covers` is the shared predicate (path-prefix,
 > command subset, network `Any`/`Hosts`/`Deny` lattice, caps `need ≤ grant` with
 > grant-`None` = unlimited). Declarations are **inert** — not in the prompt/hash, tool
-> runtime unchanged. **Deferred to SP-4 (enforcement):** runtime gating on effective =
-> grant ∩ need, sandbox/workspace isolation, command deny-lists, secret redaction — and
-> hardening the declaration-layer coverage before it gates real access: **path matching
-> is raw string-prefix (not path-component-aware, and an empty grant path `""` = allow-all),
-> and `Hosts` matching is exact-host (no subdomain/wildcard)** — SP-4 must canonicalize
-> paths / reject empty allow-all grants / define host-wildcard semantics.
+> runtime unchanged this slice. **✅ SP-4 slice 1 turned these declarations into runtime
+> enforcement** (authorization gate + the `covers()` hardening — see the SP-4 note below).
+> **Still deferred (later SP-4 slices):** runtime *confinement* (a sandbox intercepting
+> fs/network so a tool that under-reports its needs can't exceed its grant) + resource-cap
+> *killing*, workspace isolation, command deny-lists, secret redaction.
 >
 > **SP-2 slice 4 — skill/tool activation policy (Q4):** skills/tools carry a
 > definition-level `Activation` (`Always` default, or `OnKeywords`) — `SkillDef`
@@ -79,6 +78,84 @@ source: crates/orchestrator*
 > byte-identical. **Deferred:** version-pinned resume, an `on_config_reloaded` hook,
 > file-watch/auto-reload, and a persistent cross-process config version (SP-DATA
 > `config_versions`).
+>
+> **SP-4 slice 1 — tool permission ENFORCEMENT (runtime authorization):** the SP-2‑s3
+> declarations now gate execution. In `execute_tool_effect` (the single chokepoint for
+> Pure/Observation/Mutation calls), a tool call is denied unless `tool ∈ agent.tools`
+> **and** `agent.grants[tool].covers(tool.required(args))`. **`Tool::required(&self,args)
+> -> Permissions`** (default = static `spec().permissions`) reports a call's **concrete**
+> needs, so a grant may be *narrower* than the tool's declared surface (a runtime
+> **ceiling**) — the load-time full-surface `validate` check is **dropped** (a narrow
+> grant is legal, enforced per-call). `covers()` is now **component-aware** (`/work` ⊄
+> `/workspace-secret`; empty grant path rejected; `..` rejected) with **host wildcards**
+> (`*.example.com`). A denial records a **Pure `EffectRecorded`** (no tool run; **no
+> `EffectIntent`** for a Mutation) and is fed back to the agent as a **terse** tool-result
+> error (never echoes the grant → confused-deputy defense) ⇒ a resume replays it from the
+> memo, tool never re-invoked. **Authorizes, does not confine:** a tool that under-reports
+> its `required` bypasses the gate — runtime confinement + cap-killing = the sandbox slice.
+> No-permission tools + agents that list them are byte-identical.
+>
+> **SP-4 credential broker — ephemeral secret injection:** lets a tool authenticate to an
+> external system **without the secret ever reaching the model or the durable journal**
+> (completes the SP-4 arc: s1 authorizes, s2 redacts outputs, s5 makes writes exactly-once,
+> the broker provides the credential out-of-band). A tool **declares** its credential refs
+> on `ToolSpec.credentials: Vec<String>` (alongside `permissions`); `record_tool_effect`
+> resolves each ref via an injected async **`CredentialBroker`** (`Executor::with_credential_broker`,
+> default none; demo `StaticCredentialBroker`, real impl wraps `vault::Vault`) and injects
+> the resolved **`Secret`**s (`Zeroizing<String>`, `[REDACTED]` Debug, audited `expose()`)
+> into `ToolContext.credentials: Arc<HashMap<String,Secret>>` — resolved **before** the sync
+> `call_ctx` (forced by the async-broker / sync-tool boundary). **Ephemeral:** never
+> journaled / hashed (`input_hash` is over `args`) / re-injected on a memoized resume (the
+> broker is not re-consulted for a replayed tool). **Echo-leak closed** by a per-call
+> exact-value scrub of the tool's output (pure over *this* call's output + creds — not a
+> run-wide set that would diverge on resume); it runs **before** the s2 pattern redactor so
+> a wrapped/composite secret can't be fragmented past the exact-value match. **Fail-loud:**
+> a declared ref with no broker / an unresolved (`None`) / an errored broker → journal
+> `NodeFailed` + `ToolOutcome::Failed`, tool never runs. **Confused-deputy safe:** a tool
+> sees only its *own* declared creds. **No broker + empty `credentials` ⇒ byte-identical.**
+> **Deferred:** sandbox egress confinement + resource-cap killing (blocked on the
+> tool-execution-model), the real vault-backed broker, per-tenant credential scoping.
+>
+> **SP-4 s3 — workspace isolation (in-process jail + real fs tools):** the first tools that
+> do REAL I/O — **`fs_write`** (Mutation) + **`fs_read`** (Observation) — confined to a durable
+> per-run `base/<run_id>/` workspace. `Executor::with_workspace_root(base)` (default none ⇒
+> byte-identical) resolves + **canonicalizes** the per-run dir and injects it into
+> `ToolContext.workspace_root`; a jail helper `confine(root, requested)` rejects
+> absolute/`..`/root components and defends symlink-out (lstat the deepest existing ancestor +
+> `starts_with` the canonical root — the lstat matters: `Path::exists` follows links, so a
+> *dangling* symlink would otherwise escape). Enforcement is two-sided: s1 authorizes
+> (`grant.covers(required(args))`, first) then the executor's jail pre-check confines every
+> declared path to the per-run root (an escape → a terse Pure denial, no side effect, no
+> `EffectIntent`, replayed on resume); the tools re-`confine` for defense in depth. The jail's
+> unique value over s1 is per-run **isolation** (distinct runs → distinct dirs) +
+> **canonicalization/symlink** defense (s1's `covers` is lexical). A completed `fs_write`
+> replays `{bytes,path}` from the memo on resume — not re-run, file not re-written; s2
+> redaction composes over real file content. **Honest limit:** an in-process tool that
+> BYPASSES the shared `confine` helper cannot be prevented (ambient authority) — bypass-proof
+> confinement + cpu/mem/wall cap-killing are the deferred subprocess sandbox.
+>
+> **SP-4 s4 — subprocess sandbox + resource-cap killing (macOS-first):** runs an EXTERNAL
+> command as a killable, OS-confined child — what the in-process jail can't do. A portable
+> `spawn_capped` (process-group + `setrlimit` + wall-timeout `kill(-pgid, SIGKILL)` + bounded
+> output capture) underlies a `Sandbox` trait; `MacosSandbox` (`#[cfg(macos)]`) wraps it in
+> `sandbox-exec` (WRITE confined to the per-run workspace, network `(deny network*)` per
+> `NetworkPolicy`). The built-in **`ShellTool`** (`shell`, Mutation) runs its argv through a
+> per-call **`BoundSandbox`** the executor builds from the agent's GRANT (caps/network) + the
+> per-run workspace — the tool supplies only argv and CANNOT widen the policy (finally enforcing
+> the `ResourceCaps`+`NetworkPolicy` s1 declared). `required(args)` gates `commands:[argv[0]]`
+> (strict argv, so the gated command == the executed one). **Fail-closed:** no sandbox / non-macOS
+> / no grant / no workspace ⇒ `shell` refuses loud — never an unconfined run (the Linux/CI-tested
+> path until a landlock backend lands). A completed `shell` replays from the memo on resume (not
+> re-spawned); stdout flows through s2 redaction. `Executor::with_sandbox`, default none ⇒
+> byte-identical. **Linux backend (landed):** a `LinuxSandbox` (`#[cfg(target_os="linux")]`) reaches
+> macOS parity UNPRIVILEGED — **landlock** confines WRITE to the per-run workspace (ABI V5 handles
+> TRUNCATE; broad read; `/dev/null` carve-out) and **seccomp** denies IP egress
+> (`socket(AF_INET|AF_INET6|AF_PACKET)` + `io_uring_setup` → EPERM) under `Deny`, built-in-parent /
+> applied-in-child via the `spawn_capped_with` seam, fail-closed (refuse if a mechanism can't be
+> enforced). Verified in a Docker Linux container + `ubuntu-latest` CI (the dev box is macOS).
+> **Deferred:** precise network host allowlists (an egress proxy — `Hosts` is coarse both
+> platforms), a `close_range` egress-hardening, a `shell` reconciler, an output-size cap,
+> read-confinement, cgroups, BSD `pledge`/`unveil`.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable

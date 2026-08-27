@@ -8,10 +8,22 @@ license = "MIT"
 [lib]
 name = "orchestrator_store"
 
+[features]
+# Postgres adapters (PostgresJournal/ContentStore/ContextStore). Off by default so the crate
+# stays dependency-light + the InMemory path is byte-identical; a deployment enables it.
+postgres = ["dep:sqlx"]
+# Exposes the UN-COUPLED config writers (`store`, `bump_config_version`). Production
+# code must use `store_and_bump` — a store-without-bump changes content without
+# advancing the generation, so a cross-process resume matches the unchanged fence and
+# silently runs the new config. Tests need the un-coupled pair to PROVE that.
+test-support = []
+
 [dependencies]
 orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }
 async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

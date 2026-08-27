@@ -37,6 +37,11 @@ struct AgentRun<'a> {
     tools: Vec<ToolDefinition>,
     min_win: Option<u32>,
     fold: &'a Fold,
+    // The acting agent's authorization surface (owned clones, built once per
+    // agent-node-run) — the SP-4 s1 gate in `execute_tool_effect` checks each tool
+    // call against these: the tool must be LISTED and its grant must COVER the need.
+    agent_tools: Vec<String>,
+    agent_grants: std::collections::HashMap<String, orchestrator_core::Permissions>,
 }
 
 impl Executor {
@@ -78,6 +83,8 @@ impl Executor {
             tools,
             min_win,
             fold,
+            agent_tools: agent.tools.clone(),
+            agent_grants: agent.grants.clone(),
         };
 
         let mut messages: Vec<Message> = vec![Message::text(MessageRole::User, query)];
@@ -200,7 +207,13 @@ impl Executor {
         }
         let request =
             build_chat_request(&ar.chain, &ar.system, messages.to_vec(), ar.tools.clone());
-        self.dispatch_model_turn(ar.run, ar.node_id, eid, ih, request)
+        // SP-DATA-5: the token ledger rides as the chokepoint's own `Meter` view rather
+        // than the (private, `mod.rs`-owned) `Fold`, so `dispatch_model_turn` stays
+        // independent of the fold's shape — and matches the chokepoint's own signature.
+        // It must be the LIVE view and not a pair of scalars: a ReAct node dispatches
+        // once PER TURN inside a single drive, so a frozen `spent` would let an agent
+        // burn all `max_steps` turns against the ledger as it stood before turn 0.
+        self.dispatch_model_turn(ar.run, ar.node_id, eid, ih, request, &ar.fold.meter())
             .await
     }
 
@@ -292,6 +305,11 @@ impl Executor {
         teid: &EffectId,
         call: &ToolCall,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        // Unparseable `arguments` degrade to `Null` (a deliberate, currently-safe
+        // posture): the gate then derives an EMPTY `need` (so it passes), but every
+        // tool's `call` fail-closes on missing/invalid args and a non-overriding tool
+        // falls back to its static surface — so no unauthorized side effect escapes. A
+        // future strict mode could instead deny outright on unparseable args.
         let args: serde_json::Value =
             serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
         let tih = tool_input_hash(&call.name, &call.arguments);
@@ -316,6 +334,63 @@ impl Executor {
             }
         }
 
+        // SP-4 s1 authorization gate: the acting agent must LIST this tool AND hold a
+        // grant covering the concrete permissions THIS call needs. Denials are fed
+        // back to the agent (recorded as a Pure effect ⇒ replayed on resume). Runs on
+        // the LIVE path only — a memo hit above already replayed a recorded allow/deny.
+        //
+        // Fail asymmetry: an *unauthorized* call is a SOFT, recoverable denial fed back
+        // to the agent (policy violation — the agent can adapt), whereas an *unknown*
+        // tool (listed+granted but absent from the ToolRegistry) HARD-fails the node via
+        // `execute_ctx` → `UnknownTool` (a misconfiguration — loud, not recoverable).
+        let need = self.tools.required_of(&call.name, &args);
+        let no_grant = orchestrator_core::Permissions::default();
+        let grant = ar.agent_grants.get(&call.name).unwrap_or(&no_grant);
+        let listed = ar.agent_tools.iter().any(|t| t == &call.name);
+        if !(listed && grant.covers(&need)) {
+            // Model-facing reason stays TERSE: NEVER enumerate the grant (the
+            // allowlist) into the transcript/journal — the denied party IS the model,
+            // and handing it the full allowlist invites a redirect to another granted
+            // resource (confused-deputy / injection surface). Operators get the full
+            // need/grant via the debug log.
+            let detail = if !listed {
+                format!("tool '{}' is not available to this agent", call.name)
+            } else {
+                format!(
+                    "the requested access for tool '{}' is not permitted by its grant",
+                    call.name
+                )
+            };
+            tracing::debug!(tool = %call.name, ?need, ?grant, listed, "tool permission denied");
+            return self
+                .record_denied_effect(ar, teid, call, &tih, detail)
+                .await;
+        }
+
+        // SP-4 s3 workspace confinement: when a per-run jail is wired, every concrete path
+        // THIS (s1-authorized) call declares must resolve WITHIN it. A declared escape is a
+        // terse denial — recorded Pure (like the s1 denial), no side effect, replayed on
+        // resume. The jail BINDS the abstract grant to a live per-run dir + canonicalizes
+        // real paths (per-run isolation + symlink defense — what s1's lexical `covers`
+        // cannot do). In-process ambient authority means this confines the DECLARED surface;
+        // a tool bypassing the shared helper is the (deferred) subprocess sandbox's job.
+        if !need.paths.is_empty()
+            && let Some(root) = self.workspace_root_for(ar.run)?
+        {
+            for p in &need.paths {
+                if crate::agent::workspace::confine(&root, p).is_err() {
+                    tracing::debug!(tool = %call.name, path = %p, "workspace jail escape denied");
+                    let detail = format!(
+                        "the requested path for tool '{}' is outside its workspace",
+                        call.name
+                    );
+                    return self
+                        .record_denied_effect(ar, teid, call, &tih, detail)
+                        .await;
+                }
+            }
+        }
+
         // Live path. A Mutation is two-phase (Intent → side effect → Recorded,
         // §7.3); Pure/Observation record directly (Observations carry
         // freshness/provenance so a later resume can decide replay-vs-re-read).
@@ -330,8 +405,16 @@ impl Executor {
                         .and_then(|s| s.source.clone())
                         .unwrap_or_else(|| call.name.clone()),
                 });
-                self.record_tool_effect(ar, teid, call, args, &tih, (class, observation))
-                    .await
+                self.record_tool_effect(
+                    ar,
+                    teid,
+                    call,
+                    args,
+                    &tih,
+                    &idempotency_key(teid, &tih),
+                    (class, observation),
+                )
+                .await
             }
         }
     }
@@ -348,26 +431,39 @@ impl Executor {
         args: serde_json::Value,
         tih: &str,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
-        if ar.fold.intents.contains(teid) {
+        if ar.fold.intents.contains_key(teid) {
             return self.reconcile_in_doubt(ar, teid, call, args, tih).await;
         }
-        // The `idempotency_key` is persisted in the Intent for a reconciler that
-        // reads the journal to decide (an SP-4 real provider); this executor
-        // recomputes it deterministically in `reconcile_in_doubt` rather than
-        // reading it back, so the two are guaranteed identical.
+        // The effective idempotency key: the tool's author key (a domain ref) if it
+        // overrides `Tool::idempotency_key`, else the structural
+        // `sha256(effect_id | args_hash)`. Journaled in the Intent AND threaded to the
+        // tool via `call_ctx` (so the tool sends the SAME key to its external API); on
+        // an in-doubt resume `reconcile_in_doubt` READS this journaled key back.
+        let key = self
+            .tools
+            .idempotency_key_of(&call.name, &args)
+            .unwrap_or_else(|| idempotency_key(teid, tih));
         self.append(
             ar.run,
             JournalEvent::EffectIntent {
                 node: ar.node_id.clone(),
                 effect_id: teid.clone(),
-                idempotency_key: idempotency_key(teid, tih),
+                idempotency_key: key.clone(),
                 args_hash: tih.to_string(),
                 seq: 0,
             },
         )
         .await?;
-        self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
-            .await
+        self.record_tool_effect(
+            ar,
+            teid,
+            call,
+            args,
+            tih,
+            &key,
+            (EffectClass::Mutation, None),
+        )
+        .await
     }
 
     /// Reconcile an in-doubt Mutation on resume (§7.3): ask the per-tool
@@ -385,13 +481,29 @@ impl Executor {
         args: serde_json::Value,
         tih: &str,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
-        let key = idempotency_key(teid, tih);
+        // SP-4 s5: READ the effective key the live run journaled in the Intent (an
+        // author override or the structural key) rather than recompute it, so the
+        // reconciler queries the provider under the SAME key the tool sent to its
+        // external API. The fallback is unreachable in practice (this arm runs only
+        // when `teid ∈ fold.intents`); it keeps the recompute as a defensive default.
+        let key = ar
+            .fold
+            .intents
+            .get(teid)
+            .cloned()
+            .unwrap_or_else(|| idempotency_key(teid, tih));
         let verdict = match self.reconcilers.get(&call.name) {
             Some(provider) => provider.reconcile(&key, &args).await?,
             None => ReconcileOutcome::Indeterminate,
         };
         match verdict {
             ReconcileOutcome::Confirmed(output) => {
+                // SP-4 s2: scrub the reconciler's output BEFORE journal + return (mirrors
+                // `record_tool_effect`). This is a recorded side-effect output — the same
+                // secret-bearing class as a live tool result — and run 1 recorded no
+                // `EffectRecorded` (in-doubt), so there is no memo to fence; redacting once
+                // keeps the journaled `split_output` and the returned value identical.
+                let output = self.redact(&output);
                 let recorded = self.split_output(&output).await?;
                 self.append(
                     ar.run,
@@ -403,14 +515,27 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
+                        // SP-DATA-5: stays None — `output` comes from a reconciler
+                        // querying the provider's SIDE (`ReconcileOutcome::Confirmed`),
+                        // never from an `InferenceResponse`, so there is no usage to
+                        // thread here.
+                        usage: None,
                     },
                 )
                 .await?;
                 Ok(ToolOutcome::Ok(output))
             }
             ReconcileOutcome::NotApplied => {
-                self.record_tool_effect(ar, teid, call, args, tih, (EffectClass::Mutation, None))
-                    .await
+                self.record_tool_effect(
+                    ar,
+                    teid,
+                    call,
+                    args,
+                    tih,
+                    &key,
+                    (EffectClass::Mutation, None),
+                )
+                .await
             }
             ReconcileOutcome::Indeterminate => {
                 let reason = format!("mutation in-doubt: {key}");
@@ -442,9 +567,96 @@ impl Executor {
         }
     }
 
+    /// Record a permission denial as the call's effect output — a Pure, memoize-
+    /// forever `EffectRecorded` with NO tool execution (and, for a Mutation, NO
+    /// `EffectIntent`) — and feed it back to the agent. The decision is a pure fn of
+    /// (config grant, call args) ⇒ a resume replays it from the memo, tool never run.
+    async fn record_denied_effect(
+        &self,
+        ar: &AgentRun<'_>,
+        teid: &EffectId,
+        call: &ToolCall,
+        tih: &str,
+        detail: String,
+    ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
+        let denial = serde_json::json!({
+            "error": "permission_denied",
+            "tool": call.name,
+            "detail": detail,
+        });
+        let recorded = self.split_output(&denial).await?;
+        self.append(
+            ar.run,
+            JournalEvent::EffectRecorded {
+                node: ar.node_id.clone(),
+                effect_id: teid.clone(),
+                class: EffectClass::Pure,
+                input_hash: tih.to_string(),
+                seq: 0,
+                output: recorded,
+                observation: None,
+                // SP-DATA-5: stays None — a denial never dispatches, so there is no
+                // provider response to report usage from.
+                usage: None,
+            },
+        )
+        .await?;
+        Ok(ToolOutcome::Ok(denial))
+    }
+
+    /// Resolve (and lazily create) the CANONICAL per-run workspace root, or `None` if no
+    /// base is wired. `create_dir_all` is idempotent (safe on resume); `canonicalize`
+    /// resolves symlinks in the base (e.g. macOS `/var`→`/private/var`) so the jail compares
+    /// canonical-to-canonical. Called on the LIVE path only (a memo hit replays without it).
+    pub(super) fn workspace_root_for(
+        &self,
+        run: RunId,
+    ) -> Result<Option<std::sync::Arc<std::path::PathBuf>>, OrchestratorError> {
+        let Some(base) = &self.workspace_root_base else {
+            return Ok(None);
+        };
+        let dir = base.join(run.0.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| OrchestratorError::Tool {
+            tool: "workspace".into(),
+            message: format!("create workspace {}: {e}", dir.display()),
+        })?;
+        let canon = dir.canonicalize().map_err(|e| OrchestratorError::Tool {
+            tool: "workspace".into(),
+            message: format!("canonicalize workspace {}: {e}", dir.display()),
+        })?;
+        Ok(Some(std::sync::Arc::new(canon)))
+    }
+
+    /// SP-4 s4: build a per-call `BoundSandbox` for `tool`, or `None` (⇒ the `shell` tool
+    /// refuses loud). Requires ALL THREE: a wired `Sandbox`, a resolved per-run workspace, AND a
+    /// grant for the tool — the grant's caps/network are the enforced policy (the tool supplies
+    /// only argv, so it can NEVER widen them). Any one missing ⇒ `None` ⇒ fail-closed.
+    fn bound_sandbox_for(
+        &self,
+        ar: &AgentRun<'_>,
+        tool: &str,
+        workspace: &Option<std::sync::Arc<std::path::PathBuf>>,
+    ) -> Option<std::sync::Arc<crate::agent::sandbox::BoundSandbox>> {
+        let inner = self.sandbox.clone()?;
+        let ws = workspace.clone()?;
+        let grant = ar.agent_grants.get(tool)?;
+        Some(std::sync::Arc::new(
+            crate::agent::sandbox::BoundSandbox::new(
+                inner,
+                ws,
+                grant.caps.clone(),
+                grant.network.clone(),
+            ),
+        ))
+    }
+
     /// Execute a tool live and journal its `EffectRecorded` (shared by all effect
     /// classes). On a tool error, journal `NodeFailed` and return the failure
     /// message. `observation` is `Some` only for Observation effects.
+    // The effect coordinates (id/call/args/hashes/key/class) are each distinct and
+    // passed positionally by the three call sites; bundling them behind a struct would
+    // only relocate the plumbing, so the arity is allowed here.
+    #[allow(clippy::too_many_arguments)]
     async fn record_tool_effect(
         &self,
         ar: &AgentRun<'_>,
@@ -452,6 +664,7 @@ impl Executor {
         call: &ToolCall,
         args: serde_json::Value,
         tih: &str,
+        idempotency_key: &str,
         record: (EffectClass, Option<ObservationMeta>),
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let (class, observation) = record;
@@ -460,8 +673,92 @@ impl Executor {
         if let Some(h) = &self.hooks {
             h.on_agent_tool_call(ar.run, ar.node_id, &call.name).await;
         }
-        match self.tools.execute(&call.name, args) {
+        // SP-4 broker: resolve the tool's DECLARED credential refs + inject into the ctx
+        // (ephemeral — never journaled/hashed). A declared ref that cannot be resolved (no
+        // broker, or the broker returns None) fails loud — never a silent missing credential.
+        let mut resolved = std::collections::HashMap::new();
+        if let Some(spec) = self.tools.spec_of(&call.name) {
+            for cred_ref in &spec.credentials {
+                let secret = match &self.credential_broker {
+                    // A broker that ERRORS (an infra failure, not a miss) fails LOUD as a node
+                    // failure — journal `NodeFailed` + return `Failed`, mirroring the `None`
+                    // arm below (journal-everything parity; never a raw run-level `Err`).
+                    Some(broker) => match broker.resolve(cred_ref).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let msg = format!(
+                                "tool '{}' requires credential '{}' but the broker errored: {}",
+                                call.name, cred_ref, e
+                            );
+                            self.append(
+                                ar.run,
+                                JournalEvent::NodeFailed {
+                                    node: ar.node_id.clone(),
+                                    error: msg.clone(),
+                                },
+                            )
+                            .await?;
+                            return Ok(ToolOutcome::Failed(msg));
+                        }
+                    },
+                    None => None,
+                };
+                match secret {
+                    Some(s) => {
+                        resolved.insert(cred_ref.clone(), s);
+                    }
+                    None => {
+                        let msg = format!(
+                            "tool '{}' requires credential '{}' but no broker resolved it",
+                            call.name, cred_ref
+                        );
+                        self.append(
+                            ar.run,
+                            JournalEvent::NodeFailed {
+                                node: ar.node_id.clone(),
+                                error: msg.clone(),
+                            },
+                        )
+                        .await?;
+                        return Ok(ToolOutcome::Failed(msg));
+                    }
+                }
+            }
+        }
+        // SP-4 s5: thread the effective idempotency key into the tool via `call_ctx`
+        // (journaled in the Intent for a Mutation; the structural key for Pure/
+        // Observation, which ignore it) so a real tool can send the SAME key to its
+        // external API for provider-side dedup. SP-4 broker: the resolved credentials
+        // ride alongside (ephemeral — never journaled/hashed, zeroized on drop).
+        // SP-4 s3: resolve the canonical per-run workspace root ONCE (a fs tool resolves its
+        // target within it via `confine`; `None` when no jail is wired ⇒ byte-identical) and
+        // reuse it below to also derive the s4 sandbox — avoiding a redundant resolve.
+        let workspace_root = self.workspace_root_for(ar.run)?;
+        // SP-4 s4: the per-call sandbox handle, policy-fixed by the executor from the grant's
+        // caps/network + this per-run workspace. `None` unless a `Sandbox` is wired AND a
+        // workspace is resolved AND the agent holds a grant for this tool ⇒ `shell` refuses loud.
+        let sandbox = self.bound_sandbox_for(ar, &call.name, &workspace_root);
+        let ctx = crate::agent::tools::ToolContext {
+            idempotency_key: idempotency_key.to_string(),
+            effect_id: teid.clone(),
+            credentials: std::sync::Arc::new(resolved),
+            workspace_root,
+            sandbox,
+        };
+        match self.tools.execute_ctx(&call.name, args, &ctx) {
             Ok(result) => {
+                // SP-4 broker: scrub the EXACT injected credential VALUES first. A tool echoes
+                // its own credential verbatim, so a whole-value match always succeeds here;
+                // doing this BEFORE the s2 pattern redactor prevents a wrapped/composite secret
+                // (whose high-entropy span the pattern would fragment) from partially surviving.
+                // Per-call + pure ⇒ a tool holds only its own creds, so this stays
+                // determinism-safe.
+                let result =
+                    super::content::scrub_secret_values(&result, &ctx.exposed_secret_values());
+                // SP-4 s2: then pattern-redact the residual. Both passes are pure ⇒ the
+                // journaled record and the value fed back to the agent are identical (live ==
+                // journaled == replayed).
+                let result = self.redact(&result);
                 let recorded = self.split_output(&result).await?;
                 self.append(
                     ar.run,
@@ -473,6 +770,10 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation,
+                        // SP-DATA-5: stays None — this records a TOOL execution
+                        // (`self.tools.execute_ctx`), not a model call, so there is no
+                        // `InferenceResponse` in scope to report usage from.
+                        usage: None,
                     },
                 )
                 .await?;
@@ -493,10 +794,18 @@ impl Executor {
         }
     }
 
-    /// Dispatch one live model turn through the gateway and journal its result:
-    /// on success, record the `{model, text, tool_calls}` output as a Pure effect
-    /// (`eid`) and return it; on a gateway error, journal `NodeFailed` and return
-    /// the failure message. The outer `Err` is a fatal journal/CAS error.
+    /// Dispatch one live model turn through the metered chokepoint and journal its
+    /// result: on success, record the `{model, text, tool_calls}` output as a Pure
+    /// effect (`eid`) and return it; on a refusal (SP-DATA-5 — an exhausted budget,
+    /// or an unmetered call under a budget) return the journaled pause/failure; on a
+    /// gateway error, journal `NodeFailed` and return the failure message. The outer
+    /// `Err` is a fatal journal/CAS error.
+    ///
+    /// `meter` is the run's live token ledger, passed as the chokepoint's borrowed view
+    /// so this helper does not depend on `Fold`'s shape.
+    // Six positional inputs, each distinct and read straight through to either the
+    // effect record or the chokepoint; bundling them would only relocate the plumbing.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_model_turn(
         &self,
         run: RunId,
@@ -504,14 +813,17 @@ impl Executor {
         eid: EffectId,
         ih: String,
         request: InferenceRequest,
+        meter: &super::dispatch::Meter<'_>,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
-        match self.gateway.execute(&request).await {
-            Ok(response) => {
-                let output = serde_json::json!({
-                    "model": response.model,
-                    "text": response.content.clone().unwrap_or_default(),
-                    "tool_calls": response.tool_calls,
-                });
+        match self.dispatch_metered(&request, meter).await {
+            Ok(Ok(response)) => {
+                // SP-4 s2: `model_output` builds `{model, text}` with `text` scrubbed
+                // (the single redaction chokepoint) before journal + feed-back; the
+                // ReAct path then appends `tool_calls` (the structured call args the
+                // next turn dispatches on) UNREDACTED so a redacted turn still drives
+                // its tools correctly. Same `{model, text, tool_calls}` shape as before.
+                let mut output = self.model_output(&response);
+                output["tool_calls"] = serde_json::json!(response.tool_calls);
                 let recorded = self.split_output(&output).await?;
                 self.append(
                     run,
@@ -523,11 +835,21 @@ impl Executor {
                         seq: 0,
                         output: recorded,
                         observation: None,
+                        // SP-DATA-5: the ReAct-turn producer — the real usage the
+                        // provider reported on this turn, converted at the boundary.
+                        usage: response.usage.map(super::content::convert_usage),
                     },
                 )
                 .await?;
                 Ok(ToolOutcome::Ok(output))
             }
+            // SP-DATA-5: the chokepoint refused before spending. `record_refusal`
+            // journaled it (`RunPaused` for an exhausted budget — the HOTL class —
+            // or `NodeFailed` for an unmetered call), so just carry it out.
+            Ok(Err(refusal)) => match self.record_refusal(run, node_id, refusal).await? {
+                super::dispatch::RefusalKind::Paused(reason) => Ok(ToolOutcome::Paused(reason)),
+                super::dispatch::RefusalKind::Failed(message) => Ok(ToolOutcome::Failed(message)),
+            },
             // A fully-gated chain with a timed re-eligibility (§11.2) is a durable
             // pause (resumable) — on resume the turn re-attempts (no `EffectRecorded`
             // was journaled). Every other gateway error fails the node.
