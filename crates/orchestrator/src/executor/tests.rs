@@ -14743,9 +14743,9 @@ mod human_gate {
     }
 
     /// An executor over a caller-owned journal, so a test can append a decision BETWEEN
-    /// two drives — the shape `torii run gate decide` will have when Task 7 adds it, and
-    /// the shape any library caller has today. The clock is handed back so a test can
-    /// move time past a deadline.
+    /// two drives — the shape `torii run gate decide` has (it appends `GateDecided`, then
+    /// force-wakes the run for a worker to drive), and the shape any library caller has.
+    /// The clock is handed back so a test can move time past a deadline.
     async fn exec_at(journal: &InMemoryJournal, now: DateTime<Utc>) -> (Executor, Arc<FakeClock>) {
         let clock = FakeClock::new(now);
         let (gw, _calls) = recording_gateway().await;
@@ -14931,7 +14931,7 @@ mod human_gate {
             .expect("drives");
         let (_n, message) = after.failed.expect("the gate STAYS failed");
         assert!(
-            message.contains("no decision"),
+            message.contains("passed its deadline"),
             "the expiry is read back, not replaced by the late answer: {message}"
         );
         assert!(
@@ -14956,12 +14956,13 @@ mod human_gate {
     /// COMPLETES carrying "ship": s1's self-approval-by-the-back-door, in the node kind
     /// whose entire purpose is a human decision.
     ///
-    /// The operator-facing cost is real, deliberate, and CURRENTLY UNMITIGATED: a mistyped
-    /// option is TERMINAL, because a `NodeFailed` on a waiting node is irreversible by
-    /// construction. Task 7's `torii run gate decide` will validate the option against the
-    /// journaled menu before appending anything, which is what will keep this path rare —
-    /// it does not exist yet, so at this commit a typo from any caller kills the run. The
-    /// executor is what keeps it SAFE either way; the CLI is what will keep it RARE.
+    /// The operator-facing cost is real and deliberate: a mistyped option is TERMINAL,
+    /// because a `NodeFailed` on a waiting node is irreversible by construction. `torii run
+    /// gate decide` now validates the option against the journaled menu before appending
+    /// anything, which is what keeps this path RARE — but it is not the authority, because
+    /// its check and its append are not atomic and a library caller (this test) bypasses it
+    /// entirely, so a typo from one still kills the run. The executor is what keeps it
+    /// SAFE either way; the CLI is what keeps it RARE.
     #[tokio::test]
     async fn a_corrected_decision_does_not_resurrect_a_failed_gate() {
         let journal = InMemoryJournal::new();

@@ -1032,7 +1032,7 @@ pub(crate) mod tests {
             run,
             JournalEvent::NodeFailed {
                 node: release(),
-                error: "human_gate: no decision for node release by 2026-08-26T00:00:00Z".into(),
+                error: "human_gate: node release passed its deadline 2026-08-26T00:00:00Z".into(),
             },
         )
         .await
