@@ -110,6 +110,21 @@ source: crates/orchestrator*
 >   PANICKED the executor on `now + timeout`; longer than a century is not a deadline, it is
 >   `None`. Operator surface: **`torii run signal <run> --node <id> (--payload | --payload-file)`**;
 >   `torii run list-paused` names every awaiting node and its deadline.
+> - **`HumanGate { options, timeout }`** (SP-6 s2, landing — the kind and its
+>   `validate_dag` rules are in; the executor arm, the fold and the CLI land later in
+>   this slice, so an author who writes one today gets a loud `NodeFailed`, not a run,
+>   until Task 5 lands). The TYPED layer over `AwaitSignal`: a human picks one of an
+>   enumerated menu, and each `GateOption` declares its own
+>   `GateOutcome` — `Complete` (the decision becomes the node's output, dependents run)
+>   or `Fail` (`NodeFailed`, hard-edge dependents cascade-skip). Output on `Complete` is
+>   `{"decision","actor","note"}`, which `BranchCond::FieldEquals("decision", …)` matches
+>   directly, so `Branch` is reused unchanged. The MENU IS DURABLE: `GateAwaited` journals
+>   the options the human was actually shown, so editing the graph cannot retroactively
+>   change what their answer meant. Answerable ONLY by `GateDecided` — a raw
+>   `SignalReceived` on a gate is ignored. `validate_dag` rejects an empty menu, duplicate
+>   or empty option names, a menu with no `Complete` option (a guaranteed dead end), and
+>   the same timeout bounds as `AwaitSignal`. Operator surface:
+>   `torii run gate approve|reject|decide`.
 
 A hierarchical, runtime-expandable graph. Node kinds: `Agent`, `Tool`, `Loop`,
 `Subgraph`, `Branch`, `Map`, `Consolidate`, `HumanGate`. Edges are typed

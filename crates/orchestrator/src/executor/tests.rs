@@ -14392,6 +14392,77 @@ mod await_signal {
     }
 }
 
+// ================================ SP-6 s2 HumanGate (Task 2) ============================
+
+/// `HumanGate` has no executor arm yet — Task 5 adds `run_human_gate`. This is Task 2's
+/// code-quality review, Important 1: `NodeKind::HumanGate { .. } => unimplemented!()` was
+/// a REACHABLE worker panic on a graph `validate_dag` had just certified well-formed
+/// (`run_inner`/`start_inner` both call it before ever reaching the `run_node` match),
+/// which is the exact poison-pill shape `submitting_an_unaddable_timeout_leaves_no_poison_row_in_the_scheduler`
+/// above already fixed once for `AwaitSignal`: `Scheduler::submit` enqueues the durable
+/// store row BEFORE the drive, so a panicking drive leaves a `(Waking, next_wake: None)`
+/// row that every later `tick()` reclaims and panics on again. `run_node` now fails the
+/// NODE loudly instead. This test pins the property that matters across the
+/// implementation boundary — "this node kind never panics" — not the specific `Failed`
+/// outcome: Task 5 replaces that expectation with a real decision-driven outcome, but
+/// must not reintroduce a panic to do it.
+mod human_gate {
+    use super::*;
+    use orchestrator_core::{GateOption, GateOutcome};
+
+    fn gate() -> NodeId {
+        NodeId("gate".into())
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_human_gate_fails_loudly_instead_of_panicking() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1");
+
+        let graph = Graph {
+            nodes: vec![Node {
+                id: gate(),
+                kind: NodeKind::HumanGate {
+                    options: vec![GateOption {
+                        name: "approve".into(),
+                        outcome: GateOutcome::Complete,
+                    }],
+                    timeout: None,
+                },
+                deps: vec![],
+            }],
+        };
+        graph.validate_dag().expect(
+            "a well-formed HumanGate is a valid graph — the panic this test guards \
+             against only happens on a graph validate_dag has certified",
+        );
+
+        let outcome = exec.run(run, &graph).await.expect(
+            "a not-yet-executable node kind fails the RUN; it must not error (let alone \
+             panic) the executor call itself",
+        );
+
+        let (node, message) = outcome
+            .failed
+            .expect("the node fails loudly rather than completing or hanging paused");
+        assert_eq!(node, gate());
+        assert!(
+            message.contains("gate"),
+            "the failure names the node: {message}"
+        );
+
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            events.iter().any(
+                |(_, e)| matches!(e, JournalEvent::NodeFailed { node, .. } if node == &gate())
+            ),
+            "the failure is journaled loudly, exactly as any other node failure is"
+        );
+    }
+}
+
 /// SP-DATA-1 (5/5) — the HEADLINE: cross-process durable resume + durable in-doubt reconcile,
 /// proven on a live Docker Postgres. Feature-gated (`postgres-tests`) AND `DATABASE_URL`-guarded,
 /// so the default suite is byte-identical and DB-free (each test `return`s early with no DB).
