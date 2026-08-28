@@ -1,39 +1,42 @@
 # Checkpoint
 
 **Slice:** SP-6 s3 `human-as-Agent`, the LAST slice of SP-6, on
-`feat/sp-6-s3-human-as-agent` (from `develop` at `771af25`). **All 7 tasks done
-(`f482d05`); the whole-slice review is the only thing left.**
+`feat/sp-6-s3-human-as-agent` (from `develop` at `771af25`). **All 7 tasks done; the
+whole-slice review's 16 findings are ALL fixed on top (`576bc1f`).**
 
 ## Done / remaining
 
-- **Tasks 1–7 ✅ implemented AND each reviewed, findings fixed on top:** 1 `AgentBacking` +
-  4 `validate()` rules (`fa070dd`, +7) · 2 the two journal events + `MAX_HUMAN_TEXT_BYTES`,
-  `FORMAT_VERSION` stays 1 (`864cb1f`, +3) · 3 the fold, answer last-wins / question
-  first-wins (`608b316`, +2) · 4 `executor/human.rs::run_human_agent`, the branch between
-  `assemble_prompt` and `resolve_chain` (`877bf96`, +2 High/7 Med) · 5 `torii run agent
-  answer` (`451be45`, +3) · 6 `list-paused` renders `agent: "<question>"` (`7fdb33e`, +2) ·
-  7 the cross-process e2e (`f482d05`).
-- **Task 7 ✅ AC13** — `n1 → review → n2`, `review` an ordinary top-level `NodeKind::Agent`;
-  the substitution is registry-only. Green on arrival, so RED came from 3 scratch mutations
-  (delete the answer-read → stays `Paused`; drop the `## Task` half → the row loses the input;
-  default-answer-on-any-drive → never pauses). Run for real on `postgres:16`/55434 with
-  `database/_apply_all.sql`: **7 passed / 0 failed, exit 0, ZERO skips**; `journal_events`
-  holds `AgentAwaited`=1, `AgentAnswered`=1.
-- **⬜ Remaining — the Final gate's last two rows:** AC1–AC17 red-before-fix evidence exists
-  per task in the commit messages but is not re-collated; and `/review-slice` plus a RE-review
-  of its fixes (s2's re-review found three HIGH defects introduced while fixing).
+- **Tasks 1–7 ✅** (`fa070dd` … `f482d05`) — see the commit messages for per-task detail.
+- **✅ Whole-slice review fixes, red-first, grouped by concern:**
+  - `d2e8145` `parse_fm_duration` is loud, never panics — byte-index `split_at` on `48ℏ`
+    and chrono's infallible `days`/`seconds` on `999999999999999d`; + the `parse_backing`
+    empty/list `timeout:` guard (mutation-verified both arms).
+  - `18d22e2` §5.5's top-level rule is a POSITION, not a caller — `drive`/`run_node` carry
+    `nested`, cleared by `drive_nested`; a one-node `Subgraph` used to bypass it entirely.
+    + the missing `run_consolidate` `MapBody::Agent` row (mutation-verified).
+  - `9b12470` a kind-swapped Agent node fails loudly instead of hanging unanswerably —
+    keyed on `Fold::prompt_for`, the mirror of `run_human_gate`'s missing-menu arm.
+  - `02d6794` `AgentAnswered.actor` is redacted before the durable write; `one_line(actor)`
+    now guarded (mutation-verified).
+  - `72fa55d` the question's two halves get two bounds: AUTHORED fails loudly at
+    `MAX_HUMAN_TEXT_BYTES`, `## Context` truncates at the new `MAX_HUMAN_CONTEXT_BYTES`
+    (32 KiB). + the prompt is redacted before the append. `assemble_prompt` split into
+    `assemble_prompt_parts` + `render_context_section`.
+  - `4423c83` + `576bc1f` doc/spec conformance (README, execution-graph, overview
+    decision log, spec §5.2/§5.4/§5.5/§6/AC15/AC17).
+- **⬜ Remaining:** a RE-review of these fixes (s2's re-review found three HIGH defects
+  introduced while fixing), then merge to `develop`.
 
-## Next command — `/review-slice`
+## Next command — re-review the review fixes, then merge to `develop`
+
 ## Open questions
 
-- Covered by nothing: a human-backed `AgentDefinition` through a live `PostgresConfigSource`
-  (the adjacent legs — serde of a `config_agents` row, and md → `Registry` — both exist).
-  Stated in `human_registry`'s doc in `crates/torii/tests/e2e_pg.rs`, not hidden.
+- Covered by nothing: a human-backed `AgentDefinition` through a live `PostgresConfigSource`.
 - The e2e suite is `DATABASE_URL`-gated and **counts as PASSED while exercising nothing**
   without it; a raw-stderr `SKIP` is the only signal. It cannot be `#[ignore]`d.
 
 ## Known-broken
 
-None. **1583 passed / 0 failed / 7 ignored, exit 0** (`env -u DATABASE_URL cargo test
---workspace`); clippy `-D warnings`, `fmt --check`, `cargo doc --no-deps` clean.
+None. **1590 passed / 0 failed / 7 ignored, exit 0** (`env -u DATABASE_URL cargo test
+--workspace`, +7 over the 1583 baseline); clippy `-D warnings` and `fmt --check` exit 0.
 `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it.
