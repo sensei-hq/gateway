@@ -429,7 +429,11 @@ mod tests {
                 4096,
             ),
             (
-                "two deps share the budget evenly",
+                // The EVEN-SPLIT property is proven by its own test below, not here: these
+                // three assertions (total size, heading, the word "truncated" somewhere) are
+                // all satisfied by the first dependency alone, so this case can only say
+                // that two deps stay within budget.
+                "two deps stay within budget",
                 vec![
                     ("a".into(), "A".repeat(50_000)),
                     ("b".into(), "B".repeat(50_000)),
@@ -479,6 +483,61 @@ mod tests {
                  though it were the whole: {out:?}"
             );
         }
+    }
+
+    /// The budget is split EVENLY, and every dependency is REPRESENTED — the property this
+    /// renderer exists for, and the one its doc calls load-bearing: "one verbose upstream
+    /// cannot crowd the others out of the question entirely — the human is shown something
+    /// from every node they were meant to consider."
+    ///
+    /// Re-review mutated the render loop to `entries.iter().take(1)` and the entire
+    /// workspace stayed green. The case above named for this rule asserts only the total
+    /// size, the section heading and that the word "truncated" appears somewhere — all three
+    /// of which the FIRST dependency alone satisfies. So a human-backed reviewer with N Hard
+    /// deps could have been shown only some of them, with nothing in the question saying the
+    /// rest were omitted: a direct breach of §5.4's "never show the human LESS than the
+    /// model would have had", and silent.
+    ///
+    /// Bodies are `X`/`Y`/`Z` because those are the only letters absent from every piece of
+    /// boilerplate this function emits (`## Context` contributes the one uppercase `C`), so
+    /// counting occurrences measures the SHARES and nothing else.
+    #[test]
+    fn a_bounded_context_section_splits_its_budget_evenly_across_dependencies() {
+        let entries = vec![
+            ("a".to_string(), "X".repeat(50_000)),
+            ("b".to_string(), "Y".repeat(50_000)),
+            ("c".to_string(), "Z".repeat(50_000)),
+        ];
+        let out = render_context_section_bounded(&entries, 4096);
+
+        let mut shares = Vec::new();
+        for (key, filler) in [("a", 'X'), ("b", 'Y'), ("c", 'Z')] {
+            assert!(
+                out.contains(&format!("### {key}")),
+                "dependency {key} was crowded out of the question entirely: {out:?}"
+            );
+            let shown = out.matches(filler).count();
+            assert!(
+                shown >= 100,
+                "dependency {key} got a heading and essentially no body ({shown} bytes), \
+                 which shows the human a name and none of the thing named"
+            );
+            shares.push(shown);
+        }
+
+        let (lo, hi) = (
+            *shares.iter().min().expect("three deps"),
+            *shares.iter().max().expect("three deps"),
+        );
+        assert!(
+            hi - lo <= 1,
+            "the budget is split EVENLY, not first-come-first-served: shares were {shares:?}"
+        );
+        assert!(
+            out.len() <= 4096,
+            "and the whole section still fits: {} bytes",
+            out.len()
+        );
     }
 
     /// The un-truncated renderer is the MODEL's, and it must stay byte-identical to what
