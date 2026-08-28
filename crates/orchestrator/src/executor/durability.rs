@@ -133,10 +133,15 @@ impl Executor {
     /// boundary a resume folds past; each completed node's output is carried as a
     /// ref-or-inline [`EffectOutput`] (large ones split into the CAS, keeping the
     /// snapshot lean). A backend without snapshot support no-ops (trait default).
+    ///
+    /// `fold` supplies the SP-DATA-5 ledger scalars. They are not derivable from
+    /// `outcome`, and a snapshot without them is only safe for as long as nothing
+    /// folds tail-only — see [`Snapshot::spent`].
     pub(super) async fn write_snapshot(
         &self,
         run: RunId,
         outcome: &RunOutcome,
+        fold: &super::Fold,
     ) -> Result<(), OrchestratorError> {
         let seq = self
             .journal
@@ -156,6 +161,11 @@ impl Executor {
             completed: outcome.completed.clone(),
             skipped: outcome.skipped.clone(),
             outputs,
+            // Journaled + this drive's live tally: the same total the gate reads, so a
+            // seeded resume starts from where the run actually is, not where its
+            // journal prefix left off.
+            spent: fold.spent(),
+            budget: fold.budget(),
         };
         self.journal
             .snapshot(run, snap)

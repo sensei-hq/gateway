@@ -1356,6 +1356,8 @@ mod tests {
             completed: vec![NodeId("n1".into())],
             skipped: vec![],
             outputs: vec![],
+            spent: 4242,
+            budget: Some(9000),
         };
         j.snapshot(r, snap).await.unwrap();
         let got = j
@@ -1365,6 +1367,12 @@ mod tests {
             .expect("snapshot present");
         assert_eq!(got.seq, s1);
         assert_eq!(got.completed, vec![NodeId("n1".into())]);
+        // The SP-DATA-5 ledger scalars survive the jsonb round trip. A snapshot that
+        // loses them is the un-capping defect `Snapshot::spent` documents, and it would
+        // be invisible here without an explicit assertion — the struct still
+        // deserializes, just with `#[serde(default)]` zeros.
+        assert_eq!(got.spent, 4242, "spend survives the round trip");
+        assert_eq!(got.budget, Some(9000), "the cap survives the round trip");
 
         // Latest wins: a second snapshot overwrites the first.
         let snap2 = Snapshot {
@@ -1372,6 +1380,8 @@ mod tests {
             completed: vec![NodeId("n1".into()), NodeId("n2".into())],
             skipped: vec![],
             outputs: vec![],
+            spent: 0,
+            budget: None,
         };
         j.snapshot(r, snap2).await.unwrap();
         assert_eq!(j.latest_snapshot(r).await.unwrap().unwrap().seq, s2);

@@ -941,7 +941,7 @@ impl Executor {
             // OUT-OF-BAND (no journal event, so the control-flow log stays
             // byte-identical). Written even on a fresh `run` — harmlessly unused
             // unless the run later crashes and resumes.
-            self.write_snapshot(run, &state.outcome).await?;
+            self.write_snapshot(run, &state.outcome, fold).await?;
         }
         // NOTE: `drive` does NOT append `RunCompleted` — that is a RUN-level event,
         // appended once by the run-level callers (`run_inner`/`start_inner`) via
