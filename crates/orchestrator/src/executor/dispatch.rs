@@ -260,10 +260,10 @@ impl Executor {
 /// The executor's [`ModelDispatch`]: the only provider access a
 /// [`PlannerSelector`](orchestrator_core::PlannerSelector) gets.
 ///
-/// Binds one selector call to one run + Expand node so it gates on the run's budget,
-/// charges the live meter and journals its spend exactly like the other four producers.
-/// The selector supplies only the prompts; it cannot widen the capability, pick a
-/// different provider, or skip the gate.
+/// Binds one `select()` to one run + Expand node so that EVERY call it makes gates on
+/// the run's budget, charges the live meter and journals its spend exactly like the
+/// other four producers. The selector supplies only the prompts; it cannot widen the
+/// capability, pick a different provider, or skip the gate.
 ///
 /// The selector's spend is journaled under the reserved
 /// [`RESERVED_SELECT_ID`](orchestrator_core::RESERVED_SELECT_ID) path rather than the
@@ -287,6 +287,22 @@ pub(super) struct SelectorDispatch<'a> {
     /// return `OrchestratorError`, which cannot carry the pause-vs-fail distinction, so
     /// the caller reads it back here rather than re-deriving it from a message.
     refusal: std::sync::Mutex<Option<RefusalKind>>,
+    /// How many calls this `select()` has made — the effect id's `local_index`.
+    ///
+    /// `ModelDispatch` is lent to an arbitrary `PlannerSelector`, so "one call per
+    /// `select()`" is `LlmPlannerSelector`'s habit, not the port's contract: a
+    /// shortlist-then-choose selector is the obvious second shape. Pinned to `0`, every
+    /// call after the first collided on one journal key and `fold_journal`'s keyed
+    /// `usage.insert` kept exactly one of them — the ledger under-counted a real spend,
+    /// which is the one thing an exact cap cannot survive.
+    ///
+    /// The index is assignment-ORDERED, so it is the memo key only for a selector that
+    /// dispatches SEQUENTIALLY (as the trait's "run one metered text completion"
+    /// implies). One that dispatches concurrently can see its calls numbered
+    /// differently across drives — and then a resume reads a mismatched `input_hash`
+    /// and halts `DeterminismViolation`. Loud, and the intended outcome: a selector
+    /// whose calls have no stable order has no stable replay either.
+    calls: AtomicU64,
 }
 
 impl<'a> SelectorDispatch<'a> {
@@ -297,6 +313,7 @@ impl<'a> SelectorDispatch<'a> {
             node,
             fold,
             refusal: std::sync::Mutex::new(None),
+            calls: AtomicU64::new(0),
         }
     }
 
@@ -306,7 +323,8 @@ impl<'a> SelectorDispatch<'a> {
         self.refusal.lock().expect("selector refusal lock").take()
     }
 
-    /// `"{node}/__select__"` — the reserved path this call's spend is journaled under.
+    /// `"{node}/__select__"` — the reserved path the selector's spend is journaled
+    /// under, one effect per call (`effect_id(path, 0, call_index)`).
     fn select_path(&self) -> String {
         format!("{}/{}", self.node.0, orchestrator_core::RESERVED_SELECT_ID)
     }
@@ -334,7 +352,11 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
         // not sum), so the durable ledger froze at one call's tokens while the run spent
         // without bound and the cap could never fire.
         let path = self.select_path();
-        let eid = orchestrator_core::effect_id(&path, 0, 0);
+        let eid = orchestrator_core::effect_id(
+            &path,
+            0,
+            self.calls.fetch_add(1, Ordering::Relaxed) as usize,
+        );
         let ih = super::support::input_hash(
             chain,
             &serde_json::json!({ "system": system, "user": user }),

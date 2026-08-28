@@ -12355,6 +12355,96 @@ async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
     );
 }
 
+/// A selector that dispatches TWICE per `select()` — the shortlist-then-choose shape
+/// the lent [`ModelDispatch`](orchestrator_core::ModelDispatch) port makes possible.
+/// Picks a NON-candidate so `PlannerSelected` is never journaled and the next drive
+/// re-enters the `Select` arm, exercising BOTH calls' memos.
+struct TwoCallSelector;
+#[async_trait::async_trait]
+impl orchestrator_core::PlannerSelector for TwoCallSelector {
+    async fn select(
+        &self,
+        _goal: &serde_json::Value,
+        _candidates: &[AgentRef],
+        dispatch: &dyn orchestrator_core::ModelDispatch,
+    ) -> Result<AgentRef, OrchestratorError> {
+        dispatch
+            .complete("shortlist", "narrow it down", Some("c"))
+            .await?;
+        dispatch.complete("choose", "pick one", Some("c")).await?;
+        Ok(AgentRef("ghost".into()))
+    }
+}
+
+/// EVERY call a selector makes through the lent capability lands on the ledger as its
+/// OWN effect, and replays as its own effect.
+///
+/// `ModelDispatch` is public and lent to an arbitrary `PlannerSelector`, so "one call
+/// per `select()`" is `LlmPlannerSelector`'s habit, not the port's contract. With the
+/// effect id pinned to `local_index = 0` every call after the first collided on one
+/// journal key: `fold_journal`'s keyed `usage.insert` kept exactly one of them, so the
+/// metering this slice makes "unrepresentable to bypass" was bypassed by calling the
+/// lent capability twice — and on the next drive call 0 read call 1's `input_hash` from
+/// the memo and failed `DeterminismViolation`.
+///
+/// *Mutation:* pin `SelectorDispatch`'s `local_index` back to `0` and this goes red on
+/// the ledger total (77, not 154) and on the distinct-id count (1, not 2).
+#[tokio::test]
+async fn every_dispatch_a_selector_makes_is_its_own_ledger_entry() {
+    let (gateway, calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 70,
+            total_tokens: 77,
+        }),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    journal
+        .append(run, run_started_with_budget(10_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(TwoCallSelector));
+
+    // Drive twice: the second drive must replay BOTH recorded calls, not re-dispatch
+    // either and not trip a determinism violation.
+    for i in 0..2 {
+        let out = exec.start(run, &graph).await.expect("drives");
+        assert!(
+            out.failed.is_some(),
+            "drive {i}: 'ghost' is no candidate: {out:?}"
+        );
+    }
+
+    let dispatched = calls.lock().unwrap().len() as u64;
+    assert_eq!(dispatched, 2, "two calls billed once, then replayed");
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        crate::spend_of(&events).0,
+        77 * dispatched,
+        "the ledger accounts for BOTH selector calls, not just the last"
+    );
+    let ids: std::collections::HashSet<_> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded {
+                node, effect_id, ..
+            } if node.0 == format!("e/{}", orchestrator_core::RESERVED_SELECT_ID) => {
+                Some(effect_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "each call is a DISTINCT effect: {ids:?}");
+}
+
 /// A round-boundary snapshot carries the run's LEDGER, not just its node progress.
 ///
 /// `Snapshot`'s own contract is that "a resume folds events with `Seq >` this". Nothing
