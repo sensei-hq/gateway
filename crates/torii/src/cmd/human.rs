@@ -706,6 +706,44 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// [`agent_question`] folds FIRST-wins, which its doc asserts and nothing guarded.
+    ///
+    /// Re-review flipped `events.iter().find_map(…)` to `events.iter().rev().find_map(…)`
+    /// and the whole workspace stayed green. The rule is stated at three sites — here, at
+    /// `cmd::run::awaiting_nodes`' fold, and in the executor's `Fold::agent_prompts` — and
+    /// was guarded only at the executor's.
+    ///
+    /// It is pinned as a UNIT contract deliberately, and the reason is worth writing down:
+    /// [`answer`] consumes only `is_some()` today, so the drift would be silent right up
+    /// until the first caller reads the VALUE — and that caller would then disagree with
+    /// what `list-paused` renders about which question is live. Two copies of one rule in
+    /// two crates only stay one rule if both are held.
+    /// `cmd::run::list_paused_shows_the_first_question_a_node_published` is the other half.
+    #[tokio::test]
+    async fn the_question_a_late_ask_cannot_restate() {
+        const RESTATED: &str = "Actually — approve the OTHER contract?";
+        let run = RunId(uuid::Uuid::new_v4());
+        let j = agent_journal(run, &reviewer(), None).await;
+        j.append(
+            run,
+            JournalEvent::AgentAwaited {
+                node: reviewer(),
+                deadline: None,
+                prompt: RESTATED.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = j.load(run).await.unwrap();
+        assert_eq!(
+            agent_question(&events, &reviewer()).as_deref(),
+            Some(THE_QUESTION),
+            "the human was shown the FIRST question, and a later ask must not retroactively \
+             change what their answer was to"
+        );
+    }
+
     /// The positive guard. Without it every refusal test below passes vacuously — a
     /// command that refused unconditionally would satisfy all of them.
     #[tokio::test]
