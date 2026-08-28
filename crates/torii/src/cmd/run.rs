@@ -498,8 +498,19 @@ pub(crate) fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> 
 /// Every node in this run that is currently awaiting a human, in node-id order so the
 /// rendering is deterministic run to run.
 ///
-/// Covers BOTH waiting kinds: an `AwaitSignal` (no menu) and a `HumanGate` (its menu, so
-/// an operator can see the choices without reading the graph).
+/// Covers ALL THREE waiting kinds, because [`signal_states`] folds all three `*Awaited`
+/// events: an `AwaitSignal`, a `HumanGate` and — since SP-6 s3 — a human-backed `Agent`.
+///
+/// **It does not yet tell the third apart from the first.** `options` is built only from
+/// `GateAwaited`, so a human-backed agent is rendered exactly as an `AwaitSignal` is: the
+/// `signal` cell, and no `--json` key of its own. That is wrong in a way an operator feels —
+/// `torii run signal` is REFUSED for this node kind ([`signal`] checks
+/// `cmd::human::agent_question` first), so the listing currently points at a command that
+/// cannot work. Closing it means carrying `AgentAwaited.prompt` through
+/// [`render::AwaitingNode`] as its own field, and the JSON discriminator rule
+/// [`render::AwaitingNode::options`] documents has to be restated at the same time.
+/// `list_paused_does_not_yet_tell_a_human_backed_agent_from_an_await_signal` pins the gap so
+/// it cannot be forgotten, and inverts when it is closed.
 fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
     let menus: HashMap<NodeId, Vec<String>> = events
         .iter()
@@ -1313,6 +1324,9 @@ pub(crate) mod tests {
     // The `GateAwaited` fixtures live beside `cmd::gate`'s own tests — see that module's
     // doc comment for why the reuse runs in both directions.
     use crate::cmd::gate::tests::{gate_journal, release};
+    // Likewise `cmd::human`'s `AgentAwaited` fixture: the listing tests must fold the SAME
+    // shape the command that answers it folds, or the two drift silently.
+    use crate::cmd::human::tests::{agent_journal, reviewer};
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::{EffectClass, EffectId, EffectOutput, Graph, NodeId, TokenUsage};
     use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
@@ -3946,6 +3960,80 @@ pub(crate) mod tests {
         assert!(
             signal_row.contains("signal"),
             "…and must still say what it IS waiting for: {signal_row}"
+        );
+    }
+
+    // ---- SP-6 s3: a human-backed `Agent` in the listing -------------------------------
+
+    /// The third waiting kind must be VISIBLE. `signal_states`' `AgentAwaited` arm is the
+    /// only thing that puts a human-backed agent in the awaited set, and until this test
+    /// nothing in `list-paused` exercised it — dropping that arm reddened nine `cmd::human`
+    /// tests and zero listing tests, so the arm's stated purpose ("without it the node never
+    /// appears in `list-paused` at all") was guarded by nothing that renders a listing.
+    ///
+    /// An operator cannot answer what they cannot see, and this kind is the one where that
+    /// bites hardest: a human-backed agent can pause INDEFINITELY (`AgentBacking::Human`
+    /// with no timeout ⇒ `resume_after: None` ⇒ a NULL `next_wake` the durable scheduler
+    /// never auto-wakes), so nothing but this listing will ever mention it again.
+    #[tokio::test]
+    async fn list_paused_names_a_human_backed_agent() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert_eq!(out.code, EXIT_OK);
+        let row = out
+            .text
+            .lines()
+            .filter(|l| l.starts_with(&run.0.to_string()))
+            .find(|l| l.split_whitespace().nth(1) == Some("reviewer"))
+            .unwrap_or_else(|| panic!("no awaiting row for the agent:\n{}", out.text))
+            .to_string();
+        assert!(
+            row.contains("waits until signalled"),
+            "an agent with no timeout is never auto-woken, so the row must say it waits for \
+             a human rather than leaving the deadline cell blank: {row}"
+        );
+    }
+
+    /// **A KNOWN GAP, asserted so it cannot be forgotten — Task 6 closes it and this test
+    /// INVERTS.** It is written as an assertion rather than a comment because the last seven
+    /// defects in this feature were all "the prose says one thing, the code does another".
+    ///
+    /// Today a human-backed agent is listed, but nothing distinguishes it from an
+    /// `AwaitSignal`: `awaiting_nodes` builds `options` only from `GateAwaited`, and
+    /// `render::awaiting_section` renders a `None` menu as the literal cell `signal` —
+    /// pointing the operator at `torii run signal`, which `cmd::run::signal` REFUSES for
+    /// exactly this node (`signal_on_a_human_backed_agent_is_refused_and_points_at_run_
+    /// agent_answer`). The `--json` contract has the same hole: `AwaitingNode::options`
+    /// documents key ABSENCE as the discriminator meaning "an `AwaitSignal`", and a script
+    /// following that rule will issue the refused command.
+    ///
+    /// When Task 6 lands `AgentAwaited.prompt` in the listing, this test becomes the
+    /// positive form — the row names the question and the kind — rather than being deleted.
+    #[tokio::test]
+    async fn list_paused_does_not_yet_tell_a_human_backed_agent_from_an_await_signal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert!(
+            !out.text.contains("Does this release look safe to ship?"),
+            "the question is not rendered yet — if it now is, invert this test and re-word \
+             `run agent`'s help, which was softened for exactly this reason:\n{}",
+            out.text
+        );
+
+        let json = list_paused(&s, &j, true).await.expect("lists");
+        let parsed: serde_json::Value = serde_json::from_str(&json.text).expect("valid JSON");
+        let node = parsed[0]["awaiting"][0].clone();
+        assert_eq!(node["node"], "reviewer", "the node is in the JSON: {node}");
+        assert!(
+            node.get("options").is_none() && node.get("question").is_none(),
+            "no key tells a script this is a human-backed agent — the gap Task 6 closes: \
+             {node}"
         );
     }
 

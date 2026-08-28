@@ -561,6 +561,49 @@ fn run_help_lists_agent() {
     );
 }
 
+/// The help must describe the surface that SHIPS, not the one that is planned.
+///
+/// Both `run agent --help` and `run agent answer --help` told an operator that
+/// `torii run list-paused` "shows the question the human was actually asked". It does not:
+/// `render::AwaitingNode` carries `{node, deadline, options}` and `cmd::run::awaiting_nodes`
+/// never reads `AgentAwaited.prompt`, so the listing names the waiting node and says nothing
+/// about what it asked. An operator who runs the command the help names and finds no
+/// question concludes the tool is broken — or, worse, that this node is not the one waiting.
+///
+/// This exact class of defect — a CLI help sentence describing behaviour the command does
+/// not have — has been caught SEVEN times in this feature, which is why it is a test on the
+/// rendered help rather than a promise to keep the prose honest.
+///
+/// **This assertion is expected to FLIP when the question actually lands.** When
+/// `AwaitingNode` grows a `question` and the awaiting row renders it, the right change is to
+/// re-word the help AND turn this into its positive form (assert both surfaces DO name the
+/// question) — not to delete it. The pointer at `list-paused` must survive either way: it is
+/// the only way an operator discovers a node id without reading the graph.
+#[test]
+fn agent_help_promises_only_what_list_paused_actually_shows() {
+    for args in [
+        vec!["run", "agent", "--help"],
+        vec!["run", "agent", "answer", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("list-paused"),
+            "`{}` must still point at the command that names the waiting nodes — it is the \
+             only way to discover a node id without reading the graph:\n{text}",
+            args.join(" ")
+        );
+        assert!(
+            !text.to_lowercase().contains("question"),
+            "`{}` promises a question `list-paused` does not render — `AwaitingNode` is \
+             `{{node, deadline, options}}` and `awaiting_nodes` never reads \
+             `AgentAwaited.prompt`:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
 /// The trust boundary must be on the surface an operator reads when they type the flag.
 /// It matters MORE here than on `run gate`: a gate's actor is an audit trail, whereas this
 /// one is folded into the node's OUTPUT (`{"text","actor"}`) and flows into every
