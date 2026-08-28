@@ -122,6 +122,12 @@ Everything routed through the executor's own gateway on the same `run_id`: Map c
 `Subgraph`s, and the planner sub-run at `{expand}/__plan__`. A planner that burns the budget counts
 against it.
 
+> **SUPERSEDED (post-SP-6 budget-completeness pass).** This gap is CLOSED. The selector no longer
+> holds a gateway: a core `ModelDispatch` trait is lent to `select()`, so its call is gated, metered
+> and journaled under a reserved `"{expand}/__select__"` path like every other producer. The rest of
+> this section is the design-time record of why it was deferred, kept for the reasoning, not as a
+> description of the code. See the SP-DATA entry in `orchestrator-overview.md` §5.
+
 **Known gap, found during Task 3 and deliberately not closed: `LlmPlannerSelector::select` is
 unbudgeted and invisible to the ledger.** It is a fifth model-call site
 (`crates/orchestrator/src/executor/selector.rs:70`) that the chokepoint cannot reach by construction:
