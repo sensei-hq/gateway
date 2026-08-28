@@ -10,12 +10,13 @@ use orchestrator_core::{
     ObservationMeta, OrchestratorError, ReconcileOutcome, RunId, effect_id, idempotency_key,
 };
 
+use super::human::HumanQuestion;
 use super::support::{
     GatewayDisposition, agent_input_hash, build_chat_request, classify_gateway_error,
     est_prompt_tokens, render_input, tool_input_hash,
 };
 use super::{AgentStep, Executor, Fold};
-use crate::agent::prompt::{assemble_prompt, over_budget};
+use crate::agent::prompt::{assemble_prompt_parts, over_budget, render_context_section};
 
 /// The 3-way outcome of one tool effect (or one ReAct turn's tools, §7.3): a
 /// value/transcript, a node failure (already journaled `NodeFailed`), or a durable
@@ -83,14 +84,20 @@ impl Executor {
             .agent(&agent_ref.0)
             .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
         let query = render_input(input);
-        let (system, tools) = assemble_prompt(&self.registry, agent, context, &query)?;
+        // `assemble_prompt_parts`, not `assemble_prompt`: the human path needs the two
+        // halves SEPARATE (author-controlled vs. run data — see `HumanQuestion`), and the
+        // model path re-joins them one line below, exactly as `assemble_prompt` does. Every
+        // activation and unknown-ref rule still lives in `assemble_prompt_parts` alone, so
+        // the two paths cannot drift on what "the agent's prompt" means.
+        let parts = assemble_prompt_parts(&self.registry, agent, context, &query)?;
 
         // SP-6 s3: a human-backed role answers instead of a model. The branch sits HERE —
-        // AFTER `assemble_prompt`, which needs no chain, so the human's question reuses the
+        // AFTER prompt assembly, which needs no chain, so the human's question reuses the
         // model path's own prompt assembly rather than a second implementation that could
         // drift from it; and BEFORE `resolve_chain`, so no chain is resolved, no gateway is
-        // touched and zero token spend is STRUCTURAL rather than measured. (`assemble_prompt`
-        // is not the WHOLE question — see the composition below, which adds the node input.)
+        // touched and zero token spend is STRUCTURAL rather than measured. (The assembled
+        // prompt is not the WHOLE question — see `HumanQuestion::compose`, which adds the
+        // node input and bounds the context section.)
         //
         // `on_agent_started` does NOT fire on this path, deliberately: the hook's
         // signature requires `&ar.chain`, and a human-backed agent by construction never
@@ -166,31 +173,39 @@ impl Executor {
                 ));
             }
 
-            // The QUESTION is the model-EQUIVALENT one, which is `assemble_prompt`'s output
-            // plus the node's input — not `assemble_prompt`'s output alone.
+            // The QUESTION is the model-EQUIVALENT one: the assembled prompt PLUS the node's
+            // input, with the `## Context` half bounded. `HumanQuestion::compose` owns both
+            // decisions and documents them; the two facts that belong here are why the input
+            // is added at all, and why the composition is not just a `format!`.
             //
-            // `assemble_prompt` returns `(system, tools)`: `system_prompt` + activated skill
-            // bodies + the rendered `## Context` section. It takes `query` only to evaluate
-            // each skill's/tool's `activation.is_active(query)` and never puts it in the
-            // string it returns. The model path supplies the input SEPARATELY, as the first
-            // user message (`Message::text(MessageRole::User, query)`, below). So journaling
-            // `system` alone showed the human the role's standing instructions and the
-            // upstream context but NOT the thing being asked about — a reviewer role reading
-            // "say whether the contract permits sub-processing" with no contract named.
-            // Design §5.4's rule is "the human sees precisely what the model would have",
-            // and its accepted cost is explicitly one-directional: never show the human
-            // LESS than the model would have had.
+            // `assemble_prompt_parts` takes `query` only to evaluate each skill's/tool's
+            // `activation.is_active(query)` and never puts it in `authored`. The model path
+            // supplies the input SEPARATELY, as the first user message
+            // (`Message::text(MessageRole::User, query)`, below). So journaling the system
+            // string alone showed the human the role's standing instructions and the upstream
+            // context but NOT the thing being asked about — a reviewer role reading "say
+            // whether the contract permits sub-processing" with no contract named. Design
+            // §5.4's rule is "the human sees precisely what the model would have", and its
+            // accepted cost is explicitly one-directional: never show the human LESS than the
+            // model would have had.
             //
-            // `## Task` mirrors `assemble_prompt`'s own `## Context` heading so the two
-            // sections read as one document. The composed string — not `system` — is what
-            // `run_human_agent` bounds against `MAX_HUMAN_TEXT_BYTES`, so the durable row is
-            // bounded as a whole rather than in the part.
-            let question = format!("{system}\n\n## Task\n{query}");
+            // It is a type rather than a `format!` because the two halves must be bounded by
+            // DIFFERENT rules — the authored half fails loudly, the context half truncates —
+            // and once they are concatenated that distinction is unrecoverable. Charging one
+            // cap against both is precisely the defect the s3 whole-slice review found.
+            let question = HumanQuestion::compose(&parts.authored, &parts.context, &query);
             return Ok(step(
                 self.run_human_agent(run, node_id, &question, timeout, fold)
                     .await?,
             ));
         }
+
+        // The model path re-joins what `assemble_prompt_parts` split, which is exactly what
+        // `assemble_prompt` used to do inline — so this string is byte-identical to the
+        // pre-s3-review one, and the `## Context` truncation above is unreachable from here.
+        let mut system = parts.authored;
+        system.push_str(&render_context_section(&parts.context));
+        let tools = parts.tools;
 
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();
         let min_win = self.gateway.min_context_window(&chain).await;

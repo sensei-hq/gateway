@@ -14,10 +14,72 @@
 //! A new file rather than more of `agent.rs`, matching how s2 put `run_human_gate` in
 //! its own `gate.rs`: `agent.rs` is the model path and stays that.
 
-use orchestrator_core::{JournalEvent, MAX_HUMAN_TEXT_BYTES, NodeId, OrchestratorError, RunId};
+use orchestrator_core::{
+    JournalEvent, MAX_HUMAN_CONTEXT_BYTES, MAX_HUMAN_TEXT_BYTES, NodeId, OrchestratorError, RunId,
+};
+
+use crate::agent::prompt::{render_context_section_bounded, truncate_prompt_to_bound};
 
 use super::signal::WaitState;
 use super::{Executor, Fold, NodeExec};
+
+/// The question a human-backed node asks, carried as one string PLUS the count of its bytes
+/// the config author actually controls.
+///
+/// The split is the whole point, and it is the s3 whole-slice review's central finding.
+/// `MAX_HUMAN_TEXT_BYTES` used to be charged against the entire composed question, including
+/// the `## Context` section — which `assemble_prompt` renders from every Hard dependency's
+/// full materialized output, verbatim and untruncated. A human-backed node downstream of any
+/// node that produced ~1000 tokens therefore failed TERMINALLY, after the upstream tokens
+/// were already spent, with a message naming three config fields that were not the cause and
+/// no operator escape (`gate_precheck_by_id` reads the `NodeFailed` back on every later
+/// drive, so the run can never be revived). Review measured 4126 bytes on a role with a
+/// 60-byte system prompt, no skills and a 12-byte input.
+///
+/// So the two halves are bounded by two different RULES:
+/// - the AUTHORED bytes fail loudly against `MAX_HUMAN_TEXT_BYTES` — a config error, and the
+///   person who wrote the config can act on it;
+/// - the `## Context` bytes are TRUNCATED, per dependency and with a visible marker, to
+///   [`MAX_HUMAN_CONTEXT_BYTES`] — run data, degraded honestly rather than fatally.
+///
+/// Carried as `(text, authored_bytes)` rather than as three fields because the ORDER of the
+/// pieces is the model's own (`system_prompt` + skills + `## Context` + `## Task` + input),
+/// so the authored bytes are not contiguous and cannot be re-derived by the bounding code.
+pub(super) struct HumanQuestion {
+    /// The whole question, in the order a model would have received it, with the
+    /// `## Context` section already bounded.
+    text: String,
+    /// How many of `text`'s bytes are author-controlled — everything except `## Context`.
+    authored_bytes: usize,
+}
+
+impl HumanQuestion {
+    /// Compose the model-EQUIVALENT question from `assemble_prompt`'s two halves plus the
+    /// node's input, bounding the context half on the way.
+    ///
+    /// `## Task` mirrors `assemble_prompt`'s own `## Context` heading so the two sections
+    /// read as one document, and the input is present at all because the model path supplies
+    /// it separately (as the first user message) — journaling `assemble_prompt`'s output
+    /// alone showed the human the role's standing instructions and the upstream context but
+    /// NOT the thing being asked about. Design §5.4's rule is "the human sees precisely what
+    /// the model would have", with an explicitly one-directional cost: never show the human
+    /// LESS than the model would have had.
+    pub(super) fn compose(authored: &str, context: &[(String, String)], query: &str) -> Self {
+        let task = format!("\n\n## Task\n{query}");
+        let mut text = String::with_capacity(authored.len() + task.len());
+        text.push_str(authored);
+        let authored_bytes = text.len() + task.len();
+        text.push_str(&render_context_section_bounded(
+            context,
+            MAX_HUMAN_CONTEXT_BYTES,
+        ));
+        text.push_str(&task);
+        Self {
+            text,
+            authored_bytes,
+        }
+    }
+}
 
 impl Executor {
     /// Execute one human-backed `Agent` node.
@@ -68,7 +130,7 @@ impl Executor {
         &self,
         run: RunId,
         node_id: &NodeId,
-        prompt: &str,
+        question: &HumanQuestion,
         timeout: Option<chrono::Duration>,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
@@ -105,37 +167,81 @@ impl Executor {
         //    early-answer race, AC6) is still resolved in this same execution and there is
         //    never an answer to a question the durable record does not show being asked.
         if let WaitState::NotYetAsking(fresh) = &state {
-            // Bound the QUESTION before it becomes durable. The caller composes it from
-            // the system prompt + every activated skill + the rendered `## Context` section
-            // + the node's input, routinely multi-KB, so this is a real constraint rather
-            // than a theoretical one. `torii` bounds the operator-supplied side at its CLI
-            // boundary (`cmd::run::check_payload_size` against `MAX_PAYLOAD_BYTES`, the
-            // same 4096) and can simply refuse the command; the executor has no such
-            // boundary — it is already inside a durable run — so an over-bound prompt fails
-            // the NODE loudly. A question too large to journal is a malformed agent config,
-            // and failing here is what keeps a multi-megabyte string out of the journal,
-            // out of `torii run status`, and out of every later fold of this run.
+            // Bound the AUTHORED part of the question before it becomes durable — the
+            // agent's `system_prompt`, every activated skill body, and the node's input.
+            // Routinely multi-KB, so this is a real constraint rather than a theoretical
+            // one. `torii` bounds the operator-supplied side at its CLI boundary
+            // (`cmd::run::check_payload_size` against `MAX_PAYLOAD_BYTES`, the same 4096)
+            // and can simply refuse the command; the executor has no such boundary — it is
+            // already inside a durable run — so an over-bound AUTHORED prompt fails the
+            // NODE loudly. That much really is a malformed agent config, and it is
+            // actionable by the person who wrote it.
             //
-            // Guarded by `an_oversized_assembled_prompt_fails_the_node_before_it_is_
-            // journaled`. It exists because review deleted this condition and the whole
-            // workspace stayed green: AC10 is assigned to Task 5, but Task 5 covers
-            // `--text` at the CLI boundary, which is the OTHER half of the same AC and a
-            // different code path — nothing was going to test this one.
-            if prompt.len() > MAX_HUMAN_TEXT_BYTES {
+            // **The `## Context` section is deliberately NOT counted here**, and that is
+            // the s3 whole-slice review's central fix. It is composed from every Hard
+            // dependency's full materialized output — RUN DATA, which no operator can bound
+            // at config time — so charging it against a cap whose breach is a terminal
+            // `NodeFailed` made an ordinary verbose model answer unrecoverable: the node
+            // died after the upstream tokens were already spent, `gate_precheck_by_id` read
+            // the failure back on every later drive, and the message blamed three config
+            // fields that were not the cause. Review measured 4126 bytes for a role with a
+            // 60-byte system prompt, no skills and a 12-byte input; the codebase's own
+            // default `cas_threshold` is also 4096, i.e. a >4 KiB effect output is normal
+            // enough here to warrant CAS SPLITTING rather than refusal. `HumanQuestion::
+            // compose` truncates that half to `MAX_HUMAN_CONTEXT_BYTES` instead, per
+            // dependency and with a visible marker, so a verbose upstream degrades the
+            // question rather than killing the run.
+            //
+            // Guarded by `an_oversized_authored_prompt_fails_the_node_before_it_is_
+            // journaled` (this arm) and `a_verbose_upstream_output_truncates_the_question_
+            // instead_of_killing_the_node` (the other half). The first exists because review
+            // deleted this condition and the whole workspace stayed green; the second
+            // because the first used a giant SKILL body — static config — and so could not
+            // see the dynamic case at all.
+            if question.authored_bytes > MAX_HUMAN_TEXT_BYTES {
                 return self
                     .fail_human_agent(
                         run,
                         node_id,
                         format!(
-                            "human_agent: node {}'s assembled prompt is {} bytes, over \
-                             the {MAX_HUMAN_TEXT_BYTES}-byte limit — trim the agent's \
-                             system prompt, its skills or the node input",
-                            node_id.0,
-                            prompt.len()
+                            "human_agent: node {}'s authored prompt is {} bytes, over the \
+                             {MAX_HUMAN_TEXT_BYTES}-byte limit — trim the agent's system \
+                             prompt, its skills or the node input. (The `## Context` \
+                             section rendered from upstream outputs is NOT counted here: \
+                             it is run data, and it is truncated to fit its own \
+                             {MAX_HUMAN_CONTEXT_BYTES}-byte budget rather than failing \
+                             the node.)",
+                            node_id.0, question.authored_bytes
                         ),
                     )
                     .await;
             }
+
+            // Redact BEFORE the durable write, not only at display time.
+            //
+            // Design §6 lists "the prompt" among the strings that go through the redactor
+            // before the durable write, and s3 shipped `prompt: prompt.to_string()` — so
+            // the journal row was the ONE place a credential sitting in an agent's
+            // `system_prompt`, an activated skill body, the rendered `## Context` section or
+            // the node input landed in the clear. Nothing upstream scrubbed it either:
+            // `torii config push` redacts nothing, and `render::redact_question` only
+            // cleaned it up on the way to a terminal. Nothing operational is lost by doing
+            // it here — the only surface that displays a question already shows the
+            // redacted form, so this makes the durable row match what the human sees.
+            //
+            // The chokepoint was one function away the whole time: `fail_human_agent` calls
+            // `redact_text` on every failure message.
+            //
+            // Then clamp, because `[REDACTED]` is LONGER than the shortest span it replaces
+            // and can push a question that fitted over the bound. Clamping rather than
+            // failing is deliberate: the author-error diagnosis has already happened above,
+            // and turning "your prompt contained a secret" into a terminal run would
+            // reintroduce the data-dependent death this whole change removes.
+            let prompt = truncate_prompt_to_bound(
+                self.redact_text(question.text.clone()),
+                MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES,
+            );
+
             // The node-keyed record of WHICH node is asking, WHAT it asked, and — the
             // durable home of — BY WHEN. It is written at all because `RunPaused` is not
             // node-keyed, and a run pauses for many unrelated reasons over its life.
@@ -144,7 +250,7 @@ impl Executor {
                 JournalEvent::AgentAwaited {
                     node: node_id.clone(),
                     deadline: *fresh,
-                    prompt: prompt.to_string(),
+                    prompt,
                 },
             )
             .await?;

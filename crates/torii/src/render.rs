@@ -250,9 +250,11 @@ fn visible_len(redacted: &str) -> usize {
 /// machinery whose own bugs would be leaks. The residue is accepted here because this pass
 /// is defense in DEPTH, not the primary control: SP-4 s2 already redacts effect outputs
 /// with this same `PatternRedactor` before they are journaled or reach the blackboard the
-/// `## Context` section is rendered from, the journal stores the prompt unredacted anyway
-/// (`executor/human.rs` appends `prompt: prompt.to_string()`), and the reader here is the
-/// trusted human being asked to do the work.
+/// `## Context` section is rendered from, `executor/human.rs` now runs the executor's
+/// redactor over the whole composed question BEFORE the `AgentAwaited` append (the s3
+/// whole-slice review's fix — it previously appended `prompt: prompt.to_string()`, which is
+/// what this sentence used to describe), and the reader here is the trusted human being
+/// asked to do the work.
 pub(crate) fn redact_question(s: &str) -> String {
     let redacted = redact_once(s);
     if visible_len(&redact_once(&strip_control(s))) < visible_len(&redacted) {
@@ -461,9 +463,10 @@ pub(crate) const MENU_MAX: usize = 160;
 /// other.
 ///
 /// The executor composes the question from the agent's system prompt, every ACTIVATED skill
-/// body, the rendered `## Context` section of upstream outputs and a `## Task` section
-/// holding the node's input (`executor/agent.rs`, the `AgentBacking::Human` branch — it is
-/// `assemble_prompt`'s output plus the input, so the human sees what the model would have).
+/// body, the rendered `## Context` section of upstream outputs (truncated to
+/// `MAX_HUMAN_CONTEXT_BYTES`, with a visible marker) and a `## Task` section holding the
+/// node's input (`executor/human.rs`, `HumanQuestion::compose` — `assemble_prompt`'s two
+/// halves plus the input, so the human sees what the model would have).
 /// A multi-KB question is therefore the NORMAL case here, not a hostile one, and the cap is
 /// load-bearing rather than defensive: uncapped, one ordinary human-backed agent would wreck
 /// the alignment of every other row in the block.

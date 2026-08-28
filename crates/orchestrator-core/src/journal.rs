@@ -28,9 +28,43 @@ pub const FORMAT_VERSION: i32 = 1;
 ///
 /// 4 KiB matches `torii`'s `MAX_PAYLOAD_BYTES` and the executor's default
 /// `cas_threshold` (`Executor::new`, `executor/mod.rs`). The bound is load-bearing
-/// rather than theoretical for the PROMPT: an assembled prompt is the system prompt plus
-/// every activated skill plus the rendered context section, routinely multi-KB.
+/// rather than theoretical for the PROMPT: the AUTHORED part of a question is the system
+/// prompt plus every activated skill plus the node's input, routinely multi-KB.
+///
+/// **It bounds the AUTHORED part of a question only — never the whole composed question.**
+/// The whole-slice review of s3 found it charged against the rendered `## Context` section
+/// too, and that section is RUN DATA: `assemble_prompt` renders every Hard dependency's
+/// full materialized output into it verbatim. A human-backed node downstream of any node
+/// that produced ~1000 tokens therefore failed TERMINALLY, after the upstream tokens were
+/// already spent, with a message naming three config fields that were not the cause. See
+/// [`MAX_HUMAN_CONTEXT_BYTES`], which is the bound that half gets, and the reason the two
+/// are different numbers with different failure modes.
 pub const MAX_HUMAN_TEXT_BYTES: usize = 4096;
+
+/// The largest rendered `## Context` section a journaled question may carry, in bytes.
+///
+/// SP-6 s3, added by the whole-slice review. It exists because the `## Context` section has
+/// a DIFFERENT OWNER from the rest of the question: the agent's `system_prompt`, its skill
+/// bodies and the node's input are written by the config author, who can trim them, while
+/// `## Context` is whatever the upstream nodes happened to produce. Bounding a value nobody
+/// can bound at config time with a bound whose breach is a terminal `NodeFailed` makes an
+/// ordinary verbose model answer unrecoverable — and the executor's own default
+/// `cas_threshold` is 4096, i.e. this codebase already treats a >4 KiB effect output as
+/// normal enough to warrant CAS splitting rather than refusal.
+///
+/// So the two halves are bounded by two different RULES, not just two numbers: the authored
+/// half fails loudly against [`MAX_HUMAN_TEXT_BYTES`] (a config error, actionable), and this
+/// half is TRUNCATED per dependency with a visible marker (run data, degraded honestly). The
+/// durable row stays bounded either way, which was the cap's real justification: a question
+/// is re-decoded by every drive, every `torii run list-paused` and every fold for the life
+/// of the run.
+///
+/// 32 KiB — eight times the answer cap. Generous enough that the ordinary case this was
+/// found by (one verbose upstream model answer) is never truncated at all, and small enough
+/// that a person can still read the row and a `jsonb` column is not being used as a blob
+/// store. A human-backed question is bounded overall by
+/// `MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES`.
+pub const MAX_HUMAN_CONTEXT_BYTES: usize = 32 * 1024;
 
 /// A compacted per-child record (§5.3): after a `Map`'s `Consolidate` completes,
 /// each child's full `EffectRecorded` collapses to this small shape and leaves
@@ -290,12 +324,36 @@ pub enum JournalEvent {
     /// drift actually produces is loud refusal, not a second human seeing a different
     /// question.
     ///
-    /// It carries the SYSTEM prompt `assemble_prompt` builds — the agent's
-    /// `system_prompt`, plus each activated skill's body, plus the rendered `## Context`
-    /// section of resolved dependency outputs — which is the same string a model-backed
-    /// run of this node would have been given as its system prompt. A writer MUST bound
-    /// it by [`MAX_HUMAN_TEXT_BYTES`] before appending: that composition is routinely
-    /// multi-KB, and an unbounded question is a durable write.
+    /// It carries the MODEL-EQUIVALENT question, which is more than `assemble_prompt`'s
+    /// output: the agent's `system_prompt`, plus each activated skill's body, plus the
+    /// rendered `## Context` section of resolved dependency outputs, plus `\n\n## Task\n`
+    /// and the node's INPUT. The input is there because `assemble_prompt` never returns it —
+    /// it takes the query only to evaluate `activation.is_active`, and the model path
+    /// supplies it separately as the first user message — so a question without it asked a
+    /// reviewer about a contract nobody named. Design §5.4's rule is one-directional: never
+    /// show the human LESS than the model would have had. (An earlier version of this
+    /// paragraph described `assemble_prompt`'s output alone, which stopped being true when
+    /// s3's own Task 4 review added the `## Task` section.)
+    ///
+    /// A writer MUST bound it before appending — an unbounded question is a durable write,
+    /// re-decoded by every drive, every `torii run list-paused` and every fold for the life
+    /// of the run — but **by two different rules for its two halves**, because they have two
+    /// different owners:
+    ///
+    /// - the AUTHORED bytes (`system_prompt` + skills + the node input) against
+    ///   [`MAX_HUMAN_TEXT_BYTES`], loudly, since a config author can trim them;
+    /// - the `## Context` bytes against [`MAX_HUMAN_CONTEXT_BYTES`], by TRUNCATION with a
+    ///   visible marker, since they are whatever the upstream nodes produced and no operator
+    ///   can bound them at config time.
+    ///
+    /// Charging one cap against both is not a smaller version of this rule; it is a
+    /// different behaviour, and it was the s3 whole-slice review's worst finding — an
+    /// ordinary verbose upstream killed the node terminally after its tokens were already
+    /// spent. See [`MAX_HUMAN_CONTEXT_BYTES`].
+    ///
+    /// A writer must also REDACT it before appending (design §6). s3 shipped
+    /// `prompt: prompt.to_string()`, making this row the one place a credential in a
+    /// `system_prompt` or a skill body reached durable storage in the clear.
     ///
     /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited` do —
     /// overwriting the deadline is the never-expires bug s1 documents.

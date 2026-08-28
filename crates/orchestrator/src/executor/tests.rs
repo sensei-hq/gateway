@@ -17123,7 +17123,7 @@ mod human_agent {
         );
     }
 
-    /// AC10, the executor half: an assembled question over `MAX_HUMAN_TEXT_BYTES` fails the
+    /// AC10, the executor half: an AUTHORED question over `MAX_HUMAN_TEXT_BYTES` fails the
     /// node LOUDLY and journals NOTHING — no oversized `AgentAwaited` row.
     ///
     /// Review found this cap completely unguarded: replacing `prompt.len() >
@@ -17134,12 +17134,18 @@ mod human_agent {
     /// already inside a durable run — so this half has to fail the node, and nothing in the
     /// plan was going to test it.
     ///
-    /// The bound is on the ASSEMBLED question, not on `system_prompt`, which is why the
+    /// The bound is on the whole AUTHORED composition — `system_prompt` + every activated
+    /// skill body + the node input — not on `system_prompt` alone, which is why the
     /// oversize here comes from a SKILL body: a role can be composed over the limit by
     /// parts that are each individually reasonable, and that is the realistic way a
     /// multi-KB prompt happens.
+    ///
+    /// It is deliberately NOT the whole question. The `## Context` section is run data and
+    /// is bounded separately, by truncation rather than by failure — see
+    /// `a_verbose_upstream_output_truncates_the_question_instead_of_killing_the_node`,
+    /// which is the case this test's static-skill shape hid.
     #[tokio::test]
-    async fn an_oversized_assembled_prompt_fails_the_node_before_it_is_journaled() {
+    async fn an_oversized_authored_prompt_fails_the_node_before_it_is_journaled() {
         let journal = InMemoryJournal::new();
         let run = RunId(uuid::Uuid::new_v4());
         let registry = Arc::new(
@@ -17181,6 +17187,127 @@ mod human_agent {
                 .iter()
                 .map(String::len)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// **A verbose UPSTREAM node degrades the question; it does not kill the run.**
+    ///
+    /// The single worst defect the whole-slice review found, reported independently three
+    /// times. `MAX_HUMAN_TEXT_BYTES` was charged against the whole composed question,
+    /// including the `## Context` section — which `assemble_prompt` renders from every Hard
+    /// dependency's full materialized output, verbatim, with no truncation. So a
+    /// human-backed node downstream of ANY node that produced ~1000 tokens failed
+    /// TERMINALLY, after the upstream tokens were already spent, and the failure message
+    /// named "the agent's system prompt, its skills or the node input" — none of which was
+    /// the cause. The recovery was a brand-new run, which re-spends the upstream and hits
+    /// the same cap whenever the model is that verbose.
+    ///
+    /// The size was set purely by run-time data: review measured 4126 bytes for a role with
+    /// a 60-byte system prompt, no skills and a 12-byte input. The executor's own default
+    /// `cas_threshold` is also 4096, i.e. the codebase already treats a >4 KiB effect output
+    /// as ordinary enough to warrant CAS splitting — and `split_output` SPILLS such an
+    /// output rather than failing, while the same number killed the question.
+    ///
+    /// It is also the slice's headline example: a reviewer reading a contract. A contract
+    /// is over 4 KiB essentially always.
+    ///
+    /// So the two halves of the question are now bounded by two different rules, because
+    /// they have two different owners: the AUTHORED half (system prompt + skills + node
+    /// input) fails loudly against `MAX_HUMAN_TEXT_BYTES` — a config error, actionable by
+    /// the person who wrote the config — and the `## Context` half is TRUNCATED to
+    /// `MAX_HUMAN_CONTEXT_BYTES` with a visible marker, because nobody can bound it at
+    /// config time. The durable row stays bounded either way, which was the cap's real
+    /// justification.
+    ///
+    /// The shipped guard used a giant SKILL body — static config — and that is exactly why
+    /// nothing caught this. This test overflows through an upstream `ModelCall`'s OUTPUT.
+    #[tokio::test]
+    async fn a_verbose_upstream_output_truncates_the_question_instead_of_killing_the_node() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+
+        // Comfortably past `MAX_HUMAN_TEXT_BYTES` on its own, and past
+        // `MAX_HUMAN_CONTEXT_BYTES` too, so BOTH bounds are exercised: the old one would
+        // have failed the node, the new one truncates.
+        let verbose = "L".repeat(orchestrator_core::MAX_HUMAN_CONTEXT_BYTES + 5_000);
+        let (gw, _calls) = scripted_gateway(vec![final_response(&verbose)]).await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(human_registry(None))
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone());
+
+        let graph = Graph {
+            nodes: vec![
+                mc("brief", None),
+                Node {
+                    id: review(),
+                    kind: NodeKind::Agent {
+                        agent: AgentRef("reviewer".into()),
+                        input: serde_json::json!("THE-ACME-MSA-2026"),
+                        phase: None,
+                    },
+                    deps: vec![Dep::hard("brief")],
+                },
+            ],
+        };
+
+        let o = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            o.failed.is_none(),
+            "a verbose upstream must NOT fail the human-backed node — the tokens are \
+             already spent and the operator has no way to make the model terser: {o:?}"
+        );
+        assert!(
+            o.paused.is_some(),
+            "it asks the human, as it would with a short upstream: {o:?}"
+        );
+
+        let events = journal.load(run).await.unwrap();
+        let prompts = journaled_prompts(&events);
+        assert_eq!(prompts.len(), 1, "exactly one question: {prompts:?}");
+        let prompt = &prompts[0];
+
+        // The three things that must survive truncation, in priority order: the role's
+        // standing instructions, the thing being asked about, and an HONEST marker where
+        // the upstream was cut. A silently-clipped context is worse than a failed node.
+        assert!(
+            prompt.contains(QUESTION),
+            "the role's own system prompt survives: {}",
+            &prompt[..prompt.len().min(400)]
+        );
+        assert!(
+            prompt.contains("THE-ACME-MSA-2026"),
+            "so does the node input — the human must still know WHAT they are reviewing"
+        );
+        assert!(
+            prompt.contains("### brief") && prompt.contains("truncated"),
+            "the context section names the dependency and says out loud that it was cut, \
+             so the human never mistakes a clipped contract for the whole one"
+        );
+        assert!(
+            prompt.contains(&"L".repeat(1_000)),
+            "and it carries a REAL prefix of the upstream output, not just the marker"
+        );
+
+        // The durable row is still bounded — the cap's actual justification. A multi-MB
+        // question would be re-decoded by every drive, every `list-paused` and every fold
+        // for the life of the run.
+        assert!(
+            prompt.len()
+                <= orchestrator_core::MAX_HUMAN_TEXT_BYTES
+                    + orchestrator_core::MAX_HUMAN_CONTEXT_BYTES,
+            "the journaled question is bounded: {} bytes",
+            prompt.len()
+        );
+        assert!(
+            prompt.len() > orchestrator_core::MAX_HUMAN_TEXT_BYTES,
+            "and the bound that applies is NOT the answer's 4 KiB one, which is the \
+             conflation this test exists to prevent: {} bytes",
+            prompt.len()
         );
     }
 
@@ -17369,6 +17496,102 @@ mod human_agent {
         assert!(
             !String::from_utf8_lossy(&blob).contains(&secret),
             "no plaintext reaches the content store"
+        );
+    }
+
+    /// The same rule for the QUESTION, which is the third durable string on this path and
+    /// the one s3 shipped unscrubbed: `run_human_agent` appended `prompt: prompt.to_string()`
+    /// with no redaction at all.
+    ///
+    /// Design §6 lists "the prompt" among the strings that go "through the redactor before
+    /// the durable write", so the journal row was the ONE place a credential sitting in an
+    /// agent's `system_prompt`, an activated skill body, the rendered `## Context` section or
+    /// the node input landed in the clear — and nothing upstream scrubbed it: `torii config
+    /// push` redacts nothing, and `render::redact_question` only cleaned it up on the way to
+    /// a terminal, which is display, not durability.
+    ///
+    /// **Which of the three contributors actually leaked, measured rather than assumed.**
+    /// Mutating `self.redact_text(...)` out of the append reddens on the agent's
+    /// `system_prompt` and on the activated SKILL BODY — both CONFIG-sourced, so `torii
+    /// config push` is their only other gate and it redacts nothing. The upstream node's
+    /// OUTPUT survives the mutation already scrubbed, because SP-4 s2's `model_output`
+    /// chokepoint redacts an effect's output before it is journaled, and `resolve_context`
+    /// reads the blackboard the scrubbed value was written to. It is asserted here anyway:
+    /// that chokepoint is one refactor away from this path, and the `## Context` section is
+    /// the one contributor a config review can never see.
+    ///
+    /// The credentials are assembled at runtime; the repo's Semgrep CWE-798 hook blocks
+    /// literal ones in fixtures.
+    #[tokio::test]
+    async fn the_journaled_question_is_redacted_before_the_durable_write() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        let in_system = format!("sk-{}", "aaaaaaaaaaaaaaaaaaaaaaaa");
+        let in_skill = format!("sk-{}", "bbbbbbbbbbbbbbbbbbbbbbbb");
+        let in_upstream = format!("sk-{}", "cccccccccccccccccccccccc");
+
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+
+        let mut role = reviewer(None, vec!["the-playbook".into()]);
+        role.system_prompt = format!("{QUESTION} The console key is {in_system}.");
+        let registry = Arc::new(Registry::default().with_agent(role).with_skill(SkillDef {
+            name: "the-playbook".into(),
+            description: None,
+            body: format!("Escalate with {in_skill} if unsure."),
+            activation: Activation::Always,
+        }));
+
+        let (gw, _calls) = scripted_gateway(vec![final_response(&format!(
+            "The vendor sent us {in_upstream} in the clear."
+        ))])
+        .await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone())
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+        let graph = Graph {
+            nodes: vec![
+                mc("brief", None),
+                Node {
+                    id: review(),
+                    kind: NodeKind::Agent {
+                        agent: AgentRef("reviewer".into()),
+                        input: serde_json::json!("THE-ACME-MSA-2026"),
+                        phase: None,
+                    },
+                    deps: vec![Dep::hard("brief")],
+                },
+            ],
+        };
+
+        let o = ex.start(run, &graph).await.expect("drives");
+        assert!(o.paused.is_some(), "the human agent still asks: {o:?}");
+
+        let events = journal.load(run).await.unwrap();
+        let prompts = journaled_prompts(&events);
+        assert_eq!(prompts.len(), 1, "exactly one question: {prompts:?}");
+        let prompt = &prompts[0];
+        for (what, secret) in [
+            ("the agent's system_prompt", &in_system),
+            ("an activated skill body", &in_skill),
+            ("an upstream node's output", &in_upstream),
+        ] {
+            assert!(
+                !prompt.contains(secret.as_str()),
+                "a credential from {what} reached the durable journal in plaintext: {prompt}"
+            );
+        }
+        assert!(prompt.contains("[REDACTED]"), "{prompt}");
+        // Redaction is by credential SHAPE, not blanket: the question is still the question,
+        // so a human is not handed a page of `[REDACTED]` and asked to review it.
+        assert!(
+            prompt.contains("THE-ACME-MSA-2026") && prompt.contains("Escalate with"),
+            "everything that is not credential-shaped survives: {prompt}"
         );
     }
 

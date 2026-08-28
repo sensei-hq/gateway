@@ -35,7 +35,7 @@ pub use hooks::OrchestratorHooks;
 pub use ids::{NodeId, RunId, Seq};
 pub use journal::{
     ChildStatus, CompactChild, ExecutionJournal, FORMAT_VERSION, JournalEvent,
-    MAX_HUMAN_TEXT_BYTES, ObservationMeta, Snapshot,
+    MAX_HUMAN_CONTEXT_BYTES, MAX_HUMAN_TEXT_BYTES, ObservationMeta, Snapshot,
 };
 pub use plan::{
     NodeNeeds, NodePlan, PlanError, PlannedGraph, RESERVED_PLAN_ID, feasible, parse_plan,
