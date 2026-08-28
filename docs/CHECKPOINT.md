@@ -1,7 +1,7 @@
 # Checkpoint
 
 **Slice:** SP-6 s3 `human-as-Agent` — the LAST slice of SP-6. **In progress on
-`feat/sp-6-s3-human-as-agent`** (branched from `develop` at `771af25`). Task 1 of 7 done.
+`feat/sp-6-s3-human-as-agent`** (branched from `develop` at `771af25`). Task 2 of 7 done.
 
 ## Done / remaining
 
@@ -21,14 +21,24 @@
   frontmatter surface (both loud on typos), recorded in spec §4. Also: reject grants on a human
   agent, `validate`'s doc rewritten, one match not two.
   **1521 passed / 0 failed / 7 ignored**, exit 0.
-- **Tasks 2–7 ⬜** — journal events · fold · `run_human_agent` · CLI · `list-paused` · e2e.
+- **Task 2 ✅** (`864cb1f`) — `JournalEvent::{AgentAwaited,AgentAnswered}` + `MAX_HUMAN_TEXT_BYTES`
+  (in `journal.rs` beside `FORMAT_VERSION`, re-exported from `lib.rs`). New VARIANTS, so
+  `FORMAT_VERSION` stays 1. Red first: `no variant named AgentAwaited` (E0599 x4). The one
+  non-exhaustive `match` the plan predicted was the only one: `label()` in `executor/tests.rs`, given
+  two explicit arms, never a wildcard. Two plan doc claims were corrected against the code before
+  being written down: `MAX_PAYLOAD_BYTES` is `pub` (only `check_payload_size` is `pub(crate)`) — the
+  real reason reuse is impossible is the dependency CYCLE — and the journaled prompt is
+  `assemble_prompt`'s SYSTEM string, not "exactly what the model would have received" (the model also
+  gets the rendered input as a user message plus tool schemas).
+  **1522 passed / 0 failed / 7 ignored**, exit 0.
+- **Tasks 3–7 ⬜** — fold · `run_human_agent` · CLI · `list-paused` · e2e.
 
 ## Next command
 
-Task 1 is done and reviewed; start Task 2:
+Task 2 is done; start Task 3 (fold the two events):
 
 ```
-sed -n '/^## Task 2/,/^## Task 3/p' docs/superpowers/plans/2026-08-27-sp-6-s3-human-as-agent.md
+sed -n '/^## Task 3/,/^## Task 4/p' docs/superpowers/plans/2026-08-27-sp-6-s3-human-as-agent.md
 ```
 
 ## Open questions
@@ -42,6 +52,6 @@ sed -n '/^## Task 2/,/^## Task 3/p' docs/superpowers/plans/2026-08-27-sp-6-s3-hu
 
 ## Known-broken
 
-None. **1521 passed / 0 failed / 7 ignored, exit 0**; clippy `-D warnings` and fmt clean.
+None. **1522 passed / 0 failed / 7 ignored, exit 0**; clippy `-D warnings` and fmt clean.
 `$DATABASE_URL` is a REMOTE Supabase instance — never run the DB suite against it; use a throwaway
 container (`env -u DATABASE_URL` otherwise).
