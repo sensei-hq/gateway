@@ -563,24 +563,25 @@ fn run_help_lists_agent() {
 
 /// The help must describe the surface that SHIPS, not the one that is planned.
 ///
-/// Both `run agent --help` and `run agent answer --help` told an operator that
-/// `torii run list-paused` "shows the question the human was actually asked". It does not:
-/// `render::AwaitingNode` carries `{node, deadline, options}` and `cmd::run::awaiting_nodes`
-/// never reads `AgentAwaited.prompt`, so the listing names the waiting node and says nothing
-/// about what it asked. An operator who runs the command the help names and finds no
-/// question concludes the tool is broken — or, worse, that this node is not the one waiting.
+/// **This test is the POSITIVE form of a negative one, flipped by Task 6 exactly as its
+/// predecessor said it should be.** Before the question was rendered, both
+/// `run agent --help` and `run agent answer --help` told an operator that
+/// `torii run list-paused` "shows the question the human was actually asked" — and it did
+/// not: `render::AwaitingNode` was `{node, deadline, options}` and `cmd::run::awaiting_nodes`
+/// never read `AgentAwaited.prompt`. So the assertion was inverted (the help must NOT say
+/// "question") until the behaviour caught up. It now has: `AwaitingNode` carries a
+/// `question`, `awaiting_nodes` folds `AgentAwaited` into it, and `render::awaiting_section`
+/// renders it in the node's own `agent:` row.
 ///
-/// This exact class of defect — a CLI help sentence describing behaviour the command does
-/// not have — has been caught SEVEN times in this feature, which is why it is a test on the
-/// rendered help rather than a promise to keep the prose honest.
+/// It stays a test in both directions because this exact class of defect — a CLI help
+/// sentence describing behaviour the command does not have — has been caught SEVEN times in
+/// this feature. Keeping it as an assertion means the help and the renderer cannot drift
+/// apart again in EITHER direction: delete the question from the listing and this reddens.
 ///
-/// **This assertion is expected to FLIP when the question actually lands.** When
-/// `AwaitingNode` grows a `question` and the awaiting row renders it, the right change is to
-/// re-word the help AND turn this into its positive form (assert both surfaces DO name the
-/// question) — not to delete it. The pointer at `list-paused` must survive either way: it is
-/// the only way an operator discovers a node id without reading the graph.
+/// The pointer at `list-paused` survives the flip: it is the only way an operator discovers
+/// a node id without reading the graph.
 #[test]
-fn agent_help_promises_only_what_list_paused_actually_shows() {
+fn agent_help_names_the_question_list_paused_now_shows() {
     for args in [
         vec!["run", "agent", "--help"],
         vec!["run", "agent", "answer", "--help"],
@@ -595,10 +596,10 @@ fn agent_help_promises_only_what_list_paused_actually_shows() {
             args.join(" ")
         );
         assert!(
-            !text.to_lowercase().contains("question"),
-            "`{}` promises a question `list-paused` does not render — `AwaitingNode` is \
-             `{{node, deadline, options}}` and `awaiting_nodes` never reads \
-             `AgentAwaited.prompt`:\n{text}",
+            text.to_lowercase().contains("question"),
+            "`{}` must say that `list-paused` shows the question, because it now does — an \
+             operator who does not know that has no way to learn what they are answering \
+             short of reading the graph and the registry:\n{text}",
             args.join(" ")
         );
     }

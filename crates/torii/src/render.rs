@@ -248,15 +248,13 @@ pub struct AwaitingNode {
     /// SP-6 s2: the menu, for a `HumanGate`. `Some` therefore means exactly one thing — a
     /// gate, decidable with `torii run gate decide --option <name>`.
     ///
-    /// **`None` no longer means "an `AwaitSignal`", and did when this doc was written.**
-    /// SP-6 s3 added a third waiting kind — a human-backed `Agent`, answered with
-    /// `torii run agent answer --text` — and it publishes no menu either, so it lands in
-    /// this same `None` bucket. A script that reads absence as "arbitrary JSON, use
-    /// `run signal`" will issue a command `cmd::run::signal` REFUSES for that node kind.
-    /// The negative half of the discriminator is therefore INCOMPLETE until the question
-    /// lands as its own field; `cmd::run::awaiting_nodes` carries the full note and
-    /// `list_paused_does_not_yet_tell_a_human_backed_agent_from_an_await_signal` is the
-    /// test that pins it.
+    /// **`None` alone does NOT mean "an `AwaitSignal`"** — SP-6 s3 added a third waiting
+    /// kind, a human-backed `Agent` answered with `torii run agent answer --text`, and it
+    /// publishes no menu either. It is told apart by [`question`](Self::question) being
+    /// `Some`, so the full discriminator is the PAIR: `options` ⇒ a gate, `question` ⇒ a
+    /// human-backed agent, neither ⇒ an `AwaitSignal`. A script that read absence of
+    /// `options` alone as "arbitrary JSON, use `run signal`" would issue a command
+    /// `cmd::run::signal` REFUSES for an agent node.
     ///
     /// Read from the journaled `GateAwaited`, so `list-paused` needs no graph load —
     /// which matters because `list-paused` folds one journal per paused run and has no
@@ -267,11 +265,39 @@ pub struct AwaitingNode {
     /// s1 is unaffected. Key PRESENCE is the discriminator on that path — the same
     /// technique `list_paused` uses for `awaiting_error`, and for the same reason: a script
     /// must be able to tell the waiting kinds apart, and it needs the menu to build a
-    /// `gate decide` without loading the graph either. Whatever key eventually distinguishes
-    /// a human-backed `Agent` must be skip-if-absent too, or it breaks that same byte
-    /// identity for every s1/s2 consumer.
+    /// `gate decide` without loading the graph either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
+    /// SP-6 s3: the QUESTION, for a human-backed `Agent`. `Some` means exactly one thing —
+    /// a role answered by a person, answerable with `torii run agent answer --text`.
+    ///
+    /// Read from the journaled `AgentAwaited`, first-wins, so — like the menu above — no
+    /// graph load is needed. That is not a convenience: `list-paused` folds one journal per
+    /// paused run and holds no graph, and even with one the graph could not answer, because
+    /// the question is composed largely from the REGISTRY (the agent's system prompt and its
+    /// activated skill bodies) and from the run's own blackboard (the `## Context` section).
+    /// The journal is the only place the question a human was actually asked exists.
+    ///
+    /// **It arrives here ALREADY REDACTED** — `cmd::run::awaiting_nodes` applies
+    /// [`redact_reason`] when it builds this field, so every sink is covered by
+    /// construction rather than by each sink remembering. The `--json` path in particular
+    /// serializes this struct wholesale (`serde_json::to_value(nodes)`), so a sink-side
+    /// scrub is exactly the thing that would be forgotten there. The executor journals the
+    /// prompt UNREDACTED (`executor/human.rs` appends `prompt: prompt.to_string()`), and
+    /// `torii config push` does not redact an agent's `system_prompt` either, so torii is
+    /// the first thing that ever displays it — the same position it is in for a pause
+    /// reason, which is why it gets the same transform.
+    ///
+    /// The display-only half — [`one_line`] and the [`QUESTION_MAX`] cap — is applied by
+    /// [`awaiting_section`], NOT here, matching the split `json`/`table` already draw for a
+    /// pause reason: a script wants the raw newlines and the full text, redaction is the
+    /// only transform that must reach both.
+    ///
+    /// **Skipped when absent rather than serialized as `null`**, for the byte-identity
+    /// reason [`options`](Self::options) records: an s1 or s2 consumer must see unchanged
+    /// output for a run with no human-backed agent in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
 }
 
 /// A node id is author- (or planner-) supplied free text, so it gets the same
@@ -293,6 +319,31 @@ const NODE_MAX: usize = 80;
 /// names when it refuses an undeclared one, and had no cap at all — one bound for one
 /// class of value, not two that can drift.
 pub(crate) const MENU_MAX: usize = 160;
+
+/// The cap for a rendered QUESTION — a human-backed `Agent`'s ask.
+///
+/// Its own constant rather than a reuse of [`MENU_MAX`], because the two are bounded by
+/// different rules upstream and must be free to move apart: a menu is bounded by NOTHING
+/// (`validate_dag` checks options for non-emptiness, uniqueness and a reachable outcome,
+/// never length or count), while a question is already bounded at `MAX_HUMAN_TEXT_BYTES`
+/// (4096) by `Executor::run_human_agent`, which fails the node above it.
+///
+/// Wider than a menu and equal to [`REASON_MAX`] because of what the value IS: a menu is a
+/// set of short symbolic names, of which 160 characters already shows several, whereas a
+/// question is PROSE an operator has to read and understand before they can answer it. It
+/// is the one cell in this block that carries the actual work. Equal to `REASON_MAX` by
+/// argument, not by accident — a pause reason is the same kind of value, prose displayed to
+/// an operator — but a separate constant, so that moving one does not silently move the
+/// other.
+///
+/// The executor composes the question from the agent's system prompt, every ACTIVATED skill
+/// body, the rendered `## Context` section of upstream outputs and a `## Task` section
+/// holding the node's input (`executor/agent.rs`, the `AgentBacking::Human` branch — it is
+/// `assemble_prompt`'s output plus the input, so the human sees what the model would have).
+/// A multi-KB question is therefore the NORMAL case here, not a hostile one, and the cap is
+/// load-bearing rather than defensive: uncapped, one ordinary human-backed agent would wreck
+/// the alignment of every other row in the block.
+const QUESTION_MAX: usize = 300;
 
 /// One run's awaiting set — or, when that run's journal could not be folded, the reason.
 ///
@@ -320,11 +371,13 @@ pub type Awaiting = Result<Vec<AwaitingNode>, String>;
 /// `gate decide` line in the header appears only when a gate is present, so the s1 output
 /// is unchanged for a fleet that has none.
 ///
-/// **SP-6 s3's human-backed `Agent` is the exception that proves that rule, and it is not
-/// fixed yet.** It carries no menu, so it falls into the `None` arm and renders `signal` —
-/// the one verb `cmd::run::signal` refuses for it. That is precisely the misdirection the
-/// paragraph above forbids, and it stays until the row learns to say `agent:` with the
-/// question. See [`AwaitingNode::options`] and `cmd::run::awaiting_nodes`.
+/// **SP-6 s3's human-backed `Agent` is the third**, and it renders `agent: "<question>"`.
+/// Until Task 6 it carried no cell of its own, fell into the `None` arm and rendered
+/// `signal` — the one verb `cmd::run::signal` refuses for it, i.e. exactly the misdirection
+/// the paragraph above forbids. The question rides on the row rather than being looked up,
+/// because there is nowhere to look it up FROM: this function's caller folds one journal per
+/// paused run and holds no graph, and the question is composed from the registry anyway.
+/// Its extra header line, like the gate's, appears only when such a node is present.
 ///
 /// An [`Err`] row renders as `unknown: <error>` — never as an absent or empty awaiting set,
 /// which is the one answer that would tell an operator there is nothing to signal on a run
@@ -353,16 +406,36 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
              `torii run gate decide <run> --node <node> --option <name>`\n",
         );
     }
+    // The same conditional shape the gate line uses, and for the same two reasons: a fleet
+    // with no human-backed agent sees byte-identical s1/s2 output, and an operator is only
+    // told about a verb they can actually use here.
+    let any_agent = rows
+        .iter()
+        .any(|(_, a)| matches!(a, Ok(nodes) if nodes.iter().any(|n| n.question.is_some())));
+    if any_agent {
+        s.push_str(
+            "                   an `agent:` row takes free text instead — \
+             `torii run agent answer <run> --node <node> --text <text>`\n",
+        );
+    }
     for (run, a) in rows {
         match a {
             Ok(nodes) => {
                 for a in nodes {
-                    // Option names are author free text reaching a line-oriented table, so
-                    // they get the same control-character collapse and cap a node id does:
-                    // a raw newline would forge an extra row, and an ESC could rewrite what
-                    // is already on screen.
-                    let cell = match &a.options {
-                        Some(opts) => cap_chars(
+                    // Option names and a question are both author free text reaching a
+                    // line-oriented table, so they get the same control-character collapse
+                    // and cap a node id does: a raw newline would forge an extra row, and
+                    // an ESC could rewrite what is already on screen.
+                    //
+                    // The MENU is checked first, matching the order `cmd::run::signal`
+                    // checks its two refusals in (`gate_menu`, then `agent_question`). One
+                    // node cannot legitimately publish both — they are different node kinds
+                    // and the executor writes exactly one event per kind — but a corrupt or
+                    // hand-written journal could, and when the listing and the refusals
+                    // disagree about which kind a node is, the listing sends an operator to
+                    // a command that refuses them.
+                    let cell = match (&a.options, &a.question) {
+                        (Some(opts), _) => cap_chars(
                             &format!(
                                 "gate: {}",
                                 opts.iter()
@@ -372,7 +445,26 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
                             ),
                             MENU_MAX,
                         ),
-                        None => "signal".to_string(),
+                        // Quoted, unlike a menu: a question is prose containing spaces, and
+                        // without delimiters its tail is indistinguishable from the deadline
+                        // column that follows it on the same line.
+                        //
+                        // The quotes are written LITERALLY rather than taken from `{:?}`,
+                        // and that is deliberate. `{:?}` on a `&str` escapes control
+                        // characters too (`escape_debug`), so it would ALSO defeat the
+                        // forged-row and cursor-move attacks — and in doing so it would make
+                        // `one_line` here unfalsifiable: deleting the `one_line` call would
+                        // leave `a_hostile_question_cannot_forge_an_awaiting_row_or_move_
+                        // the_cursor` green, a guard that guards nothing. One explicit
+                        // transform, provably load-bearing, is worth more than two
+                        // overlapping ones of which only the incidental one is doing the
+                        // work. It also keeps this cell consistent with every other free-text
+                        // cell in the block (node id, menu), which collapse rather than
+                        // escape.
+                        (None, Some(q)) => {
+                            cap_chars(&format!("agent: \"{}\"", one_line(q)), QUESTION_MAX)
+                        }
+                        (None, None) => "signal".to_string(),
                     };
                     s.push_str(&format!(
                         "{}  {}  {}  {}\n",

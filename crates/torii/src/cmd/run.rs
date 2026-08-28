@@ -501,16 +501,16 @@ pub(crate) fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> 
 /// Covers ALL THREE waiting kinds, because [`signal_states`] folds all three `*Awaited`
 /// events: an `AwaitSignal`, a `HumanGate` and — since SP-6 s3 — a human-backed `Agent`.
 ///
-/// **It does not yet tell the third apart from the first.** `options` is built only from
-/// `GateAwaited`, so a human-backed agent is rendered exactly as an `AwaitSignal` is: the
-/// `signal` cell, and no `--json` key of its own. That is wrong in a way an operator feels —
-/// `torii run signal` is REFUSED for this node kind ([`signal`] checks
-/// `cmd::human::agent_question` first), so the listing currently points at a command that
-/// cannot work. Closing it means carrying `AgentAwaited.prompt` through
-/// [`render::AwaitingNode`] as its own field, and the JSON discriminator rule
-/// [`render::AwaitingNode::options`] documents has to be restated at the same time.
-/// `list_paused_does_not_yet_tell_a_human_backed_agent_from_an_await_signal` pins the gap so
-/// it cannot be forgotten, and inverts when it is closed.
+/// **And it tells all three apart**, which is the point of carrying a menu and a question
+/// rather than only a node id: each kind takes a different verb and REFUSES the other two,
+/// so a listing that rendered them identically would send an operator to a refusal for a
+/// node they had correctly identified. `options` comes from `GateAwaited`, `question` from
+/// `AgentAwaited`, and an `AwaitSignal` has neither — the discriminator
+/// [`render::AwaitingNode::options`] documents for the `--json` path.
+///
+/// The question is REDACTED here, once, so that every sink is covered by construction. See
+/// [`render::AwaitingNode::question`] for why that scrub belongs on this side and why the
+/// collapse-and-cap does not.
 fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
     let menus: HashMap<NodeId, Vec<String>> = events
         .iter()
@@ -529,15 +529,32 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
             acc
         });
 
+    // FIRST wins here too, and this one is not merely symmetry: it is the SAME rule
+    // `cmd::human::agent_question` folds by, and that function is what `run agent answer`
+    // validates against. If the listing showed a later question than the command answers,
+    // an operator would answer a question they were never shown.
+    let questions: HashMap<NodeId, String> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::AgentAwaited { node, prompt, .. } => Some((node.clone(), prompt)),
+            _ => None,
+        })
+        .fold(HashMap::new(), |mut acc, (n, p)| {
+            acc.entry(n).or_insert_with(|| render::redact_reason(p));
+            acc
+        });
+
     let mut out: Vec<render::AwaitingNode> = signal_states(events)
         .into_iter()
         .filter_map(|(node, st)| match st.state {
             SignalState::Awaiting { deadline } => {
                 let options = menus.get(&node).cloned();
+                let question = questions.get(&node).cloned();
                 Some(render::AwaitingNode {
                     node,
                     deadline,
                     options,
+                    question,
                 })
             }
             _ => None,
@@ -1326,7 +1343,7 @@ pub(crate) mod tests {
     use crate::cmd::gate::tests::{gate_journal, release};
     // Likewise `cmd::human`'s `AgentAwaited` fixture: the listing tests must fold the SAME
     // shape the command that answers it folds, or the two drift silently.
-    use crate::cmd::human::tests::{agent_journal, reviewer};
+    use crate::cmd::human::tests::{THE_QUESTION, agent_journal, agent_journal_asking, reviewer};
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::{EffectClass, EffectId, EffectOutput, Graph, NodeId, TokenUsage};
     use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
@@ -3997,43 +4014,253 @@ pub(crate) mod tests {
         );
     }
 
-    /// **A KNOWN GAP, asserted so it cannot be forgotten — Task 6 closes it and this test
-    /// INVERTS.** It is written as an assertion rather than a comment because the last seven
-    /// defects in this feature were all "the prose says one thing, the code does another".
+    /// One awaiting row, taken from the `AWAITING` BLOCK only.
     ///
-    /// Today a human-backed agent is listed, but nothing distinguishes it from an
-    /// `AwaitSignal`: `awaiting_nodes` builds `options` only from `GateAwaited`, and
-    /// `render::awaiting_section` renders a `None` menu as the literal cell `signal` —
-    /// pointing the operator at `torii run signal`, which `cmd::run::signal` REFUSES for
-    /// exactly this node (`signal_on_a_human_backed_agent_is_refused_and_points_at_run_
-    /// agent_answer`). The `--json` contract has the same hole: `AwaitingNode::options`
-    /// documents key ABSENCE as the discriminator meaning "an `AwaitSignal`", and a script
-    /// following that rule will issue the refused command.
+    /// Splitting on the header first is not decoration. `render::table`'s run row starts
+    /// with the same uuid and its last column is the pause REASON — free text that can
+    /// contain the very words the awaiting cell is being checked for. s2's menu test
+    /// matched the whole output and passed while the awaiting cell was empty; the same
+    /// mistake here would let every assertion below be satisfied by the reason column.
+    /// The second whitespace-separated token then discriminates the rows WITHIN the block,
+    /// which is the node id (the table's second token is a status word).
+    fn awaiting_row(text: &str, run: RunId, node: &str) -> String {
+        let (_, block) = text
+            .split_once("AWAITING")
+            .unwrap_or_else(|| panic!("no AWAITING block at all:\n{text}"));
+        block
+            .lines()
+            .filter(|l| l.starts_with(&run.0.to_string()))
+            .find(|l| l.split_whitespace().nth(1) == Some(node))
+            .unwrap_or_else(|| panic!("no awaiting row for {node}:\n{text}"))
+            .to_string()
+    }
+
+    /// The in-process half of AC13's second leg ("`list-paused` shows the question"); the
+    /// cross-process half is the Postgres e2e. The question is the WORK of a human-backed
+    /// agent, so an operator must see it without loading the graph — which `list-paused`
+    /// could not do anyway, since it folds one journal per paused run and holds no graph.
     ///
-    /// When Task 6 lands `AgentAwaited.prompt` in the listing, this test becomes the
-    /// positive form — the row names the question and the kind — rather than being deleted.
+    /// Anchored on the agent's own row inside the awaiting block; see [`awaiting_row`].
     #[tokio::test]
-    async fn list_paused_does_not_yet_tell_a_human_backed_agent_from_an_await_signal() {
+    async fn list_paused_shows_a_human_agents_question() {
         let run = RunId(uuid::Uuid::new_v4());
         let s = paused_store(run, None).await;
         let j = agent_journal(run, &reviewer(), None).await;
 
         let out = list_paused(&s, &j, false).await.expect("lists");
+        assert_eq!(out.code, EXIT_OK);
+        let row = awaiting_row(&out.text, run, "reviewer");
         assert!(
-            !out.text.contains("Does this release look safe to ship?"),
-            "the question is not rendered yet — if it now is, invert this test and re-word \
-             `run agent`'s help, which was softened for exactly this reason:\n{}",
+            row.contains(THE_QUESTION),
+            "the question must be in the agent's OWN awaiting row: {row}"
+        );
+        assert!(
+            row.contains("agent:"),
+            "…and the row must name the KIND, or an operator reaches for `run signal` — \
+             the one verb this node refuses: {row}"
+        );
+        assert!(
+            out.text.contains("run agent answer"),
+            "the block must name the verb that works, exactly as it does for a gate:\n{}",
             out.text
         );
+    }
 
+    /// **This test was the inverse until Task 6.** It asserted that nothing told a
+    /// human-backed agent from an `AwaitSignal` — a known gap, written as an assertion
+    /// rather than a comment. It is inverted rather than deleted so the closure is proven
+    /// on the same fixture that pinned the gap.
+    ///
+    /// **All THREE waiting kinds sit in ONE run**, and that is what makes the negative
+    /// assertions mean anything: [`list_paused`] folds one journal PER RUN, so a question
+    /// could not leak between runs however `awaiting_nodes` was written. In one fold, only
+    /// the per-node keying stops it — the same lesson
+    /// `list_paused_distinguishes_a_gate_from_an_await_signal` records, which found that
+    /// mutating `menus.get(&node)` to `menus.values().next()` left its two-run fixture
+    /// green.
+    #[tokio::test]
+    async fn list_paused_tells_a_human_backed_agent_from_an_await_signal() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+        j.append(
+            run,
+            JournalEvent::SignalAwaited {
+                node: gate(),
+                deadline: None,
+            },
+        )
+        .await
+        .unwrap();
+        j.append(
+            run,
+            JournalEvent::GateAwaited {
+                node: release(),
+                deadline: None,
+                options: vec![orchestrator_core::GateOption {
+                    name: "ship".into(),
+                    outcome: orchestrator_core::GateOutcome::Complete,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let agent = awaiting_row(&out.text, run, "reviewer");
+        assert!(
+            agent.contains("agent:") && agent.contains(THE_QUESTION),
+            "{agent}"
+        );
+        assert!(
+            // Keyed on the `gate:` PREFIX, not on the option name: the fixture question is
+            // "Does this release look safe to ship?", which contains both `release` and
+            // `ship` as ordinary words. A `contains("ship")` here fails on the correct
+            // output — which it did, on first run.
+            !agent.contains("gate:"),
+            "a human-backed agent publishes no menu and must not borrow the gate's: {agent}"
+        );
+        let gate_row = awaiting_row(&out.text, run, "release");
+        assert!(
+            gate_row.contains("gate: ship") && !gate_row.contains(THE_QUESTION),
+            "a gate keeps its menu and takes no question: {gate_row}"
+        );
+        let signal = awaiting_row(&out.text, run, "gate");
+        assert!(
+            !signal.contains(THE_QUESTION) && !signal.contains("agent:"),
+            "an AwaitSignal has no question and must not borrow the agent's — they are in \
+             the SAME fold, so only the per-node keying stops it: {signal}"
+        );
+        assert!(
+            signal.split_whitespace().nth(2) == Some("signal"),
+            "…and must still say what it IS waiting for: {signal}"
+        );
+
+        // The `--json` half: key PRESENCE is the discriminator a script reads, and it must
+        // now separate all THREE kinds — `options` a gate, `question` a human-backed agent,
+        // neither an `AwaitSignal`.
         let json = list_paused(&s, &j, true).await.expect("lists");
         let parsed: serde_json::Value = serde_json::from_str(&json.text).expect("valid JSON");
-        let node = parsed[0]["awaiting"][0].clone();
-        assert_eq!(node["node"], "reviewer", "the node is in the JSON: {node}");
+        let node_json = |name: &str| -> serde_json::Value {
+            parsed[0]["awaiting"]
+                .as_array()
+                .expect("an awaiting array")
+                .iter()
+                .find(|n| n["node"] == name)
+                .unwrap_or_else(|| panic!("no awaiting entry for {name}: {parsed}"))
+                .clone()
+        };
+        let agent_json = node_json("reviewer");
+        assert_eq!(
+            agent_json["question"], THE_QUESTION,
+            "a script must be able to read the question without the graph: {agent_json}"
+        );
         assert!(
-            node.get("options").is_none() && node.get("question").is_none(),
-            "no key tells a script this is a human-backed agent — the gap Task 6 closes: \
-             {node}"
+            agent_json.get("options").is_none(),
+            "a human-backed agent publishes no menu: {agent_json}"
+        );
+        let signal_json = node_json("gate");
+        assert!(
+            signal_json.get("question").is_none() && signal_json.get("options").is_none(),
+            "an AwaitSignal has neither, and `null` would change s1's JSON shape — a script \
+             written against s1 must see byte-identical output: {signal_json}"
+        );
+    }
+
+    /// A question is AUTHOR free text — an agent's `system_prompt`, its skill bodies, the
+    /// rendered upstream context and the node's input — reaching a line-oriented table, so
+    /// it carries exactly the hazards an option name does: a raw newline forges a line that
+    /// reads as its own awaiting row,
+    /// carrying a uuid an operator could paste into `run cancel`, and an ANSI escape can
+    /// rewrite what is already on screen. This is the guard on `render::one_line` in the
+    /// question cell; without it the forged line is real.
+    #[tokio::test]
+    async fn a_hostile_question_cannot_forge_an_awaiting_row_or_move_the_cursor() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let hostile = format!("ship it?\n{FORGED_RUN}  review  answered\u{1b}[2K");
+        let j = agent_journal_asking(run, &reviewer(), None, &hostile).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert!(
+            !out.text.contains('\u{1b}'),
+            "a raw escape byte survived into the table: {:?}",
+            out.text
+        );
+        let forged = out
+            .text
+            .lines()
+            .filter(|l| l.trim_start().starts_with(FORGED_RUN))
+            .count();
+        assert_eq!(
+            forged, 0,
+            "a newline in a question forged a line that reads as its own row:\n{}",
+            out.text
+        );
+    }
+
+    /// The cell is CAPPED as well as collapsed. A question is bounded upstream only by
+    /// `MAX_HUMAN_TEXT_BYTES` (4096) — `Executor::run_human_agent` fails the node above
+    /// that — which is one to two orders of magnitude too wide for a table row, and the
+    /// executor composes it from the system prompt, every activated skill body, the rendered
+    /// `## Context` section and a `## Task` section holding the node's input, so a multi-KB
+    /// question is the NORMAL case here rather than a hostile one.
+    #[tokio::test]
+    async fn an_overlong_question_is_capped_so_it_cannot_wreck_the_block() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let long = "q".repeat(4_000);
+        let j = agent_journal_asking(run, &reviewer(), None, &long).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let row = awaiting_row(&out.text, run, "reviewer");
+        assert!(
+            row.chars().count() < 500,
+            "an unbounded question wrecks the block: {} chars",
+            row.chars().count()
+        );
+        assert!(row.contains('…'), "truncation must be visible: {row}");
+    }
+
+    /// Design §6's rule that EVERY operator-facing string goes through the redactor — not
+    /// AC9, which is about the ANSWER (`--text` scrubbed in the journal and in the output).
+    /// The question needs its own guard because it takes a different route: it is journaled
+    /// by the executor UNREDACTED — verified in `executor/human.rs`, which appends
+    /// `prompt: prompt.to_string()` — and torii is the first thing that ever DISPLAYS it,
+    /// exactly the position it is in for a pause reason. Its ingredients are an agent's
+    /// `system_prompt` and skill bodies, operator-authored config pushed with
+    /// `torii config push` (which redacts nothing — there is no `redact` anywhere in
+    /// `orchestrator-store` or `cmd::config`), plus upstream blackboard values. A credential
+    /// in any of those would otherwise reach a terminal and a `--json` consumer verbatim.
+    #[tokio::test]
+    async fn a_secret_shaped_question_is_redacted_in_the_listing() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        // Assembled at runtime: the repo's Semgrep CWE-798 hook blocks a credential-shaped
+        // literal in a fixture.
+        let secret = format!("sk-{}", "A".repeat(24));
+        let j = agent_journal_asking(
+            run,
+            &reviewer(),
+            None,
+            &format!("call the API with {secret} and report the status"),
+        )
+        .await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert!(
+            !out.text.contains(&secret),
+            "the table leaked: {}",
+            out.text
+        );
+        assert!(out.text.contains("[REDACTED"), "{}", out.text);
+
+        let json = list_paused(&s, &j, true).await.expect("lists");
+        assert!(
+            !json.text.contains(&secret),
+            "a script must not receive a credential either — `render::json` redacts the \
+             pause reason for exactly this reason: {}",
+            json.text
         );
     }
 
