@@ -202,6 +202,8 @@ mod tests {
             completed: vec![NodeId("n1".into())],
             skipped: vec![],
             outputs: vec![],
+            spent: 0,
+            budget: None,
         };
         journal.snapshot(run, snap).await.unwrap();
         let got = journal
@@ -218,6 +220,8 @@ mod tests {
             completed: vec![NodeId("n1".into()), NodeId("n2".into())],
             skipped: vec![],
             outputs: vec![],
+            spent: 0,
+            budget: None,
         };
         journal.snapshot(run, snap2).await.unwrap();
         assert_eq!(journal.latest_snapshot(run).await.unwrap().unwrap().seq, s1);

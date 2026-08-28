@@ -427,6 +427,28 @@ pub struct Snapshot {
     pub skipped: Vec<NodeId>,
     /// Each completed node's output, keyed by node id (ref-or-inline).
     pub outputs: Vec<(NodeId, EffectOutput)>,
+    /// Tokens spent at `seq`, and the cap in force there — the SP-DATA-5 ledger
+    /// reduced to the two scalars a tail-only fold cannot re-derive.
+    ///
+    /// Carried because this struct's own contract above ("a resume folds events with
+    /// `Seq >` this") is a loaded gun otherwise. Wire that optimisation without these
+    /// and a resume drops every `EffectRecorded.usage` at or below `seq` AND
+    /// `RunStarted.budget`, which lives at the very first seq — so the run resumes
+    /// having apparently spent nothing, with `budget: None` and a gate that can never
+    /// fire. Uncapped, silently. `write_snapshot` runs at EVERY round boundary, so
+    /// this would be the common path, not an edge case.
+    ///
+    /// The defect is a third instance of the family SP-DATA-5's review already found
+    /// twice (Map compaction erasing children's spend; the fold summing instead of
+    /// keying by effect id). It is recorded here rather than left to the future
+    /// because a tail-only fold that compiles would pass the entire suite.
+    ///
+    /// `#[serde(default)]` on both: snapshots written before this field existed
+    /// deserialize as `(0, None)`, which is exactly the pre-existing behaviour.
+    #[serde(default)]
+    pub spent: u64,
+    #[serde(default)]
+    pub budget: Option<u64>,
 }
 
 /// The durable-journal seam. Slice 1 ships an in-memory implementation; a

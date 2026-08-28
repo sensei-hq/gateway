@@ -12286,6 +12286,61 @@ async fn the_planner_selector_journals_its_spend_to_the_ledger() {
     );
 }
 
+/// A round-boundary snapshot carries the run's LEDGER, not just its node progress.
+///
+/// `Snapshot`'s own contract is that "a resume folds events with `Seq >` this". Nothing
+/// folds tail-only today, so this is a dormant defect rather than a live one — but the
+/// two scalars a tail-only fold cannot re-derive are exactly the two that make the
+/// budget gate work, and `RunStarted.budget` lives at the FIRST seq, below every
+/// snapshot. Seed a resume from a snapshot without them and the run comes back having
+/// apparently spent nothing, with `budget: None` and a gate that can never fire.
+///
+/// This is a contract test, and deliberately so: it cannot be red-first through
+/// behaviour because the consuming path does not exist yet. That is precisely why it is
+/// worth writing — the overview's warning is that "a tail-only fold that compiles will
+/// pass the entire suite", and this is the assertion that makes that false.
+///
+/// *Mutation:* hardcode `spent: 0, budget: None` in `write_snapshot` and this fails on
+/// both assertions.
+#[tokio::test]
+async fn a_round_boundary_snapshot_carries_the_spend_ledger_and_the_cap() {
+    let (gateway, _calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 15,
+            total_tokens: 25,
+        }),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, ..) = two_node_graph("a", "b"); // linear → two rounds, two calls
+
+    journal
+        .append(run, run_started_with_budget(10_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let outcome = exec.start(run, &graph).await.expect("drives");
+    assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+
+    let snap = journal
+        .latest_snapshot(run)
+        .await
+        .unwrap()
+        .expect("a snapshot was written");
+    assert_eq!(
+        snap.spent, 50,
+        "two metered calls at 25 tokens each — the snapshot records what the gate reads"
+    );
+    assert_eq!(
+        snap.budget,
+        Some(10_000),
+        "the cap is carried too: it lives at the first seq, below every snapshot"
+    );
+}
+
 // ============================= SP-DATA-5 Task 4: usage capture =================
 //
 // Task 3 built the `Refusal::Unmetered` chokepoint arm but left it untestable —
