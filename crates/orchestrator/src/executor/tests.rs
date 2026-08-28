@@ -12286,6 +12286,75 @@ async fn the_planner_selector_journals_its_spend_to_the_ledger() {
     );
 }
 
+/// A re-driven `Select` node REPLAYS the selector's call from the journal instead of
+/// dispatching (and paying for) it again.
+///
+/// `PlannerSelected` memoizes the choice, but it is journaled AFTER the selector
+/// returns — so every window that ends before it (the anti-hallucination reject below,
+/// a crash between the `EffectRecorded` append and the `PlannerSelected` one, a
+/// gateway error) leaves a run that re-enters the `Select` arm from scratch on the next
+/// drive. Such a run IS re-driven in production: `finalize_run` withholds
+/// `RunCompleted` while a node failed "so it stays resumable", and `Scheduler::record`
+/// ranks `paused` ahead of `failed`, so a run with any paused sibling is auto-woken by
+/// `tick`.
+///
+/// Without the memo check the other four producers have, each of those wakes was a
+/// fresh billed call whose `EffectRecorded` landed on the SAME effect id — and
+/// `fold_journal`'s `usage.insert` is keyed, not summed, so the durable ledger stayed
+/// frozen at ONE call's tokens while the run spent without bound. The cap this slice
+/// exists to make exact never fired, because `spent` never moved.
+///
+/// The two assertions are the two halves of that: the run stops dispatching, and what
+/// it did dispatch is fully accounted for.
+///
+/// *Mutation:* drop the `fold.memo` lookup from `SelectorDispatch::complete` and this
+/// goes red on both (5 calls, ledger 77).
+#[tokio::test]
+async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
+    let (gateway, calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 70,
+            total_tokens: 77,
+        }),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    // A 100-token cap: ONE 77-token selector call fits, a second must not happen.
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")));
+
+    // "canned-response" is not a candidate ⇒ the node fails ⇒ no `RunCompleted`, no
+    // `PlannerSelected`, and the next drive re-enters the Select arm.
+    for i in 0..5 {
+        let out = exec.start(run, &graph).await.expect("drives");
+        assert!(out.failed.is_some(), "drive {i}: {out:?}");
+    }
+
+    let dispatched = calls.lock().unwrap().len() as u64;
+    assert_eq!(
+        dispatched, 1,
+        "five wakes, one billed selector call — the rest replay from the journal"
+    );
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        crate::spend_of(&events).0,
+        77 * dispatched,
+        "the durable ledger accounts for every selector dispatch"
+    );
+}
+
 /// A round-boundary snapshot carries the run's LEDGER, not just its node progress.
 ///
 /// `Snapshot`'s own contract is that "a resume folds events with `Seq >` this". Nothing
