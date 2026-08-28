@@ -47,6 +47,56 @@ sensei-local-engine    = { path = "../gateway/crates/local-engine" }
 
 Edit locally, build the consumer against your changes, then push here, cut a new tag, and bump the pinned tag in each consumer.
 
+## Testing
+
+```bash
+cargo test --workspace
+```
+
+That is the whole default suite and it needs no database, no Docker and no network.
+
+### Postgres-backed tests
+
+The orchestrator's durable half — the Postgres journal, CAS, context store, config source
+and scheduler, plus torii's cross-process operator e2e — can only be exercised against a
+real database. Those tests are **conditionally ignored**: with no `DATABASE_URL` they are
+reported as `ignored`, not as passed, so the number `cargo test` prints is true either way.
+
+Bring up a throwaway database, apply the schema, and run them:
+
+```bash
+docker run -d --name gw-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:16
+sleep 12
+docker exec -i gw-pg psql -U postgres -v ON_ERROR_STOP=1 < database/_apply_all.sql
+
+export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
+
+cargo test --workspace                                    # the 48 conditional tests now RUN
+cargo test -p sensei-torii --test e2e_pg                  # the cross-process operator loop
+cargo test -p sensei-orchestrator --features postgres-tests postgres_e2e
+
+docker rm -f gw-pg
+```
+
+Pick a port that is actually free (`lsof -i :55432`) — the suite talks to whatever
+`DATABASE_URL` names, so pointing it at a database you care about will write to it.
+
+**How the gate works.** Each package with database tests has a five-line `build.rs` that
+emits `cargo::rustc-cfg=have_database_url` when the variable is set, and every such test
+carries `#[cfg_attr(not(have_database_url), ignore = "...")]`. It is a build-time cfg rather
+than a plain `#[ignore]` or a cargo feature because both of those are static: a plain
+`#[ignore]` would need `-- --ignored` even when a database IS configured, and a
+`required-features` test target would make `cargo test -p sensei-torii --test e2e_pg` fail
+outright. `cargo::rerun-if-env-changed=DATABASE_URL` is what makes exporting the variable
+take effect on the next build. The runtime `db_url()` guard remains as a second layer, for
+the case where the variable is set at build time and absent at run time.
+
+**This is not wired into CI.** `.github/workflows/ci.yml`'s `build · test` job sets no
+`DATABASE_URL`, so it now reports these tests as `ignored` — honestly — rather than as
+passing. Adding a `services: postgres:16` container to that job plus a step applying
+`database/_apply_all.sql` would close the gap; that is an outward-facing CI change and has
+not been made here.
+
 ## Versioning
 
 This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); all five crates currently share version `0.3.1`.

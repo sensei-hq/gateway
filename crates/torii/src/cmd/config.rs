@@ -635,6 +635,10 @@ mod tests {
     /// Before FIX 1, `push` wrote unconditionally and the concurrent writer's entity
     /// was silently destroyed. After FIX 1, the stale generation must be caught and the
     /// write refused, leaving the concurrent writer's content intact.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn a_confirmed_push_refuses_when_the_diff_went_stale_mid_prompt() {
         let Some(url) = db_url() else { return };
@@ -717,6 +721,10 @@ mod tests {
     /// MINOR 3, the decline path: `confirm` returns false without ever seeing a
     /// concurrent write. The refusal must still say "refused" but must NOT repeat the
     /// diff `confirm` already displayed.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn a_declined_push_refuses_without_repeating_the_diff_text() {
         let Some(url) = db_url() else { return };
@@ -749,6 +757,10 @@ mod tests {
     /// stale-generation refusal, which is deliberately forced here (rather than raced)
     /// with an impossible `current_v`, so the assertion holds regardless of any
     /// concurrent activity from other tests sharing the same durable generation.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn write_and_report_keeps_the_diff_text_when_confirm_was_never_called() {
         let Some(url) = db_url() else { return };
@@ -772,6 +784,10 @@ mod tests {
     /// counterpart of the test above — `None` means `confirm` already displayed the
     /// diff, so neither a success NOR a refusal may repeat it. Forced with an
     /// impossible `current_v`, same rationale as above.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn write_and_report_omits_the_diff_text_when_confirm_already_showed_it() {
         let Some(url) = db_url() else { return };
@@ -800,6 +816,10 @@ mod tests {
     /// report a false CAS miss — proving `store_and_bump_if`'s first-push handling is
     /// reachable and correct through the caller, not just unit-tested in isolation in
     /// `orchestrator-store`.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn a_genuine_first_push_lands_through_the_real_push_path_when_the_row_is_absent() {
         let Some(url) = db_url() else { return };
@@ -855,6 +875,10 @@ mod tests {
     /// that the rows survived), and `write_and_report`'s success arm (both of its own
     /// tests force the refusal arm with an impossible `current_v`, so the write itself was
     /// never exercised end to end).
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn a_push_validates_then_refuses_then_applies_against_a_live_database() {
         let Some(url) = db_url() else { return };
@@ -955,6 +979,10 @@ mod tests {
     /// It asserts three things the pure tests cannot: that the prompt happened at all,
     /// that the text the operator saw named the strand risk, and that declining left the
     /// generation where it was.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn a_pure_addition_prompts_and_names_the_paused_runs_it_would_strand() {
         let Some(url) = db_url() else { return };
