@@ -182,9 +182,17 @@ enum RunAction {
     /// produces — so it flows into downstream nodes and model prompts exactly as a model's
     /// answer would, and a `Branch` reading that key cannot tell the difference.
     ///
-    /// The node is validated from the JOURNAL: `torii run list-paused` shows the question
-    /// the human was actually asked, and an answer to a node that never asked is refused
-    /// before anything is written.
+    /// The node is validated from the JOURNAL — the `AgentAwaited` this node published is
+    /// the whole evidence a human was asked anything, so an answer to a node that never
+    /// asked is refused before anything is written. `torii run list-paused` names the nodes
+    /// that are waiting, which is how you discover a node id without reading the graph.
+    //
+    // It names them; it does not yet show WHAT they asked. An earlier draft of this help
+    // said it did, which was false at every commit it shipped in: `render::AwaitingNode` is
+    // `{node, deadline, options}` and `cmd::run::awaiting_nodes` never reads
+    // `AgentAwaited.prompt`. Re-word this the moment the question is actually rendered —
+    // `cli.rs`'s `agent_help_promises_only_what_list_paused_actually_shows` is the guard,
+    // and it is written to be flipped rather than deleted.
     ///
     /// `--as` records WHO answered. It is ATTRIBUTION, NOT AUTHENTICATION: it is whatever
     /// string you supply (defaulting to $USER), so it answers "who claimed to answer".

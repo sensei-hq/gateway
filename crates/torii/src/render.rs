@@ -234,9 +234,9 @@ pub fn table(rows: &[ScheduledRun]) -> String {
 }
 
 /// SP-6 s1: one node currently waiting for a human, folded out of a run's journal
-/// (`SignalAwaited`/`GateAwaited`, minus anything that has since terminated the node).
-/// `RunPaused` is not node-keyed, so this is the only way an operator can learn WHAT to
-/// answer without reading the graph.
+/// (`SignalAwaited`/`GateAwaited`/`AgentAwaited`, minus anything that has since terminated
+/// the node). `RunPaused` is not node-keyed, so this is the only way an operator can learn
+/// WHAT to answer without reading the graph.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AwaitingNode {
     pub node: orchestrator_core::NodeId,
@@ -245,8 +245,18 @@ pub struct AwaitingNode {
     /// operator is most likely to lose track of, so it renders explicitly rather than
     /// blank.
     pub deadline: Option<DateTime<Utc>>,
-    /// SP-6 s2: the menu, for a `HumanGate`. `None` = an `AwaitSignal`, which takes
-    /// arbitrary JSON and so has no menu to show.
+    /// SP-6 s2: the menu, for a `HumanGate`. `Some` therefore means exactly one thing — a
+    /// gate, decidable with `torii run gate decide --option <name>`.
+    ///
+    /// **`None` no longer means "an `AwaitSignal`", and did when this doc was written.**
+    /// SP-6 s3 added a third waiting kind — a human-backed `Agent`, answered with
+    /// `torii run agent answer --text` — and it publishes no menu either, so it lands in
+    /// this same `None` bucket. A script that reads absence as "arbitrary JSON, use
+    /// `run signal`" will issue a command `cmd::run::signal` REFUSES for that node kind.
+    /// The negative half of the discriminator is therefore INCOMPLETE until the question
+    /// lands as its own field; `cmd::run::awaiting_nodes` carries the full note and
+    /// `list_paused_does_not_yet_tell_a_human_backed_agent_from_an_await_signal` is the
+    /// test that pins it.
     ///
     /// Read from the journaled `GateAwaited`, so `list-paused` needs no graph load —
     /// which matters because `list-paused` folds one journal per paused run and has no
@@ -255,9 +265,11 @@ pub struct AwaitingNode {
     /// **Skipped when absent rather than serialized as `null`**, so a run with no gate
     /// produces byte-identical `--json` to the pre-s2 output and a script written against
     /// s1 is unaffected. Key PRESENCE is the discriminator on that path — the same
-    /// technique `list_paused` uses for `awaiting_error`, and for the same reason: a
-    /// script must be able to tell the two waiting kinds apart, and it needs the menu to
-    /// build a `gate decide` without loading the graph either.
+    /// technique `list_paused` uses for `awaiting_error`, and for the same reason: a script
+    /// must be able to tell the waiting kinds apart, and it needs the menu to build a
+    /// `gate decide` without loading the graph either. Whatever key eventually distinguishes
+    /// a human-backed `Agent` must be skip-if-absent too, or it breaks that same byte
+    /// identity for every s1/s2 consumer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
 }
@@ -301,12 +313,18 @@ pub type Awaiting = Result<Vec<AwaitingNode>, String>;
 /// single-line-per-run table cannot represent, and widening the shared `table()` would also
 /// move `run status`'s columns.
 ///
-/// **SP-6 s2: the block now holds BOTH waiting kinds, so each row says which it is** — a
-/// gate renders its menu (`gate: ship|hold`), an `AwaitSignal` renders `signal`. The two
+/// **SP-6 s2: the block holds more than one waiting kind, so each row says which it is** — a
+/// gate renders its menu (`gate: ship|hold`), an `AwaitSignal` renders `signal`. The kinds
 /// take different commands and refuse each other's, so listing them identically would
 /// send an operator to a refusal for a node they had correctly identified. The extra
 /// `gate decide` line in the header appears only when a gate is present, so the s1 output
 /// is unchanged for a fleet that has none.
+///
+/// **SP-6 s3's human-backed `Agent` is the exception that proves that rule, and it is not
+/// fixed yet.** It carries no menu, so it falls into the `None` arm and renders `signal` —
+/// the one verb `cmd::run::signal` refuses for it. That is precisely the misdirection the
+/// paragraph above forbids, and it stays until the row learns to say `agent:` with the
+/// question. See [`AwaitingNode::options`] and `cmd::run::awaiting_nodes`.
 ///
 /// An [`Err`] row renders as `unknown: <error>` — never as an absent or empty awaiting set,
 /// which is the one answer that would tell an operator there is nothing to signal on a run

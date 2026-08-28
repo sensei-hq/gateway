@@ -46,7 +46,12 @@ pub enum AgentAction {
     ))]
     Answer {
         run_id: String,
-        /// The waiting node's id — `torii run list-paused` names it, with the question.
+        /// The waiting node's id — `torii run list-paused` names the nodes that are waiting.
+        //
+        // It names them; it does not yet show WHAT they asked, and this help said it did.
+        // See `crate::main`'s `Agent` variant for the whole note and for the guard
+        // (`cli.rs`'s `agent_help_promises_only_what_list_paused_actually_shows`), which
+        // asserts on BOTH surfaces because an operator reads whichever one they reached.
         #[arg(long)]
         node: String,
         /// The answer, as free text. It becomes this node's OUTPUT under the `text` key —
@@ -598,14 +603,19 @@ pub(crate) mod tests {
     use orchestrator_store::{InMemoryJournal, InMemorySchedulerStore};
 
     /// The node id every test here uses: a `review`-area role answered by a person.
-    fn reviewer() -> NodeId {
+    ///
+    /// `pub(crate)` alongside [`agent_journal`], for the reason `cmd::gate::tests::release`
+    /// is: `cmd::run`'s `list-paused` tests need the SAME fixture this module answers
+    /// against, and a second hand-rolled `AgentAwaited` would be a second place for the
+    /// shape `signal_states` folds to drift from the one the executor writes.
+    pub(crate) fn reviewer() -> NodeId {
         NodeId("reviewer".into())
     }
 
     /// A journal in which `node` has already ASKED — the state
     /// `Executor::run_human_agent` leaves behind on its first execution (`AgentAwaited`
     /// with the assembled prompt, then the durable pause).
-    async fn agent_journal(
+    pub(crate) async fn agent_journal(
         run: RunId,
         node: &NodeId,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
@@ -1219,6 +1229,429 @@ pub(crate) mod tests {
                 .count(),
             0,
             "a newline in the fault forged a line that reads as its own run row:\n{}",
+            out.text
+        );
+    }
+
+    // ---- The post-append report ---------------------------------------------------------
+    //
+    // Everything below `journal.append` is REPORTING: the answer is already durable, and the
+    // only remaining question is what — if anything — read it. Four outcomes, and they are
+    // not interchangeable: one of them is the exit-0 "answered", and reporting an ORPHANED
+    // row as answered tells an operator a human is done when the run will never see their
+    // answer.
+    //
+    // This block shipped with ZERO coverage while both siblings tested their identical
+    // copies (`cmd::gate`'s `a_decision_the_node_died_before_is_reported_as_an_orphan_not_
+    // as_decided` and `a_decision_orphaned_by_a_cancel_does_not_advise_waiting_for_a_pause`,
+    // and `cmd::run`'s equivalents): replacing the `signal_state_at` fold with a hard-coded
+    // `(NotAwaiting, None)` left every test in `sensei-torii` green, and so did turning the
+    // terminal-run arm's condition into `false &&`. Both are covered now.
+
+    /// What the concurrent worker's drive does to `run` inside the delivery window — see
+    /// [`HumanRacingStore`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum HumanRacingDrive {
+        /// It folded the journal — which by then contains our answer — completed the node
+        /// with it and finished the run. The delivery worked PERFECTLY; the only thing that
+        /// differs from the ordinary path is that there is no tick left to wait for.
+        CompletesTheNode,
+        /// It had loaded the journal BEFORE our answer landed, so it saw no answer, found
+        /// the deadline expired and failed the node behind our row without ever reading it.
+        ///
+        /// This is the only way a human-backed agent reaches `(other, at > appended)`: step 3
+        /// of `run_human_agent` returns `Completed` before the deadline is acted on at all,
+        /// so a drive that DID fold our row could not have expired the node. That is why this
+        /// command needs no fourth arm where `gate decide` does — see [`answer`].
+        ExpiresTheNode,
+        /// An operator cancelled the run. `cancel` is node-blind and journals no NODE event,
+        /// so the agent still folds as awaiting (`at: None`) while the run is over — the one
+        /// route to the `after.status.is_terminal()` arm below the `at` match.
+        CancelsTheRun,
+    }
+
+    /// A `SchedulerStore` that runs a concurrent worker against `run` at the top of
+    /// `force_wake` — i.e. exactly in the window between [`answer`]'s append and the point
+    /// where its effect becomes observable. `answer` appends BEFORE it calls `force_wake`, so
+    /// this models a worker that drove the run AFTER the answer landed. The `force_wake`
+    /// itself SUCCEEDS; it is simply a no-op, because the row is no longer `paused`.
+    ///
+    /// A third hand-rolled copy of `cmd::run`'s `SignalRacingStore` and `cmd::gate`'s
+    /// `GateRacingStore` only because each is pinned to its own module's node id and neither
+    /// is exported; the one piece that must NOT be re-derived — the durable completion marker
+    /// `signal_states` reads — is the shared `cmd::run::tests::append_completion`, since a
+    /// human-backed agent journals no `NodeCompleted` either and two hand-rolled
+    /// `ContextWrite` shapes would be two places for that marker to drift.
+    ///
+    /// Single-threaded, deterministic, no database.
+    struct HumanRacingStore {
+        inner: InMemorySchedulerStore,
+        journal: std::sync::Arc<InMemoryJournal>,
+        run: RunId,
+        drive: HumanRacingDrive,
+    }
+
+    /// The EXACT `NodeFailed` text `Executor::run_human_agent` journals when
+    /// `wait_or_expire_by_id` returns `Expired` — copied verbatim from
+    /// `crates/orchestrator/src/executor/human.rs` rather than paraphrased, so this fixture
+    /// models a row this repo actually writes.
+    const EXECUTOR_EXPIRY: &str =
+        "human_agent: node reviewer passed its deadline 1970-02-04T17:20:01Z with no answer";
+
+    #[async_trait::async_trait]
+    impl SchedulerStore for HumanRacingStore {
+        async fn enqueue(
+            &self,
+            run: RunId,
+            graph: &Graph,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<(), OrchestratorError> {
+            self.inner.enqueue(run, graph, now).await
+        }
+        async fn record_paused(
+            &self,
+            run: RunId,
+            next_wake: Option<chrono::DateTime<chrono::Utc>>,
+            reason: &str,
+        ) -> Result<(), OrchestratorError> {
+            self.inner.record_paused(run, next_wake, reason).await
+        }
+        async fn record_terminal(
+            &self,
+            run: RunId,
+            status: RunStatus,
+            reason: Option<&str>,
+        ) -> Result<(), OrchestratorError> {
+            self.inner.record_terminal(run, status, reason).await
+        }
+        async fn claim_due(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+            lease: chrono::Duration,
+            limit: usize,
+        ) -> Result<Vec<(RunId, Graph)>, OrchestratorError> {
+            self.inner.claim_due(now, lease, limit).await
+        }
+        async fn status(
+            &self,
+            run: RunId,
+        ) -> Result<Option<orchestrator_core::ScheduledRun>, OrchestratorError> {
+            self.inner.status(run).await
+        }
+        async fn list_paused(
+            &self,
+        ) -> Result<Vec<orchestrator_core::ScheduledRun>, OrchestratorError> {
+            self.inner.list_paused().await
+        }
+        async fn cancel(&self, run: RunId) -> Result<(), OrchestratorError> {
+            self.inner.cancel(run).await
+        }
+        async fn count_terminal_before(
+            &self,
+            before: chrono::DateTime<chrono::Utc>,
+        ) -> Result<u64, OrchestratorError> {
+            self.inner.count_terminal_before(before).await
+        }
+        async fn prune_terminal(
+            &self,
+            before: chrono::DateTime<chrono::Utc>,
+        ) -> Result<u64, OrchestratorError> {
+            self.inner.prune_terminal(before).await
+        }
+        async fn force_wake(
+            &self,
+            run: RunId,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<(), OrchestratorError> {
+            if run != self.run {
+                return self.inner.force_wake(run, now).await;
+            }
+            match self.drive {
+                HumanRacingDrive::CompletesTheNode => {
+                    // A worker's tick claims the run (`paused -> waking`), and its drive
+                    // folds the journal — which by now contains our answer — completes the
+                    // node with it and finishes the run.
+                    self.inner
+                        .claim_due(now, chrono::Duration::seconds(60), 10)
+                        .await?;
+                    crate::cmd::run::tests::append_completion(&self.journal, run, &reviewer())
+                        .await;
+                    self.journal.append(run, JournalEvent::RunCompleted).await?;
+                    self.inner
+                        .record_terminal(run, RunStatus::Completed, None)
+                        .await?;
+                }
+                HumanRacingDrive::ExpiresTheNode => {
+                    self.inner
+                        .claim_due(now, chrono::Duration::seconds(60), 10)
+                        .await?;
+                    self.journal
+                        .append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: reviewer(),
+                                error: EXECUTOR_EXPIRY.to_string(),
+                            },
+                        )
+                        .await?;
+                    self.inner
+                        .record_terminal(run, RunStatus::Failed, Some("human_agent"))
+                        .await?;
+                }
+                // No claim and no journal write at all: `cancel` is unconditional and
+                // node-blind, which is exactly what leaves the agent folding as awaiting on
+                // a run that is over.
+                HumanRacingDrive::CancelsTheRun => self.inner.cancel(run).await?,
+            }
+            // Our own force_wake: succeeds, but is a conditional no-op now that the row is
+            // no longer `paused`.
+            self.inner.force_wake(run, now).await
+        }
+    }
+
+    /// Drive `answer` against a worker that races it inside the delivery window, returning
+    /// the report together with the seqs of our row and of whatever the drive journaled.
+    /// The ORDERING is the whole discriminator on this arm, so every caller asserts it as a
+    /// precondition rather than trusting the fixture.
+    async fn answer_against_a_racing_drive(
+        drive: HumanRacingDrive,
+    ) -> (Outcome, std::sync::Arc<InMemoryJournal>, RunId) {
+        let run = RunId(uuid::Uuid::new_v4());
+        // `Some(now())` and NOT `None`: `claim_due` claims a paused row only when its
+        // `next_wake` is due, so with a NULL deadline the modelled worker claims nothing,
+        // `record_terminal` (which applies only to a `waking` row) silently no-ops, and the
+        // run stays `paused` — every drive below would then collapse into the ordinary
+        // queued-wake path and assert nothing. The journaled deadline matches the one
+        // [`EXECUTOR_EXPIRY`] names, so the fixture is coherent with the row it writes.
+        let inner = paused_store(run, Some(now())).await;
+        let journal = std::sync::Arc::new(
+            agent_journal(run, &reviewer(), Some(now() + chrono::Duration::seconds(1))).await,
+        );
+        let racing = HumanRacingStore {
+            inner,
+            journal: journal.clone(),
+            run,
+            drive,
+        };
+
+        let out = answer(
+            &racing,
+            journal.as_ref(),
+            run,
+            reviewer(),
+            "ship it",
+            "alice",
+            now(),
+        )
+        .await
+        .expect("a post-append race is reported, not returned as a bare error");
+        (out, journal, run)
+    }
+
+    /// The seq of the first event matching `p`, which must be on the journal.
+    async fn seq_of(
+        j: &InMemoryJournal,
+        run: RunId,
+        p: fn(&JournalEvent) -> bool,
+    ) -> orchestrator_core::Seq {
+        j.load(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(_, e)| p(e))
+            .map(|(s, _)| s)
+            .expect("the event is on the journal")
+    }
+
+    /// THE check-then-act case on the post-append arm, and the one BOTH siblings shipped
+    /// INVERTED: a worker that claims the run the instant the answer lands folds it,
+    /// completes the node and drives the run to completion — the delivery worked perfectly —
+    /// and a report that read only the SCHEDULER row said `not queued`, exit 2, advising
+    /// `torii run wake`, which refuses every non-paused run.
+    ///
+    /// This is the only exit-0 path through the post-append tail, so it is also the arm that
+    /// must never be reachable for an ORPHAN: the two tests below are its other half.
+    #[tokio::test]
+    async fn an_answer_a_racing_worker_already_folded_is_reported_as_answered() {
+        let (out, j, run) = answer_against_a_racing_drive(HumanRacingDrive::CompletesTheNode).await;
+
+        let answered = seq_of(&j, run, |e| matches!(e, JournalEvent::AgentAnswered { .. })).await;
+        let completed = seq_of(&j, run, |e| matches!(e, JournalEvent::ContextWrite { .. })).await;
+        assert!(
+            answered < completed,
+            "precondition: the drive completed the node by folding OUR answer \
+             (answered={answered} completed={completed})"
+        );
+
+        assert_eq!(
+            out.code, EXIT_OK,
+            "the answer was delivered AND read — reporting a failure here would send an \
+             operator to `torii run wake`, which refuses every non-paused run: {}",
+            out.text
+        );
+        assert!(
+            out.text.starts_with("answered:"),
+            "must report the delivery it actually achieved: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("not queued") && !out.text.contains("run wake"),
+            "the run is already moving; there is no wake to chase: {}",
+            out.text
+        );
+    }
+
+    /// The other side of that discriminator: same `at > appended` ORDERING, opposite meaning.
+    /// A drive that had already loaded the journal before our row landed sees no answer,
+    /// finds the deadline expired and fails the node behind us — so the answer is durable and
+    /// nothing read it.
+    ///
+    /// Without this test the whole `at.is_some()` classification collapses to
+    /// `Outcome::ok("answered")`, which would tell an operator their answer stopped a node
+    /// that in fact died of its SLA, and hide the far more useful fact that it expired.
+    #[tokio::test]
+    async fn an_answer_a_racing_expiry_never_read_is_not_reported_as_answered() {
+        let (out, j, run) = answer_against_a_racing_drive(HumanRacingDrive::ExpiresTheNode).await;
+
+        let answered = seq_of(&j, run, |e| matches!(e, JournalEvent::AgentAnswered { .. })).await;
+        let failed = seq_of(&j, run, |e| matches!(e, JournalEvent::NodeFailed { .. })).await;
+        assert!(
+            answered < failed,
+            "precondition: identical ORDERING to the honoured answer above — only what the \
+             drive journaled differs (answered={answered} failed={failed})"
+        );
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "the deadline fired with no answer read; reporting this as answered claims a \
+             delivery nothing ever looked at: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("not read") && out.text.contains("would not have seen it"),
+            "must say plainly that the drive never saw it: {}",
+            out.text
+        );
+    }
+
+    /// The `(other, false)` arm — a node that died INSIDE the write window, so our row landed
+    /// BEHIND a marker that was already there. Reached with a journal whose `append` slips
+    /// the `NodeFailed` in first: the store hook fires on `force_wake`, which is post-append
+    /// by construction, so no `SchedulerStore` fixture can produce this ordering.
+    ///
+    /// It must never report success, and the residue is durable and consequential: a
+    /// human-backed agent journals no `NodeCompleted` and `NodeFailed` is not folded as a
+    /// barrier, so a re-`start` of this run would re-execute the node and fold this late
+    /// answer as its OUTPUT — which then flows into every downstream model prompt.
+    #[tokio::test]
+    async fn an_answer_the_node_died_before_is_reported_as_an_orphan_not_as_answered() {
+        struct DiesInsideTheWindow {
+            inner: std::sync::Arc<InMemoryJournal>,
+        }
+        #[async_trait::async_trait]
+        impl ExecutionJournal for DiesInsideTheWindow {
+            async fn append(
+                &self,
+                run: RunId,
+                event: JournalEvent,
+            ) -> Result<orchestrator_core::Seq, orchestrator_core::JournalError> {
+                if matches!(event, JournalEvent::AgentAnswered { .. }) {
+                    self.inner
+                        .append(
+                            run,
+                            JournalEvent::NodeFailed {
+                                node: reviewer(),
+                                error: EXECUTOR_EXPIRY.to_string(),
+                            },
+                        )
+                        .await?;
+                }
+                self.inner.append(run, event).await
+            }
+            async fn load(
+                &self,
+                run: RunId,
+            ) -> Result<Vec<(orchestrator_core::Seq, JournalEvent)>, orchestrator_core::JournalError>
+            {
+                self.inner.load(run).await
+            }
+        }
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let inner = std::sync::Arc::new(agent_journal(run, &reviewer(), None).await);
+        let j = DiesInsideTheWindow {
+            inner: inner.clone(),
+        };
+
+        let out = answer(&s, &j, run, reviewer(), "ship it", "alice", now())
+            .await
+            .expect("no hard error");
+
+        let answered = seq_of(&inner, run, |e| {
+            matches!(e, JournalEvent::AgentAnswered { .. })
+        })
+        .await;
+        let failed = seq_of(&inner, run, |e| {
+            matches!(e, JournalEvent::NodeFailed { .. })
+        })
+        .await;
+        assert!(
+            failed < answered,
+            "precondition: the node was already dead when the row landed (failed={failed} \
+             answered={answered})"
+        );
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("was already") && out.text.contains("nothing read it"),
+            "must say the row is a durable orphan, not a delivery: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("re-`start`"),
+            "must name the durable consequence — the answer is still a last-wins value: {}",
+            out.text
+        );
+    }
+
+    /// The other half of the post-append window: the RUN went terminal while the NODE itself
+    /// never did. `cancel` is node-blind and journals no node event, so the agent still folds
+    /// as awaiting (`at: None`) and the report falls through to the status arm.
+    ///
+    /// "Run `torii run wake <id>` once it is paused again" is a dead end here for exactly the
+    /// reason the PRE-check arm already avoids it
+    /// (`an_answer_on_a_terminal_run_does_not_advise_waiting_for_a_pause`): `wake` refuses
+    /// every non-paused run and no shipped store moves a terminal row back to `paused`. The
+    /// rule has to hold on BOTH arms of the same function — `gate decide` shipped it on one.
+    #[tokio::test]
+    async fn an_answer_orphaned_by_a_cancel_does_not_advise_waiting_for_a_pause() {
+        let (out, j, run) = answer_against_a_racing_drive(HumanRacingDrive::CancelsTheRun).await;
+
+        assert_eq!(
+            journaled_answers(&j, run, &reviewer()).await.len(),
+            1,
+            "precondition: the answer is durable — this is a post-append report, not a refusal"
+        );
+        assert!(
+            j.load(run)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, e)| !matches!(e, JournalEvent::NodeFailed { .. })),
+            "precondition: a cancel journals no NODE event, so the node still folds as \
+             awaiting and this really is the `at: None` arm"
+        );
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("cancelled"),
+            "must name the actual state: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("once it is paused again"),
+            "a cancelled run never pauses again — this is advice to wait forever: {}",
             out.text
         );
     }
