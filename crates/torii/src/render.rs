@@ -397,13 +397,21 @@ pub struct AwaitingNode {
     /// `redact_question` when it builds this field, so every sink is covered by
     /// construction rather than by each sink remembering. The `--json` path in particular
     /// serializes this struct wholesale (`serde_json::to_value(nodes)`), so a sink-side
-    /// scrub is exactly the thing that would be forgotten there. The executor journals the
-    /// prompt UNREDACTED (`executor/human.rs` appends `prompt: prompt.to_string()`), and
-    /// `torii config push` does not redact an agent's `system_prompt` either, so torii is
-    /// the first thing that ever displays it — the same position it is in for a pause
-    /// reason. It is NOT the same transform, though: `redact_question` records why a
-    /// question cannot take the pause reason's withhold-the-whole-string-on-any-
-    /// disagreement rule.
+    /// scrub is exactly the thing that would be forgotten there.
+    ///
+    /// **It is a SECOND pass, not the first.** `executor/human.rs` runs the executor's own
+    /// redactor over the whole composed question BEFORE the `AgentAwaited` append, so the
+    /// durable row is already scrubbed — see [`redact_question`], which carries the same
+    /// sentence, and do not let the two drift again: an earlier version of this paragraph
+    /// claimed the executor appended `prompt: prompt.to_string()`, an expression that
+    /// exists on no code path, and a maintainer trusting it would conclude torii is the
+    /// only scrub here and could safely delete the executor's.
+    ///
+    /// What this pass is still FOR: `Executor::with_redactor` is opt-in and defaults to
+    /// `None`, so an embedder that wired none writes the question as composed — and
+    /// `torii config push` does not redact an agent's `system_prompt` on the way in either.
+    /// It is NOT the same transform as a pause reason's, though: `redact_question` records
+    /// why a question cannot take the withhold-the-whole-string-on-any-disagreement rule.
     ///
     /// **It can still be `WITHHELD_QUESTION` in full**, and a consumer must expect that:
     /// when reassembling the text across its control characters uncovers a credential the
@@ -451,8 +459,8 @@ pub(crate) const MENU_MAX: usize = 160;
 /// Its own constant rather than a reuse of [`MENU_MAX`], because the two are bounded by
 /// different rules upstream and must be free to move apart: a menu is bounded by NOTHING
 /// (`validate_dag` checks options for non-emptiness, uniqueness and a reachable outcome,
-/// never length or count), while a question is already bounded at `MAX_HUMAN_TEXT_BYTES`
-/// (4096) by `Executor::run_human_agent`, which fails the node above it.
+/// never length or count), while a question is bounded — see the next paragraph for by
+/// what, since it is emphatically not one number.
 ///
 /// Wider than a menu and equal to [`REASON_MAX`] because of what the value IS: a menu is a
 /// set of short symbolic names, of which 160 characters already shows several, whereas a
@@ -463,10 +471,16 @@ pub(crate) const MENU_MAX: usize = 160;
 /// other.
 ///
 /// The executor composes the question from the agent's system prompt, every ACTIVATED skill
-/// body, the rendered `## Context` section of upstream outputs (truncated to
-/// `MAX_HUMAN_CONTEXT_BYTES`, with a visible marker) and a `## Task` section holding the
-/// node's input (`executor/human.rs`, `HumanQuestion::compose` — `assemble_prompt`'s two
-/// halves plus the input, so the human sees what the model would have).
+/// body, the rendered `## Context` section of upstream outputs and a `## Task` section
+/// holding the node's input (`executor/human.rs`, `HumanQuestion::compose` —
+/// `assemble_prompt`'s two halves plus the input, so the human sees what the model would
+/// have). **The upstream bound is two numbers, not one**, and this is the canonical
+/// statement of it in this crate: the AUTHORED half (system prompt + activated skills + the
+/// node input) fails the node loudly over `MAX_HUMAN_TEXT_BYTES` (4096), the `## Context`
+/// half is TRUNCATED per dependency with a visible marker to `MAX_HUMAN_CONTEXT_BYTES`
+/// (32768) because it is run data nobody can bound at config time, and the durable row is
+/// clamped to their SUM (36864).
+///
 /// A multi-KB question is therefore the NORMAL case here, not a hostile one, and the cap is
 /// load-bearing rather than defensive: uncapped, one ordinary human-backed agent would wreck
 /// the alignment of every other row in the block.

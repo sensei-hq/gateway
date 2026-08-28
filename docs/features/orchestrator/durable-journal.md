@@ -83,11 +83,17 @@ Two variants complete the journal's HITL vocabulary, after s1's
 Both are **new variants of an existing enum**, so `FORMAT_VERSION` stays **1** — the same
 additivity discipline s1, s2 and the spend ledger used.
 
-`AgentAwaited.prompt` is journaled **unredacted**, and that is stated rather than hidden:
-it is composed from the agent's `system_prompt` and its activated skill bodies, so it is
-the one row where a credential in the *config* reaches durable storage in the clear.
-Redaction happens on the display and answer-write paths (`torii run list-paused`,
-`torii run agent answer`), not on this append.
+`AgentAwaited.prompt` is **redacted before the durable write**: `Executor::run_human_agent`
+runs the executor's own `Redactor` over the *whole* composed question and appends that
+value, then clamps it. That matters because the question is composed from the agent's
+`system_prompt` and its activated skill bodies, and nothing upstream scrubs those —
+`torii config push` redacts nothing. `render::redact_question` is a **second, display-only**
+pass on top (`torii run list-paused`, and the `--json` sink that serialises the awaiting row
+wholesale).
+
+The honest residue: `Executor::with_redactor` is **opt-in and defaults to `None`**, so a
+library embedder that wires no redactor still writes the question as composed. `torii`'s
+heavy tier wires `PatternRedactor` unconditionally, so the CLI path is covered.
 
 ## Notes
 
