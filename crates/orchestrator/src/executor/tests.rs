@@ -17184,6 +17184,105 @@ mod human_agent {
         );
     }
 
+    /// A node that already recorded a wait under a DIFFERENT kind fails LOUDLY, rather than
+    /// pausing forever with no question anyone can answer.
+    ///
+    /// This is the exact mirror of `a_gate_that_recorded_a_wait_without_a_menu_fails_loudly`
+    /// (s2), and s3 shipped without it. `Fold::deadlines` is written by all THREE waiting
+    /// kinds — `SignalAwaited`, `GateAwaited`, `AgentAwaited` — and `wait_or_expire_by_id`
+    /// reads only that shared map. So a node whose id already carries a `SignalAwaited`
+    /// returned `Waiting`, never took the `NotYetAsking` arm, and never published an
+    /// `AgentAwaited`. Review drove that shape three times and got three `RunPaused` rows
+    /// and ZERO journaled questions.
+    ///
+    /// **A silent forever-pause is the worst of the three outcomes, because no verb can
+    /// clear it.** `cmd::human::agent_question` returns `None` with no `AgentAwaited`, so
+    /// `torii run agent answer` refuses with "not delivered: review is not awaiting a human
+    /// answer" — permanently. Meanwhile `torii run signal` sees no gate menu, no agent
+    /// question and a `SignalAwaited`, so it ACCEPTS a payload, reports exit 0, and
+    /// `list-paused` renders the node as a `signal` row — while `run_human_agent` reads only
+    /// `AgentAnswered` and never completes. The operator is told the answer landed and it
+    /// never will.
+    ///
+    /// Reachable the same way s2's is: by editing a live run's graph to change a waiting
+    /// node's KIND. `gate.rs`'s own comment already noted that s3 WIDENS that reachable set
+    /// — an s3 `Agent` node re-pointed at a `HumanGate` lands in ITS loud arm — without
+    /// adding the symmetric guard on this side.
+    ///
+    /// The tell was in the code: `Fold::prompt_for`, the accessor design §4 named for
+    /// exactly this question, was `expect(dead_code)` in non-test builds, because nothing in
+    /// production asked "does THIS node have a question?" — only "has SOME kind begun
+    /// waiting here?".
+    #[tokio::test]
+    async fn an_agent_node_that_recorded_a_wait_without_a_question_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+
+        // As if this node had begun waiting as an `AwaitSignal` before the graph was edited
+        // to make it a human-backed `Agent`: a recorded wait, no question.
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                run,
+                JournalEvent::SignalAwaited {
+                    node: review(),
+                    deadline: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let o = ex.start(run, &human_graph()).await.expect("drives");
+        let (node, message) = o
+            .failed
+            .clone()
+            .expect("a recorded wait with no question must fail, not pause forever: {o:?}");
+        assert_eq!(
+            node,
+            review(),
+            "the failure is the human-backed node: {o:?}"
+        );
+        assert!(
+            message.contains("review") && message.contains("question"),
+            "the failure names the node and what is missing, so an operator is not sent to \
+             check a node id that was right: {message}"
+        );
+        assert!(
+            o.paused.is_none(),
+            "and it does NOT pause — a pause here is unanswerable by every verb torii has: \
+             {o:?}"
+        );
+
+        // Nothing was asked, so nothing can be answered. A journaled question here would be
+        // worse than none: it would be folded first-wins against a deadline the OTHER kind
+        // recorded.
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            journaled_prompts(&events).is_empty(),
+            "it never asked: {:?}",
+            journaled_prompts(&events)
+        );
+
+        // A dead node's verdict is READ BACK, never re-derived — the same unbounded-journal
+        // defect the refusal arm and the expiry arm are both pinned against.
+        ex.start(run, &human_graph()).await.expect("re-drives");
+        assert_eq!(
+            failures(&journal, run, &review()).await.len(),
+            1,
+            "the failure is read back from the fold, not re-derived on every wake"
+        );
+    }
+
     /// SP-4 s2 §6.4, the split-redaction guard for the ANSWER: ONE application of the
     /// redactor feeds BOTH the node's return AND the durable blackboard write.
     ///

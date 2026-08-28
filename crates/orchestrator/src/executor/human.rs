@@ -25,7 +25,8 @@ impl Executor {
     /// | fold state | behaviour |
     /// |---|---|
     /// | failure recorded | `Failed` — shared `gate_precheck`, checked FIRST |
-    /// | no question journaled yet | journal `AgentAwaited`, then continue below |
+    /// | no wait recorded yet | journal `AgentAwaited`, then continue below |
+    /// | a wait recorded by ANOTHER kind, so no question | `NodeFailed` — the kind swap |
     /// | **answered** | `Completed({"text","actor"})` — **read BEFORE expiry** |
     /// | not answered, deadline passed | `NodeFailed` — the SLA fired with nobody answering |
     /// | not answered, deadline not passed | re-pause on the SAME absolute instant |
@@ -147,6 +148,56 @@ impl Executor {
                 },
             )
             .await?;
+        } else if fold.prompt_for(node_id).is_none() {
+            // Already asking by the SHARED map's reckoning, but this node published no
+            // QUESTION — so there is nothing a human could have been shown and nothing an
+            // answer could be an answer to.
+            //
+            // The exact mirror of `run_human_gate`'s missing-menu arm, and s3 shipped
+            // without it. `Fold::deadlines` is written by all THREE waiting kinds while
+            // only `AgentAwaited` carries a prompt, so this arm is reachable the same way
+            // s2's is: by editing a live run's graph to change a waiting node's KIND. An
+            // `AwaitSignal` node re-pointed at a human-backed `Agent` arrives here exactly
+            // as the `AwaitSignal`→`HumanGate` swap arrives there — `gate.rs`'s own comment
+            // already noted that s3 WIDENS that reachable set, and this is the guard it was
+            // noting the absence of.
+            //
+            // **Loud, because the alternative is unanswerable.** Without this arm the node
+            // took the `Waiting` path forever: no `AgentAwaited` ⇒ `cmd::human::
+            // agent_question` is `None` ⇒ `torii run agent answer` refuses with "not
+            // awaiting a human answer", permanently — while `torii run signal` sees no
+            // menu, no question and a live `SignalAwaited`, ACCEPTS a payload, reports exit
+            // 0, and `list-paused` shows the node as a `signal` row. The operator is told
+            // the answer landed; `run_human_agent` reads only `AgentAnswered` and never
+            // completes. Review drove it three times: three pauses, zero questions.
+            //
+            // Asking HERE instead — journaling `AgentAwaited` on top of the other kind's
+            // record — was the other candidate fix and is worse: `deadlines` folds
+            // first-wins, so the question would be published against a deadline some other
+            // node kind chose, and the run would carry two contradictory durable claims
+            // about what it is waiting for.
+            //
+            // It is checked BEFORE the answer read below, deliberately: "the ask precedes
+            // the answer, unconditionally" (see this function's doc), and an answer to a
+            // question that was never asked is not an answer.
+            //
+            // This is also `Fold::prompt_for`'s production consumer. Until this arm existed
+            // nothing in a non-test build asked "does THIS node have a question?" — only
+            // the shared "has SOME kind begun waiting here?" — which is why the accessor
+            // design §4 named for precisely this check carried an `expect(dead_code)`.
+            return self
+                .fail_human_agent(
+                    run,
+                    node_id,
+                    format!(
+                        "human_agent: node {} recorded that it began waiting but published \
+                         no question, so there is nothing a human was ever shown and \
+                         nothing an answer could be delivered against. A waiting node's \
+                         kind cannot be changed mid-run; fail the run and start a new one.",
+                        node_id.0
+                    ),
+                )
+                .await;
         }
 
         // 3. Answered ⇒ complete, BEFORE any expiry consideration (see the doc comment).
