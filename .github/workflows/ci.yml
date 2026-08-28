@@ -27,6 +27,36 @@ jobs:
   test:
     name: build · test
     runs-on: ubuntu-latest
+
+    # A REAL Postgres, because the alternative is a green tick that proves nothing.
+    # Until the `have_database_url` gating landed, 48 DB tests early-returned when
+    # `DATABASE_URL` was unset and libtest counted every one of them as PASSED — so
+    # CI reported them green having never opened a connection. Gating made the skip
+    # honest (they report `ignored`); this service makes them RUN.
+    #
+    # Pinned by digest, not the mutable `:16` tag, for the same supply-chain reason
+    # the actions below are pinned to commit SHAs. Digest is for postgres:16.
+    # `--health-cmd pg_isready` makes the runner block until the server accepts
+    # connections, so no step needs to sleep-and-hope.
+    services:
+      postgres:
+        image: postgres@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5 # postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Setting this is what flips the 48 tests from `ignored` to running: each
+      # package's build.rs emits `cargo::rustc-cfg=have_database_url` when it is
+      # present. A throwaway CI database — never a shared or production one.
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -47,8 +77,24 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # The schema the DB tests expect. dbd owns `database/`; `_apply_all.sql` is
+      # its generated all-in-one apply, and every statement is `create ... if not
+      # exists`, so this is idempotent. ON_ERROR_STOP makes a bad statement fail the
+      # job instead of leaving a half-built schema for the tests to trip over.
+      - name: Apply database schema
+        run: psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f database/_apply_all.sql
+
+      # `--features postgres-tests` / `--features postgres` are NOT enabled by the
+      # plain workspace run, so the orchestrator and store PG suites need their own
+      # invocations. Without these the service container would be started and then
+      # largely unused.
       - name: Test
         run: cargo test --workspace
+
+      - name: Test (Postgres-backed suites)
+        run: |
+          cargo test -p sensei-orchestrator --features postgres-tests
+          cargo test -p sensei-orchestrator-store --features postgres
 
     # NOTE: fmt (`cargo fmt --all --check`) and clippy (`-D warnings`) gates are
     # intentionally omitted for now — the pre-existing tree is not yet rustfmt-
