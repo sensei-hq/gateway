@@ -31,8 +31,7 @@ whole-slice review's 16 findings are ALL fixed on top (`576bc1f`).**
 ## Open questions
 
 - Covered by nothing: a human-backed `AgentDefinition` through a live `PostgresConfigSource`.
-- The e2e suite is `DATABASE_URL`-gated and **counts as PASSED while exercising nothing**
-  without it; a raw-stderr `SKIP` is the only signal.
+- The e2e suite is `DATABASE_URL`-gated and **passes while exercising nothing** without it.
 
 ## Known-broken
 
