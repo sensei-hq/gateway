@@ -544,6 +544,170 @@ fn gate_help_says_attribution_is_not_authentication() {
     }
 }
 
+// ---- SP-6 s3: `torii run agent answer` ------------------------------------------------
+
+/// The subcommand is actually WIRED, not just implemented in the library. Reuses
+/// `help_command_names` for the same reason it exists: `text.contains("agent")` would also
+/// pass on the prose.
+#[test]
+fn run_help_lists_agent() {
+    let out = torii().args(["run", "--help"]).output().expect("runs");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let listed = help_command_names(&text);
+    assert!(
+        listed.iter().any(|c| c == "agent"),
+        "`agent` is not a dispatchable `run` subcommand (found {listed:?}):\n{text}"
+    );
+}
+
+/// The trust boundary must be on the surface an operator reads when they type the flag.
+/// It matters MORE here than on `run gate`: a gate's actor is an audit trail, whereas this
+/// one is folded into the node's OUTPUT (`{"text","actor"}`) and flows into every
+/// downstream model prompt for the life of the run — so an operator who reads `--as` as
+/// authenticated would be branching real work on an unverified string.
+///
+/// Asserted on BOTH surfaces and with `&&` rather than `||`, exactly as `run gate`'s
+/// equivalent: the group help is what an operator browses, `answer --help` is what they
+/// read when they type the flag, and half the sentence warns nobody.
+#[test]
+fn agent_answer_help_says_attribution_is_not_authentication() {
+    for args in [
+        vec!["run", "agent", "--help"],
+        vec!["run", "agent", "answer", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("attribution") && lower.contains("not authentication"),
+            "`{}` must not let --as read as authenticated:\n{text}",
+            args.join(" ")
+        );
+        // clap's own `[default: ""]` rendering contradicts the sentence above on the very
+        // surface that states the trust boundary — the effective default is $USER, which
+        // `cmd::gate::actor_or_user` resolves, not the empty string clap holds.
+        assert!(
+            !text.contains(r#"[default: ""]"#),
+            "`{}` advertises an empty default that is not what actually happens:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
+/// AC11, and the one sink redaction cannot reach: the process's own argv.
+///
+/// A flag value is read by `ps auxww`, by `/proc/<pid>/cmdline`, by the shell's history
+/// file and by the echo of any CI job that shells out — all of them BEFORE any redaction
+/// runs. s1 shipped `--payload` argv-only and a review caught this; s2 repeated it with
+/// `--note`. An agent's answer is the longest free text of the three and the most likely to
+/// be pasted from elsewhere, so `--text-file` ships with the command rather than after it.
+///
+/// The assertion is on the CHILD's argv, read while it is alive, so it fails if the file's
+/// contents ever get re-expanded onto a command line.
+#[test]
+fn an_answer_file_keeps_the_text_out_of_argv() {
+    let sentinel = format!("SENTINEL{}", "4c8e1a97b3d20f6e");
+    let dir = std::env::temp_dir().join(format!("torii-answer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("answer.txt");
+    std::fs::write(&path, &sentinel).expect("write answer");
+
+    let child = torii()
+        // Never-connectable, so the child lives long enough to be observed but performs no
+        // I/O — the same out-of-u16-range trick `signal_with_payload` uses.
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "agent",
+            "answer",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "reviewer",
+            "--text-file",
+            path.to_str().expect("utf-8 path"),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawns");
+
+    let argv = Command::new("ps")
+        .args(["-o", "args=", "-p", &child.id().to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let out = child.wait_with_output().expect("runs");
+
+    assert!(
+        !argv.contains(&sentinel),
+        "the answer reached the child's command line: {argv}"
+    );
+    // And the flag really did deliver it — otherwise the assertion above is vacuous, which
+    // it demonstrably is on a binary that has no `run agent` at all: clap's "unrecognized
+    // subcommand" also contains no sentinel. So the invocation must be proven to have got
+    // PAST clap and past the file read, all the way to the connection this URL cannot
+    // satisfy. Anything earlier means the argv assertion proved nothing.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("cannot connect"),
+        "the whole invocation must be accepted and the file read — only then does the argv \
+         assertion above mean anything: {combined}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Exactly one source, or the operator does not know which one won.
+#[test]
+fn text_and_text_file_are_mutually_exclusive_and_one_is_required() {
+    let both = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "agent",
+            "answer",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "reviewer",
+            "--text",
+            "ship it",
+            "--text-file",
+            "/nonexistent",
+        ])
+        .output()
+        .expect("runs");
+    let both_err = String::from_utf8_lossy(&both.stderr);
+    assert!(!both.status.success(), "two sources must be refused");
+    assert!(
+        both_err.contains("cannot be used with"),
+        "must be refused AS A CONFLICT, not incidentally: {both_err}"
+    );
+
+    let neither = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "agent",
+            "answer",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "reviewer",
+        ])
+        .output()
+        .expect("runs");
+    let neither_err = String::from_utf8_lossy(&neither.stderr);
+    assert!(!neither.status.success(), "no source must be refused");
+    assert!(
+        neither_err.contains("required") && neither_err.contains("text"),
+        "must be refused for the MISSING ANSWER specifically: {neither_err}"
+    );
+}
+
 /// An unreadable file is an operator typo, and must be reported before any connection —
 /// and without echoing whatever was read.
 #[test]
