@@ -40,7 +40,9 @@ pub use journal::{
 pub use plan::{
     NodeNeeds, NodePlan, PlanError, PlannedGraph, RESERVED_PLAN_ID, feasible, parse_plan,
 };
-pub use planner::{PLANNER_AREA, Planner, PlannerSelector, RulePlannerSelector};
+pub use planner::{
+    ModelDispatch, PLANNER_AREA, Planner, PlannerSelector, RESERVED_SELECT_ID, RulePlannerSelector,
+};
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use redact::{PatternRedactor, Redactor};
 pub use registry::{

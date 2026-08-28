@@ -7,10 +7,15 @@
 //! Here the failure would be worse — an ungated path spends real tokens past the
 //! operator's cap, silently.
 //!
-//! The four producers are the ReAct turn (`agent.rs`), the `ModelCall` node
-//! (`mod.rs`), a Map item and the `Consolidate` synthesis (`fanout.rs`). Their
-//! GATEWAY-ERROR handling deliberately differs (two classify the error into
-//! pause-vs-fail, two just stringify it), so the chokepoint returns
+//! The five producers are the ReAct turn (`agent.rs`), the `ModelCall` node
+//! (`mod.rs`), a Map item and the `Consolidate` synthesis (`fanout.rs`), and the
+//! planner selector (`selector.rs`, reaching this chokepoint through
+//! [`SelectorDispatch`]). The selector was the miss this module's own doc warned
+//! about: it shipped holding its own `Arc<Gateway>` and spent past the cap with no
+//! ledger entry, so it is now handed a borrowed capability instead of owning one.
+//!
+//! Their GATEWAY-ERROR handling deliberately differs (two classify the error into
+//! pause-vs-fail, the rest just stringify it), so the chokepoint returns
 //! `Result<Result<_, Refusal>, GatewayError>`: every site's existing `Err(error)` arm
 //! is untouched and only a new `Ok(Err(refusal))` arm is added. Their REFUSAL
 //! handling, by contrast, must be identical — so [`Executor::record_refusal`] owns
@@ -137,7 +142,7 @@ pub(super) enum Refusal {
 
 /// What a journaled refusal means for the producer that hit it: a durable pause the
 /// run stays resumable from, or a node failure. The distinction lives here rather
-/// than at each site so all four producers cannot drift apart on it.
+/// than at each site so all five producers cannot drift apart on it.
 pub(super) enum RefusalKind {
     Paused(String),
     Failed(String),
@@ -249,5 +254,146 @@ impl Executor {
                 Ok(RefusalKind::Failed(error))
             }
         }
+    }
+}
+
+/// The executor's [`ModelDispatch`]: the only provider access a
+/// [`PlannerSelector`](orchestrator_core::PlannerSelector) gets.
+///
+/// Binds one selector call to one run + Expand node so it gates on the run's budget,
+/// charges the live meter and journals its spend exactly like the other four producers.
+/// The selector supplies only the prompts; it cannot widen the capability, pick a
+/// different provider, or skip the gate.
+///
+/// The selector's spend is journaled under the reserved
+/// [`RESERVED_SELECT_ID`](orchestrator_core::RESERVED_SELECT_ID) path rather than the
+/// Expand node's own id, so it lands on the durable ledger without colliding with the
+/// node's effects. That matters beyond tidiness: `PlannerSelected` memoizes the CHOICE,
+/// so a resumed run never re-invokes the selector — without a journaled
+/// `EffectRecorded` the tokens it really spent would vanish from the fold on every
+/// subsequent resume and the run would drift permanently under its true spend.
+pub(super) struct SelectorDispatch<'a> {
+    exec: &'a Executor,
+    run: RunId,
+    /// The Expand node. The journaled effect hangs off `"{node}/__select__"`.
+    node: NodeId,
+    fold: &'a super::Fold,
+    /// A refusal this dispatch already journaled. `ModelDispatch::complete` can only
+    /// return `OrchestratorError`, which cannot carry the pause-vs-fail distinction, so
+    /// the caller reads it back here rather than re-deriving it from a message.
+    refusal: std::sync::Mutex<Option<RefusalKind>>,
+}
+
+impl<'a> SelectorDispatch<'a> {
+    pub(super) fn new(exec: &'a Executor, run: RunId, node: NodeId, fold: &'a super::Fold) -> Self {
+        Self {
+            exec,
+            run,
+            node,
+            fold,
+            refusal: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Take the refusal this dispatch journaled, if any. `None` means the selector's
+    /// `Err` was its own (a bad pick, an empty response), not the budget gate's.
+    pub(super) fn take_refusal(&self) -> Option<RefusalKind> {
+        self.refusal.lock().expect("selector refusal lock").take()
+    }
+
+    /// `"{node}/__select__"` — the reserved path this call's spend is journaled under.
+    fn select_path(&self) -> String {
+        format!("{}/{}", self.node.0, orchestrator_core::RESERVED_SELECT_ID)
+    }
+}
+
+#[async_trait::async_trait]
+impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
+    async fn complete(
+        &self,
+        system: &str,
+        user: &str,
+        chain: Option<&str>,
+    ) -> Result<String, OrchestratorError> {
+        let chain = chain.unwrap_or_default();
+        // Built here rather than via `build_request`, which hardcodes `system: None`;
+        // the selector's instruction ("answer with ONLY the exact agent name") is a
+        // system prompt and dropping it would change what the model returns.
+        let request = InferenceRequest {
+            capability: kernel::types::capability::Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some(chain.to_string()),
+            payload: kernel::types::request::Payload::Chat {
+                messages: vec![kernel::types::request::Message::text(
+                    kernel::types::request::MessageRole::User,
+                    user,
+                )],
+                system: Some(system.to_string()),
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+        };
+
+        let response = match self
+            .exec
+            .dispatch_metered(&request, &self.fold.meter())
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(refusal)) => {
+                // Already journaled by `record_refusal`; stash the kind for the caller
+                // and surface an `Err` so the selector cannot proceed to a fallback.
+                let kind = self
+                    .exec
+                    .record_refusal(self.run, &self.node, refusal)
+                    .await?;
+                let message = match &kind {
+                    RefusalKind::Paused(reason) => reason.clone(),
+                    RefusalKind::Failed(error) => error.clone(),
+                };
+                *self.refusal.lock().expect("selector refusal lock") = Some(kind);
+                return Err(OrchestratorError::Gateway(message));
+            }
+            Err(error) => return Err(OrchestratorError::Gateway(error.to_string())),
+        };
+
+        // SP-4 s2: the same redaction chokepoint every other producer's output crosses.
+        let output = self.exec.model_output(&response);
+        let text = output
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let path = self.select_path();
+        let recorded = self.exec.split_output(&output).await?;
+        self.exec
+            .append(
+                self.run,
+                JournalEvent::EffectRecorded {
+                    node: NodeId(path.clone()),
+                    effect_id: orchestrator_core::effect_id(&path, 0, 0),
+                    class: orchestrator_core::EffectClass::Pure,
+                    input_hash: super::support::input_hash(
+                        chain,
+                        &serde_json::json!({ "system": system, "user": user }),
+                    )
+                    .map_err(|e| OrchestratorError::Gateway(e.to_string()))?,
+                    seq: 0,
+                    output: recorded,
+                    observation: None,
+                    usage: response.usage.map(super::content::convert_usage),
+                },
+            )
+            .await?;
+        Ok(text)
     }
 }

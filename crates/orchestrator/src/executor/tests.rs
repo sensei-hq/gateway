@@ -9166,6 +9166,7 @@ impl orchestrator_core::PlannerSelector for FixedSelector {
         &self,
         _goal: &serde_json::Value,
         _cands: &[AgentRef],
+        _dispatch: &dyn orchestrator_core::ModelDispatch,
     ) -> Result<AgentRef, OrchestratorError> {
         Ok(self.0.clone())
     }
@@ -9180,8 +9181,24 @@ impl orchestrator_core::PlannerSelector for ErrSelector {
         &self,
         _goal: &serde_json::Value,
         _cands: &[AgentRef],
+        _dispatch: &dyn orchestrator_core::ModelDispatch,
     ) -> Result<AgentRef, OrchestratorError> {
         Err(OrchestratorError::RegistryLoad("boom".into()))
+    }
+}
+
+/// A `ModelDispatch` returning fixed content. The selector no longer holds a gateway,
+/// so its PARSING (trim, empty-content) is now testable with no provider at all.
+struct FixedDispatch(String);
+#[async_trait::async_trait]
+impl orchestrator_core::ModelDispatch for FixedDispatch {
+    async fn complete(
+        &self,
+        _system: &str,
+        _user: &str,
+        _chain: Option<&str>,
+    ) -> Result<String, OrchestratorError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -9499,16 +9516,17 @@ async fn select_resume_before_plan_expanded_reuses_the_recorded_pick() {
 #[tokio::test]
 async fn llm_planner_selector_picks_the_named_agent_from_the_menu() {
     use crate::executor::selector::LlmPlannerSelector;
-    // Scripted gateway returns the chosen agent name (with surrounding whitespace, so the
-    // selector's `.trim()` is exercised) as the response content.
-    let (gateway, _c) = scripted_gateway(vec![final_response("  beta \n")]).await;
-    // The scripted-gateway fixture only wires chain "c" (single_chain_config); the plan's
-    // literal "select.chain" isn't configured, so the gateway would return "no candidates".
-    // The registry (alpha+beta, area=="planning") lets the selector render a capability menu.
-    let sel = LlmPlannerSelector::new(Arc::new(gateway), two_planner_registry(), "c");
+    // The dispatch returns the chosen agent name with surrounding whitespace, so the
+    // selector's `.trim()` is exercised. The registry (alpha+beta, area=="planning")
+    // lets the selector render a capability menu.
+    let sel = LlmPlannerSelector::new(two_planner_registry(), "c");
     let cands = vec![AgentRef("alpha".into()), AgentRef("beta".into())];
     let got = sel
-        .select(&serde_json::json!({ "goal": "do X" }), &cands)
+        .select(
+            &serde_json::json!({ "goal": "do X" }),
+            &cands,
+            &FixedDispatch("  beta \n".into()),
+        )
         .await
         .expect("select");
     assert_eq!(got, AgentRef("beta".into()));
@@ -9519,11 +9537,14 @@ async fn llm_planner_selector_errors_on_empty_content() {
     use crate::executor::selector::LlmPlannerSelector;
     // Empty response content → a clear diagnostic Err (not AgentRef("") — the executor's
     // Select arm would otherwise report it as a non-candidate pick).
-    let (gateway, _c) = scripted_gateway(vec![final_response("")]).await;
-    let sel = LlmPlannerSelector::new(Arc::new(gateway), two_planner_registry(), "c");
+    let sel = LlmPlannerSelector::new(two_planner_registry(), "c");
     let cands = vec![AgentRef("alpha".into()), AgentRef("beta".into())];
     let err = sel
-        .select(&serde_json::json!({ "goal": "do X" }), &cands)
+        .select(
+            &serde_json::json!({ "goal": "do X" }),
+            &cands,
+            &FixedDispatch(String::new()),
+        )
         .await;
     assert!(err.is_err(), "empty content → Err, got {err:?}");
 }
@@ -9559,9 +9580,10 @@ async fn select_end_to_end_with_llm_selector_and_hook() {
     let reg = two_planner_registry();
     let exec = Executor::new(gw.clone(), Arc::new(InMemoryJournal::new()), "v1")
         .with_registry(reg.clone())
-        // LlmPlannerSelector::new(gateway, registry, chain) — the registry renders the
-        // capability menu (name/area/kind); reuse the same reg the executor selects from.
-        .with_planner_selector(Arc::new(LlmPlannerSelector::new(gw, reg.clone(), "c")))
+        // LlmPlannerSelector::new(registry, chain) — the registry renders the capability
+        // menu (name/area/kind); reuse the same reg the executor selects from. No gateway:
+        // the selector receives one metered dispatch per call from the executor.
+        .with_planner_selector(Arc::new(LlmPlannerSelector::new(reg.clone(), "c")))
         .with_hooks(Arc::new(Spy(selected.clone())));
     let e = NodeId("e".into());
     let graph = Graph {
@@ -12138,6 +12160,130 @@ async fn budget_gate_stops_the_consolidate_producer() {
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
     let out = exec.start(run, &graph).await.expect("drives");
     assert_budget_paused(&journal.load(run).await.unwrap(), &out, &calls, "cons");
+}
+
+/// Producer 5/5 — the planner selector (`LlmPlannerSelector::select`, `selector.rs`).
+/// `n1` replays from the memo carrying the spend, so the SELECTOR is the only live
+/// dispatcher left and an exhausted budget must stop it exactly like the other four.
+///
+/// This is the sibling the SP-DATA-5 chokepoint proof was missing. The selector held
+/// its OWN `Arc<Gateway>` and called `execute()` directly, bypassing
+/// `dispatch_metered` entirely: it spent real tokens past the operator's cap and
+/// journaled nothing to the ledger, so the overshoot was invisible on resume too.
+///
+/// *Mutation:* give the selector back a direct gateway handle and this fails on the
+/// `calls.len() == 0` arm — the run dispatches despite being over budget.
+#[tokio::test]
+async fn budget_gate_stops_the_planner_selector_producer() {
+    let (gateway, calls) = recording_gateway().await;
+    let gateway = Arc::new(gateway);
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", "p1"),
+                deps: vec![],
+            },
+            expand_select_node("e", vec![Dep::hard("n1")]),
+        ],
+    };
+
+    let ih = input_hash("c", &serde_json::json!({ "prompt": "p1" })).unwrap();
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+    journal
+        .append(run, spent_effect("n1", effect_id("n1", 0, 0), ih, 120))
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: NodeId("n1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let exec = Executor::new(gateway.clone(), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")));
+    let out = exec.start(run, &graph).await.expect("drives");
+    assert_budget_paused(&journal.load(run).await.unwrap(), &out, &calls, "e");
+}
+
+/// The selector's spend reaches the DURABLE ledger, not merely the live meter.
+///
+/// `PlannerSelected` memoizes the CHOICE, so a resumed run never re-invokes the
+/// selector. Without a journaled `EffectRecorded` the tokens it really spent would
+/// vanish from the fold on every subsequent resume and the run would drift permanently
+/// under its true spend — the same shape as the Map-compaction defect SP-DATA-5's own
+/// review caught.
+///
+/// The run FAILS here, deliberately: `metered_latency_gateway` answers
+/// `"canned-response"`, which is not a candidate. That isolates the ledger write (which
+/// happens inside the metered dispatch) from whatever the selector then does with the
+/// text, and proves the spend is recorded even when the selection itself is rejected —
+/// the tokens were spent either way.
+///
+/// *Mutation:* drop the `EffectRecorded` append from `SelectorDispatch::complete` and
+/// this fails on the `expect` — the spend becomes live-only and dies with the process.
+#[tokio::test]
+async fn the_planner_selector_journals_its_spend_to_the_ledger() {
+    let (gateway, calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 70,
+            total_tokens: 77,
+        }),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")));
+    let out = exec.run(run, &graph).await.expect("drives");
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the selector dispatched exactly one call"
+    );
+    assert!(
+        out.failed.is_some(),
+        "'canned-response' is not a candidate, so the pick is rejected: {out:?}"
+    );
+
+    // The spend is on the journal, under the reserved path and with the real usage.
+    let events = journal.load(run).await.unwrap();
+    let usage = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded { node, usage, .. }
+                if node.0 == format!("e/{}", orchestrator_core::RESERVED_SELECT_ID) =>
+            {
+                Some(*usage)
+            }
+            _ => None,
+        })
+        .expect("the selector's call is journaled under 'e/__select__'")
+        .expect("and carries the usage the provider reported");
+    assert_eq!(
+        usage.total_tokens, 77,
+        "the ledger records what was really spent"
+    );
 }
 
 // ============================= SP-DATA-5 Task 4: usage capture =================

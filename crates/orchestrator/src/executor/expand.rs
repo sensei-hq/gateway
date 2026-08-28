@@ -184,16 +184,41 @@ impl Executor {
                                         )
                                         .await;
                                 };
-                                let a = match selector.select(input, &candidates).await {
+                                // The selector reaches a model ONLY through this lent
+                                // capability, so its call is gated on the run's budget,
+                                // charged to the live meter and journaled to the ledger
+                                // like every other producer.
+                                let dispatch = super::dispatch::SelectorDispatch::new(
+                                    self,
+                                    run,
+                                    path.clone(),
+                                    fold,
+                                );
+                                let a = match selector.select(input, &candidates, &dispatch).await {
                                     Ok(a) => a,
                                     Err(e) => {
-                                        return self
-                                            .expand_failed(
-                                                run,
-                                                path,
-                                                format!("expand {} selector: {e}", path.0),
-                                            )
-                                            .await;
+                                        // A budget refusal is NOT a node failure: it is
+                                        // already journaled, and pause-vs-fail is the
+                                        // chokepoint's call, not this arm's.
+                                        return match dispatch.take_refusal() {
+                                            Some(super::dispatch::RefusalKind::Paused(reason)) => {
+                                                Ok(NodeExec::Paused { reason })
+                                            }
+                                            Some(super::dispatch::RefusalKind::Failed(message)) => {
+                                                Ok(NodeExec::Failed {
+                                                    message,
+                                                    output: None,
+                                                })
+                                            }
+                                            None => {
+                                                self.expand_failed(
+                                                    run,
+                                                    path,
+                                                    format!("expand {} selector: {e}", path.0),
+                                                )
+                                                .await
+                                            }
+                                        };
                                     }
                                 };
                                 if !candidates.contains(&a) {
