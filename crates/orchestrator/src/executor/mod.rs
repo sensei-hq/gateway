@@ -190,6 +190,18 @@ struct Fold {
     /// `deadlines` is folded from `GateAwaited` too, so the "has this node begun asking?"
     /// question stays in one place for both waiting kinds.
     menus: HashMap<NodeId, Vec<orchestrator_core::GateOption>>,
+    /// SP-6 s3: each human-backed agent node's answer, from `AgentAnswered`. LAST wins,
+    /// like `signals`/`gate_decisions` and for the same reason: an operator must be able
+    /// to correct an answer before the run resumes.
+    agent_answers: HashMap<NodeId, AgentAnswer>,
+    /// SP-6 s3: the QUESTION each human-backed agent node published when it began
+    /// asking, from `AgentAwaited`. FIRST wins — the human was asked THIS question, and
+    /// a later ask must not retroactively change what their answer was to.
+    ///
+    /// `deadlines` is folded from `AgentAwaited` too, for the same reason it is folded
+    /// from `GateAwaited`: "has this node begun asking?" stays one question, and
+    /// `wait_or_expire` reads only `deadline_for`.
+    agent_prompts: HashMap<NodeId, String>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
     /// the shared arm 0 of the two WAITING node kinds, for which a failure is TERMINAL (an
@@ -238,6 +250,14 @@ struct Fold {
     /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
     /// this makes and why an unbudgeted run must never touch it.
     serial_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// SP-6 s3: a folded `AgentAnswered`.
+#[derive(Debug, Clone, PartialEq)]
+struct AgentAnswer {
+    text: String,
+    /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::AgentAnswered`.
+    actor: String,
 }
 
 /// SP-6 s2: a folded `GateDecided`.
@@ -343,6 +363,45 @@ impl Fold {
     /// journaled, which this snapshot of the journal cannot yet see.
     fn menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::GateOption]> {
         self.menus.get(node).map(Vec::as_slice)
+    }
+
+    /// SP-6 s3: the answer folded for this human-backed agent node.
+    ///
+    /// `expect(dead_code)` rather than `allow`, and deliberately: the fold lands one task
+    /// ahead of its only non-test consumer (`run_human_agent`, SP-6 s3 Task 4), and an
+    /// `expect` that is no longer needed is itself a `-D warnings` failure. So this
+    /// attribute deletes itself the moment the branch starts reading the answer, instead
+    /// of silently outliving its reason the way a stale `allow` would.
+    ///
+    /// It is gated on `not(test)` because the fold test in `executor::support` DOES call
+    /// this today: an ungated `expect` is unfulfilled in the lib-test target (the method
+    /// is live there) and so fails `clippy --all-targets -D warnings` from the other
+    /// side. Only the plain-lib target has no caller yet.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "SP-6 s3 Task 4's run_human_agent is the consumer; the fold lands first"
+        )
+    )]
+    fn agent_answer_for(&self, node: &NodeId) -> Option<&AgentAnswer> {
+        self.agent_answers.get(node)
+    }
+
+    /// SP-6 s3: the question this node published when it began asking. `None` = it has
+    /// not asked yet — the trigger for `run_human_agent` to journal `AgentAwaited`
+    /// FIRST, before reading any answer, so an answer without a question never arises.
+    ///
+    /// See [`Fold::agent_answer_for`] for why this is `expect(dead_code)` and not `allow`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "SP-6 s3 Task 4's run_human_agent is the consumer; the fold lands first"
+        )
+    )]
+    fn prompt_for(&self, node: &NodeId) -> Option<&str> {
+        self.agent_prompts.get(node).map(String::as_str)
     }
 }
 

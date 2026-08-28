@@ -13,7 +13,7 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{Fold, GateDecision};
+use super::{AgentAnswer, Fold, GateDecision};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -242,6 +242,32 @@ pub(crate) fn fold_journal(
                         option: option.clone(),
                         actor: actor.clone(),
                         note: note.clone(),
+                    },
+                );
+            }
+            // SP-6 s3: the ask. EXPLICIT, never folded by a catch-all — a catch-all
+            // silently absorbing a new variant is how this codebase has shipped fold bugs.
+            //
+            // FIRST wins for BOTH the deadline and the prompt (`entry().or_insert`).
+            // The deadline goes into the SHARED map because `wait_or_expire` reads
+            // `deadline_for` and knows nothing about which kind recorded it.
+            JournalEvent::AgentAwaited {
+                node,
+                deadline,
+                prompt,
+            } => {
+                fold.deadlines.entry(node.clone()).or_insert(*deadline);
+                fold.agent_prompts
+                    .entry(node.clone())
+                    .or_insert(prompt.clone());
+            }
+            // SP-6 s3: the answer. LAST wins (`insert` overwrites).
+            JournalEvent::AgentAnswered { node, text, actor } => {
+                fold.agent_answers.insert(
+                    node.clone(),
+                    AgentAnswer {
+                        text: text.clone(),
+                        actor: actor.clone(),
                     },
                 );
             }
@@ -948,6 +974,65 @@ mod tests {
         let (fold, _, _) = fold_journal(&events);
         assert_eq!(fold.deadline_for(&NodeId("release".into())), Some(None));
         assert!(fold.menu_for(&NodeId("release".into())).is_some());
+    }
+
+    /// The two asymmetries are OPPOSITE and both load-bearing, exactly as s1's and s2's
+    /// are: the ANSWER is last-wins (an operator corrects themselves before the run
+    /// resumes) and the QUESTION is first-wins (the human was asked THIS question).
+    #[test]
+    fn agent_answers_are_last_wins_and_the_prompt_is_first_wins() {
+        let events = vec![
+            (
+                1,
+                JournalEvent::AgentAwaited {
+                    node: NodeId("review".into()),
+                    deadline: Some(at(1_000)),
+                    prompt: "Original question?".into(),
+                },
+            ),
+            (
+                2,
+                JournalEvent::AgentAnswered {
+                    node: NodeId("review".into()),
+                    text: "first answer".into(),
+                    actor: "alice".into(),
+                },
+            ),
+            (
+                3,
+                JournalEvent::AgentAnswered {
+                    node: NodeId("review".into()),
+                    text: "corrected answer".into(),
+                    actor: "alice".into(),
+                },
+            ),
+            (
+                4,
+                JournalEvent::AgentAwaited {
+                    node: NodeId("review".into()),
+                    deadline: Some(at(9_999)),
+                    prompt: "Rewritten question?".into(),
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&events);
+
+        let a = fold
+            .agent_answer_for(&NodeId("review".into()))
+            .expect("answered");
+        assert_eq!(a.text, "corrected answer", "LAST answer wins");
+        assert_eq!(a.actor, "alice");
+
+        assert_eq!(
+            fold.prompt_for(&NodeId("review".into())),
+            Some("Original question?"),
+            "FIRST question wins — the human was asked THIS one"
+        );
+        assert_eq!(
+            fold.deadline_for(&NodeId("review".into())),
+            Some(Some(at(1_000))),
+            "AgentAwaited folds into the SHARED deadlines map, first-wins"
+        );
     }
 
     #[test]
