@@ -39,8 +39,10 @@ bound" LOW is now closed by `feb6d27`.)
 
 ## Next command
 
-Pick up the 7 LOW, or open the develop→main PR. `main` is strict — merge `origin/main`
-into `develop` first or the PR sits BEHIND.
+**SP-6 IS COMPLETE (s1 `AwaitSignal` · s2 `HumanGate` · s3 `human-as-Agent`).**
+`origin/main` merged into `develop` (`b87482f`, zero content change) and
+**PR #48 is OPEN** — `MERGEABLE`, blocked only on required checks and the mandatory
+human review. Nothing to do but watch CI; then pick up the 7 LOW in a later pass.
 
 ## Known-broken
 
