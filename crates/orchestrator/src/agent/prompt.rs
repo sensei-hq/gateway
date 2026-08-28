@@ -227,7 +227,7 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
 ///
 /// The promise is not unconditional, and the escape hatch is where the honesty lives. An
 /// entry only exceeds its share when `room` falls under the marker's own ~36 bytes, at which
-/// point [`truncate_with_marker`] overruns and the accumulated overflow pushes the section
+/// point `truncate_with_marker` overruns and the accumulated overflow pushes the section
 /// past `budget`. The shipped clamp then cut trailing dependencies with NOTHING in the
 /// output saying so — a silent breach of §5.4's "never show the human LESS than the model
 /// would have had", and the one place an unmarked clip could still happen after every
