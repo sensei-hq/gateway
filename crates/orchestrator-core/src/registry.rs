@@ -748,8 +748,102 @@ fn optional_pairs(
     Ok(out)
 }
 
+/// Parse `<positive integer><unit>` (`30s`, `90m`, `48h`, `7d`) — the frontmatter
+/// spelling of a human-backed agent's SLA.
+///
+/// Deliberately narrow. A bare number is ambiguous (48 what?) and an unknown unit is
+/// a typo, so both are loud rather than guessed; a compound (`1h30m`) and a fraction
+/// (`1.5h`) are rejected too, because accepting them invites a whole duration grammar
+/// into a loader whose entire premise is a *controlled* subset.
+///
+/// Purely SYNTACTIC: it does not judge whether the duration is sane. The semantic
+/// bounds — positive, and no longer than `MAX_AWAIT_SIGNAL_TIMEOUT` — belong to
+/// [`Registry::validate`], which is the one place they can also catch a definition
+/// that arrived as a jsonb row from Postgres rather than from an md file. Duplicating
+/// them here would let the two copies drift.
+fn parse_fm_duration(text: &str) -> Result<chrono::Duration, OrchestratorError> {
+    let loud = || {
+        OrchestratorError::FrontmatterParse(format!(
+            "timeout {text:?} is not a duration; use <number><unit> with unit s|m|h|d, \
+             e.g. `timeout: 48h`, or omit the key to wait indefinitely"
+        ))
+    };
+    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(loud());
+    }
+    let n: i64 = digits.parse().map_err(|_| loud())?;
+    match unit {
+        "s" => Ok(chrono::Duration::seconds(n)),
+        "m" => Ok(chrono::Duration::minutes(n)),
+        "h" => Ok(chrono::Duration::hours(n)),
+        "d" => Ok(chrono::Duration::days(n)),
+        _ => Err(loud()),
+    }
+}
+
+/// Parse the `backed_by` + `timeout` pair (SP-6 s3).
+///
+/// Absent `backed_by` ⇒ `Model`, so every agent md written before s3 parses
+/// byte-identically. An unrecognised value is LOUD rather than defaulting to `Model`:
+/// silently reading `backed_by: huamn` as a model would produce a config that looks
+/// like a person is in the loop while the run quietly spends tokens on a model — the
+/// same failure shape `SkillDef`'s scalar-`activate_on` rejection guards against.
+///
+/// A `timeout` without `backed_by: human` is loud for the same reason: it is inert on
+/// a model agent, and accepting it would let an author believe they had set an SLA.
+fn parse_backing(map: &HashMap<String, FmValue>) -> Result<AgentBacking, OrchestratorError> {
+    // `optional_scalar` maps an empty or list-valued key to `None`, which here would
+    // silently drop `timeout: []` or `timeout:` on the floor — an SLA the author
+    // believes they set. Match the raw entry so every present-but-unusable spelling
+    // is loud instead.
+    let timeout = match map.get("timeout") {
+        None => None,
+        Some(FmValue::Scalar(t)) if !t.is_empty() => Some(parse_fm_duration(t)?),
+        Some(_) => {
+            return Err(OrchestratorError::FrontmatterParse(
+                "timeout must be a scalar <number><unit>, e.g. `timeout: 48h`; omit the \
+                 key to wait indefinitely"
+                    .into(),
+            ));
+        }
+    };
+    match map.get("backed_by") {
+        None => match timeout {
+            None => Ok(AgentBacking::Model),
+            Some(_) => Err(OrchestratorError::FrontmatterParse(
+                "timeout is only meaningful with `backed_by: human`; a model-backed \
+                 agent has no SLA to wait on"
+                    .into(),
+            )),
+        },
+        Some(FmValue::Scalar(v)) if v == "model" => match timeout {
+            None => Ok(AgentBacking::Model),
+            Some(_) => Err(OrchestratorError::FrontmatterParse(
+                "timeout is only meaningful with `backed_by: human`; a model-backed \
+                 agent has no SLA to wait on"
+                    .into(),
+            )),
+        },
+        Some(FmValue::Scalar(v)) if v == "human" => Ok(AgentBacking::Human { timeout }),
+        Some(FmValue::Scalar(v)) => Err(OrchestratorError::FrontmatterParse(format!(
+            "backed_by must be `model` or `human`, got {v:?}"
+        ))),
+        Some(FmValue::List(_)) => Err(OrchestratorError::FrontmatterParse(
+            "backed_by must be a scalar `model` or `human`, not a list".into(),
+        )),
+    }
+}
+
 impl AgentDefinition {
     /// Parse an agent from the md+frontmatter subset.
+    ///
+    /// This loader is the only producer of an `incoming` config for `torii config
+    /// push`, and push is replace-all — so `backed_by`/`timeout` have to be
+    /// expressible HERE or a human-backed agent could not be authored at all, and a
+    /// human-backed row already in Postgres would be silently rewritten to `Model` by
+    /// the next push (the diff is over `AgentDefinition`, so the operator would see
+    /// only `changed: agent <name>`).
     pub fn from_frontmatter(input: &str) -> Result<Self, OrchestratorError> {
         let (fm, body) = split_frontmatter(input)?;
         let f = parse_fields(fm)?;
@@ -763,9 +857,7 @@ impl AgentDefinition {
             tools: optional_list(&f, "tools"),
             skills: optional_list(&f, "skills"),
             system_prompt: body.to_string(),
-            // The md+frontmatter loader is model-only; a human-backed role has no
-            // frontmatter surface yet (SP-6 s3 adds the type, not this loader).
-            backed_by: AgentBacking::Model,
+            backed_by: parse_backing(&f)?,
         })
     }
 }
@@ -829,6 +921,129 @@ mod tests {
         let a = AgentDefinition::from_frontmatter(md).expect("parses");
         assert!(a.tools.is_empty());
         assert!(a.skills.is_empty());
+    }
+
+    /// SP-6 s3. The md+frontmatter loader is the ONLY producer of an `incoming`
+    /// config for `torii config push`, and push is replace-all, so without a
+    /// `backed_by` key two things were true: the spec's headline claim (swap a model
+    /// reviewer for a person *by editing config*) was unreachable, and a human-backed
+    /// row already in Postgres was silently downgraded to `Model` by the next push —
+    /// the operator seeing only `changed: agent <name>`, never that the backing
+    /// flipped and the run would now spend tokens instead of asking a person.
+    #[test]
+    fn agent_from_frontmatter_parses_human_backing_with_a_timeout() {
+        let md = "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\ntimeout: 48h\n---\nDoes this contract permit sub-processing?\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(
+            a.backed_by,
+            AgentBacking::Human {
+                timeout: Some(chrono::Duration::hours(48))
+            }
+        );
+        // A human-backed agent needs no `chain:` — `validate` skips that rule for it.
+        assert_eq!(a.chain, None);
+    }
+
+    /// No timeout means "wait indefinitely" (the `None` arm), not "no SLA field".
+    #[test]
+    fn agent_from_frontmatter_human_backing_without_a_timeout_waits_indefinitely() {
+        let md = "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\n---\nAsk.\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(a.backed_by, AgentBacking::Human { timeout: None });
+    }
+
+    /// Absent, or an explicit `model`, is `Model` — every existing agent md is
+    /// byte-identical through this loader.
+    #[test]
+    fn agent_from_frontmatter_defaults_to_model_backing() {
+        let a = AgentDefinition::from_frontmatter(AGENT_MD).expect("parses");
+        assert_eq!(a.backed_by, AgentBacking::Model);
+        let md = "---\nname: n\narea: a\nkind: k\nchain: c\nbacked_by: model\n---\nb\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(a.backed_by, AgentBacking::Model);
+    }
+
+    /// A typo must NOT silently mean `Model`. That is the same failure shape
+    /// `activate_on` guards against: a config that reads as if a person answers,
+    /// which quietly spends tokens on a model instead.
+    #[test]
+    fn agent_from_frontmatter_rejects_an_unknown_backed_by() {
+        for bad in ["huamn", "Human ", "person", ""] {
+            let md =
+                format!("---\nname: n\narea: a\nkind: k\nchain: c\nbacked_by: {bad}\n---\nb\n");
+            let e = AgentDefinition::from_frontmatter(&md)
+                .expect_err(&format!("backed_by: {bad:?} must be loud"));
+            let m = format!("{e}");
+            assert!(m.contains("backed_by"), "must name the key: {m}");
+        }
+    }
+
+    /// A timeout on a model-backed agent is inert. Accepting it would let an author
+    /// write `timeout: 48h` and believe a human is in the loop when none is.
+    #[test]
+    fn agent_from_frontmatter_rejects_a_timeout_without_human_backing() {
+        let md = "---\nname: n\narea: a\nkind: k\nchain: c\ntimeout: 48h\n---\nb\n";
+        let e = AgentDefinition::from_frontmatter(md).expect_err("timeout without human backing");
+        let m = format!("{e}");
+        assert!(m.contains("timeout"), "must name the key: {m}");
+        assert!(m.contains("backed_by"), "must name the fix: {m}");
+    }
+
+    /// A bare number is ambiguous (48 what?) and an unknown unit is a typo; both are
+    /// loud rather than guessed. Bounds (positive, <= the century cap) belong to
+    /// `validate`, so this parser is purely syntactic.
+    #[test]
+    fn agent_from_frontmatter_rejects_an_unparsable_timeout() {
+        for bad in ["48", "48x", "h", "-1h", "1.5h", "48 h", "1h30m"] {
+            let md = format!(
+                "---\nname: n\narea: a\nkind: k\nbacked_by: human\ntimeout: {bad}\n---\nb\n"
+            );
+            let e = AgentDefinition::from_frontmatter(&md)
+                .expect_err(&format!("timeout: {bad:?} must be loud"));
+            assert!(format!("{e}").contains("timeout"), "{e}");
+        }
+    }
+
+    /// Every unit the parser accepts, so a change to the unit table is caught.
+    #[test]
+    fn agent_from_frontmatter_timeout_units() {
+        let cases = [
+            ("30s", chrono::Duration::seconds(30)),
+            ("90m", chrono::Duration::minutes(90)),
+            ("48h", chrono::Duration::hours(48)),
+            ("7d", chrono::Duration::days(7)),
+        ];
+        for (text, want) in cases {
+            let md = format!(
+                "---\nname: n\narea: a\nkind: k\nbacked_by: human\ntimeout: {text}\n---\nb\n"
+            );
+            let a = AgentDefinition::from_frontmatter(&md).expect("parses");
+            assert_eq!(
+                a.backed_by,
+                AgentBacking::Human {
+                    timeout: Some(want)
+                },
+                "{text}"
+            );
+        }
+    }
+
+    /// The loader and `validate` compose: an authored human agent assembles into a
+    /// registry with no chain binding, which is the whole point of the skip.
+    #[test]
+    fn an_authored_human_agent_assembles_into_a_valid_registry() {
+        let md = "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\ntimeout: 48h\n---\nDoes this contract permit sub-processing?\n";
+        let cfg = RegistryConfig {
+            agents: vec![AgentDefinition::from_frontmatter(md).expect("parses")],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
+        let reg = Registry::from_config(cfg).expect("a human-backed agent needs no chain");
+        assert!(matches!(
+            reg.agent("reviewer").map(|a| &a.backed_by),
+            Some(AgentBacking::Human { timeout: Some(_) })
+        ));
     }
 
     #[test]

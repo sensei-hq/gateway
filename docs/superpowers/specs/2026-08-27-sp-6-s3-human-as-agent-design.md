@@ -78,6 +78,29 @@ pub struct AgentDefinition {
 `#[serde(default)]` + `#[default] Model` is what keeps every existing agent, every `config_agents`
 jsonb row and every registry test byte-identical.
 
+**Authoring surface** (added in Task 1 after review — the type alone did not make the
+substitutability claim above reachable). `AgentDefinition::from_frontmatter` parses two optional
+keys, and it is the only producer of an `incoming` config for `torii config push`:
+
+```md
+---
+name: reviewer
+area: review
+kind: human
+backed_by: human      # absent | `model` -> Model. Anything else is a LOUD parse error.
+timeout: 48h          # <number><unit>, unit s|m|h|d. Omit -> wait indefinitely.
+---
+Does this contract permit sub-processing?
+```
+
+Both are loud rather than lenient: `backed_by: huamn` silently read as `Model` would give a config
+that *looks* like a person is in the loop while the run quietly spends tokens, and `timeout:` on a
+model-backed agent would let an author believe they had set an SLA that is inert. Without these
+keys, `config push` (replace-all, diffed through `AgentDefinition`) would also silently rewrite a
+`Human` row in Postgres back to `Model`, showing the operator only `changed: agent <name>`. The
+duration parser is purely syntactic; positive-and-under-the-century-cap stays in
+`Registry::validate`, which is the one place that also sees a definition arriving as a jsonb row.
+
 ```rust
 // orchestrator-core/src/journal.rs — both NEW VARIANTS, FORMAT_VERSION stays 1
 AgentAwaited  { node: NodeId, deadline: Option<DateTime<Utc>>, prompt: String }
