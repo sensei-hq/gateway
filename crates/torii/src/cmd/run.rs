@@ -4202,17 +4202,39 @@ pub(crate) mod tests {
         );
     }
 
-    /// The cell is CAPPED as well as collapsed. A question is bounded upstream only by
-    /// `MAX_HUMAN_TEXT_BYTES` (4096) — `Executor::run_human_agent` fails the node above
-    /// that — which is one to two orders of magnitude too wide for a table row, and the
-    /// executor composes it from the system prompt, every activated skill body, the rendered
-    /// `## Context` section and a `## Task` section holding the node's input, so a multi-KB
-    /// question is the NORMAL case here rather than a hostile one.
+    /// The `## Task` text of the compose-shaped fixture below — distinctive, so an assertion
+    /// can prove the ask SURVIVED the cap rather than merely that something did.
+    const THE_ASK: &str = "Approve the ACME MSA renewal?";
+
+    /// The cell is CAPPED as well as collapsed — **and the cap must never eat the ASK**.
+    ///
+    /// The executor composes a question in a fixed order: the agent's system prompt, every
+    /// activated skill body, the rendered `## Context` section of upstream outputs, and
+    /// LAST a `## Task` section holding the node's input — the thing the human is actually
+    /// being asked. The authored half alone may run to `MAX_HUMAN_TEXT_BYTES` (4096) and
+    /// the context half to `MAX_HUMAN_CONTEXT_BYTES` (32768), so a multi-KB question is the
+    /// NORMAL case here, not a hostile one, and the cap is load-bearing.
+    ///
+    /// A front-cut therefore shows ~290 characters of standing instructions and never one
+    /// byte of the ask. That is the same defect `HumanQuestion::redact_and_clamp` was fixed
+    /// for on the DURABLE row ("the clamp must never eat the ASK"), left in place on the one
+    /// surface that displays it — `redact_question`'s own doc calls `list-paused` "the ONLY
+    /// torii surface that ever displays one".
+    ///
+    /// The fixture is COMPOSE-SHAPED for that reason. The version this replaces used
+    /// `"q".repeat(4_000)` — homogeneous, so a front-cut and a tail-preserving cut render
+    /// identically and the assertion could not tell them apart.
     #[tokio::test]
-    async fn an_overlong_question_is_capped_so_it_cannot_wreck_the_block() {
+    async fn an_overlong_question_is_capped_but_still_shows_the_ask() {
         let run = RunId(uuid::Uuid::new_v4());
         let s = paused_store(run, None).await;
-        let long = "q".repeat(4_000);
+        // `HumanQuestion::compose`'s exact order and delimiter.
+        let long = format!(
+            "You are a contract reviewer. {}\n\n## Context\n\n### brief\n{}\n\n## Task\n{}",
+            "Follow the reviewing checklist carefully and cite clauses. ".repeat(40),
+            "L".repeat(2_000),
+            THE_ASK
+        );
         let j = agent_journal_asking(run, &reviewer(), None, &long).await;
 
         let out = list_paused(&s, &j, false).await.expect("lists");
@@ -4223,6 +4245,12 @@ pub(crate) mod tests {
             row.chars().count()
         );
         assert!(row.contains('…'), "truncation must be visible: {row}");
+        assert!(
+            row.contains(THE_ASK),
+            "the cap ate the ASK — the operator is shown the role's standing instructions \
+             and no statement of what to decide, which is the one thing they need to \
+             answer: {row}"
+        );
     }
 
     /// Design §6's rule that EVERY operator-facing string goes through the redactor — not
