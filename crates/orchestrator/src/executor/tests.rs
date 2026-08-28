@@ -524,6 +524,62 @@ async fn agent_node_terminal_resume_yields_canonical_output_shape() {
     );
 }
 
+/// SP-6 s3: the terminal-resume projection must NOT flatten a HUMAN-answered Agent
+/// node's `{text, actor}` output into the model-backed `{model, text}` shape.
+///
+/// `project_agent_outputs` runs on exactly one path — the `terminal` branch of
+/// `start_inner` — so a divergence here is invisible on the drive that completes the
+/// node and appears only when the finished run is read back later. That is the worst
+/// possible shape for a bug: the same run reports two different outputs depending on
+/// WHEN it is read. Concretely, without the `actor` arm below, a human node answered by
+/// `alice` returns `{"text": …, "actor": "alice"}` from the drive that completed it and
+/// `{"model": null, "text": …}` from every subsequent `start` — attribution silently
+/// dropped, and a null `model` invented for a node no model ever touched.
+///
+/// This is a unit test over the projection rather than an end-to-end resume because the
+/// human-agent drive path does not exist yet (SP-6 s3 Task 4). It is written now, with
+/// the event, so Task 4 cannot ship the divergence: review caught it as a forward-looking
+/// finding against `AgentAnswered`, whose doc now records the decision.
+#[test]
+fn the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical() {
+    use super::support::project_agent_outputs;
+
+    let human = NodeId("review".into());
+    let model = NodeId("draft".into());
+    let graph = Graph {
+        nodes: vec![
+            agent_node("review", "reviewer", "does 7.2 permit it?"),
+            agent_node("draft", "writer", "draft it"),
+        ],
+    };
+
+    let mut outputs: HashMap<NodeId, serde_json::Value> = HashMap::new();
+    outputs.insert(
+        human.clone(),
+        serde_json::json!({ "text": "Yes, clause 7.2 permits it.", "actor": "alice" }),
+    );
+    // The raw 3-key final model turn the model path folds.
+    outputs.insert(
+        model.clone(),
+        serde_json::json!({ "model": "m", "text": "drafted", "tool_calls": [] }),
+    );
+
+    project_agent_outputs(&graph, &mut outputs);
+
+    assert_eq!(
+        outputs[&human],
+        serde_json::json!({ "text": "Yes, clause 7.2 permits it.", "actor": "alice" }),
+        "a human answer survives the projection UNCHANGED — attribution kept, no \
+         `model` key invented"
+    );
+    // The model arm is untouched by the new one: still canonical two-key `{model, text}`.
+    assert_eq!(
+        outputs[&model],
+        serde_json::json!({ "model": "m", "text": "drafted" }),
+        "the model-backed projection still drops `tool_calls` and keeps `{{model, text}}`"
+    );
+}
+
 /// Headline: a run that dies at turn 1 resumes and completes WITHOUT re-calling
 /// the gateway for turn 0 or re-executing turn 0's tool — memoized on resume.
 #[tokio::test]

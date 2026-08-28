@@ -270,6 +270,31 @@ pub(crate) fn fold_journal(
 /// `AgentStep::Completed` (design §4) — so a completed Agent node yields an
 /// identical shape on every completion path. Pure over already-materialized
 /// outputs; `ModelCall` nodes already store the canonical shape and are untouched.
+///
+/// **A HUMAN-answered node (SP-6 s3) is passed through unchanged**, because its
+/// canonical shape is a different one: `{text, actor}` (design §4 / AC2), and forcing
+/// it through the model projection would drop the `actor` and invent `model: null`
+/// for a node no model ever touched.
+///
+/// The discriminator is the presence of an `"actor"` key, and that is sound because
+/// this function's inputs are never author- or model-supplied: EVERY Agent-node output
+/// is built by the executor itself. The model path builds exactly `{model, text}`
+/// (`finish_agent`) or `{model, text, tool_calls}` (`dispatch_model_turn`) — no
+/// `actor`, ever — and `actor` reaches an output only by being folded from
+/// `JournalEvent::AgentAnswered`. So `actor` present ⟺ a human answered.
+///
+/// Deciding this HERE rather than in the human drive path is deliberate: this function
+/// runs on exactly ONE path (the `terminal` branch of `start_inner`), so getting it
+/// wrong is invisible on the drive that completes a node and shows up only when the
+/// finished run is read back — the same run reporting two different outputs depending
+/// on when it is read. Review caught that as a forward-looking finding against the
+/// event before the drive path existed; see
+/// `the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical`.
+///
+/// The alternative — resolving each node's `AgentRef` against the `Registry` to ask
+/// whether its backing is `Human` — was rejected: it makes a pure, total projection
+/// depend on registry resolution that can fail, to recover a fact the output already
+/// carries.
 pub(crate) fn project_agent_outputs(
     graph: &Graph,
     outputs: &mut HashMap<NodeId, serde_json::Value>,
@@ -278,6 +303,9 @@ pub(crate) fn project_agent_outputs(
         if let NodeKind::Agent { .. } = &node.kind
             && let Some(output) = outputs.get(&node.id).cloned()
         {
+            if output.get("actor").is_some() {
+                continue;
+            }
             let model = output
                 .get("model")
                 .cloned()
