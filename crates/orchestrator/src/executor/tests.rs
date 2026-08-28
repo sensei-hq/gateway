@@ -9954,6 +9954,64 @@ async fn consolidate_synthesis_text_is_redacted() {
     );
 }
 
+/// AC (census fix): the PLANNER SELECTOR's model text is scrubbed too — covering the
+/// FIFTH `model_output` leaf (`SelectorDispatch::complete` in `dispatch.rs`).
+///
+/// This block is the repo's answer to SP-4 s2's own review, which found the redactor
+/// wired into 1 of the then-4 producers: one test per producer, so a new producer
+/// cannot silently repeat it. The budget-completeness slice grew the INPUT-side census
+/// from four producers to five and added the matching budget test, but left the
+/// OUTPUT-side census at four. This is the fifth.
+///
+/// The selector's answer is deliberately not a candidate, so the node fails — that is
+/// irrelevant here and useful: the effect is journaled inside the metered dispatch,
+/// BEFORE the selector does anything with the text, which is exactly the leaf under
+/// test.
+///
+/// *Mutation:* replace `self.exec.model_output(&response)` in
+/// `SelectorDispatch::complete` with a raw
+/// `json!({"model": response.model, "text": response.content})` and this goes red on
+/// both the `[REDACTED]` assertion and the whole-journal scan.
+#[tokio::test]
+async fn selector_model_text_is_redacted() {
+    // Runtime-assembled token (no source literal ⇒ semgrep CWE-798 hook stays quiet).
+    let token = ["sk", "abcdefghijklmnopqrstuvwx"].join("-");
+    let (gateway, _calls) = scripted_gateway(vec![final_response(&format!("beta {token}"))]).await;
+    let journal = InMemoryJournal::new();
+    let registry = two_planner_registry();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")))
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec.run(run, &graph).await.expect("run");
+    assert!(
+        outcome.failed.is_some(),
+        "the scrubbed answer is not a candidate: {outcome:?}"
+    );
+
+    let events = journal.load(run).await.unwrap();
+    let path = format!("e/{}", orchestrator_core::RESERVED_SELECT_ID);
+    let out = recorded_output(&events, &effect_id(&path, 0, 0)).expect("selector call recorded");
+    let text = out["text"].as_str().expect("text field");
+    assert!(
+        text.contains("[REDACTED]"),
+        "selector text scrubbed: {text}"
+    );
+    assert!(
+        !text.contains(&token),
+        "plaintext token gone from text: {text}"
+    );
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(&token),
+        "plaintext token not journaled anywhere"
+    );
+}
+
 /// AC6 (resume determinism): a redacted tool output is journaled ONCE (redacted) and,
 /// on resume, REPLAYS from that memo — the tool is NOT re-invoked and no second
 /// `EffectRecorded` is appended. Unlike the pure-gate denial case (where a live re-run
