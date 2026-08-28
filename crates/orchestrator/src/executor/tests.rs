@@ -2460,6 +2460,12 @@ fn label(event: &JournalEvent) -> String {
         // compile error silently avoided by a wildcard.
         JournalEvent::GateAwaited { node, .. } => format!("GateAwaited({})", node.0),
         JournalEvent::GateDecided { node, .. } => format!("GateDecided({})", node.0),
+        // SP-6 s3 (Task 2): same reasoning as the s2 pair above — Task 4 adds the
+        // human-backed `Agent` branch that journals these, and an explicit arm now is
+        // what keeps this labeler exhaustive instead of a wildcard that would silently
+        // label a future event "unknown".
+        JournalEvent::AgentAwaited { node, .. } => format!("AgentAwaited({})", node.0),
+        JournalEvent::AgentAnswered { node, .. } => format!("AgentAnswered({})", node.0),
     }
 }
 

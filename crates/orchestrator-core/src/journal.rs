@@ -14,6 +14,24 @@ use crate::plan::NodePlan;
 /// journal-serialization break.
 pub const FORMAT_VERSION: i32 = 1;
 
+/// The largest human-supplied answer, and the largest journaled question, in bytes.
+///
+/// SP-6 s3. It lives in `orchestrator-core` because BOTH the executor and `torii` need
+/// it and neither can borrow the other's bound. `torii` already has one —
+/// `cmd::run::MAX_PAYLOAD_BYTES`, enforced by `cmd::run::check_payload_size` — but the
+/// executor cannot reach it: `sensei-torii` depends on `sensei-orchestrator` and
+/// `sensei-orchestrator-core`, so a dependency the other way is a CYCLE the crate graph
+/// cannot express, not merely a visibility problem. (`check_payload_size` is also
+/// `pub(crate)`, and takes a `serde_json::Value` rather than a `&str` — but the cycle is
+/// what makes reuse impossible.) One constant here, two call sites, no duplicated
+/// number.
+///
+/// 4 KiB matches `torii`'s `MAX_PAYLOAD_BYTES` and the executor's default
+/// `cas_threshold` (`Executor::new`, `executor/mod.rs`). The bound is load-bearing
+/// rather than theoretical for the PROMPT: an assembled prompt is the system prompt plus
+/// every activated skill plus the rendered context section, routinely multi-KB.
+pub const MAX_HUMAN_TEXT_BYTES: usize = 4096;
+
 /// A compacted per-child record (§5.3): after a `Map`'s `Consolidate` completes,
 /// each child's full `EffectRecorded` collapses to this small shape and leaves
 /// the hot fold path. The child's content stays retrievable from the
@@ -243,6 +261,49 @@ pub enum JournalEvent {
         option: String,
         actor: String,
         note: Option<String>,
+    },
+    /// SP-6 s3: a human-backed `Agent` node has begun asking, carrying the QUESTION.
+    ///
+    /// The prompt is journaled rather than recomposed for the same reason s2 journals
+    /// the menu on [`GateAwaited`]: an operator must see what is being asked without
+    /// reading the graph AND the registry, and fixing the question at ask time is what
+    /// lets a late answer still be honoured against the question it was actually given.
+    /// (Nothing binds a later drive's registry to the one that composed this prompt: a
+    /// `config push` changes an agent's `system_prompt` and skills underneath a paused
+    /// run, so recomposing on resume would show a second human a *different* question
+    /// from the one the first was shown.)
+    ///
+    /// It carries the SYSTEM prompt `assemble_prompt` builds — the agent's
+    /// `system_prompt`, plus each activated skill's body, plus the rendered `## Context`
+    /// section of resolved dependency outputs — which is the same string a model-backed
+    /// run of this node would have been given as its system prompt. A writer MUST bound
+    /// it by [`MAX_HUMAN_TEXT_BYTES`] before appending: that composition is routinely
+    /// multi-KB, and an unbounded question is a durable write.
+    ///
+    /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited` do —
+    /// overwriting the deadline is the never-expires bug s1 documents.
+    AgentAwaited {
+        node: NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        prompt: String,
+    },
+    /// SP-6 s3: a human answered a human-backed `Agent` node.
+    ///
+    /// `text` becomes the node's output under the `"text"` key — deliberately the same
+    /// key a model-backed `Agent` produces (`finish_agent`, `executor/agent.rs`), so
+    /// every existing reader of that key consumes a human answer without knowing it was
+    /// human: [`BranchCond::TextContains`](crate::graph::BranchCond::TextContains) and
+    /// [`LoopGate::TextContains`](crate::graph::LoopGate::TextContains) both read
+    /// `output["text"]`, and a dependent's `## Context` section renders the output as-is.
+    ///
+    /// `actor` is ATTRIBUTION, NOT AUTHENTICATION — it is whatever string the caller
+    /// supplied — and it matters more here than on [`GateDecided`]: a gate's actor is an
+    /// audit trail, whereas this one is recorded alongside text that lands in the node's
+    /// OUTPUT and so flows on into downstream model prompts.
+    AgentAnswered {
+        node: NodeId,
+        text: String,
+        actor: String,
     },
 }
 
@@ -610,5 +671,45 @@ mod tests {
         };
         let s = serde_json::to_string(&terse).expect("serializes");
         assert!(serde_json::from_str::<JournalEvent>(&s).is_ok());
+    }
+
+    /// SP-6 s3: both variants round-trip, and — the load-bearing half — they are new
+    /// VARIANTS, so an event written by an older binary still loads and
+    /// `FORMAT_VERSION` stays 1.
+    #[test]
+    fn the_human_agent_events_round_trip() {
+        let awaited = JournalEvent::AgentAwaited {
+            node: NodeId("review".into()),
+            deadline: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).unwrap()),
+            prompt: "Does this contract permit sub-processing?".into(),
+        };
+        let s = serde_json::to_string(&awaited).expect("serializes");
+        match serde_json::from_str::<JournalEvent>(&s).expect("round-trips") {
+            JournalEvent::AgentAwaited {
+                node,
+                deadline,
+                prompt,
+            } => {
+                assert_eq!(node.0, "review");
+                assert!(deadline.is_some());
+                assert!(prompt.contains("sub-processing"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let answered = JournalEvent::AgentAnswered {
+            node: NodeId("review".into()),
+            text: "Yes, clause 7.2 permits it.".into(),
+            actor: "alice".into(),
+        };
+        let s = serde_json::to_string(&answered).expect("serializes");
+        match serde_json::from_str::<JournalEvent>(&s).expect("round-trips") {
+            JournalEvent::AgentAnswered { node, text, actor } => {
+                assert_eq!(node.0, "review");
+                assert!(text.contains("7.2"));
+                assert_eq!(actor, "alice");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }
