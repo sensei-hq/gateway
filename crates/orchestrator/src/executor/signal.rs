@@ -18,7 +18,7 @@
 //! deadline durability — and a copy of either in a second node kind is a second place for
 //! those defects to come back.
 
-use orchestrator_core::{JournalEvent, Node, OrchestratorError, RunId};
+use orchestrator_core::{JournalEvent, Node, NodeId, OrchestratorError, RunId};
 
 use super::{Executor, Fold, NodeExec};
 
@@ -88,7 +88,23 @@ impl Executor {
     /// on. It journals NOTHING — the verdict is read back from the journal, so re-writing
     /// it is exactly consequence (a).
     pub(super) fn gate_precheck(&self, node: &Node, fold: &Fold) -> Option<NodeExec> {
-        fold.failure_for(&node.id).map(|error| NodeExec::Failed {
+        self.gate_precheck_by_id(&node.id, fold)
+    }
+
+    /// [`Executor::gate_precheck`] over a bare [`NodeId`], and the ONE implementation of
+    /// it — the `&Node` form above is a two-line delegation.
+    ///
+    /// The split exists because SP-6 s3's human-backed `Agent` node is reached through
+    /// `drive_agent`, which holds only a `&NodeId`: a `Map`/`Loop` child runs at the
+    /// synthesized path `"{map}/{i}"`, which is a node id with no `Node` anywhere in the
+    /// graph to correspond to it. Every word of the doc comment above applies here
+    /// unchanged, because this IS that function.
+    ///
+    /// Duplicating the body instead would be the specific mistake this whole shared-helper
+    /// arrangement exists to prevent: s1's whole-slice review found real defects in exactly
+    /// these arms, and a second copy is a second place for them to return.
+    pub(super) fn gate_precheck_by_id(&self, node: &NodeId, fold: &Fold) -> Option<NodeExec> {
+        fold.failure_for(node).map(|error| NodeExec::Failed {
             message: error.to_string(),
             output: None,
         })
@@ -151,7 +167,25 @@ impl Executor {
         timeout: Option<chrono::Duration>,
         fold: &Fold,
     ) -> Result<WaitState, String> {
-        let Some(recorded) = fold.deadline_for(&node.id) else {
+        self.wait_or_expire_by_id(&node.id, timeout, fold)
+    }
+
+    /// [`Executor::wait_or_expire`] over a bare [`NodeId`], and the ONE implementation of
+    /// it — the `&Node` form above is a two-line delegation.
+    ///
+    /// Same reason as [`Executor::gate_precheck_by_id`]: SP-6 s3's human-backed `Agent`
+    /// node is reached through `drive_agent`, which holds only a `&NodeId` (a `Map`/`Loop`
+    /// child runs at the synthesized path `"{map}/{i}"`, which has no `Node` in the graph
+    /// at all). The doc comment above — the precondition, the deadline durability, the
+    /// `checked_add_signed` overflow argument — applies here unchanged, because this IS
+    /// that function.
+    pub(super) fn wait_or_expire_by_id(
+        &self,
+        node: &NodeId,
+        timeout: Option<chrono::Duration>,
+        fold: &Fold,
+    ) -> Result<WaitState, String> {
+        let Some(recorded) = fold.deadline_for(node) else {
             let fresh = match timeout {
                 None => None,
                 Some(t) => match self.clock.now().checked_add_signed(t) {
@@ -160,7 +194,7 @@ impl Executor {
                         return Err(format!(
                             "node {} has a timeout ({t}) that overflows the representable \
                              instant range when added to now",
-                            node.id.0
+                            node.0
                         ));
                     }
                 },

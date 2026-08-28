@@ -309,7 +309,12 @@ impl Executor {
     /// alternatives are worse — panicking is forbidden, and discarding the message loses
     /// the only record of why the run failed. A variant-changing redactor is malformed;
     /// the shipped `PatternRedactor` is not one, so this arm is unreachable in practice.
-    fn redact_text(&self, message: String) -> String {
+    /// `pub(super)` since SP-6 s3: `human.rs`'s `fail_human_agent` is the second failure
+    /// chokepoint that needs it, and a second copy of the tradeoff above is a second place
+    /// to get it wrong. It stays defined here rather than moving next to
+    /// [`Executor::redact`] in `content.rs` because its whole justification is the
+    /// failure-message chokepoint pattern this file introduced.
+    pub(super) fn redact_text(&self, message: String) -> String {
         match self.redact(&serde_json::Value::String(message.clone())) {
             serde_json::Value::String(scrubbed) => scrubbed,
             _ => message,

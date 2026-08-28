@@ -180,7 +180,7 @@ impl Executor {
             }
             MapBody::Agent(agent_ref) => {
                 match self
-                    .drive_agent(run, &node.id, agent_ref, &input, &[], fold, None)
+                    .drive_agent(run, &node.id, agent_ref, &input, &[], fold, None, false)
                     .await?
                 {
                     AgentStep::Completed(output) => Ok(NodeExec::Completed(output)),
@@ -274,6 +274,7 @@ impl Executor {
                                 &[],
                                 fold,
                                 None,
+                                false,
                             )
                             .await
                         {
@@ -493,6 +494,7 @@ impl Executor {
                         &[],
                         fold,
                         None,
+                        false,
                     )
                     .await?
                 {
@@ -550,7 +552,7 @@ impl Executor {
                 GateSpec::Agent { agent, stop_when } => {
                     let gate_path = NodeId(format!("{path}/__gate__"));
                     match self
-                        .drive_agent(run, &gate_path, agent, &output, &[], fold, None)
+                        .drive_agent(run, &gate_path, agent, &output, &[], fold, None, false)
                         .await?
                     {
                         AgentStep::Completed(ans) => stop_when.should_stop(&ans),
