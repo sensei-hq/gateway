@@ -15328,10 +15328,9 @@ mod await_signal {
             .with_clock(FakeClock::new(at(1_000_000)));
         let out = ex.start(run, &await_graph(None)).await.expect("drives");
 
-        let (node, message) = out
-            .failed
-            .clone()
-            .expect("a recorded wait with no signal ask must fail, not pause forever: {out:?}");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("a recorded wait with no signal ask must fail, not pause forever: {out:?}")
+        });
         assert_eq!(node, gate(), "the failure is the swapped node: {out:?}");
         assert!(
             message.contains("gate") && message.contains("began waiting"),
@@ -18478,10 +18477,9 @@ mod human_agent {
             .unwrap();
 
         let o = ex.start(run, &human_graph()).await.expect("drives");
-        let (node, message) = o
-            .failed
-            .clone()
-            .expect("a recorded wait with no question must fail, not pause forever: {o:?}");
+        let (node, message) = o.failed.clone().unwrap_or_else(|| {
+            panic!("a recorded wait with no question must fail, not pause forever: {o:?}")
+        });
         assert_eq!(
             node,
             review(),
