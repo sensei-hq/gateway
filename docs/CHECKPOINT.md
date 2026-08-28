@@ -24,7 +24,6 @@
   of its fixes (s2's re-review found three HIGH defects introduced while fixing).
 
 ## Next command — `/review-slice`
-
 ## Open questions
 
 - Covered by nothing: a human-backed `AgentDefinition` through a live `PostgresConfigSource`
