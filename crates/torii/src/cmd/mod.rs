@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod gate;
+pub mod human;
 pub mod run;
 pub mod worker;
 

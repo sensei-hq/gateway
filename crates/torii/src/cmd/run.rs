@@ -404,6 +404,22 @@ fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalStateA
             JournalEvent::GateAwaited { node, deadline, .. } => {
                 awaited.entry(node.clone()).or_insert(*deadline);
             }
+            // SP-6 s3: the third waiting kind — a human-backed `Agent`. Without this arm
+            // `awaiting_nodes` finds nothing for it and the node never appears in
+            // `list-paused` at all, which is the worst available outcome for the very
+            // feature this slice ships: an operator cannot answer what they cannot see, and
+            // the run waits on a human who was never told. It is also what makes
+            // `cmd::human::answer`'s node-state pre-check able to say `Awaiting` rather than
+            // refusing every legitimate answer as "not awaiting". FIRST wins, exactly as for
+            // the two arms above and for the same reason.
+            //
+            // It does NOT make a human-backed agent answerable by `run signal` or by
+            // `run gate decide` — both refuse a node with a journaled question before they
+            // reach this fold (`cmd::human::agent_question`), and `signal_state` is consulted
+            // only after that refusal.
+            JournalEvent::AgentAwaited { node, deadline, .. } => {
+                awaited.entry(node.clone()).or_insert(*deadline);
+            }
             JournalEvent::NodeCompleted { node } => {
                 terminal.insert(node.clone(), (*seq, SignalState::Completed));
             }
@@ -812,6 +828,28 @@ pub async fn signal(
             "not delivered: {shown} is a HumanGate, not an AwaitSignal — it accepts a \
              named option, not arbitrary JSON. Use: torii run gate decide {} --node \
              {shown} --option <name>",
+            run.0
+        )));
+    }
+
+    // SP-6 s3 AC7, the third arm of the same matrix. A human-backed `Agent` is answerable
+    // ONLY by `AgentAnswered`: `run_human_agent` reads nothing else, so a raw `--payload`
+    // would be journaled, never read, and reported here as `signalled`. Unlike the gate
+    // refusal above this is not about skipping VALIDATION — there is no menu to validate
+    // against — it is about skipping ATTRIBUTION: `SignalReceived` has no `actor` field, and
+    // an agent's answer becomes the node's OUTPUT and flows into downstream model prompts,
+    // so "who said this" is part of the value rather than an audit trail beside it.
+    //
+    // Checked BEFORE `signal_state` for the same reason the gate arm is: since s3 the fold
+    // DOES report a human-backed agent as `Awaiting` (its `AgentAwaited` arm, added so
+    // `list-paused` can show it), so reaching the generic arm would not refuse this at all —
+    // it would deliver a payload nothing will ever read.
+    if crate::cmd::human::agent_question(&events, &node).is_some() {
+        return Ok(Outcome::precondition(format!(
+            "not delivered: {shown} is a human-backed Agent, not an AwaitSignal — its \
+             answer becomes the node's output and is recorded with WHO answered, which a \
+             raw payload cannot carry. Use: torii run agent answer {} --node {shown} \
+             --text '<answer>'",
             run.0
         )));
     }

@@ -269,6 +269,18 @@ pub async fn decide(
                  {shown} --payload '<json>'",
                 run.0
             )
+        } else if crate::cmd::human::agent_question(&events, &node).is_some() {
+            // SP-6 s3 AC7, the third kind. A human-backed `Agent` publishes a QUESTION and
+            // no menu, so an option name means nothing to it: `run_human_agent` reads only
+            // `AgentAnswered`. Without this arm the refusal below would be technically true
+            // ("not awaiting a decision") and useless — it sends an operator to check a node
+            // id that was right when the COMMAND was wrong.
+            format!(
+                "not delivered: {shown} is a human-backed Agent, not a HumanGate — it \
+                 answers with free text, not one of a published set of options. Use: torii \
+                 run agent answer {} --node {shown} --text '<answer>'",
+                run.0
+            )
         } else {
             format!(
                 "not delivered: {shown} is not awaiting a decision. \
@@ -711,7 +723,11 @@ pub(crate) fn gate_menu(events: &[(Seq, JournalEvent)], node: &NodeId) -> Option
 }
 
 /// Whether this node is awaiting a RAW signal — used only to give the right cross-refusal.
-fn awaiting_signal(events: &[(Seq, JournalEvent)], node: &NodeId) -> bool {
+///
+/// `pub(crate)` since SP-6 s3 made the refusal matrix three-way: `cmd::human::answer` has to
+/// distinguish an `AwaitSignal` from a `HumanGate` exactly as this module does, and a second
+/// `SignalAwaited` scan would be a second place for that rule to drift.
+pub(crate) fn awaiting_signal(events: &[(Seq, JournalEvent)], node: &NodeId) -> bool {
     events
         .iter()
         .any(|(_, e)| matches!(e, JournalEvent::SignalAwaited { node: n, .. } if n == node))
