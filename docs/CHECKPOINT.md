@@ -7,12 +7,12 @@
 ## Done / remaining
 
 - **Tasks 1–7 ✅ implemented AND each reviewed, findings fixed on top:** 1 `AgentBacking` +
-  4 `validate()` rules (`fa070dd`, +7) · 2 `JournalEvent::{AgentAwaited,AgentAnswered}` +
-  `MAX_HUMAN_TEXT_BYTES`, `FORMAT_VERSION` stays 1 (`864cb1f`, +3) · 3 the fold, answer
-  last-wins / question first-wins (`608b316`, +2) · 4 `executor/human.rs::run_human_agent`,
-  the branch between `assemble_prompt` and `resolve_chain` (`877bf96`, +2 High/7 Med) ·
-  5 `torii run agent answer` (`451be45`, +3) · 6 `list-paused` renders `agent: "<question>"`
-  (`7fdb33e`, +2) · 7 the cross-process e2e (`f482d05`).
+  4 `validate()` rules (`fa070dd`, +7) · 2 the two journal events + `MAX_HUMAN_TEXT_BYTES`,
+  `FORMAT_VERSION` stays 1 (`864cb1f`, +3) · 3 the fold, answer last-wins / question
+  first-wins (`608b316`, +2) · 4 `executor/human.rs::run_human_agent`, the branch between
+  `assemble_prompt` and `resolve_chain` (`877bf96`, +2 High/7 Med) · 5 `torii run agent
+  answer` (`451be45`, +3) · 6 `list-paused` renders `agent: "<question>"` (`7fdb33e`, +2) ·
+  7 the cross-process e2e (`f482d05`).
 - **Task 7 ✅ AC13** — `n1 → review → n2`, `review` an ordinary top-level `NodeKind::Agent`;
   the substitution is registry-only. Green on arrival, so RED came from 3 scratch mutations
   (delete the answer-read → stays `Paused`; drop the `## Task` half → the row loses the input;
@@ -23,23 +23,18 @@
   per task in the commit messages but is not re-collated; and `/review-slice` plus a RE-review
   of its fixes (s2's re-review found three HIGH defects introduced while fixing).
 
-## Next command
-
-```
-/review-slice
-```
+## Next command — `/review-slice`
 
 ## Open questions
 
-- Not covered by anything: a human-backed `AgentDefinition` through a live
-  `PostgresConfigSource`. Adjacent legs are (`agent_backing_is_serde_defaulted_and_round_trips`,
-  `filesystem_source_carries_a_human_backing_through_to_the_registry`). Stated in
-  `human_registry`'s doc in `crates/torii/tests/e2e_pg.rs`, not hidden.
-- The e2e suite is `DATABASE_URL`-gated and **counts as PASSED while exercising nothing** when
-  the var is absent; a raw-stderr `SKIP` is the only signal. It cannot be `#[ignore]`d.
+- Covered by nothing: a human-backed `AgentDefinition` through a live `PostgresConfigSource`
+  (the adjacent legs — serde of a `config_agents` row, and md → `Registry` — both exist).
+  Stated in `human_registry`'s doc in `crates/torii/tests/e2e_pg.rs`, not hidden.
+- The e2e suite is `DATABASE_URL`-gated and **counts as PASSED while exercising nothing**
+  without it; a raw-stderr `SKIP` is the only signal. It cannot be `#[ignore]`d.
 
 ## Known-broken
 
 None. **1583 passed / 0 failed / 7 ignored, exit 0** (`env -u DATABASE_URL cargo test
---workspace`); clippy `-D warnings`, `fmt --check` and `cargo doc --no-deps` clean.
+--workspace`); clippy `-D warnings`, `fmt --check`, `cargo doc --no-deps` clean.
 `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it.
