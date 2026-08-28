@@ -54,12 +54,17 @@ impl Executor {
     /// re-execution (resume without re-spend); an input-hash mismatch halts with
     /// `DeterminismViolation`.
     ///
-    /// `top_level` says whether this call is a `NodeKind::Agent` in the graph (the only
-    /// caller that passes `true`) as opposed to a `Map`/`Consolidate`/`Loop` body, a Loop
-    /// gate-agent or an `Expand` planner. It exists ONLY for SP-6 s3's human-backed
-    /// roles, which are legal at the top level and nowhere else; see the branch below.
+    /// `top_level` says whether this call is a `NodeKind::Agent` in the RUN's OWN graph, as
+    /// opposed to a `Map`/`Consolidate`/`Loop` body, a Loop gate-agent, an `Expand` planner,
+    /// or an `Agent` node nested inside a `Subgraph`/`Branch` arm/`Expand`. It exists ONLY
+    /// for SP-6 s3's human-backed roles, which are legal at that one position and nowhere
+    /// else; see the branch below.
+    ///
+    /// Only `run_node` can pass `true`, and it passes `!nested` — `drive`'s position flag,
+    /// cleared by `drive_nested` — never a literal. Deciding this on the CALLER instead was
+    /// a real, shipped bypass; the branch below records what it cost.
     // The per-invocation inputs (run/node/agent/input/context/fold/phase/top_level) are
-    // each distinct and passed positionally at five call sites; bundling them behind a
+    // each distinct and passed positionally at six call sites; bundling them behind a
     // struct would only relocate the plumbing, so the arity is allowed here.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn drive_agent(
@@ -105,12 +110,24 @@ impl Executor {
 
             if !top_level {
                 // Design §5.5: legal ONLY as a top-level `NodeKind::Agent`. `drive_agent`
-                // is the shared choke point for five callers, and the other four each mean
-                // a DIFFERENT unbuilt feature: N concurrent human asks for a `Map`, a human
-                // re-answering every `Loop` iteration, a human deciding loop continuation,
-                // and — the sharpest — a human-backed PLANNER, whose answer feeds
-                // `parse_plan(text)`, so the person would have to hand-author a
-                // machine-parseable plan GRAPH.
+                // is the shared choke point for six callers, and the five non-top-level
+                // ones each mean a DIFFERENT unbuilt feature: N concurrent human asks for a
+                // `Map`, the same for a `Consolidate`, a human re-answering every `Loop`
+                // iteration, a human deciding loop continuation, and — the sharpest — a
+                // human-backed PLANNER, whose answer feeds `parse_plan(text)`, so the
+                // person would have to hand-author a machine-parseable plan GRAPH.
+                //
+                // **`top_level` is a POSITION, not a caller.** The sixth caller,
+                // `run_node`'s own `NodeKind::Agent` arm, passes `!nested` — the flag
+                // `drive` carries and `drive_nested` clears — rather than a literal `true`.
+                // It used to pass the literal, and the whole-slice review showed what that
+                // cost: `run_loop` → `drive_nested` → `drive` → `run_node`, so wrapping the
+                // very same agent in a one-node `Subgraph` body declared it top-level and
+                // delivered "a human re-answers every `Loop` iteration" — one of the four
+                // features listed above as unbuilt — with no refusal at all. The same
+                // wrapper trick worked through a `Subgraph` node, a `Branch` arm and an
+                // `Expand` planner's spliced graph, which is the one an UNTRUSTED planner
+                // can author. `non_top_level_sites` now carries a row for each.
                 //
                 // Enforced HERE, at runtime, rather than in `Graph::validate_dag`, because
                 // `validate_dag` cannot see the registry: a graph names an `AgentRef`, and
@@ -139,8 +156,9 @@ impl Executor {
                         node_id,
                         format!(
                             "human_agent: agent {:?} is human-backed and may only be used \
-                             as a top-level Agent node, not as a Map body, Loop body, Loop \
-                             gate or planner",
+                             as a top-level Agent node — not as a Map or Consolidate body, \
+                             a Loop body, a Loop gate, a planner, or an Agent node nested \
+                             inside a Subgraph, a Branch arm or an Expand",
                             agent_ref.0
                         ),
                     )

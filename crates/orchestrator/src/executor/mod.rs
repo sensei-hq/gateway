@@ -718,7 +718,9 @@ impl Executor {
             budget: budget.map(|b| b.total_tokens),
             ..Default::default()
         };
-        let outcome = this.drive(run, graph, &fold).await?;
+        // The RUN's own graph: a human-backed `Agent` node here is at the one
+        // position §5.5 permits.
+        let outcome = this.drive(run, graph, &fold, false).await?;
         this.finalize_run(run, &outcome).await?;
         Ok(outcome)
     }
@@ -827,7 +829,9 @@ impl Executor {
             .clone()
             .with_expansion_seed(fold.expansions.len(), seed_nodes);
         this.rehydrate_context(&fold).await?;
-        let outcome = this.drive(run, graph, &fold).await?;
+        // The RUN's own graph: a human-backed `Agent` node here is at the one
+        // position §5.5 permits.
+        let outcome = this.drive(run, graph, &fold, false).await?;
         this.finalize_run(run, &outcome).await?;
         Ok(outcome)
     }
@@ -860,11 +864,29 @@ impl Executor {
     /// soft-dependent branches still run; the failure suppresses `RunCompleted`,
     /// so the run stays resumable (the slice-1/2 contract on a linear graph,
     /// where the failure has no downstream to skip).
+    ///
+    /// **`nested` says whether this drive is the RUN's own graph or one nested inside a
+    /// node of it**, and it exists for exactly one consumer: SP-6 s3's rule that a
+    /// human-backed role is legal only as a top-level `NodeKind::Agent`. `false` at the two
+    /// run-level callers (`run_inner`/`start_inner`); `true` at [`drive_nested`], which is
+    /// the single tail every `Subgraph`, `Branch` arm, `Loop`-`Subgraph` body and
+    /// planner-spliced `Expand` graph goes through.
+    ///
+    /// It is threaded rather than derived from the node path because the property is about
+    /// POSITION and nothing else carries it: `run_node` sees only a `&Node`, whose id is
+    /// already namespaced (`"{loop}/0/review"`) but whose SHAPE — a `/`-bearing id — is
+    /// also legal for a top-level node an author simply named that way. Deciding legality
+    /// on the caller instead was the shipped defect: `run_node`'s `Agent` arm passed a
+    /// hardcoded `true`, so wrapping the agent in a one-node `Subgraph` bypassed the rule
+    /// entirely and delivered "a human re-answers every `Loop` iteration" — one of the four
+    /// unbuilt features the refusal exists to prevent — through a trivial wrapper, and
+    /// through any untrusted `Expand` planner that splices such a node.
     async fn drive(
         &self,
         run: RunId,
         graph: &Graph,
         fold: &Fold,
+        nested: bool,
     ) -> Result<RunOutcome, OrchestratorError> {
         let mut state = DriveState::default();
         loop {
@@ -877,7 +899,7 @@ impl Executor {
                 // reads its Map's result from it) ends when the future resolves,
                 // before `apply_node_result` mutates `state`.
                 let result = self
-                    .run_node(run, node, fold, &state.outcome.outputs)
+                    .run_node(run, node, fold, &state.outcome.outputs, nested)
                     .await?;
                 self.apply_node_result(run, graph, node, result, fold, &mut state)
                     .await?;
@@ -1065,12 +1087,17 @@ impl Executor {
     /// `Err` (halting the run before any gateway call). `prior_outputs` carries the
     /// outputs of already-completed nodes this round advances past — a `Consolidate`
     /// reads its Map's result from it.
+    ///
+    /// `nested` is [`drive`](Self::drive)'s position flag, forwarded untouched to the one
+    /// arm that cares — see that function's doc for why the human-backed-role rule is
+    /// decided on position rather than on the calling function.
     async fn run_node(
         &self,
         run: RunId,
         node: &orchestrator_core::Node,
         fold: &Fold,
         prior_outputs: &HashMap<NodeId, serde_json::Value>,
+        nested: bool,
     ) -> Result<NodeExec, OrchestratorError> {
         match &node.kind {
             NodeKind::ModelCall { chain, payload } => {
@@ -1197,10 +1224,16 @@ impl Executor {
                         &context,
                         fold,
                         phase.as_deref(),
-                        // The ONE `true` in the codebase: this is the graph's own
-                        // `NodeKind::Agent`, the only site where SP-6 s3's human-backed
-                        // role is legal.
-                        true,
+                        // The ONE site where SP-6 s3's human-backed role can be legal —
+                        // and only when this drive is the RUN's own graph. `!nested`, not
+                        // a hardcoded `true`: `drive_nested` re-enters `drive` → `run_node`
+                        // for every `Subgraph`, `Branch` arm, `Loop`-`Subgraph` body and
+                        // planner-spliced `Expand` graph, so a literal `true` here declared
+                        // every one of those Agent nodes top-level. Review drove
+                        // `Loop { body: Subgraph([Agent -> human]) }` against the literal
+                        // and got two real journaled questions, at `lp/0/review` and
+                        // `lp/1/review`.
+                        !nested,
                     )
                     .await?
                 {
