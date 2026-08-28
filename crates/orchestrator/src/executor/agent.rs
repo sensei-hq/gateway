@@ -53,8 +53,13 @@ impl Executor {
     /// turns/tools replay from the journal with no gateway call and no
     /// re-execution (resume without re-spend); an input-hash mismatch halts with
     /// `DeterminismViolation`.
-    // The per-invocation inputs (run/node/agent/input/context/fold/phase) are each
-    // distinct and passed positionally at four call sites; bundling them behind a
+    ///
+    /// `top_level` says whether this call is a `NodeKind::Agent` in the graph (the only
+    /// caller that passes `true`) as opposed to a `Map`/`Consolidate`/`Loop` body, a Loop
+    /// gate-agent or an `Expand` planner. It exists ONLY for SP-6 s3's human-backed
+    /// roles, which are legal at the top level and nowhere else; see the branch below.
+    // The per-invocation inputs (run/node/agent/input/context/fold/phase/top_level) are
+    // each distinct and passed positionally at five call sites; bundling them behind a
     // struct would only relocate the plumbing, so the arity is allowed here.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn drive_agent(
@@ -66,6 +71,7 @@ impl Executor {
         context: &[(ContextKey, serde_json::Value)],
         fold: &Fold,
         phase: Option<&str>,
+        top_level: bool,
     ) -> Result<AgentStep, OrchestratorError> {
         let agent: &AgentDefinition = self
             .registry
@@ -73,6 +79,64 @@ impl Executor {
             .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
         let query = render_input(input);
         let (system, tools) = assemble_prompt(&self.registry, agent, context, &query)?;
+
+        // SP-6 s3: a human-backed role answers instead of a model. The branch sits HERE —
+        // AFTER `assemble_prompt`, which needs no chain, so the human is shown exactly
+        // what the model would have been (its system prompt, every activated skill body
+        // and the rendered `## Context` section); and BEFORE `resolve_chain`, so no chain
+        // is resolved, no gateway is touched and zero token spend is STRUCTURAL rather
+        // than measured.
+        //
+        // `on_agent_started` does NOT fire on this path, deliberately: the hook's
+        // signature requires `&ar.chain`, and a human-backed agent by construction never
+        // has one. `resolve_chain` would in fact FAIL for the common shape of such a role
+        // (`chain: None` with no `(area, kind)` binding), which is why the branch cannot
+        // simply sit lower down and skip the call.
+        if let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by {
+            if !top_level {
+                // Design §5.5: legal ONLY as a top-level `NodeKind::Agent`. `drive_agent`
+                // is the shared choke point for five callers, and the other four each mean
+                // a DIFFERENT unbuilt feature: N concurrent human asks for a `Map`, a human
+                // re-answering every `Loop` iteration, a human deciding loop continuation,
+                // and — the sharpest — a human-backed PLANNER, whose answer feeds
+                // `parse_plan(text)`, so the person would have to hand-author a
+                // machine-parseable plan GRAPH.
+                //
+                // Enforced HERE, at runtime, rather than in `Graph::validate_dag`, because
+                // `validate_dag` cannot see the registry: a graph names an `AgentRef`, and
+                // whether that ref is human-backed is a REGISTRY fact. That is a stated
+                // limitation of §5.5, not an oversight — which is why the refusal is loud
+                // and journaled rather than a silent fallback to the model path.
+                let message = format!(
+                    "human_agent: agent {:?} is human-backed and may only be used as a \
+                     top-level Agent node, not as a Map body, Loop body, Loop gate or \
+                     planner",
+                    agent_ref.0
+                );
+                self.append(
+                    run,
+                    JournalEvent::NodeFailed {
+                        node: node_id.clone(),
+                        error: message.clone(),
+                    },
+                )
+                .await?;
+                return Ok(AgentStep::Failed(message));
+            }
+            // `AgentStep` has no `From<NodeExec>` conversion, so the mapping is written
+            // inline — the same three-arm mapping `run_node` applies to this function's
+            // result, in the other direction. `NodeExec::Failed.output` is `None` on every
+            // path `run_human_agent` can return, so nothing is dropped here.
+            return match self
+                .run_human_agent(run, node_id, &system, timeout, fold)
+                .await?
+            {
+                super::NodeExec::Completed(output) => Ok(AgentStep::Completed(output)),
+                super::NodeExec::Failed { message, .. } => Ok(AgentStep::Failed(message)),
+                super::NodeExec::Paused { reason } => Ok(AgentStep::Paused(reason)),
+            };
+        }
+
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();
         let min_win = self.gateway.min_context_window(&chain).await;
         let ar = AgentRun {

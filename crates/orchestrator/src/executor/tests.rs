@@ -14788,7 +14788,12 @@ mod human_gate {
     use orchestrator_core::{GateOption, GateOutcome};
 
     /// A fixed instant, so every deadline in these tests is an exact literal.
-    fn at(unix_secs: i64) -> DateTime<Utc> {
+    ///
+    /// `pub(super)` because SP-6 s3's `mod human_agent` reuses it rather than deriving a
+    /// third copy: `mod await_signal` and this module already carry one each, and a
+    /// literal-instant helper that drifts between the three waiting kinds' suites makes a
+    /// failed deadline assertion read as "which second was that?".
+    pub(super) fn at(unix_secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(unix_secs, 0).expect("valid timestamp")
     }
 
@@ -14864,7 +14869,13 @@ mod human_gate {
     /// helper for the same reason; see
     /// [`a_timed_gate_pauses_on_the_absolute_deadline_it_recorded`] for what its absence
     /// from this module let through.
-    fn paused_resume_afters(events: &[(Seq, JournalEvent)]) -> Vec<Option<DateTime<Utc>>> {
+    ///
+    /// `pub(super)` for SP-6 s3's `mod human_agent`: all three waiting kinds end on the
+    /// SAME `pause_awaiting`, so they must all be able to assert on the SAME field, and a
+    /// third copy of this filter is a third thing to keep in step.
+    pub(super) fn paused_resume_afters(
+        events: &[(Seq, JournalEvent)],
+    ) -> Vec<Option<DateTime<Utc>>> {
         events
             .iter()
             .filter_map(|(_, e)| match e {
@@ -16156,6 +16167,630 @@ mod postgres_e2e {
             calls_b.lock().unwrap().len(),
             1,
             "the woken run drove the one node once (no re-spend beyond it)"
+        );
+    }
+}
+
+/// SP-6 s3 — a role in the registry answered by a PERSON. An `Agent` node whose
+/// `AgentRef` resolves to an `AgentBacking::Human` definition pauses once, journals the
+/// question it is asking, and completes when a human answers.
+///
+/// Modelled on `mod human_gate` and deliberately reusing its `at`/`paused_resume_afters`
+/// (and `crate::test_support`'s `FakeClock`/`recording_gateway`) rather than deriving a
+/// third copy of each: all three waiting kinds share one `pause_awaiting`, so they must
+/// assert on the same field with the same helper.
+///
+/// **Every registry below gives the human-backed agent `chain: None` with no binding
+/// table.** That is not laziness — it is the structural half of AC12. `resolve_chain`
+/// would return `UnresolvedChain` for such an agent, so if the human branch were ever
+/// moved BELOW `resolve_chain` in `drive_agent`, every test here fails with a chain
+/// error rather than silently costing tokens.
+mod human_agent {
+    use super::human_gate::{at, paused_resume_afters};
+    use super::*;
+    use crate::test_support::FakeClock;
+    use chrono::{DateTime, Duration, Utc};
+    use orchestrator_core::{Activation, SkillDef};
+
+    fn review() -> NodeId {
+        NodeId("review".into())
+    }
+
+    /// The question every test asks. It is the agent's `system_prompt`, which is what
+    /// `assemble_prompt` composes into the journaled question.
+    const QUESTION: &str = "Read the contract and say whether it permits sub-processing.";
+
+    /// A human-backed `reviewer` role with the given SLA. `chain: None` and no bindings —
+    /// see the module doc for why that is load-bearing.
+    fn reviewer(timeout: Option<Duration>, skills: Vec<String>) -> AgentDefinition {
+        AgentDefinition {
+            name: "reviewer".into(),
+            area: "review".into(),
+            kind: "human".into(),
+            chain: None,
+            chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            tools: vec![],
+            skills,
+            system_prompt: QUESTION.into(),
+            backed_by: AgentBacking::Human { timeout },
+        }
+    }
+
+    fn human_registry(timeout: Option<Duration>) -> Arc<Registry> {
+        Arc::new(Registry::default().with_agent(reviewer(timeout, vec![])))
+    }
+
+    /// A single top-level `Agent` node pointing at the human-backed role.
+    fn human_graph() -> Graph {
+        Graph {
+            nodes: vec![agent_node("review", "reviewer", "the Acme MSA")],
+        }
+    }
+
+    /// An executor over a caller-owned journal, so a test can append an answer BETWEEN
+    /// two drives — the shape `torii run agent answer` has (append `AgentAnswered`, then
+    /// wake the run for a worker to drive it) and the shape any library caller has. The
+    /// clock and the gateway call log are handed back: the clock to cross a deadline, the
+    /// log to prove AC12.
+    async fn exec_at(
+        journal: &InMemoryJournal,
+        registry: Arc<Registry>,
+        now: DateTime<Utc>,
+    ) -> (Executor, Arc<FakeClock>, CallLog) {
+        let clock = FakeClock::new(now);
+        let (gw, calls) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_clock(clock.clone());
+        (ex, clock, calls)
+    }
+
+    fn answered(node: &NodeId, text: &str, actor: &str) -> JournalEvent {
+        JournalEvent::AgentAnswered {
+            node: node.clone(),
+            text: text.to_string(),
+            actor: actor.to_string(),
+        }
+    }
+
+    /// Every deadline this node journaled on `AgentAwaited`, in order — the durable home
+    /// of the SLA. A correct implementation records exactly one, forever.
+    fn agent_deadlines(events: &[(Seq, JournalEvent)]) -> Vec<Option<DateTime<Utc>>> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::AgentAwaited { node, deadline, .. } if node == &review() => {
+                    Some(*deadline)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every QUESTION journaled by this run, for any node, in order.
+    fn journaled_prompts(events: &[(Seq, JournalEvent)]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::AgentAwaited { prompt, .. } => Some(prompt.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `NodeFailed` this run journaled for `node`, in order.
+    async fn failures(journal: &InMemoryJournal, run: RunId, node: &NodeId) -> Vec<String> {
+        journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::NodeFailed { node: n, error } if n == node => Some(error.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC1 + AC12: the node pauses, a human answers, the node completes — and the gateway
+    /// was never called.
+    ///
+    /// **The OUTPUT assertion is the point, not the call count.** s2 shipped an AC that
+    /// asserted only `calls == 0` and it could not fail: no gateway path is reachable from
+    /// the human branch at all, so it passed whether the node worked or was completely
+    /// broken. Paired with the output, `calls == 0` means "answered for free from the
+    /// fold" instead of "no gateway wired".
+    #[tokio::test]
+    async fn a_human_backed_agent_never_calls_the_gateway_and_still_answers() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+
+        let o1 = ex.start(run, &human_graph()).await.expect("asks");
+        assert!(
+            o1.paused.is_some(),
+            "an unanswered human agent pauses: {o1:?}"
+        );
+
+        journal
+            .append(
+                run,
+                answered(&review(), "Yes — clause 7.2 permits it.", "alice"),
+            )
+            .await
+            .unwrap();
+
+        let o2 = ex.start(run, &human_graph()).await.expect("resumes");
+        assert!(
+            o2.paused.is_none() && o2.failed.is_none(),
+            "answered: {o2:?}"
+        );
+        assert_eq!(
+            o2.outputs[&review()]["text"],
+            serde_json::json!("Yes — clause 7.2 permits it."),
+            "the human's answer IS the node's output: {o2:?}"
+        );
+        assert_eq!(
+            o2.outputs[&review()]["actor"],
+            serde_json::json!("alice"),
+            "and it is attributed"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "...at zero token cost — no chain is resolved and no gateway is touched"
+        );
+    }
+
+    /// AC2: the answer lands under the `"text"` key — the SAME key a model-backed agent
+    /// produces — so every existing reader consumes it without knowing it was human.
+    ///
+    /// Proven through `BranchCond::TextContains`, an unmodified downstream reader, rather
+    /// than by re-asserting the key: a key assertion passes even if nothing downstream can
+    /// actually use it.
+    #[tokio::test]
+    async fn the_answer_is_the_nodes_output_under_the_text_key() {
+        use orchestrator_core::BranchCond;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+
+        let route = NodeId("route".into());
+        let graph = Graph {
+            nodes: vec![
+                agent_node("review", "reviewer", "the Acme MSA"),
+                Node {
+                    id: route.clone(),
+                    kind: NodeKind::Branch {
+                        on: review(),
+                        arms: vec![(
+                            BranchCond::TextContains("permits".into()),
+                            Graph {
+                                nodes: vec![mc("permitted_out", None)],
+                            },
+                        )],
+                        default: Graph {
+                            nodes: vec![mc("refused_out", None)],
+                        },
+                    },
+                    deps: vec![Dep {
+                        on: review(),
+                        kind: EdgeKind::Hard,
+                    }],
+                },
+            ],
+        };
+
+        ex.start(run, &graph).await.expect("asks");
+        journal
+            .append(
+                run,
+                answered(&review(), "Yes — clause 7.2 permits it.", "alice"),
+            )
+            .await
+            .unwrap();
+        let o = ex.start(run, &graph).await.expect("resumes");
+
+        assert!(o.failed.is_none(), "{o:?}");
+        let branch_out = &o.outputs[&route];
+        assert!(
+            branch_out.get("permitted_out").is_some(),
+            "an UNMODIFIED `BranchCond::TextContains` matched the human's answer: {branch_out}"
+        );
+        assert!(
+            branch_out.get("refused_out").is_none(),
+            "the default arm did not run: {branch_out}"
+        );
+    }
+
+    /// AC3 — **the deliberate divergence from `HumanGate`.**
+    ///
+    /// An answer given INSIDE the SLA is honoured even when the drive that folds it runs
+    /// after the deadline. `run_human_gate` does the opposite on purpose: a gate decision
+    /// is an APPROVAL, and a late one must not approve a gate whose SLA ran out. An
+    /// agent's answer is WORK PRODUCT — there is nothing to self-approve, and discarding a
+    /// human's in-time answer because no worker happened to be running punishes them for
+    /// infrastructure they had no part in.
+    ///
+    /// This test is the ONLY guard on that ordering: move the answer read below the expiry
+    /// arm in `run_human_agent` and everything else here stays green.
+    #[tokio::test]
+    async fn an_answer_inside_the_sla_is_honoured_by_a_late_drive() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let deadline = t0 + Duration::hours(1);
+
+        // The node asked at t0 with a 1h SLA, and the human answered inside it — but no
+        // drive folded the answer before the deadline passed.
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                run,
+                JournalEvent::AgentAwaited {
+                    node: review(),
+                    deadline: Some(deadline),
+                    prompt: QUESTION.into(),
+                },
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                run,
+                answered(&review(), "Yes — clause 7.2 permits it.", "alice"),
+            )
+            .await
+            .unwrap();
+
+        // The worker only comes back an hour after the SLA expired.
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            deadline + Duration::hours(1),
+        )
+        .await;
+        let o = ex
+            .start(run, &human_graph())
+            .await
+            .expect("drives past the deadline");
+
+        assert!(
+            o.failed.is_none(),
+            "an in-time answer is WORK PRODUCT, not an approval — a late DRIVE must not \
+             discard it: {o:?}"
+        );
+        assert_eq!(
+            o.outputs[&review()]["text"],
+            serde_json::json!("Yes — clause 7.2 permits it."),
+            "the answer is the node's output: {o:?}"
+        );
+    }
+
+    /// AC4: once the expiry has FIRED, the node is terminal — an answer appended
+    /// afterwards must not resurrect it.
+    ///
+    /// AC3 and this one are the two halves of the same rule and neither implies the other:
+    /// the answer is read before the expiry CHECK, but never before a `NodeFailed` that
+    /// already exists. `gate_precheck` is what draws that line, and the journaled-failure
+    /// count pins its "read the verdict back, never re-derive it" half — a second
+    /// `NodeFailed` for an already-dead node is a missing precheck made visible.
+    #[tokio::test]
+    async fn a_fired_expiry_is_terminal_even_if_an_answer_arrives_later() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let registry = human_registry(Some(Duration::hours(1)));
+        let (ex, clock, _calls) = exec_at(&journal, registry, at(1_000)).await;
+
+        ex.start(run, &human_graph()).await.expect("asks");
+
+        clock.set(at(1_000) + Duration::hours(2));
+        let expired = ex.start(run, &human_graph()).await.expect("drives");
+        assert!(expired.failed.is_some(), "the deadline fired: {expired:?}");
+
+        // The human answers, too late.
+        journal
+            .append(
+                run,
+                answered(&review(), "Yes — clause 7.2 permits it.", "alice"),
+            )
+            .await
+            .unwrap();
+
+        let after = ex.start(run, &human_graph()).await.expect("drives");
+        let (node, message) = after.failed.clone().expect("the node STAYS failed");
+        assert_eq!(node, review());
+        assert!(
+            message.contains("deadline"),
+            "the ORIGINAL expiry is read back, not replaced by the late answer: {message}"
+        );
+        assert!(
+            !after.outputs.contains_key(&review()),
+            "a late answer must produce no output: {after:?}"
+        );
+        assert_eq!(
+            failures(&journal, run, &review()).await.len(),
+            1,
+            "the expiry is READ BACK from the fold: re-deriving it appends a second \
+             NodeFailed for an already-dead node on every drive"
+        );
+    }
+
+    /// AC5: expiry fails the node and produces NO output — never a defaulted answer.
+    ///
+    /// A human-backed agent that invented "no objection" on timeout would be the
+    /// self-approval §4 rejects, one layer further in: the invented text becomes the
+    /// node's output and flows into every downstream prompt.
+    #[tokio::test]
+    async fn an_expired_human_agent_never_produces_a_default_answer() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let registry = human_registry(Some(Duration::hours(1)));
+        let (ex, clock, _calls) = exec_at(&journal, registry, at(1_000)).await;
+
+        ex.start(run, &human_graph()).await.expect("asks");
+        clock.set(at(1_000) + Duration::hours(2));
+
+        let o = ex.start(run, &human_graph()).await.expect("drives");
+        let (_n, message) = o.failed.clone().expect("expiry fails the node");
+        assert!(
+            message.contains("review"),
+            "the failure names the node: {message}"
+        );
+        assert!(
+            !o.outputs.contains_key(&review()),
+            "expiry must produce NO output, defaulted or otherwise: {o:?}"
+        );
+    }
+
+    /// AC6: an answer delivered BEFORE the node has ever run still resolves it, in the
+    /// same execution — and the question is journaled anyway.
+    ///
+    /// s1's `AwaitSignal` gets this for free (a signal folded early is simply already
+    /// there). A durable QUESTION breaks that, exactly as s2's durable menu did: an
+    /// `AgentAnswered` folded with no `AgentAwaited` has nothing to be an answer TO, and
+    /// nothing for `torii run list-paused` or an audit to show the human was ever asked.
+    /// Resolved the same way s2 resolved it — the ask is journaled first,
+    /// unconditionally, and the pending answer is then read.
+    #[tokio::test]
+    async fn an_answer_delivered_before_the_node_first_runs_still_resolves() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+
+        journal
+            .append(
+                run,
+                answered(&review(), "Yes — clause 7.2 permits it.", "alice"),
+            )
+            .await
+            .unwrap();
+
+        let o = ex.start(run, &human_graph()).await.expect("drives");
+        assert!(
+            o.paused.is_none() && o.failed.is_none(),
+            "the early answer resolves the node in its FIRST execution: {o:?}"
+        );
+        assert_eq!(
+            o.outputs[&review()]["text"],
+            serde_json::json!("Yes — clause 7.2 permits it.")
+        );
+
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            journaled_prompts(&events).len(),
+            1,
+            "the ask is journaled even when the answer arrived first — otherwise the \
+             durable record shows an answer to a question nobody was ever asked"
+        );
+    }
+
+    /// The pause carries the RECORDED absolute deadline, on the first drive and on every
+    /// later one.
+    ///
+    /// s2's review found this untested in `mod human_gate`, where a
+    /// `pause_awaiting(…, None)` mutation left the whole workspace green: every timed
+    /// pause would land in SP-DATA-3's never-auto-woken class (`next_wake` NULL), so a
+    /// `timeout: Some(48h)` role would never be woken, the expiry check would never run,
+    /// and the SLA would exist only on paper.
+    ///
+    /// The SECOND drive separates "carries A deadline" from "carries the RECORDED one":
+    /// recomputing `now + timeout` on each execution passes the first assertion and pushes
+    /// the SLA forward on every wake, so a role force-woken every twenty minutes with a
+    /// one-hour SLA would never expire.
+    #[tokio::test]
+    async fn a_timed_human_agent_pauses_on_the_absolute_deadline_it_recorded() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let deadline = t0 + Duration::hours(1);
+        let registry = human_registry(Some(Duration::hours(1)));
+        let (ex, clock, _calls) = exec_at(&journal, registry, t0).await;
+
+        let o1 = ex.start(run, &human_graph()).await.expect("asks");
+        assert!(
+            o1.paused.is_some() && o1.failed.is_none(),
+            "an unanswered human agent pauses: {o1:?}"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            agent_deadlines(&events),
+            vec![Some(deadline)],
+            "the ABSOLUTE instant `now + timeout` is journaled on the ask"
+        );
+        assert_eq!(
+            paused_resume_afters(&events),
+            vec![Some(deadline)],
+            "and the pause re-arms the durable scheduler on it — `None` here is the \
+             never-auto-woken class, which would make the SLA decorative"
+        );
+
+        // An operator force-wakes it twenty minutes in. Still unanswered, so it re-pauses
+        // — on the SAME instant, not a fresh `now + timeout`.
+        clock.set(t0 + Duration::minutes(20));
+        let o2 = ex.start(run, &human_graph()).await.expect("re-pauses");
+        assert!(
+            o2.paused.is_some() && o2.failed.is_none(),
+            "the deadline has not passed, so it is still waiting: {o2:?}"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            agent_deadlines(&events),
+            vec![Some(deadline)],
+            "the ask is not repeated — the deadline is recorded ONCE"
+        );
+        assert_eq!(
+            paused_resume_afters(&events),
+            vec![Some(deadline), Some(deadline)],
+            "the re-pause re-arms on the recorded instant; `now + timeout` here would \
+             push the SLA forward on every wake and a role woken hourly would never expire"
+        );
+    }
+
+    /// AC17: the journaled question is the ASSEMBLED prompt — the agent's system prompt
+    /// PLUS every activated skill body PLUS the rendered `## Context` section — not just
+    /// `system_prompt`.
+    ///
+    /// That is the whole reason the branch sits AFTER `assemble_prompt`: a human answering
+    /// for a role must be shown exactly what the model would have been shown. Journaling
+    /// `agent.system_prompt` alone would compile, pass every other test here, and quietly
+    /// hide the skills and the upstream context from the person doing the work.
+    #[tokio::test]
+    async fn the_journaled_prompt_is_the_assembled_prompt() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+
+        let registry = Arc::new(
+            Registry::default()
+                .with_agent(reviewer(None, vec!["cite-the-clause".into()]))
+                .with_skill(SkillDef {
+                    name: "cite-the-clause".into(),
+                    description: None,
+                    body: "ALWAYS QUOTE THE CLAUSE NUMBER.".into(),
+                    activation: Activation::Always,
+                }),
+        );
+        let (gw, _calls) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone());
+
+        // `brief` is an ordinary upstream ModelCall whose output is published to the
+        // blackboard; the human-backed node Hard-depends on it, so `resolve_context`
+        // feeds it into the `## Context` section of the assembled prompt.
+        let graph = Graph {
+            nodes: vec![
+                mc("brief", None),
+                Node {
+                    id: review(),
+                    kind: NodeKind::Agent {
+                        agent: AgentRef("reviewer".into()),
+                        input: serde_json::json!("the Acme MSA"),
+                        phase: None,
+                    },
+                    deps: vec![Dep {
+                        on: NodeId("brief".into()),
+                        kind: EdgeKind::Hard,
+                    }],
+                },
+            ],
+        };
+
+        let o = ex.start(run, &graph).await.expect("asks");
+        assert!(o.paused.is_some(), "the human agent pauses: {o:?}");
+
+        let events = journal.load(run).await.unwrap();
+        let prompts = journaled_prompts(&events);
+        assert_eq!(prompts.len(), 1, "exactly one question: {prompts:?}");
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains(QUESTION),
+            "the role's own system prompt is in the question: {prompt}"
+        );
+        assert!(
+            prompt.contains("ALWAYS QUOTE THE CLAUSE NUMBER."),
+            "an activated skill's body is in the question — the human is shown what the \
+             model would have been: {prompt}"
+        );
+        assert!(
+            prompt.contains("## Context") && prompt.contains("### brief"),
+            "the upstream context section is in the question: {prompt}"
+        );
+    }
+
+    /// AC15: a human-backed role is legal ONLY as a top-level `NodeKind::Agent`. Used as a
+    /// `MapBody::Agent` it fails the node LOUDLY, naming the site.
+    ///
+    /// `drive_agent` is the shared choke point for five callers and the other four each
+    /// mean a different unbuilt feature: N concurrent human asks for a `Map`, a human
+    /// re-answering every `Loop` iteration, a human deciding loop continuation, and — the
+    /// sharpest — a human-backed PLANNER, whose answer feeds `parse_plan(text)`, so the
+    /// person would have to hand-author a machine-parseable plan graph.
+    ///
+    /// Enforced at RUNTIME rather than in `validate_dag`, because `validate_dag` cannot
+    /// see the registry: a graph names an `AgentRef`, and whether that ref is human-backed
+    /// is a registry fact. That is a stated limitation of §5.5, not an oversight — which
+    /// is why the refusal must be loud, and why this test asserts it never began asking.
+    #[tokio::test]
+    async fn a_human_backed_agent_is_rejected_outside_a_top_level_agent_node() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+
+        let m = NodeId("m".into());
+        let graph = Graph {
+            nodes: vec![Node {
+                id: m.clone(),
+                kind: NodeKind::Map {
+                    body: MapBody::Agent(AgentRef("reviewer".into())),
+                    over: vec![serde_json::json!("the Acme MSA")],
+                    concurrency: 1,
+                    aggregation: Aggregation::FailFast,
+                },
+                deps: vec![],
+            }],
+        };
+
+        let o = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            o.failed.is_some(),
+            "a human-backed role in a Map body must fail the run, not silently pause it \
+             or run as a model: {o:?}"
+        );
+
+        let child = NodeId("m/0".into());
+        let child_failures = failures(&journal, run, &child).await;
+        assert_eq!(
+            child_failures.len(),
+            1,
+            "the Map CHILD is the node that failed: {child_failures:?}"
+        );
+        assert!(
+            child_failures[0].contains("reviewer") && child_failures[0].contains("top-level"),
+            "the refusal names the role and the rule: {}",
+            child_failures[0]
+        );
+
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            journaled_prompts(&events).is_empty(),
+            "and it never asked a human a question it could not deliver an answer for: {:?}",
+            journaled_prompts(&events)
         );
     }
 }

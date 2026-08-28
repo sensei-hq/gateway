@@ -22,6 +22,7 @@ mod durability;
 mod expand;
 mod fanout;
 mod gate;
+mod human;
 pub(crate) mod selector;
 mod signal;
 mod subgraph;
@@ -382,23 +383,12 @@ impl Fold {
 
     /// SP-6 s3: the answer folded for this human-backed agent node.
     ///
-    /// `expect(dead_code)` rather than `allow`, and deliberately: the fold lands one task
-    /// ahead of its only non-test consumer (`run_human_agent`, SP-6 s3 Task 4), and an
-    /// `expect` that is no longer needed is itself a `-D warnings` failure. So this
-    /// attribute deletes itself the moment the branch starts reading the answer, instead
-    /// of silently outliving its reason the way a stale `allow` would.
-    ///
-    /// It is gated on `not(test)` because the fold test in `executor::support` DOES call
-    /// this today: an ungated `expect` is unfulfilled in the lib-test target (the method
-    /// is live there) and so fails `clippy --all-targets -D warnings` from the other
-    /// side. Only the plain-lib target has no caller yet.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "SP-6 s3 Task 4's run_human_agent is the consumer; the fold lands first"
-        )
-    )]
+    /// Task 3 carried an `expect(dead_code)` here because the fold landed one task ahead
+    /// of its only non-test consumer. Task 4 shipped that consumer — `run_human_agent`
+    /// (`executor/human.rs`) reads this to complete the node — so the attribute is gone,
+    /// exactly as its own doc said it would be: an `expect` that is no longer needed is
+    /// itself a `-D warnings` failure, which is what made it delete itself rather than
+    /// silently outlive its reason the way a stale `allow` would.
     fn agent_answer_for(&self, node: &NodeId) -> Option<&AgentAnswer> {
         self.agent_answers.get(node)
     }
@@ -1207,6 +1197,10 @@ impl Executor {
                         &context,
                         fold,
                         phase.as_deref(),
+                        // The ONE `true` in the codebase: this is the graph's own
+                        // `NodeKind::Agent`, the only site where SP-6 s3's human-backed
+                        // role is legal.
+                        true,
                     )
                     .await?
                 {
