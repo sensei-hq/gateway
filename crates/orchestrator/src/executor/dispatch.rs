@@ -269,9 +269,14 @@ impl Executor {
 /// [`RESERVED_SELECT_ID`](orchestrator_core::RESERVED_SELECT_ID) path rather than the
 /// Expand node's own id, so it lands on the durable ledger without colliding with the
 /// node's effects. That matters beyond tidiness: `PlannerSelected` memoizes the CHOICE,
-/// so a resumed run never re-invokes the selector — without a journaled
-/// `EffectRecorded` the tokens it really spent would vanish from the fold on every
-/// subsequent resume and the run would drift permanently under its true spend.
+/// so a resumed run that got that far never re-invokes the selector — without a
+/// journaled `EffectRecorded` the tokens it really spent would vanish from the fold on
+/// every subsequent resume and the run would drift permanently under its true spend.
+///
+/// That record is also this dispatch's MEMO: `PlannerSelected` is journaled only after
+/// `select()` returns, so a run that failed before it re-enters the `Select` arm on its
+/// next drive, and [`complete`](orchestrator_core::ModelDispatch::complete) replays the
+/// recorded text rather than paying for the call again.
 pub(super) struct SelectorDispatch<'a> {
     exec: &'a Executor,
     run: RunId,
@@ -316,6 +321,43 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
         chain: Option<&str>,
     ) -> Result<String, OrchestratorError> {
         let chain = chain.unwrap_or_default();
+
+        // The same memo check the other four producers make, and for the same reason.
+        // `PlannerSelected` fences a re-invocation only AFTER the selector returns, so
+        // every window that ends before it — the anti-hallucination reject, a gateway
+        // error, a crash between this `EffectRecorded` and that `PlannerSelected` —
+        // leaves a run that re-enters the `Select` arm on its next drive. Such a run is
+        // re-driven in production: a failed node withholds `RunCompleted` so the run
+        // stays resumable, and `Scheduler::record` ranks `paused` ahead of `failed`.
+        // Without this lookup each wake was a fresh BILLED call whose `EffectRecorded`
+        // overwrote the last at the same effect id (`fold_journal` keys `usage`, it does
+        // not sum), so the durable ledger froze at one call's tokens while the run spent
+        // without bound and the cap could never fire.
+        let path = self.select_path();
+        let eid = orchestrator_core::effect_id(&path, 0, 0);
+        let ih = super::support::input_hash(
+            chain,
+            &serde_json::json!({ "system": system, "user": user }),
+        )?;
+        if let Some((recorded_ih, output)) = self.fold.memo.get(&eid) {
+            if recorded_ih != &ih {
+                return Err(OrchestratorError::DeterminismViolation {
+                    node: NodeId(path),
+                    effect_id: eid,
+                });
+            }
+            // Replay the recorded (already redacted) text: no gateway call, no new
+            // journal event, nothing charged to the meter.
+            return Ok(self
+                .exec
+                .materialize(output)
+                .await?
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string());
+        }
+
         // Built here rather than via `build_request`, which hardcodes `system: None`;
         // the selector's instruction ("answer with ONLY the exact agent name") is a
         // system prompt and dropping it would change what the model returns.
@@ -373,20 +415,15 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             .unwrap_or_default()
             .to_string();
 
-        let path = self.select_path();
         let recorded = self.exec.split_output(&output).await?;
         self.exec
             .append(
                 self.run,
                 JournalEvent::EffectRecorded {
-                    node: NodeId(path.clone()),
-                    effect_id: orchestrator_core::effect_id(&path, 0, 0),
+                    node: NodeId(path),
+                    effect_id: eid,
                     class: orchestrator_core::EffectClass::Pure,
-                    input_hash: super::support::input_hash(
-                        chain,
-                        &serde_json::json!({ "system": system, "user": user }),
-                    )
-                    .map_err(|e| OrchestratorError::Gateway(e.to_string()))?,
+                    input_hash: ih,
                     seq: 0,
                     output: recorded,
                     observation: None,
