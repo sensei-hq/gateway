@@ -264,14 +264,31 @@ pub enum JournalEvent {
     },
     /// SP-6 s3: a human-backed `Agent` node has begun asking, carrying the QUESTION.
     ///
-    /// The prompt is journaled rather than recomposed for the same reason s2 journals
-    /// the menu on [`GateAwaited`]: an operator must see what is being asked without
-    /// reading the graph AND the registry, and fixing the question at ask time is what
-    /// lets a late answer still be honoured against the question it was actually given.
-    /// (Nothing binds a later drive's registry to the one that composed this prompt: a
-    /// `config push` changes an agent's `system_prompt` and skills underneath a paused
-    /// run, so recomposing on resume would show a second human a *different* question
-    /// from the one the first was shown.)
+    /// The prompt is journaled rather than recomposed, for two of the three reasons s2
+    /// journals the menu on [`JournalEvent::GateAwaited`] — but NOT for its third, which
+    /// does not transfer and must not be repeated here.
+    ///
+    /// It DOES transfer that an operator must be able to read the question off the
+    /// journal alone. Recomposing it needs `assemble_prompt` (`orchestrator`), which
+    /// takes a resolved `Registry` AND the run's already-materialized dependency
+    /// outputs for its `## Context` section; `torii`'s read path has neither — the light
+    /// boot tier carries a `PostgresConfigSource` (raw config rows, for `config diff`)
+    /// and a journal, not a `Registry`, a blackboard, or the executor. And it DOES
+    /// transfer that fixing the question at ask time is what lets a late answer be
+    /// honoured against the question actually given.
+    ///
+    /// What does NOT transfer is s2's drift argument. s2 journals the menu because
+    /// nothing fences the GRAPH between drives. The REGISTRY is fenced: the SP-DATA-2
+    /// config-version fence pins `{version}#cfg{generation}` on `RunStarted`, so a
+    /// `config push` that changes an agent's `system_prompt` or skills bumps the
+    /// generation and the paused run's next drive is REFUSED with
+    /// `VersionFenceMismatch` — it never resumes at all, let alone with a recomposed
+    /// question (`Executor::pinned` + the fence in `start_inner`; proven by
+    /// `reload_bumps_the_run_version_and_fences_in_flight_resume`, and it is why
+    /// SP-DATA-4's review found that a `config push` terminally strands every paused
+    /// run). Claiming a silent re-ask here would invert that: the failure mode config
+    /// drift actually produces is loud refusal, not a second human seeing a different
+    /// question.
     ///
     /// It carries the SYSTEM prompt `assemble_prompt` builds — the agent's
     /// `system_prompt`, plus each activated skill's body, plus the rendered `## Context`
@@ -297,9 +314,21 @@ pub enum JournalEvent {
     /// `output["text"]`, and a dependent's `## Context` section renders the output as-is.
     ///
     /// `actor` is ATTRIBUTION, NOT AUTHENTICATION — it is whatever string the caller
-    /// supplied — and it matters more here than on [`GateDecided`]: a gate's actor is an
-    /// audit trail, whereas this one is recorded alongside text that lands in the node's
-    /// OUTPUT and so flows on into downstream model prompts.
+    /// supplied — and it matters more here than on [`JournalEvent::GateDecided`]: a
+    /// gate's actor is an audit trail, whereas this one is recorded alongside text that
+    /// lands in the node's OUTPUT and so flows on into downstream model prompts.
+    ///
+    /// **`actor` is part of the node's OUTPUT, not journal-only attribution.** The
+    /// completed node yields `{"text", "actor"}` (design §4 / AC2) — a SECOND canonical
+    /// Agent-node shape alongside the model-backed `{"model", "text"}`. That is a
+    /// decision the writer of this event cannot make alone, because the executor
+    /// re-projects Agent outputs on the terminal-resume path
+    /// (`project_agent_outputs`, `orchestrator::executor::support`), and its original
+    /// rewrite-everything-to-`{model, text}` rule would have dropped the `actor` and
+    /// invented `model: null` — but only on that ONE path, so the same finished run
+    /// would report a different output depending on when it was read. That function now
+    /// passes an output carrying an `actor` through untouched. A writer changing this
+    /// event's field set must keep the two in step.
     AgentAnswered {
         node: NodeId,
         text: String,
@@ -711,5 +740,71 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// No doc comment in this file may link a `JournalEvent` variant by its BARE name.
+    ///
+    /// An enum variant is not in scope as a bare rustdoc path, so a link whose whole
+    /// target is `GateAwaited` does not resolve: rustdoc emits `unresolved link` and
+    /// renders the text verbatim, so the reader silently loses the cross-reference.
+    /// (This doc deliberately never writes that broken form out — the scan below is
+    /// textual and cannot tell a specimen from an offender.) The variants are
+    /// this crate's most-linked items — every new event's doc points at the one it was
+    /// modelled on — which is exactly why this keeps happening: SP-6 s3 Task 2 added
+    /// two (`GateAwaited`, `GateDecided`) and took this crate from 5 rustdoc warnings
+    /// to 7 before review caught it. `cargo doc`'s warnings are not part of
+    /// `cargo test`, so nothing but a guard like this one fails on them.
+    ///
+    /// The fix at every site is the qualified form `[`JournalEvent::GateAwaited`]`,
+    /// which resolves. This test reads the enum's own source for the variant list
+    /// rather than hard-coding it, so a variant added later is covered on arrival.
+    #[test]
+    fn no_doc_comment_links_a_journal_event_variant_by_its_bare_name() {
+        let src = include_str!("journal.rs");
+
+        // Variant names: the 4-space-indented `Name {` / `Name,` lines inside the
+        // `pub enum JournalEvent { .. }` block, which ends at the first column-0 `}`.
+        let variants: Vec<&str> = src
+            .lines()
+            .skip_while(|l| !l.starts_with("pub enum JournalEvent {"))
+            .skip(1)
+            .take_while(|l| !l.starts_with('}'))
+            .filter_map(|l| {
+                let name = l.strip_prefix("    ")?;
+                let name = name.strip_suffix(" {").or_else(|| name.strip_suffix(','))?;
+                name.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+                    .then_some(name)
+                    .filter(|n| n.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            })
+            .collect();
+        assert!(
+            variants.len() > 10 && variants.contains(&"GateAwaited"),
+            "variant scrape broke — it found {variants:?}, so the guard below would \
+             pass vacuously"
+        );
+
+        // Every ``[`target`]`` NOT followed by `(` — i.e. a link with no explicit
+        // path, which must therefore resolve `target` on its own.
+        let mut offenders: Vec<(usize, &str)> = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let mut rest = line;
+            while let Some(open) = rest.find("[`") {
+                let after = &rest[open + 2..];
+                let Some(close) = after.find("`]") else { break };
+                let target = &after[..close];
+                let tail = &after[close + 2..];
+                if !tail.starts_with('(') && variants.contains(&target) {
+                    offenders.push((i + 1, target));
+                }
+                rest = tail;
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "bare-name links to JournalEvent variants do not resolve; qualify them as \
+             [`JournalEvent::<Variant>`]: {offenders:?}"
+        );
     }
 }

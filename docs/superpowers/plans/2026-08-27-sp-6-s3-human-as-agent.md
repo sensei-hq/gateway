@@ -762,6 +762,13 @@ impl Executor {
         // run and a replayed run disagree about this node's output, surfacing later as a
         // false `DeterminismViolation`; that defect has shipped and been caught twice
         // here.
+        // The `{text, actor}` shape here is the one `project_agent_outputs`
+        // (`executor/support.rs`) already passes through untouched — it exempts any
+        // Agent output carrying an `actor`. Do NOT change these key names without
+        // changing that exemption: the projection runs ONLY on the terminal-resume
+        // path, so a mismatch is invisible on this drive and makes the finished run
+        // report `{model: null, text}` when read back later (Task 2's review caught
+        // this before the drive path existed; see the `AgentAnswered` doc).
         if let Some(answer) = fold.agent_answer_for(node_id) {
             let output = self.redact(&serde_json::json!({
                 "text": answer.text,
