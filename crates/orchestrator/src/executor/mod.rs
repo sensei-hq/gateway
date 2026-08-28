@@ -393,18 +393,20 @@ impl Fold {
         self.agent_answers.get(node)
     }
 
-    /// SP-6 s3: the question this node published when it began asking. `None` = it has
-    /// not asked yet — the trigger for `run_human_agent` to journal `AgentAwaited`
-    /// FIRST, before reading any answer, so an answer without a question never arises.
+    /// SP-6 s3: the question THIS node published when it began asking.
     ///
-    /// See [`Fold::agent_answer_for`] for why this is `expect(dead_code)` and not `allow`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "SP-6 s3 Task 4's run_human_agent is the consumer; the fold lands first"
-        )
-    )]
+    /// The node-keyed counterpart to [`Fold::deadline_for`], and the distinction is the
+    /// whole point: `deadline_for` answers "has SOME waiting kind begun here?" — all three
+    /// of `SignalAwaited`/`GateAwaited`/`AgentAwaited` write that map — whereas this
+    /// answers "did the HUMAN-BACKED AGENT kind begin here?", because only `AgentAwaited`
+    /// carries a prompt.
+    ///
+    /// `run_human_agent` reads it on the already-waiting path for exactly that reason. The
+    /// whole-slice review found the accessor unused in non-test builds and carrying an
+    /// `expect(dead_code)` — and the defect that predicted: a node whose id already bore a
+    /// `SignalAwaited` never took the `NotYetAsking` arm, so it published no question and
+    /// paused forever, unanswerable by every `torii` verb. `menu_for` is the same accessor
+    /// for `HumanGate`, read on the same arm for the same reason.
     fn prompt_for(&self, node: &NodeId) -> Option<&str> {
         self.agent_prompts.get(node).map(String::as_str)
     }
