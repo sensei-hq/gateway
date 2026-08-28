@@ -98,7 +98,7 @@ mod tests {
     use super::*;
     use orchestrator_core::EffectClass;
     use orchestrator_core::{
-        Activation, AgentDefinition, Permissions, Registry, SkillDef, ToolSpec,
+        Activation, AgentBacking, AgentDefinition, Permissions, Registry, SkillDef, ToolSpec,
     };
 
     fn registry() -> (Registry, AgentDefinition) {
@@ -112,6 +112,7 @@ mod tests {
             tools: vec!["calc".into()],
             skills: vec!["concise".into(), "cite".into()],
             system_prompt: "BODY".into(),
+            backed_by: AgentBacking::Model,
         };
         let reg = Registry::default()
             .with_agent(agent.clone())

@@ -13,6 +13,26 @@ use crate::error::OrchestratorError;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AgentRef(pub String);
 
+/// What answers an agent: a model, or a person.
+///
+/// SP-6 s3. `Model` is the serde default, so every existing `AgentDefinition`,
+/// every `config_agents` jsonb row and every registry fixture deserializes
+/// unchanged — the same additivity discipline s1 and s2 used for their journal
+/// events.
+///
+/// The timeout lives HERE rather than on `NodeKind::Agent` so the role and its SLA
+/// travel together ("legal-reviewer always has 48h") and the graph never changes —
+/// which is what makes a human-backed role substitutable at the `AgentRef`. The
+/// cost, stated: one SLA per role, not per use site.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum AgentBacking {
+    #[default]
+    Model,
+    Human {
+        timeout: Option<chrono::Duration>,
+    },
+}
+
 /// An agent: role→chain, its skills/tools (by name), and its system-prompt body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDefinition {
@@ -33,6 +53,10 @@ pub struct AgentDefinition {
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub system_prompt: String,
+    /// SP-6 s3: who answers. `#[serde(default)]` ⇒ absent means `Model`, so no
+    /// existing config changes.
+    #[serde(default)]
+    pub backed_by: AgentBacking,
 }
 
 /// A skill: an injectable instruction module composed into a prompt by name.
@@ -465,10 +489,65 @@ impl Registry {
                     });
                 }
             }
-            if agent.chain.is_none() && self.chain_binding(&agent.area, &agent.kind).is_none() {
+            let human = matches!(agent.backed_by, AgentBacking::Human { .. });
+
+            // SP-6 s3: a human-backed role resolves NO chain by construction, so the
+            // chain-resolvability rule must not apply to it. This check runs at config
+            // LOAD time, independent of `drive_agent`'s runtime short-circuit, so leaving
+            // it unconditional would reject essentially every human-backed agent before
+            // any node ever executed. Forcing an author to supply a dummy binding that is
+            // never used would be a lie in the config.
+            if !human
+                && agent.chain.is_none()
+                && self.chain_binding(&agent.area, &agent.kind).is_none()
+            {
                 return Err(OrchestratorError::UnknownChainRef {
                     agent: agent.name.clone(),
                 });
+            }
+
+            if human {
+                // The ReAct loop that would use these never runs, so a grant here grants
+                // nothing — the confused-deputy shape SP-4 s1 argues against. Reject the
+                // config rather than silently ignore the declaration.
+                if !agent.tools.is_empty() {
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {:?} is human-backed and may not declare tools ({:?}); a \
+                         human-backed agent answers once and never runs the tool loop",
+                        agent.name, agent.tools
+                    )));
+                }
+                // The prompt IS the question put to the human.
+                if agent.system_prompt.trim().is_empty() {
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {:?} is human-backed and has an empty system_prompt; the \
+                         prompt is the question, so an empty one asks the human nothing",
+                        agent.name
+                    )));
+                }
+                // `MAX_AWAIT_SIGNAL_TIMEOUT` bounds the sibling waiting kinds in
+                // `Graph::validate_dag`, which is pure over the graph and never sees the
+                // registry — so the same bound is applied here. Without it the overflow is
+                // caught only at runtime by `wait_or_expire`'s `checked_add_signed` (which
+                // fails the node rather than panicking, so it degrades safely), but both
+                // sibling slices treated the up-front bound as worth naming.
+                if let AgentBacking::Human { timeout: Some(t) } = &agent.backed_by {
+                    if *t <= chrono::Duration::zero() {
+                        return Err(OrchestratorError::RegistryLoad(format!(
+                            "agent {:?} has a non-positive timeout ({t}); use `None` to \
+                             wait indefinitely",
+                            agent.name
+                        )));
+                    }
+                    if *t > crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT {
+                        return Err(OrchestratorError::RegistryLoad(format!(
+                            "agent {:?} has a timeout ({t}) that is too long; the maximum \
+                             is {}; use `None` to wait indefinitely",
+                            agent.name,
+                            crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -665,6 +744,9 @@ impl AgentDefinition {
             tools: optional_list(&f, "tools"),
             skills: optional_list(&f, "skills"),
             system_prompt: body.to_string(),
+            // The md+frontmatter loader is model-only; a human-backed role has no
+            // frontmatter surface yet (SP-6 s3 adds the type, not this loader).
+            backed_by: AgentBacking::Model,
         })
     }
 }
@@ -933,6 +1015,7 @@ mod tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "SYS".into(),
+            backed_by: AgentBacking::Model,
         }
     }
 
@@ -1501,6 +1584,7 @@ mod tests {
                 tools: vec!["missing".into()],
                 skills: vec![],
                 system_prompt: "s".into(),
+                backed_by: AgentBacking::Model,
             }],
             skills: vec![],
             tools: vec![],
@@ -1673,5 +1757,94 @@ mod tests {
             matches!(err, Err(OrchestratorError::RegistryLoad(_))),
             "a failing source must yield Err, never a half-built handle"
         );
+    }
+
+    fn human_agent(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_string(),
+            area: "review".into(),
+            kind: "human".into(),
+            chain: None,
+            chains: HashMap::new(),
+            grants: HashMap::new(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "Does this contract permit sub-processing?".into(),
+            backed_by: AgentBacking::Human { timeout: None },
+        }
+    }
+
+    fn registry_of(agents: Vec<AgentDefinition>) -> Registry {
+        let mut r = Registry::default();
+        for a in agents {
+            r.agents.insert(a.name.clone(), a);
+        }
+        r
+    }
+
+    /// A human-backed role has NO chain by construction, so `validate`'s
+    /// chain-resolvability rule must not apply to it. That rule runs at config-LOAD
+    /// time, independent of the executor's runtime short-circuit, so leaving it
+    /// unconditional would reject essentially every human-backed agent before any
+    /// node ever ran.
+    #[test]
+    fn a_human_backed_agent_needs_no_chain() {
+        registry_of(vec![human_agent("reviewer")])
+            .validate()
+            .expect("a human-backed agent resolves no chain and must not need one");
+    }
+
+    /// A model-backed agent still does — the skip is narrow, not a hole.
+    #[test]
+    fn a_model_backed_agent_still_needs_a_chain() {
+        let mut a = human_agent("modelled");
+        a.backed_by = AgentBacking::Model;
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("no chain, no binding");
+        assert!(format!("{e}").contains("modelled"), "{e}");
+    }
+
+    /// Tools on a human-backed agent are never consulted — the loop that would use
+    /// them never runs. A grant that grants nothing is the confused-deputy shape
+    /// SP-4 s1 argues against, so reject the config rather than ignore it.
+    #[test]
+    fn a_human_backed_agent_may_not_declare_tools() {
+        let mut a = human_agent("reviewer");
+        a.tools = vec!["fs_read".into()];
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("tools on a human agent");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(m.contains("tool"), "must name the rule: {m}");
+    }
+
+    /// The prompt IS the question. An empty one asks a human nothing.
+    #[test]
+    fn a_human_backed_agent_needs_a_system_prompt() {
+        let mut a = human_agent("reviewer");
+        a.system_prompt = String::new();
+        let e = registry_of(vec![a]).validate().expect_err("empty prompt");
+        assert!(format!("{e}").contains("reviewer"), "{e}");
+    }
+
+    /// `MAX_AWAIT_SIGNAL_TIMEOUT` bounds the sibling kinds in `Graph::validate_dag`,
+    /// which is pure over the graph and never sees the registry — so the same bound
+    /// has to be applied here instead.
+    #[test]
+    fn a_human_backed_timeout_obeys_the_century_bound() {
+        let ok = |t| {
+            let mut a = human_agent("reviewer");
+            a.backed_by = AgentBacking::Human { timeout: Some(t) };
+            registry_of(vec![a]).validate()
+        };
+        ok(chrono::Duration::hours(48)).expect("48h SLA");
+        ok(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT).expect("exactly the bound");
+        let e = ok(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT + chrono::Duration::days(1))
+            .expect_err("over the bound");
+        assert!(format!("{e}").contains("reviewer"), "{e}");
+        let e = ok(chrono::Duration::zero()).expect_err("non-positive");
+        assert!(format!("{e}").contains("reviewer"), "{e}");
     }
 }

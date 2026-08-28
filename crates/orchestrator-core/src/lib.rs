@@ -44,7 +44,7 @@ pub use planner::{PLANNER_AREA, Planner, PlannerSelector, RulePlannerSelector};
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use redact::{PatternRedactor, Redactor};
 pub use registry::{
-    Activation, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions,
-    Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef, ToolSpec,
+    Activation, AgentBacking, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy,
+    Permissions, Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef, ToolSpec,
 };
 pub use scheduler::{RunStatus, ScheduledRun, SchedulerStore};
