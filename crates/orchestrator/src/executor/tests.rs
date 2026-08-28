@@ -14472,6 +14472,92 @@ mod await_signal {
             );
         }
     }
+
+    /// An `AwaitSignal` node whose id already recorded a wait but published NO
+    /// `SignalAwaited` of its own — the third direction of the kind-swap hole, and the one
+    /// s3 left open while closing the other two.
+    ///
+    /// `Fold::deadlines` is written by all THREE waiting kinds, so an `AgentAwaited` (or a
+    /// `GateAwaited`) makes `deadline_for` return `Some(_)` for a node the graph now
+    /// declares as an `AwaitSignal`. Without a guard `wait_or_expire` reports `Waiting` and
+    /// the node pauses with `resume_after: None` — SP-DATA-3's never-auto-woken class — on
+    /// every drive, forever.
+    ///
+    /// It is UNANSWERABLE in that state, and s3 is what made it so: `cmd::run::signal` now
+    /// refuses any node with a journaled `AgentAwaited` and points at `run agent answer`,
+    /// while `run agent answer` is journal-only and happily appends `AgentAnswered` and
+    /// reports exit 0 — an event `run_await_signal` never reads. Every operator surface says
+    /// the answer landed; nothing completes.
+    ///
+    /// The mirror of `a_gate_that_recorded_a_wait_without_a_menu_fails_loudly` and
+    /// `an_agent_node_that_recorded_a_wait_without_a_question_fails_loudly`. Same wording,
+    /// same reachability (`Executor::start` takes the graph as an unfenced caller parameter),
+    /// same remedy: fail loudly rather than wait forever.
+    #[tokio::test]
+    async fn a_signal_node_that_recorded_a_wait_without_a_signal_ask_fails_loudly() {
+        let (gw, _c) = recording_gateway().await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        // As if this node had begun waiting as a human-backed `Agent` before the graph was
+        // edited to make it an `AwaitSignal`: a recorded wait, no `SignalAwaited`.
+        seed(
+            &journal,
+            run,
+            vec![
+                JournalEvent::AgentAwaited {
+                    node: gate(),
+                    deadline: None,
+                    prompt: "Approve the release?".into(),
+                },
+                JournalEvent::AgentAnswered {
+                    node: gate(),
+                    text: "yes".into(),
+                    actor: "alice".into(),
+                },
+            ],
+        )
+        .await;
+
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_clock(FakeClock::new(at(1_000_000)));
+        let out = ex.start(run, &await_graph(None)).await.expect("drives");
+
+        let (node, message) = out
+            .failed
+            .clone()
+            .expect("a recorded wait with no signal ask must fail, not pause forever: {out:?}");
+        assert_eq!(node, gate(), "the failure is the swapped node: {out:?}");
+        assert!(
+            message.contains("gate") && message.contains("began waiting"),
+            "the failure names the node and what is missing, so an operator is not sent to \
+             check a node id that was right: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "and it does NOT pause — a pause here is unanswerable by every verb torii has, \
+             because `run signal` refuses the node and `run agent answer` writes an event \
+             this kind never reads: {out:?}"
+        );
+
+        // Nothing was asked by THIS kind, so nothing may be recorded as if it had been: a
+        // `SignalAwaited` journaled here would be folded first-wins against a deadline the
+        // OTHER kind recorded, leaving two contradictory durable claims.
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            awaited_deadlines(&events).is_empty(),
+            "it never asked as an AwaitSignal: {:?}",
+            awaited_deadlines(&events)
+        );
+
+        // A dead node's verdict is READ BACK, never re-derived.
+        ex.start(run, &await_graph(None)).await.expect("re-drives");
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            gate_failures(&events),
+            1,
+            "the failure is read back from the fold, not re-derived on every wake"
+        );
+    }
 }
 
 // ======================= SP-6 s2 shared waiting machinery (Task 3) ======================

@@ -244,6 +244,7 @@ impl Executor {
     /// | failure recorded | `Failed` — the expiry is READ back, never re-derived |
     /// | signal present | `Completed(payload)` — never re-asks |
     /// | no signal, nothing recorded | journal `SignalAwaited`, pause on `deadline` |
+    /// | a wait recorded by ANOTHER kind, so no `SignalAwaited` | `NodeFailed` — the kind swap |
     /// | no signal, deadline recorded, `now >= deadline` | `NodeFailed` — the timeout, loudly |
     /// | no signal, deadline recorded, `now < deadline` | re-pause on the **same** deadline |
     /// | no signal, `None` recorded (indefinite gate) | re-pause, journaling nothing further |
@@ -358,6 +359,59 @@ impl Executor {
             //    exactly the footgun this codebase's fail-closed stance argues against.
             Ok(WaitState::Expired(d)) => {
                 let message = format!("await_signal: no signal for node {} by {d}", node.id.0);
+                self.append(
+                    run,
+                    JournalEvent::NodeFailed {
+                        node: node.id.clone(),
+                        error: message.clone(),
+                    },
+                )
+                .await?;
+                return Ok(NodeExec::Failed {
+                    message,
+                    output: None,
+                });
+            }
+            // Already waiting by the SHARED map's reckoning — but did THIS kind begin
+            // waiting here?
+            //
+            // `Fold::deadlines` is written by all three waiting kinds while only
+            // `SignalAwaited` records membership in `signal_asks`, so this arm is reachable
+            // exactly the way `run_human_gate`'s missing-menu arm and `run_human_agent`'s
+            // missing-question arm are: by editing a live run's graph to change a waiting
+            // node's KIND (`Executor::start` takes the graph as an unfenced caller
+            // parameter, and `scheduled_runs.graph` is an editable row). s2 and s3 each
+            // shipped their side of that guard; this side was left open, and it is the one
+            // whose failure mode is SILENT.
+            //
+            // **Loud, because the alternative is unanswerable.** Without this arm the node
+            // took the `Waiting` path with the other kind's deadline — `None` for an
+            // indefinite human gate or agent, which is SP-DATA-3's never-auto-woken class —
+            // and re-paused forever. It cannot be rescued by any verb: since s3
+            // `cmd::run::signal` REFUSES a node carrying an `AgentAwaited` and points the
+            // operator at `run agent answer`, which is journal-only, appends `AgentAnswered`
+            // and reports exit 0 — an event `run_await_signal` never reads. Every operator
+            // surface says the answer landed; nothing ever completes. Only `run cancel`
+            // moves it.
+            //
+            // Journaling a `SignalAwaited` here instead was the other candidate and is the
+            // same bad trade `run_human_agent` records: `deadlines` folds first-wins, so the
+            // ask would be published against a deadline another kind chose, and the run
+            // would carry two contradictory durable claims about what it is waiting for.
+            //
+            // The `Expired` arm above needs no such check: it already fails loudly and
+            // terminally, so a swapped node there is dead rather than stuck. And the answer
+            // read at step 1 deliberately stays AHEAD of this — a node that has a payload is
+            // not unanswerable, and moving it would break §6.3's early-signal race (a signal
+            // folded before the node ever ran completes on the spot, journaling nothing).
+            Ok(WaitState::Waiting(_)) if !fold.has_signal_ask(&node.id) => {
+                let message = format!(
+                    "await_signal: node {} recorded that it began waiting but published no \
+                     SignalAwaited, so this run is waiting on a different node kind's record \
+                     and no signal delivered here can ever be read. A waiting node's kind \
+                     cannot be changed mid-run; fail the run and start a new one.",
+                    node.id.0
+                );
                 self.append(
                     run,
                     JournalEvent::NodeFailed {
