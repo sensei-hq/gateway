@@ -163,8 +163,14 @@ struct Fold {
     /// one for the same node.
     signals: HashMap<NodeId, serde_json::Value>,
     /// SP-6 s1: what each WAITING node recorded when it began waiting, folded from
-    /// `SignalAwaited` and — since SP-6 s2 — from `GateAwaited` too, so that "has this node
-    /// begun asking?" has ONE answer for both kinds.
+    /// `SignalAwaited` and — since SP-6 s2 and s3 — from `GateAwaited` and `AgentAwaited`
+    /// too, so that "has this node begun asking?" has ONE answer for all THREE waiting
+    /// kinds. Keep this list of writers current: every one of them is an
+    /// `entry().or_insert` in `fold_journal`, and
+    /// [`wait_or_expire`](Executor::wait_or_expire) reads the map without knowing which
+    /// kind wrote it — so a reader that reasons about which kinds can be present (see
+    /// `run_human_gate`'s missing-menu arm) is reasoning off THIS sentence.
+    ///
     /// FIRST record wins — the opposite of `signals`, and deliberately
     /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
     /// deadline forward, and a run force-woken every ten minutes with a one-hour timeout
@@ -172,12 +178,16 @@ struct Fold {
     ///
     /// The VALUE is itself an `Option`, so the two layers mean different things:
     /// *key absent* = this node has never begun waiting; `Some(None)` = it began waiting
-    /// with **no deadline** (the indefinite HITL gate). Folding that `None` as a real
-    /// value — rather than dropping it — is what makes the deadline-less arm of
+    /// with **no deadline** — the indefinite HITL gate, and since s3 also the indefinite
+    /// human agent (`AgentBacking::Human { timeout: None }`). Folding that `None` as a
+    /// real value — rather than dropping it — is what makes the deadline-less arm of
     /// [`run_await_signal`](Executor::run_await_signal) node-keyed idempotent: without it
     /// the node re-journals `SignalAwaited` on every drive, and a re-drive is NOT
     /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
-    /// keeps the whole run auto-wakeable).
+    /// keeps the whole run auto-wakeable). The same holds for the s2 and s3 kinds, which
+    /// re-journal `GateAwaited`/`AgentAwaited` respectively — see
+    /// `a_deadline_less_gate_records_that_it_began_asking` and
+    /// `a_deadline_less_human_agent_records_that_it_began_asking`.
     deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
     /// SP-6 s2: each `HumanGate`'s decision, folded from `GateDecided`. LAST wins, like
     /// `signals` and for the same reason: an operator must be able to correct a mistaken
@@ -188,7 +198,7 @@ struct Fold {
     /// not retroactively change what their answer meant.
     ///
     /// `deadlines` is folded from `GateAwaited` too, so the "has this node begun asking?"
-    /// question stays in one place for both waiting kinds.
+    /// question stays in one place — as of s3 for all three waiting kinds, not two.
     menus: HashMap<NodeId, Vec<orchestrator_core::GateOption>>,
     /// SP-6 s3: each human-backed agent node's answer, from `AgentAnswered`. LAST wins,
     /// like `signals`/`gate_decisions` and for the same reason: an operator must be able
@@ -321,14 +331,19 @@ impl Fold {
     /// SP-6 s1: what a waiting node recorded when it began waiting.
     ///
     /// Two layers, and they are not the same question:
-    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited`/`GateAwaited`).
-    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate).
+    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited`/`GateAwaited`/
+    ///   `AgentAwaited` — the three writers of [`Fold::deadlines`], all of them).
+    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate, or
+    ///   since s3 the indefinite human agent).
     /// - `Some(Some(t))` — it began waiting with the absolute deadline `t`.
     ///
     /// Read through [`wait_or_expire`](Executor::wait_or_expire) — SP-6 s2's shared arm,
-    /// called on EVERY execution by BOTH `run_await_signal` and `run_human_gate`. It is the
-    /// durable half of the never-recompute rule; the caller must not fall back to
-    /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
+    /// called on EVERY execution by BOTH `run_await_signal` and `run_human_gate`. (s3's
+    /// `AgentAwaited` is already a WRITER as of this task; its reader, `run_human_agent`,
+    /// lands in the next one — the fold deliberately goes in first so the durable record
+    /// exists before anything reads it.) It is the durable half of the never-recompute
+    /// rule; the caller must not fall back to `now + timeout` when this returns `Some`, in
+    /// EITHER of its two inner shapes.
     fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         self.deadlines.get(node).copied()
     }

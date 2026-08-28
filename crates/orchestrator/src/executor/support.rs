@@ -250,7 +250,17 @@ pub(crate) fn fold_journal(
             //
             // FIRST wins for BOTH the deadline and the prompt (`entry().or_insert`).
             // The deadline goes into the SHARED map because `wait_or_expire` reads
-            // `deadline_for` and knows nothing about which kind recorded it.
+            // `deadline_for` and knows nothing about which kind recorded it. That makes
+            // this the THIRD writer of `Fold::deadlines` (after `SignalAwaited` and
+            // `GateAwaited`); when a fourth is added, update the writer lists on
+            // `Fold::deadlines`, `Fold::deadline_for` and `run_human_gate`'s missing-menu
+            // arm, all of which reason from an explicit enumeration of them.
+            //
+            // `deadline` is folded THROUGH, `None` included — never `if
+            // deadline.is_some()`. The key alone answers "has this node begun asking?",
+            // and `AgentBacking::Human { timeout: None }` is a real configuration, so
+            // dropping the `None` would make an indefinite human agent re-ask on every
+            // drive (s1 shipped exactly that bug on the `SignalAwaited` arm above).
             JournalEvent::AgentAwaited {
                 node,
                 deadline,
@@ -1032,6 +1042,46 @@ mod tests {
             fold.deadline_for(&NodeId("review".into())),
             Some(Some(at(1_000))),
             "AgentAwaited folds into the SHARED deadlines map, first-wins"
+        );
+    }
+
+    /// The INDEFINITE human agent — `AgentBacking::Human { timeout: None }`, which is a
+    /// real configuration and not a hypothetical (see `AgentBacking` in
+    /// `orchestrator-core::registry`, whose `timeout` is an `Option`). Its `AgentAwaited`
+    /// carries `deadline: None`, and that `None` must be folded as a REAL value: the
+    /// map's KEY answers "has this node begun asking?", which is a different question
+    /// from "by when?".
+    ///
+    /// Guarding the exact bug s1's whole-slice review already found once on the
+    /// `SignalAwaited` arm (I1: the deadline-less arm was an empty `{}`, so the value was
+    /// dropped and the key never appeared). `wait_or_expire` keys `NotYetAsking` off the
+    /// OUTER `Option` of `deadline_for`, so dropping it would make a deadline-less human
+    /// agent look like it had never asked on EVERY drive: it would re-journal
+    /// `AgentAwaited` each time, and a re-ask is not human-bounded. s2 shipped the same
+    /// guard for `GateAwaited` (`a_deadline_less_gate_records_that_it_began_asking`); this
+    /// is its s3 twin, and it reddens under `if deadline.is_some() { … }` on the
+    /// `AgentAwaited` fold arm — a mutation the rest of the workspace does not detect.
+    #[test]
+    fn a_deadline_less_human_agent_records_that_it_began_asking() {
+        let events = vec![(
+            1,
+            JournalEvent::AgentAwaited {
+                node: NodeId("review".into()),
+                deadline: None,
+                prompt: "Ship it?".into(),
+            },
+        )];
+        let (fold, _, _) = fold_journal(&events);
+
+        assert_eq!(
+            fold.deadline_for(&NodeId("review".into())),
+            Some(None),
+            "key PRESENT with value None — began asking, with no deadline"
+        );
+        assert_eq!(
+            fold.prompt_for(&NodeId("review".into())),
+            Some("Ship it?"),
+            "the question is durable even when the SLA is not"
         );
     }
 
