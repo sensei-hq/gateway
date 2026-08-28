@@ -10,7 +10,7 @@ source: crates/orchestrator*
 
 # Execution Graph
 
-> **Status: Partial (Phase 3 · SP-1/3 · SP-6-2).** Design §10. Implemented node kinds:
+> **Status: Partial (Phase 3 · SP-1/3 · SP-6-3).** Design §10. Implemented node kinds:
 > `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`** (leaf + graph bodies +
 > gate-agent), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
 > PlanDelta / planner-driven), **`AwaitSignal`** (SP-6 s1 — the HITL primitive) and
@@ -93,8 +93,10 @@ source: crates/orchestrator*
 >   like `Subgraph`.
 > - **`AwaitSignal { timeout: Option<Duration> }`** (SP-6 s1) — the **HITL primitive**: a
 >   node that PAUSES until an external signal arrives, with an optional deadline that
->   **fails** it. `HumanGate` (s2, landed) and human-as-Agent (s3, planned) are the typed
->   wrappers over it. A
+>   **fails** it. `HumanGate` (s2, landed) and **human-as-Agent (s3, landed —
+>   `AgentBacking::Human` on an `AgentDefinition`, so a `NodeKind::Agent` whose `AgentRef`
+>   resolves to a human-backed role waits instead of calling a model; legal ONLY as a
+>   top-level `Agent` node)** are the typed wrappers over it. A
 >   three-way fold read over two node-keyed journal events (`SignalAwaited{node,deadline}`
 >   · `SignalReceived{node,payload}`, both new variants ⇒ `FORMAT_VERSION` stays 1),
 >   **preceded by a terminal check**: a folded `NodeFailed` for this node returns `Failed`

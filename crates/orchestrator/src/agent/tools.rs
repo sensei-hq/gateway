@@ -1422,7 +1422,7 @@ mod tests {
 #[cfg(test)]
 mod planner_tool_tests {
     use super::*;
-    use orchestrator_core::{AgentDefinition, Registry};
+    use orchestrator_core::{AgentBacking, AgentDefinition, Registry};
     use std::collections::HashMap;
 
     fn agent_def(name: &str) -> AgentDefinition {
@@ -1436,6 +1436,7 @@ mod planner_tool_tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "r".into(),
+            backed_by: AgentBacking::Model,
         }
     }
 

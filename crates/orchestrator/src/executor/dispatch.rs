@@ -7,10 +7,23 @@
 //! Here the failure would be worse — an ungated path spends real tokens past the
 //! operator's cap, silently.
 //!
-//! The four producers are the ReAct turn (`agent.rs`), the `ModelCall` node
-//! (`mod.rs`), a Map item and the `Consolidate` synthesis (`fanout.rs`). Their
-//! GATEWAY-ERROR handling deliberately differs (two classify the error into
-//! pause-vs-fail, two just stringify it), so the chokepoint returns
+//! The five producers are the ReAct turn (`agent.rs`), the `ModelCall` node
+//! (`mod.rs`), a Map item and the `Consolidate` synthesis (`fanout.rs`), and the
+//! planner selector (`selector.rs`, reaching this chokepoint through
+//! [`SelectorDispatch`]). The selector was the miss this module's own doc warned
+//! about: it shipped holding its own `Arc<Gateway>` and spent past the cap with no
+//! ledger entry, so it is now handed a borrowed capability instead of owning one.
+//!
+//! **A new producer owes THREE tests, not one.** The five are a census on both sides,
+//! and each side has its own per-producer guard in `tests.rs`: the budget gate
+//! (`budget_gate_stops_the_*_producer`), the redaction leaf (`*_text_is_redacted` —
+//! the SP-4 s2 review's own remedy), and the memo replay, which is what keeps a
+//! re-driven node from re-spending and what keeps the ledger honest across resumes.
+//! The selector shipped with the first and neither of the other two, and the review
+//! that caught it found exactly the defect the missing memo guard would have.
+//!
+//! Their GATEWAY-ERROR handling deliberately differs (two classify the error into
+//! pause-vs-fail, the rest just stringify it), so the chokepoint returns
 //! `Result<Result<_, Refusal>, GatewayError>`: every site's existing `Err(error)` arm
 //! is untouched and only a new `Ok(Err(refusal))` arm is added. Their REFUSAL
 //! handling, by contrast, must be identical — so [`Executor::record_refusal`] owns
@@ -137,7 +150,7 @@ pub(super) enum Refusal {
 
 /// What a journaled refusal means for the producer that hit it: a durable pause the
 /// run stays resumable from, or a node failure. The distinction lives here rather
-/// than at each site so all four producers cannot drift apart on it.
+/// than at each site so all five producers cannot drift apart on it.
 pub(super) enum RefusalKind {
     Paused(String),
     Failed(String),
@@ -249,5 +262,237 @@ impl Executor {
                 Ok(RefusalKind::Failed(error))
             }
         }
+    }
+}
+
+/// The executor's [`ModelDispatch`]: the only provider access a
+/// [`PlannerSelector`](orchestrator_core::PlannerSelector) gets.
+///
+/// Binds one `select()` to one run + Expand node so that EVERY call it makes gates on
+/// the run's budget, charges the live meter and journals its spend exactly like the
+/// other four producers. The selector supplies only the prompts; it cannot widen the
+/// capability, pick a different provider, or skip the gate.
+///
+/// The selector's spend is journaled under the reserved
+/// [`RESERVED_SELECT_ID`](orchestrator_core::RESERVED_SELECT_ID) path rather than the
+/// Expand node's own id, so it lands on the durable ledger without colliding with the
+/// node's effects. That matters beyond tidiness: `PlannerSelected` memoizes the CHOICE,
+/// so a resumed run that got that far never re-invokes the selector — without a
+/// journaled `EffectRecorded` the tokens it really spent would vanish from the fold on
+/// every subsequent resume and the run would drift permanently under its true spend.
+///
+/// That record is also this dispatch's MEMO: `PlannerSelected` is journaled only after
+/// `select()` returns, so a run that failed before it re-enters the `Select` arm on its
+/// next drive, and [`complete`](orchestrator_core::ModelDispatch::complete) replays the
+/// recorded text rather than paying for the call again.
+pub(super) struct SelectorDispatch<'a> {
+    exec: &'a Executor,
+    run: RunId,
+    /// The Expand node. The journaled effect hangs off `"{node}/__select__"`.
+    node: NodeId,
+    fold: &'a super::Fold,
+    /// A refusal this dispatch already journaled. `ModelDispatch::complete` can only
+    /// return `OrchestratorError`, which cannot carry the pause-vs-fail distinction, so
+    /// the caller reads it back here rather than re-deriving it from a message.
+    refusal: std::sync::Mutex<Option<RefusalKind>>,
+    /// An error raised by the EXECUTOR itself inside this dispatch — a memo mismatch
+    /// (`DeterminismViolation`) or an unreadable recorded output (`ContentDigestMiss`
+    /// and friends, from `materialize`). It is stashed rather than merely returned
+    /// because the return value is at the mercy of an arbitrary `PlannerSelector`: it
+    /// travels back through `select()`, whose `Err` the `Select` arm otherwise reads as
+    /// the SELECTOR's own failure (a bad pick, an empty response) and downgrades to a
+    /// soft node `Failed`. Every other producer's identical check is a hard halt; this
+    /// stash is how the `Select` arm re-raises it as one, even if the selector swallows
+    /// or rewraps the `Err`.
+    fatal: std::sync::Mutex<Option<OrchestratorError>>,
+    /// How many calls this `select()` has made — the effect id's `local_index`.
+    ///
+    /// `ModelDispatch` is lent to an arbitrary `PlannerSelector`, so "one call per
+    /// `select()`" is `LlmPlannerSelector`'s habit, not the port's contract: a
+    /// shortlist-then-choose selector is the obvious second shape. Pinned to `0`, every
+    /// call after the first collided on one journal key and `fold_journal`'s keyed
+    /// `usage.insert` kept exactly one of them — the ledger under-counted a real spend,
+    /// which is the one thing an exact cap cannot survive.
+    ///
+    /// The index is assignment-ORDERED, so it is the memo key only for a selector that
+    /// dispatches SEQUENTIALLY (as the trait's "run one metered text completion"
+    /// implies). One that dispatches concurrently can see its calls numbered
+    /// differently across drives — and then a resume reads a mismatched `input_hash`
+    /// and halts `DeterminismViolation`. Loud, and the intended outcome: a selector
+    /// whose calls have no stable order has no stable replay either.
+    calls: AtomicU64,
+}
+
+impl<'a> SelectorDispatch<'a> {
+    pub(super) fn new(exec: &'a Executor, run: RunId, node: NodeId, fold: &'a super::Fold) -> Self {
+        Self {
+            exec,
+            run,
+            node,
+            fold,
+            refusal: std::sync::Mutex::new(None),
+            fatal: std::sync::Mutex::new(None),
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    /// Take the refusal this dispatch journaled, if any. `None` means the selector's
+    /// `Err` was its own (a bad pick, an empty response), not the budget gate's.
+    pub(super) fn take_refusal(&self) -> Option<RefusalKind> {
+        self.refusal.lock().expect("selector refusal lock").take()
+    }
+
+    /// Take the executor's own fatal error, if this dispatch raised one. `Some` means
+    /// the drive must abort with it — the journal is inconsistent, so continuing would
+    /// write a `NodeFailed` into a record already proved unreliable and keep spending
+    /// against the cap on the strength of it.
+    pub(super) fn take_fatal(&self) -> Option<OrchestratorError> {
+        self.fatal.lock().expect("selector fatal lock").take()
+    }
+
+    /// Record `e` as the executor's own failure and hand the selector a surrogate to
+    /// abort on. The surrogate carries `e`'s message but not its type, because
+    /// `OrchestratorError` is not `Clone` and the typed original is the one the
+    /// `Select` arm re-raises — nothing downstream of the selector reads this copy.
+    fn fatal(&self, e: OrchestratorError) -> OrchestratorError {
+        let surrogate = OrchestratorError::Gateway(e.to_string());
+        *self.fatal.lock().expect("selector fatal lock") = Some(e);
+        surrogate
+    }
+
+    /// `"{node}/__select__"` — the reserved path the selector's spend is journaled
+    /// under, one effect per call (`effect_id(path, 0, call_index)`).
+    fn select_path(&self) -> String {
+        format!("{}/{}", self.node.0, orchestrator_core::RESERVED_SELECT_ID)
+    }
+}
+
+#[async_trait::async_trait]
+impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
+    async fn complete(
+        &self,
+        system: &str,
+        user: &str,
+        chain: Option<&str>,
+    ) -> Result<String, OrchestratorError> {
+        let chain = chain.unwrap_or_default();
+
+        // The same memo check the other four producers make, and for the same reason.
+        // `PlannerSelected` fences a re-invocation only AFTER the selector returns, so
+        // every window that ends before it — the anti-hallucination reject, a gateway
+        // error, a crash between this `EffectRecorded` and that `PlannerSelected` —
+        // leaves a run that re-enters the `Select` arm on its next drive. Such a run is
+        // re-driven in production: a failed node withholds `RunCompleted` so the run
+        // stays resumable, and `Scheduler::record` ranks `paused` ahead of `failed`.
+        // Without this lookup each wake was a fresh BILLED call whose `EffectRecorded`
+        // overwrote the last at the same effect id (`fold_journal` keys `usage`, it does
+        // not sum), so the durable ledger froze at one call's tokens while the run spent
+        // without bound and the cap could never fire.
+        let path = self.select_path();
+        let eid = orchestrator_core::effect_id(
+            &path,
+            0,
+            self.calls.fetch_add(1, Ordering::Relaxed) as usize,
+        );
+        let ih = super::support::input_hash(
+            chain,
+            &serde_json::json!({ "system": system, "user": user }),
+        )?;
+        if let Some((recorded_ih, output)) = self.fold.memo.get(&eid) {
+            if recorded_ih != &ih {
+                return Err(self.fatal(OrchestratorError::DeterminismViolation {
+                    node: NodeId(path),
+                    effect_id: eid,
+                }));
+            }
+            // Replay the recorded (already redacted) text: no gateway call, no new
+            // journal event, nothing charged to the meter. A recorded output that
+            // cannot be read back (`ContentDigestMiss`) is the executor's failure too,
+            // and just as fatal — the memo is unreliable either way.
+            let replayed = match self.exec.materialize(output).await {
+                Ok(v) => v,
+                Err(e) => return Err(self.fatal(e)),
+            };
+            return Ok(replayed
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string());
+        }
+
+        // Built here rather than via `build_request`, which hardcodes `system: None`;
+        // the selector's instruction ("answer with ONLY the exact agent name") is a
+        // system prompt and dropping it would change what the model returns.
+        let request = InferenceRequest {
+            capability: kernel::types::capability::Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some(chain.to_string()),
+            payload: kernel::types::request::Payload::Chat {
+                messages: vec![kernel::types::request::Message::text(
+                    kernel::types::request::MessageRole::User,
+                    user,
+                )],
+                system: Some(system.to_string()),
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+        };
+
+        let response = match self
+            .exec
+            .dispatch_metered(&request, &self.fold.meter())
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(refusal)) => {
+                // Already journaled by `record_refusal`; stash the kind for the caller
+                // and surface an `Err` so the selector cannot proceed to a fallback.
+                let kind = self
+                    .exec
+                    .record_refusal(self.run, &self.node, refusal)
+                    .await?;
+                let message = match &kind {
+                    RefusalKind::Paused(reason) => reason.clone(),
+                    RefusalKind::Failed(error) => error.clone(),
+                };
+                *self.refusal.lock().expect("selector refusal lock") = Some(kind);
+                return Err(OrchestratorError::Gateway(message));
+            }
+            Err(error) => return Err(OrchestratorError::Gateway(error.to_string())),
+        };
+
+        // SP-4 s2: the same redaction chokepoint every other producer's output crosses.
+        let output = self.exec.model_output(&response);
+        let text = output
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let recorded = self.exec.split_output(&output).await?;
+        self.exec
+            .append(
+                self.run,
+                JournalEvent::EffectRecorded {
+                    node: NodeId(path),
+                    effect_id: eid,
+                    class: orchestrator_core::EffectClass::Pure,
+                    input_hash: ih,
+                    seq: 0,
+                    output: recorded,
+                    observation: None,
+                    usage: response.usage.map(super::content::convert_usage),
+                },
+            )
+            .await?;
+        Ok(text)
     }
 }

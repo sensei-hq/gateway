@@ -1075,13 +1075,11 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
     use orchestrator_core::{
-        AgentDefinition, ChildStatus, CompactChild, ContentRef, ContentStore, ContextKey,
-        ContextRef, ContextStore, Digest, EffectClass, ExecutionJournal, Graph, JournalError,
-        JournalEvent, NetworkPolicy, NodeId, OrchestratorError, Permissions, RunId, RunStatus,
-        SchedulerStore, Scope, SkillDef, Snapshot, ToolSpec,
+        AgentBacking, AgentDefinition, ChildStatus, CompactChild, ContentRef, ContentStore,
+        ContextKey, ContextRef, ContextStore, Digest, EffectClass, ExecutionJournal, Graph,
+        JournalError, JournalEvent, NetworkPolicy, NodeId, OrchestratorError, Permissions, RunId,
+        RunStatus, SchedulerStore, Scope, SkillDef, Snapshot, ToolSpec,
     };
-    // For `PgConnection::connect` on the advisory-lock guards' dedicated connection.
-    use sqlx::Connection;
     use std::collections::HashMap;
 
     /// Tests require a live PG at $DATABASE_URL with the dbd schema applied (the Docker harness).
@@ -1114,15 +1112,10 @@ mod tests {
         url
     }
 
-    /// The raw lookup with no side effects, shared by `db_url()` (the announcing choke
-    /// point every test's own skip check goes through) and the advisory-lock guards below
-    /// (which need the value too but must NOT print a second SKIP line — `db_url()` stays
-    /// the single place that announces).
-    fn database_url_raw() -> Option<String> {
-        std::env::var("DATABASE_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    }
+    /// The raw lookup with no side effects lives in `test_guard` — the same one the shared
+    /// guard's advisory-lock connection uses, so a test and the lock isolating it provably
+    /// point at the SAME database. `db_url()` stays the single place that ANNOUNCES a skip.
+    use crate::test_guard::database_url_raw;
 
     /// A fresh, unique run id — every test gets its own so the shared `orchestrator.*`
     /// tables never collide across tests (belt-and-suspenders with `--test-threads=1`).
@@ -1133,117 +1126,18 @@ mod tests {
     // ---- Isolation for the tests that CANNOT scope themselves ------------------------------
     //
     // Most tests here isolate by a fresh `RunId`, so they are parallel-safe. Two groups
-    // cannot, and they are serialized with process-wide guards rather than by relying on
-    // `--test-threads=1` — correctness must not depend on how the suite is invoked, or a
-    // plain `cargo test` goes red while `-j1` stays green (a masked failure).
+    // cannot — the singleton `config_versions` row, and `scheduled_runs` claim sweeps — and
+    // they take the SHARED guard rather than relying on `--test-threads=1`: correctness must
+    // not depend on how the suite is invoked, or a plain `cargo test` goes red while `-j1`
+    // stays green (a masked failure).
     //
-    // These are `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held across the
-    // test's awaits, which trips `clippy::await_holding_lock` (denied here) and would park a
-    // worker thread of the multi-threaded test below. A bonus for this use: tokio's mutex has
-    // NO poisoning, so a panicking test simply releases the guard instead of cascading one
-    // real failure into a dozen confusing ones across its whole group.
-
-    // ---- Cross-PROCESS isolation (SP-DATA-4.1 #3) ------------------------------------------
-    //
-    // The mutexes above serialize this crate's OWN tests, but `sensei-torii` runs its DB
-    // tests against the same global `config_*` tables from a SEPARATE process, and an
-    // in-process mutex cannot serialize across processes. Not reachable through `cargo test
-    // --workspace` (cargo runs test binaries one at a time), but `cargo nextest` runs tests
-    // in separate processes IN PARALLEL and would defeat these mutexes entirely — a trap
-    // laid for whoever adopts it. Forcing two concurrent `cargo` invocations reproduced a
-    // failure roughly one round in four before this fix.
-    //
-    // Postgres session-level advisory locks close that gap: held by a CONNECTION, released
-    // on disconnect, visible across processes. Both crates' guards MUST use the same key.
-    //
-    /// Shared with `crates/torii/src/lib.rs`'s `test_guard::config_guard`. Both sites MUST
-    /// use this exact key.
-    const ADVISORY_CONFIG_TABLES: i64 = 0x5350_4441_5441_3401; // "SPDATA4" + 01
-    /// `orchestrator-store`-only today (torii never touches `scheduled_runs`), but keyed and
-    /// commented the same way in case a future torii DB test does.
-    const ADVISORY_SCHEDULED_RUNS: i64 = 0x5350_4441_5441_3402;
-
-    /// RAII: holds BOTH the in-process mutex guard and, when a database is configured, the
-    /// dedicated connection holding the cross-process advisory lock. Dropping releases
-    /// both — the connection's `Drop` closes the socket, which Postgres treats as a
-    /// disconnect and releases the session-level lock immediately, so a PANICKING test
-    /// still releases it without any explicit unlock (which wouldn't run on unwind anyway).
-    struct DbGuard {
-        _mutex: tokio::sync::MutexGuard<'static, ()>,
-        _conn: Option<sqlx::PgConnection>,
-    }
-
-    /// Open a DEDICATED connection and hold `pg_advisory_lock(key)` on it. Deliberately NOT
-    /// a connection borrowed from a pool: returning a pooled connection while the
-    /// session-level lock is still held would leak the lock to whichever caller borrows
-    /// that connection next. `None` when no database is configured — the test that follows
-    /// immediately checks `db_url()` itself and skips, so nothing here needs to run.
-    ///
-    /// Blocking `pg_advisory_lock` (not `pg_try_advisory_lock`) is correct: a test should
-    /// WAIT for its turn, not fail because another process got there first. An indefinite
-    /// block only matters if a lock is somehow orphaned, and a session-level lock requires a
-    /// LIVE connection to hold it — a crashed process's socket is reclaimed by the OS, which
-    /// Postgres notices and releases the lock. As a defensive bound anyway (e.g. a wedged
-    /// connection the OS hasn't yet reaped), the wait is capped by a `statement_timeout` on
-    /// this dedicated connection rather than left truly infinite, so a genuinely stuck case
-    /// fails loudly instead of hanging CI forever.
-    async fn acquire_advisory(key: i64) -> Option<sqlx::PgConnection> {
-        let url = database_url_raw()?;
-        let mut conn = sqlx::PgConnection::connect(&url)
-            .await
-            .expect("advisory-lock connection: DATABASE_URL is set, so this must succeed");
-        sqlx::query("set statement_timeout = '30s'")
-            .execute(&mut conn)
-            .await
-            .expect("set statement_timeout");
-        sqlx::query("select pg_advisory_lock($1)")
-            .bind(key)
-            .execute(&mut conn)
-            .await
-            .expect("pg_advisory_lock must succeed once connected");
-        Some(conn)
-    }
-
-    /// Group 1 — the `config_*` tables and the single-row `config_versions`. There is no
-    /// per-test key to scope by: `config_versions` is `id boolean PK check(id)`, i.e.
-    /// deliberately ONE row, so any test asserting a specific generation conflicts with any
-    /// concurrent config writer, and `store`/`store_and_bump` are replace-ALL.
-    static CONFIG_TABLES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// The in-process mutex is taken FIRST, before the advisory lock: same-process tests
-    /// then queue on the cheap local mutex rather than on Postgres, and this never holds a
-    /// database connection while merely waiting on that local mutex.
-    ///
-    /// Lock ORDER: no test in this crate takes both `config_guard` and `scheduler_guard`
-    /// (verified — grep for a test calling both), and torii only ever takes the
-    /// config-tables guard, so there is no path that could acquire these two advisory locks
-    /// in different orders and deadlock. If that ever changes, fix a single global order
-    /// (e.g. always config-tables before scheduled-runs) in BOTH crates.
-    async fn config_guard() -> DbGuard {
-        let mutex = CONFIG_TABLES.lock().await;
-        let conn = acquire_advisory(ADVISORY_CONFIG_TABLES).await;
-        DbGuard {
-            _mutex: mutex,
-            _conn: conn,
-        }
-    }
-
-    /// Group 2 — `scheduled_runs` claim sweeps. A fresh `RunId` is NOT enough here:
-    /// `claim_due` is an instance-wide sweep (`… limit N`), so a concurrent test's claim
-    /// steals another test's due row and the victim's `any(|x| x == r)` assertion fails.
-    /// Only tests that CLAIM need this; the enqueue/status-only tests scope fine by run id.
-    static SCHEDULED_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// See `config_guard` for why the in-process mutex comes first and why lock ordering
-    /// is a non-issue today.
-    async fn scheduler_guard() -> DbGuard {
-        let mutex = SCHEDULED_RUNS.lock().await;
-        let conn = acquire_advisory(ADVISORY_SCHEDULED_RUNS).await;
-        DbGuard {
-            _mutex: mutex,
-            _conn: conn,
-        }
-    }
+    // The implementation used to live here, privately. It now lives in
+    // `orchestrator_store::test_guard` so `sensei-torii` and `sensei-orchestrator` can take
+    // the SAME locks: an advisory lock only serializes the parties that take it, and
+    // `sensei-orchestrator` — which has no `sqlx` dependency and so could not hold a copy —
+    // took none at all. See that module's docs for the two layers, panic safety, and
+    // re-entrancy.
+    use crate::test_guard::{config_guard, scheduler_guard};
 
     fn started() -> JournalEvent {
         JournalEvent::RunStarted {
@@ -1356,6 +1250,8 @@ mod tests {
             completed: vec![NodeId("n1".into())],
             skipped: vec![],
             outputs: vec![],
+            spent: 4242,
+            budget: Some(9000),
         };
         j.snapshot(r, snap).await.unwrap();
         let got = j
@@ -1365,6 +1261,12 @@ mod tests {
             .expect("snapshot present");
         assert_eq!(got.seq, s1);
         assert_eq!(got.completed, vec![NodeId("n1".into())]);
+        // The SP-DATA-5 ledger scalars survive the jsonb round trip. A snapshot that
+        // loses them is the un-capping defect `Snapshot::spent` documents, and it would
+        // be invisible here without an explicit assertion — the struct still
+        // deserializes, just with `#[serde(default)]` zeros.
+        assert_eq!(got.spent, 4242, "spend survives the round trip");
+        assert_eq!(got.budget, Some(9000), "the cap survives the round trip");
 
         // Latest wins: a second snapshot overwrites the first.
         let snap2 = Snapshot {
@@ -1372,6 +1274,8 @@ mod tests {
             completed: vec![NodeId("n1".into()), NodeId("n2".into())],
             skipped: vec![],
             outputs: vec![],
+            spent: 0,
+            budget: None,
         };
         j.snapshot(r, snap2).await.unwrap();
         assert_eq!(j.latest_snapshot(r).await.unwrap().unwrap().seq, s2);
@@ -1727,6 +1631,7 @@ mod tests {
             tools: vec![tool_name.clone()],
             skills: vec!["concise".into()],
             system_prompt: "be careful".into(),
+            backed_by: AgentBacking::Model,
         };
 
         let input_schema =

@@ -45,7 +45,7 @@ impl Executor {
         }
         let plan_node = NodeId(format!("{}/__plan__", node_id.0));
         match self
-            .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None)
+            .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None, false)
             .await?
         {
             AgentStep::Completed(out) => {
@@ -184,16 +184,54 @@ impl Executor {
                                         )
                                         .await;
                                 };
-                                let a = match selector.select(input, &candidates).await {
+                                // The selector reaches a model ONLY through this lent
+                                // capability, so its call is gated on the run's budget,
+                                // charged to the live meter and journaled to the ledger
+                                // like every other producer.
+                                let dispatch = super::dispatch::SelectorDispatch::new(
+                                    self,
+                                    run,
+                                    path.clone(),
+                                    fold,
+                                );
+                                let selected = selector.select(input, &candidates, &dispatch).await;
+                                // The lent capability makes the EXECUTOR's own integrity
+                                // failures — a memo `DeterminismViolation`, an unreadable
+                                // `ContentDigestMiss` — reachable through an arbitrary
+                                // selector's return value. At every other producer that
+                                // check is a hard halt; it is one here too. Read BEFORE
+                                // the selector's own result, so a selector that swallows
+                                // or rewraps the error cannot downgrade an inconsistent
+                                // journal into a soft `NodeFailed` and leave the drive
+                                // running (and spending) on the strength of it.
+                                if let Some(fatal) = dispatch.take_fatal() {
+                                    return Err(fatal);
+                                }
+                                let a = match selected {
                                     Ok(a) => a,
                                     Err(e) => {
-                                        return self
-                                            .expand_failed(
-                                                run,
-                                                path,
-                                                format!("expand {} selector: {e}", path.0),
-                                            )
-                                            .await;
+                                        // A budget refusal is NOT a node failure: it is
+                                        // already journaled, and pause-vs-fail is the
+                                        // chokepoint's call, not this arm's.
+                                        return match dispatch.take_refusal() {
+                                            Some(super::dispatch::RefusalKind::Paused(reason)) => {
+                                                Ok(NodeExec::Paused { reason })
+                                            }
+                                            Some(super::dispatch::RefusalKind::Failed(message)) => {
+                                                Ok(NodeExec::Failed {
+                                                    message,
+                                                    output: None,
+                                                })
+                                            }
+                                            None => {
+                                                self.expand_failed(
+                                                    run,
+                                                    path,
+                                                    format!("expand {} selector: {e}", path.0),
+                                                )
+                                                .await
+                                            }
+                                        };
                                     }
                                 };
                                 if !candidates.contains(&a) {

@@ -149,7 +149,7 @@ impl ConfigSource for FilesystemConfigSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestrator_core::{Activation, EffectClass, Registry, SkillDef};
+    use orchestrator_core::{Activation, AgentBacking, EffectClass, Registry, SkillDef};
     use std::path::{Path, PathBuf};
 
     #[tokio::test]
@@ -211,6 +211,44 @@ mod tests {
         assert_eq!(
             reg.tool("calc").expect("calc tool").effect_class,
             EffectClass::Pure
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// SP-6 s3. This source is the ONLY producer of an `incoming` config for `torii
+    /// config push`, and push is replace-all: if a human-backed agent could not be
+    /// spelled in an agent md, the spec's substitutability claim would be unreachable
+    /// AND a `Human` row already in Postgres would be silently rewritten to `Model` by
+    /// the next push (the diff runs over `AgentDefinition`, so the operator would see
+    /// only `changed: agent <name>`). This asserts the whole authored path — md on
+    /// disk -> `load` -> `Registry::from_config`, which is exactly what `push`
+    /// validates with before it writes.
+    #[tokio::test]
+    async fn filesystem_source_carries_a_human_backing_through_to_the_registry() {
+        let root = temp_config_root();
+        write(
+            &root.join("agents"),
+            "reviewer.md",
+            "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\ntimeout: 48h\n---\nDoes this contract permit sub-processing?\n",
+        );
+        let cfg = FilesystemConfigSource::new(&root)
+            .load()
+            .await
+            .expect("loads");
+        // The registry must also ASSEMBLE: a human-backed agent declares no chain, and
+        // `temp_config_root` has no chains.json, so this only passes because
+        // `validate` skips the chain rule for human backing.
+        let reg = Registry::from_config(cfg).expect("a human-backed agent needs no chain");
+        assert_eq!(
+            reg.agent("reviewer").expect("reviewer").backed_by,
+            AgentBacking::Human {
+                timeout: Some(chrono::Duration::hours(48))
+            }
+        );
+        // …and the pre-existing model agent in the same dir is untouched.
+        assert_eq!(
+            reg.agent("researcher").expect("researcher").backed_by,
+            AgentBacking::Model
         );
         std::fs::remove_dir_all(&root).ok();
     }
