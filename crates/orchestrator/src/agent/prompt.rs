@@ -5,7 +5,7 @@ use orchestrator_core::{AgentDefinition, ContextKey, OrchestratorError, Registry
 
 /// An assembled prompt with its two halves still SEPARATE.
 ///
-/// The join is [`assemble_prompt`], which is what the model path uses. The split exists for
+/// The join is [`PromptParts::join`], which is what the model path uses. The split exists for
 /// SP-6 s3's human-backed roles, and it exists because the two halves have different OWNERS
 /// and so must be bounded by different rules: `authored` is written by the config author,
 /// who can trim it; `context` is whatever the upstream nodes happened to produce, which
@@ -21,6 +21,27 @@ pub struct PromptParts {
     pub context: Vec<(String, String)>,
     /// The activated tool schemas.
     pub tools: Vec<ToolDefinition>,
+}
+
+impl PromptParts {
+    /// Re-join the two halves into the system prompt the MODEL receives, using the
+    /// unbounded [`render_context_section`] — the model's own context window is the bound
+    /// that applies on that path (`over_budget`, below, which HALTS rather than truncating
+    /// so a model is never silently asked about half a document).
+    ///
+    /// **The model path calls THIS**, and so does [`assemble_prompt`]. That is the whole
+    /// reason it exists as a method rather than three lines inlined at each site. Before
+    /// this, `drive_agent` concatenated the halves itself and `assemble_prompt` had ZERO
+    /// production callers — its doc claimed to be "what the model path uses" while every
+    /// one of its callers was a test in this file. The drift guard
+    /// `the_model_context_section_is_unbounded_and_joins_exactly_as_before` pinned a
+    /// function nothing shipped ran, so changing the executor's inline join alone left it,
+    /// and the four `assemble_*` tests, green.
+    pub fn join(self) -> (String, Vec<ToolDefinition>) {
+        let mut system = self.authored;
+        system.push_str(&render_context_section(&self.context));
+        (system, self.tools)
+    }
 }
 
 /// [`assemble_prompt`]'s work, stopping one step short of joining the halves — see
@@ -109,19 +130,18 @@ pub fn render_context_section(entries: &[(String, String)]) -> String {
 /// An empty `context` adds NOTHING, so a no-dependency agent's prompt is
 /// byte-identical to the pre-blackboard prompt.
 ///
-/// A thin join over [`assemble_prompt_parts`] + [`render_context_section`]. It stays the
-/// model path's entry point so that path is provably unchanged by s3's split: this function
-/// concatenates exactly the two pieces the old body appended in place.
+/// A thin composition of [`assemble_prompt_parts`] + [`PromptParts::join`] — the SAME two
+/// calls, in the same order, that `drive_agent`'s model path makes. It is the whole prompt
+/// as one expression, for callers (and tests) that want the joined string; the executor
+/// keeps the halves apart only because it must choose between the model and human renderers
+/// in between.
 pub fn assemble_prompt(
     registry: &Registry,
     agent: &AgentDefinition,
     context: &[(ContextKey, serde_json::Value)],
     query: &str,
 ) -> Result<(String, Vec<ToolDefinition>), OrchestratorError> {
-    let parts = assemble_prompt_parts(registry, agent, context, query)?;
-    let mut system = parts.authored;
-    system.push_str(&render_context_section(&parts.context));
-    Ok((system, parts.tools))
+    Ok(assemble_prompt_parts(registry, agent, context, query)?.join())
 }
 
 /// The largest byte offset at or below `n` that is a char boundary in `s`.
@@ -179,7 +199,14 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }
-    truncate_with_marker(&text, max)
+    // The final clamp [`truncate_with_marker`]'s doc defers to. This function is the LAST
+    // step of the durable write — `redact_and_clamp` returns straight into
+    // `AgentAwaited.prompt` — so there is no later caller to catch the marker overrun, and
+    // without this line a `max` below the ~36-byte marker width returned MORE than `max`.
+    // Guarded by `a_prompt_clamp_never_overruns_its_bound`.
+    let mut out = truncate_with_marker(&text, max);
+    out.truncate(floor_char_boundary(&out, max));
+    out
 }
 
 /// Render the `## Context` section for a HUMAN-backed node's question, bounded to `budget`
@@ -195,7 +222,19 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
 ///
 /// The budget is split EVENLY across dependencies rather than first-come-first-served, so
 /// one verbose upstream cannot crowd the others out of the question entirely — the human is
-/// shown something from every node they were meant to consider.
+/// shown something from every node they were meant to consider, and when even that is
+/// impossible they are TOLD how many nodes were dropped.
+///
+/// The promise is not unconditional, and the escape hatch is where the honesty lives. An
+/// entry only exceeds its share when `room` falls under the marker's own ~36 bytes, at which
+/// point [`truncate_with_marker`] overruns and the accumulated overflow pushes the section
+/// past `budget`. The shipped clamp then cut trailing dependencies with NOTHING in the
+/// output saying so — a silent breach of §5.4's "never show the human LESS than the model
+/// would have had", and the one place an unmarked clip could still happen after every
+/// per-entry cut had been marked. So the tail is reserved for a count, the cut is taken at
+/// the end of the last COMPLETE entry (never mid-entry, so the number is exact rather than
+/// estimated), and the section says `(N of M dependencies shown)`. Guarded by
+/// `a_context_section_that_drops_dependencies_says_how_many`.
 pub fn render_context_section_bounded(entries: &[(String, String)], budget: usize) -> String {
     if entries.is_empty() {
         return String::new();
@@ -203,6 +242,10 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
     const HEAD: &str = "\n\n## Context";
     let share = budget.saturating_sub(HEAD.len()) / entries.len();
     let mut out = String::from(HEAD);
+    // Where each entry ENDS, recorded as it is written. This is what lets the degradation
+    // below report an EXACT count and cut on an entry boundary; recomputing it afterwards
+    // would mean re-parsing the very headings a dependency's own body is free to forge.
+    let mut ends = Vec::with_capacity(entries.len());
     for (key, body) in entries {
         let head = format!("\n\n### {key}\n");
         // The heading is what tells the human WHICH dependency this is, so it is never the
@@ -210,10 +253,28 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
         let room = share.saturating_sub(head.len());
         out.push_str(&head);
         out.push_str(&truncate_with_marker(body, room));
+        ends.push(out.len());
     }
-    // The unconditional clamp. Everything above is best-effort shaping; this is the line
-    // that makes "the journaled question is bounded" true no matter how many dependencies,
-    // how long their keys, or how the marker arithmetic lands.
+    if out.len() <= budget {
+        return out;
+    }
+    // Budget with the WIDEST count the marker can carry (`shown` can never exceed the total)
+    // and re-render with the real one: fewer digits only ever makes it shorter, so the total
+    // cannot grow past `budget` — the same arithmetic `truncate_with_marker` uses.
+    let omitted = |shown: usize| format!("\n\n… ({shown} of {} dependencies shown)", entries.len());
+    let ceiling = budget.saturating_sub(omitted(entries.len()).len());
+    let shown = ends.iter().take_while(|end| **end <= ceiling).count();
+    // `HEAD.len()` rather than 0 when not even the first entry fits: the section heading is
+    // what makes the remaining line legible as a statement about context at all.
+    out.truncate(if shown == 0 {
+        HEAD.len()
+    } else {
+        ends[shown - 1]
+    });
+    out.push_str(&omitted(shown));
+    // The unconditional clamp, kept. Everything above is best-effort shaping; this is the
+    // line that makes "the journaled question is bounded" true no matter how many
+    // dependencies, how long their keys, or how the marker arithmetic lands.
     out.truncate(floor_char_boundary(&out, budget));
     out
 }
@@ -537,6 +598,77 @@ mod tests {
             out.len() <= 4096,
             "and the whole section still fits: {} bytes",
             out.len()
+        );
+    }
+
+    /// `truncate_prompt_to_bound` is the LAST step of the human question's durable write, so
+    /// nothing downstream re-clamps what it returns.
+    ///
+    /// `truncate_with_marker`, which it delegates to, documents that "when `max` is smaller
+    /// than the marker itself the marker wins and the result overruns; the caller's final
+    /// clamp catches that". [`render_context_section_bounded`] is such a caller — its
+    /// unconditional `out.truncate(..)` is that clamp. This function had NO such line, so it
+    /// was the one overrun nobody caught: `truncate_prompt_to_bound("x"*1000, 10)` returned
+    /// 39 bytes for a 10-byte bound. The marker is `34 + digits(shown) + digits(len)` bytes
+    /// wide, so every bound below ~36 overran.
+    ///
+    /// Not reachable from either shipped call site today (both pass
+    /// `MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES`, and `redact_and_clamp`'s `room`
+    /// branch can only fall under ~36 if the redacted `## Task` tail reaches ~36.8 KB from a
+    /// half already capped at 4096). Pinned anyway: this is a `pub` helper whose whole
+    /// contract is one inequality, and the next caller inherits it.
+    #[test]
+    fn a_prompt_clamp_never_overruns_its_bound() {
+        for max in [0usize, 1, 10, 35, 37, 39, 64] {
+            let out = truncate_prompt_to_bound("x".repeat(1000), max);
+            assert!(
+                out.len() <= max,
+                "a {max}-byte bound returned {} bytes — the marker overran the bound this \
+                 function exists to enforce, and no caller re-clamps it: {out:?}",
+                out.len()
+            );
+        }
+    }
+
+    /// The bounded renderer's doc promises "the human is shown something from every node
+    /// they were meant to consider". Its final `out.truncate(budget)` can break that
+    /// promise — and, as shipped, broke it SILENTLY.
+    ///
+    /// When a per-entry share falls below the ~36-byte marker width, `truncate_with_marker`
+    /// overruns that share (the same arithmetic the test above pins), each entry overshoots
+    /// a little, and the accumulated overflow makes the total clamp drop TRAILING
+    /// dependencies outright. Nothing in the output says so, which is exactly the §5.4
+    /// breach "never show the human LESS than the model would have had" — and the honest
+    /// degradation the marker exists for, absent at the one point it matters most.
+    ///
+    /// The sibling table case named `"share smaller than the marker"` walks into this and
+    /// cannot see it: it asserts only the total size, the heading, and that `"truncated"`
+    /// appears SOMEWHERE — all three satisfied by dependency 0 alone.
+    ///
+    /// Either outcome is acceptable, which is why the assertion is a disjunction: show every
+    /// heading, or say how many were dropped. Silence is the only failure.
+    #[test]
+    fn a_context_section_that_drops_dependencies_says_how_many() {
+        let entries: Vec<(String, String)> = (0..200)
+            .map(|i| (format!("dep{i}"), "X".repeat(500)))
+            .collect();
+        let out = render_context_section_bounded(&entries, 1_024);
+
+        assert!(out.len() <= 1_024, "still bounded: {} bytes", out.len());
+
+        let shown = (0..200)
+            .filter(|i| out.contains(&format!("### dep{i}\n")))
+            .count();
+        if shown == 200 {
+            return; // Every dependency represented — the promise held literally.
+        }
+        assert!(
+            out.contains(&format!("of {} dependencies shown", entries.len())),
+            "{} of {} dependencies were dropped by the final clamp with NOTHING in the \
+             question saying so; a human answers about the nodes they can see as though \
+             they were all of them: {out:?}",
+            entries.len() - shown,
+            entries.len()
         );
     }
 

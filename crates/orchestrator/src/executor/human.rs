@@ -79,13 +79,45 @@ impl HumanQuestion {
     /// NOT the thing being asked about. Design §5.4's rule is "the human sees precisely what
     /// the model would have", with an explicitly one-directional cost: never show the human
     /// LESS than the model would have had.
-    pub(super) fn compose(authored: &str, context: &[(String, String)], query: &str) -> Self {
+    ///
+    /// **Each context body is redacted BEFORE it is truncated**, which is why this takes a
+    /// `redact` at all rather than leaving the whole job to
+    /// [`HumanQuestion::redact_and_clamp`]. Same shape as the `## Task` straddle that
+    /// function documents, one step earlier: a `Redactor` matches over the string it is
+    /// handed, and `render_context_section_bounded` cuts each body — so a cut that removes a
+    /// PEM's `-----END … PRIVATE KEY-----` (the one shipped pattern with an unbounded
+    /// `[\s\S]*?` body, and a body over `MAX_HUMAN_CONTEXT_BYTES` loses that line by
+    /// construction) turned a would-be `[REDACTED]` into a plaintext fragment.
+    ///
+    /// Defence in depth rather than a live durable leak: a `Scope::Run` context value is
+    /// already redacted at its producing leaf, so with a redactor wired the composed
+    /// question sees `[REDACTED]` before it arrives, and with none wired nothing is redacted
+    /// anywhere. It is here because `compose`'s correctness must not rest on a caller three
+    /// modules away, and because torii's display-time `render::redact_question` runs the
+    /// same plain pass over the same already-cut text into a terminal and a CI log.
+    ///
+    /// `redact_and_clamp`'s later whole-string pass is NOT replaced by this one — it is what
+    /// guards the `## Task` straddle, and it composes freely because `[REDACTED]` matches no
+    /// credential shape, so the second pass is idempotent. Guarded by
+    /// `a_secret_cut_in_half_by_the_context_bound_is_still_redacted`.
+    pub(super) fn compose(
+        authored: &str,
+        context: &[(String, String)],
+        query: &str,
+        redact: impl Fn(String) -> String,
+    ) -> Self {
+        // Per `(key, body)` rather than over the joined section: the join is what the bound
+        // then cuts, so redacting it would be the same ordering defect one line later.
+        let context: Vec<(String, String)> = context
+            .iter()
+            .map(|(key, body)| (key.clone(), redact(body.clone())))
+            .collect();
         let task = format!("{TASK_MARKER}{query}");
         let mut text = String::with_capacity(authored.len() + task.len());
         text.push_str(authored);
         let authored_bytes = text.len() + task.len();
         text.push_str(&render_context_section_bounded(
-            context,
+            &context,
             MAX_HUMAN_CONTEXT_BYTES,
         ));
         text.push_str(&task);
@@ -549,7 +581,7 @@ mod tests {
             "upstream".to_string(),
             "c".repeat(MAX_HUMAN_CONTEXT_BYTES * 2),
         )];
-        let q = HumanQuestion::compose("Decide whether to ship.", &context, "Order #42");
+        let q = HumanQuestion::compose("Decide whether to ship.", &context, "Order #42", |t| t);
 
         assert!(
             q.text.contains("## Task"),
@@ -622,6 +654,11 @@ mod tests {
             // The END delimiter lands in the `## Task` section, so the whole match spans the
             // split point the clamp needs.
             "-----END RSA PRIVATE KEY-----\nApprove?",
+            // IDENTITY, deliberately. `compose`'s own per-body pass is the sibling test's
+            // subject; this one is about `redact_and_clamp` seeing the WHOLE string once, and
+            // a real redactor here would decide nothing either way (the body holds only the
+            // BEGIN delimiter, so it matches no whole-pattern on its own).
+            |t| t,
         );
         assert!(
             q.text.contains("## Task"),
@@ -636,11 +673,79 @@ mod tests {
         );
     }
 
+    /// A secret cut in half by the `## Context` BOUND must still be redacted.
+    ///
+    /// Structurally the same finding as
+    /// `a_secret_that_straddles_the_task_boundary_is_still_redacted`, one function earlier:
+    /// a `Redactor` matches over the string it is handed, so any cut made BEFORE it runs
+    /// hides a whole-match that spanned the cut. That test fixed the `## Task` split;
+    /// `compose` still truncated each dependency body first and only then let
+    /// `redact_and_clamp` run the redactor over the composed result.
+    ///
+    /// `PatternRedactor`'s PEM rule is the reachable case, and it is the strongest possible
+    /// one: `-----BEGIN … PRIVATE KEY-----[\s\S]*?-----END … PRIVATE KEY-----` needs BOTH
+    /// delimiters, and an upstream output over `MAX_HUMAN_CONTEXT_BYTES` loses the `END`
+    /// line to the per-dependency truncation — turning a would-be `[REDACTED]` into 32 KiB
+    /// of plaintext key material.
+    ///
+    /// Not a live durable leak at HEAD (a `Scope::Run` context value is already redacted at
+    /// the producing leaf, so the composed question sees `[REDACTED]` before it gets here),
+    /// which is why this is defence in depth rather than a Critical. It is worth having
+    /// anyway: `compose`'s correctness must not rest on a caller three modules away, and
+    /// with `Executor::with_redactor` unset — the DEFAULT — torii's display-time
+    /// `render::redact_question` runs the same plain pass over the same already-cut text and
+    /// shows the fragment in a terminal, a `--json` payload and a CI log.
+    ///
+    /// The fix is ordering, not a new pattern: each `(key, body)` is redacted BEFORE
+    /// `render_context_section_bounded` cuts it. `redact_and_clamp`'s whole-string pass
+    /// stays (it is what guards the `## Task` straddle) and is idempotent, because
+    /// `[REDACTED]` matches no credential shape.
+    #[test]
+    fn a_secret_cut_in_half_by_the_context_bound_is_still_redacted() {
+        use orchestrator_core::{PatternRedactor, Redactor};
+
+        let redactor = PatternRedactor::default();
+        // Borrowed, not `move`: a closure that captures by shared reference is `Copy`, so
+        // the SAME pass can be handed to both `compose` and `redact_and_clamp` below — which
+        // is the arrangement under test.
+        let redact = |t: String| match redactor.redact(&serde_json::Value::String(t.clone())) {
+            serde_json::Value::String(s) => s,
+            _ => t,
+        };
+
+        // Assembled at runtime: the repo's Semgrep CWE-798 hook blocks a credential-shaped
+        // literal in a fixture. `sentinel` sits early enough in the body to SURVIVE the
+        // per-dependency cut, so its presence in the output is unambiguous evidence that
+        // raw key material was carried through.
+        let sentinel = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo";
+        let body = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n{}{sentinel}\n{}\n-----END RSA PRIVATE KEY-----",
+            "MIIB".to_string() + &"A".repeat(24),
+            "B".repeat(MAX_HUMAN_CONTEXT_BYTES * 2),
+        );
+
+        let q = HumanQuestion::compose(
+            "You are a reviewer.",
+            &[("key".to_string(), body)],
+            "Ship?",
+            redact,
+        );
+        let out = q.redact_and_clamp(redact, BOUND);
+
+        assert!(
+            !out.contains(sentinel),
+            "the per-dependency truncation cut the PEM's `-----END` delimiter off, so the \
+             redactor's whole-match never fired and key material reached the durable \
+             `AgentAwaited.prompt`: {}",
+            &out[..out.len().min(400)]
+        );
+    }
+
     /// The clamp must not fire at all when the redacted question already fits — otherwise
     /// every ordinary question would carry a truncation marker.
     #[test]
     fn a_question_that_fits_is_returned_untouched() {
-        let q = HumanQuestion::compose("Decide.", &[], "the Acme MSA");
+        let q = HumanQuestion::compose("Decide.", &[], "the Acme MSA", |t| t);
         let out = q.redact_and_clamp(|t| t, BOUND);
         assert_eq!(out, q.text);
     }
