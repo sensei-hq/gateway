@@ -1054,6 +1054,36 @@ mod tests {
         }
     }
 
+    /// The OTHER surface a definition arrives on: a `config_agents` jsonb row.
+    /// `AgentBacking`'s doc claims two things that nothing exercised — that an
+    /// existing row with no `backed_by` key still deserializes (to `Model`), and that
+    /// a human backing is durable. The second matters for `torii config push`: push
+    /// stores what it loaded, so a backing that did not survive serde would be
+    /// downgraded on the round trip exactly as the missing frontmatter key used to
+    /// downgrade it.
+    #[test]
+    fn agent_backing_is_serde_defaulted_and_round_trips() {
+        // A pre-s3 row: no `backed_by` key at all.
+        let row = serde_json::json!({
+            "name": "researcher", "area": "research", "kind": "reasoning",
+            "chain": "c", "tools": [], "skills": [], "system_prompt": "b"
+        });
+        let a: AgentDefinition = serde_json::from_value(row).expect("a pre-s3 row still loads");
+        assert_eq!(a.backed_by, AgentBacking::Model);
+
+        for backing in [
+            AgentBacking::Model,
+            AgentBacking::Human { timeout: None },
+            AgentBacking::Human {
+                timeout: Some(chrono::Duration::hours(48)),
+            },
+        ] {
+            let json = serde_json::to_string(&backing).expect("serializes");
+            let back: AgentBacking = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(backing, back, "round trip via {json}");
+        }
+    }
+
     /// The loader and `validate` compose: an authored human agent assembles into a
     /// registry with no chain binding, which is the whole point of the skip.
     #[test]
