@@ -169,8 +169,11 @@ struct Fold {
     /// kinds. Keep this list of writers current: every one of them is an
     /// `entry().or_insert` in `fold_journal`, and
     /// [`wait_or_expire`](Executor::wait_or_expire) reads the map without knowing which
-    /// kind wrote it — so a reader that reasons about which kinds can be present (see
-    /// `run_human_gate`'s missing-menu arm) is reasoning off THIS sentence.
+    /// kind wrote it — so a reader that reasons about which kinds can be present is
+    /// reasoning off THIS sentence. All three now do: `run_await_signal`'s missing-ask arm,
+    /// `run_human_gate`'s missing-menu arm and `run_human_agent`'s missing-question arm,
+    /// each pairing this shared map with its own kind-specific record
+    /// ([`Fold::signal_asks`], [`Fold::menus`], [`Fold::agent_prompts`]).
     ///
     /// FIRST record wins — the opposite of `signals`, and deliberately
     /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
@@ -190,6 +193,16 @@ struct Fold {
     /// `a_deadline_less_gate_records_that_it_began_asking` and
     /// `a_deadline_less_human_agent_records_that_it_began_asking`.
     deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
+    /// SP-6 s1: the nodes that began waiting **as an `AwaitSignal`**, from `SignalAwaited`
+    /// alone.
+    ///
+    /// The exact counterpart of [`Fold::menus`] and [`Fold::agent_prompts`], which answer
+    /// the same per-kind question for the other two waiting kinds by carrying a payload only
+    /// that kind writes. `SignalAwaited` carries no payload beyond the deadline — which goes
+    /// into the SHARED `deadlines` map — so the per-kind record has to be its own set;
+    /// without it `run_await_signal` had no way to tell "I began waiting" from "some other
+    /// kind began waiting at my id", and paused forever on the latter.
+    signal_asks: std::collections::HashSet<NodeId>,
     /// SP-6 s2: each `HumanGate`'s decision, folded from `GateDecided`. LAST wins, like
     /// `signals` and for the same reason: an operator must be able to correct a mistaken
     /// decision before the run resumes.
@@ -409,6 +422,24 @@ impl Fold {
     /// for `HumanGate`, read on the same arm for the same reason.
     fn prompt_for(&self, node: &NodeId) -> Option<&str> {
         self.agent_prompts.get(node).map(String::as_str)
+    }
+
+    /// SP-6 s1: did the `AwaitSignal` kind itself begin waiting at this node?
+    ///
+    /// The third member of the [`Fold::menu_for`]/[`Fold::prompt_for`] family, and it exists
+    /// for the same reason both of those do: [`Fold::deadline_for`] answers "has SOME
+    /// waiting kind begun here?" — all three of `SignalAwaited`/`GateAwaited`/`AgentAwaited`
+    /// write that map — and a node kind that acts on that shared answer alone acts on
+    /// another kind's record.
+    ///
+    /// `run_await_signal` reads it on the already-waiting path, exactly where its two
+    /// siblings read theirs. It was the LAST of the three to exist, and the gap was a real
+    /// defect: a node bearing another kind's awaited record re-paused with
+    /// `resume_after: None` on every drive — the never-auto-woken class — while `torii run
+    /// signal` refused it (s3 added that refusal) and `torii run agent answer` accepted an
+    /// answer nothing would ever read.
+    fn has_signal_ask(&self, node: &NodeId) -> bool {
+        self.signal_asks.contains(node)
     }
 }
 

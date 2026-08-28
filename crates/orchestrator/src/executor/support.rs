@@ -199,6 +199,7 @@ pub(crate) fn fold_journal(
                 deadline: Some(d),
             } => {
                 fold.deadlines.entry(node.clone()).or_insert(Some(*d));
+                fold.signal_asks.insert(node.clone());
             }
             // The deadline-LESS gate. `None` is folded as a REAL value, not dropped: the
             // map's key answers "has this node begun waiting?", which is a different
@@ -211,7 +212,13 @@ pub(crate) fn fold_journal(
                 deadline: None,
             } => {
                 fold.deadlines.entry(node.clone()).or_insert(None);
+                fold.signal_asks.insert(node.clone());
             }
+            // Both `SignalAwaited` arms above also record this node in `signal_asks`, the
+            // per-kind counterpart of `menus`/`agent_prompts`. It is a SET rather than an
+            // `or_insert` of a value because this event carries nothing beyond the deadline
+            // (which belongs in the shared map), and set membership is idempotent, so
+            // first-wins and last-wins coincide.
             // SP-6 s2: the ask. Deliberately EXPLICIT rather than folded with
             // `SignalAwaited` by a catch-all — the menu has no analogue there, and a
             // catch-all would silently absorb a future variant.
@@ -253,8 +260,10 @@ pub(crate) fn fold_journal(
             // `deadline_for` and knows nothing about which kind recorded it. That makes
             // this the THIRD writer of `Fold::deadlines` (after `SignalAwaited` and
             // `GateAwaited`); when a fourth is added, update the writer lists on
-            // `Fold::deadlines`, `Fold::deadline_for` and `run_human_gate`'s missing-menu
-            // arm, all of which reason from an explicit enumeration of them.
+            // `Fold::deadlines` and `Fold::deadline_for`, and give it a kind-specific
+            // record of its own plus the missing-ask arm that reads it — the three that
+            // exist (`run_await_signal`, `run_human_gate`, `run_human_agent`) all reason
+            // from an explicit enumeration of these writers.
             //
             // `deadline` is folded THROUGH, `None` included — never `if
             // deadline.is_some()`. The key alone answers "has this node begun asking?",
