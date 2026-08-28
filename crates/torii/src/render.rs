@@ -401,7 +401,7 @@ pub struct AwaitingNode {
     ///
     /// **It is a SECOND pass, not the first.** `executor/human.rs` runs the executor's own
     /// redactor over the whole composed question BEFORE the `AgentAwaited` append, so the
-    /// durable row is already scrubbed — see [`redact_question`], which carries the same
+    /// durable row is already scrubbed — see `redact_question`, which carries the same
     /// sentence, and do not let the two drift again: an earlier version of this paragraph
     /// claimed the executor appended `prompt: prompt.to_string()`, an expression that
     /// exists on no code path, and a maintainer trusting it would conclude torii is the
