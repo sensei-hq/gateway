@@ -64,10 +64,17 @@ fn db_url() -> Option<String> {
 /// `scheduled_runs` is a GLOBAL table and `tick()` claims the whole due set, not just the
 /// caller's run — so two of these tests running concurrently would each drive the other's
 /// run through their own gateway, and the re-spend counts below would be measuring the
-/// wrong executor. Serializing them process-wide is the same guard the store crate's own
-/// scheduler tests use, for the same reason. (Cross-PROCESS isolation is not needed:
-/// cargo runs test binaries one at a time.)
-static SCHEDULED_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// wrong executor. The singleton `config_versions` row has the same problem for the fence
+/// test, which asserts an exact generation.
+///
+/// Both now come from `orchestrator_store::test_guard`, the ONE shared implementation. This
+/// file used to hold a THIRD private copy — and a weaker one: a bare process-wide
+/// `tokio::sync::Mutex`, justified by "cross-PROCESS isolation is not needed: cargo runs
+/// test binaries one at a time". That is a property of `cargo test`, not of the code:
+/// `cargo nextest` runs test binaries in parallel and would defeat it silently, and it was
+/// never true of two concurrent `cargo` invocations either. The shared guard adds a Postgres
+/// session advisory lock, which holds across processes however the suite is invoked.
+use orchestrator_store::test_guard::{config_guard, scheduler_guard};
 
 /// One `ModelCall` node whose prompt is `marker` — the smallest graph that spends a token.
 ///
@@ -502,6 +509,41 @@ async fn serve_once(sched: &Scheduler) -> torii::cmd::Outcome {
     .expect("one tick against a live database")
 }
 
+/// Drive `run` through the REAL `worker serve --once` until it LEAVES `Paused`, and return
+/// the outcome of the serve that moved it.
+///
+/// Why a loop rather than the single `serve_once` this replaces: a tick claims at most
+/// `CLAIM_BATCH` (64) due rows, `order by next_wake`, out of a `scheduled_runs` table that
+/// every suite which has ever paused a run shares. An OLDER backlog — the rows a crashed or
+/// red run leaves behind — therefore crowds this test's run out of the first batch, and the
+/// serve returns a perfectly healthy `tick complete: 64 run(s) woken` having never touched
+/// it. Measured, not theorised: seeding 300 ancient due rows turned three of these tests red
+/// with `left: Paused / right: Completed` and one with `left: Paused / right: Failed`, none
+/// of which had anything wrong with them.
+///
+/// This is not a weaker assertion — every caller still asserts the exact terminal status and
+/// the exact per-node spend afterwards. It is the same thing a real `torii worker serve`
+/// (without `--once`) does: keep ticking. The bound keeps a GENUINE never-woken regression
+/// loud and fast rather than trading one flake for a hang.
+///
+/// Only for callers that expect the run to MOVE. The tests asserting a run stays `Paused`
+/// (a wake with no decision) or stays `Cancelled` keep using `serve_once`: for them a
+/// crowd-out leaves the row untouched, which is exactly what they assert.
+async fn serve_until_settled(
+    sched: &Scheduler,
+    store: &PostgresSchedulerStore,
+    run: RunId,
+) -> torii::cmd::Outcome {
+    for _ in 0..16 {
+        let served = serve_once(sched).await;
+        let status = store.status(run).await.unwrap().map(|s| s.status);
+        if status != Some(RunStatus::Paused) {
+            return served;
+        }
+    }
+    panic!("`worker serve --once` never moved {run:?} off `paused` in 16 ticks");
+}
+
 /// AC8. The full operator loop over a real Postgres:
 ///
 /// 1. **Process A** submits against a warmed-gated gateway → the run pauses, durably.
@@ -517,7 +559,7 @@ async fn serve_once(sched: &Scheduler) -> torii::cmd::Outcome {
 #[tokio::test]
 async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -604,7 +646,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
     // The ONLY thing carried over from A is the run id; everything else B needs — the
     // graph included — it reads out of Postgres.
     let (sched_b, calls_b) = fresh_worker(&url, queued_at + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run completed, and A's journaled prefix was not re-spent --------------
@@ -656,7 +698,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
 #[tokio::test]
 async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -732,7 +774,14 @@ async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
 #[tokio::test]
 async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_anything() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    // BOTH classes, in the documented global order (config-tables before scheduled-runs).
+    // This is the one test here that also writes the SINGLETON `config_versions` row, and it
+    // asserts an exact generation twice — `current == Some(gen_before)` ("nothing else may
+    // move the shared generation between pin and bump") and `gen_after == gen_before + 1`.
+    // Any concurrent config writer breaks both, and the scheduler guard it used to take
+    // alone is a DIFFERENT lock class that excludes none of them.
+    let _config = config_guard().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -788,7 +837,7 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
 
     // ---- Process B: a FRESH worker, pinned to the NOW-DRIFTED generation, ticks ----
     let (sched_b, calls_b) = fresh_worker_pinned(&url, deadline + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_a.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run FAILS at the fence — never Completed, never silently re-Paused ----
@@ -869,7 +918,7 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
 #[tokio::test]
 async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fresh_process() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     const PER_CALL: u32 = 150;
     const CAP: u64 = 100;
@@ -989,7 +1038,7 @@ async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fres
     // ---- Process B: a FRESH metered worker drives it to completion ------------------
     let (sched_b, calls_b) =
         fresh_metered_worker(&url, queued_at + Duration::seconds(1), PER_CALL).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
     assert_eq!(
         store_b.status(run).await.unwrap().unwrap().status,
@@ -1053,7 +1102,7 @@ async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fres
 #[tokio::test]
 async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_process() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -1169,7 +1218,7 @@ async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_pr
     // The only thing carried over from A is the run id; the graph included, everything
     // else B needs it reads out of Postgres.
     let (sched_b, calls_b) = fresh_context_worker(&url, signalled_at + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run completed — asserted at the scheduler AND in the journal --------------
@@ -1275,7 +1324,7 @@ async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_pr
 #[tokio::test]
 async fn a_human_gate_decided_in_another_process_completes_the_run() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -1451,7 +1500,7 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
     // The only thing carried over from A is the run id; everything else B needs — the
     // graph included — it reads out of Postgres.
     let (sched_b, calls_b) = fresh_context_worker(&url, decided_at + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run completed — asserted at the scheduler AND in the journal --------------
@@ -1567,7 +1616,7 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
 #[tokio::test]
 async fn a_human_backed_agent_answered_in_another_process_completes_the_run() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -1785,7 +1834,7 @@ async fn a_human_backed_agent_answered_in_another_process_completes_the_run() {
     // rather than read back: see `human_registry`.)
     let (sched_b, calls_b) =
         fresh_human_worker(&url, answered_at + Duration::seconds(1), sla).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run completed — asserted at the scheduler AND in the journal -------------
