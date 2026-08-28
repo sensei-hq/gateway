@@ -1,42 +1,41 @@
 # Checkpoint
 
-**Slice:** SP-6 s2 `HumanGate` — the typed menu over `AwaitSignal`. **MERGED TO `main`** via PR #47
-(`5d9b9d1`). Spec+plan: `docs/superpowers/{specs,plans}/2026-08-27-sp-6-s2-human-gate*`.
+**Slice:** SP-6 s3 `human-as-Agent` — the LAST slice of SP-6. **In progress on
+`feat/sp-6-s3-human-as-agent`** (branched from `develop` at `771af25`). Task 1 of 7 done.
 
 ## Done / remaining
 
-- **SP-6 s2 ✅ tasks 1–8** — the node kind, its two journal events, the shared waiting arms, the
-  fold, `validate_dag`, `run gate approve|reject|decide`, `list-paused` menus, the cross-process
-  Postgres e2e. Full detail: `docs/superpowers/orchestrator-overview.md` §3.
-- **Reviews ✅** — whole-slice: 1 Critical, 1 HIGH, 5 Medium, 11 doc. Re-review OF those fixes: 7
-  more in three commits — 3 HIGH in `gate decide`'s post-append classification (honoured `reject`
-  reported "not read"; both "not read" arms untested; a journal fault echoed raw) · 2 MED · 2 doc.
-- **SP-6 s1 · SP-DATA 1–5 · SP-3 · SP-4 ✅** on `main`. **SP-6 s3 human-as-Agent ⬜ — the LAST slice
-  of SP-6.** No spec, no plan on disk.
+- **SP-6 s2 ✅ MERGED TO `main`** via PR #47 (`5d9b9d1`). s1 · SP-DATA 1–5 · SP-3 · SP-4 also on main.
+- **s3 spec ✅ approved** after a depth review that found 5 blockers — four of them places the spec
+  asserted something false about the codebase. `specs/2026-08-27-sp-6-s3-human-as-agent-design.md`.
+- **s3 plan ✅** — 7 tasks, 42 steps, written against verified signatures.
+  `plans/2026-08-27-sp-6-s3-human-as-agent.md`.
+- **Task 1 ✅** (`fa070dd`) — `AgentBacking::{Model,Human{timeout}}` + the four `validate()` rules.
+  **1510 passed / 0 failed / 7 ignored**, exit 0. Used `RegistryLoad` (no `InvalidConfig` variant
+  exists). 27 literal sites across 7 files needed the new field. **Not yet reviewed** — the
+  two-stage spec+quality review for Task 1 was not run.
+- **Tasks 2–7 ⬜** — journal events · fold · `run_human_agent` · CLI · `list-paused` · e2e.
 
 ## Next command
 
-s3 needs design before code (a human-backed agent whose execution is a pause-for-input):
+Run Task 1's two-stage review first (it was skipped), then Task 2:
 
 ```
-/sensei:brainstorm SP-6 s3 human-as-Agent
+# review Task 1 (fa070dd), then:
+sed -n '/^## Task 2/,/^## Task 3/p' docs/superpowers/plans/2026-08-27-sp-6-s3-human-as-agent.md
 ```
 
 ## Open questions
 
-- **s3's shape is genuinely open:** does a human-backed agent reuse the existing waiting events, or
-  does an `Agent` node gain a human-backed `AgentRef`? That decides whether s3 is a thin wrapper or
-  a registry change.
-- **`AwaitSignal` and `HumanGate` differ in TWO places, not one** (spec §6.1): where the answer-read
-  sits, AND whether the clock is re-read after journaling a fresh deadline (only s1 does, so a gate
-  given a nanosecond pauses once on a past instant). s3 is the third waiting kind; it must pick
-  deliberately rather than inherit by accident.
-- Deferred (§10): authorization (`actor` is attribution, not authentication — never branch on it),
-  `RunStatus::Rejected`, non-CLI delivery, N-of-M approval, no hook callback for a gate event.
+- **Task 4 is the delicate one** — 8 ACs, and the slice's one deliberate divergence: the answer is
+  read BEFORE expiry, unlike `HumanGate`. Its mutation list targets that ordering specifically.
+- `drive_agent` takes `&NodeId` but `gate_precheck`/`wait_or_expire` take `&Node` — Task 4 adds thin
+  `_by_id` variants with the existing ones delegating. Do not duplicate either body.
+- The non-top-level rejection (§5.5) is a **runtime** check, not load-time: `validate_dag` cannot see
+  the registry. Stated limitation, not an oversight.
 
 ## Known-broken
 
-None. **1505 passed / 0 failed / 7 ignored, exit 0** — verified BOTH without a database and against
-live `postgres:16`, where the 6 `e2e_pg` tests ran for real (0 skips; `GateAwaited` + `GateDecided`
-rows confirmed in `journal_events`). clippy `-D warnings` + fmt clean; `cargo doc` back to the 8
-warnings that pre-date this slice. `target/` cleaned.
+None. **1510 passed / 0 failed / 7 ignored, exit 0**; clippy `-D warnings` and fmt clean.
+`$DATABASE_URL` is a REMOTE Supabase instance — never run the DB suite against it; use a throwaway
+container (`env -u DATABASE_URL` otherwise).
