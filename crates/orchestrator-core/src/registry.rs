@@ -507,14 +507,33 @@ impl Registry {
             }
 
             if human {
-                // The ReAct loop that would use these never runs, so a grant here grants
-                // nothing — the confused-deputy shape SP-4 s1 argues against. Reject the
-                // config rather than silently ignore the declaration.
+                // The ReAct loop that would use these never runs, so a tool here is
+                // never reachable — the confused-deputy shape SP-4 s1 argues against.
+                // Reject the config rather than silently ignore the declaration.
                 if !agent.tools.is_empty() {
                     return Err(OrchestratorError::RegistryLoad(format!(
                         "agent {:?} is human-backed and may not declare tools ({:?}); a \
                          human-backed agent answers once and never runs the tool loop",
                         agent.name, agent.tools
+                    )));
+                }
+                // Grants are checked SEPARATELY from tools, not folded into the check
+                // above: `grants.json` is its own authoring surface (an operator can add
+                // a grant without ever touching the agent's `tools:` line), so a
+                // tools-only check would accept "this human may read files" and silently
+                // ignore it — exactly what the rule above refuses to do. There is no
+                // privilege hole either way (SP-4 s1 authorizes on `tool ∈ agent.tools`
+                // AND the grant, so a grant alone can never widen anything); this rejects
+                // the config because it states something untrue about the agent.
+                if !agent.grants.is_empty() {
+                    let mut named: Vec<&str> = agent.grants.keys().map(String::as_str).collect();
+                    named.sort_unstable(); // HashMap order varies; the message must not.
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {:?} is human-backed and may not declare tool grants ({}); a \
+                         human-backed agent answers once and never runs the tool loop, so a \
+                         grant here grants nothing",
+                        agent.name,
+                        named.join(", ")
                     )));
                 }
                 // The prompt IS the question put to the human.
@@ -1774,8 +1793,15 @@ mod tests {
         }
     }
 
+    /// The fixture registry HOLDS `fs_read`. That is load-bearing, not decoration:
+    /// with an empty tool table the pre-existing `UnknownToolRef` check fires FIRST
+    /// for any agent that names a tool, and its message ("agent \"reviewer\"
+    /// references unknown tool \"fs_read\"") happens to satisfy loose assertions on
+    /// the human-backing rules — a review proved the tools-on-a-human-agent rule
+    /// could be deleted outright with every test still green. Registering the tool
+    /// removes the masking check so the rule under test is the one that fires.
     fn registry_of(agents: Vec<AgentDefinition>) -> Registry {
-        let mut r = Registry::default();
+        let mut r = Registry::default().with_tool(tool_spec("fs_read"));
         for a in agents {
             r.agents.insert(a.name.clone(), a);
         }
@@ -1817,7 +1843,33 @@ mod tests {
             .expect_err("tools on a human agent");
         let m = format!("{e}");
         assert!(m.contains("reviewer"), "must name the agent: {m}");
-        assert!(m.contains("tool"), "must name the rule: {m}");
+        // Substrings UNIQUE to this rule. `contains("tool")` alone was satisfied by
+        // `UnknownToolRef`, which is why this test used to pass with the rule deleted.
+        assert!(m.contains("human-backed"), "must name the backing: {m}");
+        assert!(
+            m.contains("never runs the tool loop"),
+            "must name the reason: {m}"
+        );
+    }
+
+    /// A grant is inert without a tool — SP-4 s1 authorizes on `tool ∈ agent.tools`
+    /// AND `grants[tool].covers(…)`, so a grant alone can never widen anything. It is
+    /// still a lie in the config (it says a human may read files), and `grants.json`
+    /// is a SEPARATE authoring surface from the agent md, so it is reachable without
+    /// ever writing `tools:`. Reject it for the same reason the tools rule exists:
+    /// refuse the declaration rather than silently ignore it.
+    #[test]
+    fn a_human_backed_agent_may_not_declare_grants() {
+        let mut a = human_agent("reviewer");
+        a.grants.insert("fs_read".into(), Permissions::default());
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("grants on a human agent");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(m.contains("human-backed"), "must name the backing: {m}");
+        assert!(m.contains("grant"), "must name the rule: {m}");
+        assert!(m.contains("fs_read"), "must name the offending grant: {m}");
     }
 
     /// The prompt IS the question. An empty one asks a human nothing.
@@ -1826,7 +1878,23 @@ mod tests {
         let mut a = human_agent("reviewer");
         a.system_prompt = String::new();
         let e = registry_of(vec![a]).validate().expect_err("empty prompt");
-        assert!(format!("{e}").contains("reviewer"), "{e}");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        // Rule-specific: every message in the human block interpolates the name, so
+        // the name alone cannot tell which of the four rules fired.
+        assert!(m.contains("empty system_prompt"), "must name the rule: {m}");
+
+        // Whitespace-only is empty too — the `.trim()` is the only thing rejecting
+        // this, and without this case the trim could be dropped silently.
+        let mut a = human_agent("reviewer");
+        a.system_prompt = "   \n\t ".into();
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("whitespace-only prompt");
+        assert!(
+            format!("{e}").contains("empty system_prompt"),
+            "a whitespace-only prompt asks nothing either: {e}"
+        );
     }
 
     /// `MAX_AWAIT_SIGNAL_TIMEOUT` bounds the sibling kinds in `Graph::validate_dag`,
@@ -1841,10 +1909,20 @@ mod tests {
         };
         ok(chrono::Duration::hours(48)).expect("48h SLA");
         ok(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT).expect("exactly the bound");
+        // Each branch asserts a substring unique to ITSELF: the agent name appears in
+        // all four human-block messages, so naming it proves only that *some* rule
+        // fired, not which — and not that the two bounds are wired the right way round.
         let e = ok(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT + chrono::Duration::days(1))
             .expect_err("over the bound");
-        assert!(format!("{e}").contains("reviewer"), "{e}");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(m.contains("too long"), "must be the upper-bound rule: {m}");
         let e = ok(chrono::Duration::zero()).expect_err("non-positive");
-        assert!(format!("{e}").contains("reviewer"), "{e}");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(
+            m.contains("non-positive"),
+            "must be the lower-bound rule: {m}"
+        );
     }
 }
