@@ -22,6 +22,7 @@ mod durability;
 mod expand;
 mod fanout;
 mod gate;
+mod human;
 pub(crate) mod selector;
 mod signal;
 mod subgraph;
@@ -163,8 +164,14 @@ struct Fold {
     /// one for the same node.
     signals: HashMap<NodeId, serde_json::Value>,
     /// SP-6 s1: what each WAITING node recorded when it began waiting, folded from
-    /// `SignalAwaited` and — since SP-6 s2 — from `GateAwaited` too, so that "has this node
-    /// begun asking?" has ONE answer for both kinds.
+    /// `SignalAwaited` and — since SP-6 s2 and s3 — from `GateAwaited` and `AgentAwaited`
+    /// too, so that "has this node begun asking?" has ONE answer for all THREE waiting
+    /// kinds. Keep this list of writers current: every one of them is an
+    /// `entry().or_insert` in `fold_journal`, and
+    /// [`wait_or_expire`](Executor::wait_or_expire) reads the map without knowing which
+    /// kind wrote it — so a reader that reasons about which kinds can be present (see
+    /// `run_human_gate`'s missing-menu arm) is reasoning off THIS sentence.
+    ///
     /// FIRST record wins — the opposite of `signals`, and deliberately
     /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
     /// deadline forward, and a run force-woken every ten minutes with a one-hour timeout
@@ -172,12 +179,16 @@ struct Fold {
     ///
     /// The VALUE is itself an `Option`, so the two layers mean different things:
     /// *key absent* = this node has never begun waiting; `Some(None)` = it began waiting
-    /// with **no deadline** (the indefinite HITL gate). Folding that `None` as a real
-    /// value — rather than dropping it — is what makes the deadline-less arm of
+    /// with **no deadline** — the indefinite HITL gate, and since s3 also the indefinite
+    /// human agent (`AgentBacking::Human { timeout: None }`). Folding that `None` as a
+    /// real value — rather than dropping it — is what makes the deadline-less arm of
     /// [`run_await_signal`](Executor::run_await_signal) node-keyed idempotent: without it
     /// the node re-journals `SignalAwaited` on every drive, and a re-drive is NOT
     /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
-    /// keeps the whole run auto-wakeable).
+    /// keeps the whole run auto-wakeable). The same holds for the s2 and s3 kinds, which
+    /// re-journal `GateAwaited`/`AgentAwaited` respectively — see
+    /// `a_deadline_less_gate_records_that_it_began_asking` and
+    /// `a_deadline_less_human_agent_records_that_it_began_asking`.
     deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
     /// SP-6 s2: each `HumanGate`'s decision, folded from `GateDecided`. LAST wins, like
     /// `signals` and for the same reason: an operator must be able to correct a mistaken
@@ -188,8 +199,20 @@ struct Fold {
     /// not retroactively change what their answer meant.
     ///
     /// `deadlines` is folded from `GateAwaited` too, so the "has this node begun asking?"
-    /// question stays in one place for both waiting kinds.
+    /// question stays in one place — as of s3 for all three waiting kinds, not two.
     menus: HashMap<NodeId, Vec<orchestrator_core::GateOption>>,
+    /// SP-6 s3: each human-backed agent node's answer, from `AgentAnswered`. LAST wins,
+    /// like `signals`/`gate_decisions` and for the same reason: an operator must be able
+    /// to correct an answer before the run resumes.
+    agent_answers: HashMap<NodeId, AgentAnswer>,
+    /// SP-6 s3: the QUESTION each human-backed agent node published when it began
+    /// asking, from `AgentAwaited`. FIRST wins — the human was asked THIS question, and
+    /// a later ask must not retroactively change what their answer was to.
+    ///
+    /// `deadlines` is folded from `AgentAwaited` too, for the same reason it is folded
+    /// from `GateAwaited`: "has this node begun asking?" stays one question, and
+    /// `wait_or_expire` reads only `deadline_for`.
+    agent_prompts: HashMap<NodeId, String>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
     /// the shared arm 0 of the two WAITING node kinds, for which a failure is TERMINAL (an
@@ -238,6 +261,14 @@ struct Fold {
     /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
     /// this makes and why an unbudgeted run must never touch it.
     serial_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// SP-6 s3: a folded `AgentAnswered`.
+#[derive(Debug, Clone, PartialEq)]
+struct AgentAnswer {
+    text: String,
+    /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::AgentAnswered`.
+    actor: String,
 }
 
 /// SP-6 s2: a folded `GateDecided`.
@@ -301,14 +332,19 @@ impl Fold {
     /// SP-6 s1: what a waiting node recorded when it began waiting.
     ///
     /// Two layers, and they are not the same question:
-    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited`/`GateAwaited`).
-    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate).
+    /// - `None` — this node has NEVER begun waiting (no `SignalAwaited`/`GateAwaited`/
+    ///   `AgentAwaited` — the three writers of [`Fold::deadlines`], all of them).
+    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate, or
+    ///   since s3 the indefinite human agent).
     /// - `Some(Some(t))` — it began waiting with the absolute deadline `t`.
     ///
     /// Read through [`wait_or_expire`](Executor::wait_or_expire) — SP-6 s2's shared arm,
-    /// called on EVERY execution by BOTH `run_await_signal` and `run_human_gate`. It is the
-    /// durable half of the never-recompute rule; the caller must not fall back to
-    /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
+    /// called on EVERY execution by BOTH `run_await_signal` and `run_human_gate`. (s3's
+    /// `AgentAwaited` is already a WRITER as of this task; its reader, `run_human_agent`,
+    /// lands in the next one — the fold deliberately goes in first so the durable record
+    /// exists before anything reads it.) It is the durable half of the never-recompute
+    /// rule; the caller must not fall back to `now + timeout` when this returns `Some`, in
+    /// EITHER of its two inner shapes.
     fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         self.deadlines.get(node).copied()
     }
@@ -343,6 +379,36 @@ impl Fold {
     /// journaled, which this snapshot of the journal cannot yet see.
     fn menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::GateOption]> {
         self.menus.get(node).map(Vec::as_slice)
+    }
+
+    /// SP-6 s3: the answer folded for this human-backed agent node.
+    ///
+    /// Task 3 carried an `expect(dead_code)` here because the fold landed one task ahead
+    /// of its only non-test consumer. Task 4 shipped that consumer — `run_human_agent`
+    /// (`executor/human.rs`) reads this to complete the node — so the attribute is gone,
+    /// exactly as its own doc said it would be: an `expect` that is no longer needed is
+    /// itself a `-D warnings` failure, which is what made it delete itself rather than
+    /// silently outlive its reason the way a stale `allow` would.
+    fn agent_answer_for(&self, node: &NodeId) -> Option<&AgentAnswer> {
+        self.agent_answers.get(node)
+    }
+
+    /// SP-6 s3: the question THIS node published when it began asking.
+    ///
+    /// The node-keyed counterpart to [`Fold::deadline_for`], and the distinction is the
+    /// whole point: `deadline_for` answers "has SOME waiting kind begun here?" — all three
+    /// of `SignalAwaited`/`GateAwaited`/`AgentAwaited` write that map — whereas this
+    /// answers "did the HUMAN-BACKED AGENT kind begin here?", because only `AgentAwaited`
+    /// carries a prompt.
+    ///
+    /// `run_human_agent` reads it on the already-waiting path for exactly that reason. The
+    /// whole-slice review found the accessor unused in non-test builds and carrying an
+    /// `expect(dead_code)` — and the defect that predicted: a node whose id already bore a
+    /// `SignalAwaited` never took the `NotYetAsking` arm, so it published no question and
+    /// paused forever, unanswerable by every `torii` verb. `menu_for` is the same accessor
+    /// for `HumanGate`, read on the same arm for the same reason.
+    fn prompt_for(&self, node: &NodeId) -> Option<&str> {
+        self.agent_prompts.get(node).map(String::as_str)
     }
 }
 
@@ -654,7 +720,9 @@ impl Executor {
             budget: budget.map(|b| b.total_tokens),
             ..Default::default()
         };
-        let outcome = this.drive(run, graph, &fold).await?;
+        // The RUN's own graph: a human-backed `Agent` node here is at the one
+        // position §5.5 permits.
+        let outcome = this.drive(run, graph, &fold, false).await?;
         this.finalize_run(run, &outcome).await?;
         Ok(outcome)
     }
@@ -763,7 +831,9 @@ impl Executor {
             .clone()
             .with_expansion_seed(fold.expansions.len(), seed_nodes);
         this.rehydrate_context(&fold).await?;
-        let outcome = this.drive(run, graph, &fold).await?;
+        // The RUN's own graph: a human-backed `Agent` node here is at the one
+        // position §5.5 permits.
+        let outcome = this.drive(run, graph, &fold, false).await?;
         this.finalize_run(run, &outcome).await?;
         Ok(outcome)
     }
@@ -796,11 +866,29 @@ impl Executor {
     /// soft-dependent branches still run; the failure suppresses `RunCompleted`,
     /// so the run stays resumable (the slice-1/2 contract on a linear graph,
     /// where the failure has no downstream to skip).
+    ///
+    /// **`nested` says whether this drive is the RUN's own graph or one nested inside a
+    /// node of it**, and it exists for exactly one consumer: SP-6 s3's rule that a
+    /// human-backed role is legal only as a top-level `NodeKind::Agent`. `false` at the two
+    /// run-level callers (`run_inner`/`start_inner`); `true` at [`drive_nested`], which is
+    /// the single tail every `Subgraph`, `Branch` arm, `Loop`-`Subgraph` body and
+    /// planner-spliced `Expand` graph goes through.
+    ///
+    /// It is threaded rather than derived from the node path because the property is about
+    /// POSITION and nothing else carries it: `run_node` sees only a `&Node`, whose id is
+    /// already namespaced (`"{loop}/0/review"`) but whose SHAPE — a `/`-bearing id — is
+    /// also legal for a top-level node an author simply named that way. Deciding legality
+    /// on the caller instead was the shipped defect: `run_node`'s `Agent` arm passed a
+    /// hardcoded `true`, so wrapping the agent in a one-node `Subgraph` bypassed the rule
+    /// entirely and delivered "a human re-answers every `Loop` iteration" — one of the four
+    /// unbuilt features the refusal exists to prevent — through a trivial wrapper, and
+    /// through any untrusted `Expand` planner that splices such a node.
     async fn drive(
         &self,
         run: RunId,
         graph: &Graph,
         fold: &Fold,
+        nested: bool,
     ) -> Result<RunOutcome, OrchestratorError> {
         let mut state = DriveState::default();
         loop {
@@ -813,7 +901,7 @@ impl Executor {
                 // reads its Map's result from it) ends when the future resolves,
                 // before `apply_node_result` mutates `state`.
                 let result = self
-                    .run_node(run, node, fold, &state.outcome.outputs)
+                    .run_node(run, node, fold, &state.outcome.outputs, nested)
                     .await?;
                 self.apply_node_result(run, graph, node, result, fold, &mut state)
                     .await?;
@@ -1001,12 +1089,17 @@ impl Executor {
     /// `Err` (halting the run before any gateway call). `prior_outputs` carries the
     /// outputs of already-completed nodes this round advances past — a `Consolidate`
     /// reads its Map's result from it.
+    ///
+    /// `nested` is [`drive`](Self::drive)'s position flag, forwarded untouched to the one
+    /// arm that cares — see that function's doc for why the human-backed-role rule is
+    /// decided on position rather than on the calling function.
     async fn run_node(
         &self,
         run: RunId,
         node: &orchestrator_core::Node,
         fold: &Fold,
         prior_outputs: &HashMap<NodeId, serde_json::Value>,
+        nested: bool,
     ) -> Result<NodeExec, OrchestratorError> {
         match &node.kind {
             NodeKind::ModelCall { chain, payload } => {
@@ -1133,6 +1226,16 @@ impl Executor {
                         &context,
                         fold,
                         phase.as_deref(),
+                        // The ONE site where SP-6 s3's human-backed role can be legal —
+                        // and only when this drive is the RUN's own graph. `!nested`, not
+                        // a hardcoded `true`: `drive_nested` re-enters `drive` → `run_node`
+                        // for every `Subgraph`, `Branch` arm, `Loop`-`Subgraph` body and
+                        // planner-spliced `Expand` graph, so a literal `true` here declared
+                        // every one of those Agent nodes top-level. Review drove
+                        // `Loop { body: Subgraph([Agent -> human]) }` against the literal
+                        // and got two real journaled questions, at `lp/0/review` and
+                        // `lp/1/review`.
+                        !nested,
                     )
                     .await?
                 {

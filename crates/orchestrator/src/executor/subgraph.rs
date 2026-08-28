@@ -103,7 +103,11 @@ impl Executor {
         let inner = namespace_graph(prefix, graph);
         // `Box::pin` breaks the recursive `async fn` cycle (run_node → run_* →
         // drive_nested → drive → run_node): heap indirection keeps the future finite.
-        let nested = Box::pin(self.drive(run, &inner, fold)).await?;
+        // `nested: true` — this is the single tail EVERY nested drive goes through
+        // (`Subgraph`, a `Branch` arm, a `Loop`'s `Subgraph` body, an `Expand`'s
+        // planner-spliced graph), so clearing SP-6 s3's top-level flag here covers all
+        // four at once and cannot be forgotten at a new nesting site that reuses it.
+        let nested = Box::pin(self.drive(run, &inner, fold, true)).await?;
         if let Some(p) = nested.paused {
             return Ok(NodeExec::Paused {
                 reason: format!("{kind_label} {prefix} paused: {}", p.reason),

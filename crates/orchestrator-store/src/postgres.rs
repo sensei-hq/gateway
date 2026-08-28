@@ -1075,10 +1075,10 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
     use orchestrator_core::{
-        AgentDefinition, ChildStatus, CompactChild, ContentRef, ContentStore, ContextKey,
-        ContextRef, ContextStore, Digest, EffectClass, ExecutionJournal, Graph, JournalError,
-        JournalEvent, NetworkPolicy, NodeId, OrchestratorError, Permissions, RunId, RunStatus,
-        SchedulerStore, Scope, SkillDef, Snapshot, ToolSpec,
+        AgentBacking, AgentDefinition, ChildStatus, CompactChild, ContentRef, ContentStore,
+        ContextKey, ContextRef, ContextStore, Digest, EffectClass, ExecutionJournal, Graph,
+        JournalError, JournalEvent, NetworkPolicy, NodeId, OrchestratorError, Permissions, RunId,
+        RunStatus, SchedulerStore, Scope, SkillDef, Snapshot, ToolSpec,
     };
     // For `PgConnection::connect` on the advisory-lock guards' dedicated connection.
     use sqlx::Connection;
@@ -1727,6 +1727,7 @@ mod tests {
             tools: vec![tool_name.clone()],
             skills: vec!["concise".into()],
             system_prompt: "be careful".into(),
+            backed_by: AgentBacking::Model,
         };
 
         let input_schema =

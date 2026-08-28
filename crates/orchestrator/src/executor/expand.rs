@@ -45,7 +45,7 @@ impl Executor {
         }
         let plan_node = NodeId(format!("{}/__plan__", node_id.0));
         match self
-            .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None)
+            .drive_agent(run, &plan_node, agent_ref, input, &[], fold, None, false)
             .await?
         {
             AgentStep::Completed(out) => {
