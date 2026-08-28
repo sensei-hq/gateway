@@ -234,7 +234,16 @@ OWNERS, and so are bounded by two different rules.** An assembled prompt is rout
 AUTHORED half (`system_prompt` + activated skills + the node input), which a config author can
 trim, and whose breach really is a config error that should fail loudly at first execution. The
 `## Context` half is RUN DATA — every Hard dependency's full materialized output — so it is
-TRUNCATED per dependency, with a visible marker, to its own `MAX_HUMAN_CONTEXT_BYTES`.
+TRUNCATED, with a visible marker, to `MAX_HUMAN_CONTEXT_BYTES` for the section AS A WHOLE.
+
+> **Corrected 2026-08-28.** This sentence read "TRUNCATED per dependency … to *its own*
+> `MAX_HUMAN_CONTEXT_BYTES`", which reads as n × 32 KiB and is not what ships.
+> `render_context_section_bounded` splits ONE budget: `share = (budget - HEAD.len()) /
+> entries.len()`, evenly rather than first-come-first-served so one verbose upstream cannot crowd
+> the others out, followed by a hard clamp on the TOTAL. §6's own summary below states the sum
+> correctly, and `torii::render`'s `question_cell` doc carries the canonical three-number
+> statement: authored fails loudly over 4096, context truncates to 32768, the durable row is
+> clamped to their sum of 36864.
 
 > **This is the whole-slice review's worst finding.** As shipped, the 4 KiB cap was charged against
 > the whole composed question including `## Context`, so a human-backed node downstream of ANY node
@@ -336,8 +345,9 @@ at zero token cost.
 ## 6. Bounds and safety
 
 - **`--text` and the journaled `prompt` are both size-capped**, but they cannot share torii's
-  helper. `check_payload_size`/`MAX_PAYLOAD_BYTES` are `pub(crate)` in `crates/torii/src/cmd/run.rs`,
-  and **`orchestrator` does not depend on `torii`** — that is a reverse dependency the crate graph
+  helper. `check_payload_size` is `pub(crate)` in `crates/torii/src/cmd/run.rs` (`MAX_PAYLOAD_BYTES`
+  beside it is `pub` — this bullet said `pub(crate)` for both until 2026-08-28; the visibility was
+  never the argument), and **`orchestrator` does not depend on `torii`** — that is a reverse dependency the crate graph
   cannot express, not merely a visibility problem. So: a new `pub const MAX_HUMAN_TEXT_BYTES` in
   **`orchestrator-core`**, used by BOTH the executor (bounding the composed `prompt` before it is
   journaled) and torii (bounding `--text`/`--text-file`). One constant, two call sites, no
@@ -369,8 +379,32 @@ pre-redaction while writing post-redaction, and s2 repeated the shape.
   review caught the secret-in-`ps` exposure; s2 repeated it with `--note`. An agent's answer is the
   longest free text of the three and the most likely to be pasted from elsewhere.
 - **Every operator-facing string** — the answer, the actor, the prompt, the question in
-  `list-paused` — goes through `render::one_line` and a cap, and through the redactor before the
-  durable write.
+  `list-paused` — goes through a cap and through the redactor before the durable write. The
+  `render::one_line` half is NOT blanket, and the difference is deliberate:
+
+  | field | `one_line` on the way IN? | why |
+  |---|---|---|
+  | `--as` (actor) | **yes** (`cmd::human::answer`) | short, single-token by nature; collapsing costs nothing |
+  | `--text` (answer) | **no** — `trim` only | an answer is multi-line PROSE; collapsing it would mangle the work product |
+  | the journaled `prompt` | no — capped by the executor | `one_line` is applied at DISPLAY time by `render::question_cell` |
+
+  > **Corrected 2026-08-28**, and it concealed a real asymmetry worth stating outright rather
+  > than leaving to be re-derived. The actor is control-char-collapsed on the way in for a stated
+  > security reason — *"an escape sequence smuggled through `--as` would be re-rendered by every
+  > reader of this run's output and carried into every downstream model prompt"*, guarded by
+  > `a_hostile_actor_cannot_forge_a_line_or_move_the_cursor`. **The answer sits in the same
+  > durable `AgentAnswered` row, has the same readers, is MORE attacker-controlled, and gets no
+  > such treatment.** That is a DELIBERATE choice, not an oversight: an answer is the human's
+  > work product and collapsing newlines out of it would destroy the content the node exists to
+  > capture. What bounds the exposure is that torii has **no command that prints an answer back**
+  > — nothing reads `AgentAnswered.text` for display, so unlike the actor there is no torii
+  > render path for an escape sequence to reach. The residual readers are the executor's fold
+  > (the answer becomes the node's OUTPUT and travels into downstream model prompts, where
+  > control characters are inert) and any external consumer of `journal_events`, which owes its
+  > own sanitisation. The rule this spec should have stated: **sanitise at the WRITE only where
+  > the field's shape permits it losslessly; where it does not, sanitise at every READ and say
+  > who the readers are.** Anyone adding a fourth durable operator-supplied string owes one of
+  > those two, and must say which.
 - **`Registry::validate()` gains three rules and must SKIP one it already has.**
   - **Skip:** `validate()` today unconditionally requires every agent to resolve a chain
     (`agent.chain.is_none() && chain_binding(..).is_none()` ⇒ `UnknownChainRef`, in `Registry::validate`).

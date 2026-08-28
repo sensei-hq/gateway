@@ -87,7 +87,7 @@ source: crates/orchestrator*
 >   trait, a journaled ReAct planner sub-run at `"{expand}/__plan__"`, or a
 >   `PlannerSelector` that picks a `planning`-area agent for the goal (its pick journaled
 >   as `PlannerSelected`). A pure `feasible` gate validates the plan (agent-refs, reserved
->   ids `__plan__`/`__gate__`, DAG, node count) before splicing; run-scoped
+>   ids `__plan__`/`__gate__`/`__select__`, DAG, node count) before splicing; run-scoped
 >   `max_expansions`/`max_nodes`/`max_depth` caps backstop self-DoS (a breach is a hard
 >   `GlobalCapExceeded`). Output = the spliced subgraph's sink map; failure/pause propagate
 >   like `Subgraph`.

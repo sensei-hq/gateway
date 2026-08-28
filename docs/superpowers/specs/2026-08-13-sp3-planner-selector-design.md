@@ -71,13 +71,26 @@ pub trait PlannerSelector: Send + Sync {
     /// Pick one planner agent for `goal` from `candidates` (the sorted planner
     /// library). Returning `Err`, or an agent not in `candidates`, is a node-level
     /// failure the executor maps to `Failed` (never a panic).
+    ///
+    /// `dispatch` is the only provider access an implementation gets; a selector that
+    /// needs no model (see `RulePlannerSelector`) simply ignores it.
     async fn select(
         &self,
         goal: &serde_json::Value,
         candidates: &[AgentRef],
+        dispatch: &dyn ModelDispatch,
     ) -> Result<AgentRef, OrchestratorError>;
 }
 ```
+
+> **`dispatch` was added after this spec was written**, by the budget-completeness slice
+> (`65dffb8`), which shipped with no design or plan doc of its own — so until this correction
+> (2026-08-28) the parameter appeared in NO spec, and this block still showed the two-argument
+> form. It is the change that made `LlmPlannerSelector`'s one call a METERED, refusable dispatch
+> rather than a direct gateway call: the selector no longer holds a gateway, it is LENT one, and
+> `SelectorDispatch` is what makes it the fifth budgeted producer alongside the ReAct turn, the
+> `ModelCall` node, the `Map`-item call and the `Consolidate` synthesis. `orchestrator-core`'s
+> `planner.rs` is the source of truth for the signature.
 
 ### 4.2 Journal + fold + hook
 
