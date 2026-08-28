@@ -467,10 +467,29 @@ impl Registry {
         Ok(reg)
     }
 
-    /// Fail loud on *structural* unresolvability only: any agent that references
-    /// a skill/tool the registry doesn't hold, or an unroutable chain. Grants are
-    /// NOT checked here — a grant narrower than a tool's declared permission
-    /// surface is legal and is enforced per-call at runtime (ceiling model, SP-4 s1).
+    /// Fail loud at config-LOAD time on two classes of bad config.
+    ///
+    /// **Structural unresolvability** — an agent references a skill or tool the
+    /// registry doesn't hold, or (model-backed only) has no routable chain.
+    ///
+    /// **Human-backing coherence (SP-6 s3)** — a `backed_by: Human` agent may not
+    /// declare tools or grants (it answers once; the ReAct loop that would use them
+    /// never runs), must have a non-empty `system_prompt` (the prompt IS the question
+    /// put to the person), and its timeout must be positive and no longer than
+    /// `MAX_AWAIT_SIGNAL_TIMEOUT`. These are semantic, not resolvability: they reject
+    /// a config that states something untrue about the agent rather than one that
+    /// cannot be wired up.
+    ///
+    /// **The deliberate skip, which is the load-bearing behaviour here:** the
+    /// chain-resolvability rule does NOT apply to a human-backed agent. It resolves no
+    /// chain by construction, and this runs independently of the executor's runtime
+    /// short-circuit, so an unconditional rule would reject essentially every
+    /// human-backed agent before any node ever ran.
+    ///
+    /// Grants are otherwise NOT checked — a grant narrower than a tool's declared
+    /// permission surface is legal and is enforced per-call at runtime (ceiling model,
+    /// SP-4 s1). The human-backing rule above rejects grants only because a
+    /// human-backed agent can have no tool for them to apply to.
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         for agent in self.agents.values() {
             for skill in &agent.skills {
@@ -489,6 +508,9 @@ impl Registry {
                     });
                 }
             }
+            // A bool, not a binding: the chain rule below needs only "is this human?",
+            // and its condition reads better negated than as a match arm. The rules
+            // that follow bind the timeout instead (see below).
             let human = matches!(agent.backed_by, AgentBacking::Human { .. });
 
             // SP-6 s3: a human-backed role resolves NO chain by construction, so the
@@ -506,7 +528,11 @@ impl Registry {
                 });
             }
 
-            if human {
+            // Binds `timeout` in the same step that selects the human arm. This used to
+            // be `if human { … if let AgentBacking::Human { timeout: Some(t) } = … }`,
+            // an inner match that could never fail — two matches on one value, where
+            // the second only looked conditional.
+            if let AgentBacking::Human { timeout } = &agent.backed_by {
                 // The ReAct loop that would use these never runs, so a tool here is
                 // never reachable — the confused-deputy shape SP-4 s1 argues against.
                 // Reject the config rather than silently ignore the declaration.
@@ -550,7 +576,7 @@ impl Registry {
                 // caught only at runtime by `wait_or_expire`'s `checked_add_signed` (which
                 // fails the node rather than panicking, so it degrades safely), but both
                 // sibling slices treated the up-front bound as worth naming.
-                if let AgentBacking::Human { timeout: Some(t) } = &agent.backed_by {
+                if let Some(t) = timeout {
                     if *t <= chrono::Duration::zero() {
                         return Err(OrchestratorError::RegistryLoad(format!(
                             "agent {:?} has a non-positive timeout ({t}); use `None` to \
