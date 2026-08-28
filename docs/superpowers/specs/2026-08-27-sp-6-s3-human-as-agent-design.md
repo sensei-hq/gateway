@@ -193,22 +193,52 @@ point bypasses it. Third application of s1's lesson.
 **Cross-refusal is now three-way.** `run signal` → `AwaitSignal`; `run gate` → `HumanGate`;
 `run agent answer` → a human-backed `Agent`. Each refuses the other two, naming the right verb.
 
-### 5.4 The prompt is `assemble_prompt`'s output, composed before the backing check
+### 5.4 The prompt is the model-equivalent question, composed before the backing check
 
-The journaled `prompt` is the **full output of the existing `agent::prompt::assemble`** —
-`system_prompt` + activated skills (`Activation::OnKeywords` gating unchanged) + the rendered
-`## Context` section from predecessors. The human sees precisely what the model would have, which is
-the literal reading of "a human answering where a model would", and it needs no new
-prompt-building code that could drift from the model path.
+The journaled `prompt` is the **full output of the existing `agent::prompt::assemble`, PLUS the
+node's own input** — `system_prompt` + activated skills (`Activation::OnKeywords` gating unchanged)
++ the rendered `## Context` section from predecessors + `\n\n## Task\n{input}`. The human sees
+precisely what the model would have, which is the literal reading of "a human answering where a
+model would", and it needs no new prompt-building code that could drift from the model path.
 
-**Ordering, and why it works:** `assemble_prompt` is called at `agent.rs:75`, immediately *before*
-`resolve_chain` at `agent.rs:76`. It needs no chain. So the composition happens first, exactly where
-it does today, and the human-backing branch sits between it and `resolve_chain` — the model path is
-untouched and the human path reuses its work.
+> **Revised by Task 4's review, then by the whole-slice review.** This section originally said
+> "`assemble_prompt`'s output" full stop. That output is `(system, tools)` built from
+> `system_prompt` + skills + `## Context`: `assemble_prompt` takes the query only to evaluate
+> `activation.is_active(query)` and never returns it, and the model path supplies the input
+> separately as the first user message. Journaling it alone asked a reviewer to read a contract
+> nobody had named, which is showing the human LESS than the model would have had — the one thing
+> the accepted cost below rules out.
 
-**Consequence, named because it is load-bearing:** an assembled prompt is routinely multi-KB, so
-§6's size bound is a real constraint rather than a theoretical one. A role whose skills and context
-exceed it fails loudly at first execution.
+**Ordering, and why it works:** prompt assembly happens immediately *before* `resolve_chain` and
+needs no chain. So the composition happens first, exactly where it does today, and the
+human-backing branch sits between it and `resolve_chain` — the model path is untouched and the
+human path reuses its work. The implementation calls `assemble_prompt_parts`, which is
+`assemble_prompt` stopping one step short of joining its two halves; the model path re-joins them
+and is byte-identical.
+
+**Consequence, named because it is load-bearing: the question's two halves have two different
+OWNERS, and so are bounded by two different rules.** An assembled prompt is routinely multi-KB, so
+§6's size bound is a real constraint rather than a theoretical one — but it applies only to the
+AUTHORED half (`system_prompt` + activated skills + the node input), which a config author can
+trim, and whose breach really is a config error that should fail loudly at first execution. The
+`## Context` half is RUN DATA — every Hard dependency's full materialized output — so it is
+TRUNCATED per dependency, with a visible marker, to its own `MAX_HUMAN_CONTEXT_BYTES`.
+
+> **This is the whole-slice review's worst finding.** As shipped, the 4 KiB cap was charged against
+> the whole composed question including `## Context`, so a human-backed node downstream of ANY node
+> that produced ~1000 tokens failed TERMINALLY — after the upstream tokens were already spent,
+> unrecoverably (`gate_precheck_by_id` reads the `NodeFailed` back on every later drive), with a
+> message naming three config fields that were not the cause. Measured: 4126 bytes for a role with a
+> 60-byte system prompt, no skills and a 12-byte input. It defeated this slice's own headline
+> example — a reviewer reading a contract, which is over 4 KiB essentially always — and it sat
+> against a codebase whose default `cas_threshold` is also 4096, i.e. one that already treats a
+> >4 KiB effect output as ordinary enough to SPILL rather than refuse.
+
+**The journaled prompt is redacted before the durable write**, at the executor's own redactor, like
+every other durable string on this path (§6). As shipped it was not, which made the `AgentAwaited`
+row the one place a credential in an agent's `system_prompt` or a skill body reached durable
+storage in the clear — `torii config push` redacts nothing, and `render::redact_question` is a
+display pass, not a durability one.
 
 **Accepted cost:** skills written for a model may read oddly to a person. That is preferred to
 showing the human *less* than the model would have had, which would let them answer without context
@@ -273,12 +303,20 @@ at zero token cost.
   **`orchestrator-core`**, used by BOTH the executor (bounding the composed `prompt` before it is
   journaled) and torii (bounding `--text`/`--text-file`). One constant, two call sites, no
   duplicated number.
-- **The prompt's over-bound behaviour is a `NodeFailed`, not a CLI refusal.** The prompt is composed
-  inside `drive_agent`, where no exit-2 path exists. s1 §6.5's `ContentStore`/`split_output` route
-  was considered and rejected for this field: `AgentAwaited.prompt` is a bare `String` with no
-  ref-or-inline alternative (the same shape argument s1 made for `SignalReceived.payload`), and a
-  question too large to journal is a malformed agent config, which should fail loudly at first
+- **The AUTHORED prompt's over-bound behaviour is a `NodeFailed`, not a CLI refusal.** The prompt is
+  composed inside `drive_agent`, where no exit-2 path exists. s1 §6.5's `ContentStore`/`split_output`
+  route was considered and rejected for this field: `AgentAwaited.prompt` is a bare `String` with no
+  ref-or-inline alternative (the same shape argument s1 made for `SignalReceived.payload`), and an
+  over-bound AUTHORED prompt is a malformed agent config, which should fail loudly at first
   execution rather than silently spill to CAS.
+- **The `## Context` half is NOT a config error and does not fail the node.** Corrected by the
+  whole-slice review, which found this bullet claiming that a question too large to journal is
+  "a malformed agent config" — it is not; it is a data-dependent RUNTIME condition, since
+  `assemble_prompt` renders every Hard dependency's full output into that section verbatim. It is
+  bounded by `MAX_HUMAN_CONTEXT_BYTES` through per-dependency truncation with a visible marker, so
+  the durable row stays bounded (the cap's actual justification) while a verbose upstream degrades
+  the question instead of killing the run. The overall bound on a journaled question is therefore
+  `MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES`.
 - **`--as` defaults to `$USER`**, reusing `cmd::gate::actor_or`/`actor_or_user` verbatim rather than
 re-deriving it — never-empty, falling back to `"unknown"`. One definition of "who answered" across
 both human-facing verbs.
@@ -349,7 +387,7 @@ guard the line they appeared to, and every one was caught by asking that questio
 | **AC13** Cross-process e2e (Postgres) | submit → pause → `list-paused` shows the question → answer in process B → fresh `worker serve --once` completes it | Swap the answer for a bare `wake` → stays `Paused` |
 | **AC15** A human-backed agent is rejected at every non-top-level site | Each of `MapBody`/`LoopBody`/`GateSpec::Agent`/planner fails the node loudly, naming the site | Drop the caller flag → a human-backed planner reaches `parse_plan` |
 | **AC16** `validate()` skips the chain requirement for `Human` | A human-backed agent with no `chain` and no binding loads | Leave the chain check unconditional → every human-backed config is rejected at load |
-| **AC17** The journaled prompt is `assemble_prompt`'s output | The prompt contains an activated skill's body and the `## Context` section | Compose `system_prompt` alone → the skill text is absent |
+| **AC17** The journaled prompt is `assemble_prompt`'s output PLUS the node's input, with `## Context` truncated rather than fatal | The prompt contains an activated skill's body, the `## Context` section and the node input; a verbose upstream truncates with a marker instead of failing the node | Compose `system_prompt` alone → the skill text is absent; drop the input → the reviewer is asked about an unnamed contract; charge `MAX_HUMAN_TEXT_BYTES` against `## Context` → an ordinary upstream kills the node |
 | **AC14** Additivity | No human-backed agent ⇒ byte-identical; suite stays **1505** + new | — (the baseline guard) |
 
 **AC13 is `DATABASE_URL`-gated.** It returns early without one and is therefore **counted as passed
