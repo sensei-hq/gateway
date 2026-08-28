@@ -339,17 +339,37 @@ pub async fn answer(
     // Collapsed on the way IN, not just on the way out — unlike the node id, which is
     // journaled as given. `actor` is folded into the node's OUTPUT, so an escape sequence
     // smuggled through `--as` would be re-rendered by every reader of this run's output and
-    // carried into every downstream model prompt.
+    // carried into every downstream model prompt. Guarded by
+    // `a_hostile_actor_cannot_forge_a_line_or_move_the_cursor`, on the JOURNALED row rather
+    // than on stdout: the actor is never echoed in the outcome text, so a stdout assertion
+    // would pass while the durable row still carried the newline and the escape. It is a
+    // test because review mutated this call to `actor.to_string()` and the whole crate —
+    // lib, cli and e2e — stayed green.
     //
-    // The SIBLING field on the same durable row, held to the same bound and by the same
-    // helper — `--as` was bounded by nothing on `gate decide` while `--note` was capped, and
-    // `ARG_MAX` permits a ~131 KB actor. Measured on the COLLAPSED value, because those are
-    // the bytes actually written, and `Measured::AsGiven` because an actor is NOT redacted:
-    // labelling it `AfterRedaction` would print a growth explanation naming a transform this
-    // value never went through.
-    let actor = render::one_line(actor);
-    check_human_text_size(&actor, Measured::AsGiven, "the answer's actor (--as)")
-        .map_err(CliError::error)?;
+    // The SIBLING field on the same durable row, held to the same bound AND the same
+    // redaction as the answer beside it. `--as` was bounded by nothing on `gate decide`
+    // while `--note` was capped, and `ARG_MAX` permits a ~131 KB actor.
+    //
+    // **Redacted, and redacted BEFORE the size check.** The whole-slice review found this
+    // field reaching `journal_events` in plaintext while `text` on the same row was
+    // scrubbed — against design §6, which lists the actor by name among the strings that go
+    // "through the redactor before the durable write". `--as` is exactly the field an
+    // operator scripts (`--as "$CI_TOKEN_OWNER"`), and the executor's fold-read redactor is
+    // no backstop: `Executor::with_redactor` is opt-in and defaults to `None`, so an
+    // embedder without it carries a plaintext actor into the node's output, the blackboard
+    // and every downstream prompt — and the durable jsonb keeps it either way.
+    //
+    // The order is the answer's, for the answer's reason: `[REDACTED]` is longer than the
+    // shortest span it replaces, so redaction can GROW the value past the cap, and checking
+    // the raw text would bound a value nobody stores. `Measured::AfterRedaction` moves with
+    // it, so an operator told "5580 bytes" for a 4030-byte actor gets the explanation.
+    let actor = redact_answer(&render::one_line(actor));
+    check_human_text_size(
+        &actor,
+        Measured::AfterRedaction,
+        "the answer's actor (--as)",
+    )
+    .map_err(CliError::error)?;
 
     // A node id is operator-supplied free text and every message below echoes it back to a
     // terminal, so control characters are collapsed for DISPLAY — a raw newline or an ANSI
@@ -996,6 +1016,81 @@ pub(crate) mod tests {
             "the answer reached durable storage in plaintext: {durable}"
         );
         assert!(durable.contains("[REDACTED]"), "{durable}");
+    }
+
+    /// The SIBLING field on the same durable row, held to the same rule.
+    ///
+    /// Design §6: "Every operator-facing string — the answer, the actor, the prompt, the
+    /// question in `list-paused` — … goes through the redactor before the durable write."
+    /// The whole-slice review found `actor` reaching `journal_events` in plaintext while
+    /// `text` on the SAME `AgentAnswered` row was scrubbed: it got `render::one_line` and a
+    /// size check and no redaction pass at all.
+    ///
+    /// `--as` is exactly the field an operator scripts (`--as "$CI_TOKEN_OWNER"`,
+    /// `--as "$(vault read ...)"`), and `render::redact_payload`'s own doc states the reason
+    /// the scrub exists at all: "a human who pastes a token has put it into durable storage
+    /// permanently". The exposure is not bounded by the executor's fold-read redactor
+    /// either: that is opt-in (`Executor::with_redactor`, default `None`), so an embedder
+    /// without it carries the plaintext actor into the node's OUTPUT, the blackboard, the
+    /// CAS blob and every downstream model prompt — and the durable jsonb keeps it either
+    /// way.
+    ///
+    /// The redaction runs BEFORE the size check, so the bytes checked are the bytes
+    /// written, and the check's label moves to `Measured::AfterRedaction` with it because
+    /// `[REDACTED]` can now GROW this value past the cap — the exact ordering defect s1 and
+    /// s2 each shipped once for the answer.
+    #[tokio::test]
+    async fn a_secret_shaped_actor_is_redacted_before_it_is_journaled() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+        let secret = format!("sk-{}", "A".repeat(24));
+
+        answer(&s, &j, run, reviewer(), "ship it", &secret, now())
+            .await
+            .expect("delivers");
+
+        let durable = format!("{:?}", j.load(run).await.unwrap());
+        assert!(
+            !durable.contains(&secret),
+            "the actor reached durable storage in plaintext: {durable}"
+        );
+        assert!(durable.contains("[REDACTED]"), "{durable}");
+    }
+
+    /// `render::one_line(actor)` is load-bearing and was guarded by nothing: review mutated
+    /// it to `actor.to_string()` and the whole `sensei-torii` suite (lib + cli + e2e) stayed
+    /// green.
+    ///
+    /// The hazard is strictly worse than the node id's, which IS pinned
+    /// (`a_hostile_node_id_cannot_forge_a_line_or_move_the_cursor`): a node id is only
+    /// echoed to a terminal, whereas `actor` is folded into the node's OUTPUT and travels
+    /// into every downstream model prompt and every later render of this run.
+    ///
+    /// Asserted on the JOURNALED row rather than on stdout, because the actor is not echoed
+    /// in the outcome text — a stdout-only assertion would pass while the durable row still
+    /// carried the newline and the escape.
+    #[tokio::test]
+    async fn a_hostile_actor_cannot_forge_a_line_or_move_the_cursor() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+        let hostile = format!(
+            "mallory\n{}  x  y\u{1b}[2K",
+            crate::cmd::run::tests::FORGED_RUN
+        );
+
+        answer(&s, &j, run, reviewer(), "ship it", &hostile, now())
+            .await
+            .expect("delivers");
+
+        let answers = journaled_answers(&j, run, &reviewer()).await;
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        let actor = &answers[0].1;
+        assert!(
+            !actor.contains('\n') && !actor.contains('\u{1b}'),
+            "a control character survived into the durable actor: {actor:?}"
+        );
     }
 
     // ---- AC7: the three-way cross-refusal, proven in one place ------------------------
