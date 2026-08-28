@@ -128,8 +128,9 @@ fn prompt_for(&self, node: &NodeId) -> Option<&str>
 LAST wins for the answer (an operator can correct it before the run resumes); FIRST wins for the
 prompt (the human was asked THIS question). **`fold_journal` must also add an `AgentAwaited` arm to
 the SHARED `deadlines` map** — `entry().or_insert(*deadline)`, exactly as s2's `GateAwaited` arm does
-at `mod.rs:166` — because `wait_or_expire` reads `deadline_for` and knows nothing about which kind
-recorded it. Both arms explicit, never a catch-all.
+in `fold_journal` — because `wait_or_expire` reads `deadline_for` and knows nothing about which kind
+recorded it. Both arms explicit, never a catch-all. (`Fold::deadlines`, whose doc comment keeps the
+list of all three writers current, is the field they share.)
 
 ## 5. Architecture
 
@@ -258,14 +259,24 @@ the model would have seen.
 ### 5.5 A human-backed agent is legal ONLY as a top-level `Agent` node
 
 `drive_agent` is the shared choke point for **six** call sites, not one: `run_node`
-(`mod.rs`), `run_map` and `run_consolidate` (`MapBody::Agent`, `fanout.rs:183,269` — two DISTINCT
-sites), `run_loop`'s body (`LoopBody::Agent`), `run_loop`'s **gate** (`GateSpec::Agent`, the
+(`mod.rs`), `run_map` and `run_consolidate` (`MapBody::Agent`, `fanout.rs` — two DISTINCT
+sites, one inside EACH of those two functions, which is the whole reason both are named),
+`run_loop`'s body (`LoopBody::Agent`), `run_loop`'s **gate** (`GateSpec::Agent`, the
 reserved `"{loop}/{i}/__gate__"` path), and `expand.rs`'s `drive_planner_agent`
 (`PlannerRef::Agent`/`Select`).
 
+**Sites are named by FUNCTION, never by line number.** The re-review found this paragraph
+mapping `run_map`→`fanout.rs:183` and `run_consolidate`→`:269` with the two swapped — 183 is
+inside `run_consolidate` and 269 inside `run_map` — on the one line whose entire purpose is to
+establish that they are two distinct sites. A bare line number rots on the first edit above it
+and then actively misdirects; `rg -n 'async fn run_' crates/orchestrator/src/executor/fanout.rs`
+locates any of them in one command and cannot go stale. The rest of this section already dropped
+its numbers for `mod.rs`, `run_loop`'s body and gate, and `expand.rs`; this completes the pass.
+
 Mechanically the pause already composes at all of them — `AgentStep::Paused` becomes
-`MapChildPaused` and pauses the whole Map (`fanout.rs:291-337`); a Loop body/gate pause propagates
-straight out. **But each is a different feature**, and only the first is in scope:
+`MapChildPaused`, which `run_map`'s child-fold turns into `NodeExec::Paused` for the whole Map;
+a Loop body/gate pause propagates straight out. **But each is a different feature**, and only the
+first is in scope:
 
 | site | if human-backed | verdict |
 |---|---|---|
@@ -306,7 +317,7 @@ real question to a human.
 
 ### 5.6 The `on_agent_started` hook does not fire for a human-backed agent
 
-`agent.rs:97` calls `h.on_agent_started(run, node_id, &agent_ref.0, &ar.chain)` — it requires a
+`run_agent`'s model path calls `h.on_agent_started(run, node_id, &agent_ref.0, &ar.chain)` — it requires a
 resolved `chain: &str`, which a human-backed agent by construction never has. Since the branch sits
 before `resolve_chain`, there is no chain to pass and the hook is **not** called. Recorded rather
 than left to be discovered: the hook's contract is "an agent turn is starting against this chain",
@@ -362,7 +373,7 @@ pre-redaction while writing post-redaction, and s2 repeated the shape.
   durable write.
 - **`Registry::validate()` gains three rules and must SKIP one it already has.**
   - **Skip:** `validate()` today unconditionally requires every agent to resolve a chain
-    (`agent.chain.is_none() && chain_binding(..).is_none()` ⇒ `UnknownChainRef`, `registry.rs:450-475`).
+    (`agent.chain.is_none() && chain_binding(..).is_none()` ⇒ `UnknownChainRef`, in `Registry::validate`).
     That runs at **config-load time**, independent of the runtime short-circuit, so it would reject
     most human-backed agents before any node ever executed. It must not apply to `Human` backing —
     a human-backed role has no chain by construction, and forcing a dummy binding would be a lie in
