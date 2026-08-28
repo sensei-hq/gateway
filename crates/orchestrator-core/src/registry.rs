@@ -787,6 +787,26 @@ fn optional_pairs(
 /// [`Registry::validate`], which is the one place they can also catch a definition
 /// that arrived as a jsonb row from Postgres rather than from an md file. Duplicating
 /// them here would let the two copies drift.
+///
+/// **"Loud" has to mean `Err` on EVERY input, including the ones that never reach this
+/// function's own checks.** Two classes used to panic instead, and both are reachable from
+/// an operator's `agents/*.md` through `FilesystemConfigSource::load` — i.e. from
+/// `torii config diff` / `torii config push`, where a panic aborts the CLI with a raw
+/// backtrace (exit 101) rather than the guided message below:
+///
+/// - The unit was split off with `text.split_at(text.len() - 1)`, a BYTE index.
+///   `str::split_at` requires a char boundary, so `timeout: 48ℏ` panicked inside
+///   `core::str` before the digit check ran. Split on CHARACTERS instead — `char_indices`
+///   gives the byte offset of the last char, which is a boundary by construction.
+/// - `chrono::Duration::{seconds,minutes,hours,days}` PANIC past `TimeDelta`'s range, and
+///   the digit check does not bound magnitude: `999999999999999d` is ASCII, parses as an
+///   `i64`, and then blew up in `chrono`. The `try_*` constructors return `None` there, so
+///   the overflow becomes the same loud error as a typo. `validate`'s century bound cannot
+///   substitute — it runs long after this function has already unwound — and a `u64`/`u128`
+///   digit type would not help either, since the panic is about the SCALED total.
+///
+/// Guarded by `agent_from_frontmatter_rejects_an_unparsable_timeout`, whose table carries
+/// a case for each class.
 fn parse_fm_duration(text: &str) -> Result<chrono::Duration, OrchestratorError> {
     let loud = || {
         OrchestratorError::FrontmatterParse(format!(
@@ -794,18 +814,26 @@ fn parse_fm_duration(text: &str) -> Result<chrono::Duration, OrchestratorError> 
              e.g. `timeout: 48h`, or omit the key to wait indefinitely"
         ))
     };
-    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+    // The byte offset of the LAST character, which `char_indices` guarantees is a char
+    // boundary — so neither of these two slices can panic, whatever the input's encoding.
+    let Some((split, _)) = text.char_indices().next_back() else {
+        return Err(loud());
+    };
+    let (digits, unit) = (&text[..split], &text[split..]);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(loud());
     }
     let n: i64 = digits.parse().map_err(|_| loud())?;
+    // `try_*`, never the infallible constructors: an in-range `i64` count of days is still
+    // an out-of-range `TimeDelta`, and the infallible form's answer to that is a panic.
     match unit {
-        "s" => Ok(chrono::Duration::seconds(n)),
-        "m" => Ok(chrono::Duration::minutes(n)),
-        "h" => Ok(chrono::Duration::hours(n)),
-        "d" => Ok(chrono::Duration::days(n)),
-        _ => Err(loud()),
+        "s" => chrono::Duration::try_seconds(n),
+        "m" => chrono::Duration::try_minutes(n),
+        "h" => chrono::Duration::try_hours(n),
+        "d" => chrono::Duration::try_days(n),
+        _ => None,
     }
+    .ok_or_else(loud)
 }
 
 /// Parse the `backed_by` + `timeout` pair (SP-6 s3).
@@ -1018,9 +1046,59 @@ mod tests {
     /// A bare number is ambiguous (48 what?) and an unknown unit is a typo; both are
     /// loud rather than guessed. Bounds (positive, <= the century cap) belong to
     /// `validate`, so this parser is purely syntactic.
+    ///
+    /// **"Loud" means `Err`, and it has to be asserted against a PANIC, not only against
+    /// a wrong `Ok`.** The whole-slice review found `parse_fm_duration` panicking on two
+    /// classes of input while this table — every case of which was ASCII, short and
+    /// well-formed apart from its unit — stayed green, so the property the test names was
+    /// not the property it tested:
+    ///
+    /// - `48ℏ` / `48é` / `48ч`: the parser split the unit off with
+    ///   `text.split_at(text.len() - 1)`, a BYTE index. `str::split_at` requires a char
+    ///   boundary, so any multi-byte final character panicked inside `core::str` before a
+    ///   single one of this function's own checks ran. (A trailing NON-BREAKING SPACE does
+    ///   NOT reach it — `parse_fields` trims Unicode whitespace first — so the trigger is
+    ///   specifically a multi-byte, non-whitespace final char.)
+    /// - `999999999999999d` / `99999999999999999s`: the digits are ASCII and parse as an
+    ///   `i64` just fine, and then `chrono::Duration::days`/`seconds` PANIC on a magnitude
+    ///   past `TimeDelta`'s range. `Registry::validate`'s century bound cannot help; it
+    ///   runs long after this function has already unwound.
+    ///
+    /// It is not a theoretical reachability argument: both classes arrive through
+    /// `FilesystemConfigSource::load`, i.e. `torii config diff` / `torii config push`
+    /// reading an operator's `agents/*.md`, and a panic there aborts the CLI with a raw
+    /// backtrace (exit 101) instead of the guided parse error this function exists to
+    /// produce.
+    ///
+    /// The empty and list-valued cases below guard `parse_backing`'s own `timeout` arm
+    /// rather than `parse_fm_duration`: `optional_scalar` maps both to `None`, so an arm
+    /// that used it would read `timeout:` (blank) as "no SLA" and silently drop an SLA the
+    /// author believes they set — after which the node pauses with `resume_after: None`, a
+    /// NULL `next_wake`, and the SP-DATA-3 scheduler never auto-wakes it. Review mutated
+    /// that arm to do exactly that and the whole workspace stayed green.
     #[test]
     fn agent_from_frontmatter_rejects_an_unparsable_timeout() {
-        for bad in ["48", "48x", "h", "-1h", "1.5h", "48 h", "1h30m"] {
+        for bad in [
+            "48",
+            "48x",
+            "h",
+            "-1h",
+            "1.5h",
+            "48 h",
+            "1h30m",
+            // Multi-byte final character — a byte-index split panics here.
+            "48\u{210F}",
+            "48é",
+            "48ч",
+            // Past `chrono::TimeDelta`'s range — the infallible constructors panic here.
+            "999999999999999d",
+            "99999999999999999s",
+            "9999999999999999999999h",
+            // `parse_backing`'s arm: present but unusable spellings of the key.
+            "",
+            "[]",
+            "[48h]",
+        ] {
             let md = format!(
                 "---\nname: n\narea: a\nkind: k\nbacked_by: human\ntimeout: {bad}\n---\nb\n"
             );
