@@ -1639,10 +1639,43 @@ async fn a_human_backed_agent_answered_in_another_process_completes_the_run() {
         .await
         .expect("list-paused");
     assert_eq!(listed.code, torii::errors::EXIT_OK, "{}", listed.text);
-    // Anchored PAST the header, for the reason the gate e2e spells out: `scheduled_runs`
-    // is global, and this run's own table row already carries the question incidentally
-    // inside its pause reason, so a search of the whole output would pass with the
-    // awaiting block empty.
+    // The question is asserted on this run's OWN row INSIDE the awaiting block, and both
+    // anchors are load-bearing — but NOT for the gate e2e's reason, which an earlier
+    // version of this comment copied down here and which is FALSE for a role. A gate's
+    // pause reason really does list its menu (`human_gate: waiting for a decision on node
+    // release-… (ship | hold)`), so for a gate a whole-output `contains("ship")` passes off
+    // the TABLE row with the awaiting block empty. A human-backed role's pause reason
+    // carries the node id and the deadline and NOTHING else — `executor/human.rs` builds it
+    // from exactly those two — so the question cannot leak into the table that way. The
+    // assertion below pins that, because the whole argument for anchoring rests on it.
+    //
+    // What makes each anchor load-bearing here, both observed against a live database
+    // rather than reasoned about:
+    //
+    //   * `starts_with(marker)` + the node id, because `scheduled_runs` is GLOBAL and every
+    //     human-backed run in this suite asks the IDENTICAL question — one `REVIEWER_PROMPT`
+    //     const, one registry. A run left paused by an earlier failed invocation is still
+    //     listed, so this block legitimately renders a STRANGER's `agent:` row carrying the
+    //     same prompt, and an unanchored `listed.text.contains(REVIEWER_PROMPT)` is
+    //     satisfied by it. Two consecutive runs against one database rendered exactly that:
+    //     two `agent:` rows differing only in their run and node ids.
+    //   * `split_once` past the header, because the TABLE row above ALSO starts with the
+    //     marker and names the node (its reason interpolates the node id), so an unanchored
+    //     `find` lands there first — and that line satisfies `contains("agent:")` through
+    //     the `human_agent:` prefix of its reason. Unanchored, the kind assertion below
+    //     would pass on a line that is not in the awaiting block at all.
+    let first_match = listed
+        .text
+        .lines()
+        .find(|l| l.starts_with(&marker) && l.contains(&review.0))
+        .expect("at minimum, this run's own table row");
+    assert!(
+        !first_match.contains(REVIEWER_PROMPT),
+        "a role's pause reason must NOT carry the question — it is the node id and the \
+         deadline only. If it ever does, the anchoring argument above changes and the \
+         question assertions stop distinguishing the awaiting block from the table: \
+         {first_match}"
+    );
     let block = listed
         .text
         .split_once("AWAITING A SIGNAL")
