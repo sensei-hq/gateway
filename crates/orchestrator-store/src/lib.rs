@@ -20,6 +20,17 @@ pub use stores::{InMemoryContentStore, InMemoryContextStore};
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
+/// The ONE database-test isolation guard, lent to every crate whose tests write the global
+/// `orchestrator.*` tables — this crate's own suite, `sensei-torii`, and
+/// `sensei-orchestrator` (which has no `sqlx` dependency of its own and therefore CANNOT
+/// hold a copy).
+///
+/// Gated on `postgres` (it needs `sqlx`) and on being a test build one way or another:
+/// `test` for this crate's own suite, `test-support` for a dependent's. Never compiled into
+/// a production build, so `tokio` stays out of one too.
+#[cfg(all(feature = "postgres", any(feature = "test-support", test)))]
+pub mod test_guard;
+
 /// The shared, `Seq`-stamped event log keyed by run, guarded for concurrent
 /// appends and clonable across executors.
 type SharedLog = Arc<Mutex<HashMap<RunId, Vec<(Seq, JournalEvent)>>>>;
