@@ -573,10 +573,33 @@ fn run_help_lists_agent() {
 /// `question`, `awaiting_nodes` folds `AgentAwaited` into it, and `render::awaiting_section`
 /// renders it in the node's own `agent:` row.
 ///
-/// It stays a test in both directions because this exact class of defect — a CLI help
-/// sentence describing behaviour the command does not have — has been caught SEVEN times in
-/// this feature. Keeping it as an assertion means the help and the renderer cannot drift
-/// apart again in EITHER direction: delete the question from the listing and this reddens.
+/// **This test pins the HELP side, and only that side.** It inspects `--help` stdout and
+/// has no path to the renderer, so it cannot see whether `list-paused` still shows a
+/// question. An earlier draft of this comment claimed it could ("delete the question from
+/// the listing and this reddens"), which was false and was caught in review — the eighth
+/// instance of the same class of defect this test exists to prevent, now in the doc of the
+/// guard itself. Measured rather than argued: with
+/// `cmd::run::awaiting_nodes`'s `let question = questions.get(&node).cloned();` replaced by
+/// `None` — the question gone from both the table cell and `--json` — the whole `--test cli`
+/// target still passes 26/26.
+///
+/// The renderer side is pinned by the LIB tests in another target, which the same mutation
+/// reddens six of: `cmd::run::tests::list_paused_shows_a_human_agents_question`,
+/// `list_paused_tells_a_human_backed_agent_from_an_await_signal`,
+/// `an_overlong_question_is_capped_so_it_cannot_wreck_the_block`,
+/// `a_secret_shaped_question_is_redacted_in_the_listing`,
+/// `an_ordinary_prose_question_that_wraps_after_bearer_survives` and
+/// `a_control_bisected_secret_in_a_question_is_still_withheld`. Nothing MECHANICALLY couples
+/// the two halves — this file cannot reach `list_paused` (it drives the built binary, and
+/// the listing needs a store and a journal), so the coupling is this comment plus the pair
+/// of test names. If the question is ever dropped from the listing, those six go red and
+/// this one does not; a reviewer following that trail must then delete the help sentence
+/// here too.
+///
+/// It stays a test in both directions all the same, because a CLI help sentence describing
+/// behaviour the command does not have has been the recurring defect of this feature: the
+/// help may not promise the question until the renderer shows one, and — the direction this
+/// assertion covers — may not stop promising it while the renderer does.
 ///
 /// The pointer at `list-paused` survives the flip: it is the only way an operator discovers
 /// a node id without reading the graph.

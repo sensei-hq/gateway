@@ -510,7 +510,10 @@ pub(crate) fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> 
 ///
 /// The question is REDACTED here, once, so that every sink is covered by construction. See
 /// [`render::AwaitingNode::question`] for why that scrub belongs on this side and why the
-/// collapse-and-cap does not.
+/// collapse-and-cap does not. It uses [`render::redact_question`], NOT the pause-reason
+/// transform it was written with: that one discards the whole string on either-direction
+/// disagreement, which for a question means an operator who cannot see what they are being
+/// asked — and it fired on ordinary prose (a line ending in the word "bearer").
 fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
     let menus: HashMap<NodeId, Vec<String>> = events
         .iter()
@@ -540,7 +543,7 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
             _ => None,
         })
         .fold(HashMap::new(), |mut acc, (n, p)| {
-            acc.entry(n).or_insert_with(|| render::redact_reason(p));
+            acc.entry(n).or_insert_with(|| render::redact_question(p));
             acc
         });
 
@@ -4253,7 +4256,25 @@ pub(crate) mod tests {
             "the table leaked: {}",
             out.text
         );
-        assert!(out.text.contains("[REDACTED"), "{}", out.text);
+        // The EXACT placeholder, not `contains("[REDACTED")`. Task 6's review caught that
+        // the loose prefix is satisfied by `render::WITHHELD_REASON`
+        // (`[REDACTED: reason withheld]`) as well as by the real placeholder, so a
+        // transform that threw the whole question away — the one this test's sibling
+        // `an_ordinary_prose_question_that_wraps_after_bearer_survives` exists to forbid —
+        // would have passed here while destroying the feature.
+        assert!(
+            out.text.contains("[REDACTED]"),
+            "the secret must be replaced by the placeholder: {}",
+            out.text
+        );
+        // …and the rest of the question must SURVIVE the scrub. Redaction that takes the
+        // prose with the secret leaves an operator unable to answer, which is the whole
+        // point of showing the question here.
+        let row = awaiting_row(&out.text, run, "reviewer");
+        assert!(
+            row.contains("call the API with") && row.contains("report the status"),
+            "the words either side of the secret must still be there: {row}"
+        );
 
         let json = list_paused(&s, &j, true).await.expect("lists");
         assert!(
@@ -4261,6 +4282,105 @@ pub(crate) mod tests {
             "a script must not receive a credential either — `render::json` redacts the \
              pause reason for exactly this reason: {}",
             json.text
+        );
+    }
+
+    /// **The finding this test is the fix for.** The question was scrubbed with
+    /// `render::redact_reason`, whose withhold-on-evasion transform discards the ENTIRE
+    /// string when redacting-then-normalizing disagrees with normalizing-then-redacting.
+    /// That is free for a pause reason — the value it was written for — and ruinous here:
+    /// `list-paused` is the ONLY torii surface that ever displays a question
+    /// (`cmd::human::agent_question` reads the prompt to validate the node, never echoes
+    /// it), so a withheld question leaves an operator with no way whatsoever to learn what
+    /// they are being asked.
+    ///
+    /// And the disagreement fires on ORDINARY PROSE. `PatternRedactor`'s
+    /// `(?i)bearer\s+[A-Za-z0-9._-]{8,}` matches across the newline in
+    /// `"…carries a bearer\nAuthorization header…"` — `\s` matches `\n` — but NOT in the
+    /// control-stripped copy, where the two words glue into `bearerAuthorization` and the
+    /// mandatory whitespace is gone. Equality-of-the-two-orders therefore reported an
+    /// "evasion" for a question whose redaction was working exactly as intended. A question
+    /// is the shape most exposed to it: multi-KB and newline-dense (system prompt + every
+    /// activated skill body + `## Context` + `## Task`), and a security-reviewer's prompt is
+    /// precisely the one that says the word "bearer".
+    ///
+    /// `render::redact_question` therefore withholds only in the DIRECTION the guard was
+    /// written for — when reassembly hides MORE than the plain pass does. Here the plain
+    /// pass hides more, so the question renders.
+    #[tokio::test]
+    async fn an_ordinary_prose_question_that_wraps_after_bearer_survives() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let question = "You are a contract reviewer. Confirm the request carries a bearer\n\
+                        Authorization header before approving. Does this contract permit \
+                        sub-processing?";
+        let j = agent_journal_asking(run, &reviewer(), None, question).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let row = awaiting_row(&out.text, run, "reviewer");
+        assert!(
+            !row.contains("withheld"),
+            "an ordinary prose question was thrown away wholesale — an operator cannot \
+             answer what they cannot see: {row}"
+        );
+        assert!(
+            row.contains("contract reviewer") && row.contains("sub-processing"),
+            "the words of the question must reach the operator: {row}"
+        );
+
+        let json = list_paused(&s, &j, true).await.expect("lists");
+        let parsed: serde_json::Value = serde_json::from_str(&json.text).expect("valid JSON");
+        let q = parsed[0]["awaiting"][0]["question"]
+            .as_str()
+            .expect("a question")
+            .to_string();
+        assert!(
+            !q.contains("withheld") && q.contains("sub-processing"),
+            "the `--json` sink takes the same value and must not be withheld either: {q}"
+        );
+    }
+
+    /// The other half of the pair, and the reason `redact_question` narrows the withhold
+    /// rather than deleting it: a credential BISECTED by a control byte is reassembled by
+    /// the strip-then-redact pass and by nothing else. `PatternRedactor`'s whole-match
+    /// patterns are contiguous classes that exclude control characters, so the plain pass
+    /// sees two 12-character runs, neither long enough to fire, and would print both halves
+    /// of a live key to a terminal. When reassembly hides MORE than the plain pass, the
+    /// question is withheld — the ambiguity is real and there is no honest partial
+    /// rendering of a question whose secret we can locate only after gluing it back
+    /// together.
+    ///
+    /// This is a guard test, green on arrival. Mutation-verified in a scratch copy: with
+    /// `redact_question`'s reassembly comparison deleted (`return redacted;` before the
+    /// check), the bisected key's halves both appear in the row and this test fails while
+    /// `an_ordinary_prose_question_that_wraps_after_bearer_survives` still passes — so the
+    /// two tests pin the two directions independently.
+    #[tokio::test]
+    async fn a_control_bisected_secret_in_a_question_is_still_withheld() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        // Assembled at runtime for the Semgrep CWE-798 hook, and split by a control byte
+        // exactly as the evasion this guard exists for does.
+        let half = "A".repeat(12);
+        let bisected = format!("sk-{half}\u{1}{half}");
+        let j = agent_journal_asking(
+            run,
+            &reviewer(),
+            None,
+            &format!("approve the deploy that uses {bisected}?"),
+        )
+        .await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let row = awaiting_row(&out.text, run, "reviewer");
+        assert!(
+            !row.contains(&format!("sk-{half}")),
+            "a bisected key's first half reached the terminal: {row}"
+        );
+        assert!(
+            row.contains("withheld"),
+            "the question must be withheld outright when reassembly finds what the plain \
+             pass missed: {row}"
         );
     }
 

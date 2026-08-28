@@ -60,16 +60,32 @@ pub(crate) fn redact_payload(v: &serde_json::Value) -> serde_json::Value {
 
 /// The literal placeholder `PatternRedactor` substitutes on a match
 /// (`crates/orchestrator-core/src/redact.rs`, `PLACEHOLDER`). Not exported — it is a
-/// private const there — so it is duplicated here. Only `safe_reason`'s
-/// mid-placeholder cap guard depends on this literal staying in sync; the evasion
-/// check in `redact_reason` below does not (it compares whole redacted strings, not
-/// this substring), so a drift here would silently reopen only the MINOR
-/// straddled-truncation cosmetic issue, not the CRITICAL leak.
+/// private const there — so it is duplicated here.
+///
+/// **TWO things depend on this literal staying in sync, and they are not equally
+/// serious.** `safe_reason`'s mid-placeholder cap guard is cosmetic: a drift there
+/// reopens only the straddled-truncation shard (`[REDA…`), which discloses nothing.
+/// [`visible_len`] is NOT cosmetic — it subtracts the placeholder before counting what
+/// an operator can still read, and [`redact_question`]'s withhold decision is a
+/// comparison of two such counts. A drift would leave the placeholder's ten characters
+/// counted as readable text on both sides of that comparison, which can flip the
+/// decision in the UNSAFE direction (a reassembly pass that hides two short values but
+/// adds two placeholders would measure as hiding LESS, and the question would render
+/// with both values in the clear). `the_placeholder_literal_matches_the_core_redactor`
+/// pins it against the redactor's actual output for exactly that reason.
+///
+/// `redact_reason`'s own evasion check does not depend on it (it compares whole
+/// redacted strings, not this substring).
 const PLACEHOLDER_TEXT: &str = "[REDACTED]";
 
 /// What a WITHHELD reason renders as: the whole reason discarded, not a partial
 /// redaction. See `redact_reason` for when this fires.
 const WITHHELD_REASON: &str = "[REDACTED: reason withheld]";
+
+/// The same, for a QUESTION — its own string because it names the value it replaced.
+/// An operator staring at a row that says "reason withheld" for the cell that is
+/// supposed to hold their question has been told about the wrong field.
+const WITHHELD_QUESTION: &str = "[REDACTED: question withheld]";
 
 /// A pause reason is `ScheduledRun.reason`: free text lifted from `PauseInfo.reason`
 /// and provider messages (SP-DATA-3), stored UNREDACTED — the SP-4 s2 `Redactor`
@@ -126,18 +142,11 @@ const WITHHELD_REASON: &str = "[REDACTED: reason withheld]";
 /// fault is rendered into `awaiting_error`, and free text bound for a script gets exactly
 /// the treatment [`json`] already gives `reason` — redaction only, since the
 /// control-character collapse and the length cap are display-only concerns.
+///
+/// **Not for a human-backed agent's QUESTION**, which had this transform applied to it
+/// for one commit and must not again — see [`redact_question`] for the false positive
+/// that made the whole-question withhold unacceptable there.
 pub(crate) fn redact_reason(s: &str) -> String {
-    let redact_once = |text: &str| -> String {
-        match REDACTOR.redact(&serde_json::Value::String(text.to_string())) {
-            serde_json::Value::String(out) => out,
-            other => {
-                unreachable!("redacting a Value::String must yield a Value::String, got {other:?}")
-            }
-        }
-    };
-    let strip_control =
-        |text: &str| -> String { text.chars().filter(|c| !c.is_control()).collect() };
-
     let redacted_first = redact_once(s);
     let redacted_first_then_stripped = strip_control(&redacted_first);
     let stripped_first_then_redacted = redact_once(&strip_control(s));
@@ -146,6 +155,110 @@ pub(crate) fn redact_reason(s: &str) -> String {
         return WITHHELD_REASON.to_string();
     }
     redacted_first
+}
+
+/// One redaction pass over a plain string. Lifted out of [`redact_reason`], where it was
+/// a local closure, once [`redact_question`] needed the identical pass: two transforms
+/// that must agree about what "redacted" means cannot each own their own copy of it.
+///
+/// `Redactor::redact` operates on `serde_json::Value`, not `&str`, so a plain string is
+/// wrapped and unwrapped around the call.
+fn redact_once(text: &str) -> String {
+    match REDACTOR.redact(&serde_json::Value::String(text.to_string())) {
+        serde_json::Value::String(out) => out,
+        other => {
+            unreachable!("redacting a Value::String must yield a Value::String, got {other:?}")
+        }
+    }
+}
+
+/// Control characters REMOVED outright — not collapsed to spaces, which is the whole
+/// point: removal is what glues a control-byte-bisected secret back into one contiguous
+/// run that `PatternRedactor`'s character classes can match. Also lifted from
+/// [`redact_reason`] so that it and [`redact_question`] reassemble identically.
+fn strip_control(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// How much of a redacted string an operator can still READ: its characters, minus every
+/// [`PLACEHOLDER_TEXT`] occurrence, minus whitespace and control characters.
+///
+/// Whitespace and control characters are excluded so that two passes over DIFFERENT
+/// normalizations of the same text are comparable: [`redact_question`] weighs a pass over
+/// the raw string against a pass over a control-stripped copy, and the copy is missing
+/// exactly the characters this filter drops. What remains on both sides is the same
+/// underlying sequence of readable characters, so the two counts differ only where one
+/// pass hid something the other did not.
+///
+/// The placeholder is subtracted rather than counted because it is not readable text and,
+/// left in, it would pay a fixed ten characters PER MATCH — so a pass that hid two short
+/// values would measure as showing MORE than a pass that hid nothing, which is the exact
+/// inversion the withhold decision must not make.
+fn visible_len(redacted: &str) -> usize {
+    redacted
+        .replace(PLACEHOLDER_TEXT, "")
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .count()
+}
+
+/// Scrub a human-backed `Agent`'s QUESTION for display — [`redact_reason`]'s two passes,
+/// but withholding only in the direction the guard was written for.
+///
+/// **Why this is not just `redact_reason`.** It was, for exactly one commit, and the
+/// review of that commit measured what it costs. `redact_reason` discards the ENTIRE
+/// string whenever redact-then-strip disagrees with strip-then-redact, in EITHER
+/// direction. That is free for a pause reason — its own doc records the reasoning, "a
+/// pause reason is only ever displayed, so discarding it wholesale costs nothing" — and
+/// ruinous for a question: `run list-paused` is the ONLY torii surface that ever displays
+/// one (`cmd::human::agent_question` reads the prompt to validate the node and never
+/// echoes it), so a withheld question leaves the operator holding a node id, a verb, and
+/// no idea what they are being asked. An operator cannot answer what they cannot see.
+///
+/// **And the disagreement fires on ordinary prose.** `PatternRedactor`'s
+/// `(?i)bearer\s+[A-Za-z0-9._-]{8,}` matches ACROSS a newline (`\s` matches `\n`), so
+/// `"…carries a bearer\nAuthorization header…"` is redacted in the raw pass and is not
+/// matched at all in the stripped copy, where the two words glue into
+/// `bearerAuthorization` and the pattern's mandatory whitespace no longer exists. The
+/// orders disagree, and `redact_reason` throws the question away — for a redaction that
+/// worked exactly as intended. A question is the value most exposed to this: the executor
+/// composes it from the agent's system prompt, every activated skill body, the rendered
+/// `## Context` section and a `## Task` section, so it is multi-KB and newline-dense,
+/// where a pause reason is one line; and a security-reviewer's prompt is precisely the one
+/// that says the word "bearer" or "token".
+///
+/// **The narrowing.** The guard exists for one thing: a credential bisected by a control
+/// byte (`"sk-AAAAAAAAAAAA\u{1}AAAAAAAAAAAA"`), which the contiguous character classes
+/// cannot match until the halves are glued back together. That case has a DIRECTION —
+/// the stripped pass hides something the plain pass shows. The false positive above has
+/// the opposite one — the plain pass hides something the stripped pass shows, which is a
+/// redaction succeeding, not an evasion. So the decision compares how much readable text
+/// each pass leaves ([`visible_len`]) instead of comparing the two strings for equality,
+/// and withholds only when reassembly leaves STRICTLY LESS. Equality-of-strings could not
+/// tell the directions apart; a placeholder COUNT could not either, and its failure is
+/// already recorded in [`redact_reason`]'s doc (a partially-matched `Bearer` split ties at
+/// one placeholder each while the content differs). Counting readable characters catches
+/// that case — the plain pass leaves the trailing fragment visible, so its count is
+/// higher — while leaving the prose case alone.
+///
+/// **What still gets through, stated plainly.** A question that contains BOTH a
+/// whitespace-spanning match (the `bearer\n…` shape) AND a control-bisected secret can, if
+/// the first hides more characters than the second, measure as safe and render the
+/// bisected secret's fragments. Closing that would need the UNION of the two passes'
+/// redacted spans, which the `Redactor` API cannot report — it returns a scrubbed string,
+/// not match offsets — and reconstructing spans by diffing two scrubbed strings is
+/// machinery whose own bugs would be leaks. The residue is accepted here because this pass
+/// is defense in DEPTH, not the primary control: SP-4 s2 already redacts effect outputs
+/// with this same `PatternRedactor` before they are journaled or reach the blackboard the
+/// `## Context` section is rendered from, the journal stores the prompt unredacted anyway
+/// (`executor/human.rs` appends `prompt: prompt.to_string()`), and the reader here is the
+/// trusted human being asked to do the work.
+pub(crate) fn redact_question(s: &str) -> String {
+    let redacted = redact_once(s);
+    if visible_len(&redact_once(&strip_control(s))) < visible_len(&redacted) {
+        return WITHHELD_QUESTION.to_string();
+    }
+    redacted
 }
 
 /// Rendered reasons are capped so one unbounded provider message can't wreck the
@@ -279,14 +392,25 @@ pub struct AwaitingNode {
     /// The journal is the only place the question a human was actually asked exists.
     ///
     /// **It arrives here ALREADY REDACTED** — `cmd::run::awaiting_nodes` applies
-    /// [`redact_reason`] when it builds this field, so every sink is covered by
+    /// [`redact_question`] when it builds this field, so every sink is covered by
     /// construction rather than by each sink remembering. The `--json` path in particular
     /// serializes this struct wholesale (`serde_json::to_value(nodes)`), so a sink-side
     /// scrub is exactly the thing that would be forgotten there. The executor journals the
     /// prompt UNREDACTED (`executor/human.rs` appends `prompt: prompt.to_string()`), and
     /// `torii config push` does not redact an agent's `system_prompt` either, so torii is
     /// the first thing that ever displays it — the same position it is in for a pause
-    /// reason, which is why it gets the same transform.
+    /// reason. It is NOT the same transform, though: [`redact_question`] records why a
+    /// question cannot take the pause reason's withhold-the-whole-string-on-any-
+    /// disagreement rule.
+    ///
+    /// **It can still be [`WITHHELD_QUESTION`] in full**, and a consumer must expect that:
+    /// when reassembling the text across its control characters uncovers a credential the
+    /// plain pass could not see, the value here is the literal
+    /// `[REDACTED: question withheld]` rather than the question. That is deliberate and
+    /// leaves the operator with no rendering of the ask at all, which is why
+    /// [`redact_question`] narrows it to that one direction — the ordinary-prose false
+    /// positive that used to trigger it is pinned red by
+    /// `cmd::run::tests::an_ordinary_prose_question_that_wraps_after_bearer_survives`.
     ///
     /// The display-only half — [`one_line`] and the [`QUESTION_MAX`] cap — is applied by
     /// [`awaiting_section`], NOT here, matching the split `json`/`table` already draw for a
@@ -720,6 +844,96 @@ mod tests {
         assert!(
             !out.to_lowercase().contains("withheld"),
             "must not be over-eager: {out}"
+        );
+    }
+
+    // -- SP-6 s3 Task 6 review: a QUESTION takes `redact_question`, not `redact_reason`.
+    // The pause-reason transform withholds the whole string on an either-direction
+    // disagreement, and `run list-paused` is the only surface that ever shows a question,
+    // so a false positive there costs the operator the entire ask. These pin both
+    // directions of the narrowed decision.
+
+    /// The false positive that the review measured, at the unit level: the plain pass
+    /// redacts `bearer` + the next line's first word (`\s` matches `\n`), the stripped
+    /// copy glues them into `bearerAuthorization` and matches nothing, and
+    /// `redact_reason` therefore calls a working redaction an evasion. Asserted against
+    /// BOTH transforms in one test so the difference between them is the subject rather
+    /// than a coincidence.
+    #[test]
+    fn a_question_keeps_the_prose_a_pause_reason_would_have_withheld() {
+        let text = "Confirm the request carries a bearer\nAuthorization header before \
+                    approving.";
+        assert_eq!(
+            redact_reason(text),
+            WITHHELD_REASON,
+            "if this stops holding, the false positive is gone and `redact_question`'s \
+             reason for existing must be re-argued rather than silently kept"
+        );
+
+        let q = redact_question(text);
+        assert!(
+            !q.contains("withheld"),
+            "an operator cannot answer what they cannot see: {q}"
+        );
+        assert!(
+            q.contains("Confirm the request carries") && q.contains("header before approving"),
+            "the prose either side of the redaction must survive: {q}"
+        );
+    }
+
+    /// The direction the guard IS for: a key bisected by a control byte matches nothing
+    /// until the halves are glued, so the plain pass would print both halves. Reassembly
+    /// hides strictly more, so the question is withheld outright.
+    #[test]
+    fn a_question_hiding_a_control_bisected_secret_is_withheld() {
+        let half = "A".repeat(12);
+        let q = redact_question(&format!("approve the deploy using sk-{half}\u{1}{half}?"));
+        assert_eq!(
+            q, WITHHELD_QUESTION,
+            "reassembly found a key the plain pass could not see"
+        );
+    }
+
+    /// Why [`visible_len`] subtracts the placeholder instead of counting it. Neither
+    /// `token=abc\ndefg` matches on the raw text — the assignment rule's value class needs
+    /// six characters and sees three — while the control-stripped copy matches both. Each
+    /// match hides 7 characters and would ADD 10 if the placeholder were counted, so a
+    /// naive character count would score the reassembled pass as showing MORE than the
+    /// plain one and let both values render in the clear.
+    #[test]
+    fn two_short_reassembled_values_outweigh_their_placeholders() {
+        let q = redact_question("token=abc\ndefg and token=hij\nklmn");
+        assert_eq!(
+            q, WITHHELD_QUESTION,
+            "the reassembly hid 14 characters and must not be scored as hiding less than \
+             nothing because it spent two placeholders doing it"
+        );
+    }
+
+    /// An ordinary question with control characters and no secret at all renders whole —
+    /// the same over-eagerness guard `a_reason_with_control_characters_but_no_secret_
+    /// still_renders_normally` gives the pause-reason path.
+    #[test]
+    fn a_question_with_control_characters_but_no_secret_still_renders_whole() {
+        let q = redact_question("does this look right?\u{1}answer yes or no");
+        assert!(
+            q.contains("does this look right?") && q.contains("answer yes or no"),
+            "an ordinary control-bearing question must not be withheld: {q}"
+        );
+    }
+
+    /// [`PLACEHOLDER_TEXT`] is a hand-copied duplicate of a private const in
+    /// `orchestrator-core`, and [`visible_len`] subtracts it before comparing how much
+    /// text each pass leaves readable — so a drift is not cosmetic here, it can flip
+    /// `redact_question`'s withhold decision in the unsafe direction. Pinned against what
+    /// the redactor actually emits rather than against the other copy of the literal.
+    #[test]
+    fn the_placeholder_literal_matches_the_core_redactor() {
+        let secret = format!("sk-{}", "A".repeat(24));
+        assert_eq!(
+            redact_once(&secret),
+            PLACEHOLDER_TEXT,
+            "the core redactor's placeholder changed under this crate's copy of it"
         );
     }
 
