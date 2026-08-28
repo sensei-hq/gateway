@@ -209,9 +209,20 @@ fn redact_answer(text: &str) -> String {
 /// **[`MAX_HUMAN_TEXT_BYTES`], not `cmd::run::MAX_PAYLOAD_BYTES`, and not through
 /// `check_payload_size`.** The two constants are both 4096 today, so nothing behaves
 /// differently — what differs is which one a future change moves, and this field must move
-/// with the executor's. `Executor::run_human_agent` bounds the journaled QUESTION by
-/// `MAX_HUMAN_TEXT_BYTES` on `prompt.len()`; the question and the answer are the two halves
-/// of one exchange and must not be bounded by two numbers that can drift apart.
+/// with the executor's.
+///
+/// **The reason, restated on a basis that is actually true.** An earlier version of this
+/// paragraph said `run_human_agent` bounds the journaled QUESTION by `MAX_HUMAN_TEXT_BYTES`
+/// on `prompt.len()`, so the question and the answer must not be two numbers that can drift
+/// apart. They already are two numbers: the whole journaled question is clamped to
+/// `MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES`, and only its AUTHORED half — not
+/// `prompt.len()` — is charged against 4096. What the constant is shared with is that
+/// authored half: the system prompt, the activated skills and the node input are the same
+/// CLASS of value an answer is — human free text somebody can shorten — while the
+/// `## Context` half is run data that nobody can, which is exactly why it gets a different
+/// number and a different failure mode. An answer belongs on the side that can be trimmed,
+/// so it takes that side's bound.
+///
 /// `check_payload_size` also measures a `serde_json::Value` and charges
 /// `jsonb_number_expansion`, which is meaningless for a bare `String`: `jsonb` normalises
 /// NUMBERS to `numeric`, and a string has none, so byte length as given is exactly the

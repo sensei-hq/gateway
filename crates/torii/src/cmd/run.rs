@@ -4298,14 +4298,22 @@ pub(crate) mod tests {
 
     /// Design §6's rule that EVERY operator-facing string goes through the redactor — not
     /// AC9, which is about the ANSWER (`--text` scrubbed in the journal and in the output).
-    /// The question needs its own guard because it takes a different route: it is journaled
-    /// by the executor UNREDACTED — verified in `executor/human.rs`, which appends
-    /// `prompt: prompt.to_string()` — and torii is the first thing that ever DISPLAYS it,
-    /// exactly the position it is in for a pause reason. Its ingredients are an agent's
-    /// `system_prompt` and skill bodies, operator-authored config pushed with
-    /// `torii config push` (which redacts nothing — there is no `redact` anywhere in
-    /// `orchestrator-store` or `cmd::config`), plus upstream blackboard values. A credential
-    /// in any of those would otherwise reach a terminal and a `--json` consumer verbatim.
+    ///
+    /// The question needs its own guard because torii applies a SECOND, display-oriented
+    /// scrub (`render::redact_question`) over a value the executor has already redacted —
+    /// `executor/human.rs` runs its redactor over the whole composed question before the
+    /// `AgentAwaited` append. (An earlier version of this comment claimed the opposite and
+    /// said it was "verified in `executor/human.rs`, which appends
+    /// `prompt: prompt.to_string()`" — an expression that exists on no code path. The word
+    /// "verified" is how this feature's false claims propagated: it invites the next reader
+    /// to skip re-checking.)
+    ///
+    /// The second pass earns its place two ways. `Executor::with_redactor` is opt-in and
+    /// defaults to `None`, so an embedder that wired none writes the question as composed —
+    /// and its ingredients are an agent's `system_prompt` and skill bodies, operator-authored
+    /// config pushed with `torii config push`, which redacts nothing (there is no `redact`
+    /// anywhere in `orchestrator-store` or `cmd::config`). And the `--json` sink serializes
+    /// `AwaitingNode` wholesale, so a credential would reach a script verbatim.
     #[tokio::test]
     async fn a_secret_shaped_question_is_redacted_in_the_listing() {
         let run = RunId(uuid::Uuid::new_v4());

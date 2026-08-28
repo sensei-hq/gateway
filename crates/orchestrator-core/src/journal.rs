@@ -14,7 +14,14 @@ use crate::plan::NodePlan;
 /// journal-serialization break.
 pub const FORMAT_VERSION: i32 = 1;
 
-/// The largest human-supplied answer, and the largest journaled question, in bytes.
+/// The largest human-supplied answer, and the largest AUTHORED half of a journaled
+/// question, in bytes.
+///
+/// **Not the whole journaled question** — that is bounded by
+/// `MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES`, and the summary line used to say
+/// otherwise while the body below said the opposite twenty lines later. The conflation is
+/// the exact one this constant's own doc exists to prevent, so it is corrected at the first
+/// sentence rather than only in the small print.
 ///
 /// SP-6 s3. It lives in `orchestrator-core` because BOTH the executor and `torii` need
 /// it and neither can borrow the other's bound. `torii` already has one —
@@ -351,9 +358,14 @@ pub enum JournalEvent {
     /// ordinary verbose upstream killed the node terminally after its tokens were already
     /// spent. See [`MAX_HUMAN_CONTEXT_BYTES`].
     ///
-    /// A writer must also REDACT it before appending (design §6). s3 shipped
-    /// `prompt: prompt.to_string()`, making this row the one place a credential in a
-    /// `system_prompt` or a skill body reached durable storage in the clear.
+    /// A writer must also REDACT it before appending (design §6), and `run_human_agent`
+    /// does: it runs the executor's own redactor over the WHOLE composed question and
+    /// appends that value. s3 originally shipped `prompt: prompt.to_string()`, which made
+    /// this row the one place a credential in a `system_prompt` or a skill body reached
+    /// durable storage in the clear — nothing upstream scrubs it (`torii config push`
+    /// redacts nothing). The residue worth knowing: `Executor::with_redactor` is opt-in and
+    /// defaults to `None`, so a library embedder that wires no redactor still writes the
+    /// question as composed.
     ///
     /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited` do —
     /// overwriting the deadline is the never-expires bug s1 documents.
