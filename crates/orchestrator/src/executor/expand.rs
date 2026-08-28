@@ -194,7 +194,20 @@ impl Executor {
                                     path.clone(),
                                     fold,
                                 );
-                                let a = match selector.select(input, &candidates, &dispatch).await {
+                                let selected = selector.select(input, &candidates, &dispatch).await;
+                                // The lent capability makes the EXECUTOR's own integrity
+                                // failures — a memo `DeterminismViolation`, an unreadable
+                                // `ContentDigestMiss` — reachable through an arbitrary
+                                // selector's return value. At every other producer that
+                                // check is a hard halt; it is one here too. Read BEFORE
+                                // the selector's own result, so a selector that swallows
+                                // or rewraps the error cannot downgrade an inconsistent
+                                // journal into a soft `NodeFailed` and leave the drive
+                                // running (and spending) on the strength of it.
+                                if let Some(fatal) = dispatch.take_fatal() {
+                                    return Err(fatal);
+                                }
+                                let a = match selected {
                                     Ok(a) => a,
                                     Err(e) => {
                                         // A budget refusal is NOT a node failure: it is

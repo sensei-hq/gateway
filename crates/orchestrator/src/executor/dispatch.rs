@@ -295,6 +295,16 @@ pub(super) struct SelectorDispatch<'a> {
     /// return `OrchestratorError`, which cannot carry the pause-vs-fail distinction, so
     /// the caller reads it back here rather than re-deriving it from a message.
     refusal: std::sync::Mutex<Option<RefusalKind>>,
+    /// An error raised by the EXECUTOR itself inside this dispatch — a memo mismatch
+    /// (`DeterminismViolation`) or an unreadable recorded output (`ContentDigestMiss`
+    /// and friends, from `materialize`). It is stashed rather than merely returned
+    /// because the return value is at the mercy of an arbitrary `PlannerSelector`: it
+    /// travels back through `select()`, whose `Err` the `Select` arm otherwise reads as
+    /// the SELECTOR's own failure (a bad pick, an empty response) and downgrades to a
+    /// soft node `Failed`. Every other producer's identical check is a hard halt; this
+    /// stash is how the `Select` arm re-raises it as one, even if the selector swallows
+    /// or rewraps the `Err`.
+    fatal: std::sync::Mutex<Option<OrchestratorError>>,
     /// How many calls this `select()` has made — the effect id's `local_index`.
     ///
     /// `ModelDispatch` is lent to an arbitrary `PlannerSelector`, so "one call per
@@ -321,6 +331,7 @@ impl<'a> SelectorDispatch<'a> {
             node,
             fold,
             refusal: std::sync::Mutex::new(None),
+            fatal: std::sync::Mutex::new(None),
             calls: AtomicU64::new(0),
         }
     }
@@ -329,6 +340,24 @@ impl<'a> SelectorDispatch<'a> {
     /// `Err` was its own (a bad pick, an empty response), not the budget gate's.
     pub(super) fn take_refusal(&self) -> Option<RefusalKind> {
         self.refusal.lock().expect("selector refusal lock").take()
+    }
+
+    /// Take the executor's own fatal error, if this dispatch raised one. `Some` means
+    /// the drive must abort with it — the journal is inconsistent, so continuing would
+    /// write a `NodeFailed` into a record already proved unreliable and keep spending
+    /// against the cap on the strength of it.
+    pub(super) fn take_fatal(&self) -> Option<OrchestratorError> {
+        self.fatal.lock().expect("selector fatal lock").take()
+    }
+
+    /// Record `e` as the executor's own failure and hand the selector a surrogate to
+    /// abort on. The surrogate carries `e`'s message but not its type, because
+    /// `OrchestratorError` is not `Clone` and the typed original is the one the
+    /// `Select` arm re-raises — nothing downstream of the selector reads this copy.
+    fn fatal(&self, e: OrchestratorError) -> OrchestratorError {
+        let surrogate = OrchestratorError::Gateway(e.to_string());
+        *self.fatal.lock().expect("selector fatal lock") = Some(e);
+        surrogate
     }
 
     /// `"{node}/__select__"` — the reserved path the selector's spend is journaled
@@ -371,17 +400,20 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
         )?;
         if let Some((recorded_ih, output)) = self.fold.memo.get(&eid) {
             if recorded_ih != &ih {
-                return Err(OrchestratorError::DeterminismViolation {
+                return Err(self.fatal(OrchestratorError::DeterminismViolation {
                     node: NodeId(path),
                     effect_id: eid,
-                });
+                }));
             }
             // Replay the recorded (already redacted) text: no gateway call, no new
-            // journal event, nothing charged to the meter.
-            return Ok(self
-                .exec
-                .materialize(output)
-                .await?
+            // journal event, nothing charged to the meter. A recorded output that
+            // cannot be read back (`ContentDigestMiss`) is the executor's failure too,
+            // and just as fatal — the memo is unreliable either way.
+            let replayed = match self.exec.materialize(output).await {
+                Ok(v) => v,
+                Err(e) => return Err(self.fatal(e)),
+            };
+            return Ok(replayed
                 .get("text")
                 .and_then(|t| t.as_str())
                 .unwrap_or_default()
