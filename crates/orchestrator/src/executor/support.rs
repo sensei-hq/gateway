@@ -327,6 +327,18 @@ pub(crate) fn fold_journal(
 /// event before the drive path existed; see
 /// `the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical`.
 ///
+/// **The `actor` exemption is still forward-looking as of SP-6 s3 Task 4, and nothing in
+/// the shipped human path reaches it.** The terminal branch builds `outputs` from
+/// [`fold_journal`]'s `node_last_output`, which is populated ONLY from `EffectRecorded`
+/// and `MapCompacted`; `run_human_agent` journals neither, so a human-answered node is
+/// absent from a terminal re-read altogether rather than present-and-mis-projected
+/// (`a_finished_human_backed_run_reports_no_output_when_read_back`). The exemption is
+/// kept, and its unit test with it, because the projection is the wrong place to
+/// discover that: the first change that gives a waiting node kind a durable per-node
+/// output would otherwise silently rewrite `{text, actor}` into `{model: null, text}`.
+/// This note exists because the sibling comment in `human.rs` previously described that
+/// mis-projection as something that happens TODAY, which it does not.
+///
 /// The alternative — resolving each node's `AgentRef` against the `Registry` to ask
 /// whether its backing is `Human` — was rejected: it makes a pure, total projection
 /// depend on registry resolution that can fail, to recover a fact the output already
