@@ -3,7 +3,7 @@ title: SP-6 s3 — human-as-Agent (a human answering where a model would)
 doctype: design-spec
 module: orchestrator
 slice: SP-6-s3
-status: draft
+status: approved
 date: 2026-08-27
 ---
 
