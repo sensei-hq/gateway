@@ -6,8 +6,7 @@ whole-slice review's 16 findings are ALL fixed on top (`576bc1f`).**
 
 ## Done / remaining
 
-- **Tasks 1–7 ✅** (`fa070dd` … `f482d05`) — see the commit messages for per-task detail.
-- **✅ Whole-slice review fixes, red-first, grouped by concern:**
+- **Tasks 1–7 ✅** (`fa070dd` … `f482d05`); **✅ whole-slice review fixes, red-first:**
   - `d2e8145` `parse_fm_duration` is loud, never panics — byte-index `split_at` on `48ℏ`,
     chrono's infallible `days` on `999999999999999d`; + the `parse_backing` empty/list
     `timeout:` guard (mutation-verified both arms).
