@@ -35,6 +35,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# `test-support` on top of the plain `postgres` dependency above: it exposes
+# `orchestrator_store::test_guard`, the ONE DB-test isolation guard, which this crate's
+# tests take instead of the private copy they used to carry. Dev-only — the binary links
+# the un-featured dependency.
+orchestrator-store = { package = "sensei-orchestrator-store", path = "../orchestrator-store", features = ["postgres", "test-support"] }
 # The cross-process e2e needs the same gateway/clock doubles the executor's own tests
 # use (a gated gateway to force a durable pause, a recording one to count re-spend).
 orchestrator = { package = "sensei-orchestrator", path = "../orchestrator", features = ["test-support"] }
