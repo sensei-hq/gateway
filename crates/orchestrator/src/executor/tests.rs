@@ -17276,6 +17276,68 @@ mod human_agent {
         );
     }
 
+    /// AC10 again, through the NODE INPUT alone — the third of the three things the failure
+    /// message tells an operator to trim, and the one nothing exercised.
+    ///
+    /// The sibling above overflows through a SKILL body, so it passes whether or not
+    /// `compose` charges the `## Task` bytes to `authored_bytes`. Re-review mutated
+    /// `text.len() + task.len()` to `text.len()` and the whole workspace stayed green.
+    ///
+    /// That term is load-bearing twice over. It is a third of the message's advice — "trim
+    /// the agent's system prompt, its skills or the node input" — and without it an
+    /// oversized input skips this loud, actionable config failure entirely and lands in
+    /// `redact_and_clamp` instead, where it is silently clamped as ordinary run data. The
+    /// input is exactly the wrong thing to degrade quietly: it is the ASK.
+    ///
+    /// Deliberately the mirror shape of the skill-body case — short system prompt, no
+    /// skills, the whole oversize in `input` — so the two together pin every summand.
+    #[tokio::test]
+    async fn an_oversized_node_input_fails_the_node_before_it_is_journaled() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+        // A short system prompt and no skills: `authored_bytes` can only exceed the bound
+        // through the `## Task` section.
+        let graph = Graph {
+            nodes: vec![agent_node(
+                "review",
+                "reviewer",
+                &"X".repeat(orchestrator_core::MAX_HUMAN_TEXT_BYTES),
+            )],
+        };
+
+        let o = ex.start(run, &graph).await.expect("drives");
+        let (node, message) = o
+            .failed
+            .clone()
+            .expect("an over-bound node input fails the node rather than journaling it");
+        assert_eq!(
+            node,
+            review(),
+            "the failure is the human-backed node: {o:?}"
+        );
+        assert!(
+            message.contains("review")
+                && message.contains(&orchestrator_core::MAX_HUMAN_TEXT_BYTES.to_string()),
+            "the failure names the node and the limit it broke: {message}"
+        );
+        assert!(
+            message.contains("node input"),
+            "and it names the part that was actually oversized, which is the whole value of \
+             failing loudly here: {message}"
+        );
+
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            journaled_prompts(&events).is_empty(),
+            "nothing oversized became durable: {:?}",
+            journaled_prompts(&events)
+                .iter()
+                .map(String::len)
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// **A verbose UPSTREAM node degrades the question; it does not kill the run.**
     ///
     /// The single worst defect the whole-slice review found, reported independently three
@@ -17369,13 +17431,33 @@ mod human_agent {
             prompt.contains("THE-ACME-MSA-2026"),
             "so does the node input — the human must still know WHAT they are reviewing"
         );
+        // ANCHORED inside the `## Context` section, not asserted over the whole prompt.
+        // Re-review mutated the bound to `usize::MAX` — no context truncation at all — and
+        // the workspace stayed green, because `redact_and_clamp`'s OWN "… (truncated: …)"
+        // marker satisfied a whole-string `contains("truncated")`. Two different clamps
+        // write the same word, so the assertion has to say WHERE it expects it.
+        let context = prompt
+            .split("\n\n## Task\n")
+            .next()
+            .expect("split always yields a head");
+        let context = &context[context
+            .find("\n\n## Context")
+            .expect("the section exists — the node has a Hard dep")..];
         assert!(
-            prompt.contains("### brief") && prompt.contains("truncated"),
+            context.contains("### brief") && context.contains("truncated"),
             "the context section names the dependency and says out loud that it was cut, \
-             so the human never mistakes a clipped contract for the whole one"
+             so the human never mistakes a clipped contract for the whole one: {}",
+            &context[..context.len().min(400)]
         );
         assert!(
-            prompt.contains(&"L".repeat(1_000)),
+            context.len() <= orchestrator_core::MAX_HUMAN_CONTEXT_BYTES,
+            "and the section is bounded by ITS OWN budget, which is the constant this test \
+             is named for — `MAX_HUMAN_CONTEXT_BYTES`, not the sum the whole row is clamped \
+             to: {} bytes",
+            context.len()
+        );
+        assert!(
+            context.contains(&"L".repeat(1_000)),
             "and it carries a REAL prefix of the upstream output, not just the marker"
         );
 
@@ -17394,6 +17476,78 @@ mod human_agent {
             "and the bound that applies is NOT the answer's 4 KiB one, which is the \
              conflation this test exists to prevent: {} bytes",
             prompt.len()
+        );
+    }
+
+    /// TWO verbose upstreams, at the surface the human actually reads: one of them must not
+    /// crowd the other out of the question.
+    ///
+    /// `render_context_section_bounded` splits its budget evenly for exactly this reason,
+    /// and re-review found the property provable only at the unit level — no executor-level
+    /// test composed a human question from more than ONE dependency, so nothing pinned that
+    /// the human path passes every dependency through. §5.4's rule is one-directional:
+    /// never show the human LESS than the model would have had, and a model gets every Hard
+    /// dep's output in full.
+    ///
+    /// The upstreams are CHAINED rather than dep-free so the scripted responses land in a
+    /// deterministic order — two ready nodes in one round run concurrently.
+    #[tokio::test]
+    async fn a_question_shows_something_from_every_upstream_dependency() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+
+        // Each one alone would exhaust the whole context budget.
+        let big = orchestrator_core::MAX_HUMAN_CONTEXT_BYTES;
+        let (gw, _calls) = scripted_gateway(vec![
+            final_response(&"P".repeat(big)),
+            final_response(&"Q".repeat(big)),
+        ])
+        .await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(human_registry(None))
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone());
+
+        let graph = Graph {
+            nodes: vec![
+                mc("brief", None),
+                mc("notes", Some("brief")),
+                Node {
+                    id: review(),
+                    kind: NodeKind::Agent {
+                        agent: AgentRef("reviewer".into()),
+                        input: serde_json::json!("THE-ACME-MSA-2026"),
+                        phase: None,
+                    },
+                    deps: vec![Dep::hard("brief"), Dep::hard("notes")],
+                },
+            ],
+        };
+
+        let o = ex.start(run, &graph).await.expect("drives");
+        assert!(o.failed.is_none(), "two verbose upstreams still ask: {o:?}");
+        let events = journal.load(run).await.unwrap();
+        let prompts = journaled_prompts(&events);
+        assert_eq!(prompts.len(), 1, "exactly one question: {prompts:?}");
+        let prompt = &prompts[0];
+
+        for (key, filler) in [("brief", 'P'), ("notes", 'Q')] {
+            assert!(
+                prompt.contains(&format!("### {key}")),
+                "dependency {key} was crowded out of the question the human reads"
+            );
+            assert!(
+                prompt.contains(&filler.to_string().repeat(500)),
+                "…and it carries a real prefix of {key}'s output, not just its heading"
+            );
+        }
+        assert!(
+            prompt.contains("THE-ACME-MSA-2026"),
+            "and the ask still survives both of them"
         );
     }
 
