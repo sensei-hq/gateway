@@ -32,8 +32,8 @@ kind.
 - `torii run agent answer <run> --node <id> (--text | --text-file) [--as who]`.
 - `run list-paused` shows the question.
 - Additive: a config with no human-backed agent is byte-identical.
-- **Legal ONLY as a top-level `NodeKind::Agent`** — see §5.5 for the other four `drive_agent`
-  callers and why each is rejected.
+- **Legal ONLY as a top-level `NodeKind::Agent`** — see §5.5 for the other five `drive_agent`
+  callers, the nested-`Agent` positions that reach the sixth, and why each is rejected.
 
 **Non-goals**
 - **Tool use by a human-backed agent** — see §7, "the accepted cost".
@@ -149,12 +149,23 @@ real defects in exactly those arms; a third copy would be a third place for them
 | fold state | behaviour |
 |---|---|
 | failure recorded | `Failed` — `gate_precheck`, checked FIRST |
-| no `AgentAwaited` yet | journal it (prompt + deadline), then continue below |
+| no wait recorded yet | journal `AgentAwaited` (prompt + deadline), then continue below |
+| a wait recorded by ANOTHER kind, so no prompt | `NodeFailed` — the kind swap, loudly |
 | **answered** | `Completed({"text","actor"})` — **read BEFORE expiry** |
 | not answered, deadline passed | `NodeFailed` — the SLA fired with nobody answering |
 | not answered, deadline not passed | re-pause on the **same** absolute instant |
 
-**Row 3 sits above row 4, and that is the slice's one deliberate divergence from s2.** See §3.
+**Row 4 sits above row 5, and that is the slice's one deliberate divergence from s2.** See §3.
+
+**Row 3 was added by the whole-slice review, and it is the mirror of `run_human_gate`'s
+missing-menu arm.** "Has this node begun asking?" is answered by `Fold::deadlines`, which ALL THREE
+waiting kinds write, while only `AgentAwaited` carries a prompt. So a node whose id already bore a
+`SignalAwaited` — reachable by editing a live run's graph to change a waiting node's KIND, exactly
+as s2's arm is — returned `Waiting`, never took the ask arm, published no question, and paused
+FOREVER: with no `AgentAwaited`, `torii run agent answer` refuses permanently, while `torii run
+signal` accepts a payload, reports exit 0 and `list-paused` shows the node as a `signal` row. The
+guard is keyed on `Fold::prompt_for` — the node's OWN question — which until then was
+`expect(dead_code)` in non-test builds, and that was the tell.
 
 **The ask precedes the answer, unconditionally** — the prompt is journaled first even when an answer
 is already folded, so there is never an answer without a recorded question. s2 established this: a
@@ -246,11 +257,11 @@ the model would have seen.
 
 ### 5.5 A human-backed agent is legal ONLY as a top-level `Agent` node
 
-`drive_agent` is the shared choke point for **five** call sites, not one: `run_node`
-(`mod.rs:1128`), `run_map`/`run_consolidate` (`MapBody::Agent`, `fanout.rs:183,269`), `run_loop`'s
-body (`LoopBody::Agent`, `fanout.rs:488`), `run_loop`'s **gate** (`GateSpec::Agent`, the reserved
-`"{loop}/{i}/__gate__"` path, `fanout.rs:553`), and `expand.rs`'s `drive_planner_agent`
-(`PlannerRef::Agent`/`Select`, `expand.rs:48`).
+`drive_agent` is the shared choke point for **six** call sites, not one: `run_node`
+(`mod.rs`), `run_map` and `run_consolidate` (`MapBody::Agent`, `fanout.rs:183,269` — two DISTINCT
+sites), `run_loop`'s body (`LoopBody::Agent`), `run_loop`'s **gate** (`GateSpec::Agent`, the
+reserved `"{loop}/{i}/__gate__"` path), and `expand.rs`'s `drive_planner_agent`
+(`PlannerRef::Agent`/`Select`).
 
 Mechanically the pause already composes at all of them — `AgentStep::Paused` becomes
 `MapChildPaused` and pauses the whole Map (`fanout.rs:291-337`); a Loop body/gate pause propagates
@@ -270,11 +281,28 @@ and does not know which `AgentRef`s are human-backed. **So the check needs the r
 only place both are in hand is the executor's config-load path.
 
 Resolution: the rejection is enforced where the agent is resolved — `drive_agent` fails the node
-loudly (`NodeFailed`, naming the site and the role) when a human-backed agent is reached from any
-caller but `run_node`. `run_node` passes a flag; the other four do not. This is a runtime check
-rather than a load-time one, and that is a stated limitation: a graph that misuses a human-backed
-agent validates and then fails on first execution of that node. Making it load-time needs a
-registry-aware graph validation pass that does not exist and that neither sibling slice needed.
+loudly (`NodeFailed`, naming the site and the role) when a human-backed agent is reached anywhere
+but at a top-level `NodeKind::Agent`. This is a runtime check rather than a load-time one, and that
+is a stated limitation: a graph that misuses a human-backed agent validates and then fails on first
+execution of that node. Making it load-time needs a registry-aware graph validation pass that does
+not exist and that neither sibling slice needed.
+
+**The flag is a POSITION, not a caller — corrected by the whole-slice review.** As shipped, the
+five non-`run_node` callers passed `top_level: false` and `run_node` passed a hardcoded `true`,
+which reads as complete and is not: `run_loop` → `drive_nested` → `drive` → `run_node`, so an
+`Agent` node inside a `Subgraph`, a `Branch` arm, a `Loop`'s `Subgraph` body or an `Expand`'s
+planner-spliced graph reached that literal `true` and was declared top-level. Review drove
+`Loop { body: LoopBody::Subgraph([Agent -> human-backed]), max_iters: 3 }` and got two real
+journaled questions, at `lp/0/review` and `lp/1/review` — exactly the `LoopBody::Agent` row this
+table marks *rejected*, reached through a one-node wrapper, and authorable by an UNTRUSTED `Expand`
+planner. `drive` now carries a `nested: bool` that `drive_nested` — the single tail all four
+nesting shapes share — sets, and `run_node` passes `!nested`. Legality no longer depends on which
+function called.
+
+The same review found the AC15 site table missing `run_consolidate`'s `MapBody::Agent` (the second
+of the two `fanout.rs` sites this section enumerates): flipping that one site's flag left the
+ENTIRE workspace green while a `Consolidate { body: MapBody::Agent(human) }` began journaling a
+real question to a human.
 
 ### 5.6 The `on_agent_started` hook does not fire for a human-backed agent
 
@@ -385,7 +413,7 @@ guard the line they appeared to, and every one was caught by asking that questio
 | **AC11** `--text-file` keeps the answer out of argv | Read the child's own `ps` line | Argv-only delivery → the sentinel appears |
 | **AC12** Zero re-spend on resume | Answered node replays from the fold **and still produces the answer** | Break the fold read → this must be among the reds |
 | **AC13** Cross-process e2e (Postgres) | submit → pause → `list-paused` shows the question → answer in process B → fresh `worker serve --once` completes it | Swap the answer for a bare `wake` → stays `Paused` |
-| **AC15** A human-backed agent is rejected at every non-top-level site | Each of `MapBody`/`LoopBody`/`GateSpec::Agent`/planner fails the node loudly, naming the site | Drop the caller flag → a human-backed planner reaches `parse_plan` |
+| **AC15** A human-backed agent is rejected at every non-top-level site — by POSITION, not by caller | Each of `MapBody` (both the `Map` and the `Consolidate` site), `LoopBody`, `GateSpec::Agent` and planner fails the node loudly, naming the site; so does a nested `NodeKind::Agent` inside a `Subgraph`, a `Branch` arm or a `Loop`'s `Subgraph` body | Drop the caller flag → a human-backed planner reaches `parse_plan`; pin `run_node`'s flag to a literal `true` → a one-node `Subgraph` wrapper delivers a human ask per `Loop` iteration; flip `run_consolidate`'s site → a `Consolidate` journals a real question |
 | **AC16** `validate()` skips the chain requirement for `Human` | A human-backed agent with no `chain` and no binding loads | Leave the chain check unconditional → every human-backed config is rejected at load |
 | **AC17** The journaled prompt is `assemble_prompt`'s output PLUS the node's input, with `## Context` truncated rather than fatal | The prompt contains an activated skill's body, the `## Context` section and the node input; a verbose upstream truncates with a marker instead of failing the node | Compose `system_prompt` alone → the skill text is absent; drop the input → the reviewer is asked about an unnamed contract; charge `MAX_HUMAN_TEXT_BYTES` against `## Context` → an ordinary upstream kills the node |
 | **AC14** Additivity | No human-backed agent ⇒ byte-identical; suite stays **1505** + new | — (the baseline guard) |
