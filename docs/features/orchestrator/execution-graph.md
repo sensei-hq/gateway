@@ -10,7 +10,7 @@ source: crates/orchestrator*
 
 # Execution Graph
 
-> **Status: Partial (Phase 3 · SP-1/3 · SP-6-2).** Design §10. Implemented node kinds:
+> **Status: Partial (Phase 3 · SP-1/3 · SP-6-3).** Design §10. Implemented node kinds:
 > `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`** (leaf + graph bodies +
 > gate-agent), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
 > PlanDelta / planner-driven), **`AwaitSignal`** (SP-6 s1 — the HITL primitive) and
