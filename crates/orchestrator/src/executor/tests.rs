@@ -2,7 +2,8 @@ use super::*;
 use crate::test_support::{
     CallLog, content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
     echo_system_gateway, failing_after_gateway, final_response, metered_gateway,
-    metered_latency_gateway, recording_gateway, scripted_gateway, tool_call_response,
+    metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
+    tool_call_response,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -9513,12 +9514,16 @@ async fn select_resume_before_plan_expanded_reuses_the_recorded_pick() {
     );
 }
 
+/// Renamed from `..._picks_the_named_agent_from_the_menu`, which over-claimed: since
+/// the capability was inverted this runs against a `FixedDispatch` that DISCARDS
+/// `system` and `user`, so the menu is not observable here at all. What the menu
+/// actually carries is pinned by
+/// `the_selector_transmits_the_goal_the_menu_and_its_instruction`.
 #[tokio::test]
-async fn llm_planner_selector_picks_the_named_agent_from_the_menu() {
+async fn llm_planner_selector_trims_the_dispatched_agent_name() {
     use crate::executor::selector::LlmPlannerSelector;
     // The dispatch returns the chosen agent name with surrounding whitespace, so the
-    // selector's `.trim()` is exercised. The registry (alpha+beta, area=="planning")
-    // lets the selector render a capability menu.
+    // selector's `.trim()` is exercised.
     let sel = LlmPlannerSelector::new(two_planner_registry(), "c");
     let cands = vec![AgentRef("alpha".into()), AgentRef("beta".into())];
     let got = sel
@@ -12410,6 +12415,65 @@ async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
         crate::spend_of(&events).0,
         77 * dispatched,
         "the durable ledger accounts for every selector dispatch"
+    );
+}
+
+/// What the selector ASKS actually reaches the provider: the goal, the rendered
+/// capability menu, and the instruction that makes the answer parseable.
+///
+/// `llm_planner_selector_picks_the_named_agent_from_the_menu` cannot pin any of this
+/// — since the capability was inverted it runs against a `FixedDispatch` that
+/// discards `system` and `user`, so despite its name it asserts only that a
+/// hardcoded string gets trimmed. That left BOTH halves of the prompt path
+/// unguarded, and both are load-bearing:
+///
+/// - `LlmPlannerSelector` renders `goal` + `name (area/kind)` per candidate. Replace
+///   the whole fold with an empty string and the model is asked to choose from
+///   nothing.
+/// - `SelectorDispatch` hand-builds its `InferenceRequest` rather than going through
+///   `build_request`, whose `system: None` would drop the instruction. A future
+///   author "simplifying" to the shared helper gets free-form prose back instead of a
+///   bare agent name, every `Select` expand fails the `!candidates.contains(&a)`
+///   reject at runtime — and CI stays green.
+///
+/// Measured before this test existed: gutting the menu, the goal AND the system
+/// prompt left the whole workspace at 1611 passed / 0 failed.
+#[tokio::test]
+async fn the_selector_transmits_the_goal_the_menu_and_its_instruction() {
+    // "ghost" is not a candidate — irrelevant here; the prompts are recorded by the
+    // adapter before the answer is ever parsed.
+    let (gateway, prompts) = prompt_recording_gateway("ghost").await;
+    let journal = InMemoryJournal::new();
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    Executor::new(Arc::new(gateway), Arc::new(journal), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("drives");
+
+    let recorded = prompts.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1, "one selector call: {recorded:?}");
+    let (system, user) = &recorded[0];
+    let system = system
+        .as_deref()
+        .expect("the selector's instruction is carried as a system prompt, not dropped");
+    assert!(
+        system.contains("ONLY the exact agent name"),
+        "the instruction that makes the answer parseable is transmitted: {system}"
+    );
+    // `expand_select_node`'s input is `{"goal": "g"}`.
+    assert!(
+        user.contains("\"goal\":\"g\""),
+        "the goal reaches the provider: {user}"
+    );
+    assert!(
+        user.contains("- alpha (planning/reasoning)")
+            && user.contains("- beta (planning/reasoning)"),
+        "both candidates reach it, each with the capability the registry knows: {user}"
     );
 }
 

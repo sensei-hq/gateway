@@ -32,6 +32,75 @@ pub type RecordedCall = (Option<String>, String);
 /// Shared, clonable log of recorded calls.
 pub type CallLog = Arc<Mutex<Vec<RecordedCall>>>;
 
+/// One recorded call including its SYSTEM prompt: `(system, first user message)`.
+/// See [`prompt_recording_gateway`].
+pub type RecordedPrompt = (Option<String>, String);
+
+/// Shared, clonable log of recorded prompts.
+pub type PromptLog = Arc<Mutex<Vec<RecordedPrompt>>>;
+
+/// Chat adapter recording BOTH halves of the prompt — `(system, first user
+/// message)` — for one call.
+///
+/// The existing pair each sees only one half: [`RecordingAdapter`] logs the user
+/// text, [`EchoSystemAdapter`] logs (and echoes) the system prompt. Reach for this
+/// one when a single call must be shown to carry both, as the planner selector's
+/// must: its capability menu is the user text and its instruction ("answer with
+/// ONLY the exact agent name") is the system prompt, and `SelectorDispatch`
+/// hand-builds its `InferenceRequest` precisely because the shared `build_request`
+/// hardcodes `system: None`.
+pub struct PromptRecordingAdapter {
+    prompts: PromptLog,
+    content: String,
+}
+
+impl Model for PromptRecordingAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for PromptRecordingAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        let user = req
+            .messages
+            .first()
+            .map(|m| m.as_text().to_string())
+            .unwrap_or_default();
+        self.prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((req.system.clone(), user));
+        Ok(ChatResponse {
+            content: Some(self.content.clone()),
+            tool_calls: Vec::new(),
+            usage: None,
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway whose adapter records `(system, user)` for every call and always
+/// answers `content`.
+pub async fn prompt_recording_gateway(content: &str) -> (Gateway, PromptLog) {
+    let prompts: PromptLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(PromptRecordingAdapter {
+            prompts: prompts.clone(),
+            content: content.to_string(),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), prompts)
+}
+
 /// Chat adapter that records each call into a shared log and returns a canned,
 /// non-degraded (successful) response. `fail_after` is the crash injector for
 /// the resume test: `Some(n)` ⇒ succeed for the first `n` calls then error on
