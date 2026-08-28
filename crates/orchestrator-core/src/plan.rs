@@ -140,9 +140,13 @@ pub fn feasible(
     }
     // Reserved-id is a top-level-only pre-check: nested ids namespace deeper under
     // their parent path and can't collide with the top-level `__plan__` (planner
-    // sub-run) or `__gate__` (Loop gate-agent) segments.
+    // sub-run), `__gate__` (Loop gate-agent) or `__select__` (planner-selector spend)
+    // segments.
     for n in &plan.graph.nodes {
-        if n.id.0 == RESERVED_PLAN_ID || n.id.0 == RESERVED_GATE_ID {
+        if n.id.0 == RESERVED_PLAN_ID
+            || n.id.0 == RESERVED_GATE_ID
+            || n.id.0 == crate::planner::RESERVED_SELECT_ID
+        {
             errs.push(PlanError::ReservedNodeId(n.id.0.clone()));
         }
     }
@@ -180,7 +184,8 @@ mod tests {
     use crate::effect::EffectClass;
     use crate::graph::{Aggregation, BranchCond, Dep, Graph, MapBody, Node, NodeKind};
     use crate::registry::{
-        Activation, AgentDefinition, AgentRef, Permissions, Registry, SkillDef, ToolSpec,
+        Activation, AgentBacking, AgentDefinition, AgentRef, Permissions, Registry, SkillDef,
+        ToolSpec,
     };
     use std::collections::HashMap;
 
@@ -195,6 +200,7 @@ mod tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "r".into(),
+            backed_by: AgentBacking::Model,
         })
     }
     fn mc(id: &str, dep: Option<&str>) -> Node {
@@ -302,6 +308,30 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| matches!(e, PlanError::ReservedNodeId(id) if id == "__gate__"))
+        );
+    }
+
+    #[test]
+    fn feasible_reports_a_reserved_select_id() {
+        // The third reserved segment. A selector's own model call is journaled under
+        // `"{expand}/__select__"` so its spend reaches the ledger; an untrusted planner
+        // emitting a node id `"__select__"` namespaces to exactly that path, collides
+        // on effect_id, and kills the next resume with DeterminismViolation — the same
+        // defect the s5 review found for `"__gate__"`.
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("__select__".into()),
+                    kind: mc("z", None).kind,
+                    deps: vec![],
+                }],
+            },
+            node_plans: HashMap::new(),
+        };
+        let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::ReservedNodeId(id) if id == "__select__"))
         );
     }
 

@@ -64,10 +64,17 @@ fn db_url() -> Option<String> {
 /// `scheduled_runs` is a GLOBAL table and `tick()` claims the whole due set, not just the
 /// caller's run — so two of these tests running concurrently would each drive the other's
 /// run through their own gateway, and the re-spend counts below would be measuring the
-/// wrong executor. Serializing them process-wide is the same guard the store crate's own
-/// scheduler tests use, for the same reason. (Cross-PROCESS isolation is not needed:
-/// cargo runs test binaries one at a time.)
-static SCHEDULED_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// wrong executor. The singleton `config_versions` row has the same problem for the fence
+/// test, which asserts an exact generation.
+///
+/// Both now come from `orchestrator_store::test_guard`, the ONE shared implementation. This
+/// file used to hold a THIRD private copy — and a weaker one: a bare process-wide
+/// `tokio::sync::Mutex`, justified by "cross-PROCESS isolation is not needed: cargo runs
+/// test binaries one at a time". That is a property of `cargo test`, not of the code:
+/// `cargo nextest` runs test binaries in parallel and would defeat it silently, and it was
+/// never true of two concurrent `cargo` invocations either. The shared guard adds a Postgres
+/// session advisory lock, which holds across processes however the suite is invoked.
+use orchestrator_store::test_guard::{config_guard, scheduler_guard};
 
 /// One `ModelCall` node whose prompt is `marker` — the smallest graph that spends a token.
 ///
@@ -221,6 +228,137 @@ fn gate_graph_ids(marker: &str) -> (NodeId, NodeId, NodeId) {
     )
 }
 
+/// SP-6 s3 AC13: the human-backed role this suite asks. Its `system_prompt` is the
+/// question, and `backed_by: Human` is the ONLY thing that makes the middle node of
+/// [`human_agent_graph`] wait for a person rather than call a model.
+///
+/// `chain: None`, no `chains`, and — crucially — no `(area, kind)` binding anywhere: a
+/// human-backed role has no gateway chain by construction, and `drive_agent` branches
+/// BEFORE `resolve_chain` precisely so that shape is legal. If the branch ever moved below
+/// the chain resolution, this definition would fail the node rather than pause it, which is
+/// why the definition is left un-resolvable on purpose instead of being given a harmless
+/// `chain: Some("c")`.
+const REVIEWER_PROMPT: &str = "Read the MSA and say whether it permits sub-processing.";
+
+/// What the node hands the role — the model path's first user message, which SP-6 s3's
+/// `drive_agent` appends to `assemble_prompt`'s output under a `## Task` heading so the
+/// human sees what the model would have seen. Asserted on BOTH sides of the process
+/// boundary below.
+const REVIEWER_TASK: &str = "the Acme MSA, clause 7";
+
+fn reviewer(timeout: Option<Duration>) -> orchestrator_core::AgentDefinition {
+    orchestrator_core::AgentDefinition {
+        name: "reviewer".into(),
+        area: "review".into(),
+        kind: "human".into(),
+        chain: None,
+        chains: Default::default(),
+        grants: Default::default(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: REVIEWER_PROMPT.into(),
+        backed_by: orchestrator_core::AgentBacking::Human { timeout },
+    }
+}
+
+/// A registry holding exactly [`reviewer`], for ONE process.
+///
+/// Called separately by each side of the boundary rather than cloning one `Arc` across it,
+/// so the two "processes" share no registry state — the same discipline every other helper
+/// in this file applies to pools, journals and gateways.
+///
+/// **Stated precisely, because it is the one seam this test does NOT carry over the
+/// database:** the config here is built in-process on each side rather than read back from
+/// `PostgresConfigSource`, so what is proven below is a human-backed role surviving a
+/// process boundary in the JOURNAL and the SCHEDULER — not its `AgentDefinition` surviving
+/// a `config_agents` jsonb round-trip. Adjacent coverage, named rather than gestured at:
+/// `orchestrator-core`'s `agent_backing_is_serde_defaulted_and_round_trips` covers the
+/// serde of a `config_agents` row, and `orchestrator-store`'s
+/// `filesystem_source_carries_a_human_backing_through_to_the_registry` covers the authored
+/// md → `load` → `Registry::from_config` path. What NOTHING covers today, and this test
+/// does not either, is a human-backed definition written to and read back from a live
+/// `PostgresConfigSource`.
+///
+/// Wiring `PostgresConfigSource` here instead would also pin a config generation into the
+/// fence (`RegistryHandle::from_source`, the way `fresh_worker_pinned` does it), which is
+/// the subject of `a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_
+/// anything` and not of this one.
+fn human_registry(timeout: Option<Duration>) -> std::sync::Arc<orchestrator_core::Registry> {
+    Arc::new(orchestrator_core::Registry::default().with_agent(reviewer(timeout)))
+}
+
+/// SP-6 s3 AC13: [`gate_graph`]'s shape with the middle node a top-level
+/// [`NodeKind::Agent`] pointing at the human-backed [`reviewer`] — `n1 → review → n2`,
+/// where `review` is a ROLE answered by a person and takes free text with an actor.
+///
+/// Top-level deliberately: `drive_agent` refuses a human-backed role in a `Map`/`Loop`
+/// body, a loop gate or a planner (design §5.5), so this is the only position in which the
+/// node pauses at all.
+///
+/// **No `timeout` parameter, unlike [`gate_graph`] and [`signal_graph`]**, and that is the
+/// design speaking rather than an omission: s3 put the SLA on the ROLE
+/// (`AgentBacking::Human { timeout }`) so a role and its deadline travel together and the
+/// graph never changes. The deadline is therefore threaded through [`human_registry`].
+///
+/// Everything else is [`signal_graph`]'s reasoning verbatim, including the run-unique node
+/// ids: each `ModelCall`'s prompt IS its node id (so a recorded call is attributable to the
+/// run AND the node), and `context_refs`' `(scope_kind, scope_id, ctx_key)` primary key
+/// makes a shared bare `n1` collide LOUDLY on this suite's second run against a persistent
+/// database.
+fn human_agent_graph(marker: &str) -> Graph {
+    let (n1, review, n2) = human_agent_graph_ids(marker);
+    let model = |id: &NodeId, deps: Vec<orchestrator_core::Dep>| Node {
+        id: id.clone(),
+        kind: NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": id.0 }),
+        },
+        deps,
+    };
+    Graph {
+        nodes: vec![
+            model(&n1, vec![]),
+            Node {
+                id: review.clone(),
+                kind: NodeKind::Agent {
+                    agent: orchestrator_core::AgentRef("reviewer".into()),
+                    input: serde_json::json!(REVIEWER_TASK),
+                    phase: None,
+                },
+                deps: vec![orchestrator_core::Dep::hard(n1.0.clone())],
+            },
+            model(&n2, vec![orchestrator_core::Dep::hard(review.0.clone())]),
+        ],
+    }
+}
+
+/// The three node ids of [`human_agent_graph`], in graph order — a named helper for the
+/// same reason [`signal_graph_ids`] is one.
+fn human_agent_graph_ids(marker: &str) -> (NodeId, NodeId, NodeId) {
+    (
+        NodeId(format!("n1-{marker}")),
+        NodeId(format!("review-{marker}")),
+        NodeId(format!("n2-{marker}")),
+    )
+}
+
+/// [`fresh_context_worker`], but ALSO carrying the human-backed registry — which a real
+/// worker gets from its config source and without which `drive_agent` cannot resolve the
+/// `AgentRef` at all (`OrchestratorError::UnknownAgent`).
+///
+/// Its own constructor rather than a parameter on `fresh_context_worker`, so every
+/// existing test's wiring stays byte-identical.
+async fn fresh_human_worker(
+    url: &str,
+    at: DateTime<Utc>,
+    timeout: Option<Duration>,
+) -> (Scheduler, CallLog) {
+    let (exec, journal, clock, calls) = fresh_context_executor(url, at).await;
+    let exec = exec.with_registry(human_registry(timeout));
+    let store = Arc::new(PostgresSchedulerStore::new(connect(url).await.unwrap()));
+    (Scheduler::new(store, exec, journal, clock), calls)
+}
+
 /// How many recorded gateway calls carried `marker` as their prompt.
 fn calls_for(log: &CallLog, marker: &str) -> usize {
     log.lock()
@@ -371,6 +509,41 @@ async fn serve_once(sched: &Scheduler) -> torii::cmd::Outcome {
     .expect("one tick against a live database")
 }
 
+/// Drive `run` through the REAL `worker serve --once` until it LEAVES `Paused`, and return
+/// the outcome of the serve that moved it.
+///
+/// Why a loop rather than the single `serve_once` this replaces: a tick claims at most
+/// `CLAIM_BATCH` (64) due rows, `order by next_wake`, out of a `scheduled_runs` table that
+/// every suite which has ever paused a run shares. An OLDER backlog — the rows a crashed or
+/// red run leaves behind — therefore crowds this test's run out of the first batch, and the
+/// serve returns a perfectly healthy `tick complete: 64 run(s) woken` having never touched
+/// it. Measured, not theorised: seeding 300 ancient due rows turned three of these tests red
+/// with `left: Paused / right: Completed` and one with `left: Paused / right: Failed`, none
+/// of which had anything wrong with them.
+///
+/// This is not a weaker assertion — every caller still asserts the exact terminal status and
+/// the exact per-node spend afterwards. It is the same thing a real `torii worker serve`
+/// (without `--once`) does: keep ticking. The bound keeps a GENUINE never-woken regression
+/// loud and fast rather than trading one flake for a hang.
+///
+/// Only for callers that expect the run to MOVE. The tests asserting a run stays `Paused`
+/// (a wake with no decision) or stays `Cancelled` keep using `serve_once`: for them a
+/// crowd-out leaves the row untouched, which is exactly what they assert.
+async fn serve_until_settled(
+    sched: &Scheduler,
+    store: &PostgresSchedulerStore,
+    run: RunId,
+) -> torii::cmd::Outcome {
+    for _ in 0..16 {
+        let served = serve_once(sched).await;
+        let status = store.status(run).await.unwrap().map(|s| s.status);
+        if status != Some(RunStatus::Paused) {
+            return served;
+        }
+    }
+    panic!("`worker serve --once` never moved {run:?} off `paused` in 16 ticks");
+}
+
 /// AC8. The full operator loop over a real Postgres:
 ///
 /// 1. **Process A** submits against a warmed-gated gateway → the run pauses, durably.
@@ -386,7 +559,7 @@ async fn serve_once(sched: &Scheduler) -> torii::cmd::Outcome {
 #[tokio::test]
 async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -473,7 +646,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
     // The ONLY thing carried over from A is the run id; everything else B needs — the
     // graph included — it reads out of Postgres.
     let (sched_b, calls_b) = fresh_worker(&url, queued_at + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run completed, and A's journaled prefix was not re-spent --------------
@@ -525,7 +698,7 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
 #[tokio::test]
 async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -601,7 +774,14 @@ async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
 #[tokio::test]
 async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_anything() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    // BOTH classes, in the documented global order (config-tables before scheduled-runs).
+    // This is the one test here that also writes the SINGLETON `config_versions` row, and it
+    // asserts an exact generation twice — `current == Some(gen_before)` ("nothing else may
+    // move the shared generation between pin and bump") and `gen_after == gen_before + 1`.
+    // Any concurrent config writer breaks both, and the scheduler guard it used to take
+    // alone is a DIFFERENT lock class that excludes none of them.
+    let _config = config_guard().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -657,7 +837,7 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
 
     // ---- Process B: a FRESH worker, pinned to the NOW-DRIFTED generation, ticks ----
     let (sched_b, calls_b) = fresh_worker_pinned(&url, deadline + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_a.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run FAILS at the fence — never Completed, never silently re-Paused ----
@@ -738,7 +918,7 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
 #[tokio::test]
 async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fresh_process() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     const PER_CALL: u32 = 150;
     const CAP: u64 = 100;
@@ -858,7 +1038,7 @@ async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fres
     // ---- Process B: a FRESH metered worker drives it to completion ------------------
     let (sched_b, calls_b) =
         fresh_metered_worker(&url, queued_at + Duration::seconds(1), PER_CALL).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
     assert_eq!(
         store_b.status(run).await.unwrap().unwrap().status,
@@ -922,7 +1102,7 @@ async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fres
 #[tokio::test]
 async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_process() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -1038,7 +1218,7 @@ async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_pr
     // The only thing carried over from A is the run id; the graph included, everything
     // else B needs it reads out of Postgres.
     let (sched_b, calls_b) = fresh_context_worker(&url, signalled_at + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run completed — asserted at the scheduler AND in the journal --------------
@@ -1144,7 +1324,7 @@ async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_pr
 #[tokio::test]
 async fn a_human_gate_decided_in_another_process_completes_the_run() {
     let Some(url) = db_url() else { return };
-    let _guard = SCHEDULED_RUNS.lock().await;
+    let _guard = scheduler_guard().await;
 
     let run = RunId(uuid::Uuid::new_v4());
     let marker = run.0.to_string();
@@ -1320,7 +1500,7 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
     // The only thing carried over from A is the run id; everything else B needs — the
     // graph included — it reads out of Postgres.
     let (sched_b, calls_b) = fresh_context_worker(&url, decided_at + Duration::seconds(1)).await;
-    let served = serve_once(&sched_b).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
     assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
 
     // ---- The run completed — asserted at the scheduler AND in the journal --------------
@@ -1401,5 +1581,353 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
         }),
         "the operator's decision — who, what and why — is what the gate returned into the \
          graph"
+    );
+}
+
+/// SP-6 s3 AC13 — a human-backed ROLE, end to end, across a process boundary.
+///
+/// The third and last waiting kind. s1's `AwaitSignal` waits for arbitrary JSON and s2's
+/// `HumanGate` for a named option; here the waiting thing is an ordinary top-level
+/// [`NodeKind::Agent`] whose `AgentRef` happens to resolve to an `AgentBacking::Human`
+/// definition — so the GRAPH is the model-backed graph, unchanged, and the substitution
+/// lives entirely in the registry. That is the property this test exists to show over a
+/// process boundary:
+///
+/// 1. **Process A** submits `n1 → review → n2`. `n1` costs a real gateway call; `review`
+///    journals its QUESTION and takes a durable, timed pause.
+/// 2. **The operator, light tier** (`run list-paused`) reads that question out of the
+///    database on its OWN pool — no gateway, no model credentials, no graph in hand.
+/// 3. **Discrimination**: a bare `run wake` is a RESUME, not an ANSWER. The run comes back
+///    still paused, re-armed on the same instant, having spent nothing.
+/// 4. **The operator answers** on a THIRD pool (`run agent answer --text … --as …`).
+/// 5. **Process B** — a fresh store/journal/content-store/context-store/gateway/registry,
+///    sharing nothing in-process with A — drives it through torii's real
+///    `worker serve --once` to `Completed`.
+/// 6. **Zero re-spend**, asserted per node, and the human's free text is the node's durable
+///    OUTPUT under `"text"` — the same key a model-backed agent writes, which is what lets
+///    a downstream node consume it without knowing a person produced it.
+///
+/// **`DATABASE_URL`-gated, and the consequence is worth stating plainly: with no database
+/// this test RETURNS EARLY and is counted as PASSED while exercising nothing.** The raw
+/// stderr `SKIP` line [`db_url`] writes is the only signal that happened. It is not
+/// `#[ignore]`d, and it cannot be: `#[ignore]` is a compile-time attribute and cannot be
+/// conditioned on an environment variable. (s2's spec claimed this suite was `#[ignore]`d.
+/// It never was, and the claim is repeated here only to kill it.)
+#[tokio::test]
+async fn a_human_backed_agent_answered_in_another_process_completes_the_run() {
+    let Some(url) = db_url() else { return };
+    let _guard = scheduler_guard().await;
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let marker = run.0.to_string();
+    let (n1, review, n2) = human_agent_graph_ids(&marker);
+    let graph = human_agent_graph(&marker);
+    // An hour out, so the deadline is far beyond every instant this test reaches: nothing
+    // but an operator can make this run claimable, which is what turns the completion
+    // below into a statement about the ANSWER.
+    let sla = Some(Duration::hours(1));
+    let t0 = DateTime::<Utc>::from_timestamp(8_000_000, 0).unwrap();
+    let clock = FakeClock::new(t0);
+
+    // ---- Process A: the prefix is paid for, then the role asks and pauses -------------
+    let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let (gw_a, calls_a) = recording_gateway().await;
+    let exec_a = Executor::new(Arc::new(gw_a), journal_a.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_context_store(Arc::new(PostgresContextStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_registry(human_registry(sla))
+        .with_clock(clock.clone());
+    let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), None, || {})
+        .await
+        .expect("a role-paused run is not an error");
+    assert_eq!(submitted.code, torii::errors::EXIT_OK, "{}", submitted.text);
+    assert!(
+        submitted.text.starts_with("paused:") && submitted.text.contains("human_agent"),
+        "the human-backed role must PAUSE the run (resumable), naming itself as the cause \
+         — not fail it, and not fall through to the model path: {}",
+        submitted.text
+    );
+
+    // The prefix is REAL — this is the spend the zero-re-spend assertion later protects.
+    // `n2` is behind the role and `review` itself resolves no chain at all, so a `2` here
+    // would mean the human branch had been bypassed.
+    assert_eq!(
+        (calls_for(&calls_a, &n1.0), calls_for(&calls_a, &n2.0)),
+        (1, 0),
+        "n1 spends; n2 is behind the unanswered role and must not have run"
+    );
+
+    let deadline = t0 + Duration::hours(1);
+    let paused = store_a
+        .status(run)
+        .await
+        .unwrap()
+        .expect("a schedule record");
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(
+        paused.next_wake,
+        Some(deadline),
+        "the pause carries the role's ABSOLUTE deadline, so the scheduler re-arms on the \
+         same instant however often the run is woken early: {paused:?}"
+    );
+
+    // ---- The operator, light tier: WHICH node is waiting, and on WHAT question? -------
+    // A separate pool and a separate journal handle — no gateway, no model credentials,
+    // no registry, nothing in-process shared with A. The question comes out of the durable
+    // `AgentAwaited`; `list-paused` has neither the graph nor the config in hand and must
+    // not need either.
+    let store_b = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let listed = torii::cmd::run::list_paused(store_b.as_ref(), journal_b.as_ref(), false)
+        .await
+        .expect("list-paused");
+    assert_eq!(listed.code, torii::errors::EXIT_OK, "{}", listed.text);
+    // The question is asserted on this run's OWN row INSIDE the awaiting block, and both
+    // anchors are load-bearing — but NOT for the gate e2e's reason, which an earlier
+    // version of this comment copied down here and which is FALSE for a role. A gate's
+    // pause reason really does list its menu (`human_gate: waiting for a decision on node
+    // release-… (ship | hold)`), so for a gate a whole-output `contains("ship")` passes off
+    // the TABLE row with the awaiting block empty. A human-backed role's pause reason
+    // carries the node id and the deadline and NOTHING else — `executor/human.rs` builds it
+    // from exactly those two — so the question cannot leak into the table that way. The
+    // assertion below pins that, because the whole argument for anchoring rests on it.
+    //
+    // What makes each anchor load-bearing here, both observed against a live database
+    // rather than reasoned about:
+    //
+    //   * `starts_with(marker)` + the node id, because `scheduled_runs` is GLOBAL and every
+    //     human-backed run in this suite asks the IDENTICAL question — one `REVIEWER_PROMPT`
+    //     const, one registry. A run left paused by an earlier failed invocation is still
+    //     listed, so this block legitimately renders a STRANGER's `agent:` row carrying the
+    //     same prompt, and an unanchored `listed.text.contains(REVIEWER_PROMPT)` is
+    //     satisfied by it. Two consecutive runs against one database rendered exactly that:
+    //     two `agent:` rows differing only in their run and node ids.
+    //   * `split_once` past the header, because the TABLE row above ALSO starts with the
+    //     marker and names the node (its reason interpolates the node id), so an unanchored
+    //     `find` lands there first — and that line satisfies `contains("agent:")` through
+    //     the `human_agent:` prefix of its reason. Unanchored, the kind assertion below
+    //     would pass on a line that is not in the awaiting block at all.
+    let first_match = listed
+        .text
+        .lines()
+        .find(|l| l.starts_with(&marker) && l.contains(&review.0))
+        .expect("at minimum, this run's own table row");
+    assert!(
+        !first_match.contains(REVIEWER_PROMPT),
+        "a role's pause reason must NOT carry the question — it is the node id and the \
+         deadline only. If it ever does, the anchoring argument above changes and the \
+         question assertions stop distinguishing the awaiting block from the table: \
+         {first_match}"
+    );
+    let block = listed
+        .text
+        .split_once("AWAITING A SIGNAL")
+        .unwrap_or_else(|| {
+            panic!(
+                "list-paused must render the awaiting block for a human-backed role:\n{}",
+                listed.text
+            )
+        })
+        .1;
+    let row = block
+        .lines()
+        .find(|l| l.starts_with(&marker) && l.contains(&review.0))
+        .unwrap_or_else(|| {
+            panic!(
+                "the awaiting block must name the awaiting NODE — an operator cannot \
+                 answer what they cannot discover:\n{}",
+                listed.text
+            )
+        });
+    assert!(
+        row.contains("agent:"),
+        "…and must mark it an AGENT, which takes free text rather than the named option a \
+         gate takes or the raw JSON `run signal` delivers — the three verbs refuse each \
+         other, so a mislabelled row sends an operator to a refusal: {row}"
+    );
+    assert!(
+        row.contains(REVIEWER_PROMPT) && row.contains(REVIEWER_TASK),
+        "…and the QUESTION, both halves of it: the role's standing instructions AND the \
+         node's input under `## Task`. The input half is the one Task 4's review found \
+         missing (finding 4, fixed in 367daf6) — a reviewer asked to judge a contract with \
+         no contract named — so it is asserted here too, at the surface an operator \
+         actually reads: {row}"
+    );
+    assert!(
+        row.contains(&format!(
+            "deadline {}",
+            deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )),
+        "…and the deadline it will FAIL at: {row}"
+    );
+
+    // ---- Discrimination: a bare `wake` is a RESUME, not an ANSWER --------------------
+    // Without this the completion below would be ambiguous: `agent answer` also queues a
+    // wake, so a role that completed on ANY resume — on an empty answer, on a default —
+    // would pass every assertion after it. Here the very same run is woken with no answer
+    // on the journal, driven by a real worker tick, and must come back untouched.
+    let woken_at = t0 + Duration::seconds(60);
+    let woken = torii::cmd::run::wake(store_b.as_ref(), journal_b.as_ref(), run, woken_at, None)
+        .await
+        .expect("wake");
+    assert_eq!(woken.code, torii::errors::EXIT_OK, "{}", woken.text);
+    let (sched_w, calls_w) = fresh_human_worker(&url, woken_at + Duration::seconds(1), sla).await;
+    let served_w = serve_once(&sched_w).await;
+    assert_eq!(served_w.code, torii::errors::EXIT_OK, "{}", served_w.text);
+    let after_wake = store_b.status(run).await.unwrap().unwrap();
+    assert_eq!(
+        (after_wake.status, after_wake.next_wake),
+        (RunStatus::Paused, Some(deadline)),
+        "a wake with no answer must leave the role waiting, re-armed on the deadline it \
+         RECORDED — never completed, never failed: {after_wake:?}"
+    );
+    assert_eq!(
+        (calls_for(&calls_w, &n1.0), calls_for(&calls_w, &n2.0)),
+        (0, 0),
+        "and it must cost nothing: n1 replays from the durable journal + CAS, and n2 is \
+         still behind an unanswered role"
+    );
+
+    // ---- The operator answers, on a THIRD pool ---------------------------------------
+    // Two minutes in — far short of the hour — so the role is genuinely still waiting and
+    // the completion below cannot be the timeout firing.
+    const ANSWER: &str = "Clause 7 permits sub-processing with 30 days' written notice.";
+    let answered_at = t0 + Duration::seconds(120);
+    let store_c = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_c = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let delivered = torii::cmd::human::answer(
+        store_c.as_ref(),
+        journal_c.as_ref(),
+        run,
+        review.clone(),
+        ANSWER,
+        "counsel",
+        answered_at,
+    )
+    .await
+    .expect("answer");
+    assert_eq!(delivered.code, torii::errors::EXIT_OK, "{}", delivered.text);
+    assert!(
+        delivered.text.starts_with("answered:") && delivered.text.contains(&review.0),
+        "{}",
+        delivered.text
+    );
+
+    // Answering QUEUES; it does not drive — exactly what the message claims.
+    let after_answer = store_c.status(run).await.unwrap().unwrap();
+    assert_eq!(
+        (after_answer.status, after_answer.next_wake),
+        (RunStatus::Paused, Some(answered_at)),
+        "the answer is journaled and the wake is queued, but a worker tick does the \
+         driving: {after_answer:?}"
+    );
+
+    // ---- Process B: a FRESH worker drives it -----------------------------------------
+    // The only things carried over from A are the run id and the config — everything else
+    // B needs, the graph included, it reads out of Postgres. (Why the config is rebuilt
+    // rather than read back: see `human_registry`.)
+    let (sched_b, calls_b) =
+        fresh_human_worker(&url, answered_at + Duration::seconds(1), sla).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
+    assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
+
+    // ---- The run completed — asserted at the scheduler AND in the journal -------------
+    assert_eq!(
+        store_b.status(run).await.unwrap().unwrap().status,
+        RunStatus::Completed,
+        "the answered run runs to completion in the fresh process: {}",
+        served.text
+    );
+    let events = journal_b.load(run).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "…and says so durably, in the journal the scheduler read it from"
+    );
+
+    // ---- ZERO RE-SPEND of the completed prefix, per node ------------------------------
+    // Attributable, not an empty log: `calls_for` counts the recording gateway's calls
+    // whose PROMPT is the node id, so the SAME filter that returns 1 for `n2` returns 0 for
+    // `n1`. A bare total would be meaningless — `tick()` legitimately drives every due run
+    // in the shared `scheduled_runs` table, leftovers from other suites included.
+    assert_eq!(
+        calls_for(&calls_b, &n1.0),
+        0,
+        "n1 was paid for by process A — B must replay it from the durable journal + CAS, \
+         never call the gateway for it again"
+    );
+    assert_eq!(
+        calls_for(&calls_b, &n2.0),
+        1,
+        "exactly the one node the answer unblocked, driven once"
+    );
+
+    // ---- The role asked ONCE: one question, one deadline, across three drives ----------
+    // A's pause, the bare wake's re-pause and B's completion — and exactly one
+    // `AgentAwaited`. A question re-published per execution would let an author edit a live
+    // run's config and retroactively change what a human's recorded answer meant; a
+    // deadline recomputed as `now + timeout` would be the never-expires bug. Neither is
+    // visible to any assertion above.
+    //
+    // The question is asserted WHOLE here rather than by substring as the listing row was:
+    // the row is capped for display, the journal is not, and this is the durable value.
+    let awaited: Vec<_> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::AgentAwaited {
+                node,
+                deadline,
+                prompt,
+            } if node == &review => Some((*deadline, prompt.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(awaited.len(), 1, "exactly one ask, ever: {awaited:?}");
+    let (asked_deadline, question) = &awaited[0];
+    assert_eq!(
+        *asked_deadline,
+        Some(deadline),
+        "the role publishes its ABSOLUTE deadline once, at first execution, and folds it \
+         thereafter"
+    );
+    // Start and end rather than full equality, because the middle is the `## Context`
+    // section `assemble_prompt` renders from `n1`'s durable blackboard output — real, and
+    // deliberately not pinned here, since asserting a `ModelCall`'s output shape would make
+    // this test fail for a reason that has nothing to do with human-backed roles.
+    assert!(
+        question.starts_with(REVIEWER_PROMPT),
+        "the question opens with the role's standing instructions: {question:?}"
+    );
+    assert!(
+        question.ends_with(&format!("\n\n## Task\n{REVIEWER_TASK}")),
+        "…and closes with the node's input under `## Task`, which is what the model would \
+         have received as its first user message: {question:?}"
+    );
+
+    // ---- The human's answer IS the role's durable output --------------------------------
+    // Read back through a THIRD context store on its own pool, so this is the durable row,
+    // not B's in-process blackboard.
+    //
+    // `"text"` is deliberately the SAME key a model-backed agent writes, which is what lets
+    // a downstream `Branch` or prompt consume a human's answer without knowing it was
+    // human; `"actor"` is the part a model output has no equivalent of, and it is what makes
+    // the run auditable after the fact.
+    let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
+    let published = ctx
+        .get(Scope::Run, ContextKey(review.0.clone()))
+        .await
+        .unwrap()
+        .expect("the completed role published its answer to the durable blackboard");
+    assert_eq!(
+        ctx.load(&published).await.unwrap(),
+        serde_json::json!({ "text": ANSWER, "actor": "counsel" }),
+        "the human's free text — and who gave it — is what the role returned into the graph"
     );
 }

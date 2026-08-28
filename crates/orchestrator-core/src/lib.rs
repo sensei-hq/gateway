@@ -34,17 +34,19 @@ pub use graph::{
 pub use hooks::OrchestratorHooks;
 pub use ids::{NodeId, RunId, Seq};
 pub use journal::{
-    ChildStatus, CompactChild, ExecutionJournal, FORMAT_VERSION, JournalEvent, ObservationMeta,
-    Snapshot,
+    ChildStatus, CompactChild, ExecutionJournal, FORMAT_VERSION, JournalEvent,
+    MAX_HUMAN_CONTEXT_BYTES, MAX_HUMAN_TEXT_BYTES, ObservationMeta, Snapshot,
 };
 pub use plan::{
     NodeNeeds, NodePlan, PlanError, PlannedGraph, RESERVED_PLAN_ID, feasible, parse_plan,
 };
-pub use planner::{PLANNER_AREA, Planner, PlannerSelector, RulePlannerSelector};
+pub use planner::{
+    ModelDispatch, PLANNER_AREA, Planner, PlannerSelector, RESERVED_SELECT_ID, RulePlannerSelector,
+};
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use redact::{PatternRedactor, Redactor};
 pub use registry::{
-    Activation, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy, Permissions,
-    Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef, ToolSpec,
+    Activation, AgentBacking, AgentDefinition, AgentRef, ChainBinding, ConfigSource, NetworkPolicy,
+    Permissions, Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef, ToolSpec,
 };
 pub use scheduler::{RunStatus, ScheduledRun, SchedulerStore};

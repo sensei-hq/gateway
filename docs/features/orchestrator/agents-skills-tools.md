@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-2
+spec: SP-1, SP-2, SP-4, SP-6-3
 source: crates/orchestrator*
 ---
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete)).** Design §6/§9;
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete) + SP-4 s1/s3/s4 + credential broker + SP-6-3).** Design §6/§9;
 > config-source design
 > [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
 > **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
@@ -156,6 +156,39 @@ source: crates/orchestrator*
 > **Deferred:** precise network host allowlists (an egress proxy — `Hosts` is coarse both
 > platforms), a `close_range` egress-hardening, a `shell` reconciler, an output-size cap,
 > read-confinement, cgroups, BSD `pledge`/`unveil`.
+>
+> **SP-6 s3 — a human-backed agent (who answers is a REGISTRY fact):** `AgentDefinition`
+> gains **`backed_by: AgentBacking`** — `Model` (the `#[derive(Default)]` variant) or
+> `Human { timeout: Option<chrono::Duration> }`. `#[serde(default)]` ⇒ an absent key means
+> `Model`, so every agent md written before s3 and every `config_agents` jsonb row parses
+> and round-trips **byte-identically**. The timeout lives on the ROLE, not on
+> `NodeKind::Agent`, so the role and its SLA travel together ("legal-reviewer always has
+> 48h") and swapping a model-backed `AgentRef` for a human-backed one needs **no graph
+> change** — the stated cost being one SLA per role, not per use site.
+> **`from_frontmatter`** parses the pair (`backed_by: human` + `timeout: 48h`) through
+> `parse_backing`, which is loud on everything it does not understand: an unknown value
+> (`backed_by: huamn` must not silently read as a model — that config looks correct and
+> quietly never asks anyone), a list instead of a scalar, and a `timeout` with no
+> `backed_by: human` (inert, so it is an author error, not a default).
+> **`Registry::validate` gains three rules and SKIPS one it already had.** The skip is
+> load-bearing: the chain-resolvability rule (`chain.is_none() && chain_binding(..).is_none()`
+> ⇒ `UnknownChainRef`) runs at config-LOAD time, independent of the runtime short-circuit, so
+> leaving it unconditional would reject essentially every human-backed agent before any node
+> ever ran — and a dummy binding to satisfy it would be a lie in the config. The three added
+> rules reject, loudly at load: **declared `tools`** and **declared `grants`** (the ReAct loop
+> that would use them never runs, so the declaration states something untrue about the agent;
+> `grants.json` is checked separately from `tools:` because it is its own authoring surface —
+> there is no privilege hole either way, since SP-4 s1 authorizes on `tool ∈ agent.tools` AND
+> the grant), an **empty `system_prompt`** (the prompt IS the question, so an empty one asks
+> the human nothing), and a **non-positive or over-`MAX_AWAIT_SIGNAL_TIMEOUT` timeout**
+> (`None` is the way to wait indefinitely) — the same bound `Graph::validate_dag` applies to
+> the sibling waiting kinds, applied here because that pass is pure over the graph and never
+> sees the registry. At runtime the branch sits in `run_agent` **after** prompt assembly and
+> **before** `resolve_chain`, so the human's question reuses the model path's own
+> `assemble_prompt` rather than a second implementation that could drift, and zero token spend
+> is STRUCTURAL rather than measured. **Deferred:** tool use by a human-backed role,
+> multi-turn (one ask, one answer), human-as-fallback when a model declines, and per-use-site
+> SLA overrides.
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
