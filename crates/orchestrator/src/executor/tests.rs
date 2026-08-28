@@ -16614,9 +16614,19 @@ mod human_gate {
 /// the same seams the InMemory resume tests use (`Executor::new(.., journal, ..)` +
 /// `with_content_store`). These tests reach Postgres ONLY through
 /// `orchestrator_store::postgres::{connect, PostgresJournal, PostgresContentStore}` — no direct
-/// sqlx handle. Every test uses a fresh `RunId` so the shared `orchestrator.*` tables never
-/// collide across tests (belt-and-suspenders with `--test-threads=1`). SP-DATA-3 adds the scheduler
-/// cross-process wake e2e here too.
+/// sqlx handle. Most tests here isolate on a fresh `RunId`, which is enough for the per-run
+/// `orchestrator.*` rows. SP-DATA-3 adds the scheduler cross-process wake e2e here too.
+///
+/// ISOLATION (the fix for a defect this module carried from SP-DATA-2): a fresh `RunId` is NOT
+/// enough for two kinds of state that are deliberately NOT per-run — the singleton
+/// `config_versions` row, and `scheduled_runs` claim sweeps, which are instance-wide. Those tests
+/// take [`orchestrator_store::test_guard`], the shared guard `orchestrator-store` and `torii`
+/// already used. This module had NO guard of any kind, which made it both the in-process race
+/// (its own two `config_versions` tests raced each other in this one binary — red 5 runs out of 5
+/// under default threads) and the hole that made the OTHER crates' advisory lock worthless (an
+/// advisory lock only serializes the parties that take it: red 10/10 against concurrent guarded
+/// suites). The comment this replaces claimed `--test-threads=1` covered it; it does not, and
+/// correctness must not depend on how the suite is invoked.
 #[cfg(feature = "postgres-tests")]
 mod postgres_e2e {
     use super::*;
@@ -16625,6 +16635,7 @@ mod postgres_e2e {
         PostgresConfigSource, PostgresContentStore, PostgresJournal, PostgresSchedulerStore,
         connect,
     };
+    use orchestrator_store::test_guard::{config_guard, scheduler_guard};
 
     fn db_url() -> Option<String> {
         std::env::var("DATABASE_URL").ok()
@@ -16857,6 +16868,11 @@ mod postgres_e2e {
     #[tokio::test]
     async fn postgres_unchanged_config_generation_permits_cross_process_resume() {
         let Some(url) = db_url() else { return };
+        // `config_versions` is a SINGLETON row, so `v` below is a global the moment it is
+        // read: without this guard the sibling `postgres_bumped_…` test's bump lands between
+        // `bump_config_version()` returning and `RegistryHandle::from_source` reading, and the
+        // handle boots one (or two) generations ahead of `v`.
+        let _guard = config_guard().await;
         let run = RunId(uuid::Uuid::new_v4());
         let (graph, n1, n2) = two_node_graph("a", "b");
 
@@ -16928,6 +16944,10 @@ mod postgres_e2e {
     #[tokio::test]
     async fn postgres_bumped_config_generation_fences_a_cross_process_resume() {
         let Some(url) = db_url() else { return };
+        // The mirror of the sibling test's need: this one bumps the singleton TWICE and
+        // asserts `handle_b.generation() == v2`, so a concurrent writer breaks it too — and
+        // its own bumps are what break the sibling. Both sides must take the guard.
+        let _guard = config_guard().await;
         let run = RunId(uuid::Uuid::new_v4());
         let (graph, _n1, _n2) = two_node_graph("a", "b");
 
@@ -16994,18 +17014,38 @@ mod postgres_e2e {
     #[tokio::test]
     async fn scheduler_wakes_a_paused_run_cross_process() {
         let Some(url) = db_url() else { return };
+        // `sched_b.tick()` is a GLOBAL claim sweep, not a per-run one, so it can steal
+        // another suite's due rows and drive them through THIS test's gateway. This test is
+        // written tolerantly (`woken >= 1`, and it attributes spend to its own run), so the
+        // theft would not fail it — it would fail the victim, in another process, for reasons
+        // invisible from there. That is exactly the class `ADVISORY_SCHEDULED_RUNS` exists for.
+        let _guard = scheduler_guard().await;
         use crate::Scheduler;
         use crate::test_support::{FakeClock, gated_gateway};
         use chrono::{DateTime, Duration, Utc};
         use orchestrator_core::{RunStatus, SchedulerStore};
 
         let run = RunId(uuid::Uuid::new_v4());
+        // The prompt is the run's OWN id, which makes every gateway call attributable to the
+        // run that caused it. A bare `calls_b.len()` counted the whole tick's spend, and a
+        // tick legitimately drives EVERY due run in the shared table — so two leftover rows
+        // from an earlier suite turned "the woken run drove the one node once" into
+        // `left: 3 / right: 1`, blaming this run for two strangers' calls. Same convention
+        // as torii's `e2e_pg::calls_for`, for the same reason.
+        let marker = run.0.to_string();
         let graph = Graph {
             nodes: vec![Node {
                 id: NodeId("n1".into()),
-                kind: model_call("c", "go"),
+                kind: model_call("c", &marker),
                 deps: vec![],
             }],
+        };
+        let calls_for = |log: &crate::test_support::CallLog| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, p)| *p == marker)
+                .count()
         };
         let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(3_000_000, 0).unwrap());
 
@@ -17048,15 +17088,37 @@ mod postgres_e2e {
         // A tick past the deadline wakes the due set — OUR run among any others sharing the
         // `scheduled_runs` table (unique run ids + a GLOBAL claim, per the harness's shared-table
         // convention). Assert OUR run's outcome, not the global count.
-        let woken = sched_b.tick().await.unwrap();
+        //
+        // Why a LOOP and not one `tick()`: a tick claims at most `CLAIM_BATCH` (64) rows,
+        // `order by next_wake`, from a table every suite that ever paused a run shares. A
+        // backlog of OLDER due rows therefore crowds this run out of the first batch and the
+        // tick returns a perfectly healthy `woken == 64` having never touched it — measured
+        // exactly that way: seeding 70 ancient due rows turned the assertion below into
+        // `left: Paused / right: Completed`, 100% of the time, with nothing wrong at all.
+        // A real worker (`torii worker serve`) ticks repeatedly, so this does too. The bound
+        // keeps a GENUINE regression loud: a run that never wakes still fails, in seconds.
+        let mut woken = 0;
+        let mut ticks = 0;
+        let status_b = loop {
+            woken += sched_b.tick().await.unwrap();
+            ticks += 1;
+            let st = store_b.status(run).await.unwrap().unwrap().status;
+            if st != RunStatus::Paused {
+                break st;
+            }
+            assert!(
+                ticks < 16,
+                "process B never woke the due run in {ticks} ticks ({woken} other runs woken)"
+            );
+        };
         assert!(woken >= 1, "process B wakes at least the due run");
         assert_eq!(
-            store_b.status(run).await.unwrap().unwrap().status,
+            status_b,
             RunStatus::Completed,
             "the woken run completes across the process boundary"
         );
         assert_eq!(
-            calls_b.lock().unwrap().len(),
+            calls_for(&calls_b),
             1,
             "the woken run drove the one node once (no re-spend beyond it)"
         );
