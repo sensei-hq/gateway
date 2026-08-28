@@ -11,6 +11,13 @@ fn torii() -> Command {
     c
 }
 
+/// **The SECOND layer, since the conditional-ignore gate.** The first is
+/// `#[cfg_attr(not(have_database_url), ignore = "...")]` on every test below, driven by
+/// this package's `build.rs` — that is what makes a database-less run report these as
+/// `ignored` rather than as PASSED, which is what the runtime early-return made them.
+/// This helper still runs, and still announces, for the case the cfg cannot see: the
+/// variable present at BUILD time and gone at run time.
+///
 /// WHOLE-SLICE FIX 6: `Some(url)` to run, `None` plus a VISIBLE skip notice naming the
 /// test to skip. Written to the real stderr rather than through `eprintln!` because
 /// libtest captures the print macros for a passing test and replays them only on failure —
@@ -148,6 +155,10 @@ fn an_unparseable_retention_window_is_rejected_by_the_parser() {
 /// developer's database was last changed before 1926, so the count is zero and `--yes`
 /// deletes nothing. It still exercises the whole real path — boot, connect,
 /// `count_terminal_before` — against a live database.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[test]
 fn prune_is_a_light_tier_command_and_a_century_window_deletes_nothing() {
     let Some(url) = db_url() else { return };
@@ -319,6 +330,10 @@ fn a_connect_failure_does_not_leak_the_password() {
 /// two-tier boot — was asserted nowhere. `TORII_FENCE_VERSION` is explicitly removed (by
 /// `torii()`) and no `--gateway-config` is passed, so a light-tier command that had crept
 /// into needing either would fail here rather than at an operator's terminal.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[test]
 fn a_light_tier_command_runs_with_only_a_database_url() {
     let Some(url) = db_url() else { return };

@@ -825,6 +825,10 @@ mod tests {
     /// race at the source; the retry below is kept as the backstop for any
     /// future writer that forgets the guard, and any OTHER failure is a real bug
     /// and is not retried.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn heavy_boots_on_one_pools_worth_of_real_backend_connections() {
         let Some(url) = crate::test_guard::db_url() else {

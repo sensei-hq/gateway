@@ -16647,6 +16647,10 @@ mod postgres_e2e {
     /// Mirrors the in-memory `resume_folds_a_ref_lazily_and_rematerializes_it_from_the_cas_without_respending`,
     /// but the two executors share NOTHING in-process: they hold independent pools/instances over
     /// the same `DATABASE_URL`, so a pass proves the state crossed the process boundary via Postgres.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn postgres_cross_process_resume_replays_from_the_durable_journal() {
         let Some(url) = db_url() else { return };
@@ -16741,6 +16745,10 @@ mod postgres_e2e {
     ///
     /// Mirrors the in-memory `exactly_once_confirmed_by_key_does_not_double_apply`, but the
     /// standing intent lives in Postgres (durable) and a brand-new `PostgresJournal` reads it back.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn postgres_in_doubt_reconcile_is_durable() {
         let Some(url) = db_url() else { return };
@@ -16864,6 +16872,10 @@ mod postgres_e2e {
     /// fence matches → the completed prefix replays from the durable memo (the fresh gateway is called
     /// only for the tail). The cross-process form of the in-process fence test
     /// `reload_bumps_the_run_version_and_fences_in_flight_resume`.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn postgres_unchanged_config_generation_permits_cross_process_resume() {
         let Some(url) = db_url() else { return };
@@ -16940,6 +16952,10 @@ mod postgres_e2e {
     /// AC6 — a config change (a bump) between the original run and the resume is caught LOUDLY across
     /// the process boundary. AC7 (mutation-check): were `version()` to return None, both handles would
     /// boot at 0 and this mismatch would NOT fire — proving the durable version carries the fence.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn postgres_bumped_config_generation_fences_a_cross_process_resume() {
         let Some(url) = db_url() else { return };
@@ -17010,6 +17026,10 @@ mod postgres_e2e {
     /// DB — it shares NOTHING in-process with A. B reads A's durable pause (status + deadline) from PG,
     /// then a `tick` past the deadline drives the woken run to completion (the gated node re-attempts
     /// once under the un-gated gateway — a real quota reset).
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn scheduler_wakes_a_paused_run_cross_process() {
         let Some(url) = db_url() else { return };
