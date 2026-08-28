@@ -68,11 +68,18 @@ impl Executor {
 
     /// Build a model node's journaled+returned output `{model, text}` with `text`
     /// redacted (SP-4 s2 — the SINGLE redaction point every model-output producer
-    /// routes through, so a new producer is scrubbed by construction). The four live
+    /// routes through, so a new producer is scrubbed by construction). The five live
     /// producers are the direct `ModelCall` node, the `Map`-item call, the
-    /// `Consolidate` synthesis, and the ReAct turn (`dispatch_model_turn`, which
-    /// APPENDS `tool_calls` to this shape after — it is the only path that carries
-    /// tool calls; the other three are single-shot and text-only).
+    /// `Consolidate` synthesis, the planner selector's lent dispatch
+    /// (`SelectorDispatch::complete`), and the ReAct turn (`dispatch_model_turn`,
+    /// which APPENDS `tool_calls` to this shape after — it is the only path that
+    /// carries tool calls; the other four are single-shot and text-only).
+    ///
+    /// This count is the same census the INPUT side keeps at `dispatch_metered`, and
+    /// it moves with it: the budget-completeness pass made the selector the fifth of
+    /// both. Each producer has its own redaction test — that regime is what SP-4 s2's
+    /// review left behind after finding the redactor wired into 1 of the then-4, so a
+    /// sixth producer means a sixth test, not just a bigger number here.
     pub(super) fn model_output(
         &self,
         resp: &kernel::types::request::InferenceResponse,
