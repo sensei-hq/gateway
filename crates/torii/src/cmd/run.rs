@@ -4069,6 +4069,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// FIRST wins on the QUESTION, and this is the guard the comment at `awaiting_nodes`'
+    /// fold has always claimed: "if the listing showed a later question than the command
+    /// answers, an operator would answer a question they were never shown."
+    ///
+    /// Re-review flipped `acc.entry(n).or_insert_with(…)` to `acc.insert(n, …)` and the
+    /// whole workspace stayed green — the rule was asserted at three sites and guarded at
+    /// one, the executor's `Fold::agent_prompts`. Both torii copies survived. This closes
+    /// the listing's half; `cmd::human::the_question_a_late_ask_cannot_restate` closes the
+    /// answering command's, so the two sides are pinned to the SAME first-wins rule they
+    /// have to agree on.
+    #[tokio::test]
+    async fn list_paused_shows_the_first_question_a_node_published() {
+        const RESTATED: &str = "Actually — approve the OTHER contract?";
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+        // A second ask for the SAME node. The executor cannot write one (its fold is
+        // first-wins too), but a corrupt or hand-written journal can, and the listing must
+        // not disagree with `run agent answer` about which question is live.
+        j.append(
+            run,
+            JournalEvent::AgentAwaited {
+                node: reviewer(),
+                deadline: None,
+                prompt: RESTATED.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let row = awaiting_row(&out.text, run, "reviewer");
+        assert!(
+            row.contains(THE_QUESTION),
+            "the FIRST question is the one a human was shown: {row}"
+        );
+        assert!(
+            !row.contains(RESTATED),
+            "a later ask must not retroactively change what the operator is answering — \
+             `cmd::human::agent_question` validates against the first one: {row}"
+        );
+    }
+
     /// **This test was the inverse until Task 6.** It asserted that nothing told a
     /// human-backed agent from an `AwaitSignal` — a known gap, written as an assertion
     /// rather than a comment. It is inverted rather than deleted so the closure is proven
