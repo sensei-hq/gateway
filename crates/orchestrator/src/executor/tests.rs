@@ -12554,6 +12554,100 @@ async fn selector_memo_mismatch_is_a_hard_halt() {
     );
 }
 
+/// A selector whose prompt drifts between drives, so drive 2 genuinely asks something
+/// drive 1 did not. `vary_system` chooses WHICH half moves, since the memo key is
+/// built from both. Always answers a NON-candidate, so `PlannerSelected` is never
+/// journaled and the next drive re-enters the `Select` arm and consults the memo.
+struct DriftingSelector {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    vary_system: bool,
+}
+#[async_trait::async_trait]
+impl orchestrator_core::PlannerSelector for DriftingSelector {
+    async fn select(
+        &self,
+        _goal: &serde_json::Value,
+        _candidates: &[AgentRef],
+        dispatch: &dyn orchestrator_core::ModelDispatch,
+    ) -> Result<AgentRef, OrchestratorError> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (system, user) = if self.vary_system {
+            (format!("instruction {n}"), "menu".to_string())
+        } else {
+            ("instruction".to_string(), format!("menu {n}"))
+        };
+        dispatch.complete(&system, &user, Some("c")).await?;
+        Ok(AgentRef("ghost".into()))
+    }
+}
+
+/// Drive a Select node twice with a `DriftingSelector` and return the second drive's
+/// error, if any. Shared by the two memo-key guards below.
+async fn second_drive_of_a_drifting_selector(vary_system: bool) -> Option<OrchestratorError> {
+    let (gateway, _calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let selector = Arc::new(DriftingSelector {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        vary_system,
+    });
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(selector);
+    let first = exec.start(run, &graph).await.expect("drive 1 yields");
+    assert!(
+        first.failed.is_some(),
+        "drive 1 picks a non-candidate, so the run stays resumable: {first:?}"
+    );
+    exec.start(run, &graph).await.err()
+}
+
+/// The memo key must actually DISCRIMINATE: it is
+/// `input_hash(chain, {system, user})`, and both halves are in it because both are
+/// what was asked.
+///
+/// `selector_memo_mismatch_is_a_hard_halt` proves the mismatch ARM halts, but it
+/// seeds a hand-written bogus hash — so it passes even if the key is a constant.
+/// Measured: replacing the key with `input_hash(chain, &json!({}))` left the whole
+/// workspace at 1612 passed / 0 failed. A constant key is worse than no memo: every
+/// re-drive would silently replay the FIRST call's answer no matter what the selector
+/// went on to ask, and the run would proceed on a stale pick with nothing loud
+/// anywhere.
+///
+/// *Mutation:* `&json!({})`, or a key dropping `"user"`, reds this one.
+#[tokio::test]
+async fn a_changed_selector_question_does_not_hit_the_memo() {
+    let err = second_drive_of_a_drifting_selector(false)
+        .await
+        .expect("a drifting user prompt must not replay drive 1's answer");
+    assert!(
+        matches!(&err, OrchestratorError::DeterminismViolation { node, .. }
+            if node.0 == format!("e/{}", orchestrator_core::RESERVED_SELECT_ID)),
+        "expected a violation at the reserved select path, got {err:?}"
+    );
+}
+
+/// The `system` half of that key, pinned separately. `LlmPlannerSelector`'s
+/// instruction is a constant, so only a selector that varies its own instruction can
+/// distinguish a key built from both halves from one built from `user` alone — and
+/// `ModelDispatch` is a public port, so such a selector is ordinary third-party code.
+///
+/// *Mutation:* a key dropping `"system"` reds this one and leaves its sibling green.
+#[tokio::test]
+async fn a_changed_selector_instruction_does_not_hit_the_memo() {
+    let err = second_drive_of_a_drifting_selector(true)
+        .await
+        .expect("a drifting system prompt must not replay drive 1's answer");
+    assert!(
+        matches!(&err, OrchestratorError::DeterminismViolation { node, .. }
+            if node.0 == format!("e/{}", orchestrator_core::RESERVED_SELECT_ID)),
+        "expected a violation at the reserved select path, got {err:?}"
+    );
+}
+
 /// The memo's OTHER newly-reachable fatal error: the recorded selector output was
 /// stored as a CAS `Ref` and the content is gone, so `materialize` cannot replay it.
 ///
