@@ -12413,6 +12413,236 @@ async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
     );
 }
 
+/// The memo check the replay above relies on has a SECOND arm — a recorded
+/// `input_hash` that does NOT match — and that arm must halt the drive, exactly like
+/// the identical check at every other producer.
+///
+/// It is reachable only through the LENT capability, and that is what makes it
+/// special: the error travels back out through an arbitrary `PlannerSelector`'s
+/// `Result`, into the `Select` arm, whose blanket `Err(e)` handler was written for a
+/// selector's OWN failures (a bad pick, an empty response) and turned the executor's
+/// integrity failure into a soft journaled `NodeFailed`. The run then kept driving:
+/// it wrote a `NodeFailed` into a journal it had just proved inconsistent, and the
+/// independent sibling below went on to make a live, billed call against the cap.
+///
+/// The precedent is `planner_agent_determinism_violation_in_the_plan_sub_run_halts`,
+/// which pins the SAME property for `"e/__plan__"` — the other reserved sub-path of
+/// the same Expand node. Both assertions here mirror it: a hard `Err`, and a gateway
+/// that a determinism violation never touches.
+///
+/// *Mutation:* drop the `take_fatal()` re-raise from the `Select` arm and this goes
+/// red on both (`Ok(RunOutcome{failed})`, and 1 sibling call / 77 tokens spent).
+#[tokio::test]
+async fn selector_memo_mismatch_is_a_hard_halt() {
+    let (gateway, calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 70,
+            total_tokens: 77,
+        }),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    // "e" first so the sequential round reaches it before the independent sibling:
+    // a halt there must mean the sibling never dispatched at all.
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![]), mc("sib", None)],
+    };
+    let path = format!("e/{}", orchestrator_core::RESERVED_SELECT_ID);
+    let eid = effect_id(&path, 0, 0);
+    journal
+        .append(run, run_started_with_budget(10_000))
+        .await
+        .unwrap();
+    // A recorded selector effect whose `input_hash` cannot match anything this drive
+    // computes — the journal and the graph disagree about what was asked.
+    journal
+        .append(run, spent_effect(&path, eid.clone(), "bogus".into(), 77))
+        .await
+        .unwrap();
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")));
+    let err = exec
+        .start(run, &graph)
+        .await
+        .expect_err("a mismatched selector memo halts the drive");
+    match &err {
+        OrchestratorError::DeterminismViolation { node, effect_id } => {
+            assert_eq!(node.0, path, "the violation names the reserved select path");
+            assert_eq!(effect_id, &eid, "and the effect it could not replay");
+        }
+        other => panic!("expected a fatal DeterminismViolation, got {other:?}"),
+    }
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        0,
+        "a determinism violation never touches the gateway — the halt precedes the sibling"
+    );
+    assert_eq!(
+        crate::spend_of(&journal.load(run).await.unwrap()).0,
+        77,
+        "nothing was spent after the integrity failure (only the seeded record)"
+    );
+}
+
+/// The memo's OTHER newly-reachable fatal error: the recorded selector output was
+/// stored as a CAS `Ref` and the content is gone, so `materialize` cannot replay it.
+///
+/// `ContentDigestMiss` is documented as loud — "never a silent empty value" — but the
+/// lent capability routed it through the same blanket `Err(e)` handler, which turned
+/// it into a soft `NodeFailed` and let the run continue. A digest miss means the
+/// durable record cannot be read; inventing a node failure on top of it discards the
+/// one signal an operator has.
+///
+/// *Mutation:* drop the `take_fatal()` re-raise from the `Select` arm and this goes
+/// red (`Ok(RunOutcome{failed})`).
+#[tokio::test]
+async fn selector_content_digest_miss_is_a_hard_halt() {
+    use orchestrator_store::InMemoryContentStore;
+    // "ghost" is not a candidate ⇒ the pick is rejected BEFORE `PlannerSelected` is
+    // journaled, so the next drive re-enters the Select arm and consults the memo.
+    let (gateway, _calls) = scripted_gateway(vec![final_response("ghost")]).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    // Drive 1 with a CAS threshold of 0: the selector's recorded output is a `Ref`
+    // into THIS executor's content store.
+    Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(
+            registry.clone(),
+            "c",
+        )))
+        .with_content_store(Arc::new(InMemoryContentStore::new()))
+        .with_cas_threshold(0)
+        .start(run, &graph)
+        .await
+        .expect("drive 1 yields an outcome");
+    let path = format!("e/{}", orchestrator_core::RESERVED_SELECT_ID);
+    let eid = effect_id(&path, 0, 0);
+    let stored_as_ref = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .any(|(_, ev)| {
+            matches!(ev, JournalEvent::EffectRecorded { effect_id, output: EffectOutput::Ref(_), .. } if effect_id == &eid)
+        });
+    assert!(
+        stored_as_ref,
+        "drive 1 stored the selector's output in the CAS, not inline"
+    );
+
+    // Drive 2 on a FRESH executor: same journal, EMPTY content store. The memo hits,
+    // the hash matches, and `materialize` cannot resolve the digest.
+    let (gw2, calls2) = recording_gateway().await;
+    let err = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")))
+        .start(run, &graph)
+        .await
+        .expect_err("an unreadable selector memo halts the drive");
+    assert!(
+        matches!(err, OrchestratorError::ContentDigestMiss(_)),
+        "expected a loud ContentDigestMiss, got {err:?}"
+    );
+    assert!(
+        calls2.lock().unwrap().is_empty(),
+        "the halt precedes any dispatch"
+    );
+}
+
+/// A selector that SWALLOWS the dispatch's `Err` and answers anyway — the shape an
+/// author reaches for when they want a fallback ("if the model call fails, pick the
+/// first candidate"). Perfectly reasonable, and it must not be able to convert the
+/// executor's integrity failure into a normal selection.
+struct SwallowingSelector;
+#[async_trait::async_trait]
+impl orchestrator_core::PlannerSelector for SwallowingSelector {
+    async fn select(
+        &self,
+        _goal: &serde_json::Value,
+        candidates: &[AgentRef],
+        dispatch: &dyn orchestrator_core::ModelDispatch,
+    ) -> Result<AgentRef, OrchestratorError> {
+        match dispatch.complete("sys", "user", Some("c")).await {
+            Ok(text) => Ok(AgentRef(text.trim().to_string())),
+            Err(_) => Ok(candidates[0].clone()),
+        }
+    }
+}
+
+/// The halt does not depend on the selector's cooperation.
+///
+/// `PlannerSelector` is a public port implemented by arbitrary code, so "the error the
+/// executor raised is the error the executor sees" is an assumption, not a fact: a
+/// selector with a fallback returns `Ok`, and one that rewraps returns a different
+/// `Err`. Either way the drive must still abort, because the inconsistency is in the
+/// JOURNAL — it is not the selector's to forgive. That is why the fatal error is
+/// stashed on the dispatch and read BEFORE `select()`'s own result rather than being
+/// sniffed out of the returned variant.
+///
+/// *Mutation:* move the `take_fatal()` check inside the `Err(e)` arm and this goes red
+/// — the run journals `PlannerSelected(alpha)` and carries on.
+#[tokio::test]
+async fn a_selector_cannot_swallow_the_executors_determinism_violation() {
+    let (gateway, calls) = recording_gateway().await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let path = format!("e/{}", orchestrator_core::RESERVED_SELECT_ID);
+    let eid = effect_id(&path, 0, 0);
+    journal
+        .append(
+            run,
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+                budget: None,
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(run, spent_effect(&path, eid.clone(), "bogus".into(), 0))
+        .await
+        .unwrap();
+
+    let err = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(SwallowingSelector))
+        .start(run, &graph)
+        .await
+        .expect_err("the violation outranks the selector's fallback");
+    assert!(
+        matches!(&err, OrchestratorError::DeterminismViolation { node, .. } if node.0 == path),
+        "expected the executor's own violation, got {err:?}"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "and nothing dispatched on the strength of the fallback pick"
+    );
+    assert!(
+        !journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, ev)| matches!(ev, JournalEvent::PlannerSelected { .. })),
+        "the swallowed error must not become a journaled selection"
+    );
+}
+
 /// A selector that dispatches TWICE per `select()` — the shortlist-then-choose shape
 /// the lent [`ModelDispatch`](orchestrator_core::ModelDispatch) port makes possible.
 /// Picks a NON-candidate so `PlannerSelected` is never journaled and the next drive
