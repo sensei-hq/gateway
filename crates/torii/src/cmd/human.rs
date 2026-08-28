@@ -46,12 +46,15 @@ pub enum AgentAction {
     ))]
     Answer {
         run_id: String,
-        /// The waiting node's id — `torii run list-paused` names the nodes that are waiting.
+        /// The waiting node's id — `torii run list-paused` names every node that is waiting
+        /// and shows the question each one asked, in its `agent:` cell.
         //
-        // It names them; it does not yet show WHAT they asked, and this help said it did.
-        // See `crate::main`'s `Agent` variant for the whole note and for the guard
-        // (`cli.rs`'s `agent_help_promises_only_what_list_paused_actually_shows`), which
-        // asserts on BOTH surfaces because an operator reads whichever one they reached.
+        // This help once promised the question while the listing did not render it. It does
+        // now (`render::AwaitingNode::question`, folded by `cmd::run::awaiting_nodes` from
+        // `AgentAwaited`), so the promise is accurate. See `crate::main`'s `Agent` variant
+        // for the whole history and for the guard — `cli.rs`'s
+        // `agent_help_names_the_question_list_paused_now_shows`, which asserts on BOTH help
+        // surfaces because an operator reads whichever one they reached.
         #[arg(long)]
         node: String,
         /// The answer, as free text. It becomes this node's OUTPUT under the `text` key —
@@ -612,6 +615,11 @@ pub(crate) mod tests {
         NodeId("reviewer".into())
     }
 
+    /// The question [`agent_journal`] asks. Named rather than inlined because
+    /// `cmd::run`'s listing tests assert on this exact text — the row must show what the
+    /// journal recorded, and a second literal is a second thing to forget to change.
+    pub(crate) const THE_QUESTION: &str = "Does this release look safe to ship?";
+
     /// A journal in which `node` has already ASKED — the state
     /// `Executor::run_human_agent` leaves behind on its first execution (`AgentAwaited`
     /// with the assembled prompt, then the durable pause).
@@ -620,13 +628,27 @@ pub(crate) mod tests {
         node: &NodeId,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
     ) -> InMemoryJournal {
+        agent_journal_asking(run, node, deadline, THE_QUESTION).await
+    }
+
+    /// [`agent_journal`] with the question spelled out, for the tests whose subject IS the
+    /// question: `cmd::run`'s listing renders it into a line-oriented table, so it needs a
+    /// hostile one (control characters), an overlong one and a secret-shaped one. Those go
+    /// through the SAME `AgentAwaited` shape the executor writes rather than a hand-rolled
+    /// event, for the reason [`reviewer`] records.
+    pub(crate) async fn agent_journal_asking(
+        run: RunId,
+        node: &NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        prompt: &str,
+    ) -> InMemoryJournal {
         let j = InMemoryJournal::new();
         j.append(
             run,
             JournalEvent::AgentAwaited {
                 node: node.clone(),
                 deadline,
-                prompt: "Does this release look safe to ship?".into(),
+                prompt: prompt.to_string(),
             },
         )
         .await
