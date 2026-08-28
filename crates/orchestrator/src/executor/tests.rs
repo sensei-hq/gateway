@@ -16755,10 +16755,15 @@ mod human_agent {
         );
     }
 
-    /// Every non-top-level `drive_agent` call site, paired with the node id its refusal is
-    /// journaled against — `Map` body, `Loop` body, `Loop` GATE and `Expand` PLANNER. The
-    /// fifth caller, `run_node`'s own `NodeKind::Agent`, is the one legal site and passes
-    /// `top_level: true`.
+    /// Every site at which a human-backed role is NOT legal, paired with the node id its
+    /// refusal is journaled against. Two families, and the second is the one the whole-slice
+    /// review had to add:
+    ///
+    /// - **Direct `drive_agent` callers** — `Map` body, `Consolidate` body, `Loop` body,
+    ///   `Loop` GATE and `Expand` PLANNER, all five of which pass `top_level: false`.
+    /// - **NESTED `NodeKind::Agent` nodes** — a `Subgraph`, a `Branch` arm and a `Loop`
+    ///   whose body is a `Subgraph`. These reach `run_node`'s own `NodeKind::Agent` arm,
+    ///   the one that passes `top_level: true`.
     ///
     /// **A table because AC15 is a claim about EVERY site, and the single-site version of
     /// this test could not see three of them.** Review flipped the individual `false`
@@ -16767,6 +16772,27 @@ mod human_agent {
     /// mutation reddened anything. The planner is the sharpest of the four and is exactly
     /// the regression §8's AC15 row names ("Drop the caller flag → a human-backed planner
     /// reaches `parse_plan`"), so it was the one site the guard had to cover and didn't.
+    ///
+    /// **The nested rows exist because §5.5's rule was enforced on the CALLER, not on the
+    /// node's POSITION, and a one-node `Subgraph` wrapper defeated it entirely.**
+    /// `run_loop` → `drive_nested` → `drive` → `run_node`, and `run_node`'s `Agent` arm
+    /// passed a hardcoded `true` — commented as "the ONE `true` in the codebase: this is
+    /// the graph's own `NodeKind::Agent`", which is equally true of every Agent node inside
+    /// a subgraph, a branch arm, a Loop's `Subgraph` body and any planner-spliced graph
+    /// from an `Expand`. Review drove `Loop { body: Subgraph([Agent -> human]) }` and got
+    /// two real journaled questions, at `lp/0/review` and `lp/1/review` — the "a human
+    /// re-answers every iteration" feature the refusal's own comment enumerates as unbuilt,
+    /// reached through a trivial wrapper, and reachable from an untrusted `Expand` planner
+    /// that splices such a node. The guard is now positional: `drive_nested` clears the
+    /// flag, so the legality of the SITE no longer depends on which function called it.
+    ///
+    /// **`MapBody::Agent` under a `Consolidate` is the fifth direct caller and was missing.**
+    /// Review flipped `fanout.rs`'s `run_consolidate` call site from `false` to `true` in a
+    /// scratch clone and the ENTIRE workspace stayed green — the table reached
+    /// `run_map_child`'s site (via the `m/0` path) but never `run_consolidate`'s, although
+    /// design §5.5 enumerates them as two distinct sites. Under that mutation a
+    /// `Consolidate { body: MapBody::Agent(human) }` stops refusing and journals a real
+    /// question to a human.
     ///
     /// The `Loop`-gate graph uses a `ModelCall` BODY on chain "c" so iteration 0 completes
     /// and the gate is actually reached; an `Agent` body would fail first and the gate
@@ -16839,18 +16865,121 @@ mod human_agent {
                 },
                 NodeId("E/__plan__".into()),
             ),
+            // The FIFTH direct caller: `run_consolidate`'s own `MapBody::Agent` arm, which
+            // the table used to miss entirely. The `Map` body is a `ModelCall` so the map
+            // COMPLETES and the consolidate is actually reached — an Agent body would fail
+            // the map first and silently reduce this row to a duplicate of the Map row.
+            (
+                "Consolidate MapBody::Agent",
+                Graph {
+                    nodes: vec![
+                        Node {
+                            id: NodeId("m".into()),
+                            kind: NodeKind::Map {
+                                body: MapBody::ModelCall { chain: "c".into() },
+                                over: vec![serde_json::json!({ "prompt": "one" })],
+                                concurrency: 1,
+                                aggregation: Aggregation::BestEffort,
+                            },
+                            deps: vec![],
+                        },
+                        Node {
+                            id: NodeId("cons".into()),
+                            kind: NodeKind::Consolidate {
+                                over: NodeId("m".into()),
+                                min_viable: 1,
+                                body: MapBody::Agent(reviewer()),
+                            },
+                            deps: vec![Dep::soft("m")],
+                        },
+                    ],
+                },
+                NodeId("cons".into()),
+            ),
+            // ---- Nested `NodeKind::Agent` nodes: `run_node`'s own arm, one level down ----
+            (
+                "Subgraph",
+                Graph {
+                    nodes: vec![Node {
+                        id: NodeId("sub".into()),
+                        kind: NodeKind::Subgraph {
+                            graph: Box::new(Graph {
+                                nodes: vec![agent_node("review", "reviewer", "the Acme MSA")],
+                            }),
+                        },
+                        deps: vec![],
+                    }],
+                },
+                NodeId("sub/review".into()),
+            ),
+            (
+                "LoopBody::Subgraph",
+                Graph {
+                    nodes: vec![Node {
+                        id: NodeId("lp".into()),
+                        kind: NodeKind::Loop {
+                            body: LoopBody::Subgraph(Box::new(Graph {
+                                nodes: vec![agent_node("review", "reviewer", "the Acme MSA")],
+                            })),
+                            input: serde_json::json!("the Acme MSA"),
+                            gate: GateSpec::Pure(LoopGate::TextContains("NEVER".into())),
+                            max_iters: 3,
+                        },
+                        deps: vec![],
+                    }],
+                },
+                NodeId("lp/0/review".into()),
+            ),
+            (
+                "Branch arm",
+                Graph {
+                    nodes: vec![
+                        mc("pick", None),
+                        Node {
+                            id: NodeId("br".into()),
+                            kind: NodeKind::Branch {
+                                on: NodeId("pick".into()),
+                                // `recording_gateway` answers "canned-response", so arm 0
+                                // is the one selected and the human node really is reached.
+                                arms: vec![(
+                                    orchestrator_core::BranchCond::TextContains("canned".into()),
+                                    Graph {
+                                        nodes: vec![agent_node(
+                                            "review",
+                                            "reviewer",
+                                            "the Acme MSA",
+                                        )],
+                                    },
+                                )],
+                                default: Graph {
+                                    nodes: vec![mc("skipped", None)],
+                                },
+                            },
+                            deps: vec![Dep::hard("pick")],
+                        },
+                    ],
+                },
+                NodeId("br/0/review".into()),
+            ),
         ]
     }
 
-    /// AC15: a human-backed role is legal ONLY as a top-level `NodeKind::Agent`. At each of
-    /// the four other `drive_agent` call sites it fails the node LOUDLY, naming the role
-    /// and the rule, and never asks a human a question.
+    /// AC15: a human-backed role is legal ONLY as a top-level `NodeKind::Agent` — meaning
+    /// an `Agent` node in the graph the caller handed `Executor::start`, not one nested
+    /// inside anything. At every other site in [`non_top_level_sites`] it fails the node
+    /// LOUDLY, naming the role and the rule, and never asks a human a question.
     ///
-    /// `drive_agent` is the shared choke point for five callers and the other four each
-    /// mean a different unbuilt feature: N concurrent human asks for a `Map`, a human
-    /// re-answering every `Loop` iteration, a human deciding loop continuation, and — the
-    /// sharpest — a human-backed PLANNER, whose answer feeds `parse_plan(text)`, so the
-    /// person would have to hand-author a machine-parseable plan graph.
+    /// `drive_agent` is the shared choke point for six callers and the five non-top-level
+    /// ones each mean a different unbuilt feature: N concurrent human asks for a `Map`, the
+    /// same for a `Consolidate`, a human re-answering every `Loop` iteration, a human
+    /// deciding loop continuation, and — the sharpest — a human-backed PLANNER, whose
+    /// answer feeds `parse_plan(text)`, so the person would have to hand-author a
+    /// machine-parseable plan graph.
+    ///
+    /// The NESTED rows reach that same sixth caller — `run_node`'s `NodeKind::Agent` arm —
+    /// one or more levels down, and they are the rows the whole-slice review had to add:
+    /// wrapping the agent in a one-node `Subgraph` used to bypass the rule completely and
+    /// deliver the `Loop`-iteration shape by the back door. See [`non_top_level_sites`].
     ///
     /// Enforced at RUNTIME rather than in `validate_dag`, because `validate_dag` cannot
     /// see the registry: a graph names an `AgentRef`, and whether that ref is human-backed
