@@ -16657,14 +16657,26 @@ mod human_agent {
         );
     }
 
-    /// AC17: the journaled question is the ASSEMBLED prompt — the agent's system prompt
-    /// PLUS every activated skill body PLUS the rendered `## Context` section — not just
-    /// `system_prompt`.
+    /// AC17: the journaled question is the model-equivalent one — the agent's system prompt
+    /// PLUS every activated skill body PLUS the rendered `## Context` section PLUS **the
+    /// node's own input**, the user message a model-backed run would have received.
     ///
     /// That is the whole reason the branch sits AFTER `assemble_prompt`: a human answering
-    /// for a role must be shown exactly what the model would have been shown. Journaling
-    /// `agent.system_prompt` alone would compile, pass every other test here, and quietly
-    /// hide the skills and the upstream context from the person doing the work.
+    /// for a role must be shown exactly what the model would have been shown (design §5.4:
+    /// showing the human *less* than the model would have had "would let them answer
+    /// without context the model would have seen"). Journaling `agent.system_prompt` alone
+    /// would compile, pass every other test here, and quietly hide the skills and the
+    /// upstream context from the person doing the work.
+    ///
+    /// **The input assertion is the one review had to add, and it was red.** The shipped
+    /// implementation journaled `assemble_prompt`'s output verbatim, and that output is
+    /// `(system, tools)` built from `system_prompt` + skills + `## Context`: the node's
+    /// `input` is used by `assemble_prompt` ONLY to evaluate `activation.is_active(query)`
+    /// and never appears in the returned string. The model path adds it separately, as
+    /// `Message::text(MessageRole::User, query)`. So a reviewer role was being asked "read
+    /// the contract and say whether it permits sub-processing" with no indication of WHICH
+    /// contract — and the original version of this test used an input (`"the Acme MSA"`) it
+    /// never asserted on, so the omission was invisible.
     #[tokio::test]
     async fn the_journaled_prompt_is_the_assembled_prompt() {
         use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
@@ -16700,7 +16712,11 @@ mod human_agent {
                     id: review(),
                     kind: NodeKind::Agent {
                         agent: AgentRef("reviewer".into()),
-                        input: serde_json::json!("the Acme MSA"),
+                        // A marker string that appears NOWHERE else in this fixture — not
+                        // in the system prompt, the skill body, or `brief`'s output — so
+                        // `contains` below can only pass if the node input really reached
+                        // the question.
+                        input: serde_json::json!("THE-ACME-MSA-2026"),
                         phase: None,
                     },
                     deps: vec![Dep {
@@ -16731,10 +16747,104 @@ mod human_agent {
             prompt.contains("## Context") && prompt.contains("### brief"),
             "the upstream context section is in the question: {prompt}"
         );
+        assert!(
+            prompt.contains("THE-ACME-MSA-2026"),
+            "the node's INPUT — the user message a model would have received — is in the \
+             question; without it the human is asked to review a contract nobody named: \
+             {prompt}"
+        );
     }
 
-    /// AC15: a human-backed role is legal ONLY as a top-level `NodeKind::Agent`. Used as a
-    /// `MapBody::Agent` it fails the node LOUDLY, naming the site.
+    /// Every non-top-level `drive_agent` call site, paired with the node id its refusal is
+    /// journaled against — `Map` body, `Loop` body, `Loop` GATE and `Expand` PLANNER. The
+    /// fifth caller, `run_node`'s own `NodeKind::Agent`, is the one legal site and passes
+    /// `top_level: true`.
+    ///
+    /// **A table because AC15 is a claim about EVERY site, and the single-site version of
+    /// this test could not see three of them.** Review flipped the individual `false`
+    /// arguments at `expand.rs` (the planner) and `fanout.rs` (the Loop gate) to `true` and
+    /// the whole crate stayed green — only the blanket `if !top_level` → `if false`
+    /// mutation reddened anything. The planner is the sharpest of the four and is exactly
+    /// the regression §8's AC15 row names ("Drop the caller flag → a human-backed planner
+    /// reaches `parse_plan`"), so it was the one site the guard had to cover and didn't.
+    ///
+    /// The `Loop`-gate graph uses a `ModelCall` BODY on chain "c" so iteration 0 completes
+    /// and the gate is actually reached; an `Agent` body would fail first and the gate
+    /// would never run, silently reducing that row to a duplicate of the Loop-body row.
+    fn non_top_level_sites() -> Vec<(&'static str, Graph, NodeId)> {
+        let reviewer = || AgentRef("reviewer".into());
+        vec![
+            (
+                "MapBody::Agent",
+                Graph {
+                    nodes: vec![Node {
+                        id: NodeId("m".into()),
+                        kind: NodeKind::Map {
+                            body: MapBody::Agent(reviewer()),
+                            over: vec![serde_json::json!("the Acme MSA")],
+                            concurrency: 1,
+                            aggregation: Aggregation::FailFast,
+                        },
+                        deps: vec![],
+                    }],
+                },
+                NodeId("m/0".into()),
+            ),
+            (
+                "LoopBody::Agent",
+                Graph {
+                    nodes: vec![Node {
+                        id: NodeId("L".into()),
+                        kind: NodeKind::Loop {
+                            body: LoopBody::Agent(reviewer()),
+                            input: serde_json::json!("the Acme MSA"),
+                            gate: GateSpec::Pure(LoopGate::TextContains("NEVER".into())),
+                            max_iters: 2,
+                        },
+                        deps: vec![],
+                    }],
+                },
+                NodeId("L/0".into()),
+            ),
+            (
+                "GateSpec::Agent",
+                Graph {
+                    nodes: vec![Node {
+                        id: NodeId("G".into()),
+                        kind: NodeKind::Loop {
+                            body: LoopBody::ModelCall { chain: "c".into() },
+                            input: serde_json::json!({ "prompt": "start" }),
+                            gate: GateSpec::Agent {
+                                agent: reviewer(),
+                                stop_when: LoopGate::TextContains("NEVER".into()),
+                            },
+                            max_iters: 1,
+                        },
+                        deps: vec![],
+                    }],
+                },
+                NodeId("G/0/__gate__".into()),
+            ),
+            (
+                "PlannerRef::Agent",
+                Graph {
+                    nodes: vec![Node {
+                        id: NodeId("E".into()),
+                        kind: NodeKind::Expand {
+                            input: serde_json::json!({ "goal": "do the thing" }),
+                            planner: orchestrator_core::PlannerRef::Agent(reviewer()),
+                        },
+                        deps: vec![],
+                    }],
+                },
+                NodeId("E/__plan__".into()),
+            ),
+        ]
+    }
+
+    /// AC15: a human-backed role is legal ONLY as a top-level `NodeKind::Agent`. At each of
+    /// the four other `drive_agent` call sites it fails the node LOUDLY, naming the role
+    /// and the rule, and never asks a human a question.
     ///
     /// `drive_agent` is the shared choke point for five callers and the other four each
     /// mean a different unbuilt feature: N concurrent human asks for a `Map`, a human
@@ -16746,18 +16856,395 @@ mod human_agent {
     /// see the registry: a graph names an `AgentRef`, and whether that ref is human-backed
     /// is a registry fact. That is a stated limitation of §5.5, not an oversight — which
     /// is why the refusal must be loud, and why this test asserts it never began asking.
+    ///
+    /// **The run is driven TWICE and the failure count is still 1.** A refused node is
+    /// terminal, but a run that failed journals no `RunCompleted`, so `start` is not on the
+    /// terminal path and re-drives the Map child / Loop iteration / planner on every single
+    /// wake. Re-deriving the refusal there appends a fresh `NodeFailed` for an already-dead
+    /// node each time — an unbounded journal for a run that can never make progress, and
+    /// exactly the defect `a_fired_expiry_is_terminal_even_if_an_answer_arrives_later` pins
+    /// for the sibling arm. The fix is the same `gate_precheck_by_id` read-back the rest of
+    /// the human path already uses.
     #[tokio::test]
     async fn a_human_backed_agent_is_rejected_outside_a_top_level_agent_node() {
+        for (site, graph, failing) in non_top_level_sites() {
+            let journal = InMemoryJournal::new();
+            let run = RunId(uuid::Uuid::new_v4());
+            let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+
+            let o = ex.start(run, &graph).await.expect("drives");
+            assert!(
+                o.failed.is_some(),
+                "{site}: a human-backed role must fail the run, not silently pause it or \
+                 run as a model: {o:?}"
+            );
+
+            let refusals = failures(&journal, run, &failing).await;
+            assert_eq!(
+                refusals.len(),
+                1,
+                "{site}: {} is the node that failed: {refusals:?}",
+                failing.0
+            );
+            assert!(
+                refusals[0].contains("reviewer") && refusals[0].contains("top-level"),
+                "{site}: the refusal names the role and the rule: {}",
+                refusals[0]
+            );
+
+            let events = journal.load(run).await.unwrap();
+            assert!(
+                journaled_prompts(&events).is_empty(),
+                "{site}: it never asked a human a question it could not deliver an answer \
+                 for: {:?}",
+                journaled_prompts(&events)
+            );
+
+            // The second drive: a dead node's verdict is READ BACK, never re-derived.
+            ex.start(run, &graph).await.expect("re-drives");
+            assert_eq!(
+                failures(&journal, run, &failing).await.len(),
+                1,
+                "{site}: the refusal is read back from the fold — re-deriving it appends a \
+                 second NodeFailed for an already-dead node on every wake"
+            );
+        }
+    }
+
+    /// The terminal-re-read asymmetry this node kind inherits from its family, made
+    /// executable: a FINISHED human-backed run, read back through a third `start`, reports
+    /// the node in neither `completed` nor `outputs` — while the durable blackboard the
+    /// completing drive published is untouched.
+    ///
+    /// `AwaitSignal`, `HumanGate`, `Branch` and `Subgraph` all share this: none of them
+    /// journals `NodeStarted`/`NodeCompleted`/`EffectRecorded`, and `start_inner`'s terminal
+    /// branch rebuilds its outcome from exactly those events (`fold_journal` populates
+    /// `node_last_output` ONLY from `EffectRecorded` and `MapCompacted`). It is documented
+    /// as known on `run_human_agent`; it was NOT tested, and a prose-only invariant in this
+    /// file has now been wrong twice.
+    ///
+    /// **It is pinned here specifically because a comment three lines from that doc claimed
+    /// the opposite consequence** — that renaming the `{text, actor}` keys would make a
+    /// finished run report `{model: null, text}` via `project_agent_outputs`. It cannot:
+    /// that projection only rewrites nodes that are IN `outputs`, and this one never is. A
+    /// future change that makes a completed human node survive a terminal re-read is welcome
+    /// — it should red this test and update both doc comments, which is exactly the point of
+    /// writing it down in code instead of prose.
+    ///
+    /// The three positive assertions are what keep it from passing vacuously: the live drive
+    /// really did produce the output, the run really is terminal, and the answer really is
+    /// durable on the blackboard.
+    #[tokio::test]
+    async fn a_finished_human_backed_run_reports_no_output_when_read_back() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
         let journal = InMemoryJournal::new();
         let run = RunId(uuid::Uuid::new_v4());
-        let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+        let (gw, _calls) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(human_registry(None))
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone());
 
-        let m = NodeId("m".into());
+        ex.start(run, &human_graph()).await.expect("asks");
+        journal
+            .append(
+                run,
+                answered(&review(), "Yes — clause 7.2 permits it.", "alice"),
+            )
+            .await
+            .unwrap();
+
+        let live = ex.start(run, &human_graph()).await.expect("completes");
+        assert_eq!(
+            live.outputs[&review()]["text"],
+            serde_json::json!("Yes — clause 7.2 permits it."),
+            "the COMPLETING drive reports the answer: {live:?}"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+            "the run really is terminal, so the next `start` takes the terminal branch"
+        );
+
+        let reread = ex.start(run, &human_graph()).await.expect("re-reads");
+        assert!(
+            !reread.outputs.contains_key(&review()),
+            "a terminal re-read rebuilds `outputs` from EffectRecorded/MapCompacted only, \
+             and this node kind journals neither: {reread:?}"
+        );
+        assert!(
+            !reread.completed.contains(&review()),
+            "and from NodeCompleted, which it also does not journal: {reread:?}"
+        );
+
+        let r = ctx
+            .get(orchestrator_core::Scope::Run, ContextKey("review".into()))
+            .await
+            .unwrap()
+            .expect("the durable blackboard is unaffected — that is the doc's other half");
+        assert_eq!(
+            ctx.load(&r).await.unwrap()["text"],
+            serde_json::json!("Yes — clause 7.2 permits it."),
+            "the human's answer is still durable and still readable by a downstream node"
+        );
+    }
+
+    /// AC10, the executor half: an assembled question over `MAX_HUMAN_TEXT_BYTES` fails the
+    /// node LOUDLY and journals NOTHING — no oversized `AgentAwaited` row.
+    ///
+    /// Review found this cap completely unguarded: replacing `prompt.len() >
+    /// MAX_HUMAN_TEXT_BYTES` with `false` left the entire workspace green. The plan assigns
+    /// AC10 to Task 5, but Task 5's test covers `torii`'s `--text`, which is the OPERATOR's
+    /// side of the same bound and a different code path (`cmd::run::check_payload_size`,
+    /// which can simply refuse the command). The executor has no such luxury — it is
+    /// already inside a durable run — so this half has to fail the node, and nothing in the
+    /// plan was going to test it.
+    ///
+    /// The bound is on the ASSEMBLED question, not on `system_prompt`, which is why the
+    /// oversize here comes from a SKILL body: a role can be composed over the limit by
+    /// parts that are each individually reasonable, and that is the realistic way a
+    /// multi-KB prompt happens.
+    #[tokio::test]
+    async fn an_oversized_assembled_prompt_fails_the_node_before_it_is_journaled() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let registry = Arc::new(
+            Registry::default()
+                .with_agent(reviewer(None, vec!["the-whole-playbook".into()]))
+                .with_skill(SkillDef {
+                    name: "the-whole-playbook".into(),
+                    description: None,
+                    body: "X".repeat(orchestrator_core::MAX_HUMAN_TEXT_BYTES),
+                    activation: Activation::Always,
+                }),
+        );
+        let (ex, _clock, _calls) = exec_at(&journal, registry, at(1_000)).await;
+
+        let o = ex.start(run, &human_graph()).await.expect("drives");
+        let (node, message) = o
+            .failed
+            .clone()
+            .expect("an over-bound question fails the node rather than journaling it");
+        assert_eq!(
+            node,
+            review(),
+            "the failure is the human-backed node: {o:?}"
+        );
+        assert!(
+            message.contains("review")
+                && message.contains(&orchestrator_core::MAX_HUMAN_TEXT_BYTES.to_string()),
+            "the failure names the node and the limit it broke, so the config error is \
+             actionable: {message}"
+        );
+
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            journaled_prompts(&events).is_empty(),
+            "and NOTHING oversized became durable — the whole point of the cap is that a \
+             multi-KB string stays out of the journal, out of `torii run status` and out \
+             of every later fold of this run: {:?}",
+            journaled_prompts(&events)
+                .iter()
+                .map(String::len)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// SP-4 s2 §6.4, the split-redaction guard for the ANSWER: ONE application of the
+    /// redactor feeds BOTH the node's return AND the durable blackboard write.
+    ///
+    /// Both siblings ship exactly this test — `payload_is_redacted_before_both_the_return_
+    /// and_the_durable_write` (`AwaitSignal`) and `a_decision_is_redacted_before_both_the_
+    /// return_and_the_durable_write` (`HumanGate`) — precisely because the split defect
+    /// "has been shipped and caught twice in this codebase". `run_human_agent` restates
+    /// that reasoning in a seven-line comment and shipped no guard: review deleted the
+    /// `self.redact(...)` call entirely and the workspace stayed at 1535 passed / 0 failed.
+    ///
+    /// If a future edit redacts on only one of the two paths, a live run and a replayed run
+    /// disagree about this node's output and it surfaces as a false `DeterminismViolation`
+    /// — never as a red test — unless this test exists. The answer is the leak surface with
+    /// the widest blast radius of the three: it is free text a person typed that becomes
+    /// the node's OUTPUT and flows into every downstream node and model prompt.
+    #[tokio::test]
+    async fn an_answer_is_redacted_before_both_the_return_and_the_durable_write() {
+        use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+        // Assembled at RUNTIME: the repo's semgrep CWE-798 hook blocks credential-shaped
+        // literals in source. The redactor still matches the built string.
+        let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+        let content = Arc::new(InMemoryContentStore::new());
+        let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (gw, _calls) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(human_registry(None))
+            .with_clock(FakeClock::new(at(1_000)))
+            .with_content_store(content.clone())
+            .with_context_store(ctx.clone())
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+        ex.start(run, &human_graph()).await.expect("asks");
+        journal
+            .append(
+                run,
+                answered(
+                    &review(),
+                    &format!("Yes — clause 7.2 permits it. Use key {secret} to verify."),
+                    "alice",
+                ),
+            )
+            .await
+            .unwrap();
+        let o = ex.start(run, &human_graph()).await.expect("resumes");
+
+        // (a) THE RETURN — what downstream nodes and model prompts will see.
+        let output = &o.outputs[&review()];
+        assert!(
+            !serde_json::to_string(output).unwrap().contains(&secret),
+            "no plaintext survives into the node output: {output}"
+        );
+        assert!(
+            output["text"]
+                .as_str()
+                .expect("text")
+                .contains("clause 7.2"),
+            "the legitimate answer is untouched — the redactor matches credential SHAPES, \
+             it does not blank a human's work product: {output}"
+        );
+        assert_eq!(
+            output["actor"],
+            serde_json::json!("alice"),
+            "and the attribution survives: {output}"
+        );
+
+        // (b) THE DURABLE WRITE — the same single redacted value, not a second scrub.
+        let r = ctx
+            .get(orchestrator_core::Scope::Run, ContextKey("review".into()))
+            .await
+            .unwrap()
+            .expect("the completed node published its answer to the blackboard");
+        let stored = ctx.load(&r).await.unwrap();
+        assert!(
+            !serde_json::to_string(&stored).unwrap().contains(&secret),
+            "the durably-stored value is scrubbed too: {stored}"
+        );
+        assert_eq!(
+            stored, *output,
+            "ONE redaction feeds both: live == journaled == replayed"
+        );
+        let blob = content.get(&r.content.digest).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&blob).contains(&secret),
+            "no plaintext reaches the content store"
+        );
+    }
+
+    /// The same rule for the FAILURE text, which is a sink the output assertions above do
+    /// not cover: a `NodeFailed` reaches the durable journal, `RunOutcome.failed` and
+    /// whatever `torii run status` renders — and because `fold.failed` is read back by
+    /// `gate_precheck_by_id`, it is re-emitted on EVERY later drive.
+    ///
+    /// `run_human_gate` shipped this arm unredacted once (an undeclared option NAME reached
+    /// the journal in plaintext) and the fix was to move the scrub into `fail_gate`, the
+    /// chokepoint every failure arm already routes through. `fail_human_agent` copies that
+    /// shape and, until review, copied it without a test: deleting `self.redact_text(...)`
+    /// left the workspace green.
+    ///
+    /// **What actually reaches these messages is author-supplied config text, not a human's
+    /// answer** — that is worth stating precisely, because `fail_human_agent`'s own doc used
+    /// to claim the opposite. Today's four arms interpolate a NODE ID (from the graph), an
+    /// AGENT NAME (from the registry), a byte count and a deadline. Both cases below cover
+    /// a real one:
+    ///   * the node id, through the expiry arm — the most-travelled failure in this kind;
+    ///   * the agent name, through the non-top-level refusal — the arm review found
+    ///     appending its own `NodeFailed` directly, outside the chokepoint entirely.
+    /// The chokepoint's forward-looking value is the rest: a future arm that DOES quote the
+    /// question or the answer is scrubbed by construction rather than by remembering.
+    #[tokio::test]
+    async fn a_failure_message_is_redacted_before_it_reaches_the_journal() {
+        let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+        let journaled = |journal: &InMemoryJournal, run: RunId| {
+            let journal = journal.clone();
+            async move {
+                journal
+                    .load(run)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(_, e)| match e {
+                        JournalEvent::NodeFailed { error, .. } => Some(error.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // (a) the NODE ID, via the expiry arm. Graph node ids are author-supplied and land
+        //     verbatim in a durable journal row.
+        let leaky_node = NodeId(format!("review-{secret}"));
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (gw, _calls) = recording_gateway().await;
+        let clock = FakeClock::new(at(1_000));
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(human_registry(Some(Duration::hours(1))))
+            .with_clock(clock.clone())
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
         let graph = Graph {
             nodes: vec![Node {
-                id: m.clone(),
+                id: leaky_node.clone(),
+                kind: NodeKind::Agent {
+                    agent: AgentRef("reviewer".into()),
+                    input: serde_json::json!("the Acme MSA"),
+                    phase: None,
+                },
+                deps: vec![],
+            }],
+        };
+        ex.start(run, &graph).await.expect("asks");
+        clock.set(at(1_000) + Duration::hours(2));
+        let o = ex.start(run, &graph).await.expect("expires");
+        let (_n, message) = o.failed.expect("the deadline fires");
+        assert!(
+            !message.contains(&secret),
+            "a credential-shaped node id must not reach the returned failure: {message}"
+        );
+        let rows = journaled(&journal, run).await;
+        assert_eq!(
+            rows,
+            vec![message.clone()],
+            "and the journaled row is the SAME redacted string — the two cannot drift"
+        );
+        assert!(
+            message.contains("deadline"),
+            "redaction is by credential SHAPE, not blanket: the message is still \
+             diagnostic: {message}"
+        );
+
+        // (b) the AGENT NAME, via the non-top-level refusal — the arm that used to append
+        //     its own `NodeFailed` inline instead of routing through the chokepoint.
+        let leaky_role = format!("reviewer-{secret}");
+        let mut role = reviewer(None, vec![]);
+        role.name = leaky_role.clone();
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            Arc::new(Registry::default().with_agent(role)),
+            at(1_000),
+        )
+        .await;
+        let ex = ex.with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+        let graph = Graph {
+            nodes: vec![Node {
+                id: NodeId("m".into()),
                 kind: NodeKind::Map {
-                    body: MapBody::Agent(AgentRef("reviewer".into())),
+                    body: MapBody::Agent(AgentRef(leaky_role)),
                     over: vec![serde_json::json!("the Acme MSA")],
                     concurrency: 1,
                     aggregation: Aggregation::FailFast,
@@ -16765,32 +17252,21 @@ mod human_agent {
                 deps: vec![],
             }],
         };
-
-        let o = ex.start(run, &graph).await.expect("drives");
+        ex.start(run, &graph).await.expect("refuses");
+        let rows = journaled(&journal, run).await;
         assert!(
-            o.failed.is_some(),
-            "a human-backed role in a Map body must fail the run, not silently pause it \
-             or run as a model: {o:?}"
+            !rows.is_empty(),
+            "the refusal is journaled loudly, not swallowed"
         );
-
-        let child = NodeId("m/0".into());
-        let child_failures = failures(&journal, run, &child).await;
-        assert_eq!(
-            child_failures.len(),
-            1,
-            "the Map CHILD is the node that failed: {child_failures:?}"
-        );
+        for row in &rows {
+            assert!(
+                !row.contains(&secret),
+                "a credential-shaped agent name must not reach the journal: {row}"
+            );
+        }
         assert!(
-            child_failures[0].contains("reviewer") && child_failures[0].contains("top-level"),
-            "the refusal names the role and the rule: {}",
-            child_failures[0]
-        );
-
-        let events = journal.load(run).await.unwrap();
-        assert!(
-            journaled_prompts(&events).is_empty(),
-            "and it never asked a human a question it could not deliver an answer for: {:?}",
-            journaled_prompts(&events)
+            rows.iter().any(|r| r.contains("top-level")),
+            "and the refusal still names the rule: {rows:?}"
         );
     }
 }

@@ -81,11 +81,11 @@ impl Executor {
         let (system, tools) = assemble_prompt(&self.registry, agent, context, &query)?;
 
         // SP-6 s3: a human-backed role answers instead of a model. The branch sits HERE —
-        // AFTER `assemble_prompt`, which needs no chain, so the human is shown exactly
-        // what the model would have been (its system prompt, every activated skill body
-        // and the rendered `## Context` section); and BEFORE `resolve_chain`, so no chain
-        // is resolved, no gateway is touched and zero token spend is STRUCTURAL rather
-        // than measured.
+        // AFTER `assemble_prompt`, which needs no chain, so the human's question reuses the
+        // model path's own prompt assembly rather than a second implementation that could
+        // drift from it; and BEFORE `resolve_chain`, so no chain is resolved, no gateway is
+        // touched and zero token spend is STRUCTURAL rather than measured. (`assemble_prompt`
+        // is not the WHOLE question — see the composition below, which adds the node input.)
         //
         // `on_agent_started` does NOT fire on this path, deliberately: the hook's
         // signature requires `&ar.chain`, and a human-backed agent by construction never
@@ -93,6 +93,16 @@ impl Executor {
         // (`chain: None` with no `(area, kind)` binding), which is why the branch cannot
         // simply sit lower down and skip the call.
         if let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by {
+            // `AgentStep` has no `From<NodeExec>` conversion, so the mapping is written
+            // inline — the same three-arm mapping `run_node` applies to this function's
+            // result, in the other direction. `NodeExec::Failed.output` is `None` on every
+            // path `run_human_agent`/`fail_human_agent` can return, so nothing is dropped.
+            let step = |exec: super::NodeExec| match exec {
+                super::NodeExec::Completed(output) => AgentStep::Completed(output),
+                super::NodeExec::Failed { message, .. } => AgentStep::Failed(message),
+                super::NodeExec::Paused { reason } => AgentStep::Paused(reason),
+            };
+
             if !top_level {
                 // Design §5.5: legal ONLY as a top-level `NodeKind::Agent`. `drive_agent`
                 // is the shared choke point for five callers, and the other four each mean
@@ -107,34 +117,61 @@ impl Executor {
                 // whether that ref is human-backed is a REGISTRY fact. That is a stated
                 // limitation of §5.5, not an oversight — which is why the refusal is loud
                 // and journaled rather than a silent fallback to the model path.
-                let message = format!(
-                    "human_agent: agent {:?} is human-backed and may only be used as a \
-                     top-level Agent node, not as a Map body, Loop body, Loop gate or \
-                     planner",
-                    agent_ref.0
-                );
-                self.append(
-                    run,
-                    JournalEvent::NodeFailed {
-                        node: node_id.clone(),
-                        error: message.clone(),
-                    },
-                )
-                .await?;
-                return Ok(AgentStep::Failed(message));
+                //
+                // The precheck FIRST, for the same reason `run_human_agent`'s step 0 does
+                // it: this refusal is TERMINAL for the node, but the run it kills journals
+                // no `RunCompleted`, so `start_inner` never takes its terminal branch and
+                // every later wake re-drives the Map child / Loop iteration / planner. A
+                // re-derived refusal appends a fresh `NodeFailed` for an already-dead node
+                // on each of them — an unboundedly growing journal for a run that cannot
+                // make progress. Read the verdict back instead. (Review found this arm
+                // doing exactly that: three drives, three rows.)
+                if let Some(failed) = self.gate_precheck_by_id(node_id, fold) {
+                    return Ok(step(failed));
+                }
+                // Through `fail_human_agent` rather than a local `append`, so this arm
+                // cannot skip the redaction chokepoint every other human-path failure goes
+                // through — the `model_output` precedent, and the specific defect s2 shipped
+                // when one gate failure arm scrubbed and another did not.
+                return Ok(step(
+                    self.fail_human_agent(
+                        run,
+                        node_id,
+                        format!(
+                            "human_agent: agent {:?} is human-backed and may only be used \
+                             as a top-level Agent node, not as a Map body, Loop body, Loop \
+                             gate or planner",
+                            agent_ref.0
+                        ),
+                    )
+                    .await?,
+                ));
             }
-            // `AgentStep` has no `From<NodeExec>` conversion, so the mapping is written
-            // inline — the same three-arm mapping `run_node` applies to this function's
-            // result, in the other direction. `NodeExec::Failed.output` is `None` on every
-            // path `run_human_agent` can return, so nothing is dropped here.
-            return match self
-                .run_human_agent(run, node_id, &system, timeout, fold)
-                .await?
-            {
-                super::NodeExec::Completed(output) => Ok(AgentStep::Completed(output)),
-                super::NodeExec::Failed { message, .. } => Ok(AgentStep::Failed(message)),
-                super::NodeExec::Paused { reason } => Ok(AgentStep::Paused(reason)),
-            };
+
+            // The QUESTION is the model-EQUIVALENT one, which is `assemble_prompt`'s output
+            // plus the node's input — not `assemble_prompt`'s output alone.
+            //
+            // `assemble_prompt` returns `(system, tools)`: `system_prompt` + activated skill
+            // bodies + the rendered `## Context` section. It takes `query` only to evaluate
+            // each skill's/tool's `activation.is_active(query)` and never puts it in the
+            // string it returns. The model path supplies the input SEPARATELY, as the first
+            // user message (`Message::text(MessageRole::User, query)`, below). So journaling
+            // `system` alone showed the human the role's standing instructions and the
+            // upstream context but NOT the thing being asked about — a reviewer role reading
+            // "say whether the contract permits sub-processing" with no contract named.
+            // Design §5.4's rule is "the human sees precisely what the model would have",
+            // and its accepted cost is explicitly one-directional: never show the human
+            // LESS than the model would have had.
+            //
+            // `## Task` mirrors `assemble_prompt`'s own `## Context` heading so the two
+            // sections read as one document. The composed string — not `system` — is what
+            // `run_human_agent` bounds against `MAX_HUMAN_TEXT_BYTES`, so the durable row is
+            // bounded as a whole rather than in the part.
+            let question = format!("{system}\n\n## Task\n{query}");
+            return Ok(step(
+                self.run_human_agent(run, node_id, &question, timeout, fold)
+                    .await?,
+            ));
         }
 
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();

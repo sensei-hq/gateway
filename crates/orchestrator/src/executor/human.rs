@@ -104,16 +104,22 @@ impl Executor {
         //    early-answer race, AC6) is still resolved in this same execution and there is
         //    never an answer to a question the durable record does not show being asked.
         if let WaitState::NotYetAsking(fresh) = &state {
-            // Bound the QUESTION before it becomes durable. An assembled prompt is
-            // system prompt + every activated skill + the rendered context section,
-            // routinely multi-KB, so this is a real constraint rather than a theoretical
-            // one. `torii` bounds the operator-supplied side at its CLI boundary
-            // (`cmd::run::check_payload_size` against `MAX_PAYLOAD_BYTES`, the same 4096)
-            // and can simply refuse the command; the executor has no such boundary — it
-            // is already inside a durable run — so an over-bound prompt fails the NODE
-            // loudly. A question too large to journal is a malformed agent config, and
-            // failing here is what keeps a multi-megabyte string out of the journal, out
-            // of `torii run status`, and out of every later fold of this run.
+            // Bound the QUESTION before it becomes durable. The caller composes it from
+            // the system prompt + every activated skill + the rendered `## Context` section
+            // + the node's input, routinely multi-KB, so this is a real constraint rather
+            // than a theoretical one. `torii` bounds the operator-supplied side at its CLI
+            // boundary (`cmd::run::check_payload_size` against `MAX_PAYLOAD_BYTES`, the
+            // same 4096) and can simply refuse the command; the executor has no such
+            // boundary — it is already inside a durable run — so an over-bound prompt fails
+            // the NODE loudly. A question too large to journal is a malformed agent config,
+            // and failing here is what keeps a multi-megabyte string out of the journal,
+            // out of `torii run status`, and out of every later fold of this run.
+            //
+            // Guarded by `an_oversized_assembled_prompt_fails_the_node_before_it_is_
+            // journaled`. It exists because review deleted this condition and the whole
+            // workspace stayed green: AC10 is assigned to Task 5, but Task 5 covers
+            // `--text` at the CLI boundary, which is the OTHER half of the same AC and a
+            // different code path — nothing was going to test this one.
             if prompt.len() > MAX_HUMAN_TEXT_BYTES {
                 return self
                     .fail_human_agent(
@@ -122,7 +128,7 @@ impl Executor {
                         format!(
                             "human_agent: node {}'s assembled prompt is {} bytes, over \
                              the {MAX_HUMAN_TEXT_BYTES}-byte limit — trim the agent's \
-                             system prompt or its skills",
+                             system prompt, its skills or the node input",
                             node_id.0,
                             prompt.len()
                         ),
@@ -153,13 +159,33 @@ impl Executor {
         //    A human answer is free text that becomes the node's output and flows into
         //    downstream nodes and model prompts — it is not merely displayed.
         //
-        //    The `{text, actor}` shape here is the one `project_agent_outputs`
-        //    (`executor/support.rs`) already passes through untouched — it exempts any
-        //    Agent output carrying an `actor`. Do NOT change these key names without
-        //    changing that exemption: the projection runs ONLY on the terminal-resume
-        //    path, so a mismatch is invisible on this drive and makes the finished run
-        //    report `{model: null, text}` when read back later (Task 2's review caught
-        //    this before the drive path existed; see the `AgentAnswered` doc).
+        //    `an_answer_is_redacted_before_both_the_return_and_the_durable_write` is the
+        //    guard, and both siblings ship the same one. It is a guard and not a comment
+        //    because review deleted this `redact` call outright and the whole workspace
+        //    stayed green — which is precisely the failure mode described above: the defect
+        //    surfaces as a false `DeterminismViolation` on some later resume, never as a
+        //    red test.
+        //
+        //    The `{text, actor}` shape is what downstream readers key on, and `"text"` is
+        //    deliberately the SAME key a model-backed agent produces — that is what lets an
+        //    unmodified `BranchCond::TextContains` consume a human's answer without knowing
+        //    it was human. `the_answer_is_the_nodes_output_under_the_text_key` is the guard
+        //    on the key names, through a real downstream reader rather than by re-asserting
+        //    the key.
+        //
+        //    `project_agent_outputs` (`executor/support.rs`) additionally exempts an Agent
+        //    output carrying an `actor` from its `{model, text}` projection. **That
+        //    exemption is forward-looking and THIS path never reaches it** — stated
+        //    explicitly because the comment that used to sit here claimed the opposite, that
+        //    a key rename would make the finished run report `{model: null, text}` when read
+        //    back. It cannot. The projection runs on exactly one path, the terminal branch
+        //    of `start_inner`, and that branch builds `outputs` from `fold_journal`'s
+        //    `node_last_output` — populated ONLY from `EffectRecorded` and `MapCompacted`.
+        //    This node kind journals neither (see this function's doc: no gateway call, no
+        //    `EffectRecorded`), so a human-answered node is absent from a terminal re-read's
+        //    `outputs` entirely and the projection has nothing to rewrite. That is the same
+        //    family asymmetry the doc comment above describes, and
+        //    `a_finished_human_backed_run_reports_no_output_when_read_back` pins it.
         if let Some(answer) = fold.agent_answer_for(node_id) {
             let output = self.redact(&serde_json::json!({
                 "text": answer.text,
@@ -217,11 +243,23 @@ impl Executor {
         self.pause_awaiting(run, reason, deadline).await
     }
 
-    /// Journal a `NodeFailed` and return it. Every failure path above routes through here
-    /// so the journaled message and the returned one cannot drift — and the message is
-    /// redacted at this single chokepoint, because a prompt and an answer are both free
-    /// text that reach the journal and `torii run status`. s2 shipped a per-arm scrub that
-    /// missed one arm; a chokepoint makes that unrepresentable.
+    /// Journal a `NodeFailed` and return it. Every failure path routes through here — the
+    /// four in `run_human_agent` above AND `drive_agent`'s non-top-level refusal, which
+    /// review found appending its own `NodeFailed` inline and bypassing this — so the
+    /// journaled message and the returned one cannot drift, and every one of them is
+    /// redacted at this single chokepoint.
+    ///
+    /// **What the redaction is actually protecting, stated precisely:** today's arms
+    /// interpolate a NODE ID (author-supplied, straight out of the graph), an AGENT NAME
+    /// (author-supplied, out of the registry), a byte count and a deadline. Neither the
+    /// question nor the answer is quoted into a failure message, and an earlier version of
+    /// this comment claimed they were. The two author-supplied strings are the live surface
+    /// — they land verbatim in a durable journal row, in `RunOutcome.failed`, and in
+    /// whatever `torii run status` renders — and `a_failure_message_is_redacted_before_it_
+    /// reaches_the_journal` covers one arm of each. The chokepoint's remaining value is
+    /// forward-looking: s2 shipped a per-arm scrub that missed one arm (an undeclared option
+    /// NAME reached the journal in plaintext), and a chokepoint makes that unrepresentable
+    /// for a future arm that DOES quote free text.
     ///
     /// `output: None` on every one of them, and that is the AC5 property: an expired
     /// human-backed node produces NO output, defaulted or otherwise.
@@ -229,7 +267,7 @@ impl Executor {
     /// `redact_text` is `gate.rs`'s, shared rather than re-derived — it is the
     /// `Value`-typed [`Executor::redact`] wrapped for a bare string, with the
     /// variant-preservation tradeoff documented there.
-    async fn fail_human_agent(
+    pub(super) async fn fail_human_agent(
         &self,
         run: RunId,
         node_id: &NodeId,
