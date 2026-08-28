@@ -165,7 +165,7 @@ pub fn diff(current: &RegistryConfig, incoming: &RegistryConfig) -> ConfigDiff {
 mod tests {
     use super::*;
     use orchestrator_core::{
-        Activation, AgentDefinition, ChainBinding, EffectClass, SkillDef, ToolSpec,
+        Activation, AgentBacking, AgentDefinition, ChainBinding, EffectClass, SkillDef, ToolSpec,
     };
 
     fn skill(name: &str, body: &str) -> SkillDef {
@@ -188,6 +188,7 @@ mod tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "you are an agent".into(),
+            backed_by: AgentBacking::Model,
         }
     }
 

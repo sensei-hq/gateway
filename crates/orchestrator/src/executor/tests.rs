@@ -15,8 +15,8 @@ use crate::agent::tools::{
     Tool, ToolContext, ToolRegistry,
 };
 use orchestrator_core::{
-    AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError, OrchestratorHooks,
-    Permissions, Registry,
+    AgentBacking, AgentDefinition, AgentRef, Clock, EffectClass, OrchestratorError,
+    OrchestratorHooks, Permissions, Registry,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,6 +99,7 @@ fn agent_def(chain: &str) -> AgentDefinition {
         tools: vec![],
         skills: vec![],
         system_prompt: "SYS".into(),
+        backed_by: AgentBacking::Model,
     }
 }
 
@@ -340,6 +341,7 @@ async fn agent_routes_via_area_kind_binding_end_to_end() {
         tools: vec![],
         skills: vec![],
         system_prompt: "SYS".into(),
+        backed_by: AgentBacking::Model,
     };
     let cfg = RegistryConfig {
         agents: vec![agent],
@@ -393,6 +395,7 @@ async fn phase_override_wins_over_base_route_through_from_config() {
         tools: vec![],
         skills: vec![],
         system_prompt: "SYS".into(),
+        backed_by: AgentBacking::Model,
     };
     let cfg = RegistryConfig {
         agents: vec![agent],
@@ -3244,6 +3247,7 @@ async fn agent_node_drives_real_reference_chain_to_local_fallover() {
         tools: vec![],
         skills: vec![],
         system_prompt: "Research carefully.".into(),
+        backed_by: AgentBacking::Model,
     }));
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
         .with_registry(registry)
@@ -3825,6 +3829,7 @@ async fn map_of_agents_then_consolidate_drives_the_real_reference_chain_to_local
         tools: vec![],
         skills: vec![],
         system_prompt: "Work carefully.".into(),
+        backed_by: AgentBacking::Model,
     };
     let registry = Arc::new(
         Registry::default()
@@ -3943,6 +3948,7 @@ async fn e2e_map_observation_agents_plus_mutation_agent_through_the_real_gateway
         tools,
         skills: vec![],
         system_prompt: "Work carefully.".into(),
+        backed_by: AgentBacking::Model,
     };
     let search = Arc::new(Search::new(search_calls.clone()));
     let recorder_tool = Arc::new(RecordNote::new(sink.clone()));
@@ -4100,6 +4106,7 @@ async fn in_doubt_mutation_in_a_map_child_pauses_the_whole_run() {
             tools: vec!["record_note".into()],
             skills: vec![],
             system_prompt: "Record.".into(),
+            backed_by: AgentBacking::Model,
         };
         (
             Arc::new(
@@ -4367,6 +4374,7 @@ async fn agent_prompt_includes_its_dependency_output_from_the_blackboard() {
         tools: vec![],
         skills: vec![],
         system_prompt: sys.into(),
+        backed_by: AgentBacking::Model,
     };
     let registry = Arc::new(
         Registry::default()
@@ -5085,6 +5093,7 @@ async fn loop_subgraph_body_pause_pauses_the_loop() {
             tools: vec!["record_note".into()],
             skills: vec![],
             system_prompt: "Record.".into(),
+            backed_by: AgentBacking::Model,
         };
         (
             Arc::new(
@@ -5549,6 +5558,7 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
                 tools: vec![],
                 skills: vec![],
                 system_prompt: "Emit a plan as JSON.".into(),
+                backed_by: AgentBacking::Model,
             })
             .with_agent(AgentDefinition {
                 name: "gate".into(),
@@ -5560,6 +5570,7 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
                 tools: vec![],
                 skills: vec![],
                 system_prompt: "Answer DONE once the goal is met, else keep going.".into(),
+                backed_by: AgentBacking::Model,
             }),
     );
 
@@ -7070,6 +7081,7 @@ async fn an_in_doubt_mutation_in_a_subgraph_pauses_the_run() {
             tools: vec!["record_note".into()],
             skills: vec![],
             system_prompt: "Record.".into(),
+            backed_by: AgentBacking::Model,
         };
         (
             Arc::new(
@@ -7584,6 +7596,7 @@ async fn an_in_doubt_mutation_in_a_branch_arm_pauses_the_run() {
             tools: vec!["record_note".into()],
             skills: vec![],
             system_prompt: "Record.".into(),
+            backed_by: AgentBacking::Model,
         };
         (
             Arc::new(
@@ -8351,6 +8364,7 @@ async fn an_in_doubt_mutation_in_an_expand_plan_pauses_the_run() {
             tools: vec!["record_note".into()],
             skills: vec![],
             system_prompt: "Record.".into(),
+            backed_by: AgentBacking::Model,
         };
         (
             Arc::new(
@@ -8521,6 +8535,7 @@ fn planner_registry() -> Arc<Registry> {
         tools: vec![],
         skills: vec![],
         system_prompt: "Emit a plan as JSON.".into(),
+        backed_by: AgentBacking::Model,
     }))
 }
 
@@ -8886,6 +8901,7 @@ async fn planner_agent_determinism_violation_in_the_plan_sub_run_halts() {
             tools: vec![],
             skills: vec![],
             system_prompt: sys.into(),
+            backed_by: AgentBacking::Model,
         }))
     };
     // Single-node plan (n1); e (planner agent) drives it.
@@ -8955,6 +8971,7 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
         tools: vec![],
         skills: vec![],
         system_prompt: "work".into(),
+        backed_by: AgentBacking::Model,
     };
     let planner = AgentDefinition {
         name: "planner".into(),
@@ -8966,6 +8983,7 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
         tools: vec!["validate_plan".into(), "list_agents".into()],
         skills: vec![],
         system_prompt: "Plan. Prefer the simplest structure.".into(),
+        backed_by: AgentBacking::Model,
     };
     let reg = Arc::new(
         Registry::default()
@@ -9117,6 +9135,7 @@ fn two_planner_registry() -> Arc<Registry> {
         tools: vec![],
         skills: vec![],
         system_prompt: format!("planner {name}"),
+        backed_by: AgentBacking::Model,
     };
     Arc::new(
         Registry::default()
@@ -9181,6 +9200,7 @@ async fn select_with_no_candidates_fails_the_node() {
         tools: vec![],
         skills: vec![],
         system_prompt: "c".into(),
+        backed_by: AgentBacking::Model,
     }));
     let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1")
         .with_registry(reg)

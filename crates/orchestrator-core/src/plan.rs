@@ -180,7 +180,8 @@ mod tests {
     use crate::effect::EffectClass;
     use crate::graph::{Aggregation, BranchCond, Dep, Graph, MapBody, Node, NodeKind};
     use crate::registry::{
-        Activation, AgentDefinition, AgentRef, Permissions, Registry, SkillDef, ToolSpec,
+        Activation, AgentBacking, AgentDefinition, AgentRef, Permissions, Registry, SkillDef,
+        ToolSpec,
     };
     use std::collections::HashMap;
 
@@ -195,6 +196,7 @@ mod tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "r".into(),
+            backed_by: AgentBacking::Model,
         })
     }
     fn mc(id: &str, dep: Option<&str>) -> Node {

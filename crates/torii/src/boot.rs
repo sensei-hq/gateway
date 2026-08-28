@@ -826,6 +826,7 @@ mod tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "probe".to_string(),
+            backed_by: orchestrator_core::AgentBacking::Model,
         };
         let seed = orchestrator_core::RegistryConfig {
             agents: vec![agent],
