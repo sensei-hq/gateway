@@ -394,27 +394,27 @@ pub struct AwaitingNode {
     /// The journal is the only place the question a human was actually asked exists.
     ///
     /// **It arrives here ALREADY REDACTED** — `cmd::run::awaiting_nodes` applies
-    /// [`redact_question`] when it builds this field, so every sink is covered by
+    /// `redact_question` when it builds this field, so every sink is covered by
     /// construction rather than by each sink remembering. The `--json` path in particular
     /// serializes this struct wholesale (`serde_json::to_value(nodes)`), so a sink-side
     /// scrub is exactly the thing that would be forgotten there. The executor journals the
     /// prompt UNREDACTED (`executor/human.rs` appends `prompt: prompt.to_string()`), and
     /// `torii config push` does not redact an agent's `system_prompt` either, so torii is
     /// the first thing that ever displays it — the same position it is in for a pause
-    /// reason. It is NOT the same transform, though: [`redact_question`] records why a
+    /// reason. It is NOT the same transform, though: `redact_question` records why a
     /// question cannot take the pause reason's withhold-the-whole-string-on-any-
     /// disagreement rule.
     ///
-    /// **It can still be [`WITHHELD_QUESTION`] in full**, and a consumer must expect that:
+    /// **It can still be `WITHHELD_QUESTION` in full**, and a consumer must expect that:
     /// when reassembling the text across its control characters uncovers a credential the
     /// plain pass could not see, the value here is the literal
     /// `[REDACTED: question withheld]` rather than the question. That is deliberate and
     /// leaves the operator with no rendering of the ask at all, which is why
-    /// [`redact_question`] narrows it to that one direction — the ordinary-prose false
+    /// `redact_question` narrows it to that one direction — the ordinary-prose false
     /// positive that used to trigger it is pinned red by
     /// `cmd::run::tests::an_ordinary_prose_question_that_wraps_after_bearer_survives`.
     ///
-    /// The display-only half — [`one_line`] and the [`QUESTION_MAX`] cap — is applied by
+    /// The display-only half — `one_line` and the `QUESTION_MAX` cap — is applied by
     /// [`awaiting_section`], NOT here, matching the split `json`/`table` already draw for a
     /// pause reason: a script wants the raw newlines and the full text, redaction is the
     /// only transform that must reach both.

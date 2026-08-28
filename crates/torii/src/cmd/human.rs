@@ -247,7 +247,7 @@ fn check_human_text_size(text: &str, measured: Measured, what: &str) -> Result<(
 ///
 /// **Validation is JOURNAL-ONLY.** A journaled `AgentAwaited` for this node is the whole
 /// evidence that a human was asked anything; absent, this refuses. The graph is not read
-/// and the registry is not consulted — see [`agent_question`] for why neither is available
+/// and the registry is not consulted — see `agent_question` for why neither is available
 /// and why folding is not merely the cheaper option but the only one that works. This is
 /// exactly what `cmd::gate::gate_menu` and `cmd::run::signal_state` already do; s2's spec
 /// claimed `gate decide` "reads the graph from `scheduled_runs`", which was never true of
