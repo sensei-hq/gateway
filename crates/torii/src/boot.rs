@@ -790,12 +790,31 @@ mod tests {
     /// true by construction for ANY `connect()` result, so it could not fail even
     /// against the pre-fix four-separate-`connect()` shape (mutation-proven by the
     /// reviewer). This version drives the REAL `heavy()` and counts REAL backend
-    /// connections in `pg_stat_activity` before and after: the four-pool shape
-    /// shows a delta of ~4 (each `connect()` eagerly opens a backend), this one a
-    /// delta of ~1. Discrimination was verified by hand: temporarily reverting
-    /// `heavy()`'s pool sharing to four separate `connect()` calls made this
-    /// exact test fail with a reported delta of 4; restoring the fix made it pass
-    /// with a delta of 1 (both outputs reported alongside this change).
+    /// connections in `pg_stat_activity`: the four-pool shape shows ~4 (each
+    /// `connect()` eagerly opens a backend), this one ~1. Discrimination was
+    /// verified by hand: temporarily reverting `heavy()`'s pool sharing to four
+    /// separate `connect()` calls made this exact test fail with a reported 4;
+    /// restoring the fix made it pass with 1.
+    ///
+    /// It counts backends carrying a UNIQUE `application_name` this call put in
+    /// `heavy()`'s connection URL, NOT a before/after delta of every backend on the
+    /// database. The delta form measured a global: any concurrent DB test in this
+    /// binary opening its own pool between the two reads was charged to `heavy()`,
+    /// which made it fail 5 runs out of 6 under default threads —
+    ///
+    /// ```text
+    /// saw a delta of 3 (before=5, after=8)
+    /// ```
+    ///
+    /// — with nothing wrong. `config_guard` cannot fix that: the noise is every
+    /// OTHER DB test, not a config writer. Naming the connections is strictly more
+    /// discriminating than counting them, since it can no longer credit `heavy()`
+    /// with a stranger's pool NOR excuse one of its own.
+    ///
+    /// `before` is asserted to be 0 (the tag is unique to this call) and `after` to
+    /// be at least 1 — that lower bound is what proves sqlx actually honoured the
+    /// `application_name` parameter, so a silently-ignored tag fails loudly here
+    /// rather than making the upper bound vacuously true.
     ///
     /// `config_agents`/`config_versions` are process-wide shared tables and
     /// `store_and_bump` is replace-all (see its own doc comment: concurrent
@@ -847,16 +866,23 @@ mod tests {
         )
         .expect("write gateway config");
 
+        // The tag that makes the count attributable. Unique per call, and carried
+        // ONLY by the pool `heavy()` opens from this URL — the probe pool above
+        // connects to the bare `url` and so is never counted.
+        let tag = format!("torii-boot-probe-{}", uuid::Uuid::new_v4());
+        let sep = if url.contains('?') { '&' } else { '?' };
         let env = EnvConfig {
-            database_url: url.clone(),
+            database_url: format!("{url}{sep}application_name={tag}"),
             fence_version: Some("torii-boot-probe-fence".to_string()),
             pool_size: DEFAULT_POOL_SIZE,
         };
 
-        async fn backend_count(pool: &sqlx::PgPool) -> i64 {
+        async fn backend_count(pool: &sqlx::PgPool, tag: &str) -> i64 {
             let (n,): (i64,) = sqlx::query_as(
-                "select count(*) from pg_stat_activity where datname = current_database()",
+                "select count(*) from pg_stat_activity
+                 where datname = current_database() and application_name = $1",
             )
+            .bind(tag)
             .fetch_one(pool)
             .await
             .expect("count backends");
@@ -869,10 +895,10 @@ mod tests {
                 .store_and_bump(&seed)
                 .await
                 .expect("seed the probe agent");
-            let before = backend_count(&probe_pool).await;
+            let before = backend_count(&probe_pool, &tag).await;
             match heavy(&env, &gw_path, None).await {
                 Ok(deps) => {
-                    let after = backend_count(&probe_pool).await;
+                    let after = backend_count(&probe_pool, &tag).await;
                     outcome = Some((deps, before, after));
                     break;
                 }
@@ -883,12 +909,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&gw_dir);
         let (deps, before, after) =
             outcome.expect("heavy() never won the probe-agent seed race after 5 attempts");
-        let delta = after - before;
+        assert_eq!(
+            before, 0,
+            "the probe tag is unique to this call, so nothing may carry it before \
+             heavy() connects (saw {before})",
+        );
         assert!(
-            delta <= 2,
-            "heavy() must share ONE pool (a delta of ~1 backend connection), saw a \
-             delta of {delta} (before={before}, after={after}) — a regression to a \
-             separate connect() per adapter would show ~4",
+            after >= 1,
+            "no backend carried the probe tag — sqlx did not honour the \
+             `application_name` URL parameter, so this test is measuring nothing",
+        );
+        assert!(
+            after <= 2,
+            "heavy() must share ONE pool (~1 backend connection), saw {after} \
+             carrying the probe tag — a regression to a separate connect() per \
+             adapter would show ~4",
         );
         drop(deps);
     }
