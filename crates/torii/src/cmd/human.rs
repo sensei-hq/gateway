@@ -982,6 +982,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// The ORDERING half of the actor's bound — the sibling of
+    /// `an_answer_that_only_exceeds_the_cap_after_redaction_is_rejected`, which pins the
+    /// same property one screen above for `--text`.
+    ///
+    /// `--as` is redacted BEFORE it is size-checked, so the bytes checked are the bytes
+    /// written. Nothing pinned that: the re-review reversed the two statements — checking
+    /// the raw one-lined value (`Measured::AsGiven`) and redacting afterwards — and the
+    /// whole `sensei-torii` crate stayed green while an actor that grows past the cap under
+    /// redaction was accepted and journaled over-limit. `[REDACTED]` is LONGER than the
+    /// shortest span it replaces, so the raw check bounds a value nobody stores.
+    ///
+    /// Asserts the POST-redaction size in the message for the same operator reason the
+    /// answer's guard does: an operator told the number they typed cannot tell how much to
+    /// cut.
+    #[tokio::test]
+    async fn an_actor_that_only_exceeds_the_cap_after_redaction_is_rejected() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+
+        // The answer's fixture, for the answer's reason: the trailing space keeps each
+        // value class bounded, so redaction yields 310 placeholders rather than collapsing
+        // the whole string into one (which would SHRINK it).
+        let unit = format!("{}:{} ", "token", "abcdef");
+        let raw = unit.repeat(310);
+        // Unlike `--text`, the actor is NOT trimmed — it is passed through
+        // `render::one_line` (an identity here: no control characters) and then redacted.
+        let journaled = redact_answer(&render::one_line(&raw));
+        assert!(
+            raw.len() <= MAX_HUMAN_TEXT_BYTES,
+            "precondition: this actor is under the cap as typed ({} bytes)",
+            raw.len()
+        );
+        assert!(
+            journaled.len() > MAX_HUMAN_TEXT_BYTES,
+            "precondition: redaction GROWS it past the cap ({} -> {} bytes)",
+            raw.len(),
+            journaled.len()
+        );
+
+        let e = answer(&s, &j, run, reviewer(), "ship it", &raw, now())
+            .await
+            .expect_err("an actor that would exceed the cap once redacted is refused");
+
+        assert_eq!(e.code, crate::errors::EXIT_ERROR, "{}", e.message);
+        assert!(
+            e.message.contains(&journaled.len().to_string()),
+            "must name the size that would actually be JOURNALED ({}), not the one the \
+             operator typed ({}): {}",
+            journaled.len(),
+            raw.len(),
+            e.message
+        );
+        assert!(
+            e.message.contains("--as"),
+            "must name the flag the operator actually typed: {}",
+            e.message
+        );
+        assert!(
+            journaled_answers(&j, run, &reviewer()).await.is_empty(),
+            "an over-limit actor must never reach the journal"
+        );
+    }
+
     /// AC9, the torii half: a secret-shaped answer is redacted BEFORE the durable write.
     ///
     /// Not merely a display concern — the answer BECOMES the node's output and flows into
