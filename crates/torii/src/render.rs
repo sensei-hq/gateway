@@ -472,6 +472,67 @@ pub(crate) const MENU_MAX: usize = 160;
 /// the alignment of every other row in the block.
 const QUESTION_MAX: usize = 300;
 
+/// How much of [`QUESTION_MAX`] the ASK is guaranteed, when the question carries one.
+///
+/// A number rather than "whatever is left", because the point of the reserve is that the
+/// ask's share cannot be squeezed to nothing by a long head. Wide enough for a sentence or
+/// two, which is what a `## Task` section holding a node's input normally is; the head keeps
+/// the rest, which is still ~160 characters of the role's standing instructions and the
+/// upstream context — enough to recognise the run.
+const QUESTION_ASK_MAX: usize = 120;
+
+/// The delimiter `HumanQuestion::compose` (`orchestrator/src/executor/human.rs`) writes
+/// immediately before the node's input, and therefore the seam this renderer splits on.
+///
+/// Two copies of one literal, in two crates that cannot share a constant without torii
+/// depending on the executor's internals. It is a DISPLAY optimisation on this side, not a
+/// contract: if it ever drifts, [`question_cell`] falls into its no-marker arm and renders
+/// exactly what it rendered before the tail reserve existed.
+const TASK_MARKER: &str = "\n\n## Task\n";
+
+/// What the reserve puts between the (truncated) head and the ask, so the operator can see
+/// that the middle was cut and that what follows is the `## Task` section.
+const TASK_SEP: &str = " ## Task ";
+
+/// Render the `agent:` cell for one human-backed `Agent`, **reserving the tail**.
+///
+/// `HumanQuestion::compose` puts `## Task` — the node's input, the thing the human is being
+/// asked — LAST, after the system prompt, every activated skill body and the rendered
+/// `## Context` section. A plain front-cut at [`QUESTION_MAX`] therefore shows ~290
+/// characters of standing instructions and never one byte of the ask, for any question over
+/// that threshold — which every real `system_prompt`, or any upstream `## Context`
+/// dependency, exceeds. `list-paused` is the ONLY torii surface that displays a question
+/// (see [`redact_question`]), so that is the operator's whole view of the work.
+///
+/// This is the display-side counterpart of the fix `HumanQuestion::redact_and_clamp` already
+/// carries for the DURABLE row ("the clamp must never eat the ASK"), and it reserves the
+/// tail the same way: cap the ask on its own budget, then give the head what remains, so the
+/// total still fits `QUESTION_MAX`.
+///
+/// `--json` is unaffected and still carries the whole question — the display-only transforms
+/// (`one_line`, the caps) live here rather than on `AwaitingNode`, matching the split
+/// `json`/`table` already draw for a pause reason.
+fn question_cell(q: &str) -> String {
+    // No marker ⇒ nothing to reserve. Reachable two ways, both fine: a question composed
+    // by something other than `compose`, and — the real one — a secret whose redacted span
+    // swallowed the delimiter, in which case there is no ask to protect.
+    let Some(split) = q.rfind(TASK_MARKER) else {
+        return cap_chars(&format!("agent: \"{}\"", one_line(q)), QUESTION_MAX);
+    };
+    let ask = cap_chars(&one_line(&q[split + TASK_MARKER.len()..]), QUESTION_ASK_MAX);
+    // `agent: "` + `"` are 9 characters of the cell that are not the question, and the
+    // separator sits between the two halves — all charged against `QUESTION_MAX` so the
+    // rendered cell is bounded by exactly the same number the no-marker arm is.
+    // …plus one for the `…` `cap_chars` appends BEYOND its `max` when it truncates. Without
+    // that char the reserve would render one character over `QUESTION_MAX`.
+    let overhead = "agent: \"\"".chars().count() + TASK_SEP.chars().count() + 1;
+    let room = QUESTION_MAX.saturating_sub(overhead + ask.chars().count());
+    format!(
+        "agent: \"{}{TASK_SEP}{ask}\"",
+        cap_chars(&one_line(&q[..split]), room)
+    )
+}
+
 /// One run's awaiting set — or, when that run's journal could not be folded, the reason.
 ///
 /// **Whole-slice review, Important.** The awaiting set is per-RUN and so is the fault that
@@ -588,9 +649,11 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
                         // work. It also keeps this cell consistent with every other free-text
                         // cell in the block (node id, menu), which collapse rather than
                         // escape.
-                        (None, Some(q)) => {
-                            cap_chars(&format!("agent: \"{}\"", one_line(q)), QUESTION_MAX)
-                        }
+                        //
+                        // The cell is built by [`question_cell`] rather than inline,
+                        // because it does more than cap: it RESERVES the `## Task` tail,
+                        // which `compose` puts last and a front-cut would delete.
+                        (None, Some(q)) => question_cell(q),
                         (None, None) => "signal".to_string(),
                     };
                     s.push_str(&format!(
@@ -648,6 +711,41 @@ mod tests {
             reason: reason.map(|s| s.to_string()),
             updated_at: DateTime::<Utc>::from_timestamp(3_000_000, 0).unwrap(),
         }
+    }
+
+    /// The tail reserve must not cost the cap its meaning: the cell stays bounded by
+    /// `QUESTION_MAX` whichever arm it takes, and the no-marker arm renders exactly what it
+    /// rendered before the reserve existed.
+    #[test]
+    fn a_reserved_question_cell_is_still_bounded_and_falls_back_cleanly() {
+        let composed = format!(
+            "standing instructions {}{TASK_MARKER}{}",
+            "x".repeat(5_000),
+            "y".repeat(5_000)
+        );
+        let cell = question_cell(&composed);
+        assert!(
+            cell.chars().count() <= QUESTION_MAX,
+            "the reserve must not overrun the cap: {} chars",
+            cell.chars().count()
+        );
+        assert!(
+            cell.contains(TASK_SEP) && cell.contains("yyyy"),
+            "the ask's share is reserved, not squeezed out by the head: {cell}"
+        );
+        assert!(
+            cell.starts_with("agent: \"standing"),
+            "and the head still leads the cell: {cell}"
+        );
+
+        // No marker ⇒ the pre-reserve rendering, unchanged.
+        let plain = "q".repeat(5_000);
+        let cell = question_cell(&plain);
+        assert_eq!(
+            cell,
+            cap_chars(&format!("agent: \"{plain}\""), QUESTION_MAX),
+            "a question with no `## Task` section has no tail to reserve"
+        );
     }
 
     #[test]
