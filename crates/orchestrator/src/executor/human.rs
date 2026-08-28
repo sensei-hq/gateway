@@ -51,6 +51,16 @@ pub(super) struct HumanQuestion {
     text: String,
     /// How many of `text`'s bytes are author-controlled — everything except `## Context`.
     authored_bytes: usize,
+    /// How many of `text`'s TRAILING bytes are the `## Task` section — the node input, i.e.
+    /// the thing the human is actually being asked about.
+    ///
+    /// Recorded so the post-redaction clamp can protect it. Without this the clamp cut from
+    /// the end, and `compose` puts `## Task` LAST, so a redaction that GREW the authored
+    /// half deleted the ask outright: the human was journaled the role's standing
+    /// instructions plus up to `MAX_HUMAN_CONTEXT_BYTES` of upstream context and no
+    /// statement of what to decide. That is the defect `## Task` exists to prevent, and it
+    /// breaks §5.4's one-directional rule — never show the human LESS than the model had.
+    task_bytes: usize,
 }
 
 impl HumanQuestion {
@@ -77,6 +87,40 @@ impl HumanQuestion {
         Self {
             text,
             authored_bytes,
+            task_bytes: task.len(),
+        }
+    }
+
+    /// Redact the question and bring it under `bound`, **cutting only the `## Context`
+    /// half**.
+    ///
+    /// Redaction runs first because `[REDACTED]` is longer than the shortest span it
+    /// replaces, so a question that fitted before can exceed the bound after — and the
+    /// bytes that must be bounded are the bytes actually written. Clamping rather than
+    /// failing is deliberate: the author-error diagnosis has already happened against
+    /// `authored_bytes`, and turning "your prompt contained a secret" into a terminal run
+    /// would reintroduce the data-dependent death the two-bounds rule removed.
+    ///
+    /// The tail is reserved. `head` is everything before `## Task`; only it is truncated,
+    /// then the task is re-appended, so the ask survives every time the clamp fires. If the
+    /// redacted task alone exceeds `bound` — unreachable while `authored_bytes` (which
+    /// INCLUDES the task) is checked against the smaller `MAX_HUMAN_TEXT_BYTES` — the whole
+    /// thing is truncated as a last resort rather than returning something over the bound.
+    pub(super) fn redact_and_clamp(
+        &self,
+        redact: impl Fn(String) -> String,
+        bound: usize,
+    ) -> String {
+        let split = self.text.len() - self.task_bytes;
+        let head = redact(self.text[..split].to_string());
+        let task = redact(self.text[split..].to_string());
+        match bound.checked_sub(task.len()) {
+            Some(room) => {
+                let mut out = truncate_prompt_to_bound(head, room);
+                out.push_str(&task);
+                out
+            }
+            None => truncate_prompt_to_bound(head + &task, bound),
         }
     }
 }
@@ -237,8 +281,8 @@ impl Executor {
             // failing is deliberate: the author-error diagnosis has already happened above,
             // and turning "your prompt contained a secret" into a terminal run would
             // reintroduce the data-dependent death this whole change removes.
-            let prompt = truncate_prompt_to_bound(
-                self.redact_text(question.text.clone()),
+            let prompt = question.redact_and_clamp(
+                |t| self.redact_text(t),
                 MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES,
             );
 
@@ -443,5 +487,82 @@ impl Executor {
             message,
             output: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator_core::{MAX_HUMAN_CONTEXT_BYTES, MAX_HUMAN_TEXT_BYTES};
+
+    const BOUND: usize = MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES;
+
+    /// The post-redaction clamp must never eat the ASK.
+    ///
+    /// The clamp exists because `[REDACTED]` is longer than the shortest span it replaces,
+    /// so a question that fitted can exceed the bound afterwards. But `compose` puts
+    /// `## Task` — the node input, the thing the human is being asked about — LAST, and the
+    /// clamp cut from the END. A redaction that grew the authored half therefore deleted the
+    /// ask outright, leaving the human the role's standing instructions plus up to 32 KiB of
+    /// upstream context and no statement of what to decide.
+    ///
+    /// That is the defect `## Task` was added to prevent, reintroduced in a narrower window,
+    /// and it breaks §5.4's one-directional rule: never show the human LESS than the model
+    /// would have had. Found by the re-review of the whole-slice review's own fixes.
+    ///
+    /// Tested at the unit level deliberately. The executor-level path needs an upstream node
+    /// producing more than `MAX_HUMAN_CONTEXT_BYTES`, because the authored half alone cannot
+    /// reach the bound (a 4096 cap times redaction's ~1.67x growth is ~6.8 KB) — and no
+    /// gateway helper returns an output that large. The property is a property of the
+    /// clamp, so it is pinned where it lives.
+    ///
+    /// Mutation that must break this: replace `redact_and_clamp`'s body with the shipped
+    /// form, `truncate_prompt_to_bound(redact(self.text.clone()), bound)`.
+    #[test]
+    fn the_clamp_cuts_context_and_never_the_ask() {
+        let context = vec![(
+            "upstream".to_string(),
+            "c".repeat(MAX_HUMAN_CONTEXT_BYTES * 2),
+        )];
+        let q = HumanQuestion::compose("Decide whether to ship.", &context, "Order #42");
+
+        assert!(
+            q.text.contains("## Task"),
+            "precondition: compose adds the ask"
+        );
+        assert!(
+            q.text.ends_with("Order #42"),
+            "precondition: the ask is LAST, which is why the clamp could eat it"
+        );
+
+        // A redactor that GROWS its input, which is the only way the clamp fires at all.
+        let grow = |t: String| t.replace('c', "cc");
+        let out = q.redact_and_clamp(grow, BOUND);
+
+        assert!(
+            out.len() <= BOUND,
+            "the durable row must stay bounded: {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("## Task"),
+            "the ASK must survive — a human with no statement of what to decide cannot \
+             answer. tail: {:?}",
+            &out[out.len().saturating_sub(80)..]
+        );
+        assert!(
+            out.ends_with("Order #42"),
+            "and the node input with it. tail: {:?}",
+            &out[out.len().saturating_sub(80)..]
+        );
+    }
+
+    /// The clamp must not fire at all when the redacted question already fits — otherwise
+    /// every ordinary question would carry a truncation marker.
+    #[test]
+    fn a_question_that_fits_is_returned_untouched() {
+        let q = HumanQuestion::compose("Decide.", &[], "the Acme MSA");
+        let out = q.redact_and_clamp(|t| t, BOUND);
+        assert_eq!(out, q.text);
     }
 }
