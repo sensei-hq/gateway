@@ -51,17 +51,22 @@ pub(super) struct HumanQuestion {
     text: String,
     /// How many of `text`'s bytes are author-controlled — everything except `## Context`.
     authored_bytes: usize,
-    /// How many of `text`'s TRAILING bytes are the `## Task` section — the node input, i.e.
-    /// the thing the human is actually being asked about.
-    ///
-    /// Recorded so the post-redaction clamp can protect it. Without this the clamp cut from
-    /// the end, and `compose` puts `## Task` LAST, so a redaction that GREW the authored
-    /// half deleted the ask outright: the human was journaled the role's standing
-    /// instructions plus up to `MAX_HUMAN_CONTEXT_BYTES` of upstream context and no
-    /// statement of what to decide. That is the defect `## Task` exists to prevent, and it
-    /// breaks §5.4's one-directional rule — never show the human LESS than the model had.
-    task_bytes: usize,
 }
+
+/// The delimiter that opens the `## Task` section, written once and used by BOTH the
+/// composition and the clamp's tail reserve.
+///
+/// The clamp has to protect this section: `compose` puts it LAST, and the clamp cuts from
+/// the end, so a redaction that GREW the authored half deleted the ask outright — the human
+/// was journaled the role's standing instructions plus up to `MAX_HUMAN_CONTEXT_BYTES` of
+/// upstream context and no statement of what to decide. That is the defect `## Task` exists
+/// to prevent, and it breaks §5.4's one-directional rule: never show the human LESS than the
+/// model had.
+///
+/// A shared CONST rather than a recorded byte count, because the clamp locates the split in
+/// the REDACTED text (see [`HumanQuestion::redact_and_clamp`]) where a byte count taken
+/// before redaction no longer points anywhere.
+const TASK_MARKER: &str = "\n\n## Task\n";
 
 impl HumanQuestion {
     /// Compose the model-EQUIVALENT question from `assemble_prompt`'s two halves plus the
@@ -75,7 +80,7 @@ impl HumanQuestion {
     /// the model would have", with an explicitly one-directional cost: never show the human
     /// LESS than the model would have had.
     pub(super) fn compose(authored: &str, context: &[(String, String)], query: &str) -> Self {
-        let task = format!("\n\n## Task\n{query}");
+        let task = format!("{TASK_MARKER}{query}");
         let mut text = String::with_capacity(authored.len() + task.len());
         text.push_str(authored);
         let authored_bytes = text.len() + task.len();
@@ -87,7 +92,6 @@ impl HumanQuestion {
         Self {
             text,
             authored_bytes,
-            task_bytes: task.len(),
         }
     }
 
@@ -106,14 +110,35 @@ impl HumanQuestion {
     /// redacted task alone exceeds `bound` — unreachable while `authored_bytes` (which
     /// INCLUDES the task) is checked against the smaller `MAX_HUMAN_TEXT_BYTES` — the whole
     /// thing is truncated as a last resort rather than returning something over the bound.
+    ///
+    /// **The redactor sees the WHOLE question, exactly once, before anything is split.**
+    /// The tail reserve needs a split point and the obvious implementation takes it first,
+    /// redacting `text[..split]` and `text[split..]` independently — which hides from the
+    /// redactor every match that STRADDLES the boundary. A `Redactor` matches over the
+    /// string it is handed; cutting first makes a whole-match the two halves cannot see, and
+    /// the miss is durable (`AgentAwaited.prompt` → `journal_events`, with
+    /// `render::redact_question` running the same plain pass over the same already-split
+    /// text downstream). `PatternRedactor`'s PEM rule is the reachable case today — the one
+    /// shipped pattern with an unbounded `[\s\S]*?` body — and the weakening was unguarded
+    /// for any future multi-line pattern. Guarded by
+    /// `a_secret_that_straddles_the_task_boundary_is_still_redacted`.
+    ///
+    /// So the split is located in the REDACTED text, by its marker. Two consequences, both
+    /// intended: a secret that swallowed the `\n\n## Task\n` delimiter leaves no marker to
+    /// find, and the whole redacted string is then clamped as one (there is no ask to
+    /// reserve — its delimiter was part of the secret); and if the node input ITSELF
+    /// contains the literal `\n\n## Task\n`, the reserved tail is the part after its LAST
+    /// occurrence, so the ask's final section survives and the clamp may cut earlier ask
+    /// text. Both are strictly better than leaking key material.
     pub(super) fn redact_and_clamp(
         &self,
         redact: impl Fn(String) -> String,
         bound: usize,
     ) -> String {
-        let split = self.text.len() - self.task_bytes;
-        let head = redact(self.text[..split].to_string());
-        let task = redact(self.text[split..].to_string());
+        let redacted = redact(self.text.clone());
+        let split = redacted.rfind(TASK_MARKER).unwrap_or(redacted.len());
+        let head = redacted[..split].to_string();
+        let task = redacted[split..].to_string();
         match bound.checked_sub(task.len()) {
             Some(room) => {
                 let mut out = truncate_prompt_to_bound(head, room);
@@ -554,6 +579,60 @@ mod tests {
             out.ends_with("Order #42"),
             "and the node input with it. tail: {:?}",
             &out[out.len().saturating_sub(80)..]
+        );
+    }
+
+    /// A secret whose WHOLE MATCH straddles the `## Task` boundary must still be redacted.
+    ///
+    /// The tail-reserve above needs a split point, and the shipped implementation took it
+    /// before redacting — `redact(text[..split])` and `redact(text[split..])` as two
+    /// independent passes. A `Redactor` sees a whole string and matches over it; cutting the
+    /// string first hides from it any match that spans the cut. `PatternRedactor`'s PEM rule
+    /// is the reachable case today (`-----BEGIN … PRIVATE KEY-----[\s\S]*?-----END …`, the
+    /// one shipped pattern with an unbounded multi-line body), and the split is unguarded
+    /// for any future multi-line pattern.
+    ///
+    /// The leak was DURABLE: the unredacted value went into `AgentAwaited.prompt`, i.e. into
+    /// `journal_events`, and `render::redact_question` cannot recover it downstream — it
+    /// runs the same plain pass over the same already-split text.
+    ///
+    /// Uses the real `PatternRedactor` rather than a synthetic closure: the property is
+    /// "one whole-string pass", and only a redactor with a genuinely multi-line rule can
+    /// tell one pass from two.
+    #[test]
+    fn a_secret_that_straddles_the_task_boundary_is_still_redacted() {
+        use orchestrator_core::{PatternRedactor, Redactor};
+
+        let redactor = PatternRedactor::default();
+        let redact = move |t: String| match redactor.redact(&serde_json::Value::String(t.clone())) {
+            serde_json::Value::String(s) => s,
+            _ => t,
+        };
+
+        // Assembled at runtime: the repo's Semgrep CWE-798 hook blocks a credential-shaped
+        // literal in a fixture.
+        let head_half = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n{}",
+            "MIIB".to_string() + &"A".repeat(24)
+        );
+        let secret_body = "MIIB".to_string() + &"A".repeat(24);
+        let q = HumanQuestion::compose(
+            "You are a reviewer.",
+            &[("upstream".to_string(), head_half)],
+            // The END delimiter lands in the `## Task` section, so the whole match spans the
+            // split point the clamp needs.
+            "-----END RSA PRIVATE KEY-----\nApprove?",
+        );
+        assert!(
+            q.text.contains("## Task"),
+            "precondition: the boundary this test straddles exists"
+        );
+
+        let out = q.redact_and_clamp(redact, BOUND);
+        assert!(
+            !out.contains(&secret_body),
+            "the key material survived a redaction split at the `## Task` boundary and \
+             would have been written to `journal_events`: {out}"
         );
     }
 
