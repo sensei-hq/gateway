@@ -14,6 +14,14 @@
 //! about: it shipped holding its own `Arc<Gateway>` and spent past the cap with no
 //! ledger entry, so it is now handed a borrowed capability instead of owning one.
 //!
+//! **A new producer owes THREE tests, not one.** The five are a census on both sides,
+//! and each side has its own per-producer guard in `tests.rs`: the budget gate
+//! (`budget_gate_stops_the_*_producer`), the redaction leaf (`*_text_is_redacted` —
+//! the SP-4 s2 review's own remedy), and the memo replay, which is what keeps a
+//! re-driven node from re-spending and what keeps the ledger honest across resumes.
+//! The selector shipped with the first and neither of the other two, and the review
+//! that caught it found exactly the defect the missing memo guard would have.
+//!
 //! Their GATEWAY-ERROR handling deliberately differs (two classify the error into
 //! pause-vs-fail, the rest just stringify it), so the chokepoint returns
 //! `Result<Result<_, Refusal>, GatewayError>`: every site's existing `Err(error)` arm
