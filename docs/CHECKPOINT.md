@@ -1,51 +1,44 @@
 # Checkpoint
 
-**Slice:** SP-6 s3 `human-as-Agent` (merged to `develop` at `4026a90`). The whole-slice
-adversarial re-review's **15 findings are all CLOSED** — 14 confirmed and fixed, 1 a
-duplicate (#4 and #13 are the same `authored_bytes` gap).
+**Slice:** budget completeness — the two SP-DATA-5 carry-forwards that let a run spend
+past its cap. Both CLOSED on `develop`. SP-6 is complete and **PR #48 is open** to `main`.
 
 ## Done
 
-- `98b83e7` fix(orchestrator) — the THIRD kind-swap direction. A node bearing another
-  kind's awaited record, driven as `AwaitSignal`, re-paused with `resume_after: None`
-  forever while `run signal` refused it and `run agent answer` reported exit 0. New
-  `Fold::signal_asks` + `has_signal_ask`, the counterpart of `menu_for`/`prompt_for`.
-- `b700339` fix(orchestrator) — `redact_and_clamp` redacted the question as TWO passes
-  split at `## Task`, so a `PatternRedactor` whole-match spanning the boundary (the PEM
-  rule) reached `journal_events` in the clear. Whole-string pass; split located in the
-  REDACTED text via a shared `TASK_MARKER`.
-- `b8a4665` fix(torii) — `list-paused`'s `agent:` cell cut from the FRONT, so for any
-  question over ~290 chars the operator saw standing instructions and never the ask.
-  `render::question_cell` reserves the tail exactly as the journal clamp does.
-- `ad3686e` test(orchestrator) — three surviving mutations pinned: the `## Task` term in
-  `authored_bytes`, `MAX_HUMAN_CONTEXT_BYTES` (its `truncated` marker assertion is now
-  ANCHORED inside `## Context`), and the even budget split across dependencies.
-- `fffecdd` test(torii) — FIRST-wins on the question at both torii sites (both survived
-  mutation; only the executor's copy was guarded).
-- `feb6d27` docs — six sites still said the executor journals the prompt UNREDACTED and/or
-  that the whole question is bounded at 4096; plus the overview's s3 branch parenthetical.
+- `65dffb8` fix(orchestrator) — **the planner selector was the fifth, unmetered model
+  call.** It held its own `Arc<Gateway>` and called `execute()` directly, so one call per
+  `PlannerRef::Select` node spent past the cap with no ledger entry — and because
+  `PlannerSelected` memoizes the CHOICE, a resumed run never re-invokes it, so the tokens
+  were missing from the fold on every later resume too. Closed by INVERTING the
+  capability: a new core trait `ModelDispatch` is lent to `select()`; the selector holds
+  no gateway, so the bypass is unrepresentable. Text-in/text-out because
+  `orchestrator-core` depends on no provider crate. Spend journals under a reserved
+  `"{expand}/__select__"` path via the existing `EffectRecorded` (FORMAT_VERSION stays 1);
+  that id is now reserved against plan node ids beside `__plan__`/`__gate__`.
+- `e820d87` fix(orchestrator-core) — **a snapshot that forgets the budget un-caps the
+  run.** `Snapshot` gains `spent` + `budget` (`#[serde(default)]`; `run_snapshots` is one
+  `jsonb` column, so no schema change). Dormant, not live — but the trap was that a
+  tail-only fold that compiles would have passed the whole suite.
 
-**Measured:** `cargo test --workspace` **1601 passed / 0 failed / 7 ignored, exit 0**.
-`clippy -D warnings` exit 0. `fmt --check` exit 0. `cargo doc` "links to private item"
-back to **24** (the baseline). Postgres e2e re-run against a throwaway container on 55432
-(removed afterwards): **7 passed, zero skips**; `orchestrator-store --features postgres`
-**66 passed**; the durable `AgentAwaited.prompt` inspected in `journal_events`.
+**Mutation-verified, all four new guards:** producer 5/5 observed RED first (1 dispatch
+against an exhausted cap, 0 allowed); un-reserve `__select__` → red; drop the
+`EffectRecorded` append → red; hardcode `spent: 0, budget: None` → red (0 vs 50).
+
+**Measured:** `cargo test --workspace` **1605 passed / 0 failed, exit 0**; `clippy
+-D warnings` 0; `fmt --check` 0. Postgres on a throwaway container (port 55447, removed):
+store suite **66 passed**, `e2e_pg` **7 passed, zero skips**.
 
 ## Remaining
 
-The re-review's **7 LOW** only: `truncate_prompt_to_bound` overruns for a tiny `max`;
-`assemble_prompt` has zero production callers; assorted prose. (The "stale single-4096
-bound" LOW is now closed by `feb6d27`.)
+The SP-6 whole-slice review's **7 LOW** only. Nothing blocking.
 
 ## Next command
 
-**SP-6 IS COMPLETE (s1 `AwaitSignal` · s2 `HumanGate` · s3 `human-as-Agent`).**
-`origin/main` merged into `develop` (`b87482f`, zero content change) and
-**PR #48 is OPEN** — `MERGEABLE`, blocked only on required checks and the mandatory
-human review. Nothing to do but watch CI; then pick up the 7 LOW in a later pass.
+Push `develop`. PR #48 (SP-6 → `main`) is CI-green and awaits the mandatory human review;
+these two commits land on `develop` after it and are NOT in that PR.
 
 ## Known-broken
 
 Nothing. `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it; use a
-throwaway container (`docker run -p 55432:5432 postgres:16`, then
-`psql < database/_apply_all.sql`).
+throwaway container (`docker run -p 55447:5432 postgres:16`, then
+`psql < database/_apply_all.sql`), and remove it afterwards.
