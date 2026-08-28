@@ -32,8 +32,8 @@ kind.
 - `torii run agent answer <run> --node <id> (--text | --text-file) [--as who]`.
 - `run list-paused` shows the question.
 - Additive: a config with no human-backed agent is byte-identical.
-- **Legal ONLY as a top-level `NodeKind::Agent`** — see §5.5 for the other four `drive_agent`
-  callers and why each is rejected.
+- **Legal ONLY as a top-level `NodeKind::Agent`** — see §5.5 for the other five `drive_agent`
+  callers, the nested-`Agent` positions that reach the sixth, and why each is rejected.
 
 **Non-goals**
 - **Tool use by a human-backed agent** — see §7, "the accepted cost".
@@ -77,6 +77,29 @@ pub struct AgentDefinition {
 
 `#[serde(default)]` + `#[default] Model` is what keeps every existing agent, every `config_agents`
 jsonb row and every registry test byte-identical.
+
+**Authoring surface** (added in Task 1 after review — the type alone did not make the
+substitutability claim above reachable). `AgentDefinition::from_frontmatter` parses two optional
+keys, and it is the only producer of an `incoming` config for `torii config push`:
+
+```md
+---
+name: reviewer
+area: review
+kind: human
+backed_by: human      # absent | `model` -> Model. Anything else is a LOUD parse error.
+timeout: 48h          # <number><unit>, unit s|m|h|d. Omit -> wait indefinitely.
+---
+Does this contract permit sub-processing?
+```
+
+Both are loud rather than lenient: `backed_by: huamn` silently read as `Model` would give a config
+that *looks* like a person is in the loop while the run quietly spends tokens, and `timeout:` on a
+model-backed agent would let an author believe they had set an SLA that is inert. Without these
+keys, `config push` (replace-all, diffed through `AgentDefinition`) would also silently rewrite a
+`Human` row in Postgres back to `Model`, showing the operator only `changed: agent <name>`. The
+duration parser is purely syntactic; positive-and-under-the-century-cap stays in
+`Registry::validate`, which is the one place that also sees a definition arriving as a jsonb row.
 
 ```rust
 // orchestrator-core/src/journal.rs — both NEW VARIANTS, FORMAT_VERSION stays 1
@@ -126,12 +149,23 @@ real defects in exactly those arms; a third copy would be a third place for them
 | fold state | behaviour |
 |---|---|
 | failure recorded | `Failed` — `gate_precheck`, checked FIRST |
-| no `AgentAwaited` yet | journal it (prompt + deadline), then continue below |
+| no wait recorded yet | journal `AgentAwaited` (prompt + deadline), then continue below |
+| a wait recorded by ANOTHER kind, so no prompt | `NodeFailed` — the kind swap, loudly |
 | **answered** | `Completed({"text","actor"})` — **read BEFORE expiry** |
 | not answered, deadline passed | `NodeFailed` — the SLA fired with nobody answering |
 | not answered, deadline not passed | re-pause on the **same** absolute instant |
 
-**Row 3 sits above row 4, and that is the slice's one deliberate divergence from s2.** See §3.
+**Row 4 sits above row 5, and that is the slice's one deliberate divergence from s2.** See §3.
+
+**Row 3 was added by the whole-slice review, and it is the mirror of `run_human_gate`'s
+missing-menu arm.** "Has this node begun asking?" is answered by `Fold::deadlines`, which ALL THREE
+waiting kinds write, while only `AgentAwaited` carries a prompt. So a node whose id already bore a
+`SignalAwaited` — reachable by editing a live run's graph to change a waiting node's KIND, exactly
+as s2's arm is — returned `Waiting`, never took the ask arm, published no question, and paused
+FOREVER: with no `AgentAwaited`, `torii run agent answer` refuses permanently, while `torii run
+signal` accepts a payload, reports exit 0 and `list-paused` shows the node as a `signal` row. The
+guard is keyed on `Fold::prompt_for` — the node's OWN question — which until then was
+`expect(dead_code)` in non-test builds, and that was the tell.
 
 **The ask precedes the answer, unconditionally** — the prompt is journaled first even when an answer
 is already folded, so there is never an answer without a recorded question. s2 established this: a
@@ -170,22 +204,52 @@ point bypasses it. Third application of s1's lesson.
 **Cross-refusal is now three-way.** `run signal` → `AwaitSignal`; `run gate` → `HumanGate`;
 `run agent answer` → a human-backed `Agent`. Each refuses the other two, naming the right verb.
 
-### 5.4 The prompt is `assemble_prompt`'s output, composed before the backing check
+### 5.4 The prompt is the model-equivalent question, composed before the backing check
 
-The journaled `prompt` is the **full output of the existing `agent::prompt::assemble`** —
-`system_prompt` + activated skills (`Activation::OnKeywords` gating unchanged) + the rendered
-`## Context` section from predecessors. The human sees precisely what the model would have, which is
-the literal reading of "a human answering where a model would", and it needs no new
-prompt-building code that could drift from the model path.
+The journaled `prompt` is the **full output of the existing `agent::prompt::assemble`, PLUS the
+node's own input** — `system_prompt` + activated skills (`Activation::OnKeywords` gating unchanged)
++ the rendered `## Context` section from predecessors + `\n\n## Task\n{input}`. The human sees
+precisely what the model would have, which is the literal reading of "a human answering where a
+model would", and it needs no new prompt-building code that could drift from the model path.
 
-**Ordering, and why it works:** `assemble_prompt` is called at `agent.rs:75`, immediately *before*
-`resolve_chain` at `agent.rs:76`. It needs no chain. So the composition happens first, exactly where
-it does today, and the human-backing branch sits between it and `resolve_chain` — the model path is
-untouched and the human path reuses its work.
+> **Revised by Task 4's review, then by the whole-slice review.** This section originally said
+> "`assemble_prompt`'s output" full stop. That output is `(system, tools)` built from
+> `system_prompt` + skills + `## Context`: `assemble_prompt` takes the query only to evaluate
+> `activation.is_active(query)` and never returns it, and the model path supplies the input
+> separately as the first user message. Journaling it alone asked a reviewer to read a contract
+> nobody had named, which is showing the human LESS than the model would have had — the one thing
+> the accepted cost below rules out.
 
-**Consequence, named because it is load-bearing:** an assembled prompt is routinely multi-KB, so
-§6's size bound is a real constraint rather than a theoretical one. A role whose skills and context
-exceed it fails loudly at first execution.
+**Ordering, and why it works:** prompt assembly happens immediately *before* `resolve_chain` and
+needs no chain. So the composition happens first, exactly where it does today, and the
+human-backing branch sits between it and `resolve_chain` — the model path is untouched and the
+human path reuses its work. The implementation calls `assemble_prompt_parts`, which is
+`assemble_prompt` stopping one step short of joining its two halves; the model path re-joins them
+and is byte-identical.
+
+**Consequence, named because it is load-bearing: the question's two halves have two different
+OWNERS, and so are bounded by two different rules.** An assembled prompt is routinely multi-KB, so
+§6's size bound is a real constraint rather than a theoretical one — but it applies only to the
+AUTHORED half (`system_prompt` + activated skills + the node input), which a config author can
+trim, and whose breach really is a config error that should fail loudly at first execution. The
+`## Context` half is RUN DATA — every Hard dependency's full materialized output — so it is
+TRUNCATED per dependency, with a visible marker, to its own `MAX_HUMAN_CONTEXT_BYTES`.
+
+> **This is the whole-slice review's worst finding.** As shipped, the 4 KiB cap was charged against
+> the whole composed question including `## Context`, so a human-backed node downstream of ANY node
+> that produced ~1000 tokens failed TERMINALLY — after the upstream tokens were already spent,
+> unrecoverably (`gate_precheck_by_id` reads the `NodeFailed` back on every later drive), with a
+> message naming three config fields that were not the cause. Measured: 4126 bytes for a role with a
+> 60-byte system prompt, no skills and a 12-byte input. It defeated this slice's own headline
+> example — a reviewer reading a contract, which is over 4 KiB essentially always — and it sat
+> against a codebase whose default `cas_threshold` is also 4096, i.e. one that already treats a
+> >4 KiB effect output as ordinary enough to SPILL rather than refuse.
+
+**The journaled prompt is redacted before the durable write**, at the executor's own redactor, like
+every other durable string on this path (§6). As shipped it was not, which made the `AgentAwaited`
+row the one place a credential in an agent's `system_prompt` or a skill body reached durable
+storage in the clear — `torii config push` redacts nothing, and `render::redact_question` is a
+display pass, not a durability one.
 
 **Accepted cost:** skills written for a model may read oddly to a person. That is preferred to
 showing the human *less* than the model would have had, which would let them answer without context
@@ -193,11 +257,11 @@ the model would have seen.
 
 ### 5.5 A human-backed agent is legal ONLY as a top-level `Agent` node
 
-`drive_agent` is the shared choke point for **five** call sites, not one: `run_node`
-(`mod.rs:1128`), `run_map`/`run_consolidate` (`MapBody::Agent`, `fanout.rs:183,269`), `run_loop`'s
-body (`LoopBody::Agent`, `fanout.rs:488`), `run_loop`'s **gate** (`GateSpec::Agent`, the reserved
-`"{loop}/{i}/__gate__"` path, `fanout.rs:553`), and `expand.rs`'s `drive_planner_agent`
-(`PlannerRef::Agent`/`Select`, `expand.rs:48`).
+`drive_agent` is the shared choke point for **six** call sites, not one: `run_node`
+(`mod.rs`), `run_map` and `run_consolidate` (`MapBody::Agent`, `fanout.rs:183,269` — two DISTINCT
+sites), `run_loop`'s body (`LoopBody::Agent`), `run_loop`'s **gate** (`GateSpec::Agent`, the
+reserved `"{loop}/{i}/__gate__"` path), and `expand.rs`'s `drive_planner_agent`
+(`PlannerRef::Agent`/`Select`).
 
 Mechanically the pause already composes at all of them — `AgentStep::Paused` becomes
 `MapChildPaused` and pauses the whole Map (`fanout.rs:291-337`); a Loop body/gate pause propagates
@@ -217,11 +281,28 @@ and does not know which `AgentRef`s are human-backed. **So the check needs the r
 only place both are in hand is the executor's config-load path.
 
 Resolution: the rejection is enforced where the agent is resolved — `drive_agent` fails the node
-loudly (`NodeFailed`, naming the site and the role) when a human-backed agent is reached from any
-caller but `run_node`. `run_node` passes a flag; the other four do not. This is a runtime check
-rather than a load-time one, and that is a stated limitation: a graph that misuses a human-backed
-agent validates and then fails on first execution of that node. Making it load-time needs a
-registry-aware graph validation pass that does not exist and that neither sibling slice needed.
+loudly (`NodeFailed`, naming the site and the role) when a human-backed agent is reached anywhere
+but at a top-level `NodeKind::Agent`. This is a runtime check rather than a load-time one, and that
+is a stated limitation: a graph that misuses a human-backed agent validates and then fails on first
+execution of that node. Making it load-time needs a registry-aware graph validation pass that does
+not exist and that neither sibling slice needed.
+
+**The flag is a POSITION, not a caller — corrected by the whole-slice review.** As shipped, the
+five non-`run_node` callers passed `top_level: false` and `run_node` passed a hardcoded `true`,
+which reads as complete and is not: `run_loop` → `drive_nested` → `drive` → `run_node`, so an
+`Agent` node inside a `Subgraph`, a `Branch` arm, a `Loop`'s `Subgraph` body or an `Expand`'s
+planner-spliced graph reached that literal `true` and was declared top-level. Review drove
+`Loop { body: LoopBody::Subgraph([Agent -> human-backed]), max_iters: 3 }` and got two real
+journaled questions, at `lp/0/review` and `lp/1/review` — exactly the `LoopBody::Agent` row this
+table marks *rejected*, reached through a one-node wrapper, and authorable by an UNTRUSTED `Expand`
+planner. `drive` now carries a `nested: bool` that `drive_nested` — the single tail all four
+nesting shapes share — sets, and `run_node` passes `!nested`. Legality no longer depends on which
+function called.
+
+The same review found the AC15 site table missing `run_consolidate`'s `MapBody::Agent` (the second
+of the two `fanout.rs` sites this section enumerates): flipping that one site's flag left the
+ENTIRE workspace green while a `Consolidate { body: MapBody::Agent(human) }` began journaling a
+real question to a human.
 
 ### 5.6 The `on_agent_started` hook does not fire for a human-backed agent
 
@@ -250,12 +331,20 @@ at zero token cost.
   **`orchestrator-core`**, used by BOTH the executor (bounding the composed `prompt` before it is
   journaled) and torii (bounding `--text`/`--text-file`). One constant, two call sites, no
   duplicated number.
-- **The prompt's over-bound behaviour is a `NodeFailed`, not a CLI refusal.** The prompt is composed
-  inside `drive_agent`, where no exit-2 path exists. s1 §6.5's `ContentStore`/`split_output` route
-  was considered and rejected for this field: `AgentAwaited.prompt` is a bare `String` with no
-  ref-or-inline alternative (the same shape argument s1 made for `SignalReceived.payload`), and a
-  question too large to journal is a malformed agent config, which should fail loudly at first
+- **The AUTHORED prompt's over-bound behaviour is a `NodeFailed`, not a CLI refusal.** The prompt is
+  composed inside `drive_agent`, where no exit-2 path exists. s1 §6.5's `ContentStore`/`split_output`
+  route was considered and rejected for this field: `AgentAwaited.prompt` is a bare `String` with no
+  ref-or-inline alternative (the same shape argument s1 made for `SignalReceived.payload`), and an
+  over-bound AUTHORED prompt is a malformed agent config, which should fail loudly at first
   execution rather than silently spill to CAS.
+- **The `## Context` half is NOT a config error and does not fail the node.** Corrected by the
+  whole-slice review, which found this bullet claiming that a question too large to journal is
+  "a malformed agent config" — it is not; it is a data-dependent RUNTIME condition, since
+  `assemble_prompt` renders every Hard dependency's full output into that section verbatim. It is
+  bounded by `MAX_HUMAN_CONTEXT_BYTES` through per-dependency truncation with a visible marker, so
+  the durable row stays bounded (the cap's actual justification) while a verbose upstream degrades
+  the question instead of killing the run. The overall bound on a journaled question is therefore
+  `MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES`.
 - **`--as` defaults to `$USER`**, reusing `cmd::gate::actor_or`/`actor_or_user` verbatim rather than
 re-deriving it — never-empty, falling back to `"unknown"`. One definition of "who answered" across
 both human-facing verbs.
@@ -324,9 +413,9 @@ guard the line they appeared to, and every one was caught by asking that questio
 | **AC11** `--text-file` keeps the answer out of argv | Read the child's own `ps` line | Argv-only delivery → the sentinel appears |
 | **AC12** Zero re-spend on resume | Answered node replays from the fold **and still produces the answer** | Break the fold read → this must be among the reds |
 | **AC13** Cross-process e2e (Postgres) | submit → pause → `list-paused` shows the question → answer in process B → fresh `worker serve --once` completes it | Swap the answer for a bare `wake` → stays `Paused` |
-| **AC15** A human-backed agent is rejected at every non-top-level site | Each of `MapBody`/`LoopBody`/`GateSpec::Agent`/planner fails the node loudly, naming the site | Drop the caller flag → a human-backed planner reaches `parse_plan` |
+| **AC15** A human-backed agent is rejected at every non-top-level site — by POSITION, not by caller | Each of `MapBody` (both the `Map` and the `Consolidate` site), `LoopBody`, `GateSpec::Agent` and planner fails the node loudly, naming the site; so does a nested `NodeKind::Agent` inside a `Subgraph`, a `Branch` arm or a `Loop`'s `Subgraph` body | Drop the caller flag → a human-backed planner reaches `parse_plan`; pin `run_node`'s flag to a literal `true` → a one-node `Subgraph` wrapper delivers a human ask per `Loop` iteration; flip `run_consolidate`'s site → a `Consolidate` journals a real question |
 | **AC16** `validate()` skips the chain requirement for `Human` | A human-backed agent with no `chain` and no binding loads | Leave the chain check unconditional → every human-backed config is rejected at load |
-| **AC17** The journaled prompt is `assemble_prompt`'s output | The prompt contains an activated skill's body and the `## Context` section | Compose `system_prompt` alone → the skill text is absent |
+| **AC17** The journaled prompt is `assemble_prompt`'s output PLUS the node's input, with `## Context` truncated rather than fatal | The prompt contains an activated skill's body, the `## Context` section and the node input; a verbose upstream truncates with a marker instead of failing the node | Compose `system_prompt` alone → the skill text is absent; drop the input → the reviewer is asked about an unnamed contract; charge `MAX_HUMAN_TEXT_BYTES` against `## Context` → an ordinary upstream kills the node |
 | **AC14** Additivity | No human-backed agent ⇒ byte-identical; suite stays **1505** + new | — (the baseline guard) |
 
 **AC13 is `DATABASE_URL`-gated.** It returns early without one and is therefore **counted as passed

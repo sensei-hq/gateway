@@ -13,7 +13,7 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{Fold, GateDecision};
+use super::{AgentAnswer, Fold, GateDecision};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -245,6 +245,42 @@ pub(crate) fn fold_journal(
                     },
                 );
             }
+            // SP-6 s3: the ask. EXPLICIT, never folded by a catch-all — a catch-all
+            // silently absorbing a new variant is how this codebase has shipped fold bugs.
+            //
+            // FIRST wins for BOTH the deadline and the prompt (`entry().or_insert`).
+            // The deadline goes into the SHARED map because `wait_or_expire` reads
+            // `deadline_for` and knows nothing about which kind recorded it. That makes
+            // this the THIRD writer of `Fold::deadlines` (after `SignalAwaited` and
+            // `GateAwaited`); when a fourth is added, update the writer lists on
+            // `Fold::deadlines`, `Fold::deadline_for` and `run_human_gate`'s missing-menu
+            // arm, all of which reason from an explicit enumeration of them.
+            //
+            // `deadline` is folded THROUGH, `None` included — never `if
+            // deadline.is_some()`. The key alone answers "has this node begun asking?",
+            // and `AgentBacking::Human { timeout: None }` is a real configuration, so
+            // dropping the `None` would make an indefinite human agent re-ask on every
+            // drive (s1 shipped exactly that bug on the `SignalAwaited` arm above).
+            JournalEvent::AgentAwaited {
+                node,
+                deadline,
+                prompt,
+            } => {
+                fold.deadlines.entry(node.clone()).or_insert(*deadline);
+                fold.agent_prompts
+                    .entry(node.clone())
+                    .or_insert(prompt.clone());
+            }
+            // SP-6 s3: the answer. LAST wins (`insert` overwrites).
+            JournalEvent::AgentAnswered { node, text, actor } => {
+                fold.agent_answers.insert(
+                    node.clone(),
+                    AgentAnswer {
+                        text: text.clone(),
+                        actor: actor.clone(),
+                    },
+                );
+            }
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
@@ -270,6 +306,43 @@ pub(crate) fn fold_journal(
 /// `AgentStep::Completed` (design §4) — so a completed Agent node yields an
 /// identical shape on every completion path. Pure over already-materialized
 /// outputs; `ModelCall` nodes already store the canonical shape and are untouched.
+///
+/// **A HUMAN-answered node (SP-6 s3) is passed through unchanged**, because its
+/// canonical shape is a different one: `{text, actor}` (design §4 / AC2), and forcing
+/// it through the model projection would drop the `actor` and invent `model: null`
+/// for a node no model ever touched.
+///
+/// The discriminator is the presence of an `"actor"` key, and that is sound because
+/// this function's inputs are never author- or model-supplied: EVERY Agent-node output
+/// is built by the executor itself. The model path builds exactly `{model, text}`
+/// (`finish_agent`) or `{model, text, tool_calls}` (`dispatch_model_turn`) — no
+/// `actor`, ever — and `actor` reaches an output only by being folded from
+/// `JournalEvent::AgentAnswered`. So `actor` present ⟺ a human answered.
+///
+/// Deciding this HERE rather than in the human drive path is deliberate: this function
+/// runs on exactly ONE path (the `terminal` branch of `start_inner`), so getting it
+/// wrong is invisible on the drive that completes a node and shows up only when the
+/// finished run is read back — the same run reporting two different outputs depending
+/// on when it is read. Review caught that as a forward-looking finding against the
+/// event before the drive path existed; see
+/// `the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical`.
+///
+/// **The `actor` exemption is still forward-looking as of SP-6 s3 Task 4, and nothing in
+/// the shipped human path reaches it.** The terminal branch builds `outputs` from
+/// [`fold_journal`]'s `node_last_output`, which is populated ONLY from `EffectRecorded`
+/// and `MapCompacted`; `run_human_agent` journals neither, so a human-answered node is
+/// absent from a terminal re-read altogether rather than present-and-mis-projected
+/// (`a_finished_human_backed_run_reports_no_output_when_read_back`). The exemption is
+/// kept, and its unit test with it, because the projection is the wrong place to
+/// discover that: the first change that gives a waiting node kind a durable per-node
+/// output would otherwise silently rewrite `{text, actor}` into `{model: null, text}`.
+/// This note exists because the sibling comment in `human.rs` previously described that
+/// mis-projection as something that happens TODAY, which it does not.
+///
+/// The alternative — resolving each node's `AgentRef` against the `Registry` to ask
+/// whether its backing is `Human` — was rejected: it makes a pure, total projection
+/// depend on registry resolution that can fail, to recover a fact the output already
+/// carries.
 pub(crate) fn project_agent_outputs(
     graph: &Graph,
     outputs: &mut HashMap<NodeId, serde_json::Value>,
@@ -278,6 +351,9 @@ pub(crate) fn project_agent_outputs(
         if let NodeKind::Agent { .. } = &node.kind
             && let Some(output) = outputs.get(&node.id).cloned()
         {
+            if output.get("actor").is_some() {
+                continue;
+            }
             let model = output
                 .get("model")
                 .cloned()
@@ -920,6 +996,105 @@ mod tests {
         let (fold, _, _) = fold_journal(&events);
         assert_eq!(fold.deadline_for(&NodeId("release".into())), Some(None));
         assert!(fold.menu_for(&NodeId("release".into())).is_some());
+    }
+
+    /// The two asymmetries are OPPOSITE and both load-bearing, exactly as s1's and s2's
+    /// are: the ANSWER is last-wins (an operator corrects themselves before the run
+    /// resumes) and the QUESTION is first-wins (the human was asked THIS question).
+    #[test]
+    fn agent_answers_are_last_wins_and_the_prompt_is_first_wins() {
+        let events = vec![
+            (
+                1,
+                JournalEvent::AgentAwaited {
+                    node: NodeId("review".into()),
+                    deadline: Some(at(1_000)),
+                    prompt: "Original question?".into(),
+                },
+            ),
+            (
+                2,
+                JournalEvent::AgentAnswered {
+                    node: NodeId("review".into()),
+                    text: "first answer".into(),
+                    actor: "alice".into(),
+                },
+            ),
+            (
+                3,
+                JournalEvent::AgentAnswered {
+                    node: NodeId("review".into()),
+                    text: "corrected answer".into(),
+                    actor: "alice".into(),
+                },
+            ),
+            (
+                4,
+                JournalEvent::AgentAwaited {
+                    node: NodeId("review".into()),
+                    deadline: Some(at(9_999)),
+                    prompt: "Rewritten question?".into(),
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&events);
+
+        let a = fold
+            .agent_answer_for(&NodeId("review".into()))
+            .expect("answered");
+        assert_eq!(a.text, "corrected answer", "LAST answer wins");
+        assert_eq!(a.actor, "alice");
+
+        assert_eq!(
+            fold.prompt_for(&NodeId("review".into())),
+            Some("Original question?"),
+            "FIRST question wins — the human was asked THIS one"
+        );
+        assert_eq!(
+            fold.deadline_for(&NodeId("review".into())),
+            Some(Some(at(1_000))),
+            "AgentAwaited folds into the SHARED deadlines map, first-wins"
+        );
+    }
+
+    /// The INDEFINITE human agent — `AgentBacking::Human { timeout: None }`, which is a
+    /// real configuration and not a hypothetical (see `AgentBacking` in
+    /// `orchestrator-core::registry`, whose `timeout` is an `Option`). Its `AgentAwaited`
+    /// carries `deadline: None`, and that `None` must be folded as a REAL value: the
+    /// map's KEY answers "has this node begun asking?", which is a different question
+    /// from "by when?".
+    ///
+    /// Guarding the exact bug s1's whole-slice review already found once on the
+    /// `SignalAwaited` arm (I1: the deadline-less arm was an empty `{}`, so the value was
+    /// dropped and the key never appeared). `wait_or_expire` keys `NotYetAsking` off the
+    /// OUTER `Option` of `deadline_for`, so dropping it would make a deadline-less human
+    /// agent look like it had never asked on EVERY drive: it would re-journal
+    /// `AgentAwaited` each time, and a re-ask is not human-bounded. s2 shipped the same
+    /// guard for `GateAwaited` (`a_deadline_less_gate_records_that_it_began_asking`); this
+    /// is its s3 twin, and it reddens under `if deadline.is_some() { … }` on the
+    /// `AgentAwaited` fold arm — a mutation the rest of the workspace does not detect.
+    #[test]
+    fn a_deadline_less_human_agent_records_that_it_began_asking() {
+        let events = vec![(
+            1,
+            JournalEvent::AgentAwaited {
+                node: NodeId("review".into()),
+                deadline: None,
+                prompt: "Ship it?".into(),
+            },
+        )];
+        let (fold, _, _) = fold_journal(&events);
+
+        assert_eq!(
+            fold.deadline_for(&NodeId("review".into())),
+            Some(None),
+            "key PRESENT with value None — began asking, with no deadline"
+        );
+        assert_eq!(
+            fold.prompt_for(&NodeId("review".into())),
+            Some("Ship it?"),
+            "the question is durable even when the SLA is not"
+        );
     }
 
     #[test]

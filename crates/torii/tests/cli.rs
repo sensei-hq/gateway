@@ -544,6 +544,237 @@ fn gate_help_says_attribution_is_not_authentication() {
     }
 }
 
+// ---- SP-6 s3: `torii run agent answer` ------------------------------------------------
+
+/// The subcommand is actually WIRED, not just implemented in the library. Reuses
+/// `help_command_names` for the same reason it exists: `text.contains("agent")` would also
+/// pass on the prose.
+#[test]
+fn run_help_lists_agent() {
+    let out = torii().args(["run", "--help"]).output().expect("runs");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let listed = help_command_names(&text);
+    assert!(
+        listed.iter().any(|c| c == "agent"),
+        "`agent` is not a dispatchable `run` subcommand (found {listed:?}):\n{text}"
+    );
+}
+
+/// The help must describe the surface that SHIPS, not the one that is planned.
+///
+/// **This test is the POSITIVE form of a negative one, flipped by Task 6 exactly as its
+/// predecessor said it should be.** Before the question was rendered, both
+/// `run agent --help` and `run agent answer --help` told an operator that
+/// `torii run list-paused` "shows the question the human was actually asked" — and it did
+/// not: `render::AwaitingNode` was `{node, deadline, options}` and `cmd::run::awaiting_nodes`
+/// never read `AgentAwaited.prompt`. So the assertion was inverted (the help must NOT say
+/// "question") until the behaviour caught up. It now has: `AwaitingNode` carries a
+/// `question`, `awaiting_nodes` folds `AgentAwaited` into it, and `render::awaiting_section`
+/// renders it in the node's own `agent:` row.
+///
+/// **This test pins the HELP side, and only that side.** It inspects `--help` stdout and
+/// has no path to the renderer, so it cannot see whether `list-paused` still shows a
+/// question. An earlier draft of this comment claimed it could ("delete the question from
+/// the listing and this reddens"), which was false and was caught in review — the eighth
+/// instance of the same class of defect this test exists to prevent, now in the doc of the
+/// guard itself. Measured rather than argued: with
+/// `cmd::run::awaiting_nodes`'s `let question = questions.get(&node).cloned();` replaced by
+/// `None` — the question gone from both the table cell and `--json` — the whole `--test cli`
+/// target still passes 26/26.
+///
+/// The renderer side is pinned by the LIB tests in another target, which the same mutation
+/// reddens six of: `cmd::run::tests::list_paused_shows_a_human_agents_question`,
+/// `list_paused_tells_a_human_backed_agent_from_an_await_signal`,
+/// `an_overlong_question_is_capped_so_it_cannot_wreck_the_block`,
+/// `a_secret_shaped_question_is_redacted_in_the_listing`,
+/// `an_ordinary_prose_question_that_wraps_after_bearer_survives` and
+/// `a_control_bisected_secret_in_a_question_is_still_withheld`. Nothing MECHANICALLY couples
+/// the two halves — this file cannot reach `list_paused` (it drives the built binary, and
+/// the listing needs a store and a journal), so the coupling is this comment plus the pair
+/// of test names. If the question is ever dropped from the listing, those six go red and
+/// this one does not; a reviewer following that trail must then delete the help sentence
+/// here too.
+///
+/// It stays a test in both directions all the same, because a CLI help sentence describing
+/// behaviour the command does not have has been the recurring defect of this feature: the
+/// help may not promise the question until the renderer shows one, and — the direction this
+/// assertion covers — may not stop promising it while the renderer does.
+///
+/// The pointer at `list-paused` survives the flip: it is the only way an operator discovers
+/// a node id without reading the graph.
+#[test]
+fn agent_help_names_the_question_list_paused_now_shows() {
+    for args in [
+        vec!["run", "agent", "--help"],
+        vec!["run", "agent", "answer", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("list-paused"),
+            "`{}` must still point at the command that names the waiting nodes — it is the \
+             only way to discover a node id without reading the graph:\n{text}",
+            args.join(" ")
+        );
+        assert!(
+            text.to_lowercase().contains("question"),
+            "`{}` must say that `list-paused` shows the question, because it now does — an \
+             operator who does not know that has no way to learn what they are answering \
+             short of reading the graph and the registry:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
+/// The trust boundary must be on the surface an operator reads when they type the flag.
+/// It matters MORE here than on `run gate`: a gate's actor is an audit trail, whereas this
+/// one is folded into the node's OUTPUT (`{"text","actor"}`) and flows into every
+/// downstream model prompt for the life of the run — so an operator who reads `--as` as
+/// authenticated would be branching real work on an unverified string.
+///
+/// Asserted on BOTH surfaces and with `&&` rather than `||`, exactly as `run gate`'s
+/// equivalent: the group help is what an operator browses, `answer --help` is what they
+/// read when they type the flag, and half the sentence warns nobody.
+#[test]
+fn agent_answer_help_says_attribution_is_not_authentication() {
+    for args in [
+        vec!["run", "agent", "--help"],
+        vec!["run", "agent", "answer", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("attribution") && lower.contains("not authentication"),
+            "`{}` must not let --as read as authenticated:\n{text}",
+            args.join(" ")
+        );
+        // clap's own `[default: ""]` rendering contradicts the sentence above on the very
+        // surface that states the trust boundary — the effective default is $USER, which
+        // `cmd::gate::actor_or_user` resolves, not the empty string clap holds.
+        assert!(
+            !text.contains(r#"[default: ""]"#),
+            "`{}` advertises an empty default that is not what actually happens:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
+/// AC11, and the one sink redaction cannot reach: the process's own argv.
+///
+/// A flag value is read by `ps auxww`, by `/proc/<pid>/cmdline`, by the shell's history
+/// file and by the echo of any CI job that shells out — all of them BEFORE any redaction
+/// runs. s1 shipped `--payload` argv-only and a review caught this; s2 repeated it with
+/// `--note`. An agent's answer is the longest free text of the three and the most likely to
+/// be pasted from elsewhere, so `--text-file` ships with the command rather than after it.
+///
+/// The assertion is on the CHILD's argv, read while it is alive, so it fails if the file's
+/// contents ever get re-expanded onto a command line.
+#[test]
+fn an_answer_file_keeps_the_text_out_of_argv() {
+    let sentinel = format!("SENTINEL{}", "4c8e1a97b3d20f6e");
+    let dir = std::env::temp_dir().join(format!("torii-answer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("answer.txt");
+    std::fs::write(&path, &sentinel).expect("write answer");
+
+    let child = torii()
+        // Never-connectable, so the child lives long enough to be observed but performs no
+        // I/O — the same out-of-u16-range trick `signal_with_payload` uses.
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "agent",
+            "answer",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "reviewer",
+            "--text-file",
+            path.to_str().expect("utf-8 path"),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawns");
+
+    let argv = Command::new("ps")
+        .args(["-o", "args=", "-p", &child.id().to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let out = child.wait_with_output().expect("runs");
+
+    assert!(
+        !argv.contains(&sentinel),
+        "the answer reached the child's command line: {argv}"
+    );
+    // And the flag really did deliver it — otherwise the assertion above is vacuous, which
+    // it demonstrably is on a binary that has no `run agent` at all: clap's "unrecognized
+    // subcommand" also contains no sentinel. So the invocation must be proven to have got
+    // PAST clap and past the file read, all the way to the connection this URL cannot
+    // satisfy. Anything earlier means the argv assertion proved nothing.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("cannot connect"),
+        "the whole invocation must be accepted and the file read — only then does the argv \
+         assertion above mean anything: {combined}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Exactly one source, or the operator does not know which one won.
+#[test]
+fn text_and_text_file_are_mutually_exclusive_and_one_is_required() {
+    let both = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "agent",
+            "answer",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "reviewer",
+            "--text",
+            "ship it",
+            "--text-file",
+            "/nonexistent",
+        ])
+        .output()
+        .expect("runs");
+    let both_err = String::from_utf8_lossy(&both.stderr);
+    assert!(!both.status.success(), "two sources must be refused");
+    assert!(
+        both_err.contains("cannot be used with"),
+        "must be refused AS A CONFLICT, not incidentally: {both_err}"
+    );
+
+    let neither = torii()
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:999999/none")
+        .args([
+            "run",
+            "agent",
+            "answer",
+            "00000000-0000-0000-0000-000000000000",
+            "--node",
+            "reviewer",
+        ])
+        .output()
+        .expect("runs");
+    let neither_err = String::from_utf8_lossy(&neither.stderr);
+    assert!(!neither.status.success(), "no source must be refused");
+    assert!(
+        neither_err.contains("required") && neither_err.contains("text"),
+        "must be refused for the MISSING ANSWER specifically: {neither_err}"
+    );
+}
+
 /// An unreadable file is an operator typo, and must be reported before any connection —
 /// and without echoing whatever was read.
 #[test]

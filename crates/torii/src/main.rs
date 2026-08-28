@@ -171,6 +171,44 @@ enum RunAction {
         #[command(subcommand)]
         action: cmd::gate::GateAction,
     },
+    /// Answer a human-backed `Agent` — a role the registry says a person fills
+    ///
+    /// The third waiting kind. `run signal` delivers arbitrary JSON to an `AwaitSignal`,
+    /// `run gate` picks one of a `HumanGate`'s published options, and this delivers FREE
+    /// TEXT to an `Agent` node whose role is answered by a person instead of a model. Each
+    /// of the three refuses the other two and names the verb that would work.
+    ///
+    /// The answer becomes the node's OUTPUT under the same `text` key a model-backed agent
+    /// produces — so it flows into downstream nodes and model prompts exactly as a model's
+    /// answer would, and a `Branch` reading that key cannot tell the difference.
+    ///
+    /// The node is validated from the JOURNAL — the `AgentAwaited` this node published is
+    /// the whole evidence a human was asked anything, so an answer to a node that never
+    /// asked is refused before anything is written. `torii run list-paused` lists the nodes
+    /// that are waiting AND the question each one asked, which is how you discover both
+    /// without reading the graph.
+    //
+    // That sentence was deliberately weaker until the listing caught up: an earlier draft
+    // promised the question at a time when `render::AwaitingNode` was `{node, deadline,
+    // options}` and `cmd::run::awaiting_nodes` never read `AgentAwaited.prompt`. It is
+    // accurate now — the field, the fold and the `agent:` cell all exist — and
+    // `cli.rs`'s `agent_help_names_the_question_list_paused_now_shows` is the guard that
+    // keeps the two from drifting apart in either direction.
+    ///
+    /// `--as` records WHO answered. It is ATTRIBUTION, NOT AUTHENTICATION: it is whatever
+    /// string you supply (defaulting to $USER), so it answers "who claimed to answer".
+    /// Anyone who can reach the database can write any actor — and unlike `run gate`'s,
+    /// this one is folded into the node's OUTPUT and travels with it.
+    ///
+    /// AN ANSWER IS NOT A CREDENTIAL CHANNEL — the credential broker is. Secret-shaped text
+    /// is redacted before it is journaled, but that is a best-effort scrub by shape.
+    Agent {
+        // The enum lives in the LIBRARY (`cmd::human`), not here: this binary has no test
+        // module, so anything that sits in it is asserted by nothing at any layer — the
+        // lesson `cmd::gate::GateAction` records.
+        #[command(subcommand)]
+        action: cmd::human::AgentAction,
+    },
     /// Cancel a non-terminal run so it is never woken
     Cancel { run_id: String },
     /// Queue a paused run for the next worker tick
@@ -422,6 +460,33 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                     &d0.option,
                     &actor,
                     d0.note.as_deref(),
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+            RunAction::Agent { action } => {
+                // The `--text`/`--text-file` sourcing lives in the LIBRARY
+                // (`cmd::human::answer_args`) rather than inline here, so the file read —
+                // the half with a failure mode and a disclosure rule — is testable at all.
+                let a = cmd::human::answer_args(action)?;
+                // Parse BEFORE connecting, same as `status`, `signal` and `gate`: an invalid
+                // run id is the likeliest operator typo and sqlx would otherwise retry a
+                // refused connection for the whole pool-acquire timeout first.
+                let run = parse_run_id(&a.run_id)?;
+                // `cmd::gate`'s resolver, not a second `$USER` fallback: one definition of
+                // "who answered" across both human-facing verbs.
+                let actor = cmd::gate::actor_or_user(&a.actor);
+                // LIGHT tier: answering needs the scheduler store and the journal, nothing
+                // else. An operator must be able to answer a waiting run from a box with no
+                // gateway config and no model credentials.
+                let d = boot::light(&env).await?;
+                cmd::human::answer(
+                    d.scheduler_store.as_ref(),
+                    d.journal.as_ref(),
+                    run,
+                    orchestrator_core::NodeId(a.node),
+                    &a.text,
+                    &actor,
                     chrono::Utc::now(),
                 )
                 .await

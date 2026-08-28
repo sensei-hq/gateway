@@ -13,6 +13,26 @@ use crate::error::OrchestratorError;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AgentRef(pub String);
 
+/// What answers an agent: a model, or a person.
+///
+/// SP-6 s3. `Model` is the serde default, so every existing `AgentDefinition`,
+/// every `config_agents` jsonb row and every registry fixture deserializes
+/// unchanged — the same additivity discipline s1 and s2 used for their journal
+/// events.
+///
+/// The timeout lives HERE rather than on `NodeKind::Agent` so the role and its SLA
+/// travel together ("legal-reviewer always has 48h") and the graph never changes —
+/// which is what makes a human-backed role substitutable at the `AgentRef`. The
+/// cost, stated: one SLA per role, not per use site.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum AgentBacking {
+    #[default]
+    Model,
+    Human {
+        timeout: Option<chrono::Duration>,
+    },
+}
+
 /// An agent: role→chain, its skills/tools (by name), and its system-prompt body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDefinition {
@@ -33,6 +53,10 @@ pub struct AgentDefinition {
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub system_prompt: String,
+    /// SP-6 s3: who answers. `#[serde(default)]` ⇒ absent means `Model`, so no
+    /// existing config changes.
+    #[serde(default)]
+    pub backed_by: AgentBacking,
 }
 
 /// A skill: an injectable instruction module composed into a prompt by name.
@@ -443,10 +467,29 @@ impl Registry {
         Ok(reg)
     }
 
-    /// Fail loud on *structural* unresolvability only: any agent that references
-    /// a skill/tool the registry doesn't hold, or an unroutable chain. Grants are
-    /// NOT checked here — a grant narrower than a tool's declared permission
-    /// surface is legal and is enforced per-call at runtime (ceiling model, SP-4 s1).
+    /// Fail loud at config-LOAD time on two classes of bad config.
+    ///
+    /// **Structural unresolvability** — an agent references a skill or tool the
+    /// registry doesn't hold, or (model-backed only) has no routable chain.
+    ///
+    /// **Human-backing coherence (SP-6 s3)** — a `backed_by: Human` agent may not
+    /// declare tools or grants (it answers once; the ReAct loop that would use them
+    /// never runs), must have a non-empty `system_prompt` (the prompt IS the question
+    /// put to the person), and its timeout must be positive and no longer than
+    /// `MAX_AWAIT_SIGNAL_TIMEOUT`. These are semantic, not resolvability: they reject
+    /// a config that states something untrue about the agent rather than one that
+    /// cannot be wired up.
+    ///
+    /// **The deliberate skip, which is the load-bearing behaviour here:** the
+    /// chain-resolvability rule does NOT apply to a human-backed agent. It resolves no
+    /// chain by construction, and this runs independently of the executor's runtime
+    /// short-circuit, so an unconditional rule would reject essentially every
+    /// human-backed agent before any node ever ran.
+    ///
+    /// Grants are otherwise NOT checked — a grant narrower than a tool's declared
+    /// permission surface is legal and is enforced per-call at runtime (ceiling model,
+    /// SP-4 s1). The human-backing rule above rejects grants only because a
+    /// human-backed agent can have no tool for them to apply to.
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         for agent in self.agents.values() {
             for skill in &agent.skills {
@@ -465,10 +508,91 @@ impl Registry {
                     });
                 }
             }
-            if agent.chain.is_none() && self.chain_binding(&agent.area, &agent.kind).is_none() {
+            // A bool, not a binding: the chain rule below needs only "is this human?",
+            // and its condition reads better negated than as a match arm. The rules
+            // that follow bind the timeout instead (see below).
+            let human = matches!(agent.backed_by, AgentBacking::Human { .. });
+
+            // SP-6 s3: a human-backed role resolves NO chain by construction, so the
+            // chain-resolvability rule must not apply to it. This check runs at config
+            // LOAD time, independent of `drive_agent`'s runtime short-circuit, so leaving
+            // it unconditional would reject essentially every human-backed agent before
+            // any node ever executed. Forcing an author to supply a dummy binding that is
+            // never used would be a lie in the config.
+            if !human
+                && agent.chain.is_none()
+                && self.chain_binding(&agent.area, &agent.kind).is_none()
+            {
                 return Err(OrchestratorError::UnknownChainRef {
                     agent: agent.name.clone(),
                 });
+            }
+
+            // Binds `timeout` in the same step that selects the human arm. This used to
+            // be `if human { … if let AgentBacking::Human { timeout: Some(t) } = … }`,
+            // an inner match that could never fail — two matches on one value, where
+            // the second only looked conditional.
+            if let AgentBacking::Human { timeout } = &agent.backed_by {
+                // The ReAct loop that would use these never runs, so a tool here is
+                // never reachable — the confused-deputy shape SP-4 s1 argues against.
+                // Reject the config rather than silently ignore the declaration.
+                if !agent.tools.is_empty() {
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {:?} is human-backed and may not declare tools ({:?}); a \
+                         human-backed agent answers once and never runs the tool loop",
+                        agent.name, agent.tools
+                    )));
+                }
+                // Grants are checked SEPARATELY from tools, not folded into the check
+                // above: `grants.json` is its own authoring surface (an operator can add
+                // a grant without ever touching the agent's `tools:` line), so a
+                // tools-only check would accept "this human may read files" and silently
+                // ignore it — exactly what the rule above refuses to do. There is no
+                // privilege hole either way (SP-4 s1 authorizes on `tool ∈ agent.tools`
+                // AND the grant, so a grant alone can never widen anything); this rejects
+                // the config because it states something untrue about the agent.
+                if !agent.grants.is_empty() {
+                    let mut named: Vec<&str> = agent.grants.keys().map(String::as_str).collect();
+                    named.sort_unstable(); // HashMap order varies; the message must not.
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {:?} is human-backed and may not declare tool grants ({}); a \
+                         human-backed agent answers once and never runs the tool loop, so a \
+                         grant here grants nothing",
+                        agent.name,
+                        named.join(", ")
+                    )));
+                }
+                // The prompt IS the question put to the human.
+                if agent.system_prompt.trim().is_empty() {
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {:?} is human-backed and has an empty system_prompt; the \
+                         prompt is the question, so an empty one asks the human nothing",
+                        agent.name
+                    )));
+                }
+                // `MAX_AWAIT_SIGNAL_TIMEOUT` bounds the sibling waiting kinds in
+                // `Graph::validate_dag`, which is pure over the graph and never sees the
+                // registry — so the same bound is applied here. Without it the overflow is
+                // caught only at runtime by `wait_or_expire`'s `checked_add_signed` (which
+                // fails the node rather than panicking, so it degrades safely), but both
+                // sibling slices treated the up-front bound as worth naming.
+                if let Some(t) = timeout {
+                    if *t <= chrono::Duration::zero() {
+                        return Err(OrchestratorError::RegistryLoad(format!(
+                            "agent {:?} has a non-positive timeout ({t}); use `None` to \
+                             wait indefinitely",
+                            agent.name
+                        )));
+                    }
+                    if *t > crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT {
+                        return Err(OrchestratorError::RegistryLoad(format!(
+                            "agent {:?} has a timeout ({t}) that is too long; the maximum \
+                             is {}; use `None` to wait indefinitely",
+                            agent.name,
+                            crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -650,8 +774,130 @@ fn optional_pairs(
     Ok(out)
 }
 
+/// Parse `<positive integer><unit>` (`30s`, `90m`, `48h`, `7d`) — the frontmatter
+/// spelling of a human-backed agent's SLA.
+///
+/// Deliberately narrow. A bare number is ambiguous (48 what?) and an unknown unit is
+/// a typo, so both are loud rather than guessed; a compound (`1h30m`) and a fraction
+/// (`1.5h`) are rejected too, because accepting them invites a whole duration grammar
+/// into a loader whose entire premise is a *controlled* subset.
+///
+/// Purely SYNTACTIC: it does not judge whether the duration is sane. The semantic
+/// bounds — positive, and no longer than `MAX_AWAIT_SIGNAL_TIMEOUT` — belong to
+/// [`Registry::validate`], which is the one place they can also catch a definition
+/// that arrived as a jsonb row from Postgres rather than from an md file. Duplicating
+/// them here would let the two copies drift.
+///
+/// **"Loud" has to mean `Err` on EVERY input, including the ones that never reach this
+/// function's own checks.** Two classes used to panic instead, and both are reachable from
+/// an operator's `agents/*.md` through `FilesystemConfigSource::load` — i.e. from
+/// `torii config diff` / `torii config push`, where a panic aborts the CLI with a raw
+/// backtrace (exit 101) rather than the guided message below:
+///
+/// - The unit was split off with `text.split_at(text.len() - 1)`, a BYTE index.
+///   `str::split_at` requires a char boundary, so `timeout: 48ℏ` panicked inside
+///   `core::str` before the digit check ran. Split on CHARACTERS instead — `char_indices`
+///   gives the byte offset of the last char, which is a boundary by construction.
+/// - `chrono::Duration::{seconds,minutes,hours,days}` PANIC past `TimeDelta`'s range, and
+///   the digit check does not bound magnitude: `999999999999999d` is ASCII, parses as an
+///   `i64`, and then blew up in `chrono`. The `try_*` constructors return `None` there, so
+///   the overflow becomes the same loud error as a typo. `validate`'s century bound cannot
+///   substitute — it runs long after this function has already unwound — and a `u64`/`u128`
+///   digit type would not help either, since the panic is about the SCALED total.
+///
+/// Guarded by `agent_from_frontmatter_rejects_an_unparsable_timeout`, whose table carries
+/// a case for each class.
+fn parse_fm_duration(text: &str) -> Result<chrono::Duration, OrchestratorError> {
+    let loud = || {
+        OrchestratorError::FrontmatterParse(format!(
+            "timeout {text:?} is not a duration; use <number><unit> with unit s|m|h|d, \
+             e.g. `timeout: 48h`, or omit the key to wait indefinitely"
+        ))
+    };
+    // The byte offset of the LAST character, which `char_indices` guarantees is a char
+    // boundary — so neither of these two slices can panic, whatever the input's encoding.
+    let Some((split, _)) = text.char_indices().next_back() else {
+        return Err(loud());
+    };
+    let (digits, unit) = (&text[..split], &text[split..]);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(loud());
+    }
+    let n: i64 = digits.parse().map_err(|_| loud())?;
+    // `try_*`, never the infallible constructors: an in-range `i64` count of days is still
+    // an out-of-range `TimeDelta`, and the infallible form's answer to that is a panic.
+    match unit {
+        "s" => chrono::Duration::try_seconds(n),
+        "m" => chrono::Duration::try_minutes(n),
+        "h" => chrono::Duration::try_hours(n),
+        "d" => chrono::Duration::try_days(n),
+        _ => None,
+    }
+    .ok_or_else(loud)
+}
+
+/// Parse the `backed_by` + `timeout` pair (SP-6 s3).
+///
+/// Absent `backed_by` ⇒ `Model`, so every agent md written before s3 parses
+/// byte-identically. An unrecognised value is LOUD rather than defaulting to `Model`:
+/// silently reading `backed_by: huamn` as a model would produce a config that looks
+/// like a person is in the loop while the run quietly spends tokens on a model — the
+/// same failure shape `SkillDef`'s scalar-`activate_on` rejection guards against.
+///
+/// A `timeout` without `backed_by: human` is loud for the same reason: it is inert on
+/// a model agent, and accepting it would let an author believe they had set an SLA.
+fn parse_backing(map: &HashMap<String, FmValue>) -> Result<AgentBacking, OrchestratorError> {
+    // `optional_scalar` maps an empty or list-valued key to `None`, which here would
+    // silently drop `timeout: []` or `timeout:` on the floor — an SLA the author
+    // believes they set. Match the raw entry so every present-but-unusable spelling
+    // is loud instead.
+    let timeout = match map.get("timeout") {
+        None => None,
+        Some(FmValue::Scalar(t)) if !t.is_empty() => Some(parse_fm_duration(t)?),
+        Some(_) => {
+            return Err(OrchestratorError::FrontmatterParse(
+                "timeout must be a scalar <number><unit>, e.g. `timeout: 48h`; omit the \
+                 key to wait indefinitely"
+                    .into(),
+            ));
+        }
+    };
+    match map.get("backed_by") {
+        None => match timeout {
+            None => Ok(AgentBacking::Model),
+            Some(_) => Err(OrchestratorError::FrontmatterParse(
+                "timeout is only meaningful with `backed_by: human`; a model-backed \
+                 agent has no SLA to wait on"
+                    .into(),
+            )),
+        },
+        Some(FmValue::Scalar(v)) if v == "model" => match timeout {
+            None => Ok(AgentBacking::Model),
+            Some(_) => Err(OrchestratorError::FrontmatterParse(
+                "timeout is only meaningful with `backed_by: human`; a model-backed \
+                 agent has no SLA to wait on"
+                    .into(),
+            )),
+        },
+        Some(FmValue::Scalar(v)) if v == "human" => Ok(AgentBacking::Human { timeout }),
+        Some(FmValue::Scalar(v)) => Err(OrchestratorError::FrontmatterParse(format!(
+            "backed_by must be `model` or `human`, got {v:?}"
+        ))),
+        Some(FmValue::List(_)) => Err(OrchestratorError::FrontmatterParse(
+            "backed_by must be a scalar `model` or `human`, not a list".into(),
+        )),
+    }
+}
+
 impl AgentDefinition {
     /// Parse an agent from the md+frontmatter subset.
+    ///
+    /// This loader is the only producer of an `incoming` config for `torii config
+    /// push`, and push is replace-all — so `backed_by`/`timeout` have to be
+    /// expressible HERE or a human-backed agent could not be authored at all, and a
+    /// human-backed row already in Postgres would be silently rewritten to `Model` by
+    /// the next push (the diff is over `AgentDefinition`, so the operator would see
+    /// only `changed: agent <name>`).
     pub fn from_frontmatter(input: &str) -> Result<Self, OrchestratorError> {
         let (fm, body) = split_frontmatter(input)?;
         let f = parse_fields(fm)?;
@@ -665,6 +911,7 @@ impl AgentDefinition {
             tools: optional_list(&f, "tools"),
             skills: optional_list(&f, "skills"),
             system_prompt: body.to_string(),
+            backed_by: parse_backing(&f)?,
         })
     }
 }
@@ -728,6 +975,209 @@ mod tests {
         let a = AgentDefinition::from_frontmatter(md).expect("parses");
         assert!(a.tools.is_empty());
         assert!(a.skills.is_empty());
+    }
+
+    /// SP-6 s3. The md+frontmatter loader is the ONLY producer of an `incoming`
+    /// config for `torii config push`, and push is replace-all, so without a
+    /// `backed_by` key two things were true: the spec's headline claim (swap a model
+    /// reviewer for a person *by editing config*) was unreachable, and a human-backed
+    /// row already in Postgres was silently downgraded to `Model` by the next push —
+    /// the operator seeing only `changed: agent <name>`, never that the backing
+    /// flipped and the run would now spend tokens instead of asking a person.
+    #[test]
+    fn agent_from_frontmatter_parses_human_backing_with_a_timeout() {
+        let md = "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\ntimeout: 48h\n---\nDoes this contract permit sub-processing?\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(
+            a.backed_by,
+            AgentBacking::Human {
+                timeout: Some(chrono::Duration::hours(48))
+            }
+        );
+        // A human-backed agent needs no `chain:` — `validate` skips that rule for it.
+        assert_eq!(a.chain, None);
+    }
+
+    /// No timeout means "wait indefinitely" (the `None` arm), not "no SLA field".
+    #[test]
+    fn agent_from_frontmatter_human_backing_without_a_timeout_waits_indefinitely() {
+        let md = "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\n---\nAsk.\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(a.backed_by, AgentBacking::Human { timeout: None });
+    }
+
+    /// Absent, or an explicit `model`, is `Model` — every existing agent md is
+    /// byte-identical through this loader.
+    #[test]
+    fn agent_from_frontmatter_defaults_to_model_backing() {
+        let a = AgentDefinition::from_frontmatter(AGENT_MD).expect("parses");
+        assert_eq!(a.backed_by, AgentBacking::Model);
+        let md = "---\nname: n\narea: a\nkind: k\nchain: c\nbacked_by: model\n---\nb\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(a.backed_by, AgentBacking::Model);
+    }
+
+    /// A typo must NOT silently mean `Model`. That is the same failure shape
+    /// `activate_on` guards against: a config that reads as if a person answers,
+    /// which quietly spends tokens on a model instead.
+    #[test]
+    fn agent_from_frontmatter_rejects_an_unknown_backed_by() {
+        for bad in ["huamn", "Human ", "person", ""] {
+            let md =
+                format!("---\nname: n\narea: a\nkind: k\nchain: c\nbacked_by: {bad}\n---\nb\n");
+            let e = AgentDefinition::from_frontmatter(&md)
+                .expect_err(&format!("backed_by: {bad:?} must be loud"));
+            let m = format!("{e}");
+            assert!(m.contains("backed_by"), "must name the key: {m}");
+        }
+    }
+
+    /// A timeout on a model-backed agent is inert. Accepting it would let an author
+    /// write `timeout: 48h` and believe a human is in the loop when none is.
+    #[test]
+    fn agent_from_frontmatter_rejects_a_timeout_without_human_backing() {
+        let md = "---\nname: n\narea: a\nkind: k\nchain: c\ntimeout: 48h\n---\nb\n";
+        let e = AgentDefinition::from_frontmatter(md).expect_err("timeout without human backing");
+        let m = format!("{e}");
+        assert!(m.contains("timeout"), "must name the key: {m}");
+        assert!(m.contains("backed_by"), "must name the fix: {m}");
+    }
+
+    /// A bare number is ambiguous (48 what?) and an unknown unit is a typo; both are
+    /// loud rather than guessed. Bounds (positive, <= the century cap) belong to
+    /// `validate`, so this parser is purely syntactic.
+    ///
+    /// **"Loud" means `Err`, and it has to be asserted against a PANIC, not only against
+    /// a wrong `Ok`.** The whole-slice review found `parse_fm_duration` panicking on two
+    /// classes of input while this table — every case of which was ASCII, short and
+    /// well-formed apart from its unit — stayed green, so the property the test names was
+    /// not the property it tested:
+    ///
+    /// - `48ℏ` / `48é` / `48ч`: the parser split the unit off with
+    ///   `text.split_at(text.len() - 1)`, a BYTE index. `str::split_at` requires a char
+    ///   boundary, so any multi-byte final character panicked inside `core::str` before a
+    ///   single one of this function's own checks ran. (A trailing NON-BREAKING SPACE does
+    ///   NOT reach it — `parse_fields` trims Unicode whitespace first — so the trigger is
+    ///   specifically a multi-byte, non-whitespace final char.)
+    /// - `999999999999999d` / `99999999999999999s`: the digits are ASCII and parse as an
+    ///   `i64` just fine, and then `chrono::Duration::days`/`seconds` PANIC on a magnitude
+    ///   past `TimeDelta`'s range. `Registry::validate`'s century bound cannot help; it
+    ///   runs long after this function has already unwound.
+    ///
+    /// It is not a theoretical reachability argument: both classes arrive through
+    /// `FilesystemConfigSource::load`, i.e. `torii config diff` / `torii config push`
+    /// reading an operator's `agents/*.md`, and a panic there aborts the CLI with a raw
+    /// backtrace (exit 101) instead of the guided parse error this function exists to
+    /// produce.
+    ///
+    /// The empty and list-valued cases below guard `parse_backing`'s own `timeout` arm
+    /// rather than `parse_fm_duration`: `optional_scalar` maps both to `None`, so an arm
+    /// that used it would read `timeout:` (blank) as "no SLA" and silently drop an SLA the
+    /// author believes they set — after which the node pauses with `resume_after: None`, a
+    /// NULL `next_wake`, and the SP-DATA-3 scheduler never auto-wakes it. Review mutated
+    /// that arm to do exactly that and the whole workspace stayed green.
+    #[test]
+    fn agent_from_frontmatter_rejects_an_unparsable_timeout() {
+        for bad in [
+            "48",
+            "48x",
+            "h",
+            "-1h",
+            "1.5h",
+            "48 h",
+            "1h30m",
+            // Multi-byte final character — a byte-index split panics here.
+            "48\u{210F}",
+            "48é",
+            "48ч",
+            // Past `chrono::TimeDelta`'s range — the infallible constructors panic here.
+            "999999999999999d",
+            "99999999999999999s",
+            "9999999999999999999999h",
+            // `parse_backing`'s arm: present but unusable spellings of the key.
+            "",
+            "[]",
+            "[48h]",
+        ] {
+            let md = format!(
+                "---\nname: n\narea: a\nkind: k\nbacked_by: human\ntimeout: {bad}\n---\nb\n"
+            );
+            let e = AgentDefinition::from_frontmatter(&md)
+                .expect_err(&format!("timeout: {bad:?} must be loud"));
+            assert!(format!("{e}").contains("timeout"), "{e}");
+        }
+    }
+
+    /// Every unit the parser accepts, so a change to the unit table is caught.
+    #[test]
+    fn agent_from_frontmatter_timeout_units() {
+        let cases = [
+            ("30s", chrono::Duration::seconds(30)),
+            ("90m", chrono::Duration::minutes(90)),
+            ("48h", chrono::Duration::hours(48)),
+            ("7d", chrono::Duration::days(7)),
+        ];
+        for (text, want) in cases {
+            let md = format!(
+                "---\nname: n\narea: a\nkind: k\nbacked_by: human\ntimeout: {text}\n---\nb\n"
+            );
+            let a = AgentDefinition::from_frontmatter(&md).expect("parses");
+            assert_eq!(
+                a.backed_by,
+                AgentBacking::Human {
+                    timeout: Some(want)
+                },
+                "{text}"
+            );
+        }
+    }
+
+    /// The OTHER surface a definition arrives on: a `config_agents` jsonb row.
+    /// `AgentBacking`'s doc claims two things that nothing exercised — that an
+    /// existing row with no `backed_by` key still deserializes (to `Model`), and that
+    /// a human backing is durable. The second matters for `torii config push`: push
+    /// stores what it loaded, so a backing that did not survive serde would be
+    /// downgraded on the round trip exactly as the missing frontmatter key used to
+    /// downgrade it.
+    #[test]
+    fn agent_backing_is_serde_defaulted_and_round_trips() {
+        // A pre-s3 row: no `backed_by` key at all.
+        let row = serde_json::json!({
+            "name": "researcher", "area": "research", "kind": "reasoning",
+            "chain": "c", "tools": [], "skills": [], "system_prompt": "b"
+        });
+        let a: AgentDefinition = serde_json::from_value(row).expect("a pre-s3 row still loads");
+        assert_eq!(a.backed_by, AgentBacking::Model);
+
+        for backing in [
+            AgentBacking::Model,
+            AgentBacking::Human { timeout: None },
+            AgentBacking::Human {
+                timeout: Some(chrono::Duration::hours(48)),
+            },
+        ] {
+            let json = serde_json::to_string(&backing).expect("serializes");
+            let back: AgentBacking = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(backing, back, "round trip via {json}");
+        }
+    }
+
+    /// The loader and `validate` compose: an authored human agent assembles into a
+    /// registry with no chain binding, which is the whole point of the skip.
+    #[test]
+    fn an_authored_human_agent_assembles_into_a_valid_registry() {
+        let md = "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\ntimeout: 48h\n---\nDoes this contract permit sub-processing?\n";
+        let cfg = RegistryConfig {
+            agents: vec![AgentDefinition::from_frontmatter(md).expect("parses")],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
+        let reg = Registry::from_config(cfg).expect("a human-backed agent needs no chain");
+        assert!(matches!(
+            reg.agent("reviewer").map(|a| &a.backed_by),
+            Some(AgentBacking::Human { timeout: Some(_) })
+        ));
     }
 
     #[test]
@@ -933,6 +1383,7 @@ mod tests {
             tools: vec![],
             skills: vec![],
             system_prompt: "SYS".into(),
+            backed_by: AgentBacking::Model,
         }
     }
 
@@ -1501,6 +1952,7 @@ mod tests {
                 tools: vec!["missing".into()],
                 skills: vec![],
                 system_prompt: "s".into(),
+                backed_by: AgentBacking::Model,
             }],
             skills: vec![],
             tools: vec![],
@@ -1672,6 +2124,154 @@ mod tests {
         assert!(
             matches!(err, Err(OrchestratorError::RegistryLoad(_))),
             "a failing source must yield Err, never a half-built handle"
+        );
+    }
+
+    fn human_agent(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_string(),
+            area: "review".into(),
+            kind: "human".into(),
+            chain: None,
+            chains: HashMap::new(),
+            grants: HashMap::new(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: "Does this contract permit sub-processing?".into(),
+            backed_by: AgentBacking::Human { timeout: None },
+        }
+    }
+
+    /// The fixture registry HOLDS `fs_read`. That is load-bearing, not decoration:
+    /// with an empty tool table the pre-existing `UnknownToolRef` check fires FIRST
+    /// for any agent that names a tool, and its message ("agent \"reviewer\"
+    /// references unknown tool \"fs_read\"") happens to satisfy loose assertions on
+    /// the human-backing rules — a review proved the tools-on-a-human-agent rule
+    /// could be deleted outright with every test still green. Registering the tool
+    /// removes the masking check so the rule under test is the one that fires.
+    fn registry_of(agents: Vec<AgentDefinition>) -> Registry {
+        let mut r = Registry::default().with_tool(tool_spec("fs_read"));
+        for a in agents {
+            r.agents.insert(a.name.clone(), a);
+        }
+        r
+    }
+
+    /// A human-backed role has NO chain by construction, so `validate`'s
+    /// chain-resolvability rule must not apply to it. That rule runs at config-LOAD
+    /// time, independent of the executor's runtime short-circuit, so leaving it
+    /// unconditional would reject essentially every human-backed agent before any
+    /// node ever ran.
+    #[test]
+    fn a_human_backed_agent_needs_no_chain() {
+        registry_of(vec![human_agent("reviewer")])
+            .validate()
+            .expect("a human-backed agent resolves no chain and must not need one");
+    }
+
+    /// A model-backed agent still does — the skip is narrow, not a hole.
+    #[test]
+    fn a_model_backed_agent_still_needs_a_chain() {
+        let mut a = human_agent("modelled");
+        a.backed_by = AgentBacking::Model;
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("no chain, no binding");
+        assert!(format!("{e}").contains("modelled"), "{e}");
+    }
+
+    /// Tools on a human-backed agent are never consulted — the loop that would use
+    /// them never runs. A grant that grants nothing is the confused-deputy shape
+    /// SP-4 s1 argues against, so reject the config rather than ignore it.
+    #[test]
+    fn a_human_backed_agent_may_not_declare_tools() {
+        let mut a = human_agent("reviewer");
+        a.tools = vec!["fs_read".into()];
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("tools on a human agent");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        // Substrings UNIQUE to this rule. `contains("tool")` alone was satisfied by
+        // `UnknownToolRef`, which is why this test used to pass with the rule deleted.
+        assert!(m.contains("human-backed"), "must name the backing: {m}");
+        assert!(
+            m.contains("never runs the tool loop"),
+            "must name the reason: {m}"
+        );
+    }
+
+    /// A grant is inert without a tool — SP-4 s1 authorizes on `tool ∈ agent.tools`
+    /// AND `grants[tool].covers(…)`, so a grant alone can never widen anything. It is
+    /// still a lie in the config (it says a human may read files), and `grants.json`
+    /// is a SEPARATE authoring surface from the agent md, so it is reachable without
+    /// ever writing `tools:`. Reject it for the same reason the tools rule exists:
+    /// refuse the declaration rather than silently ignore it.
+    #[test]
+    fn a_human_backed_agent_may_not_declare_grants() {
+        let mut a = human_agent("reviewer");
+        a.grants.insert("fs_read".into(), Permissions::default());
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("grants on a human agent");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(m.contains("human-backed"), "must name the backing: {m}");
+        assert!(m.contains("grant"), "must name the rule: {m}");
+        assert!(m.contains("fs_read"), "must name the offending grant: {m}");
+    }
+
+    /// The prompt IS the question. An empty one asks a human nothing.
+    #[test]
+    fn a_human_backed_agent_needs_a_system_prompt() {
+        let mut a = human_agent("reviewer");
+        a.system_prompt = String::new();
+        let e = registry_of(vec![a]).validate().expect_err("empty prompt");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        // Rule-specific: every message in the human block interpolates the name, so
+        // the name alone cannot tell which of the four rules fired.
+        assert!(m.contains("empty system_prompt"), "must name the rule: {m}");
+
+        // Whitespace-only is empty too — the `.trim()` is the only thing rejecting
+        // this, and without this case the trim could be dropped silently.
+        let mut a = human_agent("reviewer");
+        a.system_prompt = "   \n\t ".into();
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("whitespace-only prompt");
+        assert!(
+            format!("{e}").contains("empty system_prompt"),
+            "a whitespace-only prompt asks nothing either: {e}"
+        );
+    }
+
+    /// `MAX_AWAIT_SIGNAL_TIMEOUT` bounds the sibling kinds in `Graph::validate_dag`,
+    /// which is pure over the graph and never sees the registry — so the same bound
+    /// has to be applied here instead.
+    #[test]
+    fn a_human_backed_timeout_obeys_the_century_bound() {
+        let ok = |t| {
+            let mut a = human_agent("reviewer");
+            a.backed_by = AgentBacking::Human { timeout: Some(t) };
+            registry_of(vec![a]).validate()
+        };
+        ok(chrono::Duration::hours(48)).expect("48h SLA");
+        ok(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT).expect("exactly the bound");
+        // Each branch asserts a substring unique to ITSELF: the agent name appears in
+        // all four human-block messages, so naming it proves only that *some* rule
+        // fired, not which — and not that the two bounds are wired the right way round.
+        let e = ok(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT + chrono::Duration::days(1))
+            .expect_err("over the bound");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(m.contains("too long"), "must be the upper-bound rule: {m}");
+        let e = ok(chrono::Duration::zero()).expect_err("non-positive");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(
+            m.contains("non-positive"),
+            "must be the lower-bound rule: {m}"
         );
     }
 }

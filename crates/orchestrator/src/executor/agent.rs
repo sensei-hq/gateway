@@ -10,12 +10,13 @@ use orchestrator_core::{
     ObservationMeta, OrchestratorError, ReconcileOutcome, RunId, effect_id, idempotency_key,
 };
 
+use super::human::HumanQuestion;
 use super::support::{
     GatewayDisposition, agent_input_hash, build_chat_request, classify_gateway_error,
     est_prompt_tokens, render_input, tool_input_hash,
 };
 use super::{AgentStep, Executor, Fold};
-use crate::agent::prompt::{assemble_prompt, over_budget};
+use crate::agent::prompt::{assemble_prompt_parts, over_budget, render_context_section};
 
 /// The 3-way outcome of one tool effect (or one ReAct turn's tools, §7.3): a
 /// value/transcript, a node failure (already journaled `NodeFailed`), or a durable
@@ -53,8 +54,18 @@ impl Executor {
     /// turns/tools replay from the journal with no gateway call and no
     /// re-execution (resume without re-spend); an input-hash mismatch halts with
     /// `DeterminismViolation`.
-    // The per-invocation inputs (run/node/agent/input/context/fold/phase) are each
-    // distinct and passed positionally at four call sites; bundling them behind a
+    ///
+    /// `top_level` says whether this call is a `NodeKind::Agent` in the RUN's OWN graph, as
+    /// opposed to a `Map`/`Consolidate`/`Loop` body, a Loop gate-agent, an `Expand` planner,
+    /// or an `Agent` node nested inside a `Subgraph`/`Branch` arm/`Expand`. It exists ONLY
+    /// for SP-6 s3's human-backed roles, which are legal at that one position and nowhere
+    /// else; see the branch below.
+    ///
+    /// Only `run_node` can pass `true`, and it passes `!nested` — `drive`'s position flag,
+    /// cleared by `drive_nested` — never a literal. Deciding this on the CALLER instead was
+    /// a real, shipped bypass; the branch below records what it cost.
+    // The per-invocation inputs (run/node/agent/input/context/fold/phase/top_level) are
+    // each distinct and passed positionally at six call sites; bundling them behind a
     // struct would only relocate the plumbing, so the arity is allowed here.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn drive_agent(
@@ -66,13 +77,136 @@ impl Executor {
         context: &[(ContextKey, serde_json::Value)],
         fold: &Fold,
         phase: Option<&str>,
+        top_level: bool,
     ) -> Result<AgentStep, OrchestratorError> {
         let agent: &AgentDefinition = self
             .registry
             .agent(&agent_ref.0)
             .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
         let query = render_input(input);
-        let (system, tools) = assemble_prompt(&self.registry, agent, context, &query)?;
+        // `assemble_prompt_parts`, not `assemble_prompt`: the human path needs the two
+        // halves SEPARATE (author-controlled vs. run data — see `HumanQuestion`), and the
+        // model path re-joins them one line below, exactly as `assemble_prompt` does. Every
+        // activation and unknown-ref rule still lives in `assemble_prompt_parts` alone, so
+        // the two paths cannot drift on what "the agent's prompt" means.
+        let parts = assemble_prompt_parts(&self.registry, agent, context, &query)?;
+
+        // SP-6 s3: a human-backed role answers instead of a model. The branch sits HERE —
+        // AFTER prompt assembly, which needs no chain, so the human's question reuses the
+        // model path's own prompt assembly rather than a second implementation that could
+        // drift from it; and BEFORE `resolve_chain`, so no chain is resolved, no gateway is
+        // touched and zero token spend is STRUCTURAL rather than measured. (The assembled
+        // prompt is not the WHOLE question — see `HumanQuestion::compose`, which adds the
+        // node input and bounds the context section.)
+        //
+        // `on_agent_started` does NOT fire on this path, deliberately: the hook's
+        // signature requires `&ar.chain`, and a human-backed agent by construction never
+        // has one. `resolve_chain` would in fact FAIL for the common shape of such a role
+        // (`chain: None` with no `(area, kind)` binding), which is why the branch cannot
+        // simply sit lower down and skip the call.
+        if let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by {
+            // `AgentStep` has no `From<NodeExec>` conversion, so the mapping is written
+            // inline — the same three-arm mapping `run_node` applies to this function's
+            // result, in the other direction. `NodeExec::Failed.output` is `None` on every
+            // path `run_human_agent`/`fail_human_agent` can return, so nothing is dropped.
+            let step = |exec: super::NodeExec| match exec {
+                super::NodeExec::Completed(output) => AgentStep::Completed(output),
+                super::NodeExec::Failed { message, .. } => AgentStep::Failed(message),
+                super::NodeExec::Paused { reason } => AgentStep::Paused(reason),
+            };
+
+            if !top_level {
+                // Design §5.5: legal ONLY as a top-level `NodeKind::Agent`. `drive_agent`
+                // is the shared choke point for six callers, and the five non-top-level
+                // ones each mean a DIFFERENT unbuilt feature: N concurrent human asks for a
+                // `Map`, the same for a `Consolidate`, a human re-answering every `Loop`
+                // iteration, a human deciding loop continuation, and — the sharpest — a
+                // human-backed PLANNER, whose answer feeds `parse_plan(text)`, so the
+                // person would have to hand-author a machine-parseable plan GRAPH.
+                //
+                // **`top_level` is a POSITION, not a caller.** The sixth caller,
+                // `run_node`'s own `NodeKind::Agent` arm, passes `!nested` — the flag
+                // `drive` carries and `drive_nested` clears — rather than a literal `true`.
+                // It used to pass the literal, and the whole-slice review showed what that
+                // cost: `run_loop` → `drive_nested` → `drive` → `run_node`, so wrapping the
+                // very same agent in a one-node `Subgraph` body declared it top-level and
+                // delivered "a human re-answers every `Loop` iteration" — one of the four
+                // features listed above as unbuilt — with no refusal at all. The same
+                // wrapper trick worked through a `Subgraph` node, a `Branch` arm and an
+                // `Expand` planner's spliced graph, which is the one an UNTRUSTED planner
+                // can author. `non_top_level_sites` now carries a row for each.
+                //
+                // Enforced HERE, at runtime, rather than in `Graph::validate_dag`, because
+                // `validate_dag` cannot see the registry: a graph names an `AgentRef`, and
+                // whether that ref is human-backed is a REGISTRY fact. That is a stated
+                // limitation of §5.5, not an oversight — which is why the refusal is loud
+                // and journaled rather than a silent fallback to the model path.
+                //
+                // The precheck FIRST, for the same reason `run_human_agent`'s step 0 does
+                // it: this refusal is TERMINAL for the node, but the run it kills journals
+                // no `RunCompleted`, so `start_inner` never takes its terminal branch and
+                // every later wake re-drives the Map child / Loop iteration / planner. A
+                // re-derived refusal appends a fresh `NodeFailed` for an already-dead node
+                // on each of them — an unboundedly growing journal for a run that cannot
+                // make progress. Read the verdict back instead. (Review found this arm
+                // doing exactly that: three drives, three rows.)
+                if let Some(failed) = self.gate_precheck_by_id(node_id, fold) {
+                    return Ok(step(failed));
+                }
+                // Through `fail_human_agent` rather than a local `append`, so this arm
+                // cannot skip the redaction chokepoint every other human-path failure goes
+                // through — the `model_output` precedent, and the specific defect s2 shipped
+                // when one gate failure arm scrubbed and another did not.
+                return Ok(step(
+                    self.fail_human_agent(
+                        run,
+                        node_id,
+                        format!(
+                            "human_agent: agent {:?} is human-backed and may only be used \
+                             as a top-level Agent node — not as a Map or Consolidate body, \
+                             a Loop body, a Loop gate, a planner, or an Agent node nested \
+                             inside a Subgraph, a Branch arm or an Expand",
+                            agent_ref.0
+                        ),
+                    )
+                    .await?,
+                ));
+            }
+
+            // The QUESTION is the model-EQUIVALENT one: the assembled prompt PLUS the node's
+            // input, with the `## Context` half bounded. `HumanQuestion::compose` owns both
+            // decisions and documents them; the two facts that belong here are why the input
+            // is added at all, and why the composition is not just a `format!`.
+            //
+            // `assemble_prompt_parts` takes `query` only to evaluate each skill's/tool's
+            // `activation.is_active(query)` and never puts it in `authored`. The model path
+            // supplies the input SEPARATELY, as the first user message
+            // (`Message::text(MessageRole::User, query)`, below). So journaling the system
+            // string alone showed the human the role's standing instructions and the upstream
+            // context but NOT the thing being asked about — a reviewer role reading "say
+            // whether the contract permits sub-processing" with no contract named. Design
+            // §5.4's rule is "the human sees precisely what the model would have", and its
+            // accepted cost is explicitly one-directional: never show the human LESS than the
+            // model would have had.
+            //
+            // It is a type rather than a `format!` because the two halves must be bounded by
+            // DIFFERENT rules — the authored half fails loudly, the context half truncates —
+            // and once they are concatenated that distinction is unrecoverable. Charging one
+            // cap against both is precisely the defect the s3 whole-slice review found.
+            let question = HumanQuestion::compose(&parts.authored, &parts.context, &query);
+            return Ok(step(
+                self.run_human_agent(run, node_id, &question, timeout, fold)
+                    .await?,
+            ));
+        }
+
+        // The model path re-joins what `assemble_prompt_parts` split, which is exactly what
+        // `assemble_prompt` used to do inline — so this string is byte-identical to the
+        // pre-s3-review one, and the `## Context` truncation above is unreachable from here.
+        let mut system = parts.authored;
+        system.push_str(&render_context_section(&parts.context));
+        let tools = parts.tools;
+
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();
         let min_win = self.gateway.min_context_window(&chain).await;
         let ar = AgentRun {

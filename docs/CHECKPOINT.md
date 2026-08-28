@@ -1,42 +1,41 @@
 # Checkpoint
 
-**Slice:** SP-6 s2 `HumanGate` — the typed menu over `AwaitSignal`. **MERGED TO `main`** via PR #47
-(`5d9b9d1`). Spec+plan: `docs/superpowers/{specs,plans}/2026-08-27-sp-6-s2-human-gate*`.
+**Slice:** SP-6 s3 `human-as-Agent` — the last SP-6 slice, on `feat/sp-6-s3-human-as-agent`
+(from `develop` at `771af25`). All 7 tasks + the whole-slice review's 16 fixes are in.
+A RE-review of those fixes found 6 more; **the HIGH is fixed (`b6d4df0`), 5 remain.**
 
-## Done / remaining
+## Done
 
-- **SP-6 s2 ✅ tasks 1–8** — the node kind, its two journal events, the shared waiting arms, the
-  fold, `validate_dag`, `run gate approve|reject|decide`, `list-paused` menus, the cross-process
-  Postgres e2e. Full detail: `docs/superpowers/orchestrator-overview.md` §3.
-- **Reviews ✅** — whole-slice: 1 Critical, 1 HIGH, 5 Medium, 11 doc. Re-review OF those fixes: 7
-  more in three commits — 3 HIGH in `gate decide`'s post-append classification (honoured `reject`
-  reported "not read"; both "not read" arms untested; a journal fault echoed raw) · 2 MED · 2 doc.
-- **SP-6 s1 · SP-DATA 1–5 · SP-3 · SP-4 ✅** on `main`. **SP-6 s3 human-as-Agent ⬜ — the LAST slice
-  of SP-6.** No spec, no plan on disk.
+- Tasks 1–7 (`fa070dd` … `f482d05`), then the whole-slice review's 16 findings (`d2e8145`,
+  `18d22e2`, `9b12470`, `02d6794`, `72fa55d`, + docs `4423c83`/`576bc1f`).
+- **1592 passed / 0 failed / 7 ignored, exit 0**; clippy `-D warnings` and `fmt --check` exit 0.
+- **The Postgres e2e was RE-RUN against current code** (it had gone stale behind 5 fix commits):
+  7 passed / 0 failed, **zero skips**, `AgentAwaited=1` + `AgentAnswered=1` in `journal_events`.
+
+## ⬜ Remaining — 6 findings from the re-review of the fixes, none fixed
+
+1. ~~HIGH — the clamp ate the ASK~~ **FIXED `b6d4df0`.** `HumanQuestion` now records
+   `task_bytes` and `redact_and_clamp` reserves the tail, so only `## Context` is ever cut.
+   Mutation-verified: restoring the shipped clamp turns the guard red.
+2. MEDIUM — `--as` post-redaction ordering unguarded; reversing it leaves `sensei-torii` green.
+   Mirror `an_answer_that_only_exceeds_the_cap_after_redaction_is_rejected` for the actor.
+3. MEDIUM — spec §5.5 maps `run_map`→`fanout.rs:183` and `run_consolidate`→`:269`; both
+   BACKWARDS (183 ∈ `run_consolidate`, 269 ∈ `run_map`). Drop the bare line numbers.
+4. MEDIUM — `agents-skills-tools.md` and `durable-journal.md` still have ZERO mention of s3,
+   though it changed `AgentDefinition`, `from_frontmatter` and `Registry::validate`, and added
+   two `JournalEvent` variants. Three `SP-6-2` status markers need bumping to `SP-6-3`.
+5. 7 LOW (stale doc sentences asserting the old single-4096 bound; `truncate_prompt_to_bound`
+   overruns for a tiny `max`; `assemble_prompt` now has zero production callers).
+6. 7 NEW rustdoc warnings — "links to private item" on `question` (`render.rs`) and `answer`
+   (`cmd/human.rs:250`). Fix as code spans, not by widening visibility.
 
 ## Next command
 
-s3 needs design before code (a human-backed agent whose execution is a pause-for-input):
-
-```
-/sensei:brainstorm SP-6 s3 human-as-Agent
-```
-
-## Open questions
-
-- **s3's shape is genuinely open:** does a human-backed agent reuse the existing waiting events, or
-  does an `Agent` node gain a human-backed `AgentRef`? That decides whether s3 is a thin wrapper or
-  a registry change.
-- **`AwaitSignal` and `HumanGate` differ in TWO places, not one** (spec §6.1): where the answer-read
-  sits, AND whether the clock is re-read after journaling a fresh deadline (only s1 does, so a gate
-  given a nanosecond pauses once on a past instant). s3 is the third waiting kind; it must pick
-  deliberately rather than inherit by accident.
-- Deferred (§10): authorization (`actor` is attribution, not authentication — never branch on it),
-  `RunStatus::Rejected`, non-CLI delivery, N-of-M approval, no hook callback for a gate event.
+Merged to `develop`. Remaining findings are MEDIUM-and-below; pick them up before the
+develop→main PR, or fold them into SP-6's close-out.
 
 ## Known-broken
 
-None. **1505 passed / 0 failed / 7 ignored, exit 0** — verified BOTH without a database and against
-live `postgres:16`, where the 6 `e2e_pg` tests ran for real (0 skips; `GateAwaited` + `GateDecided`
-rows confirmed in `journal_events`). clippy `-D warnings` + fmt clean; `cargo doc` back to the 8
-warnings that pre-date this slice. `target/` cleaned.
+Nothing failing; the HIGH is fixed. What remains is 3 MEDIUM (all documentation or an
+unguarded ordering), 7 LOW and 7 rustdoc warnings. `$DATABASE_URL` is REMOTE Supabase — never run the DB
+suite against it; use a throwaway container.
