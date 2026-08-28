@@ -11,17 +11,23 @@
 - **s3 plan ✅** — 7 tasks, 42 steps, written against verified signatures.
   `plans/2026-08-27-sp-6-s3-human-as-agent.md`.
 - **Task 1 ✅** (`fa070dd`) — `AgentBacking::{Model,Human{timeout}}` + the four `validate()` rules.
-  **1510 passed / 0 failed / 7 ignored**, exit 0. Used `RegistryLoad` (no `InvalidConfig` variant
-  exists). 27 literal sites across 7 files needed the new field. **Not yet reviewed** — the
-  two-stage spec+quality review for Task 1 was not run.
+  Used `RegistryLoad` (no `InvalidConfig` variant exists). 27 literal sites across 7 files needed
+  the new field.
+- **Task 1 review ✅ REVIEWED + all 7 findings fixed** (`c2fef43` · `4f25b8b` · `c0ae114` ·
+  `d33465d`). The HIGH: the no-tools rule was untested — `UnknownToolRef` fired first and its
+  message satisfied both assertions, so the rule deleted still passed. The MEDIUM that changed
+  behaviour: `from_frontmatter` hardcoded `Model`, so a human agent could not be AUTHORED and
+  `config push` silently downgraded a `Human` row; there is now a `backed_by:` / `timeout: 48h`
+  frontmatter surface (both loud on typos), recorded in spec §4. Also: reject grants on a human
+  agent, `validate`'s doc rewritten, one match not two.
+  **1521 passed / 0 failed / 7 ignored**, exit 0.
 - **Tasks 2–7 ⬜** — journal events · fold · `run_human_agent` · CLI · `list-paused` · e2e.
 
 ## Next command
 
-Run Task 1's two-stage review first (it was skipped), then Task 2:
+Task 1 is done and reviewed; start Task 2:
 
 ```
-# review Task 1 (fa070dd), then:
 sed -n '/^## Task 2/,/^## Task 3/p' docs/superpowers/plans/2026-08-27-sp-6-s3-human-as-agent.md
 ```
 
@@ -36,6 +42,6 @@ sed -n '/^## Task 2/,/^## Task 3/p' docs/superpowers/plans/2026-08-27-sp-6-s3-hu
 
 ## Known-broken
 
-None. **1510 passed / 0 failed / 7 ignored, exit 0**; clippy `-D warnings` and fmt clean.
+None. **1521 passed / 0 failed / 7 ignored, exit 0**; clippy `-D warnings` and fmt clean.
 `$DATABASE_URL` is a REMOTE Supabase instance — never run the DB suite against it; use a throwaway
 container (`env -u DATABASE_URL` otherwise).
