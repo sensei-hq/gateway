@@ -505,15 +505,17 @@ pub enum JournalEvent {
     /// row an audit cannot use. So the type refuses to express one.
     ///
     /// The field carried an `Option<String>` from its introduction (s4 Task 3) until it
-    /// was narrowed here (s4 Task 5). The spec that specified the `Option` never argued
-    /// for it, and no reading of the slice's own reasoning supports it — a loop gate's
-    /// decider is exactly as attributable as a `HumanGate`'s. It was narrowed while
-    /// nothing yet wrote the event (Task 6 is the first writer), so
-    /// there is no `None` in any journal to migrate; a stored row without the field now
-    /// fails to deserialize, loudly, which is the correct treatment of an approval whose
-    /// attribution was lost. (An earlier doc justified the `Option` as room for "an
-    /// automated operator on a schedule". That is wrong twice over: an automated operator
-    /// has a name, and naming it is what `actor_or` exists for.)
+    /// was narrowed here. The narrowing belongs to no task of the s4 plan: it landed OUT
+    /// OF BAND, between that plan's Tasks 4 and 5, because it changes the JOURNAL's shape
+    /// and such a change is cheap only while nothing writes the event (Task 6 is the
+    /// first writer). The spec that specified the `Option` never argued for it, and no
+    /// reading of the slice's own reasoning supports it — a loop gate's decider is
+    /// exactly as attributable as a `HumanGate`'s. Since no journal holds a `None` to
+    /// migrate, a stored row without the field now fails to deserialize, loudly, which is
+    /// the correct treatment of an approval whose attribution was lost. (An earlier doc
+    /// justified the `Option` as room for "an automated operator on a schedule". That is
+    /// wrong twice over: an automated operator has a name, and naming it is what
+    /// `actor_or` exists for.)
     ///
     /// The remaining degenerate value is `""`, and nothing normalises it away — the fold
     /// stores what was appended, so an audit reader sees exactly the string the writer

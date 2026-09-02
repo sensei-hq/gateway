@@ -107,8 +107,9 @@ unargued inconsistency with the reasoning this same document uses one section ea
 answering `continue` **authorizes another iteration of spend**. That is an approval in the strict
 sense s2 built its ordering for, and s2 made `GateDecided.actor` required precisely because an
 approval always records who claimed to give it. A loop gate's decider is exactly as attributable as
-a `HumanGate`'s, so the two fields have the same type. Narrowed during Task 5, while nothing yet
-wrote the event and there were therefore no `None` rows to migrate; Task 6 is the first writer.
+a `HumanGate`'s, so the two fields have the same type. Narrowed out of band — it is no task of the
+plan, but a change landed between the plan's Tasks 4 and 5 — while nothing yet wrote the event and
+there were therefore no `None` rows to migrate; Task 6 is the first writer.
 (`actor` remains **attribution, never authentication** — whatever string the caller supplied, and
 nothing branches on it. The remaining degenerate value, `""`, is a writer bug rather than a legal
 "anonymous" encoding: `cmd::gate::actor_or_user` resolves an unnameable operator to `unknown`, and

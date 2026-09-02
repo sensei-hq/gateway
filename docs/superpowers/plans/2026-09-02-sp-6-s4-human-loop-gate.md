@@ -658,18 +658,19 @@ fn the_loop_gate_events_round_trip() {
 }
 ```
 
-> **Corrected during Task 5 — `actor` is a required `String`, not an `Option<String>`.** The
+> **Corrected out of band, between Tasks 4 and 5 — `actor` is a required `String`, not an
+> `Option<String>`.** (No task of this plan owns the change; it is a journal-shape change, cheap
+> only while nothing writes the event, so it could not wait for a task that needed it.) The
 > version Task 3 shipped had `actor: Option<String>`, following design §4, which specified it
 > and never argued for it. It contradicts the reasoning the same spec uses in §3's "Expiry vs
 > decision" row: reading expiry before the decision is justified on the ground that answering
 > `continue` **authorizes another iteration of spend**, which is an approval in the strict sense
 > s2 built its ordering for — and s2 made `GateDecided.actor` a required `String` precisely
-> because an approval always records who claimed to give it. Narrowed while nothing yet wrote
-> the event (Task 6 is the first writer), so no journal holds a `None` to migrate. The
-> actor-less round-trip case the draft carried asserted that an anonymous decision is a legal
-> shape; that premise is what the narrowing removes, so it is REPLACED above (not deleted) by
-> the two properties that survive: an absent `actor` must fail to decode, and `""` must
-> round-trip verbatim. Design §4 records the same reasoning.
+> because an approval always records who claimed to give it. No journal holds a `None` to migrate,
+> since Task 6 is the first writer. The actor-less round-trip case the draft carried asserted that
+> an anonymous decision is a legal shape; that premise is what the narrowing removes, so it is
+> REPLACED above (not deleted) by the two properties that survive: an absent `actor` must fail to
+> decode, and `""` must round-trip verbatim. Design §4 records the same reasoning.
 
 **Mutation-prove it before moving on.** Apply `#[serde(skip)]` to each of the three fields in
 turn and confirm the test reddens each time; the draft above did not. This is a standing
@@ -707,13 +708,16 @@ them:
    cross-kind refusal Tasks 9 and 12 must enforce. Note too that `GateDecided` is the ONE
    alternative that does carry an option name, so "all three bypass the menu match" is also
    wrong as stated.
-3. **Why `actor` is `Option`.** The draft said "a loop gate can legitimately be decided by an
-   automated operator on a schedule". An automated operator has a name, and s2 already solved
-   that with a required `String` plus `cmd::gate::actor_or`/`actor_or_user`, which never yield
-   an empty actor ("an unresolvable actor is named `unknown`", because a blank audit row is
-   indistinguishable from a bug). No operator-facing path can produce `None`. The shipped doc
-   keeps the `Option` the spec specifies and says what `None` MEANS instead: written by a
-   library embedder, not by an operator. **Open for Task 12** — see the note there.
+3. **The `actor` `Option`.** The draft justified it with "a loop gate can legitimately be
+   decided by an automated operator on a schedule". An automated operator has a name, and s2
+   already solved that with a required `String` plus `cmd::gate::actor_or`/`actor_or_user`,
+   which never yield an empty actor ("an unresolvable actor is named `unknown`", because a
+   blank audit row is indistinguishable from a bug) — so no operator-facing path could produce
+   a `None` for that prose to be about. The review struck the justification but left the
+   `Option` design §4 specified; the field was then promoted to a required `String` out of
+   band, ahead of Task 6, the first writer. **The variant therefore ships as `actor: String`,
+   and there is no "what `None` means" paragraph to write** — do not reintroduce either half.
+   The reasoning is in the correction blockquote at the end of Step 1.
 
 The variants themselves:
 
@@ -878,7 +882,8 @@ fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision(
 /// The fold copies `actor` VERBATIM and never launders a degenerate one.
 ///
 /// REPLACES `a_loop_gate_decision_without_an_actor_folds_as_none_not_as_empty`, whose
-/// premise (`None` vs `Some("")`) the Task 5 narrowing removed — see Task 3 Step 1.
+/// premise (`None` vs `Some("")`) the `actor` narrowing removed — see the correction
+/// blockquote at the end of Task 3 Step 1.
 /// What survives is not automatic: `""` is still expressible, and a "helpful" fold —
 /// `if actor.is_empty() { "unknown".into() }` — would mirror what `cmd::gate::actor_or`
 /// legitimately does at the WRITE side. Doing it HERE is laundering: a row that reads
@@ -893,8 +898,10 @@ fn a_loop_gate_decisions_actor_folds_verbatim_including_an_empty_one() {
         (1, JournalEvent::LoopGateDecided {
             node: claimed_empty.clone(), option: "done".into(), actor: String::new(),
         }),
-        // Stores the exact string the laundering bug would invent, so the assertion
-        // above is non-vacuous: a substituting fold makes the two nodes agree.
+        // Catches what the assertion above CANNOT: a fold that blanks the actor
+        // regardless of input agrees with an expectation of `""`. (The laundering
+        // substitution reddens that assertion unaided — mutation-proven. This value is
+        // `unknown` because that is the string the laundering bug would invent.)
         (2, JournalEvent::LoopGateDecided {
             node: named.clone(), option: "done".into(), actor: "unknown".into(),
         }),
@@ -981,8 +988,9 @@ pub(super) struct LoopGateDecision {
     ///
     /// A required `String`, the SAME shape as `GateDecision::actor` and
     /// `AgentAnswer::actor`. The fold cannot widen or narrow it: the event's own field
-    /// is required (Task 5 narrowing — see Task 3 Step 1), so there is no "nobody said
-    /// who" state left for the side-map to represent.
+    /// is required (narrowed out of band — see the correction blockquote at the end of
+    /// Task 3 Step 1), so there is no "nobody said who" state left for the side-map to
+    /// represent.
     pub(super) actor: String,
 }
 
@@ -2024,8 +2032,9 @@ call; the pure part is recomputed from the journaled option name."
 
 `gate_menu` (`gate.rs:716`) already reads the menu from the **journal**, which is why this extends rather than rewrites.
 
-> **SETTLED during Task 5 — was "carried forward from Task 3's review".** The question this
-> note used to pose (should `LoopGateDecided.actor` stay `Option<String>` where
+> **SETTLED out of band, between Tasks 4 and 5 — was "carried forward from Task 3's review".** No
+> task of this plan owns the change; see the correction blockquote at Task 3 Step 1. The question
+> this note used to pose (should `LoopGateDecided.actor` stay `Option<String>` where
 > `GateDecided.actor` is a required `String`?) is closed: it was promoted to `String`, because
 > the asymmetry had no semantic justification — a loop gate's decider is exactly as attributable
 > as a `HumanGate`'s, and s2 deliberately made a blank audit row unrepresentable via
