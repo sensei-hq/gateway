@@ -16,7 +16,7 @@ use super::support::{
     est_prompt_tokens, render_input, tool_input_hash,
 };
 use super::{AgentStep, Executor, Fold};
-use crate::agent::prompt::{assemble_prompt_parts, over_budget, render_context_section};
+use crate::agent::prompt::{assemble_prompt_parts, over_budget};
 
 /// The 3-way outcome of one tool effect (or one ReAct turn's tools, §7.3): a
 /// value/transcript, a node failure (already journaled `NodeFailed`), or a durable
@@ -193,19 +193,29 @@ impl Executor {
             // DIFFERENT rules — the authored half fails loudly, the context half truncates —
             // and once they are concatenated that distinction is unrecoverable. Charging one
             // cap against both is precisely the defect the s3 whole-slice review found.
-            let question = HumanQuestion::compose(&parts.authored, &parts.context, &query);
+            let question = HumanQuestion::compose(
+                &parts.authored,
+                &parts.context,
+                &query,
+                // The executor's own pure redactor, applied to each context body BEFORE the
+                // bound cuts it — see `compose`. Identity when none is wired, which is the
+                // default, so the composed question stays byte-identical there.
+                |t| self.redact_text(t),
+            );
             return Ok(step(
                 self.run_human_agent(run, node_id, &question, timeout, fold)
                     .await?,
             ));
         }
 
-        // The model path re-joins what `assemble_prompt_parts` split, which is exactly what
-        // `assemble_prompt` used to do inline — so this string is byte-identical to the
-        // pre-s3-review one, and the `## Context` truncation above is unreachable from here.
-        let mut system = parts.authored;
-        system.push_str(&render_context_section(&parts.context));
-        let tools = parts.tools;
+        // The model path re-joins what `assemble_prompt_parts` split, through the SAME
+        // `PromptParts::join` that `assemble_prompt` calls — so the string is byte-identical
+        // to the pre-s3-review one AND provably so: the drift guard
+        // `the_model_context_section_is_unbounded_and_joins_exactly_as_before` now pins the
+        // code this line runs. It used to concatenate the halves here instead, which left
+        // `assemble_prompt` with zero production callers and that guard pinning nothing that
+        // shipped. The `## Context` truncation above is unreachable from here.
+        let (system, tools) = parts.join();
 
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();
         let min_win = self.gateway.min_context_window(&chain).await;

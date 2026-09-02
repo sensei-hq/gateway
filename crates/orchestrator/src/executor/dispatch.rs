@@ -218,8 +218,17 @@ impl Executor {
     }
 
     /// Journal a [`Refusal`] and report what it means for the caller. One place owns
-    /// both the durable record and the operator-facing wording, so the four producers
+    /// both the durable record and the operator-facing wording, so the five producers
     /// pause/fail identically on the same cause.
+    ///
+    /// FIVE, matching the census this module's header and `dispatch_metered` keep and the
+    /// `model_output` chokepoint keeps on the OUTPUT side: the ReAct turn (`agent.rs`), the
+    /// `ModelCall` node (`mod.rs`), the `Map`-item call and the `Consolidate` synthesis
+    /// (`fanout.rs`), and the selector's lent dispatch (`dispatch.rs`). The
+    /// budget-completeness pass moved that number from four to five in four places and
+    /// missed this one. The two neighbours below saying "the OTHER four producers" are
+    /// correct as written — they speak from inside `SelectorDispatch`, i.e. the fifth about
+    /// the other four.
     pub(super) async fn record_refusal(
         &self,
         run: RunId,

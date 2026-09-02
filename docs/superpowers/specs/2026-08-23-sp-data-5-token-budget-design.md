@@ -362,9 +362,18 @@ SP-DATA-4 alone — so each of these names the mutation that must break it.
   anyone wires that, every `EffectRecorded.usage` at or below `snapshot.seq` stops being folded and
   the ledger silently loses the run's whole prefix — the exact failure compaction had, but **worse**:
   `write_snapshot` runs at *every round boundary*, not only after a `Consolidate` over a `Map`.
-  **Not a live defect today** — `Executor::start` folds the FULL journal via `load()`, and nothing in
-  the workspace calls `load_since`/`latest_snapshot` outside the stores' own tests, so the
-  snapshot-seeded resume is built but unwired. Recorded here rather than fixed because fixing it
+  **Not a live defect today** — `Executor::start` folds the FULL journal via `load()`, so the
+  snapshot-seeded resume is built but unwired. **Correction (2026-08-28):** the justification as
+  first written — "nothing in the workspace calls `load_since`/`latest_snapshot` outside the stores'
+  own tests" — was FALSE for `load_since`, and `e820d87`'s commit message repeats it. There is one
+  production caller: `Scheduler::earliest_resume_after` (`orchestrator/src/scheduler.rs`), on the
+  driver path. It does not affect the conclusion, and the reason is worth stating rather than
+  re-deriving: that call folds NO run state. It filters the tail for `RunPaused { resume_after }` and
+  takes the `min()`, so `Snapshot.spent`/`budget` are irrelevant to it — a scheduler asking "when is
+  this run due?" cannot lose a ledger it never reads. `latest_snapshot` has no non-test caller, which
+  is the narrower claim `docs/superpowers/orchestrator-overview.md` makes and which remains true.
+  The dormancy therefore stands, on the correct ground: it is `Executor::start`, and only
+  `Executor::start`, that would have to change. Recorded here rather than fixed because fixing it
   means designing what a snapshot must carry (a folded `spent` scalar plus the effective `budget`,
   and an argument for why re-folding the tail on top cannot double-count) — the same
   keyed-by-effect-id reasoning §6.5b needed, but over a summary rather than a per-child manifest.
