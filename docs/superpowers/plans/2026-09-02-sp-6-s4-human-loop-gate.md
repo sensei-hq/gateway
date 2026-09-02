@@ -788,41 +788,57 @@ In `support.rs`'s inline test module:
 ```rust
 /// The menu is FIRST-wins: a second ask must not retroactively change what a human's
 /// answer meant. The decision is LAST-wins: an operator may correct it before resume.
+///
+/// The s4 twin of `gate_decisions_are_last_wins_and_the_menu_is_first_wins` (s2) and
+/// `agent_answers_are_last_wins_and_the_prompt_is_first_wins` (s3): assert the same
+/// three things they do, INCLUDING the deadline. A LAST-wins deadline on the SHARED map
+/// is the never-expires bug — a run force-woken every ten minutes under a one-hour SLA
+/// re-arms it on every drive.
 #[test]
 fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision() {
     let node = NodeId("lp/0/__gate__".into());
-    let opt = |name: &str, stops: bool| orchestrator_core::LoopGateOption {
-        name: name.into(),
-        stops,
-    };
     let events = vec![
-        (Seq(1), JournalEvent::LoopGateAwaited {
+        (1, JournalEvent::LoopGateAwaited {
             node: node.clone(),
-            deadline: None,
+            deadline: Some(at(1_000)),
             prompt: "first question".into(),
-            menu: vec![opt("done", true)],
+            // TWO options with DIFFERING `stops`: a one-option fixture cannot catch a
+            // truncating or name-blanking fold, and cannot exercise the realistic menu
+            // (Task 2 validates convergence, i.e. a mix of `stops`).
+            menu: vec![lopt("done", true), lopt("again", false)],
         }),
-        (Seq(2), JournalEvent::LoopGateAwaited {
+        (2, JournalEvent::LoopGateAwaited {
             node: node.clone(),
-            deadline: None,
+            deadline: Some(at(9_999)),
             prompt: "second question".into(),
-            menu: vec![opt("done", false)],
+            menu: vec![lopt("done", false)],
         }),
-        (Seq(3), JournalEvent::LoopGateDecided {
+        // DIFFERENT options, so the last-wins assertion pins the name too.
+        (3, JournalEvent::LoopGateDecided {
             node: node.clone(),
-            option: "done".into(),
+            option: "again".into(),
             actor: Some("a".into()),
         }),
-        (Seq(4), JournalEvent::LoopGateDecided {
+        (4, JournalEvent::LoopGateDecided {
             node: node.clone(),
             option: "done".into(),
             actor: Some("b".into()),
         }),
     ];
-    let fold = fold_journal(&events);
+    let (fold, _, _) = fold_journal(&events);
 
+    assert_eq!(
+        fold.deadline_for(&node),
+        Some(Some(at(1_000))),
+        "FIRST ask wins — a later one must not push the deadline forward; \
+         overwriting it IS the never-expires bug"
+    );
     let menu = fold.loop_gate_menu_for(&node).expect("menu folded");
+    assert_eq!(menu.len(), 2, "FIRST menu wins — not the later one-option ask");
+    assert_eq!(menu[0].name, "done", "the option NAME survives, in order");
     assert!(menu[0].stops, "FIRST menu wins: the second ask must not flip `stops`");
+    assert_eq!(menu[1].name, "again", "the whole menu, not just its head");
+    assert!(!menu[1].stops, "per-option `stops`, not a single flag");
     assert_eq!(
         fold.loop_gate_prompt_for(&node).expect("prompt folded"),
         "first question",
@@ -830,19 +846,48 @@ fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision(
     );
     let decision = fold.loop_gate_decision_for(&node).expect("decision folded");
     assert_eq!(decision.actor.as_deref(), Some("b"), "LAST decision wins");
+    assert_eq!(decision.option, "done", "LAST decision's option, not the first");
+}
+
+/// `LoopGateDecision::actor` is an `Option` where its s2/s3 siblings are a `String`, and
+/// the `Option` is the only thing separating "nobody said who" from "somebody claimed to
+/// be the empty string". Fold two nodes so the two states stay distinguishable — an
+/// `unwrap_or_default()` in the arm invents an attribution nobody made.
+#[test]
+fn a_loop_gate_decision_without_an_actor_folds_as_none_not_as_empty() {
+    let anonymous = NodeId("lp/0/__gate__".into());
+    let claimed_empty = NodeId("lp/1/__gate__".into());
+    let (fold, _, _) = fold_journal(&[
+        (1, JournalEvent::LoopGateDecided {
+            node: anonymous.clone(), option: "done".into(), actor: None,
+        }),
+        (2, JournalEvent::LoopGateDecided {
+            node: claimed_empty.clone(), option: "done".into(), actor: Some(String::new()),
+        }),
+    ]);
+    assert!(fold.loop_gate_decision_for(&anonymous).expect("decided").actor.is_none());
+    assert_eq!(
+        fold.loop_gate_decision_for(&claimed_empty).expect("decided").actor.as_deref(),
+        Some(""),
+    );
 }
 
 /// `LoopGateAwaited` is the FOURTH writer of the SHARED `deadlines` map, so
 /// "has this node begun asking?" still has one answer for every waiting kind. The
 /// `None` is folded THROUGH — dropping it is the re-ask-every-drive bug s1 shipped.
+///
+/// And it writes ONLY its own kind-specific record: if a loop gate leaked into
+/// `agent_prompts`, `run_human_agent`'s missing-question arm — which exists to fail loud
+/// when a node bears ANOTHER kind's awaited record — would instead resume a human-backed
+/// `Agent` with a loop gate's question.
 #[test]
 fn a_deadline_less_loop_gate_records_that_it_began_asking() {
     let node = NodeId("lp/0/__gate__".into());
-    let fold = fold_journal(&[(Seq(1), JournalEvent::LoopGateAwaited {
+    let (fold, _, _) = fold_journal(&[(1, JournalEvent::LoopGateAwaited {
         node: node.clone(),
         deadline: None,
         prompt: "q".into(),
-        menu: vec![orchestrator_core::LoopGateOption { name: "done".into(), stops: true }],
+        menu: vec![lopt("done", true)],
     })]);
     assert_eq!(
         fold.deadline_for(&node),
@@ -850,8 +895,19 @@ fn a_deadline_less_loop_gate_records_that_it_began_asking() {
         "the key must be PRESENT with a None value: present = began asking, \
          None = no deadline"
     );
+    assert_eq!(fold.loop_gate_prompt_for(&node), Some("q"));
+    assert!(fold.loop_gate_menu_for(&node).is_some());
+    // One negative assertion per sibling kind — the other half of the bookkeeping.
+    assert!(fold.prompt_for(&node).is_none());
+    assert!(fold.menu_for(&node).is_none());
+    assert!(!fold.has_signal_ask(&node));
 }
 ```
+
+`fold_journal` takes `&[(Seq, JournalEvent)]` where `Seq` is a bare integer alias and
+returns a **3-tuple** — hence `(1, ev)` and `let (fold, _, _) = …`, not `Seq(1)` and a
+bare `fold`. `at()` is the module's existing timestamp helper (`support.rs:947`); `lopt`
+is its `LoopGateOption` counterpart, added beside the existing `gopt`.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -895,10 +951,27 @@ pub(super) struct LoopGateAsk {
 }
 ```
 
-and the three accessors, beside `menu_for`/`prompt_for`:
+and the three accessors, beside `menu_for`/`prompt_for`. **Each one needs the
+`cfg_attr(not(test), expect(dead_code))` block below or the pre-commit hook rejects the
+commit** — the fold lands one task ahead of its only non-test consumer, so
+`cargo clippy -p sensei-orchestrator --lib -- -D warnings` exits 101 with "methods
+`loop_gate_menu_for`, `loop_gate_prompt_for`, and `loop_gate_decision_for` are never
+used". This is the s3 precedent, not an invention: `Fold::agent_answer_for`'s doc
+(`mod.rs:440`) records the same attribute being carried for one task and then deleted by
+its consumer. `expect` rather than `allow` so it deletes itself — an `expect` that is no
+longer needed is itself a `-D warnings` failure — and `not(test)` because the fold test
+in this module calls all three today, so an ungated `expect` would be UNFULFILLED in the
+lib-test target and fail `clippy --all-targets` from the other side.
 
 ```rust
     /// The menu a loop gate published, or `None` if it never began asking.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "SP-6 s4 Task 6's run_human_loop_gate is the consumer; the fold lands first"
+        )
+    )]
     pub(super) fn loop_gate_menu_for(
         &self,
         node: &NodeId,
@@ -908,11 +981,12 @@ and the three accessors, beside `menu_for`/`prompt_for`:
 
     /// The question a loop gate published. Answers "did the LOOP GATE kind begin here?"
     /// — narrower than [`Fold::deadline_for`], which all FOUR waiting kinds write.
+    /// (Same `cfg_attr` block; elided here.)
     pub(super) fn loop_gate_prompt_for(&self, node: &NodeId) -> Option<&str> {
         self.loop_gate_asks.get(node).map(|a| a.prompt.as_str())
     }
 
-    /// The decision recorded for a loop gate, if any.
+    /// The decision recorded for a loop gate, if any. (Same `cfg_attr` block.)
     pub(super) fn loop_gate_decision_for(&self, node: &NodeId) -> Option<&LoopGateDecision> {
         self.loop_gate_decisions.get(node)
     }
@@ -1126,6 +1200,14 @@ preserving; the s3 suite is the regression guard."
 - Test: `crates/orchestrator/src/executor/tests.rs`
 
 The core arm. Structure follows `run_human_gate` (s2), **not** `run_human_agent` (s3) — the expiry ordering is the difference and Task 8 pins it.
+
+**Delete the three `cfg_attr(not(test), expect(dead_code))` blocks Task 4 put on
+`Fold::loop_gate_menu_for`/`loop_gate_prompt_for`/`loop_gate_decision_for` as you wire each
+one up.** That is not tidying: an `expect` whose lint no longer fires is itself a
+`-D warnings` failure, so the pre-commit hook rejects the commit that reads them while the
+attribute is still there. s3 did exactly this at its own Task 4 and left the reason in
+`Fold::agent_answer_for`'s doc; replace each attribute with the same one-paragraph note
+rather than deleting it silently.
 
 - [ ] **Step 1: Write the failing tests (AC3, AC4, AC5, AC6)**
 
@@ -2148,7 +2230,8 @@ Add an SP-6 s4 entry to `docs/superpowers/orchestrator-overview.md`'s SP-6 secti
 
 Two **feature** docs drift with this slice and were missing from this list entirely (found by Task 3's review — the variants alone already falsify the first of the three sentences below):
 
-- `docs/features/orchestrator/durable-journal.md` — the SP-6 s3 section opens "Two variants **complete** the journal's HITL vocabulary, after s1's … and s2's …". There are now four pairs. Task 3 downgraded "complete" to "extend" as a stopgap; this step writes the real s4 section (`LoopGateAwaited` first-wins with its durable menu + question, `LoopGateDecided` last-wins) and the Gherkin scenarios beside the s3 ones.
+- `docs/features/orchestrator/durable-journal.md` — the SP-6 s3 section opens "Two variants **complete** the journal's HITL vocabulary, after s1's … and s2's …". There are now four pairs. Task 3 downgraded "complete" to "extend" as a stopgap; this step writes the real s4 section (`LoopGateAwaited` first-wins with its durable menu + question, `LoopGateDecided` last-wins) and the Gherkin scenarios beside the s3 ones. (The `AgentAwaited` bullet's "shared by all three waiting kinds … the only one of the three that can answer" sentence was a second falsified claim in this file; it was **already corrected in the Task 4 review follow-up** and needs no further edit here.)
+- **Before closing this step, bound the set rather than trusting these three bullets:** `rg -in 'all (THREE|FOUR|FIVE)|(three|four|five) waiting kinds' crates docs`. The waiting-kind count is restated in production comments, in the rustdoc of the tests that guard the kind-swap arms, in `e2e_pg.rs`, and in both feature docs; Task 4 updated the arms alone and the review found four more stale sites. Several remaining hits (`tests.rs`'s `pause_awaiting` and shared-helper comments, `torii/src/cmd/run.rs`'s three-way cross-refusal) become stale only once Tasks 6–7 add the fourth EXECUTING kind and Task 12 adds its CLI verb — check them then, not before.
 - `docs/features/orchestrator/README.md` — two sentences in the **Durable journal** status row: "all six are new variants, so `FORMAT_VERSION` stays 1" (now eight) and `AgentAwaited` described as "the only one of the three waiting kinds that carries a prompt" (`LoopGateAwaited` carries one too, and there is a fourth waiting kind). The row's `Partial (… · SP-6-3)` marker and the **Execution graph** row's `GateSpec` description need the s4 bump as well, and the **HITL (SP-6)** bullet needs its s4 paragraph — including retiring the s3 carry-forward sentence that calls this slice "the obvious next slice".
 
 - [ ] **Step 5: Whole-slice adversarial review**

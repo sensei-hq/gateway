@@ -69,9 +69,12 @@ slice lands.
   a run pauses for many unrelated reasons over its life. Folded **FIRST-wins**, exactly as
   `SignalAwaited`/`GateAwaited` are: overwriting the deadline is the never-expires bug s1
   documents, and the human was asked *this* question. It also writes the `deadlines` map
-  shared by all three waiting kinds, so "has this node begun asking?" has one answer —
-  while `prompt` makes it the only one of the three that can answer "did the *human-backed
-  agent* kind begin here?".
+  shared by all **four** waiting kinds (s4's `LoopGateAwaited` is the fourth), so "has this
+  node begun asking?" has one answer — while `prompt`, which lands in the `agent_prompts`
+  map only this variant writes, answers the narrower "did the *human-backed agent* kind
+  begin here?". `LoopGateAwaited` carries a prompt too, but into its own `loop_gate_asks`:
+  a loop gate is not answerable by `AgentAnswered`, so the two questions must not share a
+  slot.
 - **`AgentAnswered { node, text, actor }`** — folded **LAST-wins**, so an operator can
   correct a mistaken answer before the run resumes. `text` becomes the node's output under
   the same `"text"` key a model-backed `Agent` produces, so an unmodified

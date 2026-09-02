@@ -1617,8 +1617,9 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
 
 /// SP-6 s3 AC13 — a human-backed ROLE, end to end, across a process boundary.
 ///
-/// The third and last waiting kind. s1's `AwaitSignal` waits for arbitrary JSON and s2's
-/// `HumanGate` for a named option; here the waiting thing is an ordinary top-level
+/// The third waiting kind (SP-6 s4's human loop gate is the fourth). s1's `AwaitSignal`
+/// waits for arbitrary JSON and s2's `HumanGate` for a named option; here the waiting
+/// thing is an ordinary top-level
 /// [`NodeKind::Agent`] whose `AgentRef` happens to resolve to an `AgentBacking::Human`
 /// definition — so the GRAPH is the model-backed graph, unchanged, and the substitution
 /// lives entirely in the registry. That is the property this test exists to show over a

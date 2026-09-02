@@ -1,9 +1,16 @@
 //! The human-backed `Agent` node (SP-6 s3): a role answered by a person, not a model.
 //!
 //! s1 shipped `AwaitSignal` (pause, accept any JSON), s2 `HumanGate` (the typed menu).
-//! This is the third and last waiting kind: an `Agent` node whose `AgentRef` resolves to
+//! This is the THIRD waiting kind: an `Agent` node whose `AgentRef` resolves to
 //! a human-backed definition pauses ONCE, journals the question it is asking, and
 //! completes when a human answers.
+//!
+//! It is not the last, though s3 wrote that it was. SP-6 s4 adds a FOURTH — the human
+//! LOOP GATE, a `Loop` whose `GateSpec::Human` asks a person whether to iterate again.
+//! Its journal variants and its fold arms (`LoopGateAwaited`/`LoopGateDecided`, the
+//! fourth writer of the SHARED `Fold::deadlines` map) already exist; its executor arm,
+//! `run_human_loop_gate`, joins this file later in that slice. The count matters here
+//! because the missing-question arm below reasons from it explicitly.
 //!
 //! The waiting machinery is SHARED with both siblings, not copied — `gate_precheck` and
 //! `wait_or_expire` live in `signal.rs`, reached here through their `_by_id` forms

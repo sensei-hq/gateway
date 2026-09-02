@@ -246,16 +246,23 @@ struct Fold {
     loop_gate_asks: HashMap<NodeId, LoopGateAsk>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
-    /// the shared arm 0 of the two WAITING node kinds, for which a failure is TERMINAL (an
+    /// the shared arm 0 of the WAITING node kinds, for which a failure is TERMINAL (an
     /// expired gate stays expired). SP-6 s2 moved that read out of `run_await_signal` and
-    /// into the shared helper, so it now has two CALLERS —
+    /// into the shared helper, and the CALLER count has grown with the waiting kinds
+    /// while the reader count has not. Four call it today:
     /// [`run_await_signal`](Executor::run_await_signal) and
-    /// [`run_human_gate`](Executor::run_human_gate) — but still one reader.
+    /// [`run_human_gate`](Executor::run_human_gate) through `gate_precheck`;
+    /// [`run_human_agent`](Executor::run_human_agent) (s3) and `drive_agent`'s
+    /// human-backed-in-a-nested-position refusal (`agent.rs`, also s3) through
+    /// `gate_precheck_by_id`, which is the same body over a bare `NodeId`. s4's
+    /// `run_human_loop_gate` makes a fifth (design §5.2 step 0) — five callers, still ONE
+    /// reader.
     ///
     /// It is deliberately not consulted anywhere else, and the fence is on the READER, not
-    /// on the caller count: a third node kind may read this map only by being a waiting
-    /// kind that calls `gate_precheck` first. A `NodeFailed` does not make a node terminal
-    /// in general: a `ModelCall` or `Agent` node whose provider died journals one and
+    /// on the caller count — which is why the count growing is not a loosening: a further
+    /// node kind may read this map only by being a waiting kind that calls `gate_precheck`
+    /// first. A `NodeFailed` does not make a node terminal in general: a `ModelCall` or
+    /// `Agent` node whose provider died journals one and
     /// RE-ATTEMPTS on the next drive, which is the documented resume contract (see
     /// `a_paused_gated_run_reattempts_and_completes_on_resume`, and `resolve_context`'s note
     /// that a failed node "carries no memo and re-runs on resume"). Making this map
