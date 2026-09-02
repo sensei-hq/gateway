@@ -19745,9 +19745,14 @@ mod human_loop_gate {
     /// green.
     ///
     /// The gate path is written by hand exactly as an operator would type it, because a
-    /// loop gate has no `Node` in the graph to name it: the reachability here is a
-    /// hand-written journal (or an authored node id colliding with the reserved path),
-    /// not a graph edit.
+    /// loop gate has no `Node` in the graph to name it: the reachability HERE is a journal
+    /// the executor did not write, not a graph edit. The arm's other vector — an authored
+    /// `__gate__` segment inside the `Loop`'s own `Subgraph` body, which namespaces onto
+    /// the same path through a graph `validate_dag` accepts — is the sibling
+    /// `an_authored_gate_id_in_a_loop_body_collides_and_fails_loudly` below. The two are
+    /// kept apart because they answer different questions: this one that the arm is
+    /// fail-closed against a forged log, that one that the arm is reachable at all without
+    /// forging anything.
     #[tokio::test]
     async fn a_loop_gate_that_recorded_a_wait_without_a_menu_fails_loudly() {
         let journal = InMemoryJournal::new();
@@ -20120,6 +20125,267 @@ mod human_loop_gate {
             rows(&journal.load(run).await.expect("loads")),
             settled,
             "the self-healing append is idempotent, not a second source of growth"
+        );
+    }
+
+    /// The AUTHORED half of the kind-swap arm's reachability, and the reason the arm is
+    /// not merely defence in depth against a forged journal.
+    ///
+    /// The sibling above reaches the arm through a journal `torii` did not write. This one
+    /// reaches it through a graph an author can write TODAY, with `validate_dag` green and
+    /// `torii run submit` accepting it: a `Loop` whose `Subgraph` body declares a node
+    /// literally named `__gate__`. `drive_nested` namespaces that body under
+    /// `"{loop}/{i}"`, so the inner node's path is `"lp/0/__gate__"` — byte-identical to
+    /// the path `run_loop` synthesizes for the gate.
+    ///
+    /// **`validate_dag` does not stop it, and that is deliberate rather than an oversight
+    /// this test papers over.** Its SP-6 s1 rule bans the `/` SEPARATOR in an
+    /// author-supplied id, which makes the whole reserved PATH unauthorable in one piece
+    /// but says nothing about a bare `__gate__` SEGMENT that only becomes that path once
+    /// nesting has flattened it. `plan::feasible` does reserve the segment
+    /// (`PlanError::ReservedNodeId`, the SP-3 s5 review's fix) — so a PLANNER cannot emit
+    /// it — and `Executor::start`/`run` both call `validate_dag`, so the "unvalidated
+    /// caller parameter" escape an earlier version of the arm's comment claimed does not
+    /// exist. The author-supplied segment is the one door left open, and it is the door
+    /// this test walks through.
+    ///
+    /// Reaching the arm this way costs the author's own signal delivery: the inner node
+    /// must COMPLETE before `run_loop` evaluates the gate at all, so the run pauses on
+    /// `lp/0/__gate__` as an `AwaitSignal`, is answered there, and only then does the gate
+    /// find a deadline it did not record. The refusal is what an operator should see;
+    /// making the collision unauthorable in `validate_dag` is a separate change, recorded
+    /// as a follow-up in the s4 plan.
+    #[tokio::test]
+    async fn an_authored_gate_id_in_a_loop_body_collides_and_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+
+        // A legal graph. The inner id carries no `/`, so s1's separator ban has nothing to
+        // catch; the collision exists only after `drive_nested` namespaces it.
+        let graph = Graph {
+            nodes: vec![Node {
+                id: lp(),
+                kind: NodeKind::Loop {
+                    body: LoopBody::Subgraph(Box::new(Graph {
+                        nodes: vec![Node {
+                            id: NodeId(orchestrator_core::plan::RESERVED_GATE_ID.into()),
+                            kind: NodeKind::AwaitSignal { timeout: None },
+                            deps: vec![],
+                        }],
+                    })),
+                    input: serde_json::json!({ "prompt": "draft it" }),
+                    gate: GateSpec::Human {
+                        agent: AgentRef("reviewer".into()),
+                        menu: menu(),
+                    },
+                    max_iters: 3,
+                },
+                deps: vec![],
+            }],
+        };
+        graph
+            .validate_dag()
+            .expect("the graph is LEGAL — that is the whole point of this vector");
+
+        // Iteration 0's body parks on the inner `AwaitSignal`, at the path the gate will
+        // later want for itself.
+        let first = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            first.paused.is_some() && first.failed.is_none(),
+            "the body's own node pauses first: {first:?}"
+        );
+        assert!(
+            journal.load(run).await.expect("loads").iter().any(
+                |(_, e)| matches!(e, JournalEvent::SignalAwaited { node, .. } if node == &gate(0))
+            ),
+            "…and it is the SIGNAL kind that recorded the wait at the reserved path"
+        );
+
+        // The author answers their own node. The body completes; the gate is now evaluated
+        // at an id that already carries another kind's wait.
+        journal
+            .append(
+                run,
+                JournalEvent::SignalReceived {
+                    node: gate(0),
+                    payload: serde_json::json!({ "ok": true }),
+                },
+            )
+            .await
+            .expect("the signal lands");
+
+        let out = ex.start(run, &graph).await.expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("the colliding wait must fail the gate, not be answered by it: {out:?}")
+        });
+        assert_eq!(node, lp(), "a gate failure fails the LOOP: {out:?}");
+        assert!(
+            message.contains(&gate(0).0) && message.contains("menu"),
+            "with the same refusal the forged-journal sibling gets: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "and it does NOT pause — the gate cannot be answered here: {out:?}"
+        );
+        assert!(
+            !message.contains("revise") && !message.contains("ship"),
+            "…and it never recites the GRAPH's menu, which is the fallback this arm \
+             exists to refuse: {message}"
+        );
+        assert!(
+            asks(&journal.load(run).await.expect("loads")).is_empty(),
+            "it never published a question of its own on top of the signal's record"
+        );
+    }
+
+    /// `decide_from_published_menu`'s first refusal: a SETTLEMENT with no ask behind it.
+    ///
+    /// The settled-replay path (step 1) is the Critical fix's own code, and both of its
+    /// fail-closed refusals shipped with no test at all — review mutation-proved them
+    /// unguarded. This is the first: `Fold::loop_gate_settled_with` says a drive honoured
+    /// this gate, and `Fold::loop_gate_menu_for` says it never asked. The two cannot both
+    /// be true of a journal this executor wrote — `LoopGateSettled` is appended in exactly
+    /// one place, the `Waiting` arm, *after* the published menu has already resolved the
+    /// option — so this state is reachable only from a journal the executor did not write,
+    /// and `torii` has no settle verb at all. That is precisely why it must fail rather
+    /// than guess: the replay has nothing to recompute `stops` FROM, and both defaults are
+    /// a decision no human made — to stop, or to spend another iteration.
+    ///
+    /// It reddens on the silent default (`…find(…).map(|o| o.stops).unwrap_or(false)`),
+    /// which continues the loop off a settlement it could not resolve.
+    #[tokio::test]
+    async fn a_settled_loop_gate_with_no_published_menu_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+        // A settlement with nothing behind it: no `LoopGateAwaited`, so no menu.
+        journal
+            .append(
+                run,
+                JournalEvent::LoopGateSettled {
+                    node: gate(0),
+                    option: "ship".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("a settlement with no published menu must fail, not guess: {out:?}")
+        });
+        assert_eq!(node, lp(), "the gate's failure fails the LOOP: {out:?}");
+        assert!(
+            message.contains(&gate(0).0) && message.contains("published no menu"),
+            "the REPLAY path gives the same refusal the live arm does — an operator who \
+             sees it on one drive and again on the next must read one sentence: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "and it does NOT pause — nothing an operator can do would answer it: {out:?}"
+        );
+        assert!(
+            !message.contains("revise") && !message.contains("ship"),
+            "…and it never recites the GRAPH's menu, the fallback both sites refuse: \
+             {message}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "iteration 0's body ran once and iteration 1 was never entered — a silent \
+             default would have spent a second iteration on a settlement it could not read"
+        );
+    }
+
+    /// `decide_from_published_menu`'s second refusal: a SETTLEMENT naming an option the
+    /// published menu does not contain.
+    ///
+    /// The replay counterpart of the live arm's unmatched-option refusal, and unguarded
+    /// for the same reason the one above was: the settled path was added by the Critical
+    /// fix with its two refusals written but never exercised. The ask here is REAL — a
+    /// genuine drive published the menu — and only the settlement is forged, which is what
+    /// makes this a different state from the one above rather than a re-run of it.
+    ///
+    /// The refusal must recite the PUBLISHED names, because those are the ones an operator
+    /// could legitimately have picked, and it must name the option that failed to match so
+    /// they can see which of the two is wrong.
+    ///
+    /// It reddens on the same silent default as its sibling — `unwrap_or(false)` turns an
+    /// unresolvable settlement into "run another iteration", spending tokens on a decision
+    /// nobody made.
+    #[tokio::test]
+    async fn a_settled_loop_gate_naming_an_option_outside_its_menu_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        let graph = human_gated_loop_graph(3);
+
+        // A real ask, so the menu really is published — only the settlement is forged.
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        journal
+            .append(
+                run,
+                JournalEvent::LoopGateSettled {
+                    node: gate(0),
+                    option: "abandon".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let out = ex.start(run, &graph).await.expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("a settlement outside the published menu must fail, not guess: {out:?}")
+        });
+        assert_eq!(node, lp(), "the gate's failure fails the LOOP: {out:?}");
+        assert!(
+            message.contains("abandon"),
+            "the refusal names the option that matched nothing: {message}"
+        );
+        assert!(
+            message.contains("revise") && message.contains("ship"),
+            "…and recites the PUBLISHED menu, which is what an operator could actually \
+             have picked: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "and it does NOT pause — the settlement is durable and unanswerable: {out:?}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "no second iteration was spent — the whole point of refusing rather than \
+             defaulting to `continue`"
         );
     }
 }

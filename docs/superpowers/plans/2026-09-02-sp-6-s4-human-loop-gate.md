@@ -1986,7 +1986,33 @@ arm has not read the fold and cannot know whether one exists."
 >
 > Since that review the refusal has TWO call sites — the live `Waiting` arm and the settled
 > replay (`decide_from_published_menu`, design §5.2 step 0b) — sharing one message builder.
-> AC14b's test should reach both, and the `LoopGateSettled`-shaped input is the second.
+> **Both of the replay site's refusals are now covered**, by `eba6083`'s verify follow-up:
+> `a_settled_loop_gate_with_no_published_menu_fails_loudly` and
+> `a_settled_loop_gate_naming_an_option_outside_its_menu_fails_loudly`. The replay path was
+> the Critical fix's own new code and shipped with neither refusal exercised; both are
+> mutation-proven against the silent default
+> (`…find(…).map(|o| o.stops).unwrap_or(false)`), which continues the loop off a settlement
+> it could not resolve. Nothing is left for this task on the replay half either — AC14b's
+> own test still owes the LIVE arm's unmatched-option refusal.
+>
+> **The kind-swap arm's reachability was restated and is now guarded on the AUTHORED side
+> too.** `eba6083`'s comment claimed one vector was a `/`-containing authored id reaching
+> the executor because "`Executor::start` takes the graph as an unvalidated caller
+> parameter". Both halves are false: `validate_dag` rejects the separator at every depth,
+> and `start_inner`/`run_inner` each call it before anything is journaled. The vector that
+> DOES hold needs no separator — an author names a `Loop`-body node `__gate__`, and
+> `drive_nested` namespaces it onto exactly `"{loop}/{i}/__gate__"`. Guarded by
+> `an_authored_gate_id_in_a_loop_body_collides_and_fails_loudly`.
+>
+> **Follow-up, deliberately NOT taken here (out of scope for a findings commit, and not a
+> silent failure): reserve the `__gate__` SEGMENT in `validate_dag`.** `plan::feasible`
+> already does (`PlanError::ReservedNodeId`, the SP-3 s5 review's fix), so only the
+> author-supplied path is open; s1's rule bans the `/` separator, which makes the whole
+> reserved path unauthorable in one piece but says nothing about a bare segment that becomes
+> that path once nesting flattens it. Today the collision is a LOUD gate failure whose
+> message ("a waiting node's kind cannot be changed mid-run") diagnoses the wrong thing —
+> the author named a reserved id. Rejecting it at validation, with a message that says so,
+> is the right fix and belongs with Task 14 or a follow-on slice.
 
 - [ ] **Step 1: Write the failing tests (AC13, AC14, AC14b)**
 
