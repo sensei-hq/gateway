@@ -324,12 +324,15 @@ struct LoopGateDecision {
     option: String,
     /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::LoopGateDecided`.
     ///
-    /// `Option`, unlike [`GateDecision::actor`] and [`AgentAnswer::actor`], because the
-    /// event's own field is: a loop gate may be decided by a caller that supplied no
-    /// `--as`. Folding it to `""` instead would make "nobody said who" indistinguishable
-    /// from "somebody claimed to be the empty string", and this field is displayed to an
-    /// operator deciding whether to trust the decision.
-    actor: Option<String>,
+    /// A required `String`, the SAME shape as [`GateDecision::actor`] and
+    /// [`AgentAnswer::actor`], because a loop gate's decision is an approval on exactly
+    /// their terms — answering `continue` authorizes another iteration of spend — and an
+    /// approval always records who claimed to give it. The fold cannot widen or narrow
+    /// this: the event's own field is required, so there is no "nobody said who" state
+    /// left for the side-map to represent. Whatever string was appended is what an
+    /// operator sees, `""` included; see the event's doc for why an empty one is a writer
+    /// bug rather than an anonymous decision.
+    actor: String,
 }
 
 /// SP-6 s4: a folded `LoopGateAwaited` — what the human was shown.

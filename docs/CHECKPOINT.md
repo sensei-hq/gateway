@@ -22,8 +22,9 @@ container on an `lsof`-checked free port.
 Tasks 4–14. Standing obligations, none discharged: `support.rs:262`'s instruction for the
 **fourth** `Fold::deadlines` writer is Task 4's; **expiry ordering (Task 8) must be
 mutation-proven** — it reddens only if the arm is "simplified" into s3's answer-first order;
-Task 12 must settle whether `LoopGateDecided.actor` stays `Option<String>` (note in the plan
-at Task 12) and route the loop branch through `actor_or_user`; Task 14 also owns
+`LoopGateDecided.actor` is now a required `String` (promoted before Task 6, the first writer;
+spec §4 + the plan's Task 3 Step 1 carry the reasoning), so Task 12's remaining half is only
+to route the loop branch through `actor_or_user`; Task 14 also owns
 `docs/features/orchestrator/{durable-journal,README}.md`, which drift with this slice.
 **Doc-link baseline: 16** (re-measured with Task 14 Step 3's command; the plan's 24 was stale).
 

@@ -617,34 +617,59 @@ fn the_loop_gate_events_round_trip() {
     let decided = JournalEvent::LoopGateDecided {
         node: NodeId("lp/0/__gate__".into()),
         option: "done".into(),
-        actor: Some("jerry".into()),
+        actor: "jerry".into(),
     };
     let json = serde_json::to_string(&decided).expect("serialises");
     match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
         JournalEvent::LoopGateDecided { node, option, actor } => {
             assert_eq!(node.0, "lp/0/__gate__");
             assert_eq!(option, "done");
-            assert_eq!(actor.as_deref(), Some("jerry"));
+            assert_eq!(actor, "jerry");
         }
         other => panic!("wrong variant: {other:?}"),
     }
 
-    // An actor-less decision is a LEGAL SHAPE, not a second durability check.
-    let anonymous = JournalEvent::LoopGateDecided {
+    // An UNATTRIBUTED row must FAIL to decode — the guard on the variant's contract
+    // that an approval always records who claimed to give it. Hand-written JSON: the
+    // shape being pinned is one the type can no longer construct, which is the point.
+    // One `#[serde(default)]` turns the refusal into a silent `""`, so this is a real
+    // guard, not a restatement of serde's defaults.
+    let unattributed = r#"{"LoopGateDecided":{"node":"lp/0/__gate__","option":"again"}}"#;
+    let err = serde_json::from_str::<JournalEvent>(unattributed)
+        .expect_err("an approval with no attribution must not decode");
+    assert!(err.to_string().contains("actor"), "…names the missing field: {err}");
+
+    // …and `""`, the degenerate value still expressible, round-trips VERBATIM.
+    // Resolving an unnameable actor is torii's job at the WRITE side (`actor_or`); a
+    // reader inventing one would launder a writer bug into a plausible audit row.
+    let claimed_empty = JournalEvent::LoopGateDecided {
         node: NodeId("lp/0/__gate__".into()),
         option: "again".into(),
-        actor: None,
+        actor: String::new(),
     };
-    let json = serde_json::to_string(&anonymous).expect("serialises");
+    let json = serde_json::to_string(&claimed_empty).expect("serialises");
     match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
         JournalEvent::LoopGateDecided { option, actor, .. } => {
             assert_eq!(option, "again");
-            assert!(actor.is_none());
+            assert_eq!(actor, "", "an empty actor is preserved, never re-labelled");
         }
         other => panic!("wrong variant: {other:?}"),
     }
 }
 ```
+
+> **Corrected during Task 5 — `actor` is a required `String`, not an `Option<String>`.** The
+> version Task 3 shipped had `actor: Option<String>`, following design §4, which specified it
+> and never argued for it. It contradicts the reasoning the same spec uses in §3's "Expiry vs
+> decision" row: reading expiry before the decision is justified on the ground that answering
+> `continue` **authorizes another iteration of spend**, which is an approval in the strict sense
+> s2 built its ordering for — and s2 made `GateDecided.actor` a required `String` precisely
+> because an approval always records who claimed to give it. Narrowed while nothing yet wrote
+> the event (Task 6 is the first writer), so no journal holds a `None` to migrate. The
+> actor-less round-trip case the draft carried asserted that an anonymous decision is a legal
+> shape; that premise is what the narrowing removes, so it is REPLACED above (not deleted) by
+> the two properties that survive: an absent `actor` must fail to decode, and `""` must
+> round-trip verbatim. Design §4 records the same reasoning.
 
 **Mutation-prove it before moving on.** Apply `#[serde(skip)]` to each of the three fields in
 turn and confirm the test reddens each time; the draft above did not. This is a standing
@@ -702,7 +727,8 @@ The variants themselves:
     LoopGateDecided {
         node: NodeId,
         option: String,
-        actor: Option<String>,
+        // REQUIRED, not `Option<String>` — see the correction blockquote in Step 1.
+        actor: String,
     },
 ```
 
@@ -817,12 +843,12 @@ fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision(
         (3, JournalEvent::LoopGateDecided {
             node: node.clone(),
             option: "again".into(),
-            actor: Some("a".into()),
+            actor: "a".into(),
         }),
         (4, JournalEvent::LoopGateDecided {
             node: node.clone(),
             option: "done".into(),
-            actor: Some("b".into()),
+            actor: "b".into(),
         }),
     ];
     let (fold, _, _) = fold_journal(&events);
@@ -845,30 +871,41 @@ fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision(
         "FIRST prompt wins"
     );
     let decision = fold.loop_gate_decision_for(&node).expect("decision folded");
-    assert_eq!(decision.actor.as_deref(), Some("b"), "LAST decision wins");
+    assert_eq!(decision.actor, "b", "LAST decision wins");
     assert_eq!(decision.option, "done", "LAST decision's option, not the first");
 }
 
-/// `LoopGateDecision::actor` is an `Option` where its s2/s3 siblings are a `String`, and
-/// the `Option` is the only thing separating "nobody said who" from "somebody claimed to
-/// be the empty string". Fold two nodes so the two states stay distinguishable — an
-/// `unwrap_or_default()` in the arm invents an attribution nobody made.
+/// The fold copies `actor` VERBATIM and never launders a degenerate one.
+///
+/// REPLACES `a_loop_gate_decision_without_an_actor_folds_as_none_not_as_empty`, whose
+/// premise (`None` vs `Some("")`) the Task 5 narrowing removed — see Task 3 Step 1.
+/// What survives is not automatic: `""` is still expressible, and a "helpful" fold —
+/// `if actor.is_empty() { "unknown".into() }` — would mirror what `cmd::gate::actor_or`
+/// legitimately does at the WRITE side. Doing it HERE is laundering: a row that reads
+/// `""` (the CLI was bypassed) would display identically to one written THROUGH
+/// `actor_or` (the operator could not be named), collapsing two different failures into
+/// one audit line.
 #[test]
-fn a_loop_gate_decision_without_an_actor_folds_as_none_not_as_empty() {
-    let anonymous = NodeId("lp/0/__gate__".into());
-    let claimed_empty = NodeId("lp/1/__gate__".into());
+fn a_loop_gate_decisions_actor_folds_verbatim_including_an_empty_one() {
+    let claimed_empty = NodeId("lp/0/__gate__".into());
+    let named = NodeId("lp/1/__gate__".into());
     let (fold, _, _) = fold_journal(&[
         (1, JournalEvent::LoopGateDecided {
-            node: anonymous.clone(), option: "done".into(), actor: None,
+            node: claimed_empty.clone(), option: "done".into(), actor: String::new(),
         }),
+        // Stores the exact string the laundering bug would invent, so the assertion
+        // above is non-vacuous: a substituting fold makes the two nodes agree.
         (2, JournalEvent::LoopGateDecided {
-            node: claimed_empty.clone(), option: "done".into(), actor: Some(String::new()),
+            node: named.clone(), option: "done".into(), actor: "unknown".into(),
         }),
     ]);
-    assert!(fold.loop_gate_decision_for(&anonymous).expect("decided").actor.is_none());
     assert_eq!(
-        fold.loop_gate_decision_for(&claimed_empty).expect("decided").actor.as_deref(),
-        Some(""),
+        fold.loop_gate_decision_for(&claimed_empty).expect("decided").actor, "",
+        "never re-labelled `unknown` — that is what a WRITER through `actor_or` stores",
+    );
+    assert_eq!(
+        fold.loop_gate_decision_for(&named).expect("decided").actor, "unknown",
+        "…and the two stay distinguishable from each other",
     );
 }
 
@@ -941,7 +978,12 @@ and the two records, beside `AgentAnswer`/`GateDecision`:
 pub(super) struct LoopGateDecision {
     pub(super) option: String,
     /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::LoopGateDecided`.
-    pub(super) actor: Option<String>,
+    ///
+    /// A required `String`, the SAME shape as `GateDecision::actor` and
+    /// `AgentAnswer::actor`. The fold cannot widen or narrow it: the event's own field
+    /// is required (Task 5 narrowing — see Task 3 Step 1), so there is no "nobody said
+    /// who" state left for the side-map to represent.
+    pub(super) actor: String,
 }
 
 /// SP-6 s4: a folded `LoopGateAwaited` — what the human was shown.
@@ -1268,7 +1310,7 @@ async fn a_stopping_decision_converges_the_loop() {
         .append(run_id(), JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "ship".into(),
-            actor: Some("jerry".into()),
+            actor: "jerry".into(),
         })
         .await
         .expect("decision lands");
@@ -1290,7 +1332,7 @@ async fn a_continuing_decision_runs_another_iteration_that_asks_again() {
         .append(run_id(), JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "revise".into(),
-            actor: None,
+            actor: "jerry".into(),
         })
         .await
         .expect("decision lands");
@@ -1325,7 +1367,7 @@ async fn max_iters_bounds_a_human_who_keeps_continuing() {
             .append(run_id(), JournalEvent::LoopGateDecided {
                 node: NodeId(format!("lp/{i}/__gate__")),
                 option: "revise".into(),
-                actor: None,
+                actor: "jerry".into(),
             })
             .await
             .expect("decision lands");
@@ -1529,7 +1571,7 @@ async fn a_decision_after_the_deadline_does_not_continue_the_loop() {
         .append(run_id(), JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "revise".into(),
-            actor: Some("late".into()),
+            actor: "late".into(),
         })
         .await
         .expect("decision lands late");
@@ -1569,7 +1611,7 @@ async fn a_fired_loop_gate_expiry_is_terminal_and_appends_no_second_failure() {
         .append(run_id(), JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "ship".into(),
-            actor: Some("too-late".into()),
+            actor: "too-late".into(),
         })
         .await
         .expect("lands");
@@ -1642,7 +1684,7 @@ async fn a_decision_naming_an_unknown_option_fails_the_loop_gate() {
         .append(run_id(), JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "sideways".into(),
-            actor: None,
+            actor: "jerry".into(),
         })
         .await
         .expect("lands");
@@ -1924,7 +1966,7 @@ async fn a_decided_loop_gate_replays_from_the_journal_without_re_asking() {
         .append(run_id(), JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "ship".into(),
-            actor: None,
+            actor: "jerry".into(),
         })
         .await
         .expect("lands");
@@ -1982,17 +2024,27 @@ call; the pure part is recomputed from the journaled option name."
 
 `gate_menu` (`gate.rs:716`) already reads the menu from the **journal**, which is why this extends rather than rewrites.
 
-> **Carried forward from Task 3's review — settle it in Step 3, do not let it drift.**
-> `LoopGateDecided.actor` is `Option<String>` where `GateDecided.actor` is a required `String`,
-> and the asymmetry has no semantic justification: a loop gate's decider is exactly as
-> attributable as a `HumanGate`'s, and s2 deliberately made a blank audit row unrepresentable
-> via `actor_or`/`actor_or_user` ("an unresolvable actor is named `unknown`"). Two consequences
-> for THIS task: (a) the shared decide path must route the loop-gate branch through
-> `actor_or_user` too, so no torii-written row is ever `None`; (b) the field-type difference is
-> the one thing the "factor it over the option NAMES" sharing in Step 3 cannot absorb, so budget
-> for a `.map(Some)` at the append rather than discovering it mid-refactor. If the shared path
-> turns out to want them identical, promoting the field to `String` is a **journal shape change**
-> — cheap only while nothing has written the event — and needs the spec (§4) updated with it.
+> **SETTLED during Task 5 — was "carried forward from Task 3's review".** The question this
+> note used to pose (should `LoopGateDecided.actor` stay `Option<String>` where
+> `GateDecided.actor` is a required `String`?) is closed: it was promoted to `String`, because
+> the asymmetry had no semantic justification — a loop gate's decider is exactly as attributable
+> as a `HumanGate`'s, and s2 deliberately made a blank audit row unrepresentable via
+> `actor_or`/`actor_or_user` ("an unresolvable actor is named `unknown`"). It was done then
+> rather than here because it is a **journal shape change**, cheap only while nothing has
+> written the event, and Task 6 is the first writer. Spec §4 and Task 3 carry the reasoning.
+>
+> What that leaves for THIS task is narrower but not gone, and both halves still bind:
+> **(a)** the shared decide path must route the loop-gate branch through `actor_or_user` too.
+> This is now the ONLY thing standing between an operator and a blank audit row: the `Option`
+> at least made "nobody said who" legible as such, whereas a `String` that skipped the resolver
+> would journal clap's empty default as a silent `""`, indistinguishable at a glance from a
+> real name. `decide` (`gate.rs:238`) already takes `actor: &str` and `main.rs:450` already
+> resolves it, so the branch inherits this by staying inside that signature — the failure mode
+> is a *second* append site added beside it, not the existing one.
+> **(b)** the field-type difference is no longer an obstacle to the "factor it over the option
+> NAMES" sharing in Step 3, which is the point of having done it: the two events' `actor` fields
+> are now the same type, so the shared path needs no `.map(Some)` and no per-kind branch for
+> attribution at all.
 
 - [ ] **Step 1: Write the failing tests (AC17, AC18)**
 
@@ -2276,7 +2328,7 @@ async fn the_loop_gate_menu_is_read_from_the_journal_not_the_graph() {
         .append(run_id(), JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "ship".into(),
-            actor: None,
+            actor: "jerry".into(),
         })
         .await
         .expect("lands");

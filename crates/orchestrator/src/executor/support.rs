@@ -1205,7 +1205,7 @@ mod tests {
                 JournalEvent::LoopGateDecided {
                     node: node.clone(),
                     option: "again".into(),
-                    actor: Some("a".into()),
+                    actor: "a".into(),
                 },
             ),
             (
@@ -1213,7 +1213,7 @@ mod tests {
                 JournalEvent::LoopGateDecided {
                     node: node.clone(),
                     option: "done".into(),
-                    actor: Some("b".into()),
+                    actor: "b".into(),
                 },
             ),
         ];
@@ -1256,7 +1256,7 @@ mod tests {
             "FIRST prompt wins"
         );
         let decision = fold.loop_gate_decision_for(&node).expect("decision folded");
-        assert_eq!(decision.actor.as_deref(), Some("b"), "LAST decision wins");
+        assert_eq!(decision.actor, "b", "LAST decision wins");
         // The OPTION as well as the actor: it is what Task 6 matches against the journaled
         // menu, so a decision that folds without its name is a decision no arm can honour.
         // The two decisions name DIFFERENT options on purpose — with one option this
@@ -1267,49 +1267,64 @@ mod tests {
         );
     }
 
-    /// `LoopGateDecision::actor` is an `Option` where its s2/s3 siblings are a `String`,
-    /// and the `Option` is the only thing that distinguishes "nobody said who" from
-    /// "somebody claimed to be the empty string". This pins that distinction: an operator
-    /// reads this field to decide whether to trust a decision, so folding a missing actor
-    /// to `""` — `actor.clone().unwrap_or_default()` — would silently invent an
-    /// attribution nobody made.
+    /// The fold copies `actor` VERBATIM and never launders a degenerate one.
+    ///
+    /// This replaces a test that pinned the `Option`-shaped distinction between "nobody
+    /// said who" (`None`) and "somebody claimed to be the empty string" (`Some("")`).
+    /// That premise is gone: `LoopGateDecided.actor` is now a required `String`, because
+    /// a loop-gate decision is an approval — answering `continue` authorizes another
+    /// iteration of spend — and an approval always records who claimed to give it. There
+    /// is no unattributed state left to distinguish.
+    ///
+    /// What survives is worth keeping, because the narrowing did not make it automatic.
+    /// `""` is still expressible, and a plausible-looking "helpful" fold — `if
+    /// actor.is_empty() { "unknown".into() }` — would mirror what torii's
+    /// `cmd::gate::actor_or` legitimately does at the WRITE side. Doing it HERE instead
+    /// is a laundering bug: it makes a journal row that literally reads `""` display as
+    /// `unknown`, which is precisely what a row written THROUGH `actor_or` (an operator
+    /// whose `$USER` was unresolvable) also displays as. Two different failures — the CLI
+    /// was bypassed, versus the CLI could not name the operator — would become one
+    /// indistinguishable audit line, and the fold is where a run's history stops being
+    /// re-derivable from the journal.
     #[test]
-    fn a_loop_gate_decision_without_an_actor_folds_as_none_not_as_empty() {
-        let anonymous = NodeId("lp/0/__gate__".into());
-        let claimed_empty = NodeId("lp/1/__gate__".into());
+    fn a_loop_gate_decisions_actor_folds_verbatim_including_an_empty_one() {
+        let claimed_empty = NodeId("lp/0/__gate__".into());
+        let named = NodeId("lp/1/__gate__".into());
         let (fold, _, _) = fold_journal(&[
             (
                 1,
                 JournalEvent::LoopGateDecided {
-                    node: anonymous.clone(),
+                    node: claimed_empty.clone(),
                     option: "done".into(),
-                    actor: None,
+                    actor: String::new(),
                 },
             ),
             (
                 2,
                 JournalEvent::LoopGateDecided {
-                    node: claimed_empty.clone(),
+                    node: named.clone(),
                     option: "done".into(),
-                    actor: Some(String::new()),
+                    actor: "unknown".into(),
                 },
             ),
         ]);
 
-        assert!(
-            fold.loop_gate_decision_for(&anonymous)
-                .expect("decided")
-                .actor
-                .is_none(),
-            "a caller that supplied no `--as` folds as None — never as Some(\"\")"
-        );
         assert_eq!(
             fold.loop_gate_decision_for(&claimed_empty)
                 .expect("decided")
-                .actor
-                .as_deref(),
-            Some(""),
-            "…and the two states stay distinguishable from each other"
+                .actor,
+            "",
+            "an empty actor folds as the empty string — never re-labelled `unknown`, \
+             which is what a WRITER that routed through `actor_or` would have stored"
+        );
+        // The sibling is the half that makes the assertion above non-vacuous: it stores
+        // the exact string the laundering bug would have invented, so a fold that
+        // substituted would make the two nodes agree, and this pins that they do not.
+        assert_eq!(
+            fold.loop_gate_decision_for(&named).expect("decided").actor,
+            "unknown",
+            "…and a genuinely-`unknown` actor is still stored as written, so the two \
+             stay distinguishable from each other"
         );
     }
 
