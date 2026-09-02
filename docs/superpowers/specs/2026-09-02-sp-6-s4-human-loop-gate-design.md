@@ -227,6 +227,22 @@ wants one decision for the whole loop does not have that here (§2, non-goals).
 **`actor` is attribution, never authentication.** Inherited from s2 verbatim: it must not be
 branched on, and nothing in this slice does.
 
+**An untrusted planner can author a `GateSpec::Human`, and `feasible` will accept it.**
+Found during Task 1's review, not at design time. `plan::feasible` validates a planner's
+`plan.graph` — a full `Graph` — through `validate_dag`, and neither rejects a `Loop` whose
+gate is `Human`. So a planner model can splice a node that asks a person a question. That is
+**not** a new capability of this slice and not a reason to gate it: a planner could already
+splice a `HumanGate` node, and the SP-6 s3 refusal it *cannot* get past — a human-backed
+role at an illegal `drive_agent` position — is unchanged here.
+
+What it did change is the cost of getting the temporary state wrong. Between Task 1 and
+Task 7 the gate arm is a stub, and had that stub been the `unreachable!` the plan originally
+specified, a planner's output could have **panicked the worker** — model-controlled, through
+`Scheduler::tick`, stranding the claimed lease and re-killing every subsequent wake. It is a
+`fail_loop` instead, so the worst case is a loud run-scoped failure. Recorded here because
+"an untrusted planner reaches this" is the right first question for any new node behaviour,
+and this slice's answer is yes.
+
 ## 8. Acceptance criteria
 
 1. `GateSpec::Human { agent, menu }` and `LoopGateOption { name, stops }` exist; a graph using

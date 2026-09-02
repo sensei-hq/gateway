@@ -1,7 +1,7 @@
 # Checkpoint
 
-**Slice: SP-6 s4 — the human loop gate.** Spec (`1633a96`) and plan (`f7641c1`) written,
-committed, approved. **NO CODE YET — task 1 of 14 is next.**
+**Slice: SP-6 s4 — the human loop gate.** Spec (`1633a96`) and plan (`f7641c1`) approved.
+**Task 1 of 14 DONE** (`91e3bbc` + `6a378f5`), both reviews closed. Task 2 is next.
 
 Everything through SP-6 + its follow-through is on `main` (PR #49, `78c5138`, 2026-09-02);
 `develop` is ahead by docs only. CI-verified on run 33636750338 that the PG suites really
@@ -27,13 +27,15 @@ and expiry ordering (task 8) — the latter reddens if the arm is "simplified" i
 
 ## Next command
 
+Task 2 — `validate_dag` rejects a human loop gate that cannot converge:
+
 ```
-cargo test -p sensei-orchestrator-core a_human_gate_spec_round_trips_through_serde
+cargo test -p sensei-orchestrator-core human_loop_gate
 ```
 
-Expect a COMPILE ERROR — that is the red. The new variant breaks the one exhaustive
-`match` on `GateSpec` (`fanout.rs`); add task 1 step 6's temporary `unreachable!` arm,
-delete it in task 7.
+Expect 6 failures. `fanout.rs` carries a temporary `fail_loop` STUB arm (not a panic —
+`GateSpec::Human` is reachable from untrusted planner output, and a panic there poisons
+the worker through `Scheduler::tick`). Task 7 deletes it.
 
 ## Known-broken
 
