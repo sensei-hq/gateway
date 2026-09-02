@@ -2253,6 +2253,15 @@ mod tests {
     /// (`AwaitSignal`'s "a human answers", `HumanGate`'s bullet), and a bare
     /// `doc.contains` would have been GREEN before this slice wrote a word.
     ///
+    /// **The bound is an explicit MARKER PAIR in the markdown, not a heuristic.** It was
+    /// first written as "up to the next blank blockquote line", which the doc's own growth
+    /// then stretched to a 3.8 KB span covering three further paragraphs about human loop
+    /// gates — re-creating the `doc.contains` weakness the paragraph above rejects, since
+    /// any one of those sentences mentioning `` `Human` `` would keep the guard green with
+    /// the enumeration sentence silently emptied. A comment pair cannot drift that way, and
+    /// it tells the next author writing in this blockquote which side of the line to write
+    /// on.
+    ///
     /// Only rule 1 (the enumeration) applies. There is no per-gate-kind bullet convention
     /// to hold a variant to — the gate kinds are documented inside the `Loop` paragraph,
     /// which is where an author reading about loops will be.
@@ -2288,15 +2297,22 @@ mod tests {
         );
 
         let doc = include_str!("../../../docs/features/orchestrator/execution-graph.md");
-        // The enumeration, bounded to its own markdown paragraph. Everything after it in
-        // the same blockquote is about what a gate DOES, not about which kinds exist.
+        // The enumeration, bounded by the marker pair the page carries for exactly this
+        // purpose. Everything outside it in the same blockquote is about what a gate DOES,
+        // not about which kinds exist — and only the markers keep that distinction from
+        // eroding as the page grows.
         let enumeration = doc
-            .split_once("**`GateSpec`** is")
-            .expect("the feature doc still enumerates the gate kinds")
+            .split_once("<!-- gate-spec-enumeration -->")
+            .expect("the feature doc still marks where the gate-kind enumeration starts")
             .1
-            .split("\n>\n")
-            .next()
-            .expect("the enumeration paragraph ends");
+            .split_once("<!-- /gate-spec-enumeration -->")
+            .expect("…and where it ends")
+            .0;
+        assert!(
+            enumeration.contains("**`GateSpec`** is"),
+            "the markers must bracket the enumeration SENTENCE, not some other prose: \
+             {enumeration}"
+        );
 
         // A backticked name whose next character is non-alphanumeric, so `` `Pure(LoopGate)` ``
         // documents `Pure` while `` `HumanGate` `` — a DIFFERENT node kind this page also

@@ -529,6 +529,49 @@ pub enum JournalEvent {
         option: String,
         actor: String,
     },
+    /// SP-6 s4: a drive HONOURED a loop gate's decision while that gate was still live —
+    /// the durable half of "the decision was made in time".
+    ///
+    /// **It exists because a `Loop` re-derives every iteration's gate on every drive, and
+    /// the SLA is per-GATE while the clock is global.** `run_loop` re-enters
+    /// `for i in 0..max_iters` from zero on each wake, so iteration 0's gate is
+    /// recomputed forever; `wait_or_expire_by_id` answers only from `now >= recorded
+    /// deadline`, and knows nothing about a decision an earlier drive already read,
+    /// honoured and spent an iteration against. Without this row, the moment wall-clock
+    /// passed the FIRST gate's deadline the whole `Loop` died — even though every person
+    /// had answered inside their own gate's SLA — taking every earlier iteration's tokens
+    /// with it, unrecoverably. Reproduced twice by review: a 3-iteration loop whose
+    /// operator answered at +30m and +70m under a 1h SLA, and a loop that had already
+    /// CONVERGED and was retroactively killed a day later when a downstream signal woke
+    /// the run.
+    ///
+    /// It is the SUCCESS mirror of the `NodeFailed` the expiry path writes, and it is
+    /// written for the same reason: a verdict is settled by the drive that produces it and
+    /// READ BACK afterwards, never re-derived against a moving clock. The alternative —
+    /// reading the decision before the deadline — is the s3 ordering this slice
+    /// deliberately inverts (§3, "Expiry vs decision"), and it reopens the hole AC8 exists
+    /// for: a "continue" arriving after the SLA would authorize another iteration of
+    /// spend. Ordering the row this way keeps both properties at once, because an
+    /// UNSETTLED gate still meets the clock first.
+    ///
+    /// `option` is the name that was honoured, and the replay resolves THAT against the
+    /// journaled menu rather than re-reading `LoopGateDecided`. The difference is
+    /// deliberate and narrow: `LoopGateDecided` is folded LAST-wins so an operator can
+    /// correct a decision *before the run resumes*, and this row is exactly the line
+    /// after which "before" has passed — the loop has already spent an iteration on the
+    /// strength of the answer, so a later correction must not retroactively move where
+    /// the loop converged.
+    ///
+    /// FIRST record wins when folded. The executor writes at most one (it reads the row
+    /// back ahead of everything that could write another), so a second can only come from
+    /// a journal the executor did not write, and the first is the one that describes what
+    /// actually happened.
+    ///
+    /// Additive, like the pair above: `FORMAT_VERSION` stays 1.
+    LoopGateSettled {
+        node: NodeId,
+        option: String,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
@@ -979,14 +1022,16 @@ mod tests {
     /// this doc claimed "the existing variant-count assertion in this module" did; there
     /// is no such assertion. The `variants.len() > 10` check in
     /// `no_doc_comment_links_a_journal_event_variant_by_its_bare_name` is a LOWER bound
-    /// that guards its own scrape against silently finding nothing, and 23 variants
+    /// that guards its own scrape against silently finding nothing, and 24 variants
     /// against a bound of 10 cannot detect one more. `fold_journal`
     /// (`orchestrator::executor::support`) carries a `_` catch-all and absorbs an
     /// unknown variant silently. The one real detector is the exhaustive `label` helper
     /// in `crates/orchestrator/src/executor/tests.rs` — and being `#[cfg(test)]`, it is
     /// invisible to `cargo build --workspace`; only `--all-targets` compiles it.
-    /// (Verified: with its two loop-gate arms deleted, `cargo build --workspace` exits 0
-    /// while `cargo check --workspace --all-targets` exits 101 with one `E0004`.)
+    /// (Verified: with its three loop-gate arms deleted, `cargo build --workspace` exits 0
+    /// while `cargo check --workspace --all-targets` exits 101 with one `E0004`. It earned
+    /// its keep again when the s4 review added `LoopGateSettled`: that arm was the single
+    /// compile error the whole `--all-targets` build produced.)
     #[test]
     fn the_durable_journal_format_version_is_pinned_at_1() {
         assert_eq!(
@@ -999,8 +1044,9 @@ mod tests {
         );
     }
 
-    /// The two variants round-trip, carrying everything an operator needs to see the
-    /// question, the menu, the deadline and the decision off the journal alone.
+    /// The THREE variants round-trip, carrying everything an operator needs to see the
+    /// question, the menu, the deadline and the decision off the journal alone — plus, for
+    /// the executor, which decision a drive already HONOURED.
     ///
     /// Every field is asserted BY VALUE, and that is the point of the test rather than
     /// pedantry. The version this slice first shipped asserted the decided half with
@@ -1111,6 +1157,26 @@ mod tests {
             JournalEvent::LoopGateDecided { option, actor, .. } => {
                 assert_eq!(option, "again");
                 assert_eq!(actor, "", "an empty actor is preserved, never re-labelled");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // The settlement, whose `option` is the field the whole variant exists to carry:
+        // it is what the replay resolves against the journaled menu, so a value lost on
+        // the wire becomes `""`, matches nothing in any menu, and turns a settled gate
+        // into a terminal `NodeFailed` — killing a `Loop` that had already succeeded, on
+        // the very resume path the variant was added to protect. Asserted BY VALUE for
+        // the reason the two above are, and mutation-proven the same way
+        // (`#[serde(skip)]` on `option` reddens this).
+        let settled = JournalEvent::LoopGateSettled {
+            node: NodeId("lp/0/__gate__".into()),
+            option: "again".into(),
+        };
+        let json = serde_json::to_string(&settled).expect("serialises");
+        match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
+            JournalEvent::LoopGateSettled { node, option } => {
+                assert_eq!(node.0, "lp/0/__gate__");
+                assert_eq!(option, "again");
             }
             other => panic!("wrong variant: {other:?}"),
         }

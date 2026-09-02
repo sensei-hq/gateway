@@ -50,9 +50,14 @@ pub(super) enum WaitState {
 }
 
 impl Executor {
-    /// Arm 0 of §6.2, shared by BOTH waiting node kinds: a folded `NodeFailed` for this
-    /// node is TERMINAL, read back rather than re-derived, and — this is the load-bearing
-    /// part — checked BEFORE the caller reads its answer.
+    /// Arm 0 of §6.2: a folded `NodeFailed` for this node is TERMINAL, read back rather
+    /// than re-derived, and — this is the load-bearing part — checked BEFORE the caller
+    /// reads its answer.
+    ///
+    /// Shared by ALL FOUR waiting node kinds: `AwaitSignal` (s1) and `HumanGate` (s2)
+    /// through this `&Node` form, the human-backed `Agent` (s3) and the human LOOP GATE
+    /// (s4) through the `_by_id` and `gate_failure_by_id` forms below, which are the same
+    /// read of the same map.
     ///
     /// **Whole-slice review, Important.** `fold_journal` originally had no `NodeFailed`
     /// arm, so an expired gate was not terminal on resume, with two consequences, the
@@ -91,10 +96,13 @@ impl Executor {
         self.gate_precheck_by_id(&node.id, fold)
     }
 
-    /// [`Executor::gate_precheck`] over a bare [`NodeId`], and the ONE implementation of
-    /// it — the `&Node` form above is a two-line delegation.
+    /// [`Executor::gate_precheck`] over a bare [`NodeId`] — a WRAPPER, since SP-6 s4, over
+    /// [`Executor::gate_failure_by_id`] below, which is the family's one implementation.
+    /// (It was itself that implementation until s4 needed the verdict as a bare message;
+    /// the `&Node` form above has always been a two-line delegation to this one.)
     ///
-    /// The split exists because SP-6 s3's human-backed `Agent` node is reached through
+    /// The `&NodeId`-vs-`&Node` split is the part that still lives here, and it exists
+    /// because SP-6 s3's human-backed `Agent` node is reached through
     /// `drive_agent`, which holds only a `&NodeId`: a `Map`/`Loop` child runs at the
     /// synthesized path `"{map}/{i}"`, which is a node id with no `Node` anywhere in the
     /// graph to correspond to it. Every word of the doc comment above applies here
@@ -229,7 +237,10 @@ impl Executor {
         }
     }
 
-    /// The durable pause both waiting kinds end on.
+    /// The durable pause ALL FOUR waiting kinds end on — `run_await_signal` (s1),
+    /// `run_human_gate` (s2) and `run_human_agent` (s3) directly, and s4's
+    /// `run_human_loop_gate` through its own `pause_gate` wrapper, which adds the menu to
+    /// the reason and echoes the same string back as a `LoopGateStep`.
     ///
     /// `resume_after` carries the ORIGINAL absolute deadline (not `now + timeout`), so the
     /// durable scheduler re-arms on the same instant however many times the run is woken

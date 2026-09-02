@@ -138,6 +138,21 @@ struct Fold {
     memo: HashMap<EffectId, (String, EffectOutput)>,
     started: std::collections::HashSet<NodeId>,
     completed: std::collections::HashSet<NodeId>,
+    /// The nodes whose `NodeSkipped` is already journaled, so
+    /// [`cascade_skip_from`](Executor::cascade_skip_from) appends each at most once across
+    /// resumes.
+    ///
+    /// The counterpart of `started`/`completed`, and it exists for the same bounded-growth
+    /// reason the SP-6 s4 review found at the `Loop`: a run whose node FAILED terminally
+    /// journals no `RunCompleted`, so it stays resumable and every later wake re-drives it,
+    /// re-fails it and re-cascades. `DriveState.terminal` bounds the cascade WITHIN one
+    /// drive — that is the "each node is skipped at most once" its doc means — and nothing
+    /// bounded it ACROSS drives, so a dead run appended one `NodeSkipped` per hard
+    /// dependent per wake, forever (measured 1 / 2 / 3 rows over three drives).
+    ///
+    /// `RunOutcome.skipped` is unaffected: the in-process outcome still reports every
+    /// cascade-skipped node on every drive. Only the durable append is guarded.
+    skipped: std::collections::HashSet<NodeId>,
     /// Effect ids that journaled an `EffectIntent` → the journaled idempotency key
     /// (§7.3, SP-4 s5). An id here with no matching `EffectRecorded` is in-doubt on
     /// resume; reconcile queries the provider by THIS key.
@@ -243,6 +258,24 @@ struct Fold {
     /// read together by the same arm; splitting them would allow a state where one is
     /// present and the other is not, which no writer can produce.
     loop_gate_asks: HashMap<NodeId, LoopGateAsk>,
+    /// SP-6 s4: the option each loop gate was HONOURED with, from `LoopGateSettled`.
+    /// FIRST wins — the executor writes at most one, and the first is the one that
+    /// happened.
+    ///
+    /// The success mirror of [`Fold::failed`], and read for the same reason: a loop gate's
+    /// verdict must be settled by the drive that produced it and READ BACK afterwards,
+    /// never re-derived. `run_loop` recomputes every iteration's gate on every drive, so
+    /// without this map a decision honoured inside its SLA was re-checked against a clock
+    /// that had since passed the deadline — and the whole `Loop` died. See the event's own
+    /// doc for the two reproductions.
+    ///
+    /// It carries the option NAME rather than the resolved `bool`, so the replay resolves
+    /// it against the journaled menu exactly as the live path did (§5.7: the pure part is
+    /// recomputed, never carried). What it deliberately does NOT do is re-read
+    /// [`Fold::loop_gate_decisions`], whose LAST-wins rule lets an operator correct a
+    /// decision *before the run resumes*: this row is the line after which "before" has
+    /// passed.
+    loop_gate_settlements: HashMap<NodeId, String>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
     /// the shared arm 0 of the WAITING node kinds, for which a failure is TERMINAL (an
@@ -258,9 +291,19 @@ struct Fold {
     /// step 0) — which is that same body again, one wrapper further in, because a loop
     /// gate's step type is not a `NodeExec`. Five callers, still ONE reader.
     ///
-    /// It is deliberately not consulted anywhere else, and the fence is on the READER, not
-    /// on the caller count — which is why the count growing is not a loosening: a further
-    /// node kind may read this map only by being a waiting kind that calls `gate_precheck`
+    /// **There is now a second reader, and it is a different question.**
+    /// [`fail_loop`](Executor::fail_loop) (SP-6 s4 review) asks whether the `Loop`'s own
+    /// `NodeFailed` is ALREADY DURABLE, so that its append is idempotent — a dead run
+    /// otherwise grew a row per wake. It makes no terminality claim whatsoever: the `Loop`
+    /// fails on this drive's own verdict either way, and the map decides only whether a row
+    /// is written. That is why it is not a loosening of the fence below, which is about
+    /// which kinds may treat a recorded failure as FINAL. Any third reader owes the same
+    /// distinction explicitly.
+    ///
+    /// The fence is on the READER, not on the caller count — which is why the count growing
+    /// is not a loosening: a further
+    /// node kind may read this map AS A VERDICT only by being a waiting kind that calls
+    /// `gate_precheck`
     /// first. A `NodeFailed` does not make a node terminal in general: a `ModelCall` or
     /// `Agent` node whose provider died journals one and
     /// RE-ATTEMPTS on the next drive, which is the documented resume contract (see
@@ -411,8 +454,13 @@ impl Fold {
     }
 
     /// SP-6 s1: the failure this node already journaled, if any — see [`Fold::failed`] for
-    /// why only [`gate_precheck`](Executor::gate_precheck), on behalf of the two waiting
-    /// node kinds, may act on it.
+    /// why only [`gate_precheck`](Executor::gate_precheck) and its `_by_id` forms, on
+    /// behalf of the four waiting node kinds, may ACT on it.
+    ///
+    /// [`fail_loop`](Executor::fail_loop) reads it too, since SP-6 s4, and does not act on
+    /// it: it asks only whether the `Loop`'s own `NodeFailed` is already durable, so that
+    /// the append is idempotent. The fence on `Fold::failed` is about TERMINALITY, and that
+    /// read makes no terminality claim — see `fail_loop`'s own doc.
     fn failure_for(&self, node: &NodeId) -> Option<&str> {
         self.failed.get(node).map(String::as_str)
     }
@@ -548,8 +596,30 @@ impl Fold {
     ///
     /// Task 6's `run_human_loop_gate` is that reader, so Task 4's `expect(dead_code)` is
     /// gone — see [`Fold::loop_gate_menu_for`].
+    ///
+    /// It is read on the LIVE path only. Once a drive has honoured the answer the replay
+    /// reads [`Fold::loop_gate_settled_with`] instead, which is what bounds this map's
+    /// LAST-wins rule: a correction wins up to the drive that acts on it, and not after.
     fn loop_gate_decision_for(&self, node: &NodeId) -> Option<&LoopGateDecision> {
         self.loop_gate_decisions.get(node)
+    }
+
+    /// SP-6 s4: the option a loop gate was HONOURED with, or `None` if no drive has
+    /// honoured it yet.
+    ///
+    /// Read FIRST by `run_human_loop_gate` — ahead of the clock, and for the same reason
+    /// [`gate_precheck`](Executor::gate_precheck) is read ahead of the answer: a verdict
+    /// that has already been reached is READ BACK, never re-derived. `Some` means a drive
+    /// resolved this gate while it was still live, so its recorded deadline has no further
+    /// say; `None` means the gate is still live, and the deadline decides.
+    ///
+    /// That split is what lets AC8 and §5.7 both hold. Reading the DECISION first instead
+    /// would satisfy §5.7 and break AC8 (a "continue" arriving after the SLA would
+    /// authorize another iteration of spend); reading the CLOCK first alone satisfies AC8
+    /// and breaks §5.7 (a settled gate dies of its own stale deadline). Only "settled, then
+    /// clock, then decision" satisfies both.
+    fn loop_gate_settled_with(&self, node: &NodeId) -> Option<&str> {
+        self.loop_gate_settlements.get(node).map(String::as_str)
     }
 }
 
@@ -1118,6 +1188,7 @@ impl Executor {
                     run,
                     graph,
                     &node.id,
+                    fold,
                     &mut state.terminal,
                     &mut state.outcome,
                 )
@@ -1144,13 +1215,26 @@ impl Executor {
     /// terminal set and to `RunOutcome.skipped` — and recurse into ITS
     /// hard-dependents (§3.3). `Soft` edges never cascade, so a soft-dependent
     /// of a failed/skipped node is left runnable. Deterministic in graph
-    /// declaration order; each node is skipped at most once (guarded by the
-    /// terminal set).
+    /// declaration order; each node is skipped at most once per drive (guarded by
+    /// the terminal set) and its `NodeSkipped` is appended at most once EVER
+    /// (guarded by [`Fold::skipped`]).
+    ///
+    /// **The fold guard is the across-drives half, and it was missing.** The terminal
+    /// set is per-drive, so a run whose node failed TERMINALLY — a fired human deadline,
+    /// which `gate_precheck` reads back forever — re-failed and re-cascaded on every
+    /// wake, appending a fresh `NodeSkipped` per hard dependent each time. Such a run
+    /// journals no `RunCompleted`, so it stays resumable and the growth is unbounded:
+    /// measured at 1 / 2 / 3 rows over three drives by the SP-6 s4 review, which found
+    /// the `Loop`'s own `NodeFailed` had just been bounded one edge in while this was
+    /// left growing. `RunOutcome.skipped` is deliberately NOT guarded — the in-process
+    /// outcome still reports what this drive skipped, which is what a caller asked for;
+    /// only the durable append is idempotent.
     async fn cascade_skip_from(
         &self,
         run: RunId,
         graph: &Graph,
         origin: &NodeId,
+        fold: &Fold,
         terminal: &mut std::collections::HashSet<NodeId>,
         outcome: &mut RunOutcome,
     ) -> Result<(), OrchestratorError> {
@@ -1165,13 +1249,15 @@ impl Executor {
                     .iter()
                     .any(|dep| dep.kind == orchestrator_core::EdgeKind::Hard && dep.on == current);
                 if hard_on_current {
-                    self.append(
-                        run,
-                        JournalEvent::NodeSkipped {
-                            node: node.id.clone(),
-                        },
-                    )
-                    .await?;
+                    if !fold.skipped.contains(&node.id) {
+                        self.append(
+                            run,
+                            JournalEvent::NodeSkipped {
+                                node: node.id.clone(),
+                            },
+                        )
+                        .await?;
+                    }
                     terminal.insert(node.id.clone());
                     outcome.skipped.push(node.id.clone());
                     frontier.push(node.id.clone());
