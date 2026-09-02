@@ -224,12 +224,22 @@ nor `completed`. Pre-existing, not new.
 
 ## 6. Bounds and safety
 
-- **The authored half** of the question fails loudly over `MAX_HUMAN_TEXT_BYTES` (4096).
+- **The authored half** of the question fails loudly over `MAX_HUMAN_TEXT_BYTES` (4096). For a gate
+  that half is the role's `system_prompt`, its activated skill bodies, and the synthesized `## Task`
+  ask (below) — all three author-controlled at config time, which is what makes a loud failure the
+  right answer.
 - **The `## Context` half** — the iteration's output, i.e. run data no operator can bound at config
   time — is **truncated** per dependency to `MAX_HUMAN_CONTEXT_BYTES` (32 KiB) with a visible
   marker. This is s3's whole-slice fix and it is load-bearing here: a loop gate's context is a model
   iteration's output essentially always, so charging one cap against both would kill the node on
   ordinary data, after the iteration's tokens were already spent.
+- **Which seam argument each half comes from is therefore part of the contract, not an
+  implementation detail.** `human_question_for(agent_ref, input, context)` puts `input` in
+  `## Task` and charges it to the loud cap; `context` becomes `## Context` and truncates. So
+  `run_human_loop_gate` passes the iteration output as a `context` entry and a short
+  menu-derived ask as `input` — the reverse kills the gate on ordinary data. Task 5's review
+  found the plan's Task 6 sketch written the reverse way, before it was executed; the rule is now
+  on the seam's own doc comment.
 - **Redaction before the durable write**, through the same chokepoint: the prompt, the failure
   messages, and `actor` (the leak s3's review caught on that exact field). Then clamp, because
   `[REDACTED]` is longer than the shortest span it replaces.

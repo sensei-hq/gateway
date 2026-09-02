@@ -19,15 +19,25 @@
 //! place for them to return.
 //!
 //! A new file rather than more of `agent.rs`, matching how s2 put `run_human_gate` in
-//! its own `gate.rs`: `agent.rs` is the model path and stays that.
+//! its own `gate.rs`: `agent.rs` is the model path and stays that. s4's shared seam,
+//! [`Executor::human_question_for`], is here for the same reason — it is wholly a
+//! human-path function, `drive_agent` merely calls it, and its second caller
+//! (`run_human_loop_gate`) is in this file. It landed in `agent.rs` first, next to the
+//! `assemble_prompt_parts` call it was extracted from, which put ~100 lines of human-path
+//! doc in the model path's file and left BOTH module headers describing a layout that no
+//! longer held; review caught it and it moved.
 
 use orchestrator_core::{
-    JournalEvent, MAX_HUMAN_CONTEXT_BYTES, MAX_HUMAN_TEXT_BYTES, NodeId, OrchestratorError, RunId,
+    AgentDefinition, AgentRef, ContextKey, JournalEvent, MAX_HUMAN_CONTEXT_BYTES,
+    MAX_HUMAN_TEXT_BYTES, NodeId, OrchestratorError, RunId,
 };
 
-use crate::agent::prompt::{render_context_section_bounded, truncate_prompt_to_bound};
+use crate::agent::prompt::{
+    assemble_prompt_parts, render_context_section_bounded, truncate_prompt_to_bound,
+};
 
 use super::signal::WaitState;
+use super::support::render_input;
 use super::{Executor, Fold, NodeExec};
 
 /// The question a human-backed node asks, carried as one string PLUS the count of its bytes
@@ -204,6 +214,126 @@ impl HumanQuestion {
 }
 
 impl Executor {
+    /// Resolve a human-backed `AgentRef` into the QUESTION to ask and the SLA to ask it
+    /// under — the seam `drive_agent`'s human branch (SP-6 s3) and `run_human_loop_gate`
+    /// (SP-6 s4) share.
+    ///
+    /// **It exists so s4 needs no second prompt builder.** s3's central property is that a
+    /// human's question is composed by the MODEL path's own [`assemble_prompt_parts`], so
+    /// the two cannot drift on what "the agent's prompt" means — s3 secured it by putting
+    /// its human branch INSIDE `drive_agent`, immediately after that call. s4's
+    /// `GateSpec::Human` cannot be routed the same way: it has no ReAct loop, no turns and
+    /// no `stop_when`, and threading a menu through `drive_agent` would put a parameter
+    /// there that every model caller must pass as `None`. Sharing this function keeps the
+    /// property without the coupling. `the_human_question_seam_composes_the_same_prompt_
+    /// the_model_path_would` is the guard: it computes `assemble_prompt_parts` itself and
+    /// requires the composed question to contain `parts.authored` VERBATIM, with an
+    /// INACTIVE skill's body absent — a hand-rolled second builder that concatenated every
+    /// declared skill, or joined them with a different separator, is what that reddens on.
+    ///
+    /// # Which half a caller's data belongs in
+    ///
+    /// The two parameters are NOT interchangeable, and picking wrong is a terminal
+    /// data-dependent node failure rather than a compile error:
+    ///
+    /// - **`input` is the ASK.** It becomes the `## Task` section and is counted in
+    ///   [`HumanQuestion`]'s `authored_bytes`, which [`Executor::run_human_agent`] checks
+    ///   against [`MAX_HUMAN_TEXT_BYTES`] (4096) with a LOUD, terminal `NodeFailed` — and
+    ///   which s4's gate arm checks the same way. So it must be AUTHOR-SCALE: a node input
+    ///   an operator wrote, or a short synthesized ask, never an upstream node's output. It
+    ///   is also the query `assemble_prompt_parts` evaluates every skill's and tool's
+    ///   `activation.is_active` against.
+    /// - **`context` is RUN DATA.** It becomes the `## Context` section, which
+    ///   `render_context_section_bounded` TRUNCATES per dependency to
+    ///   [`MAX_HUMAN_CONTEXT_BYTES`] (32 KiB) with a visible marker, and which
+    ///   `authored_bytes` deliberately excludes. Anything a model produced belongs here.
+    ///
+    /// That asymmetry is the s3 whole-slice review's central fix and it is load-bearing for
+    /// s4: a loop gate's context is a model iteration's output essentially always, so
+    /// passing that output as `input` would kill the gate on ordinary data — after the
+    /// iteration's tokens were already spent, and unrecoverably, since `gate_precheck_by_id`
+    /// reads the `NodeFailed` back on every later drive. `run_human_loop_gate` will
+    /// therefore pass the iteration output as a `context` entry and a short menu-derived ask
+    /// as `input`. Written down here because the s4 PLAN's own sketch of that call had the
+    /// two the wrong way round and review caught it before the task ran; design §6 and AC15
+    /// are the record.
+    ///
+    /// # Why the input is in the question at all
+    ///
+    /// `assemble_prompt_parts` takes `query` only to evaluate activation and never puts it
+    /// in `authored`. The model path supplies the input SEPARATELY, as the first user
+    /// message (`Message::text(MessageRole::User, query)`). So journaling the system string
+    /// alone showed the human the role's standing instructions and the upstream context but
+    /// NOT the thing being asked about — a reviewer role reading "say whether the contract
+    /// permits sub-processing" with no contract named. Design §5.4's rule is "the human sees
+    /// precisely what the model would have", and its accepted cost is explicitly
+    /// one-directional: never show the human LESS than the model would have had.
+    ///
+    /// The result is a type rather than a `format!` because the two halves must be bounded
+    /// by the two DIFFERENT rules above, and once they are concatenated that distinction is
+    /// unrecoverable. [`HumanQuestion::compose`] owns both and documents them.
+    ///
+    /// # The rest of the contract
+    ///
+    /// **The SLA comes back with the question** so no caller re-reads the registry to find
+    /// the deadline it must pause on. A second read is a second place for a role and its
+    /// SLA to come apart, which is the arrangement `AgentBacking::Human { timeout }` exists
+    /// to prevent.
+    ///
+    /// **Fails loudly on a MODEL-backed role**, which is unreachable from `drive_agent`
+    /// (its branch has already matched the backing) and is s4's case: an author naming a
+    /// model-backed role in a `GateSpec::Human`. Design §5.5 — silence there would let an
+    /// author believe a person is in the loop while the run quietly decides for itself, the
+    /// mirror of the refusal `drive_agent` gives a human-backed role at an illegal
+    /// position. The message names the role, the defect and the fix, because the only
+    /// person who can act on it is the one who wrote the config.
+    ///
+    /// **It ADDS no token spend** — it resolves no chain and touches no gateway. That is
+    /// not the same as guaranteeing zero spend on a caller's path, and this function cannot:
+    /// nothing stops a caller resolving a chain the line after. Each caller still owes the
+    /// STRUCTURAL placement — `drive_agent`'s human branch returns above `resolve_chain`
+    /// (guarded by the role's `chain: None`, so a mis-ordered branch reddens `mod
+    /// human_agent` wholesale), and s4's gate arm drives no agent at all. See the comment
+    /// at `drive_agent`'s branch, which is the authoritative statement for that caller.
+    ///
+    /// It returns `Err`, not a `NodeFailed`: it has no `RunId`, journals nothing, and its
+    /// two callers differ in what a failure means (s3's `?`-propagates as it always has;
+    /// s4's gate arm turns it into a `NodeFailed` that fails the `Loop`). Deciding that
+    /// here would take the choice away from the caller that owns it.
+    pub(super) fn human_question_for(
+        &self,
+        agent_ref: &AgentRef,
+        input: &serde_json::Value,
+        context: &[(ContextKey, serde_json::Value)],
+    ) -> Result<(HumanQuestion, Option<chrono::Duration>), OrchestratorError> {
+        let agent: &AgentDefinition = self
+            .registry
+            .agent(&agent_ref.0)
+            .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
+        let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by else {
+            return Err(OrchestratorError::InvalidGraph(format!(
+                "agent {:?} is model-backed but is named where a human-backed role is \
+                 required; set `backed_by: human` in its frontmatter, or use a gate kind \
+                 that takes a model",
+                agent_ref.0
+            )));
+        };
+        let query = render_input(input);
+        let parts = assemble_prompt_parts(&self.registry, agent, context, &query)?;
+        Ok((
+            HumanQuestion::compose(
+                &parts.authored,
+                &parts.context,
+                &query,
+                // The executor's own pure redactor, applied to each context body BEFORE the
+                // bound cuts it — see `compose`. Identity when none is wired, which is the
+                // default, so the composed question stays byte-identical there.
+                |t| self.redact_text(t),
+            ),
+            timeout,
+        ))
+    }
+
     /// Execute one human-backed `Agent` node.
     ///
     /// | fold state | behaviour |

@@ -17752,70 +17752,111 @@ mod human_agent {
     /// without a shared function s4 would need a SECOND prompt builder. That is the drift
     /// this guards.
     ///
-    /// So the assertions are on the three things only real prompt assembly produces — the
-    /// role's `system_prompt`, an ACTIVATED skill body, and the node input `compose` adds
-    /// as `## Task` — rather than on "some non-empty string". A hand-rolled
-    /// `format!("{}: {}", agent.system_prompt, input)` would satisfy a bare non-empty
-    /// assertion and silently drop the skill.
+    /// So the authored half is asserted against a value this test COMPUTES — it calls
+    /// `assemble_prompt_parts` itself, with the same arguments, and requires the composed
+    /// question to contain `parts.authored` VERBATIM. Three hand-picked `contains`
+    /// substrings were the first shape of this assertion and they were too weak: a seam
+    /// that reordered the skills, changed the separator or interpolated anything between
+    /// the halves would keep all three green while no longer producing the model path's
+    /// string. The computed form is the one the test's NAME already promises.
+    ///
+    /// The two skills are the other half of that. `cite-the-clause` is `Always` and its
+    /// body must be present; `only-for-invoices` is `OnKeywords` and does NOT match this
+    /// query, so its body must be ABSENT. Without the second one "ACTIVATED" is an unchecked
+    /// word — a seam that ignored `activation` entirely stays green against a fixture whose
+    /// only skill is `Always`.
+    ///
+    /// `## Task` is asserted separately because it is `compose`'s own contribution, not
+    /// assembly's: `assemble_prompt_parts` takes the query only to evaluate activation and
+    /// never puts it in `authored`.
     ///
     /// The SLA is asserted BY VALUE. Returning it is what keeps the caller from re-reading
     /// the registry to find the deadline it must pause on — a second read is a second
     /// place for the role and its SLA to come apart, which is the arrangement
     /// `AgentBacking::Human { timeout }` exists to prevent.
+    ///
+    /// **No `calls == 0` assertion here, deliberately.** The shipped first version had one,
+    /// and it was unfalsifiable in exactly the way this module's own
+    /// `a_human_backed_agent_never_calls_the_gateway_and_still_answers` doc records as an
+    /// s2 defect: `human_question_for` is a synchronous `fn`, the `CallLog` is written only
+    /// by `RecordingAdapter::chat`, and this test drives no node at all — so no mutation of
+    /// the seam can make the count non-zero. (Confirmed: under the
+    /// `agent.system_prompt`-instead-of-`parts.authored` mutation only the prompt assertion
+    /// reddened; `calls == 0` stayed green.) Zero spend is a property of each CALLER's
+    /// structure — `drive_agent` returns above `resolve_chain`, and the gate arm drives no
+    /// agent — so it is AC11's end-to-end test that owns it, over a run that really could
+    /// have spent.
     #[tokio::test]
     async fn the_human_question_seam_composes_the_same_prompt_the_model_path_would() {
         let journal = InMemoryJournal::new();
+        let skills = vec!["cite-the-clause".into(), "only-for-invoices".into()];
         let registry = Arc::new(
             Registry::default()
-                .with_agent(reviewer(
-                    Some(Duration::hours(1)),
-                    vec!["cite-the-clause".into()],
-                ))
+                .with_agent(reviewer(Some(Duration::hours(1)), skills.clone()))
                 .with_skill(SkillDef {
                     name: "cite-the-clause".into(),
                     description: None,
                     body: "ALWAYS QUOTE THE CLAUSE NUMBER.".into(),
                     activation: Activation::Always,
+                })
+                .with_skill(SkillDef {
+                    name: "only-for-invoices".into(),
+                    description: None,
+                    body: "TOTAL THE LINE ITEMS.".into(),
+                    activation: Activation::OnKeywords(vec!["invoice".into()]),
                 }),
         );
-        let (ex, _clock, calls) = exec_at(&journal, registry, at(1_000)).await;
+        let (ex, _clock, _calls) = exec_at(&journal, registry.clone(), at(1_000)).await;
 
+        // The same marker the s3 test uses, and for the same reason: it appears nowhere
+        // else in the fixture, so `contains` can only pass if the input really reached the
+        // question. It also contains no "invoice", which is what leaves the second skill
+        // inactive.
+        let input = serde_json::json!("THE-ACME-MSA-2026");
         let (question, timeout) = ex
-            .human_question_for(
-                &AgentRef("reviewer".into()),
-                // The same marker the s3 test uses, and for the same reason: it appears
-                // nowhere else in the fixture, so `contains` can only pass if the input
-                // really reached the question.
-                &serde_json::json!("THE-ACME-MSA-2026"),
-                &[],
-            )
+            .human_question_for(&AgentRef("reviewer".into()), &input, &[])
             .expect("a human-backed role composes a question");
+
+        // What the MODEL path would have assembled, computed here rather than guessed at
+        // with substrings. `render_input` of a JSON string is the string itself, which is
+        // the query `assemble_prompt_parts` evaluates activation against.
+        let parts = crate::agent::prompt::assemble_prompt_parts(
+            &registry,
+            &reviewer(Some(Duration::hours(1)), skills),
+            &[],
+            "THE-ACME-MSA-2026",
+        )
+        .expect("the model path assembles");
 
         let text = question.text();
         assert!(
-            text.contains(QUESTION),
-            "the role's own system_prompt is in the question: {text}"
+            text.contains(&parts.authored),
+            "the question contains the model path's own authored half VERBATIM.\n\
+             expected to find: {:?}\nin: {text}",
+            parts.authored
         );
         assert!(
-            text.contains("ALWAYS QUOTE THE CLAUSE NUMBER."),
-            "an ACTIVATED skill body is in the question — the evidence that this went \
-             through `assemble_prompt_parts` and not a second builder: {text}"
+            parts.authored.contains(QUESTION)
+                && parts.authored.contains("ALWAYS QUOTE THE CLAUSE NUMBER."),
+            "…and that half is not vacuous: it carries the role's system_prompt and the \
+             ACTIVATED skill body: {:?}",
+            parts.authored
+        );
+        assert!(
+            !text.contains("TOTAL THE LINE ITEMS."),
+            "the INACTIVE skill's body is absent — the seam honours `activation` rather \
+             than concatenating every declared skill: {text}"
         );
         assert!(
             text.contains("THE-ACME-MSA-2026"),
-            "the node input reaches the question, as `## Task`: {text}"
+            "the node input reaches the question, as `## Task` — `compose`'s own \
+             contribution, which assembly never makes: {text}"
         );
         assert_eq!(
             timeout,
             Some(Duration::hours(1)),
             "the role's `backed_by: human` timeout comes back with the question, so the \
              caller never re-reads the registry for the SLA"
-        );
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            0,
-            "and it costs nothing: the seam sits above `resolve_chain`, so zero token \
-             spend on the loop-gate path is STRUCTURAL"
         );
     }
 
@@ -18147,6 +18188,97 @@ mod human_agent {
                  second NodeFailed for an already-dead node on every wake"
             );
         }
+    }
+
+    /// A BAD CONFIG beats the position refusal: a non-top-level human role whose `skills`
+    /// name a skill the registry does not have fails with `UnknownSkillRef` — a hard `Err`
+    /// out of `start`, with no `NodeFailed` anywhere in the journal — not with the
+    /// `!top_level` `NodeFailed`. (The `Map`'s own `NodeStarted`/`MapExpanded` are there:
+    /// the abort happens inside the child, after the fan-out. What must be absent is any
+    /// journaled VERDICT.)
+    ///
+    /// **This is an ORDERING test, and it exists because the ordering was guarded only by
+    /// a comment.** `drive_agent` calls `assemble_prompt_parts` (whose `?` raises
+    /// `UnknownSkillRef`) ABOVE the human branch, and SP-6 s4's seam extraction made the
+    /// call redundant on the human path — the seam re-assembles — so hoisting it below the
+    /// branch is the obvious cleanup, and it is not behaviour-preserving. Review applied
+    /// exactly that hoist and `cargo test --workspace` exited 0 while the observable
+    /// behaviour flipped: `Err(UnknownSkillRef)` aborting the run with no journaled verdict
+    /// became `Ok` plus a durable
+    /// `NodeFailed("… may only be used as a top-level Agent node …")`. That is a
+    /// caller-visible error-taxonomy change — a whole run aborting versus one node failing
+    /// — reached by deleting a comment along with the code it described.
+    ///
+    /// Which order is RIGHT is a separate question this test does not answer; it pins the
+    /// order that ships, so changing it has to be a deliberate red-first commit rather than
+    /// a silent side effect of a tidy-up. The refusal message is the poorer diagnosis of the
+    /// two: the config names a skill that does not exist, and being told instead that the
+    /// role is in the wrong POSITION sends its author looking at the graph.
+    ///
+    /// The site is `MapBody::Agent`, one of [`non_top_level_sites`]' rows — any row would
+    /// do, since the branch is shared. The `Err` variant is what discriminates; the journal
+    /// assertion is the second half, because the hoisted ordering does not merely return a
+    /// different error, it writes a durable `NodeFailed` that `gate_precheck_by_id` would
+    /// then read back forever.
+    #[tokio::test]
+    async fn an_unknown_skill_beats_the_non_top_level_refusal() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        // Human-backed, and its ONLY skill is unregistered — the registry has the agent and
+        // no skills at all.
+        let registry =
+            Arc::new(Registry::default().with_agent(reviewer(None, vec!["no-such-skill".into()])));
+        let (ex, _clock, _calls) = exec_at(&journal, registry, at(1_000)).await;
+
+        let graph = Graph {
+            nodes: vec![Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::Agent(AgentRef("reviewer".into())),
+                    over: vec![serde_json::json!("the Acme MSA")],
+                    concurrency: 1,
+                    aggregation: Aggregation::FailFast,
+                },
+                deps: vec![],
+            }],
+        };
+
+        let err = match ex.start(run, &graph).await {
+            Err(e) => e,
+            Ok(o) => panic!(
+                "an unknown skill is a hard config error and aborts the run; it must not be \
+                 downgraded to the position refusal: {o:?}"
+            ),
+        };
+        assert!(
+            matches!(
+                &err,
+                OrchestratorError::UnknownSkillRef { agent, skill }
+                    if agent == "reviewer" && skill == "no-such-skill"
+            ),
+            "the run aborts with UnknownSkillRef naming the role and the missing skill, \
+             NOT with the !top_level refusal: {err:?}"
+        );
+
+        // No verdict is journaled. `NodeFailed` is the one that matters — under the hoist
+        // the refusal writes one at `m/0`, and `gate_precheck_by_id` reads it back on every
+        // later drive — but `AgentAwaited` is asserted too, because the OTHER way to get
+        // this wrong is to reach the ask with a half-assembled prompt.
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            !events.iter().any(|(_, e)| matches!(
+                e,
+                JournalEvent::NodeFailed { .. } | JournalEvent::AgentAwaited { .. }
+            )),
+            "the refusal never ran and nobody was asked anything — an aborted run leaves no \
+             durable verdict behind: {events:?}"
+        );
+        assert!(
+            failures(&journal, run, &NodeId("m/0".into()))
+                .await
+                .is_empty(),
+            "…and in particular nothing at `m/0`, the node the refusal would have named"
+        );
     }
 
     /// The terminal-re-read asymmetry this node kind inherits from its family, made

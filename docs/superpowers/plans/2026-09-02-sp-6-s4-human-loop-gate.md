@@ -34,8 +34,8 @@
 | `crates/orchestrator-core/src/lib.rs` | re-export `LoopGateOption` | 1 |
 | `crates/orchestrator/src/executor/mod.rs` | `Fold` fields + accessors + writer-list docs | 4 |
 | `crates/orchestrator/src/executor/support.rs` | `fold_journal` arms | 4 |
-| `crates/orchestrator/src/executor/agent.rs` | extract the shared question seam | 5 |
-| `crates/orchestrator/src/executor/human.rs` | `run_human_loop_gate` — the whole arm | 6, 8, 9, 10 |
+| `crates/orchestrator/src/executor/agent.rs` | `drive_agent`'s human branch calls the seam | 5 |
+| `crates/orchestrator/src/executor/human.rs` | the shared question seam; `run_human_loop_gate` — the whole arm | 5, 6, 8, 9, 10 |
 | `crates/orchestrator/src/executor/fanout.rs` | the third arm in the gate match | 7 |
 | `crates/orchestrator/src/executor/tests.rs` | executor tests | 6–11 |
 | `crates/torii/src/cmd/gate.rs` | `decide` learns the second event pair | 12 |
@@ -1122,6 +1122,8 @@ the bug s1 shipped on the SignalAwaited arm."
 
 **Files:**
 - Modify: `crates/orchestrator/src/executor/agent.rs:82-107` (the head of `drive_agent`)
+- Modify: `crates/orchestrator/src/executor/human.rs` (where the seam ended up — see the review
+  note at the end of this task; the sketch below says `agent.rs`)
 - Test: `crates/orchestrator/src/executor/tests.rs`
 
 Behaviour-preserving extraction. The existing s3 tests are the regression guard; the new test pins the property the extraction exists to protect.
@@ -1251,8 +1253,8 @@ preserving; the s3 suite is the regression guard."
    plus `timeout.is_some()` is satisfied by a hand-rolled `format!("{system_prompt}: {input}")`
    — i.e. by the second prompt builder this seam exists to prevent. The shipped test also
    asserts an **ACTIVATED skill body** is present (only real assembly produces it) and pins
-   the SLA **by value**. Mutation-proven: composing from `agent.system_prompt` instead of
-   `parts.authored` reddens the skill assertion and nothing else in the crate.
+   the SLA **by value**. (Its mutation evidence was recorded wrongly; see the review
+   corrections below, which also strengthen the test again.)
 3. **`HumanQuestion::text()` is `#[cfg(test)]`, not `pub(super)`.** A plain `pub(super)`
    accessor is dead code in the lib target and fails the hook's `-D warnings`; more to the
    point, no production caller wants the raw text — every one goes through
@@ -1271,8 +1273,71 @@ clarity wins"); what the extraction actually duplicates on the human path is
 not have: hoisting the assembly below the human branch to avoid it is **not**
 behaviour-preserving. Today a non-top-level human role naming an unknown skill fails with
 `assemble_prompt_parts`'s `UnknownSkillRef` (a fatal `?`) *before* the `!top_level` refusal is
-reached; after the hoist the refusal would win and journal a `NodeFailed` instead. The comment
-at the call site records this so a later "obvious" cleanup does not silently make the change.
+reached; after the hoist the refusal would win and journal a `NodeFailed` instead.
+
+#### Task 5's review, and what the follow-up commit changed
+
+Three reviewers examined `9286702`. Twelve findings at Minor or above, and **two of the claims
+recorded above and in `9286702`'s commit message are false** — the fifth such correction this
+slice has had to make (`2d254ad`, `aae15a2`, `6a378f5`, `9e68537`), which is why they are
+written down here rather than only in a commit message (`9286702` cannot be amended; the
+follow-up commit carries the fix).
+
+**Correction A — the mutation claim in item 2 was wrong.** It said composing from
+`agent.system_prompt` instead of `parts.authored` "reddens the skill assertion and nothing else
+in the crate". Re-run on a clean tree, `cargo test -p sensei-orchestrator` under that mutation
+is **`360 passed; 4 failed`** against `364 passed; 0 failed` clean. The four:
+
+| test | slice |
+|---|---|
+| `the_human_question_seam_composes_the_same_prompt_the_model_path_would` | s4 (new) |
+| `the_journaled_prompt_is_the_assembled_prompt` | s3 |
+| `an_oversized_authored_prompt_fails_the_node_before_it_is_journaled` | s3 |
+| `the_journaled_question_is_redacted_before_the_durable_write` | s3 |
+
+So the honest reading is the opposite of the one recorded: **the s3 suite is the effective
+guard on that mutation**, and the new test earns its place on a DIFFERENT mutation. A
+second-prompt-builder inside the seam (concatenate every declared skill, joined with a single
+`\n`, ignoring `activation`) — which is precisely the drift the seam exists to prevent —
+reddens **only** `the_human_question_seam_composes_the_same_prompt_the_model_path_would`
+(`364 passed; 1 failed`), and only after the review strengthened it: the shipped three
+`contains` substrings all survive that mutation. The strengthened test computes
+`assemble_prompt_parts` itself and requires `question.text()` to contain `parts.authored`
+VERBATIM, and registers a second, `OnKeywords`-inactive skill whose body must be ABSENT (with
+one `Always` skill, "ACTIVATED" was an unchecked word).
+
+**Correction B — the regression-guard count in `9286702`'s message was the POST-commit
+number.** It says "the 21 s3 human-agent tests are the regression guard". `cargo test -p
+sensei-orchestrator human_agent` gives **19** at `9286702^` (18 in `mod human_agent` plus
+`executor::support::tests::a_deadline_less_human_agent_records_that_it_began_asking`, which the
+filter also matches) and **21** at `9286702` — two of which this commit added, so they guard
+nothing about it. The s3 regression guard is **19**; the post-commit filter count is 21, and
+after the review's own test it is 22.
+
+**The review also closed a real gap, red-first.** The ordering the "one correction" paragraph
+above argues for — `UnknownSkillRef` beating the `!top_level` refusal — had **zero** test
+coverage anywhere in the workspace. A reviewer applied the hoist and `cargo test --workspace`
+exited 0 while the observable behaviour flipped: `Err(UnknownSkillRef)` aborting the run with
+no journaled verdict became `Ok` plus a durable `NodeFailed` at the child node — which
+`gate_precheck_by_id` then reads back forever.
+`an_unknown_skill_beats_the_non_top_level_refusal`
+now pins it, and it is the ONLY test that reddens under the hoist (`364 passed; 1 failed`).
+That is the class of defect this slice keeps producing: an invariant guarded by the comment
+that describes it, which a cleanup pass deletes together with the code.
+
+**Two more, both moves rather than fixes:**
+
+- The seam **lives in `human.rs`, not `agent.rs`.** It is wholly a human-path function and its
+  second caller is in `human.rs`; leaving it in `agent.rs` falsified both module headers at
+  once (`agent.rs`: "the durable ReAct loop and its per-turn tool execution"; `human.rs`: "a
+  new file rather than more of `agent.rs` … `agent.rs` is the model path and stays that").
+  The file-structure table above now says `human.rs` for Task 5.
+- The seam test's `assert_eq!(calls.len(), 0)` is **gone.** It could not fail:
+  `human_question_for` is a synchronous `fn`, the `CallLog` is written only by
+  `RecordingAdapter::chat`, and the test drives no node — under the mutation above it stayed
+  green while the prompt assertion reddened. It is the same unfalsifiable shape `mod
+  human_agent`'s own doc records as an s2 defect. Zero spend is a property of each CALLER's
+  structure, so **AC11's end-to-end test owns it**, over a run that really could have spent.
 
 ---
 
@@ -1464,8 +1529,14 @@ The body, in order:
 
         // 1. The question and the SLA, through the shared seam. A model-backed role here
         //    fails loudly (AC14).
+        //
+        //    **The iteration output goes in the `context` argument, NOT `input`.** See
+        //    below — this is the one call in the slice where getting it wrong is a
+        //    terminal, data-dependent node death.
+        let ask = gate_ask(menu);
+        let context = [(ContextKey("iteration output".into()), iteration_output.clone())];
         let (question, timeout) =
-            match self.human_question_for(agent_ref, iteration_output, &[]) {
+            match self.human_question_for(agent_ref, &serde_json::json!(ask), &context) {
                 Ok(v) => v,
                 Err(e) => {
                     return Ok(LoopGateStep::Failed(
@@ -1479,14 +1550,59 @@ The body, in order:
         match self.wait_or_expire_by_id(node_id, timeout, fold) { … }
 ```
 
+> **Which seam argument the iteration output goes in — corrected by Task 5's review, before
+> this task was executed.**
+>
+> This sketch originally read `self.human_question_for(agent_ref, iteration_output, &[])`, and
+> that is a **defect**, not a style choice. `HumanQuestion::compose` puts the seam's `input`
+> into the `## Task` tail and counts it in `authored_bytes`
+> (`let authored_bytes = text.len() + task.len()`), and the `NotYetAsking` arm below checks
+> `authored_bytes` against `MAX_HUMAN_TEXT_BYTES` (4096) with a **loud terminal
+> `NodeFailed`**. A loop gate's iteration output is a model answer, i.e. over 4 KiB
+> essentially always — design §6 says exactly that — so the gate would die on ordinary run
+> data, *after* the iteration's tokens were spent, unrecoverably (`gate_precheck_by_id` reads
+> the `NodeFailed` back on every later drive), blaming the config author's system prompt.
+> That is verbatim the defect s3's whole-slice review found and the two-cap rule exists to
+> prevent; `an_oversized_node_input_fails_the_node_before_it_is_journaled` already proves a
+> >4096-byte `input` kills the node. It also contradicted design §2 ("the person sees the
+> iteration output as `## Context`"), §6, and this plan's own AC15 test
+> `a_verbose_iteration_output_truncates_the_question_instead_of_killing_the_gate`, which
+> asserts `out.failed.is_none()` on a ~50 KiB output. The sketch was internally inconsistent
+> too: the `NotYetAsking` arm tells the failure message to say "`## Context` is **not**
+> counted", which only makes sense if the output were in `## Context`.
+>
+> **The rule, now also on `human_question_for`'s own doc comment so the next caller cannot
+> pick wrong:** `input` is the ASK (author-scale, charged to the LOUD 4096 cap, and the query
+> `activation.is_active` is evaluated against); `context` is RUN DATA (truncated per
+> dependency to `MAX_HUMAN_CONTEXT_BYTES`, 32 KiB, and excluded from `authored_bytes`).
+>
+> **So what is the `## Task` for a gate?** A short ask synthesized from the menu — a pure
+> `gate_ask(menu) -> String` along the lines of *"Review the iteration output above and choose
+> one: `revise`, `accept`."* Two reasons for that shape rather than a bare constant. It keeps
+> everything charged to the loud cap **author-controlled at config time**, which is the whole
+> principle behind which half fails loudly: the menu names are author free text and their
+> being over 4 KiB really is a config error the author can act on. And it makes the journaled
+> `LoopGateAwaited.prompt` self-contained — `torii run list-paused` renders the `menu` field
+> beside it, but the durable question should still state what is being decided, the same
+> reason s3 added `## Task` at all (§5.4: never show the human LESS than the model would
+> have had).
+>
+> **One consequence to accept deliberately:** activation is then evaluated against the ask,
+> not against the iteration output, so a gate role's `OnKeywords` skills match on the menu
+> text. That is a live limitation, not an oversight — the seam has ONE `input` serving both
+> `## Task` and the activation query, and splitting it into two parameters is a change to
+> s3's path as well. `Always` skills (the default, and what a gate role wants) are unaffected.
+> If a real gate role ever needs output-driven activation, that is the change to make, and it
+> gets its own red-first commit.
+
 with these arms:
 
 - `Err(message)` → `fail_loop_gate(run, node_id, format!("loop_gate: {message}"))`.
 - `Ok(WaitState::Expired(d))` → fail, naming the deadline and **not** "no decision" (this arm has not read the fold and cannot know whether one exists — the exact wording bug s2's review caught).
-- `Ok(WaitState::NotYetAsking(fresh))` → bound `question.authored_bytes` against `MAX_HUMAN_TEXT_BYTES` (loud fail, message naming the role's `system_prompt`/skills and stating that `## Context` is **not** counted), then `question.redact_and_clamp(|t| self.redact_text(t), MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES)`, append `LoopGateAwaited { node, deadline: fresh, prompt, menu: menu.to_vec() }`, return `Paused`.
+- `Ok(WaitState::NotYetAsking(fresh))` → bound `question.authored_bytes` against `MAX_HUMAN_TEXT_BYTES` (loud fail, message naming the role's `system_prompt`/skills **and the menu names**, since `gate_ask(menu)` is the third author-controlled contributor to that count, and stating that `## Context` — the ITERATION OUTPUT — is **not** counted), then `question.redact_and_clamp(|t| self.redact_text(t), MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES)`, append `LoopGateAwaited { node, deadline: fresh, prompt, menu: menu.to_vec() }`, return `Paused`.
 - `Ok(WaitState::Waiting(d))` → read the **journaled** menu via `fold.loop_gate_menu_for(node_id)`. Absent ⇒ a kind-swapped node (the shared `deadlines` map has four writers) ⇒ fail loudly, never fall back to the graph's menu. Then read `fold.loop_gate_decision_for(node_id)`; absent ⇒ `Paused`; present ⇒ match `option` against the journaled menu; unmatched ⇒ fail loudly (Task 9); matched ⇒ `Decided { stop: o.stops }`.
 
-Add `fail_loop_gate`, mirroring `fail_human_agent`, so this arm cannot skip the redaction chokepoint.
+Add `fail_loop_gate`, mirroring `fail_human_agent`, so this arm cannot skip the redaction chokepoint. Add `gate_ask(menu) -> String` as a free `fn` in `human.rs` — pure, so it can be unit-tested without an executor, and so the `## Task` text has one definition rather than being inlined at the append site.
 
 - [ ] **Step 4: Run to verify passing**
 
@@ -2405,6 +2521,6 @@ async fn the_loop_gate_menu_is_read_from_the_journal_not_the_graph() {
 
 **Placeholder scan:** none. Every code step carries real code; the one `…` (Task 6 Step 3's `match` arms) is immediately expanded as a labelled bullet list below it.
 
-**Type consistency:** `LoopGateOption { name, stops }`, `LoopGateStep::{Decided{stop}, Failed, Paused}`, `LoopGateAsk { prompt, menu }`, `LoopGateDecision { option, actor }`, `PublishedMenu::{Human, Loop}`, `human_question_for`, `run_human_loop_gate`, `fail_loop_gate`, `loop_gate_menu_for`, `loop_gate_prompt_for`, `loop_gate_decision_for`. Each is defined in exactly one task and referenced consistently after it.
+**Type consistency:** `LoopGateOption { name, stops }`, `LoopGateStep::{Decided{stop}, Failed, Paused}`, `LoopGateAsk { prompt, menu }`, `LoopGateDecision { option, actor }`, `PublishedMenu::{Human, Loop}`, `human_question_for`, `run_human_loop_gate`, `fail_loop_gate`, `gate_ask`, `loop_gate_menu_for`, `loop_gate_prompt_for`, `loop_gate_decision_for`. Each is defined in exactly one task and referenced consistently after it.
 
 **Test-helper caveat:** Tasks 6–11 use helpers (`executor_with_human_reviewer_and_journal`, `FakeClock`, `count_node_failed`, `executor_with_human_reviewer_and_counting_gateway`) modelled on the s3 suite's existing fixtures. Task 6 Step 3 should adapt the real ones in `crates/orchestrator/src/executor/tests.rs` rather than write new ones — match the names actually there.
