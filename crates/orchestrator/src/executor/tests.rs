@@ -17280,7 +17280,13 @@ mod human_agent {
     }
 
     /// Every QUESTION journaled by this run, for any node, in order.
-    fn journaled_prompts(events: &[(Seq, JournalEvent)]) -> Vec<String> {
+    ///
+    /// `AgentAwaited` only — deliberately, and `pub(super)` on the strength of it. SP-6
+    /// s4's `mod human_loop_gate` uses it to assert that a REFUSED `GateSpec::Agent` never
+    /// asked anybody anything; a loop gate's own asks are `LoopGateAwaited` and are scraped
+    /// by that module's `asks`, so widening this to both kinds would make the two
+    /// assertions overlap and each stop meaning what it says.
+    pub(super) fn journaled_prompts(events: &[(Seq, JournalEvent)]) -> Vec<String> {
         events
             .iter()
             .filter_map(|(_, e)| match e {
@@ -17291,7 +17297,15 @@ mod human_agent {
     }
 
     /// Every `NodeFailed` this run journaled for `node`, in order.
-    async fn failures(journal: &InMemoryJournal, run: RunId, node: &NodeId) -> Vec<String> {
+    ///
+    /// `pub(super)` for SP-6 s4's `mod human_loop_gate`, which asserts on the message
+    /// [`non_top_level_sites`]' `GateSpec::Agent` row produces — a message s4 EXTENDS, so
+    /// the assertion has to read the journaled row rather than the `RunOutcome`'s wrapper.
+    pub(super) async fn failures(
+        journal: &InMemoryJournal,
+        run: RunId,
+        node: &NodeId,
+    ) -> Vec<String> {
         journal
             .load(run)
             .await
@@ -17974,7 +17988,17 @@ mod human_agent {
     /// The `Loop`-gate graph uses a `ModelCall` BODY on chain "c" so iteration 0 completes
     /// and the gate is actually reached; an `Agent` body would fail first and the gate
     /// would never run, silently reducing that row to a duplicate of the Loop-body row.
-    fn non_top_level_sites() -> Vec<(&'static str, Graph, NodeId)> {
+    ///
+    /// **`pub(super)` for SP-6 s4's `mod human_loop_gate`, and that is a guard rather than
+    /// a convenience.** s4's AC13 asserts that a human-backed role in a `GateSpec::Agent`
+    /// STILL refuses, now naming `GateSpec::Human` as the variant that would work — and it
+    /// asserts it against THIS table's own `GateSpec::Agent` row, looked up by name. A
+    /// hand-written second copy of that graph would let the two drift, and, worse, would
+    /// keep passing if the row here were deleted. Design §5.4 turns on the row standing:
+    /// s4 adds no new path into `drive_agent`, so making `GateSpec::Agent` polymorphic over
+    /// the backing is exactly the `Subgraph`-wrapper bypass the s3 review closed. Deleting
+    /// the row now fails two tests in two modules instead of silently opening it.
+    pub(super) fn non_top_level_sites() -> Vec<(&'static str, Graph, NodeId)> {
         let reviewer = || AgentRef("reviewer".into());
         vec![
             (
@@ -19178,7 +19202,10 @@ mod human_agent {
 /// so an arm that ever drove the gate ROLE through the model path could not silently cost
 /// tokens; it would error.
 mod human_loop_gate {
-    use super::human_agent::{QUESTION, exec_at, human_registry};
+    use super::human_agent::{
+        QUESTION, exec_at, failures, human_registry, journaled_prompts, non_top_level_sites,
+        reviewer,
+    };
     use super::human_gate::at;
     use super::*;
     use chrono::{DateTime, Duration, Utc};
@@ -20474,6 +20501,310 @@ mod human_loop_gate {
             1,
             "no second iteration was spent — the whole point of refusing rather than \
              defaulting to `continue`"
+        );
+    }
+
+    /// AC14b — the LIVE arm's unmatched-option refusal: a journaled DECISION naming an
+    /// option the published menu does not contain fails the gate loudly.
+    ///
+    /// The `Waiting`-arm counterpart of `a_settled_loop_gate_naming_an_option_outside_its_
+    /// menu_fails_loudly`, and a different state rather than a re-run of it: there the
+    /// forged row is a `LoopGateSettled` and the replay path resolves it, here it is a
+    /// `LoopGateDecided` and the live path does. The two share `unmatched_option_message`
+    /// precisely so an operator reads one sentence on both drives — which is only worth
+    /// anything if both call sites are exercised. The replay site was covered by the
+    /// Critical fix's verify follow-up; this is the site that has been shipping unguarded
+    /// since Task 6.
+    ///
+    /// It must NEITHER continue NOR stop. Both defaults are a decision no human made — to
+    /// spend another iteration, or to converge a loop nobody converged — which is why the
+    /// mutation with teeth is a silent fallback rather than a wrong answer:
+    /// `published.iter().find(…).or(published.first())` resolves `sideways` to `revise`
+    /// and runs another iteration off a name nobody offered.
+    ///
+    /// Reachable only from a journal `torii` did not write — `cmd::gate::decide` refuses
+    /// such a name at its own boundary, reciting the menu — which is exactly why the
+    /// executor must fail rather than guess: the one caller that can produce this state is
+    /// the one that skipped the validating boundary.
+    #[tokio::test]
+    async fn a_decision_naming_an_unknown_option_fails_the_loop_gate() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        let graph = human_gated_loop_graph(3);
+
+        // A REAL ask, so the menu really is published and the failure can only be about the
+        // option name.
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        journal
+            .append(run, decided(&gate(0), "sideways", "jerry"))
+            .await
+            .expect("a decision naming nothing lands");
+
+        let out = ex.start(run, &graph).await.expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("an option outside the published menu must fail, not guess: {out:?}")
+        });
+        assert_eq!(node, lp(), "the gate's failure fails the LOOP: {out:?}");
+        assert!(
+            message.contains("sideways"),
+            "the refusal names the option that matched nothing, so an operator can see \
+             which of the two is wrong: {message}"
+        );
+        assert!(
+            message.contains("revise") && message.contains("ship"),
+            "…and recites the PUBLISHED menu, which is what they could actually have \
+             picked: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "and it does NOT pause — re-offering the same menu to the same operator \
+             changes nothing about the row already in the journal: {out:?}"
+        );
+        assert_eq!(
+            asks(&journal.load(run).await.expect("loads")).len(),
+            1,
+            "iteration 1 was never entered, so nobody was asked a second question"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "…and no second iteration was SPENT — a silent fallback to the menu's head \
+             would have bought one on a decision nobody made"
+        );
+    }
+
+    /// AC14 — a MODEL-backed role named in a `GateSpec::Human` fails the loop loudly,
+    /// end-to-end through the gate arm.
+    ///
+    /// `the_human_question_seam_refuses_a_model_backed_role` pins the same refusal at
+    /// `human_question_for`, the function that owns the message. This pins that the GATE
+    /// ARM still surfaces it end-to-end, which is a separate claim and the one design §5.5
+    /// makes: silence here would let an author believe a person is in the loop while the
+    /// run quietly decides for itself. Mutation-proven — turning the seam's `Err` into
+    /// `Ok(None)`, so a model backing reads as an unbounded human SLA, leaves this run
+    /// PAUSED on a question no person will ever see.
+    ///
+    /// **What it does NOT reach is the arm's step-2 SLA read**, and that is worth stating
+    /// because the obvious reading of the arm says it should. Deleting step 2's refusal
+    /// (`self.human_sla_for(agent_ref).unwrap_or(None)`) leaves this test GREEN: this drive
+    /// takes the `NotYetAsking` arm, which calls `human_question_for`, which re-raises the
+    /// identical error, and the arm's own `Err` branch there catches it. The step-2 read
+    /// earns its place only on a drive that does NOT ask — the sibling below.
+    ///
+    /// It must fail rather than fall back to the model path, and the fixture makes that
+    /// visible: the role keeps `chain: None` and the registry has no binding table, so an
+    /// arm that DID route this role through the model path could not silently spend — it
+    /// would fail with a chain-resolution error instead, which the message assertions
+    /// below tell apart from the config refusal.
+    #[tokio::test]
+    async fn a_model_backed_role_in_a_human_loop_gate_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        // The SAME `reviewer` every other test in this module uses, differing in exactly
+        // the field under test — so a failure here can only be about the backing.
+        let model_backed = Arc::new(Registry::default().with_agent(AgentDefinition {
+            backed_by: AgentBacking::Model,
+            ..reviewer(Some(Duration::hours(1)), vec![])
+        }));
+        let (ex, _clock, calls) = exec_at(&journal, model_backed, at(1_000)).await;
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("a model-backed role must not be asked to stand in for a person: {out:?}")
+        });
+        assert_eq!(node, lp(), "the gate's refusal fails the LOOP: {out:?}");
+        assert!(
+            message.contains("reviewer") && message.contains("model-backed"),
+            "the refusal names the role and the defect: {message}"
+        );
+        assert!(
+            message.contains("backed_by: human"),
+            "…and the fix, because the only person who can act on it is the one who wrote \
+             the config: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "and it does NOT pause — a pause would be a question addressed to nobody: \
+             {out:?}"
+        );
+        assert!(
+            asks(&journal.load(run).await.expect("loads")).is_empty(),
+            "it never published a question at all"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "iteration 0's BODY ran and the gate itself cost nothing — the refusal is not \
+             a silent fallback to driving the role as a model"
+        );
+    }
+
+    /// AC14 on a drive that does NOT ask, which is the only thing the arm's step-2 SLA read
+    /// is load-bearing for — and it was shipping unguarded.
+    ///
+    /// The sibling above cannot see it: its drive takes the `NotYetAsking` arm, where
+    /// `human_question_for` re-raises the same refusal, so deleting step 2 entirely leaves
+    /// that test green. `human_sla_for`'s own doc makes the wider claim — a caller "that
+    /// needs the deadline and not the question still gets AC14's loudness on every drive
+    /// that could still ask" — and this is the drive that claim is about: a gate that has
+    /// already published its question and is merely being re-paused. On that path the arm
+    /// composes nothing, so step 2 is the ONLY place the backing is checked.
+    ///
+    /// **The vector is real, not hypothetical.** The question is durable and the ROLE is
+    /// not: `torii config push` is replace-all against a live registry, so a role can be
+    /// edited from `backed_by: human` to `backed_by: model` while a run sits paused on its
+    /// gate. Modelled here as a second executor over the SAME journal with a different
+    /// registry, which is exactly what a worker in another process gets after a push.
+    ///
+    /// Failing is the right answer and not merely the loud one. A gate whose role is no
+    /// longer human-backed has nobody to deliver the answer to — `torii run gate decide`
+    /// would still append a `LoopGateDecided`, and the arm would honour it as though a
+    /// person had picked, which is precisely the "the run quietly decides for itself" state
+    /// §5.5 exists to prevent. Contrast step 1: a gate already SETTLED replays above the
+    /// SLA read, so the same edit cannot retroactively kill a loop nobody is waiting on.
+    /// The two arms differ deliberately and this test pins the live half.
+    #[tokio::test]
+    async fn a_role_edited_to_model_backed_mid_wait_fails_a_drive_that_does_not_ask() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = human_gated_loop_graph(3);
+
+        // Drive one: an ordinary human-backed ask. The question and its deadline are now
+        // durable.
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        assert_eq!(
+            asks(&journal.load(run).await.expect("loads")).len(),
+            1,
+            "the question really was published, so the next drive takes the `Waiting` arm \
+             and not `NotYetAsking` — the whole point of this fixture"
+        );
+
+        // `torii config push` replaces the role, and a worker in another process picks up
+        // the new registry. Same journal, same graph, same clock instant: the ONLY thing
+        // that changed is the backing.
+        let (edited, _clock, calls) = exec_at(
+            &journal,
+            Arc::new(Registry::default().with_agent(AgentDefinition {
+                backed_by: AgentBacking::Model,
+                ..reviewer(Some(Duration::hours(1)), vec![])
+            })),
+            at(1_000),
+        )
+        .await;
+
+        let out = edited.start(run, &graph).await.expect("re-drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!(
+                "the gate must refuse a role that is no longer human-backed even on a \
+                 drive that asks nothing — re-pausing would leave a durable question \
+                 addressed to a role that can no longer answer it: {out:?}"
+            )
+        });
+        assert_eq!(node, lp(), "the gate's refusal fails the LOOP: {out:?}");
+        assert!(
+            message.contains("reviewer") && message.contains("model-backed"),
+            "with the same message the ask-time refusal gives, so an operator who saw one \
+             and then the other reads one sentence: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "and it does NOT re-pause on the deadline it recorded: {out:?}"
+        );
+        assert_eq!(
+            asks(&journal.load(run).await.expect("loads")).len(),
+            1,
+            "it published no SECOND question on top of the one already durable"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "and the re-drive spent nothing: iteration 0 replayed from its memo"
+        );
+    }
+
+    /// AC13 — a HUMAN-backed role in a `GateSpec::Agent` STILL refuses, and the refusal now
+    /// names `GateSpec::Human` as the variant that would work.
+    ///
+    /// The cross-refusal shape `torii` already uses ("naming the verb that WOULD work"),
+    /// owed here because s4 makes the fix expressible for the first time: before this slice
+    /// there was nothing to point an author at, and the refusal could only say no.
+    ///
+    /// **What this test does NOT do is relax the rule**, and the fixture is what says so.
+    /// It drives [`non_top_level_sites`]' own `GateSpec::Agent` row, looked up by name,
+    /// rather than a second hand-written graph. Design §5.4: s4 adds no new path into
+    /// `drive_agent` at all, so making `GateSpec::Agent` polymorphic over the backing would
+    /// reopen exactly what the s3 review closed — legality decided by position, not by
+    /// caller — and the row standing is the guarantee. Deleting it now reddens this test
+    /// too, in a different module, with a message that says a bypass was opened.
+    ///
+    /// The assertion reads the JOURNALED row at the gate path rather than
+    /// `RunOutcome.failed`, because the `Loop`'s own wrapper is what an operator sees in
+    /// `torii run status` while the row is what they see in the failure log, and it is the
+    /// row that has to carry the fix.
+    #[tokio::test]
+    async fn a_human_role_in_gate_spec_agent_still_refuses_and_names_gate_spec_human() {
+        let (site, graph, failing) = non_top_level_sites()
+            .into_iter()
+            .find(|(site, ..)| *site == "GateSpec::Agent")
+            .expect(
+                "`non_top_level_sites` must still carry its `GateSpec::Agent` row. If it \
+                 had to be deleted, a human-backed role became legal at that site and the \
+                 Subgraph-wrapper bypass the s3 review closed is open again — design §5.4 \
+                 keeps the refusal deliberately unchanged.",
+            );
+
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+
+        let out = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            out.failed.is_some(),
+            "{site}: a human-backed role in a GateSpec::Agent is STILL refused: {out:?}"
+        );
+        let refusals = failures(&journal, run, &failing).await;
+        assert_eq!(
+            refusals.len(),
+            1,
+            "{site}: {} is the node that failed: {refusals:?}",
+            failing.0
+        );
+        assert!(
+            refusals[0].contains("GateSpec::Human"),
+            "{site}: the refusal names the variant that WOULD work — s4 is the slice that \
+             makes the fix expressible, so a refusal that can only say no is now the \
+             poorer of two available messages: {}",
+            refusals[0]
+        );
+        assert!(
+            refusals[0].contains("reviewer") && refusals[0].contains("top-level"),
+            "{site}: …without losing the role and the rule the shared message already \
+             carried: {}",
+            refusals[0]
+        );
+        assert!(
+            journaled_prompts(&journal.load(run).await.expect("loads")).is_empty(),
+            "{site}: and it never asked a human a question it could not deliver an answer \
+             for"
         );
     }
 }

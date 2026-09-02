@@ -191,6 +191,27 @@ impl Executor {
                 // cannot skip the redaction chokepoint every other human-path failure goes
                 // through — the `model_output` precedent, and the specific defect s2 shipped
                 // when one gate failure arm scrubbed and another did not.
+                //
+                // **The `Loop` gate is the one site of the six that now has a FIX to name,
+                // and the message names it** (SP-6 s4, AC13, design §5.4). The other five
+                // each remain an unbuilt feature with nowhere to send their author; a human
+                // deciding whether a `Loop` continues is a feature that now EXISTS, one
+                // variant across. The cross-refusal shape is `torii`'s — refuse, and name
+                // the verb that would work — and it is the whole difference between a rule
+                // an author can comply with and one they can only trip over.
+                //
+                // The clause is attached to the `Loop` gate item of the enumeration rather
+                // than appended to the end, deliberately: this message is SHARED by all six
+                // sites, and a trailing "use GateSpec::Human instead" would be read as
+                // advice by an author who put a human-backed role in a `Map` body, where it
+                // is not merely unhelpful but wrong.
+                //
+                // It does NOT relax the rule. This slice adds no new path into
+                // `drive_agent`, `fanout.rs`'s `GateSpec::Agent` arm still passes the
+                // literal `false`, and `non_top_level_sites` keeps its row — asserted from
+                // two modules now, since
+                // `a_human_role_in_gate_spec_agent_still_refuses_and_names_gate_spec_human`
+                // drives that row rather than a copy of it.
                 return Ok(step(
                     self.fail_human_agent(
                         run,
@@ -198,8 +219,11 @@ impl Executor {
                         format!(
                             "human_agent: agent {:?} is human-backed and may only be used \
                              as a top-level Agent node — not as a Map or Consolidate body, \
-                             a Loop body, a Loop gate, a planner, or an Agent node nested \
-                             inside a Subgraph, a Branch arm or an Expand",
+                             a Loop body, a Loop gate (a person deciding whether a Loop \
+                             continues belongs in GateSpec::Human, which takes a menu of \
+                             options; GateSpec::Agent drives a MODEL and applies a pure \
+                             stop_when predicate to its answer), a planner, or an Agent \
+                             node nested inside a Subgraph, a Branch arm or an Expand",
                             agent_ref.0
                         ),
                     )
