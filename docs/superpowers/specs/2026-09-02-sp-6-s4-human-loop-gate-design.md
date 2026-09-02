@@ -236,6 +236,21 @@ A role named in `GateSpec::Human` that is **model**-backed is a config error and
 mirror of §5.4, and for the same reason: silence would let an author believe a person is in the loop
 while the run quietly decides for itself.
 
+**The refusal is owed on every drive that could still ask, not only on the drive that asks**, which
+is why the arm reads the SLA at step 2 rather than inside the `NotYetAsking` arm that composes the
+question. The vector is `torii config push` — replace-all against a live registry — so a role can be
+edited from `backed_by: human` to `backed_by: model` while a run sits paused on its gate. On the
+re-pause drive the arm composes nothing, so step 2 is the ONLY place the backing is checked; without
+it the run re-pauses on a durable question addressed to a role that can no longer answer it, and a
+`LoopGateDecided` appended afterwards would be honoured as though a person had picked. Task 9 found
+this untested and it is now `a_role_edited_to_model_backed_mid_wait_fails_a_drive_that_does_not_ask`
+— the ask-time test cannot reach it, because `human_question_for` re-raises the identical error and
+the `NotYetAsking` arm's own `Err` branch catches it, so deleting step 2 leaves that test green.
+
+Deliberately asymmetric with §5.2's step 0b: a gate that has already been **settled** replays ABOVE
+the SLA read, so the same config edit cannot retroactively kill a loop nobody is waiting on. Live
+gates refuse; settled ones are already answered and are none of the registry's business.
+
 ### 5.6 Zero token spend is structural
 
 The arm never calls `resolve_chain` and never reaches the gateway, so no `EffectRecorded` is
@@ -353,9 +368,15 @@ and this slice's answer is yes.
     loop that has already converged is not re-killed by its own gate's stale deadline when a later
     wake re-drives the graph. The guarding tests must **advance the clock across iterations** — every
     s4 test written before this one held it fixed, which is why the suite was green over the defect.
+12c. AC8 and AC12b hold **simultaneously, in one run**: a settled gate replays while a LATER
+    iteration's gate that nobody answered still expires and still fails the `Loop`, and the failure
+    names the gate that actually ran out. Guarded separately the two are invisible to the
+    over-correction — suppress expiry once the loop has made progress — since the AC8 test has no
+    settlement in its journal and neither AC12b test lets a gate expire.
 13. A human-backed role in `GateSpec::Agent` still fails loudly, and the message names
     `GateSpec::Human`. The `non_top_level_sites` row stands.
-14. A model-backed role in `GateSpec::Human` fails loudly.
+14. A model-backed role in `GateSpec::Human` fails loudly — at the ask, **and on a drive that does
+    not ask** (a role edited `human` → `model` while the run sits paused on its gate). §5.5.
 14b. A journaled decision naming an option **absent from the journaled menu** fails the node loudly —
     it neither continues nor stops the loop.
 15. An oversized **authored** prompt fails the node; a verbose **iteration output** truncates the

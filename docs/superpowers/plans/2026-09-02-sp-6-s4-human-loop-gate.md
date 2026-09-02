@@ -1853,7 +1853,7 @@ The single most important test in the slice. It is the one that reddens if someo
 > extend rather than duplicate them, and must keep advancing the clock ACROSS iterations —
 > every s4 test written before them held it fixed, which is how the Critical shipped green.
 
-- [ ] **Step 1: Write the failing tests (AC8, AC9, AC10)**
+- [x] **Step 1: Write the failing tests (AC8, AC9, AC10)**
 
 ```rust
 /// AC8 — **the ordering test.** A decision that lands AFTER the deadline does not
@@ -1931,13 +1931,13 @@ async fn a_fired_loop_gate_expiry_is_terminal_and_appends_no_second_failure() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail if the ordering is wrong**
+- [x] **Step 2: Run to verify they fail if the ordering is wrong**
 
 Run: `cargo test -p sensei-orchestrator a_decision_after_the_deadline`
 
 Expected: **PASS** if Task 6 implemented the ordering correctly. **This is the one case where a green first run is acceptable** — but you must then prove the test is not vacuous.
 
-- [ ] **Step 3: Mutation-prove the ordering test**
+- [x] **Step 3: Mutation-prove the ordering test**
 
 Temporarily move the decision read **above** the `WaitState::Expired` arm in `run_human_loop_gate` (s3's ordering). Re-run:
 
@@ -1945,7 +1945,37 @@ Run: `cargo test -p sensei-orchestrator a_decision_after_the_deadline_does_not_c
 
 Expected under the mutation: **FAIL.** Revert. Re-run: **PASS.** If it passes under the mutation the test is not guarding the ordering — fix the test before continuing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
+
+**What Task 8 actually landed (`b4a1d44`), and the correction to Steps 1–3.**
+
+Steps 1–3's sketches were both already on `develop`, under the names the Tasks 6+7 review
+gave them, so writing them again would have been a duplicate rather than a test. What was
+executed instead:
+
+1. **The mandated mutation, re-run at this commit.** The s3-shaped hoist — a decision-first
+   read (published menu → `loop_gate_decision_for` → resolve → settle → `Decided`) inserted
+   above the `wait_or_expire_by_id` match — reddens
+   `a_decision_after_the_deadline_does_not_continue_the_loop` **and nothing else**: 13
+   passed, 1 failed. The test is a real guard, and the two AC12b tests staying green under
+   it is itself the evidence that they distinguish a LATE decision from a REPLAYED one.
+2. **AC9 and AC10 were already reached** and are not re-asserted. AC9's terminality and
+   "no second `NodeFailed`" are the second half of the ordering test; AC10's "fails the
+   `Loop`, not just the gate node" is its `assert_eq!(node, lp())` plus
+   `a_dead_loop_gate_stops_appending_node_failed_rows_on_every_wake`'s
+   `failures == vec![gate(0), lp()]` and its `NodeSkipped(after)` cascade assertion.
+3. **The gap that was real: the BOUNDARY between AC8 and AC12b.** The two pull in opposite
+   directions and were guarded in separate runs — the late-decision test has no settlement
+   in its journal at all, and neither AC12b test ever lets a gate expire. So the
+   over-correction is invisible: suppress expiry once the loop has made progress, and a
+   question nobody answered stops costing anything.
+   `a_settled_gate_replays_while_a_later_iterations_gate_still_expires` puts both states
+   live at once (gate 0 settled at +30m, gate 1 unanswered past its own deadline at +3h),
+   which forces the arm to tell them apart by NODE rather than by run. Mutation-proven
+   **both ways**: `Expired if !fold.loop_gate_settlements.is_empty() => pause` reddens THAT
+   TEST ALONE (14 others green), and deleting step 1's settled replay reddens it on the
+   discriminating assertion — the message names `lp/0/__gate__`, the gate answered on time,
+   instead of `lp/1/__gate__`, the one that ran out.
 
 ```bash
 cargo fmt --all
@@ -2014,7 +2044,7 @@ arm has not read the fold and cannot know whether one exists."
 > the author named a reserved id. Rejecting it at validation, with a message that says so,
 > is the right fix and belongs with Task 14 or a follow-on slice.
 
-- [ ] **Step 1: Write the failing tests (AC13, AC14, AC14b)**
+- [x] **Step 1: Write the failing tests (AC13, AC14, AC14b)**
 
 ```rust
 /// AC14b — a decision naming an option ABSENT from the journaled menu fails loudly. It
@@ -2088,13 +2118,13 @@ async fn a_human_role_in_gate_spec_agent_still_refuses_and_names_gate_spec_human
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p sensei-orchestrator -- unknown_option model_backed_role_in_a_human gate_spec_agent_still_refuses`
 
 Expected: **3 failures.**
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 1. In `run_human_loop_gate`'s decided arm, the unmatched branch:
 
@@ -2122,18 +2152,57 @@ Expected: **3 failures.**
 
 3. In `agent.rs`'s `!top_level` refusal, extend the message with: `"(a human-backed role gating a Loop belongs in GateSpec::Human, which takes a menu; GateSpec::Agent drives a model and applies a pure stop_when to its answer)"`.
 
-- [ ] **Step 4: Run to verify passing, and that the site table still holds**
+- [x] **Step 4: Run to verify passing, and that the site table still holds**
 
 Run: `cargo test -p sensei-orchestrator -- unknown_option model_backed_role_in_a_human gate_spec_agent_still_refuses`
 Run: `cargo test -p sensei-orchestrator non_top_level`
 
 Expected: **all pass.** The `non_top_level_sites` table must be **unchanged** — if a row had to be deleted, a bypass was opened. Stop and re-read §5.4 of the spec.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
+
+**What Task 9 actually landed (`be42bad`), and the FOURTH refusal Step 1 did not know it
+owed.** `human.rs` needed no change at all: the unmatched-option branch Step 3 sketches has
+been shipping since Task 6, unguarded. Three of the four properties were therefore already
+correct, and each went red first by mutating the source:
+
+| Test | Mutation that reddens it |
+| --- | --- |
+| `a_decision_naming_an_unknown_option_fails_the_loop_gate` (AC14b, the LIVE arm) | `.find(…).or(published.first())` — silently resolves `sideways` to `revise` and spends another iteration |
+| `a_model_backed_role_in_a_human_loop_gate_fails_loudly` (AC14, at the ask) | `human_sla_for` returning `Ok(None)` for a model backing — the run PAUSES on a question no person will ever see |
+| `a_role_edited_to_model_backed_mid_wait_fails_a_drive_that_does_not_ask` (AC14, **new**) | `self.human_sla_for(agent_ref).unwrap_or(None)` at step 2 — the arm re-pauses instead of refusing |
+| `a_human_role_in_gate_spec_agent_still_refuses_and_names_gate_spec_human` (AC13) | none needed: genuinely red, `agent.rs`'s message did not contain `GateSpec::Human` |
+
+**The new one is the finding.** The obvious reading of the arm says the ask-time AC14 test
+covers step 2's SLA read. It does not: deleting step 2 entirely leaves it GREEN, because
+that drive takes `NotYetAsking`, where `human_question_for` re-raises the identical error
+and the arm's own `Err` branch there catches it. Step 2 is load-bearing only on a drive that
+composes nothing — a gate that has already published its question and is merely being
+re-paused — which is exactly the claim `human_sla_for`'s doc makes ("every drive that could
+still ask") and exactly what nothing tested. The vector is `torii config push`: replace-all
+against a live registry, so a role can go `human` → `model` while a run sits paused on its
+gate, leaving a durable question addressed to a role that can no longer answer it. Modelled
+as a second executor over the same journal with a different registry. Note the deliberate
+asymmetry with step 1, which sits ABOVE the SLA read so the same edit cannot retroactively
+kill a loop nobody is waiting on; the new test pins the live half, and design §5.5 now
+records both.
+
+**`non_top_level_sites` is UNCHANGED** — no row deleted, no row edited. It is now
+`pub(super)`, and that is a guard rather than a convenience: the AC13 test drives its
+`GateSpec::Agent` row looked up BY NAME rather than a hand-written second copy, with an
+`expect` that says a deleted row means a bypass was opened. Deleting it now fails two tests
+in two modules.
+
+**The message clause is attached to the `Loop` gate ITEM of the enumeration**, not appended
+at the end as Step 3 sketched. The message is shared by all six refused sites, and a
+trailing "use `GateSpec::Human` instead" reads as advice to an author who put a human-backed
+role in a `Map` body, where it is wrong. The `Loop` gate is the only one of the six with a
+fix to name; the other five each remain an unbuilt feature with nowhere to send their
+author.
 
 ```bash
 cargo fmt --all
-git add crates/orchestrator/src/executor/human.rs crates/orchestrator/src/executor/agent.rs crates/orchestrator/src/executor/tests.rs
+git add crates/orchestrator/src/executor/agent.rs crates/orchestrator/src/executor/tests.rs
 git commit -m "feat(orchestrator): the three loud refusals
 
 An unmatched option fails rather than guessing: defaulting either way
