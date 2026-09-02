@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{Graph, LoopBody, MapBody, NodeKind};
+use crate::graph::{GateSpec, Graph, LoopBody, MapBody, NodeKind};
 use crate::ids::NodeId;
 use crate::registry::Registry;
 
@@ -71,13 +71,14 @@ pub fn parse_plan(text: &str) -> Result<PlannedGraph, PlanError> {
 
 /// Recursively check every agent ref against the registry: top-level `Agent`
 /// nodes, the `MapBody::Agent` body of `Map`/`Consolidate` nodes, a `Loop`'s
-/// `LoopBody::Agent` body (and, descending, a `LoopBody::Subgraph` body's graph),
-/// and — mirroring `validate_dag`'s recursion — the same inside every `Subgraph`'s
-/// graph and every `Branch`'s arm/`default` graphs. An unknown agent anywhere must
-/// fail feasibility, not only at splice time (where it would `?`-propagate as a
-/// fatal, non-resumable hard halt). `Expand` (top-level or a `LoopBody::Expand`
-/// body) has no static nested graph (its plan is produced at runtime), so it is not
-/// recursed into. Accumulates into `errs` (all errors, no short-circuit).
+/// `LoopBody::Agent` body and its `GateSpec::Agent`/`GateSpec::Human` GATE (and,
+/// descending, a `LoopBody::Subgraph` body's graph), and — mirroring `validate_dag`'s
+/// recursion — the same inside every `Subgraph`'s graph and every `Branch`'s
+/// arm/`default` graphs. An unknown agent anywhere must fail feasibility, not only at
+/// splice time (where it would `?`-propagate as a fatal, non-resumable hard halt).
+/// `Expand` (top-level or a `LoopBody::Expand` body) has no static nested graph (its
+/// plan is produced at runtime), so it is not recursed into. Accumulates into `errs`
+/// (all errors, no short-circuit).
 fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError>) {
     for n in &graph.nodes {
         match &n.kind {
@@ -93,18 +94,51 @@ fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError
                     errs.push(PlanError::UnknownAgent(agent.0.clone()));
                 }
             }
-            NodeKind::Loop { body, .. } => match body {
-                LoopBody::Agent(agent) => {
-                    if registry.agent(&agent.0).is_none() {
-                        errs.push(PlanError::UnknownAgent(agent.0.clone()));
+            NodeKind::Loop { body, gate, .. } => {
+                match body {
+                    LoopBody::Agent(agent) => {
+                        if registry.agent(&agent.0).is_none() {
+                            errs.push(PlanError::UnknownAgent(agent.0.clone()));
+                        }
                     }
+                    // A `Subgraph` body has a static nested graph — recurse (mirrors the
+                    // top-level `Subgraph` node). `ModelCall`/`Expand` have no static
+                    // agent ref to resolve here (`Expand`'s plan is checked at splice).
+                    LoopBody::Subgraph(g) => check_agent_refs(g, registry, errs),
+                    LoopBody::ModelCall { .. } | LoopBody::Expand { .. } => {}
                 }
-                // A `Subgraph` body has a static nested graph — recurse (mirrors the
-                // top-level `Subgraph` node). `ModelCall`/`Expand` have no static
-                // agent ref to resolve here (`Expand`'s plan is checked at splice).
-                LoopBody::Subgraph(g) => check_agent_refs(g, registry, errs),
-                LoopBody::ModelCall { .. } | LoopBody::Expand { .. } => {}
-            },
+                // The GATE names an agent too, and until the SP-6 s4 Task 2 review this
+                // arm bound only `body`, so neither variant's ref was resolved. The cost
+                // was not a worse message: an untrusted `Expand` planner could splice
+                // `Loop { gate: … agent: "ghost" }`, `feasible` accepted it, iteration 0
+                // spent a full body's tokens, and only then did `drive_agent` surface
+                // `UnknownAgent` through `?` — the fatal, non-resumable halt this whole
+                // function exists to pre-empt. `GateSpec::Human` is checked identically:
+                // a human gate resolves its `AgentRef` for the QUESTION (the role's
+                // `system_prompt`) exactly as an agent gate does for the answerer, so an
+                // unresolvable ref is just as fatal there.
+                //
+                // EXISTENCE only. Whether the ref's BACKING suits the variant stays with
+                // the executor: a human-backed role reached through `GateSpec::Agent` is
+                // already refused there, loudly and journaled (`drive_agent`'s
+                // `non_top_level_sites` rule), and the mirror rule — a model-backed role
+                // under `GateSpec::Human` — arrives with the arm itself in s4. Both facts
+                // are readable from the `&Registry` this function already holds, so the
+                // temptation to check them here is real. The reason not to is that the
+                // runtime must enforce them ANYWAY: `feasible` runs over planner output,
+                // while a hand-authored graph reaches the executor through
+                // `Executor::start` / `torii run submit`, which validate the GRAPH and
+                // never call this function. A copy here would guard the one path that is
+                // already guarded, and drift from the copy that guards both.
+                match gate {
+                    GateSpec::Agent { agent, .. } | GateSpec::Human { agent, .. } => {
+                        if registry.agent(&agent.0).is_none() {
+                            errs.push(PlanError::UnknownAgent(agent.0.clone()));
+                        }
+                    }
+                    GateSpec::Pure(_) => {}
+                }
+            }
             NodeKind::Subgraph { graph } => check_agent_refs(graph, registry, errs),
             NodeKind::Branch { arms, default, .. } => {
                 for (_, g) in arms {
@@ -119,9 +153,10 @@ fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError
 
 /// Pure feasibility: structure (validate_dag) + registry-resolvable agent refs
 /// (top-level `Agent` nodes, the `Map`/`Consolidate` `MapBody::Agent` bodies, a
-/// `Loop`'s `LoopBody::Agent` body, and recursively through nested `Subgraph`/
-/// `Branch` graphs plus a `LoopBody::Subgraph` body) + each `NodePlan.needs`
-/// (agents/skills/tools) + reserved-id + node-count. Returns ALL errors.
+/// `Loop`'s `LoopBody::Agent` body and its `GateSpec::Agent`/`GateSpec::Human` gate,
+/// and recursively through nested `Subgraph`/`Branch` graphs plus a
+/// `LoopBody::Subgraph` body) + each `NodePlan.needs` (agents/skills/tools) +
+/// reserved-id + node-count. Returns ALL errors.
 pub fn feasible(
     plan: &PlannedGraph,
     registry: &Registry,
@@ -182,7 +217,10 @@ pub fn feasible(
 mod tests {
     use super::*;
     use crate::effect::EffectClass;
-    use crate::graph::{Aggregation, BranchCond, Dep, Graph, MapBody, Node, NodeKind};
+    use crate::graph::{
+        Aggregation, BranchCond, Dep, GateSpec, Graph, LoopBody, LoopGate, LoopGateOption, MapBody,
+        Node, NodeKind,
+    };
     use crate::registry::{
         Activation, AgentBacking, AgentDefinition, AgentRef, Permissions, Registry, SkillDef,
         ToolSpec,
@@ -554,5 +592,99 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, PlanError::UnknownAgent(a) if a == "ghost_default"))
         );
+    }
+
+    /// **SP-6 s4 Task 2 review, Minor.** A `Loop`'s GATE names an agent too, and until
+    /// this test `check_agent_refs` bound only `body` — so neither `GateSpec::Agent`'s
+    /// nor `GateSpec::Human`'s ref was resolved here.
+    ///
+    /// The cost is not "an error with a worse message". An untrusted `Expand` planner can
+    /// splice `Loop { gate: … agent: "ghost" }`; `feasible` accepted it, so iteration 0
+    /// ran — a full body's tokens — and only then did `drive_agent` surface
+    /// `OrchestratorError::UnknownAgent` through `?`, i.e. as a fatal, non-resumable hard
+    /// halt rather than a pre-splice refusal. Every other agent-bearing position in this
+    /// file is checked before that spend; the gate is now one of them.
+    ///
+    /// Both variants, because they are separate fields on separate arms: a check written
+    /// for one does not reach the other, which is exactly how `Human` arrived beside an
+    /// already-unchecked `Agent`.
+    #[test]
+    fn feasible_reports_an_unknown_agent_in_a_loop_gate() {
+        let gated = |gate: GateSpec| PlannedGraph {
+            graph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("lp".into()),
+                    kind: NodeKind::Loop {
+                        // A `ModelCall` body, so the only agent ref in the graph is the
+                        // gate's — an `UnknownAgent` here can have no other source.
+                        body: LoopBody::ModelCall {
+                            chain: "research.bulk".into(),
+                        },
+                        input: serde_json::json!({}),
+                        gate,
+                        max_iters: 3,
+                    },
+                    deps: vec![],
+                }],
+            },
+            node_plans: HashMap::new(),
+        };
+        let names = |errs: &[PlanError]| {
+            errs.iter()
+                .filter_map(|e| match e {
+                    PlanError::UnknownAgent(a) => Some(a.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let errs = feasible(
+            &gated(GateSpec::Agent {
+                agent: AgentRef("ghost_gate".into()),
+                stop_when: LoopGate::TextContains("DONE".into()),
+            }),
+            &agent_reg(),
+            512,
+        )
+        .unwrap_err();
+        assert!(
+            names(&errs).iter().any(|a| a == "ghost_gate"),
+            "GateSpec::Agent's ref must be resolved: {errs:?}"
+        );
+
+        let errs = feasible(
+            &gated(GateSpec::Human {
+                agent: AgentRef("ghost_human".into()),
+                // A well-formed menu, so `validate_dag` has nothing to say and the only
+                // error left is the one under test.
+                menu: vec![LoopGateOption {
+                    name: "done".into(),
+                    stops: true,
+                }],
+            }),
+            &agent_reg(),
+            512,
+        )
+        .unwrap_err();
+        assert_eq!(
+            names(&errs),
+            vec!["ghost_human".to_string()],
+            "GateSpec::Human's ref must be resolved, and be the ONLY complaint: {errs:?}"
+        );
+
+        // The other half: a gate naming a REGISTERED agent still passes, so the rule
+        // cannot have been written as a blanket refusal of gated loops.
+        feasible(
+            &gated(GateSpec::Human {
+                agent: AgentRef("researcher".into()),
+                menu: vec![LoopGateOption {
+                    name: "done".into(),
+                    stops: true,
+                }],
+            }),
+            &agent_reg(),
+            512,
+        )
+        .expect("a registered gate agent is feasible");
     }
 }
