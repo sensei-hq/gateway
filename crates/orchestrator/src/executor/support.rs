@@ -1317,9 +1317,19 @@ mod tests {
             "an empty actor folds as the empty string — never re-labelled `unknown`, \
              which is what a WRITER that routed through `actor_or` would have stored"
         );
-        // The sibling is the half that makes the assertion above non-vacuous: it stores
-        // the exact string the laundering bug would have invented, so a fold that
-        // substituted would make the two nodes agree, and this pins that they do not.
+        // The sibling catches a DIFFERENT mutation, NOT the laundering one: the assertion
+        // above already catches that unaided — `if actor.is_empty() { "unknown".into() }`
+        // in the fold arm reddens it on ITS line, mutation-proven, and execution never
+        // reaches this assertion at all.
+        //
+        // What the assertion above cannot see is a fold that BLANKS the actor regardless
+        // of what was appended, because its expected value IS `""`, so such a fold agrees
+        // with it; only a node whose actor is non-empty notices. Mutation: `actor:
+        // String::new()` in the fold arm reddens HERE and leaves the one above green.
+        //
+        // The non-empty value is `"unknown"` rather than an arbitrary name because it is
+        // also the exact string the laundering bug would invent, so the pair doubles as
+        // the audit distinction — bypassed CLI versus unnameable operator — held apart.
         assert_eq!(
             fold.loop_gate_decision_for(&named).expect("decided").actor,
             "unknown",
