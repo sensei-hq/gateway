@@ -134,6 +134,20 @@ impl HumanQuestion {
         }
     }
 
+    /// The composed question, for a test in a SIBLING module to assert on.
+    ///
+    /// `#[cfg(test)]` rather than an `expect(dead_code)`: no production caller wants the
+    /// raw text — every one of them goes through [`HumanQuestion::redact_and_clamp`], and
+    /// an accessor that hands out the UNREDACTED string is exactly the shortcut that
+    /// bypass would take. `human.rs`'s own tests read the field directly; this exists
+    /// because `executor::tests` cannot (a private field is visible only to the defining
+    /// module and its descendants), and SP-6 s4's seam test lives there, beside the s3
+    /// human-agent fixtures it reuses.
+    #[cfg(test)]
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
     /// Redact the question and bring it under `bound`, **cutting only the `## Context`
     /// half**.
     ///

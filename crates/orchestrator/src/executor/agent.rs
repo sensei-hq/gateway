@@ -92,19 +92,32 @@ impl Executor {
         let parts = assemble_prompt_parts(&self.registry, agent, context, &query)?;
 
         // SP-6 s3: a human-backed role answers instead of a model. The branch sits HERE —
-        // AFTER prompt assembly, which needs no chain, so the human's question reuses the
-        // model path's own prompt assembly rather than a second implementation that could
-        // drift from it; and BEFORE `resolve_chain`, so no chain is resolved, no gateway is
-        // touched and zero token spend is STRUCTURAL rather than measured. (The assembled
-        // prompt is not the WHOLE question — see `HumanQuestion::compose`, which adds the
-        // node input and bounds the context section.)
+        // BEFORE `resolve_chain`, so no chain is resolved, no gateway is touched and zero
+        // token spend is STRUCTURAL rather than measured. (The assembled prompt is not the
+        // WHOLE question — see `HumanQuestion::compose`, which adds the node input and
+        // bounds the context section.)
+        //
+        // It also sits after prompt assembly, but SP-6 s4 moved what that used to buy.
+        // s3 composed the question from the `parts` above, so "the human's question is the
+        // model path's own prompt assembly" was a property of this branch's POSITION;
+        // `human_question_for` now owns it, for both this caller and the human loop gate,
+        // and the position is load-bearing only for the zero-spend half. The branch stays
+        // where it is because moving it changes which failure a misconfigured non-top-level
+        // role gets — see the seam call below.
+        //
+        // The backing is matched with `matches!` rather than destructured: the SLA comes
+        // back from the seam, and binding a second `timeout` here would be the second read
+        // of the role's deadline that returning it exists to avoid.
         //
         // `on_agent_started` does NOT fire on this path, deliberately: the hook's
         // signature requires `&ar.chain`, and a human-backed agent by construction never
         // has one. `resolve_chain` would in fact FAIL for the common shape of such a role
         // (`chain: None` with no `(area, kind)` binding), which is why the branch cannot
         // simply sit lower down and skip the call.
-        if let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by {
+        if matches!(
+            agent.backed_by,
+            orchestrator_core::AgentBacking::Human { .. }
+        ) {
             // `AgentStep` has no `From<NodeExec>` conversion, so the mapping is written
             // inline — the same three-arm mapping `run_node` applies to this function's
             // result, in the other direction. `NodeExec::Failed.output` is `None` on every
@@ -173,35 +186,29 @@ impl Executor {
                 ));
             }
 
-            // The QUESTION is the model-EQUIVALENT one: the assembled prompt PLUS the node's
-            // input, with the `## Context` half bounded. `HumanQuestion::compose` owns both
-            // decisions and documents them; the two facts that belong here are why the input
-            // is added at all, and why the composition is not just a `format!`.
+            // The QUESTION and the SLA, through the seam SP-6 s4's human LOOP GATE shares
+            // (see [`Executor::human_question_for`], which owns the reasoning that used to
+            // sit here). s3 got the model/human no-drift property for free by composing the
+            // question a few lines below its own `assemble_prompt_parts` call; s4 does not
+            // route through `drive_agent` at all, so the property now lives in a function
+            // both call instead of in this branch's proximity to that one.
             //
-            // `assemble_prompt_parts` takes `query` only to evaluate each skill's/tool's
-            // `activation.is_active(query)` and never puts it in `authored`. The model path
-            // supplies the input SEPARATELY, as the first user message
-            // (`Message::text(MessageRole::User, query)`, below). So journaling the system
-            // string alone showed the human the role's standing instructions and the upstream
-            // context but NOT the thing being asked about — a reviewer role reading "say
-            // whether the contract permits sub-processing" with no contract named. Design
-            // §5.4's rule is "the human sees precisely what the model would have", and its
-            // accepted cost is explicitly one-directional: never show the human LESS than the
-            // model would have had.
+            // **`assemble_prompt_parts` therefore runs TWICE on this path** — once above,
+            // once inside the seam — and that is deliberate. It is pure, so the second call
+            // cannot disagree with the first, and it happens on a path that is about to
+            // append a durable journal row and pause the whole run; a second `HashMap` hit
+            // and a second string build are not the cost here. Hoisting the assembly BELOW
+            // this branch to avoid it is the obvious alternative and it is NOT
+            // behaviour-preserving: today a non-top-level human role whose config names an
+            // unknown skill fails with `assemble_prompt_parts`'s `UnknownSkillRef` (a fatal
+            // `?`, before the refusal is reached), and after the hoist the `!top_level`
+            // refusal above would win instead. This extraction changes no behaviour, so the
+            // ordering stays as it is and the redundant call is the price.
             //
-            // It is a type rather than a `format!` because the two halves must be bounded by
-            // DIFFERENT rules — the authored half fails loudly, the context half truncates —
-            // and once they are concatenated that distinction is unrecoverable. Charging one
-            // cap against both is precisely the defect the s3 whole-slice review found.
-            let question = HumanQuestion::compose(
-                &parts.authored,
-                &parts.context,
-                &query,
-                // The executor's own pure redactor, applied to each context body BEFORE the
-                // bound cuts it — see `compose`. Identity when none is wired, which is the
-                // default, so the composed question stays byte-identical there.
-                |t| self.redact_text(t),
-            );
+            // The seam's timeout is used rather than one bound off `agent.backed_by` here,
+            // so there is exactly ONE read of the role's SLA on this path — the same reason
+            // it is returned to `run_human_loop_gate` rather than re-read there.
+            let (question, timeout) = self.human_question_for(agent_ref, input, context)?;
             return Ok(step(
                 self.run_human_agent(run, node_id, &question, timeout, fold)
                     .await?,
@@ -286,6 +293,97 @@ impl Executor {
         )
         .await?;
         Ok(AgentStep::Failed(message))
+    }
+
+    /// Resolve a human-backed `AgentRef` into the QUESTION to ask and the SLA to ask it
+    /// under — the seam `drive_agent`'s human branch (SP-6 s3) and `run_human_loop_gate`
+    /// (SP-6 s4) share.
+    ///
+    /// **It exists so s4 needs no second prompt builder.** s3's central property is that a
+    /// human's question is composed by the MODEL path's own [`assemble_prompt_parts`], so
+    /// the two cannot drift on what "the agent's prompt" means — s3 secured it by putting
+    /// its human branch INSIDE `drive_agent`, immediately after that call. s4's
+    /// `GateSpec::Human` cannot be routed the same way: it has no ReAct loop, no turns and
+    /// no `stop_when`, and threading a menu through `drive_agent` would put a parameter
+    /// there that every model caller must pass as `None`. Sharing this function keeps the
+    /// property without the coupling. `the_human_question_seam_composes_the_same_prompt_
+    /// the_model_path_would` is the guard, and it asserts on the pieces only real assembly
+    /// produces (an ACTIVATED skill body among them), because a hand-rolled
+    /// `format!("{system_prompt}: {input}")` would satisfy anything weaker.
+    ///
+    /// The QUESTION is the model-EQUIVALENT one: the assembled prompt PLUS the node's
+    /// input, with the `## Context` half bounded. [`HumanQuestion::compose`] owns both
+    /// decisions and documents them; the two facts that belong here are why the input is
+    /// added at all, and why the composition is not just a `format!`.
+    ///
+    /// `assemble_prompt_parts` takes `query` only to evaluate each skill's/tool's
+    /// `activation.is_active(query)` and never puts it in `authored`. The model path
+    /// supplies the input SEPARATELY, as the first user message
+    /// (`Message::text(MessageRole::User, query)`). So journaling the system string alone
+    /// showed the human the role's standing instructions and the upstream context but NOT
+    /// the thing being asked about — a reviewer role reading "say whether the contract
+    /// permits sub-processing" with no contract named. Design §5.4's rule is "the human
+    /// sees precisely what the model would have", and its accepted cost is explicitly
+    /// one-directional: never show the human LESS than the model would have had.
+    ///
+    /// It is a type rather than a `format!` because the two halves must be bounded by
+    /// DIFFERENT rules — the authored half fails loudly, the context half truncates — and
+    /// once they are concatenated that distinction is unrecoverable. Charging one cap
+    /// against both is precisely the defect the s3 whole-slice review found.
+    ///
+    /// **The SLA comes back with the question** so no caller re-reads the registry to find
+    /// the deadline it must pause on. A second read is a second place for a role and its
+    /// SLA to come apart, which is the arrangement `AgentBacking::Human { timeout }` exists
+    /// to prevent.
+    ///
+    /// **Fails loudly on a MODEL-backed role**, which is unreachable from `drive_agent`
+    /// (its branch has already matched the backing) and is s4's case: an author naming a
+    /// model-backed role in a `GateSpec::Human`. Design §5.5 — silence there would let an
+    /// author believe a person is in the loop while the run quietly decides for itself, the
+    /// mirror of the refusal `drive_agent` gives a human-backed role at an illegal
+    /// position. The message names the role, the defect and the fix, because the only
+    /// person who can act on it is the one who wrote the config.
+    ///
+    /// No chain is resolved and no gateway is touched, so **zero token spend on every
+    /// caller's path is structural** rather than measured — the property s3 secured by
+    /// placing its branch above `resolve_chain`, now a property of this function.
+    ///
+    /// It returns `Err`, not a `NodeFailed`: it has no `RunId`, journals nothing, and its
+    /// two callers differ in what a failure means (s3's `?`-propagates as it always has;
+    /// s4's gate arm turns it into a `NodeFailed` that fails the `Loop`). Deciding that
+    /// here would take the choice away from the caller that owns it.
+    pub(super) fn human_question_for(
+        &self,
+        agent_ref: &AgentRef,
+        input: &serde_json::Value,
+        context: &[(ContextKey, serde_json::Value)],
+    ) -> Result<(HumanQuestion, Option<chrono::Duration>), OrchestratorError> {
+        let agent: &AgentDefinition = self
+            .registry
+            .agent(&agent_ref.0)
+            .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
+        let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by else {
+            return Err(OrchestratorError::InvalidGraph(format!(
+                "agent {:?} is model-backed but is named where a human-backed role is \
+                 required; set `backed_by: human` in its frontmatter, or use a gate kind \
+                 that takes a model",
+                agent_ref.0
+            )));
+        };
+        let query = render_input(input);
+        let parts = assemble_prompt_parts(&self.registry, agent, context, &query)?;
+        Ok((
+            HumanQuestion::compose(
+                &parts.authored,
+                &parts.context,
+                &query,
+                // The executor's own pure redactor, applied to each context body BEFORE the
+                // bound cuts it — see `compose`. Identity when none is wired, which is the
+                // default, so the composed question stays byte-identical there.
+                |t| self.redact_text(t),
+            ),
+            timeout,
+        ))
     }
 
     /// Produce one ReAct turn's model output: a memoized turn replays from the
