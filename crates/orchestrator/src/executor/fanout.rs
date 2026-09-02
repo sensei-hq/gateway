@@ -425,10 +425,12 @@ impl Executor {
     /// per iteration and threads its whole output (the sink map) as the next planner
     /// input. A graph-body
     /// Failed/Paused fails/pauses the Loop exactly like a leaf body. The `gate` is
-    /// either `Pure` (an SP-1 pure predicate over the iteration output, no journaling)
-    /// or `Agent` — a gate-agent driven over the output at `"{loop}/{i}/__gate__"`,
+    /// `Pure` (an SP-1 pure predicate over the iteration output, no journaling),
+    /// `Agent` — a gate-agent driven over the output at `"{loop}/{i}/__gate__"`,
     /// whose journaled answer feeds the pure `stop_when` (a gate-agent Failed fails the
-    /// Loop, a gate-agent Paused pauses it). Cap-without-Stop
+    /// Loop, a gate-agent Paused pauses it) — or `Human` — a person picks from an
+    /// enumerated menu, once per iteration (SP-6 s4; the arm is a stub until Task 7).
+    /// Cap-without-Stop
     /// completes best-effort (`converged: false`), never a bare fail; a body failure
     /// fails the Loop; a body pause pauses the Loop. Resume replays completed
     /// iterations (memo-hit, no re-spend) and recomputes the gate — a pure gate from
