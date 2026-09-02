@@ -144,9 +144,10 @@ pub const MAX_AWAIT_SIGNAL_TIMEOUT: chrono::Duration = chrono::Duration::days(36
 ///
 /// Not to be confused with [`LoopGateOption`] (SP-6 s4) — both now put a NAMED MENU in
 /// front of a human, so the two are easy to reach for interchangeably, but they answer
-/// to different node kinds: this one belongs to the `HumanGate` node and carries a
-/// [`GateOutcome`] (`Complete` or `Fail` the whole run); `LoopGateOption` belongs to a
-/// `Loop`'s `GateSpec::Human` and carries `stops` (continue or converge one iteration).
+/// to different node kinds: this one belongs to the `HumanGate` node and its
+/// [`GateOutcome`] decides that NODE's outcome (and a `Fail` option fails the run);
+/// `LoopGateOption` belongs to a `Loop`'s `GateSpec::Human` and its `stops` decides
+/// whether the LOOP keeps iterating — asked once per iteration, not once per run.
 /// The tell is which field is on the option — `outcome` here, `stops` there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateOption {
