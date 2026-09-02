@@ -344,8 +344,17 @@ pub async fn answer(
     // A hard error (exit 1), matching both siblings: exit 2 in this taxonomy means "ran
     // fine, nothing to do", and an over-limit answer is invalid INPUT.
     let text = redact_answer(text);
-    check_human_text_size(&text, Measured::AfterRedaction, "the answer (--text)")
-        .map_err(CliError::error)?;
+    // BOTH flags, because by this point the distinction is gone: `answer_args` collapses
+    // `--text` and `--text-file` into one `String` before `answer` is called, so a label
+    // naming only `--text` blames an operator who used `--text-file` for an argument they
+    // never typed. The sibling check below names `--as` because `--as` is the only way to
+    // supply an actor; here there are two, and the message must not pick one.
+    check_human_text_size(
+        &text,
+        Measured::AfterRedaction,
+        "the answer (--text/--text-file)",
+    )
+    .map_err(CliError::error)?;
 
     // Collapsed on the way IN, not just on the way out — unlike the node id, which is
     // journaled as given. `actor` is folded into the node's OUTPUT, so an escape sequence
@@ -374,13 +383,31 @@ pub async fn answer(
     // shortest span it replaces, so redaction can GROW the value past the cap, and checking
     // the raw text would bound a value nobody stores. `Measured::AfterRedaction` moves with
     // it, so an operator told "5580 bytes" for a 4030-byte actor gets the explanation.
-    let actor = redact_answer(&render::one_line(actor));
+    let one_lined = render::one_line(actor);
+    let actor = redact_answer(&one_lined);
     check_human_text_size(
         &actor,
         Measured::AfterRedaction,
         "the answer's actor (--as)",
     )
     .map_err(CliError::error)?;
+    // The scrub above is recall-over-precision by design (`redact.rs`: "open lower bounds
+    // are intentional"), so it also rewrites values that are not credentials: an assignment
+    // like `--as "deploy-token:prod-eu"` is journaled as `deploy-token:[REDACTED]`. The
+    // actor is ATTRIBUTION, not authentication, so a mangled one has no security or
+    // correctness consequence — but it is never echoed in the outcome text either, so
+    // without this an operator learns their attribution was rewritten only by reading the
+    // journal back.
+    //
+    // A notice, deliberately, rather than a per-field allowlist: an allowlist would reopen
+    // the plaintext-actor leak the whole-slice review closed, on precisely the field an
+    // operator scripts from a credential-bearing variable (`--as "$CI_TOKEN_OWNER"`). It
+    // carries the REDACTED value — the row's own bytes — and never the raw one, so it
+    // announces the scrub without defeating it. Silent when nothing changed, which keeps
+    // the ordinary `--as alice` outcome byte-identical.
+    let rewritten = (actor != one_lined)
+        .then(|| format!(" (--as contained secret-shaped text and was recorded as {actor})"));
+    let rewritten = rewritten.as_deref().unwrap_or_default();
 
     // A node id is operator-supplied free text and every message below echoes it back to a
     // terminal, so control characters are collapsed for DISPLAY — a raw newline or an ANSI
@@ -564,9 +591,27 @@ pub async fn answer(
             )),
             // Terminated BEFORE our row landed: a true orphan. The pre-check refuses this
             // shape, so reaching it means the node died inside the write window — worth
-            // saying plainly, because the residue is durable: a human-backed agent journals
-            // no `NodeCompleted` and `NodeFailed` is not folded as a barrier, so a re-`start`
-            // would re-execute the node and fold this late answer as its output.
+            // saying plainly, because what happens to the residue next differs by HOW it
+            // died, and the operator's next move differs with it.
+            //
+            // `Failed` is split out because the general claim below is FALSE for it. That
+            // claim was grounded on "`NodeFailed` is not folded as a barrier", which is true
+            // of the fold in general and irrelevant to this node kind: `run_human_agent`'s
+            // step 0 calls `gate_precheck_by_id` — `fold.failure_for(node)` — and returns
+            // `Failed` BEFORE step 3 reads any answer. A re-`start` therefore re-reads the
+            // failure and never looks at this row. Saying otherwise sends an operator
+            // hunting for a downstream contamination that cannot occur, and understates how
+            // terminal the node is.
+            (SignalState::Failed, false) => Outcome::precondition(format!(
+                "not read: {shown}'s answer is journaled durably, but {shown} had already \
+                 FAILED before the write landed, so nothing read it. The row is inert — \
+                 every later drive re-reads that failure before it would read an answer, so \
+                 a re-`start` of this run cannot fold it as the node's output. The node \
+                 stays failed; start a new run."
+            )),
+            // `Completed` and `Skipped`. The last-wins claim holds here: neither leaves a
+            // failure for the precheck to read back, so a re-`start` re-executes the node
+            // and folds this late answer as its output.
             (other, false) => Outcome::precondition(format!(
                 "not read: {shown}'s answer is journaled durably, but {shown} was already {} \
                  before the write landed, so nothing read it. The answer stays on the journal \
@@ -596,7 +641,7 @@ pub async fn answer(
         // Says QUEUED, never RESUMED: `force_wake` only sets `next_wake`; a worker tick does
         // the driving.
         Outcome::ok(format!(
-            "answered: {shown} (the run will resume on the next worker tick)"
+            "answered: {shown} (the run will resume on the next worker tick){rewritten}"
         ))
     } else if after.status.is_terminal() {
         // The run is over while the node itself never terminated — `cancel`/`record_terminal`
@@ -929,6 +974,19 @@ pub(crate) mod tests {
             "must name the input the operator actually supplied: {}",
             e.message
         );
+        // BOTH flags, because by the time `answer` runs it cannot tell which one was used:
+        // `answer_args` collapses `--text` and `--text-file` into one `String` before this
+        // function is ever called, so a label naming only `--text` sends an operator who
+        // used `--text-file` looking for an argument they did not pass. `contains("--text")`
+        // above cannot catch that — `"--text-file"` satisfies it too, which is exactly why
+        // it shipped wrong.
+        assert!(
+            e.message.contains("--text-file"),
+            "an oversized answer supplied by FILE must not be blamed on a flag the operator \
+             never typed; this function cannot tell the two apart, so the label names both: \
+             {}",
+            e.message
+        );
         assert!(
             journaled_answers(&j, run, &reviewer()).await.is_empty(),
             "an over-limit answer must never reach the journal"
@@ -1169,6 +1227,72 @@ pub(crate) mod tests {
             "the actor reached durable storage in plaintext: {durable}"
         );
         assert!(durable.contains("[REDACTED]"), "{durable}");
+    }
+
+    /// The redaction the actor NEEDS is also the redaction that can mangle it, and the
+    /// operator is never shown either fact.
+    ///
+    /// `PatternRedactor` is recall-over-precision by design (`redact.rs`: "open lower
+    /// bounds are intentional"), and its assignment rule matches `key: value` on
+    /// `token|secret|api_key|password`. A service-account attribution like
+    /// `--as "deploy-token:prod-eu"` is exactly that shape, so the durable row records
+    /// `deploy-token:[REDACTED]` — and because the actor is never echoed in the outcome
+    /// text, the operator sees `answered: reviewer` and has no way to learn their
+    /// attribution was rewritten until they read the journal back.
+    ///
+    /// The fix is NOT a per-field allowlist: that would reopen the plaintext-actor leak the
+    /// whole-slice review closed, on the field an operator most often scripts from a
+    /// credential-bearing variable. The trade stands. What is cheap and leaks nothing is
+    /// SAYING so — the notice carries the REDACTED value (the row's own bytes), never the
+    /// raw one.
+    ///
+    /// Deliberately silent when nothing changed, so the ordinary `--as alice` outcome is
+    /// byte-identical; that half is asserted here too, because a notice that always fires
+    /// says nothing.
+    #[tokio::test]
+    async fn an_actor_the_redactor_rewrote_is_reported_to_the_operator() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = agent_journal(run, &reviewer(), None).await;
+
+        let out = answer(
+            &s,
+            &j,
+            run,
+            reviewer(),
+            "ship it",
+            // Assembled rather than a literal: the repo's Semgrep CWE-798 hook blocks a
+            // credential-shaped fixture, and this is deliberately NOT a credential — that
+            // is the whole point of the case.
+            &format!("deploy-{}:prod-eu", "token"),
+            now(),
+        )
+        .await
+        .expect("delivers");
+
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+        assert!(
+            out.text.contains("[REDACTED]"),
+            "an operator whose attribution was rewritten must be told, and told what was \
+             recorded instead — the actor is never otherwise echoed: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("prod-eu"),
+            "the notice reports the REDACTED value; echoing the raw one would defeat the \
+             scrub it is announcing: {}",
+            out.text
+        );
+
+        let plain = answer(&s, &j, run, reviewer(), "ship it", "alice", now())
+            .await
+            .expect("delivers");
+        assert!(
+            !plain.text.contains("[REDACTED]"),
+            "an ordinary actor is not rewritten, so the notice must stay silent — one that \
+             always fires says nothing: {}",
+            plain.text
+        );
     }
 
     /// `render::one_line(actor)` is load-bearing and was guarded by nothing: review mutated
@@ -1769,10 +1893,22 @@ pub(crate) mod tests {
     /// the `NodeFailed` in first: the store hook fires on `force_wake`, which is post-append
     /// by construction, so no `SchedulerStore` fixture can produce this ordering.
     ///
-    /// It must never report success, and the residue is durable and consequential: a
-    /// human-backed agent journals no `NodeCompleted` and `NodeFailed` is not folded as a
-    /// barrier, so a re-`start` of this run would re-execute the node and fold this late
-    /// answer as its OUTPUT — which then flows into every downstream model prompt.
+    /// It must never report success, and it must describe the residue CORRECTLY.
+    ///
+    /// The message shipped claiming the answer "stays on the journal as a last-wins value
+    /// that a re-`start` of this run would fold as the node's output", grounded on
+    /// "`NodeFailed` is not folded as a barrier". That is wrong for THIS node kind, and this
+    /// fixture is the state it is wrong about: `run_human_agent`'s step 0 calls
+    /// `gate_precheck_by_id`, which is `fold.failure_for(node)` and returns `Failed` BEFORE
+    /// step 3 ever reads an answer. A re-`start` therefore re-reads the `NodeFailed` and
+    /// never looks at the row — the residue is inert, not a pending output. Telling an
+    /// operator otherwise sends them hunting for a downstream contamination that cannot
+    /// happen, and understates how dead the node is.
+    ///
+    /// `Failed` is the dominant reachable state in this arm but not the only one:
+    /// `signal_states` can also land `Skipped` (a cascade skip) and `Completed` (a
+    /// concurrent duplicate answer), and for `Completed` the last-wins claim IS true. So the
+    /// arm splits on `Failed` rather than being rewritten wholesale.
     #[tokio::test]
     async fn an_answer_the_node_died_before_is_reported_as_an_orphan_not_as_answered() {
         struct DiesInsideTheWindow {
@@ -1834,13 +1970,29 @@ pub(crate) mod tests {
 
         assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
         assert!(
-            out.text.contains("was already") && out.text.contains("nothing read it"),
-            "must say the row is a durable orphan, not a delivery: {}",
+            out.text.contains("already FAILED") && out.text.contains("nothing read it"),
+            "must say the row is a durable orphan, not a delivery — and name the state, \
+             because the residue's fate differs between `Failed` and the other two: {}",
             out.text
         );
         assert!(
             out.text.contains("re-`start`"),
-            "must name the durable consequence — the answer is still a last-wins value: {}",
+            "must name what a re-`start` does with the row, which is the operator's next \
+             question: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("fold as the node's output"),
+            "the node is FAILED: `gate_precheck_by_id` reads that failure back on every \
+             later drive and returns before the answer is read, so a re-`start` can never \
+             fold this row as the node's output. Promising that sends an operator hunting \
+             for a downstream contamination that cannot happen: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("inert"),
+            "and must say what the residue actually is, rather than leaving the operator to \
+             infer it from a claim that was withdrawn: {}",
             out.text
         );
     }

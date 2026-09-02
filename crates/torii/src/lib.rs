@@ -19,6 +19,13 @@ pub(crate) mod test_guard {
     /// The single choke point for every DB-gated unit test in this crate: `Some(url)` to
     /// run, `None` — plus a VISIBLE skip notice naming the test — to skip.
     ///
+    /// **The SECOND layer, since the conditional-ignore gate.** The first is
+    /// `#[cfg_attr(not(have_database_url), ignore = "...")]` on every test below, driven by
+    /// this package's `build.rs` — that is what makes a database-less run report these as
+    /// `ignored` rather than as PASSED, which is what the runtime early-return made them.
+    /// This helper still runs, and still announces, for the case the cfg cannot see: the
+    /// variable present at BUILD time and gone at run time.
+    ///
     /// WHOLE-SLICE FIX 6: a silent early return made a skipped DB suite indistinguishable
     /// from a green one (same test count, same "ok"), so a CI job that loses the variable
     /// reported a fully-passing database suite that touched nothing.

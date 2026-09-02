@@ -533,6 +533,29 @@ impl Registry {
             // an inner match that could never fail — two matches on one value, where
             // the second only looked conditional.
             if let AgentBacking::Human { timeout } = &agent.backed_by {
+                // The counterpart to the SKIP above, and the reason the skip is safe to
+                // state so broadly. Having exempted a human agent from HAVING to resolve a
+                // chain, this rejects one that declares a chain anyway: `drive_agent`
+                // short-circuits into `run_human_agent` before `resolve_chain` is ever
+                // reached, so the binding named here is not merely unused — it is never
+                // resolved, may not exist, and nothing would ever say so.
+                //
+                // Same rule, same reason, as the tools and grants rules below, and the exact
+                // shape `parse_backing` is already loud about in the mirror direction ("a
+                // model-backed agent's timeout is inert"). Silence here was the odd one out.
+                //
+                // `chains` is checked with `chain`: the per-phase map is the identical
+                // declaration keyed by phase, and catching only the singular form would move
+                // the footgun one line down the md.
+                if agent.chain.is_some() || !agent.chains.is_empty() {
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {:?} is human-backed and may not declare a chain; a \
+                         human-backed agent is answered by a person and never calls a \
+                         provider, so the chain is never resolved and the binding named \
+                         here is not checked to exist",
+                        agent.name
+                    )));
+                }
                 // The ReAct loop that would use these never runs, so a tool here is
                 // never reachable — the confused-deputy shape SP-4 s1 argues against.
                 // Reject the config rather than silently ignore the declaration.
@@ -2219,6 +2242,47 @@ mod tests {
         assert!(m.contains("human-backed"), "must name the backing: {m}");
         assert!(m.contains("grant"), "must name the rule: {m}");
         assert!(m.contains("fs_read"), "must name the offending grant: {m}");
+    }
+
+    /// A chain on a human-backed agent is the SAME inert declaration as a tool or a grant,
+    /// and it was the one the block said nothing about.
+    ///
+    /// The asymmetry is what makes it worth a rule. `validate` deliberately SKIPS the
+    /// chain-resolvability requirement for a human agent (see
+    /// `a_human_backed_agent_needs_no_chain`), so a `chain:` here is not merely unused — it
+    /// is never even resolved, and `drive_agent` short-circuits to `run_human_agent` before
+    /// `resolve_chain` is reached. A `chain: research.bulk` on a human role therefore names
+    /// a binding that may not exist at all and nothing ever notices.
+    ///
+    /// It is exactly the shape `parse_backing` is already LOUD about in the mirror
+    /// direction — "timeout is only meaningful with `backed_by: human`; a model-backed
+    /// agent's timeout is inert" — and the shape the tools and grants rules above reject in
+    /// this one. Silence here was the odd rule out.
+    ///
+    /// `chains` (the per-phase map) is covered by the same rule and the same test: it is the
+    /// identical declaration keyed by phase, and a rule that caught only the singular form
+    /// would just move the footgun one line down the md.
+    #[test]
+    fn a_human_backed_agent_may_not_declare_a_chain() {
+        let mut a = human_agent("reviewer");
+        a.chain = Some("research.bulk".into());
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("a chain on a human agent resolves nothing");
+        let m = format!("{e}");
+        assert!(m.contains("reviewer"), "must name the agent: {m}");
+        assert!(m.contains("human-backed"), "must name the backing: {m}");
+        assert!(m.contains("chain"), "must name the rule: {m}");
+
+        let mut a = human_agent("reviewer");
+        a.chains.insert("draft".into(), "research.bulk".into());
+        let e = registry_of(vec![a])
+            .validate()
+            .expect_err("a per-phase chain map resolves nothing either");
+        assert!(
+            format!("{e}").contains("chain"),
+            "the per-phase map is the same declaration keyed by phase: {e}"
+        );
     }
 
     /// The prompt IS the question. An empty one asks a human nothing.

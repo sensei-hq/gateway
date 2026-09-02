@@ -37,6 +37,13 @@ use orchestrator_store::postgres::{
 };
 use std::sync::Arc;
 
+/// **The SECOND layer, since the conditional-ignore gate.** The first is
+/// `#[cfg_attr(not(have_database_url), ignore = "...")]` on every test below, driven by
+/// this package's `build.rs` — that is what makes a database-less run report these as
+/// `ignored` rather than as PASSED, which is what the runtime early-return made them.
+/// This helper still runs, and still announces, for the case the cfg cannot see: the
+/// variable present at BUILD time and gone at run time.
+///
 /// WHOLE-SLICE FIX 6: `None` also emits a VISIBLE skip notice naming the test, so a green
 /// run that touched no database is distinguishable from one that did. Written to the real
 /// stderr rather than through `eprintln!`, which libtest captures for a passing test. (Same
@@ -556,6 +563,10 @@ async fn serve_until_settled(
 /// 5. The run reaches `Completed`, and process B's gateway saw exactly ONE call for this
 ///    run: the single un-run node. A's journaled prefix was replayed from the durable
 ///    journal + CAS, never re-spent.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[tokio::test]
 async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() {
     let Some(url) = db_url() else { return };
@@ -695,6 +706,10 @@ async fn the_operator_loop_drives_a_paused_run_to_completion_across_processes() 
 /// That trailing tick is the whole point. Without it the test would only prove a status
 /// column changed; with it, the claim path itself is shown to honour the cancellation,
 /// which is the claim `run cancel`'s output actually makes to the operator.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[tokio::test]
 async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
     let Some(url) = db_url() else { return };
@@ -771,6 +786,10 @@ async fn a_cancelled_run_is_never_driven_by_a_later_worker_tick() {
 ///    the whole point of a fence is refusing before spending.
 /// 5. Afterwards `torii run wake` on the now-`failed` run must say so plainly, not queue
 ///    it as if the fence had never fired.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[tokio::test]
 async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_anything() {
     let Some(url) = db_url() else { return };
@@ -915,6 +934,10 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
 ///    NEVER — A's already-paid-for prefix was replayed from the durable journal + CAS.
 ///    And the final ledger reads 300, not 150: spend ACCUMULATED across the boundary
 ///    rather than restarting, which is the whole point of journaling it.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[tokio::test]
 async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fresh_process() {
     let Some(url) = db_url() else { return };
@@ -1099,6 +1122,10 @@ async fn a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fres
 /// `run_subgraph` already carries, and "fixing" it for one node kind would make
 /// `AwaitSignal` divergent from its siblings. The durable blackboard is correct throughout,
 /// which is what the `context_refs` read below actually demonstrates.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[tokio::test]
 async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_process() {
     let Some(url) = db_url() else { return };
@@ -1321,6 +1348,10 @@ async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_pr
 /// `RunCompleted` and the durable blackboard — never through a terminal re-`start`'s
 /// `RunOutcome`, which is empty for this node-kind family for reasons that have nothing to
 /// do with gating. See the `AwaitSignal` e2e above for that argument in full.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[tokio::test]
 async fn a_human_gate_decided_in_another_process_completes_the_run() {
     let Some(url) = db_url() else { return };
@@ -1613,6 +1644,10 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
 /// `#[ignore]`d, and it cannot be: `#[ignore]` is a compile-time attribute and cannot be
 /// conditioned on an environment variable. (s2's spec claimed this suite was `#[ignore]`d.
 /// It never was, and the claim is repeated here only to kill it.)
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
 #[tokio::test]
 async fn a_human_backed_agent_answered_in_another_process_completes_the_run() {
     let Some(url) = db_url() else { return };

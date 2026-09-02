@@ -4814,6 +4814,10 @@ pub(crate) mod tests {
     /// Touches only its own freshly-generated run id (`status`/`record_paused`/
     /// `force_wake` are all run-scoped and no assertion here reads the global paused
     /// list), so it needs no `scheduled_runs` guard and cannot race another suite.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn a_signal_payload_is_redacted_before_it_reaches_postgres() {
         let Some(url) = crate::test_guard::db_url() else {

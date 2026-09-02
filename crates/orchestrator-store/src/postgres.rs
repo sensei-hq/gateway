@@ -1082,6 +1082,13 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    /// **The SECOND layer, since the conditional-ignore gate.** The first is
+    /// `#[cfg_attr(not(have_database_url), ignore = "...")]` on every test below, driven by
+    /// this package's `build.rs` — that is what makes a database-less run report these as
+    /// `ignored` rather than as PASSED, which is what the runtime early-return made them.
+    /// This helper still runs, and still announces, for the case the cfg cannot see: the
+    /// variable present at BUILD time and gone at run time.
+    ///
     /// Tests require a live PG at $DATABASE_URL with the dbd schema applied (the Docker harness).
     /// Absent DATABASE_URL, they skip (so a bare `cargo test --features postgres` without a DB
     /// doesn't fail spuriously).
@@ -1153,6 +1160,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn connects_and_the_schema_exists() {
         let Some(url) = db_url() else { return };
@@ -1166,6 +1177,10 @@ mod tests {
         assert!(n >= 5, "expected the 5 orchestrator.* tables, saw {n}");
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn append_then_load_returns_events_in_ascending_seq() {
         let Some(url) = db_url() else { return };
@@ -1185,6 +1200,10 @@ mod tests {
         assert!(matches!(evs[1].1, JournalEvent::NodeStarted { .. }));
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn load_since_returns_only_the_tail() {
         let Some(url) = db_url() else { return };
@@ -1199,6 +1218,10 @@ mod tests {
         assert_eq!(tail[0].0, s2, "the tail is the second event");
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn incompatible_format_version_fences_on_load() {
         let Some(url) = db_url() else { return };
@@ -1233,6 +1256,10 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn snapshot_round_trips_latest_wins() {
         let Some(url) = db_url() else { return };
@@ -1281,6 +1308,10 @@ mod tests {
         assert_eq!(j.latest_snapshot(r).await.unwrap().unwrap().seq, s2);
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn compact_removes_the_named_events_and_appends_the_manifest() {
         let Some(url) = db_url() else { return };
@@ -1326,6 +1357,10 @@ mod tests {
     /// Parity with `content_store_dedupes_identical_bytes_and_misses_loudly`:
     /// `put` of identical bytes yields ONE row + the same `Digest`; `get` of a missing digest
     /// is the SAME loud `ContentDigestMiss` the InMemory store raises.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_content_store_dedupes_identical_bytes_and_misses_loudly() {
         let Some(url) = db_url() else { return };
@@ -1363,6 +1398,10 @@ mod tests {
     /// A content-addressed blob store must round-trip ARBITRARY bytes losslessly (not just UTF-8)
     /// — `bytea` over sqlx's binary protocol. Guards against a future serialization change quietly
     /// mangling non-UTF-8 content.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_content_store_round_trips_arbitrary_binary_bytes() {
         let Some(url) = db_url() else { return };
@@ -1382,6 +1421,10 @@ mod tests {
     /// distinct-key writes round-trip via the CAS; a re-write of an existing `(scope,key)`
     /// collides LOUDLY (`ContextKeyCollision`, not a silent overwrite); a `Node` read resolves
     /// up to `Run`; a `Node`-scoped write is private to that node; a miss is `Ok(None)`.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_context_store_collides_resolves_node_to_run_and_misses_to_none() {
         let Some(url) = db_url() else { return };
@@ -1448,6 +1491,10 @@ mod tests {
     /// Parity with `insert_ref_rehydrates_an_entry_without_recomputing_the_cas`:
     /// `insert_ref` rehydrates from an already-journaled ref (no CAS recompute) and is
     /// idempotent — re-inserting the same ref does NOT collide (unlike `put`).
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_insert_ref_rehydrates_an_entry_without_recomputing_the_cas() {
         let Some(url) = db_url() else { return };
@@ -1502,6 +1549,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn store_then_load_round_trips_config() {
         let _guard = config_guard().await;
@@ -1522,6 +1573,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn version_is_zero_on_empty_then_monotonic_under_bump() {
         let _guard = config_guard().await;
@@ -1542,6 +1597,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn store_is_replace_all_removed_entities_do_not_linger() {
         let _guard = config_guard().await;
@@ -1573,6 +1632,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn chain_bindings_round_trip_as_a_relational_row() {
         let _guard = config_guard().await;
@@ -1603,6 +1666,10 @@ mod tests {
     /// (a `grants` map of `Permissions`, a nested `input_schema` object, a `credentials` vec) —
     /// unlike `SkillDef`/`ChainBinding`, which are flat. Proves the jsonb round-trip preserves
     /// that nested structure exactly, not just that a row with the right name exists.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn agent_and_tool_round_trip_through_jsonb_including_nested_fields() {
         let _guard = config_guard().await;
@@ -1811,6 +1878,10 @@ mod tests {
     /// while BOTH calls return `Ok`. That is a config push that reports success and did not
     /// happen: an operator revoking access with `{}` against a concurrent `{x, z}` push
     /// silently keeps `{x, z}`.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn concurrent_store_and_bumps_do_not_merge_their_content() {
         let _guard = config_guard().await;
@@ -1897,6 +1968,10 @@ mod tests {
     /// current-thread runtime the two tasks interleave only at await points and in
     /// practice run to completion one after the other (which yields `23505`, not the
     /// cycle). Real parallelism is what makes the cycle reachable.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_writers_with_overlapping_names_neither_deadlock_nor_merge() {
         let _guard = config_guard().await;
@@ -1961,6 +2036,10 @@ mod tests {
     /// `repeatable read` transaction and asserted on values read inside it, which merely
     /// demonstrated Postgres semantics — it passed even with the `set transaction
     /// isolation level` line deleted from `load_versioned`. This version fails.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn load_versioned_returns_a_consistent_pair_despite_a_writer_committing_mid_read() {
         let _guard = config_guard().await;
@@ -2059,6 +2138,10 @@ mod tests {
     /// canNOT detect a regression in `load_versioned`. See
     /// `load_versioned_returns_a_consistent_pair_despite_a_writer_committing_mid_read` for
     /// the test that guards the production code path.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn repeatable_read_snapshots_are_fixed_at_the_first_read() {
         let _guard = config_guard().await;
@@ -2111,6 +2194,10 @@ mod tests {
     }
 
     /// AC6 — content and generation move together, atomically.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn store_and_bump_advances_content_and_generation_together() {
         let _guard = config_guard().await;
@@ -2134,6 +2221,10 @@ mod tests {
     }
 
     /// AC6 — a rolled-back write moves NEITHER content nor generation.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn a_failed_store_and_bump_leaves_content_and_generation_untouched() {
         let _guard = config_guard().await;
@@ -2177,6 +2268,10 @@ mod tests {
     /// A CAS write must apply ONLY at the expected generation. This is the residual
     /// window the SP-DATA-4 re-read could not close: between `version()` returning and
     /// the bump committing.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn store_and_bump_if_refuses_at_an_unexpected_generation() {
         let Some(url) = db_url() else { return };
@@ -2218,6 +2313,10 @@ mod tests {
     /// re-check-then-fallback, which would reopen a (narrower) version of the very
     /// race this method exists to close (see the doc comment on the method for the
     /// full argument). Proven here directly against a table where the row is absent.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn store_and_bump_if_lands_a_genuine_first_push_when_the_row_is_absent() {
         let Some(url) = db_url() else { return };
@@ -2255,6 +2354,10 @@ mod tests {
     /// check-then-fallback, which — for this exact interleaving — would let both
     /// `store_and_bump` fallback calls succeed (true last-writer-wins, per
     /// `store_and_bump`'s own doc comment) rather than refusing the loser outright.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn concurrent_first_pushes_do_not_both_land() {
         let Some(url) = db_url() else { return };
@@ -2308,6 +2411,10 @@ mod tests {
     /// `expected == 0` tests exercises that path, so this is the one that would catch a
     /// regression here — notably, a future switch to `REPEATABLE READ` would turn this
     /// clean `None` into a `40001` serialization error instead.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn concurrent_pushes_at_the_same_nonzero_generation_do_not_both_land() {
         let Some(url) = db_url() else { return };
@@ -2367,6 +2474,10 @@ mod tests {
     /// then sees its `NOT EXISTS (SELECT 1 FROM ins)` guard hold, and its own `WHERE
     /// version = $1` matches the row that is genuinely present — so the update, not
     /// the insert, is what lands.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn store_and_bump_if_applies_when_the_row_is_present_at_generation_zero() {
         let Some(url) = db_url() else { return };
@@ -2412,6 +2523,10 @@ mod tests {
     }
 
     /// The exactly-once gate: two concurrent `claim_due` on one due run → exactly one wins.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_claim_due_is_exactly_once_under_concurrent_claims() {
         let _guard = scheduler_guard().await;
@@ -2438,6 +2553,10 @@ mod tests {
     }
 
     /// Round-trip + transitions: not-due is skipped; due is claimed (stored graph returned); terminal.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_round_trip_and_transitions() {
         let _guard = scheduler_guard().await;
@@ -2481,6 +2600,10 @@ mod tests {
     }
 
     /// Intervene: cancel makes a paused run unwakeable; force_wake makes a NULL-deadline pause claimable.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_cancel_and_force_wake() {
         let _guard = scheduler_guard().await;
@@ -2581,6 +2704,10 @@ mod tests {
     /// Everything is aged into 1971 and the cutoff sits between the two 1971 stamps, so the
     /// blast radius cannot reach any other test's rows — every one of those carries the live
     /// server clock.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
     #[tokio::test]
     async fn pg_prune_terminal_deletes_old_terminal_rows_and_never_a_live_one() {
         let _guard = scheduler_guard().await;
