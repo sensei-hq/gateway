@@ -566,26 +566,37 @@ plan. When Task 14 traces AC2, read this step's message, not `7cf61a5`'s.
 
 **Files:**
 - Modify: `crates/orchestrator-core/src/journal.rs` — the `JournalEvent` enum, after the `AgentAnswered` variant
+- Modify: `crates/orchestrator/src/executor/tests.rs` — two arms in the `label` helper (see Step 5; this is not optional and not Task 4's work)
 - Test: `crates/orchestrator-core/src/journal.rs` inline tests
 
 - [ ] **Step 1: Write the failing tests**
 
+> **Corrected after Task 3's review.** The text below is the SHIPPED version. The draft it
+> replaces asserted the decided half with `matches!(.., LoopGateDecided { .. })` — the variant
+> TAG only — and built the awaited half with `deadline: None`, which `assert!(deadline.is_none())`
+> cannot tell apart from a dropped field because `None` is serde's default. Three reviewers
+> independently mutation-proved it: `#[serde(skip)]` on `LoopGateDecided::option`, on its `actor`,
+> and on `LoopGateAwaited::deadline` each left the draft GREEN. Assert every field BY VALUE, as the
+> three sibling round-trips in the same module already do.
+
 ```rust
-/// AC20 — new VARIANTS are additive, so the durable format is unchanged. The existing
-/// variant-count assertion in this module is the guard that a variant was added
-/// deliberately; this asserts the version did not move with it.
+/// AC20 — the durable format version is PINNED, so it cannot move unannounced.
+/// (Doc comment abridged here; the shipped one records that this cannot observe
+/// additivity — the two old-JSON decode tests do that — and that NOTHING in
+/// `orchestrator-core` notices a variant being ADDED.)
 #[test]
-fn the_loop_gate_variants_do_not_move_the_format_version() {
-    assert_eq!(FORMAT_VERSION, 1, "adding variants must not break the format");
+fn the_durable_journal_format_version_is_pinned_at_1() {
+    assert_eq!(FORMAT_VERSION, 1, "the durable journal format version moved. …");
 }
 
 /// The two variants round-trip, carrying everything an operator needs to see the
-/// question, the menu and the deadline off the journal alone.
+/// question, the menu, the deadline and the decision off the journal alone.
 #[test]
 fn the_loop_gate_events_round_trip() {
+    let asked_at = chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).expect("a valid instant");
     let awaited = JournalEvent::LoopGateAwaited {
         node: NodeId("lp/0/__gate__".into()),
-        deadline: None,
+        deadline: Some(asked_at),
         prompt: "Continue?".into(),
         menu: vec![crate::graph::LoopGateOption { name: "done".into(), stops: true }],
     };
@@ -596,8 +607,9 @@ fn the_loop_gate_events_round_trip() {
             assert_eq!(node.0, "lp/0/__gate__");
             assert_eq!(prompt, "Continue?");
             assert_eq!(menu.len(), 1);
+            assert_eq!(menu[0].name, "done"); // the name is what `--option` matches
             assert!(menu[0].stops);
-            assert!(deadline.is_none());
+            assert_eq!(deadline, Some(asked_at)); // the exact instant, not `is_some()`
         }
         other => panic!("wrong variant: {other:?}"),
     }
@@ -608,10 +620,35 @@ fn the_loop_gate_events_round_trip() {
         actor: Some("jerry".into()),
     };
     let json = serde_json::to_string(&decided).expect("serialises");
-    let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
-    assert!(matches!(back, JournalEvent::LoopGateDecided { .. }));
+    match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
+        JournalEvent::LoopGateDecided { node, option, actor } => {
+            assert_eq!(node.0, "lp/0/__gate__");
+            assert_eq!(option, "done");
+            assert_eq!(actor.as_deref(), Some("jerry"));
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    // An actor-less decision is a LEGAL SHAPE, not a second durability check.
+    let anonymous = JournalEvent::LoopGateDecided {
+        node: NodeId("lp/0/__gate__".into()),
+        option: "again".into(),
+        actor: None,
+    };
+    let json = serde_json::to_string(&anonymous).expect("serialises");
+    match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
+        JournalEvent::LoopGateDecided { option, actor, .. } => {
+            assert_eq!(option, "again");
+            assert!(actor.is_none());
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
 }
 ```
+
+**Mutation-prove it before moving on.** Apply `#[serde(skip)]` to each of the three fields in
+turn and confirm the test reddens each time; the draft above did not. This is a standing
+obligation for the slice, alongside Task 2's nested validation and Task 8's expiry ordering.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -621,42 +658,47 @@ Expected: **compile error** — `no variant named `LoopGateAwaited``.
 
 - [ ] **Step 3: Add the variants**
 
-In `journal.rs`, after the `AgentAnswered` variant:
+In `journal.rs`, after the `AgentAnswered` variant. The shipped doc comments are longer than
+the sketch below; read them in `journal.rs` rather than re-deriving them from here. Three
+claims in the original draft were **wrong** and the review replaced them — do not reintroduce
+them:
+
+1. **The drift vectors.** The draft named three ways a graph can be edited between the ask and
+   the decision — "a `scheduled_runs.graph` row, a resubmitted `run submit`, or a runtime
+   `Expand` subgraph" — and two are false. A resubmit is refused (`cmd::run::submit`'s
+   `Scheduler::status` pre-check, and `SchedulerStore::enqueue`'s `on conflict do nothing` +
+   `rows_affected == 0` as the real guard); an `Expand` subgraph is the one path that IS bound
+   (`PlanExpanded` journals it before it is driven and `drive_expand_with` reuses
+   `fold.expansions`). Use s2's GENERAL form — nothing binds the graph handed to a later
+   `Executor::start`, there is no graph fence — and cite `scheduled_runs.graph` plus a direct
+   embedder `start` as the vectors that hold. Same correction applied to design §5.3.
+2. **Why not `GateDecided`.** The draft said `GateDecided` "would additionally carry a
+   `GateOutcome` this kind cannot interpret". It carries no `GateOutcome` — it is
+   `{node, option, actor, note}`, and the outcome lives on the MENU (`GateAwaited.options`).
+   The real reason is the one §3's table and design line 65 give: the two menu VOCABULARIES are
+   not interchangeable (`GateOption.outcome` is `{Complete, Fail}`; `LoopGateOption.stops` is
+   the continue/stop axis), so a `GateDecided` at a loop-gate node folds into
+   `Fold::gate_decisions` and is validated against the wrong menu — which is exactly the
+   cross-kind refusal Tasks 9 and 12 must enforce. Note too that `GateDecided` is the ONE
+   alternative that does carry an option name, so "all three bypass the menu match" is also
+   wrong as stated.
+3. **Why `actor` is `Option`.** The draft said "a loop gate can legitimately be decided by an
+   automated operator on a schedule". An automated operator has a name, and s2 already solved
+   that with a required `String` plus `cmd::gate::actor_or`/`actor_or_user`, which never yield
+   an empty actor ("an unresolvable actor is named `unknown`", because a blank audit row is
+   indistinguishable from a bug). No operator-facing path can produce `None`. The shipped doc
+   keeps the `Option` the spec specifies and says what `None` MEANS instead: written by a
+   library embedder, not by an operator. **Open for Task 12** — see the note there.
+
+The variants themselves:
 
 ```rust
-    /// SP-6 s4: a `GateSpec::Human` loop gate has begun asking, carrying the QUESTION and
-    /// the MENU it published.
-    ///
-    /// The menu is journaled for s2's reason, which transfers exactly: a graph can be
-    /// edited between the ask and the decision — a `scheduled_runs.graph` row, a
-    /// resubmitted `run submit`, or a runtime `Expand` subgraph — and an operator's answer
-    /// must keep meaning what it meant when they were asked. Reading the graph's menu at
-    /// decision time would let an author flip an option's `stops` after a human picked it
-    /// and silently invert their decision.
-    ///
-    /// The prompt is journaled for s3's reason: an operator must be able to read the
-    /// question off the journal alone, and `torii`'s read path has no `Registry` and no
-    /// blackboard with which to recompose it.
-    ///
-    /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited`/
-    /// `AgentAwaited` do — overwriting the deadline is the never-expires bug.
     LoopGateAwaited {
         node: NodeId,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
         prompt: String,
         menu: Vec<crate::graph::LoopGateOption>,
     },
-    /// SP-6 s4: a human picked one of a loop gate's options.
-    ///
-    /// A loop gate is answerable ONLY by this event, never by `SignalReceived`,
-    /// `GateDecided` or `AgentAnswered` — each of the other three would bypass the
-    /// menu match, and `GateDecided` would additionally carry a `GateOutcome` this kind
-    /// cannot interpret.
-    ///
-    /// `actor` is ATTRIBUTION, NOT AUTHENTICATION: whatever string the caller supplied. It
-    /// is `Option` here, unlike `GateDecided`'s required `actor`, because a loop gate can
-    /// legitimately be decided by an automated operator on a schedule; the CLI still
-    /// defaults it.
     LoopGateDecided {
         node: NodeId,
         option: String,
@@ -664,33 +706,68 @@ In `journal.rs`, after the `AgentAnswered` variant:
     },
 ```
 
-- [ ] **Step 4: Update the variant-count assertion**
+`LoopGateAwaited`'s doc must also carry the two writer obligations `AgentAwaited`'s does, since
+this variant's `prompt` is the same model-equivalent question: the **two-cap bound** (authored
+half loud against `MAX_HUMAN_TEXT_BYTES`, `## Context` half truncated against
+`MAX_HUMAN_CONTEXT_BYTES`) and **redact before appending**. `LoopGateDecided.actor` carries the
+redaction obligation too (design §6 — "the leak s3's review caught on that exact field"). Task 10
+implements them; the doc states them here so Task 6's append site cannot ship without them.
 
-`journal.rs:875` asserts `variants.len() > 10 && variants.contains(&"GateAwaited")`. Extend it to also assert `variants.contains(&"LoopGateAwaited")`, so a future refactor that drops the variant is caught.
+- [ ] **Step 4: Extend the scrape-sanity assertion**
+
+The `variants.len() > 10 && variants.contains(&"GateAwaited")` check in
+`no_doc_comment_links_a_journal_event_variant_by_its_bare_name` is a **scrape sanity check**, not
+a variant census — it is a LOWER bound (23 variants against a bound of 10) and cannot notice a
+variant being added. Add `variants.contains(&"LoopGateAwaited")` as a second sentinel, and fix
+the assertion MESSAGE, which said only "variant scrape broke": a legitimately removed sentinel
+now fails it too, and the message must say so.
 
 - [ ] **Step 5: Run to verify passing**
 
-Run: `cargo test -p sensei-orchestrator-core loop_gate`
+```bash
+cargo test -p sensei-orchestrator-core loop_gate; echo "exit=$?"
+cargo check --workspace --all-targets; echo "exit=$?"
+```
 
-Expected: **all passed.** Then `cargo build --workspace` — expect errors in any exhaustive `match` on `JournalEvent`. `fold_journal` has a `_` catch-all, so it will compile; Task 4 replaces that with explicit arms, which is the point.
+Expected: the tests pass, and `cargo check --all-targets` fails with **exactly one** `E0004`
+non-exhaustive-match error, at the `label` helper in `crates/orchestrator/src/executor/tests.rs`.
+Add the two arms there — that is Task 3's work, not Task 4's; no later task adds them.
+
+> **`cargo build --workspace` is the WRONG check here and the draft of this step said to use
+> it.** Verified at the reviewed commit: with the two `label` arms deleted, `cargo build
+> --workspace` exits **0** while `cargo check --workspace --all-targets` exits **101**. The
+> `label` helper is the workspace's only exhaustive `match` on `JournalEvent`, and it lives in a
+> `#[cfg(test)]` module that `cargo build` never compiles. `fold_journal`'s `_` catch-all is not
+> a guard — it absorbs an unknown variant silently — and nothing in `orchestrator-core` notices
+> a variant being added at all. A literal execution of the draft would have committed a tree
+> where `cargo test --workspace` does not compile.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
-git add crates/orchestrator-core/src/journal.rs
+git add crates/orchestrator-core/src/journal.rs crates/orchestrator/src/executor/tests.rs
 git commit -m "feat(core): LoopGateAwaited / LoopGateDecided
 
 New VARIANTS, so FORMAT_VERSION stays 1 — the additivity s3 proved with
 AgentAwaited/AgentAnswered.
 
-The menu is journaled for s2's reason, which transfers exactly: a graph
-can be edited between the ask and the decision, and an operator's answer
-must keep meaning what it meant. Reading the graph's menu at decision time
-would let an author flip an option's stops after a human picked it and
-silently invert their decision.
+The menu is journaled for s2's reason, which transfers exactly: nothing
+binds the graph handed to a later Executor::start to the one the human was
+shown, and an operator's answer must keep meaning what it meant. Reading
+the graph's menu at decision time would let an author flip an option's
+stops after a human picked it and silently invert their decision.
 
-Not GateDecided: it carries a GateOutcome this kind cannot interpret."
+Not GateDecided: its menu is a different vocabulary. GateOption carries
+{Complete, Fail}; a loop gate's option carries stops, so a decision
+recorded as GateDecided at a loop-gate node folds into gate_decisions and
+is validated against the wrong menu.
+
+Also two arms in the executor tests' \`label\` helper. That labeler is the
+only match on JournalEvent in the workspace that enumerates every variant,
+and it was the single error \`cargo check --all-targets\` produced —
+\`cargo build\` never compiles it, and fold_journal's \`_\` catch-all
+absorbed both variants silently, so the fold is not the guard."
 ```
 
 ---
@@ -1684,10 +1761,26 @@ Run: `cargo test -p sensei-orchestrator -- oversized_authored_prompt_fails_the_l
 
 Expected: **all pass** if Task 6 used `question.authored_bytes` and `redact_and_clamp` as specified. If the redaction test fails, the arm is appending `question.text()` directly — route it through `redact_and_clamp`.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Reconcile the journal-variant docs with what actually shipped**
+
+Task 3's review put these obligations on the variants' own doc comments **ahead of** this task,
+deliberately: in this codebase the event's doc is where the next writer of the event learns its
+contract, which is why s3's review put the same rules on `AgentAwaited`, and Task 6's append site
+lands four tasks before this one. So the doc text already exists — `LoopGateAwaited.prompt`
+states the two-cap rule and the redact-then-clamp rule, and `LoopGateDecided.actor` states the
+redaction rule ("the leak s3's review caught on that exact field", design §6).
+
+This step is therefore a RECONCILIATION, not an addition: re-read both docs against the shipped
+behaviour and correct whichever is wrong. A doc that promises a bound the code does not enforce
+is worse than no doc — that is the Task 1 finding pattern this slice keeps hitting. In
+particular, confirm that `actor` really is redacted (nothing in Task 10's three tests above
+asserts it — add a fourth if the shared seam does not make it structural).
+
+- [ ] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
+# plus crates/orchestrator-core/src/journal.rs if Step 3 corrected either variant's doc
 git add crates/orchestrator/src/executor/tests.rs
 git commit -m "test(orchestrator): loop-gate bounds and redaction
 
@@ -1806,6 +1899,18 @@ call; the pure part is recomputed from the journaled option name."
 - Test: `crates/torii/src/cmd/gate.rs` and `crates/torii/src/cmd/run.rs` inline tests
 
 `gate_menu` (`gate.rs:716`) already reads the menu from the **journal**, which is why this extends rather than rewrites.
+
+> **Carried forward from Task 3's review — settle it in Step 3, do not let it drift.**
+> `LoopGateDecided.actor` is `Option<String>` where `GateDecided.actor` is a required `String`,
+> and the asymmetry has no semantic justification: a loop gate's decider is exactly as
+> attributable as a `HumanGate`'s, and s2 deliberately made a blank audit row unrepresentable
+> via `actor_or`/`actor_or_user` ("an unresolvable actor is named `unknown`"). Two consequences
+> for THIS task: (a) the shared decide path must route the loop-gate branch through
+> `actor_or_user` too, so no torii-written row is ever `None`; (b) the field-type difference is
+> the one thing the "factor it over the option NAMES" sharing in Step 3 cannot absorb, so budget
+> for a `.map(Some)` at the append rather than discovering it mid-refactor. If the shared path
+> turns out to want them identical, promoting the field to `String` is a **journal shape change**
+> — cheap only while nothing has written the event — and needs the spec (§4) updated with it.
 
 - [ ] **Step 1: Write the failing tests (AC17, AC18)**
 
@@ -2035,11 +2140,16 @@ Expected: **exit 0**, and **0 ignored** in the DB suites — an ignored DB test 
 cargo doc --workspace --no-deps --document-private-items 2>&1 | grep -c 'unresolved link'
 ```
 
-Expected: the count must not exceed the **24** baseline recorded in `docs/CHECKPOINT.md`.
+Expected: the count must not exceed the baseline recorded in `docs/CHECKPOINT.md` — **16**, re-measured with this exact command at Task 3. (This step originally said 24, which no invocation of the command above produces; the stale number would have hidden eight new broken links.)
 
-- [ ] **Step 4: Update the overview**
+- [ ] **Step 4: Update the overview and the two feature docs**
 
 Add an SP-6 s4 entry to `docs/superpowers/orchestrator-overview.md`'s SP-6 section, and update the s3 entry's carry-forward line — `GateSpec::Agent` is no longer "the obvious next slice", it is **done as `GateSpec::Human`**, and the s3 non-goal that named it should say so.
+
+Two **feature** docs drift with this slice and were missing from this list entirely (found by Task 3's review — the variants alone already falsify the first of the three sentences below):
+
+- `docs/features/orchestrator/durable-journal.md` — the SP-6 s3 section opens "Two variants **complete** the journal's HITL vocabulary, after s1's … and s2's …". There are now four pairs. Task 3 downgraded "complete" to "extend" as a stopgap; this step writes the real s4 section (`LoopGateAwaited` first-wins with its durable menu + question, `LoopGateDecided` last-wins) and the Gherkin scenarios beside the s3 ones.
+- `docs/features/orchestrator/README.md` — two sentences in the **Durable journal** status row: "all six are new variants, so `FORMAT_VERSION` stays 1" (now eight) and `AgentAwaited` described as "the only one of the three waiting kinds that carries a prompt" (`LoopGateAwaited` carries one too, and there is a fourth waiting kind). The row's `Partial (… · SP-6-3)` marker and the **Execution graph** row's `GateSpec` description need the s4 bump as well, and the **HITL (SP-6)** bullet needs its s4 paragraph — including retiring the s3 carry-forward sentence that calls this slice "the obvious next slice".
 
 - [ ] **Step 5: Whole-slice adversarial review**
 

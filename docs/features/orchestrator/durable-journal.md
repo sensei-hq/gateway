@@ -59,8 +59,10 @@ Feature: Durable journal
 
 ## SP-6 s3 — the human-answer events
 
-Two variants complete the journal's HITL vocabulary, after s1's
-`SignalAwaited`/`SignalReceived` and s2's `GateAwaited`/`GateDecided`:
+Two variants extend the journal's HITL vocabulary, after s1's
+`SignalAwaited`/`SignalReceived` and s2's `GateAwaited`/`GateDecided`. Not the last pair: SP-6
+s4 adds `LoopGateAwaited`/`LoopGateDecided` for the human loop gate, documented here when that
+slice lands.
 
 - **`AgentAwaited { node, deadline, prompt }`** — the durable record of which node is
   asking, what it asked, and by when. It exists because `RunPaused` is not node-keyed and
