@@ -1149,7 +1149,9 @@ Expected: **4 passed, 0 failed** (these will only fully pass once Task 7 wires t
 
 - [ ] **Step 1: Replace the temporary arm**
 
-Delete the `unreachable!` placeholder from Task 1 and add:
+Delete the temporary `fail_loop` stub arm from Task 1 — **confirm it is gone, not merely
+shadowed**; leaving it beside the real arm is dead code the "do not leave it past Task 7"
+rule exists to prevent. Then add:
 
 ```rust
                 // SP-6 s4: a PERSON decides. Same reserved path as the gate-agent, but no
@@ -1179,7 +1181,19 @@ Delete the `unreachable!` placeholder from Task 1 and add:
                 }
 ```
 
-- [ ] **Step 2: Run the Task 6 tests**
+- [ ] **Step 2: Update `run_loop`'s own doc comment**
+
+`fanout.rs`'s `run_loop` doc (around `:427`) enumerates the gate as *"either `Pure` … or
+`Agent`"*. Task 1 already added the third clause; confirm it is still accurate against the
+final arm, and that nothing else in the file's prose still says there are two.
+
+This is not cosmetic here: the codebase has a test
+(`every_node_kind_is_documented_in_the_execution_graph_feature_doc`) built on the principle
+that a kind a doc omits is a kind the doc states does not exist. Check whether that test —
+or a sibling — also needs to learn about `GateSpec::Human`, and if it does, that is a red
+test to write before the arm lands, not a doc chore afterwards.
+
+- [ ] **Step 3: Run the Task 6 tests**
 
 Run: `cargo test -p sensei-orchestrator human_loop_gate`
 
