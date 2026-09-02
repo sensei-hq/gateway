@@ -1612,6 +1612,60 @@ Expected: **4 passed, 0 failed** (these will only fully pass once Task 7 wires t
 
 - [ ] **Step 5: Commit** (fold into Task 7's commit if the arm is not yet reachable)
 
+**What actually landed (Tasks 6 and 7 as one commit), and five deviations from the steps
+above.** All five are in the same direction: the steps under-specified something the
+compiler or a measurement then forced.
+
+1. **`LoopGateStep::Failed` is a STRUCT variant, `{ message, newly_journaled }`, not
+   `Failed(String)`.** Measured, not theorised: with the sketch's shape, a gate killed by
+   expiry left `run_loop` appending a fresh `NodeFailed` for the LOOP on **every** later
+   drive (3 rows after two wakes, growing without bound), because a human gate's verdict is
+   terminal — step 0 reads it back forever — while the run it kills journals no
+   `RunCompleted` and so stays resumable. Reading the GATE's verdict back was only half the
+   fix; the wrapper one level out re-derived its own. That is verbatim the unbounded-growth
+   defect `gate_precheck` exists to prevent, and **AC9's test as sketched in Task 8 would
+   have failed** (`count_node_failed` is whole-run). The flag is carried on the step rather
+   than re-derived in `run_loop` from `Fold::failed`, because that map has exactly ONE
+   reader family by design — `gate_precheck` and its `_by_id` forms, on behalf of the
+   WAITING kinds — and a `Loop` is not one. `a_dead_loop_gate_stops_appending_node_failed_
+   rows_on_every_wake` guards it and is mutation-proven (disable the branch → it is the only
+   test in the crate that reddens).
+2. **`fail_loop_gate` returns the whole `LoopGateStep`, not a `String`.** That is what makes
+   `newly_journaled: true` unforgeable: the only place it is set is the function that writes
+   the row. Every failure site is then `return self.fail_loop_gate(…).await;`.
+3. **A third form of the shared terminal guard: `Executor::gate_failure_by_id`.** The sketch
+   has step 0 call `gate_precheck_by_id`, which returns an `Option<NodeExec>` this kind
+   cannot use — leaving either an `unreachable!` (forbidden) or an `if let Some(NodeExec::
+   Failed { .. })` whose non-matching path falls THROUGH and silently ignores a recorded
+   failure, i.e. fail-OPEN in the one guard whose whole purpose is fail-closed. So
+   `gate_precheck_by_id` is now a two-line wrapper over `gate_failure_by_id`, exactly as the
+   `&Node` form is a wrapper over it: still ONE read of ONE map.
+4. **AC14b's unmatched-option refusal ships HERE, not in Task 9.** The arm cannot compile
+   without a branch for it, and the only correct branch is the loud one. Task 9's AC14b test
+   will therefore be green on its first run and must be mutation-proven rather than
+   red-first; AC13 and AC14's end-to-end tests are untouched and still Task 9's.
+5. **Task 7 Step 2's "check whether a documentation test needs to learn about
+   `GateSpec::Human`" answered YES, and it was a real gap.**
+   `every_node_kind_is_documented_in_the_execution_graph_feature_doc` cannot see it — a gate
+   is not a `NodeKind` — so `execution-graph.md` still read "**`GateSpec`** is
+   **`Pure(LoopGate)`** … or **`Agent { … }`**", a CLOSED enumeration stating that s4's kind
+   does not exist. A sibling guard,
+   `every_gate_spec_variant_is_documented_in_the_execution_graph_feature_doc`, was written
+   RED (`missing: ["Human"]`), then the paragraph was filled in. Bounded to the enumeration
+   sentence for the node-kind guard's own reason: `Human` occurs in that page's prose in
+   several unrelated senses, so a bare `doc.contains` would have been green before this
+   slice wrote a word.
+
+**Two smaller things.** `Fold::loop_gate_prompt_for` turned out to have no production
+consumer — the arm reads `loop_gate_menu_for`, which answers the same "did the LOOP GATE
+kind begin here?" question AND returns the value the arm needs — so it is now `#[cfg(test)]`
+rather than carrying an `expect(dead_code)` whose stated occasion never arrives (the
+`HumanQuestion::text` precedent from Task 5). And the `NotYetAsking` arm PAUSES rather than
+falling through to read a decision, which is where s2's shape and s4's differ: a loop gate's
+path is synthesized per iteration and cannot be decided before it exists through any
+operator surface, so the early-decision race s2 resolves in-execution is unreachable here
+and costs at most one extra wake from a hand-written journal.
+
 ---
 
 ### Task 7: Wire the arm into `run_loop`

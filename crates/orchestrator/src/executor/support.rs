@@ -264,9 +264,7 @@ pub(crate) fn fold_journal(
             // `Fold::deadline_for`, and give it a kind-specific record of its own plus
             // the missing-ask arm that reads it — every reader of this map reasons from
             // an explicit enumeration of these writers: `run_await_signal`,
-            // `run_human_gate`, `run_human_agent`, and s4's `run_human_loop_gate` (which
-            // arrives with s4's executor arm — the fold lands one task ahead of its
-            // reader, exactly as s3's did).
+            // `run_human_gate`, `run_human_agent`, and s4's `run_human_loop_gate`.
             //
             // And the enumeration is restated OUTSIDE those arms, not only in them: the
             // `..._fails_loudly` kind-swap tests in `tests.rs` spell out the writer list
@@ -307,10 +305,11 @@ pub(crate) fn fold_journal(
             // FIRST wins for the deadline, the prompt AND the menu (`entry().or_insert`).
             // This is the FOURTH writer of the SHARED `Fold::deadlines` map, after
             // `SignalAwaited`, `GateAwaited` and `AgentAwaited` — the writer lists on
-            // `Fold::deadlines` and `Fold::deadline_for` name it, and the missing-ask arm
-            // that reads its kind-specific record is `run_human_loop_gate`'s, which lands
-            // with the executor arm later in this slice (the fold goes in first, so the
-            // durable record exists before anything reads it — the s3 ordering).
+            // `Fold::deadlines` and `Fold::deadline_for` name it, and the arm that reads
+            // its kind-specific record is `run_human_loop_gate`'s missing-MENU arm (this
+            // kind's version of the missing-ask guard: it reads `Fold::loop_gate_menu_for`,
+            // which answers "did the LOOP GATE kind begin here?" and hands back the menu
+            // the decision must be validated against in the same call).
             //
             // `deadline` is folded THROUGH, `None` included. A role with
             // `backed_by: human { timeout: None }` gating a loop is a real configuration,
