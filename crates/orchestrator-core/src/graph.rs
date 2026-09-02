@@ -142,9 +142,12 @@ pub const MAX_AWAIT_SIGNAL_TIMEOUT: chrono::Duration = chrono::Duration::days(36
 
 /// One choice a [`NodeKind::HumanGate`] offers, and what picking it does to the run.
 ///
-/// Not to be confused with [`GateSpec`]/[`LoopGate`] — those name a `Loop`'s stop
-/// predicate (continue vs. halt the iteration); this `Gate` is the unrelated HITL
-/// sense, a human picking one of a named menu.
+/// Not to be confused with [`LoopGateOption`] (SP-6 s4) — both now put a NAMED MENU in
+/// front of a human, so the two are easy to reach for interchangeably, but they answer
+/// to different node kinds: this one belongs to the `HumanGate` node and carries a
+/// [`GateOutcome`] (`Complete` or `Fail` the whole run); `LoopGateOption` belongs to a
+/// `Loop`'s `GateSpec::Human` and carries `stops` (continue or converge one iteration).
+/// The tell is which field is on the option — `outcome` here, `stops` there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateOption {
     /// What the operator types: `torii run gate decide … --option <name>`.
@@ -210,9 +213,10 @@ pub enum LoopBody {
     Expand { planner: PlannerRef },
 }
 
-/// A `Loop`'s stop decision (SP-3 s5). `Pure` = the SP-1 pure predicate (no journaling);
-/// `Agent` = a gate-agent over the iteration output, then a pure `stop_when` over the
-/// agent's answer (the agent turn is journaled ⇒ resume replays it).
+/// A `Loop`'s stop decision (SP-3 s5, extended SP-6 s4). `Pure` = the SP-1 pure predicate
+/// (no journaling); `Agent` = a gate-agent over the iteration output, then a pure
+/// `stop_when` over the agent's answer (the agent turn is journaled ⇒ resume replays it);
+/// `Human` = a PERSON picks from an enumerated menu, once per iteration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GateSpec {
     Pure(LoopGate),
@@ -220,6 +224,33 @@ pub enum GateSpec {
         agent: crate::registry::AgentRef,
         stop_when: LoopGate,
     },
+    /// SP-6 s4. The `AgentRef` supplies the QUESTION (its `system_prompt` and activated
+    /// skills) and the SLA (its `backed_by: human { timeout }`); the `menu` supplies the
+    /// DECISION and lives on the graph, not the registry, so `validate_dag` can reject a
+    /// menu that cannot converge.
+    ///
+    /// There is deliberately no `stop_when` here. Under a human backing a pure predicate
+    /// would be either inert or applied to a magic option-name vocabulary, where
+    /// `TextContains("halt")` against a menu emitting `"stop"` silently yields a loop that
+    /// runs to `max_iters`. `LoopGateOption::stops` says the thing directly.
+    Human {
+        agent: crate::registry::AgentRef,
+        menu: Vec<LoopGateOption>,
+    },
+}
+
+/// One choice a [`GateSpec::Human`] offers, and what picking it does to the LOOP.
+///
+/// Deliberately NOT [`GateOption`]/[`GateOutcome`], whose `{Complete, Fail}` cannot
+/// express "continue" — the one decision this variant exists for. Reinterpreting
+/// `Complete` as "stop the loop" would put two meanings in a two-variant enum depending
+/// on which node read it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopGateOption {
+    /// What the operator types: `torii run gate decide … --option <name>`.
+    pub name: String,
+    /// `true` converges the loop; `false` runs another iteration (subject to `max_iters`).
+    pub stops: bool,
 }
 
 /// A deterministic Stop condition for a [`NodeKind::Loop`], evaluated as a pure
@@ -1364,6 +1395,68 @@ mod tests {
         assert!(!field.should_stop(&serde_json::json!({ "done": false })));
         assert!(!field.should_stop(&serde_json::json!({ "done": "true" }))); // strict: JSON true only
         assert!(!field.should_stop(&serde_json::json!({})));
+    }
+
+    /// AC1 — the new variant round-trips through serde.
+    #[test]
+    fn a_human_gate_spec_round_trips_through_serde() {
+        let gate = GateSpec::Human {
+            agent: crate::registry::AgentRef("reviewer".into()),
+            menu: vec![
+                LoopGateOption {
+                    name: "keep-going".into(),
+                    stops: false,
+                },
+                LoopGateOption {
+                    name: "good-enough".into(),
+                    stops: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&gate).expect("serialises");
+        // Pin the wire bytes, not just the round-trip: a round-trip alone is invariant
+        // under `#[serde(rename = "halts")] pub stops: bool` (renames both directions
+        // together). The mutation with teeth is that rename PLUS `#[serde(default)]` —
+        // a missing `stops`/`halts` field then silently reads as `false`, flipping every
+        // stopping option in an already-persisted `scheduled_runs.graph` row to
+        // non-stopping, which is the exact failure this variant exists to prevent. This
+        // assertion is what would catch it; it is not redundant with the round-trip above.
+        assert_eq!(
+            json,
+            r#"{"Human":{"agent":"reviewer","menu":[{"name":"keep-going","stops":false},{"name":"good-enough","stops":true}]}}"#
+        );
+        let back: GateSpec = serde_json::from_str(&json).expect("deserialises");
+        match back {
+            GateSpec::Human { agent, menu } => {
+                assert_eq!(agent.0, "reviewer");
+                assert_eq!(menu.len(), 2);
+                assert!(!menu[0].stops, "keep-going must not stop the loop");
+                assert!(menu[1].stops, "good-enough must stop the loop");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// AC1 — additivity: a graph using no `Human` gate serialises exactly as it does
+    /// today. Guards against a change to the TAGGING REPRESENTATION — `#[serde(tag =
+    /// …)]`, `untagged`, a rename — silently rewriting every existing
+    /// `scheduled_runs.graph` row.
+    ///
+    /// It does NOT catch variant REORDERING, and that is not a gap here: externally
+    /// tagged serde (today's default, unchanged by this variant) keys JSON by variant
+    /// NAME, so order cannot affect the output or name-matched deserialisation. Order
+    /// would only matter under `untagged` or an index-based binary format, and this
+    /// workspace persists `Graph` as JSON/jsonb everywhere (no `bincode`/`postcard`/
+    /// `rmp_serde`/`ciborium`/`serde_cbor` in any crate). If one is ever added, this
+    /// test stops being sufficient and a round-trip through THAT format is what closes
+    /// the gap.
+    #[test]
+    fn an_existing_pure_gate_serialises_unchanged_by_the_new_variant() {
+        let gate = GateSpec::Pure(LoopGate::TextContains("DONE".into()));
+        assert_eq!(
+            serde_json::to_string(&gate).expect("serialises"),
+            r#"{"Pure":{"TextContains":"DONE"}}"#
+        );
     }
 
     /// A minimal node carrying a throwaway `ModelCall` kind — `validate_dag`
