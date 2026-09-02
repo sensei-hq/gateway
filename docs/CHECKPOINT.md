@@ -25,8 +25,8 @@ pre-existing `cloud-providers` doctest. Both required checks green; merge state 
 
 Nothing from SP-6. **Next slice: SP-6 s4, the human loop gate** — "a human decides whether
 the loop continues", named by the s3 review as *the most valuable rejected site and the
-obvious next slice*. Status: **spec written and committed (`1633a96`), awaiting user
-review. No code yet, no plan yet.**
+obvious next slice*. Status: **spec (`1633a96`) and plan (`f7641c1`) both written,
+committed and approved. NO CODE YET — task 1 of 14 is the next thing to do.**
 
 Spec: `docs/superpowers/specs/2026-09-02-sp-6-s4-human-loop-gate-design.md` (20 ACs).
 The four decisions it turns on, all made: an enumerated **menu** rather than free text; a
@@ -43,27 +43,34 @@ slice is the HUMAN backing at that site, which `drive_agent`'s `!top_level` arm 
 today — `fanout.rs:555` passes a literal `false`, and `non_top_level_sites` carries a
 `"GateSpec::Agent"` row asserting the refusal.
 
-Open design questions, none answered yet:
+Plan: `docs/superpowers/plans/2026-09-02-sp-6-s4-human-loop-gate.md` — 14 tasks, red-first,
+with an AC→task coverage table. Order: types (1) → `validate_dag` (2) → journal (3) → fold
+(4) → the shared question seam (5) → `run_human_loop_gate` (6) → wire `fanout.rs` (7) →
+expiry ordering (8) → the three refusals (9) → bounds/redaction (10) → zero-spend/resume
+(11) → torii (12) → PG e2e (13) → whole-slice review (14).
 
-1. **Expiry ordering** — s2 `HumanGate` reads expiry BEFORE the decision (an approval must
-   not self-approve late); s3 human-agent reads the answer FIRST (work product). A
-   continue/stop decision looks like an approval, so it likely inverts s3 — but that must
-   be argued, not inherited.
-2. **What expiry DOES** — fail the loop, or converge it? Failing is louder.
-3. **Per-iteration re-asking** is the point here, not the bug s3 fixed. The refusal must
-   narrow to this one site without reopening the `Subgraph`-wrapper bypass.
-4. **`torii` surface** — does `run agent answer --node "{loop}/{i}/__gate__"` serve it, or
-   does the three-way cross-refusal need a fourth arm?
+**Three preconditions VERIFIED against the code, not inherited:** `RESERVED_GATE_ID` is
+enforced in `feasible` (`plan.rs:147`), so an untrusted planner cannot forge a gate node;
+`validate_dag` recurses at block 2c, so a node-walking block fires at every nesting level;
+and `support.rs:262` carries a standing instruction that the **fourth** writer of
+`Fold::deadlines` must update three doc lists — task 4 discharges it and re-words it to
+"a fifth".
+
+**Two tests are mutation-proven, not assumed:** the nested-validation test (task 2) and
+the expiry-ordering test (task 8) — the latter is the one that reddens if the arm is
+"simplified" into s3's shape.
 
 ## Next command
 
-After the user signs off on the spec: write the implementation plan to
-`docs/superpowers/plans/2026-09-02-sp-6-s4-human-loop-gate.md`, then build it red-first.
+Build task 1 (`GateSpec::Human` + `LoopGateOption`) red-first:
 
-Two preconditions the plan must RE-VERIFY rather than inherit from the spec: that
-`RESERVED_GATE_ID` (`orchestrator-core/src/plan.rs:22`) still blocks a planner-authored
-`__gate__` node, and that `validate_dag` really recurses into `Loop`/`Subgraph` bodies for
-the new variant.
+```
+cargo test -p sensei-orchestrator-core a_human_gate_spec_round_trips_through_serde
+```
+
+Expect a COMPILE ERROR first — that is the red. Task 1 step 6 warns that the new variant
+breaks the one exhaustive `match` on `GateSpec` (`fanout.rs`); add the temporary
+`unreachable!` arm it specifies and delete it in task 7.
 
 ## Known-broken
 
