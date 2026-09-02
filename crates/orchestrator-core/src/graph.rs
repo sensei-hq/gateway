@@ -228,7 +228,8 @@ pub enum GateSpec {
     /// SP-6 s4. The `AgentRef` supplies the QUESTION (its `system_prompt` and activated
     /// skills) and the SLA (its `backed_by: human { timeout }`); the `menu` supplies the
     /// DECISION and lives on the graph, not the registry, so `validate_dag` can reject a
-    /// menu that cannot converge.
+    /// menu that cannot converge. See the `GateSpec::Human` block in
+    /// [`Graph::validate_dag`].
     ///
     /// There is deliberately no `stop_when` here. Under a human backing a pure predicate
     /// would be either inert or applied to a magic option-name vocabulary, where
@@ -603,6 +604,71 @@ impl Graph {
                         "human_gate node {:?} has a timeout ({t}) beyond the \
                          {MAX_AWAIT_SIGNAL_TIMEOUT} maximum; use `None` to wait indefinitely",
                         node.id
+                    )));
+                }
+            }
+        }
+
+        // 2b-ter-bis. SP-6 s4: a `GateSpec::Human`'s menu must be usable, and must offer
+        // a way to STOP. Same principle as `max_iters == 0` and 2b-ter above: reject the
+        // degenerate node loudly here rather than let it produce a baffling runtime state.
+        //
+        // The stopping-option rule is the sharper of the two. A menu with no `stops: true`
+        // option is a loop that provably cannot converge however the human answers — it
+        // runs to `max_iters` and reports a non-converged result, having asked a person
+        // `max_iters` times to no purpose. That is a malformed graph, and catching it is
+        // the entire reason s4 puts the menu on the GRAPH rather than on the
+        // `AgentDefinition`: a registry menu is invisible here, exactly as s3's §5.5
+        // records for the human backing itself.
+        //
+        // The converse is NOT checked. A menu whose every option stops is degenerate
+        // ("approve once, then stop") but legitimate, and rejecting it would be policy
+        // rather than structure. Contrast 2b-ter, which DOES require a `Complete` option:
+        // there, every-option-Fails is a guaranteed dead end; here, every-option-stops
+        // still completes the loop normally.
+        //
+        // No timeout bounds are checked here — unlike 2b-ter — because a `GateSpec::Human`
+        // carries no timeout. Its SLA is the ROLE's `backed_by: human { timeout }`, which
+        // is a registry fact bounded where the registry is parsed (`parse_fm_duration`),
+        // not a graph one.
+        for node in &self.nodes {
+            let NodeKind::Loop {
+                gate: GateSpec::Human { menu, .. },
+                ..
+            } = &node.kind
+            else {
+                continue;
+            };
+            if menu.is_empty() {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "loop node {:?} has a human gate with no options; it must offer at \
+                     least one option",
+                    node.id
+                )));
+            }
+            if !menu.iter().any(|o| o.stops) {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "loop node {:?} has a human gate with no stopping option, so the loop \
+                     can never converge however the human answers — it would run to \
+                     max_iters and ask a person that many times to no purpose; at least \
+                     one option with `stops: true` is required",
+                    node.id
+                )));
+            }
+            let mut seen = HashSet::new();
+            for o in menu {
+                if o.name.is_empty() {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "loop node {:?} has a human gate option with an empty name; an \
+                         operator could not type it",
+                        node.id
+                    )));
+                }
+                if !seen.insert(o.name.as_str()) {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "loop node {:?} has a duplicate human gate option name {:?}; \
+                         `--option {}` would be ambiguous",
+                        node.id, o.name, o.name
                     )));
                 }
             }
@@ -1458,6 +1524,138 @@ mod tests {
             serde_json::to_string(&gate).expect("serialises"),
             r#"{"Pure":{"TextContains":"DONE"}}"#
         );
+    }
+
+    /// A single-node `Loop` gated by `GateSpec::Human`, valid in every respect EXCEPT
+    /// whatever the caller puts in `menu` — the menu is the variable under test here, so
+    /// it is deliberately not required to be well-formed. Everything else is fixed so a
+    /// rejection can only be the menu's doing.
+    fn human_gated_loop(menu: Vec<LoopGateOption>) -> Graph {
+        Graph {
+            nodes: vec![Node {
+                id: NodeId("lp".into()),
+                kind: NodeKind::Loop {
+                    body: LoopBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({ "prompt": "start" }),
+                    gate: GateSpec::Human {
+                        agent: crate::registry::AgentRef("reviewer".into()),
+                        menu,
+                    },
+                    max_iters: 3,
+                },
+                deps: vec![],
+            }],
+        }
+    }
+
+    /// AC2 — a menu with no stopping option is a loop that provably cannot converge; it
+    /// runs to `max_iters` however the human answers. That is a malformed graph, not a
+    /// policy, and it is the whole reason the menu lives on the graph rather than the
+    /// registry: only here can it be caught statically.
+    #[test]
+    fn validate_dag_rejects_a_human_loop_gate_with_no_stopping_option() {
+        let g = human_gated_loop(vec![
+            LoopGateOption {
+                name: "again".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "more".into(),
+                stops: false,
+            },
+        ]);
+        let err = g.validate_dag().expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no stopping option"),
+            "must name the defect: {msg}"
+        );
+        assert!(msg.contains("lp"), "must name the node: {msg}");
+    }
+
+    /// AC2 — an empty menu leaves the human nothing to pick.
+    #[test]
+    fn validate_dag_rejects_a_human_loop_gate_with_an_empty_menu() {
+        let err = human_gated_loop(vec![])
+            .validate_dag()
+            .expect_err("must reject");
+        assert!(format!("{err}").contains("no options"), "{err}");
+    }
+
+    /// AC2 — `--option x` would be ambiguous.
+    #[test]
+    fn validate_dag_rejects_a_duplicate_option_name_in_a_human_loop_gate() {
+        let g = human_gated_loop(vec![
+            LoopGateOption {
+                name: "x".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "x".into(),
+                stops: true,
+            },
+        ]);
+        let err = g.validate_dag().expect_err("must reject");
+        assert!(format!("{err}").contains("duplicate"), "{err}");
+    }
+
+    /// AC2 — an operator could not type it.
+    #[test]
+    fn validate_dag_rejects_an_empty_option_name_in_a_human_loop_gate() {
+        let g = human_gated_loop(vec![LoopGateOption {
+            name: String::new(),
+            stops: true,
+        }]);
+        let err = g.validate_dag().expect_err("must reject");
+        assert!(format!("{err}").contains("empty name"), "{err}");
+    }
+
+    /// AC2 — the valid shape is accepted. A menu with ONLY stopping options is legal:
+    /// "approve once, then stop" is degenerate but legitimate, and rejecting it would be
+    /// policy rather than structure.
+    #[test]
+    fn validate_dag_accepts_a_well_formed_human_loop_gate() {
+        human_gated_loop(vec![
+            LoopGateOption {
+                name: "again".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "done".into(),
+                stops: true,
+            },
+        ])
+        .validate_dag()
+        .expect("a menu with a stopping option is valid");
+
+        human_gated_loop(vec![LoopGateOption {
+            name: "done".into(),
+            stops: true,
+        }])
+        .validate_dag()
+        .expect("an all-stopping menu is degenerate but legal");
+    }
+
+    /// AC2 — the rule fires at DEPTH. Block 2c recurses into a `Subgraph` body, so a bad
+    /// gate one level down must be rejected too. Without this test the block could be
+    /// written to walk only the top level and every nested loop gate would escape it.
+    #[test]
+    fn validate_dag_rejects_a_bad_human_loop_gate_nested_in_a_subgraph() {
+        let inner = human_gated_loop(vec![LoopGateOption {
+            name: "again".into(),
+            stops: false,
+        }]);
+        let outer = Graph {
+            nodes: vec![Node {
+                id: NodeId("sub".into()),
+                kind: NodeKind::Subgraph {
+                    graph: Box::new(inner),
+                },
+                deps: vec![],
+            }],
+        };
+        let err = outer.validate_dag().expect_err("must reject at depth");
+        assert!(format!("{err}").contains("no stopping option"), "{err}");
     }
 
     /// A minimal node carrying a throwaway `ModelCall` kind — `validate_dag`
