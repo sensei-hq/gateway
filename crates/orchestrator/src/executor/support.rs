@@ -268,6 +268,15 @@ pub(crate) fn fold_journal(
             // arrives with s4's executor arm — the fold lands one task ahead of its
             // reader, exactly as s3's did).
             //
+            // And the enumeration is restated OUTSIDE those arms, not only in them: the
+            // `..._fails_loudly` kind-swap tests in `tests.rs` spell out the writer list
+            // in their rustdoc to explain why their arm is reachable at all, `human.rs`'s
+            // module header counts the kinds, and `durable-journal.md` states it for the
+            // feature docs. s4 updated the three arms and left all of those saying THREE;
+            // the whole-slice review caught it. So the instruction is
+            // `rg -in 'all (THREE|FOUR|FIVE)|(three|four|five) waiting kinds' crates docs`
+            // and fix the WHOLE set — updating only the arms is how this went stale.
+            //
             // `deadline` is folded THROUGH, `None` included — never `if
             // deadline.is_some()`. The key alone answers "has this node begun asking?",
             // and `AgentBacking::Human { timeout: None }` is a real configuration, so
@@ -1151,39 +1160,51 @@ mod tests {
         );
     }
 
-    /// The menu is FIRST-wins: a second ask must not retroactively change what a human's
-    /// answer meant. The decision is LAST-wins: an operator may correct it before resume.
+    fn lopt(name: &str, stops: bool) -> orchestrator_core::LoopGateOption {
+        orchestrator_core::LoopGateOption {
+            name: name.to_string(),
+            stops,
+        }
+    }
+
+    /// The DEADLINE, the prompt and the menu are FIRST-wins: a second ask must not
+    /// retroactively change what a human's answer meant, nor when it is due. The decision
+    /// is LAST-wins: an operator may correct it before resume.
+    ///
+    /// The s4 twin of `gate_decisions_are_last_wins_and_the_menu_is_first_wins` (s2) and
+    /// `agent_answers_are_last_wins_and_the_prompt_is_first_wins` (s3), and it asserts the
+    /// same three things they do for the same reasons — including the deadline, which the
+    /// first version of this test dropped. `Fold::deadlines` is SHARED, `wait_or_expire`
+    /// reads it without knowing which kind wrote it, and a LAST-wins deadline is the
+    /// never-expires bug: a run force-woken every ten minutes under a one-hour SLA
+    /// re-arms its deadline on every drive and never fires it.
     #[test]
     fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision() {
         let node = NodeId("lp/0/__gate__".into());
-        let opt = |name: &str, stops: bool| orchestrator_core::LoopGateOption {
-            name: name.into(),
-            stops,
-        };
         let events = vec![
             (
                 1,
                 JournalEvent::LoopGateAwaited {
                     node: node.clone(),
-                    deadline: None,
+                    deadline: Some(at(1_000)),
                     prompt: "first question".into(),
-                    menu: vec![opt("done", true)],
+                    menu: vec![lopt("done", true), lopt("again", false)],
                 },
             ),
             (
                 2,
                 JournalEvent::LoopGateAwaited {
                     node: node.clone(),
-                    deadline: None,
+                    deadline: Some(at(9_999)),
                     prompt: "second question".into(),
-                    menu: vec![opt("done", false)],
+                    menu: vec![lopt("done", false)],
                 },
             ),
             (
                 3,
                 JournalEvent::LoopGateDecided {
                     node: node.clone(),
-                    option: "done".into(),
+                    option: "again".into(),
                     actor: Some("a".into()),
                 },
             ),
@@ -1198,11 +1219,37 @@ mod tests {
         ];
         let (fold, _, _) = fold_journal(&events);
 
+        assert_eq!(
+            fold.deadline_for(&node),
+            Some(Some(at(1_000))),
+            "FIRST ask wins — a later one must not push the deadline forward; \
+             overwriting it IS the never-expires bug"
+        );
+
         let menu = fold.loop_gate_menu_for(&node).expect("menu folded");
+        assert_eq!(
+            menu.len(),
+            2,
+            "FIRST menu wins — the human was shown THIS menu, not the later one-option ask"
+        );
+        assert_eq!(
+            menu[0].name, "done",
+            "the option NAME survives the fold, in order: it is the side of the match \
+             Task 6 checks a decision against"
+        );
         assert!(
             menu[0].stops,
             "FIRST menu wins: the second ask must not flip `stops`"
         );
+        assert_eq!(
+            menu[1].name, "again",
+            "the whole menu is folded, not just its head"
+        );
+        // `stops` is as much a part of the offer as the name — s2's twin makes the same
+        // point about `GateOutcome`. A menu whose options all read the same way would make
+        // every "keep going" answer converge the loop, or every "we're done" answer spin it.
+        assert!(!menu[1].stops, "per-option `stops`, not a single flag");
+
         assert_eq!(
             fold.loop_gate_prompt_for(&node).expect("prompt folded"),
             "first question",
@@ -1212,12 +1259,71 @@ mod tests {
         assert_eq!(decision.actor.as_deref(), Some("b"), "LAST decision wins");
         // The OPTION as well as the actor: it is what Task 6 matches against the journaled
         // menu, so a decision that folds without its name is a decision no arm can honour.
-        assert_eq!(decision.option, "done");
+        // The two decisions name DIFFERENT options on purpose — with one option this
+        // assertion would hold even if the fold dropped the name and kept the first.
+        assert_eq!(
+            decision.option, "done",
+            "LAST decision's option, not the first"
+        );
+    }
+
+    /// `LoopGateDecision::actor` is an `Option` where its s2/s3 siblings are a `String`,
+    /// and the `Option` is the only thing that distinguishes "nobody said who" from
+    /// "somebody claimed to be the empty string". This pins that distinction: an operator
+    /// reads this field to decide whether to trust a decision, so folding a missing actor
+    /// to `""` — `actor.clone().unwrap_or_default()` — would silently invent an
+    /// attribution nobody made.
+    #[test]
+    fn a_loop_gate_decision_without_an_actor_folds_as_none_not_as_empty() {
+        let anonymous = NodeId("lp/0/__gate__".into());
+        let claimed_empty = NodeId("lp/1/__gate__".into());
+        let (fold, _, _) = fold_journal(&[
+            (
+                1,
+                JournalEvent::LoopGateDecided {
+                    node: anonymous.clone(),
+                    option: "done".into(),
+                    actor: None,
+                },
+            ),
+            (
+                2,
+                JournalEvent::LoopGateDecided {
+                    node: claimed_empty.clone(),
+                    option: "done".into(),
+                    actor: Some(String::new()),
+                },
+            ),
+        ]);
+
+        assert!(
+            fold.loop_gate_decision_for(&anonymous)
+                .expect("decided")
+                .actor
+                .is_none(),
+            "a caller that supplied no `--as` folds as None — never as Some(\"\")"
+        );
+        assert_eq!(
+            fold.loop_gate_decision_for(&claimed_empty)
+                .expect("decided")
+                .actor
+                .as_deref(),
+            Some(""),
+            "…and the two states stay distinguishable from each other"
+        );
     }
 
     /// `LoopGateAwaited` is the FOURTH writer of the SHARED `deadlines` map, so
     /// "has this node begun asking?" still has one answer for every waiting kind. The
     /// `None` is folded THROUGH — dropping it is the re-ask-every-drive bug s1 shipped.
+    ///
+    /// It also writes ONLY its own kind-specific record. That is the other half of the
+    /// four-writer bookkeeping and it is load-bearing in both directions: the shared map
+    /// must see this ask, and no other kind's per-kind record may. If a loop gate leaked
+    /// into `agent_prompts`, `run_human_agent`'s missing-question arm — which exists
+    /// precisely to fail loud when a node bears ANOTHER kind's awaited record — would
+    /// instead resume a human-backed `Agent` with a loop gate's question and let
+    /// `AgentAnswered` complete it.
     #[test]
     fn a_deadline_less_loop_gate_records_that_it_began_asking() {
         let node = NodeId("lp/0/__gate__".into());
@@ -1227,10 +1333,7 @@ mod tests {
                 node: node.clone(),
                 deadline: None,
                 prompt: "q".into(),
-                menu: vec![orchestrator_core::LoopGateOption {
-                    name: "done".into(),
-                    stops: true,
-                }],
+                menu: vec![lopt("done", true)],
             },
         )]);
         assert_eq!(
@@ -1238,6 +1341,31 @@ mod tests {
             Some(None),
             "the key must be PRESENT with a None value: present = began asking, \
              None = no deadline"
+        );
+        assert_eq!(
+            fold.loop_gate_prompt_for(&node),
+            Some("q"),
+            "the question is durable even when the SLA is not"
+        );
+        assert!(
+            fold.loop_gate_menu_for(&node).is_some(),
+            "and so is the menu it was asked with"
+        );
+
+        // The SHARED map, and nothing else. One negative assertion per sibling kind.
+        assert!(
+            fold.prompt_for(&node).is_none(),
+            "a loop gate is not answerable by `AgentAnswered`, so its prompt must not \
+             land in `agent_prompts`"
+        );
+        assert!(
+            fold.menu_for(&node).is_none(),
+            "nor its menu in the `HumanGate` menu map — the two vocabularies differ \
+             (`stops` vs `GateOutcome`)"
+        );
+        assert!(
+            !fold.has_signal_ask(&node),
+            "nor may it claim to be an `AwaitSignal` ask"
         );
     }
 

@@ -15293,9 +15293,10 @@ mod await_signal {
     /// `SignalAwaited` of its own — the third direction of the kind-swap hole, and the one
     /// s3 left open while closing the other two.
     ///
-    /// `Fold::deadlines` is written by all THREE waiting kinds, so an `AgentAwaited` (or a
-    /// `GateAwaited`) makes `deadline_for` return `Some(_)` for a node the graph now
-    /// declares as an `AwaitSignal`. Without a guard `wait_or_expire` reports `Waiting` and
+    /// `Fold::deadlines` is written by all FOUR waiting kinds, so an `AgentAwaited` (or a
+    /// `GateAwaited`, or SP-6 s4's `LoopGateAwaited`) makes `deadline_for` return `Some(_)`
+    /// for a node the graph now declares as an `AwaitSignal`. Without a guard
+    /// `wait_or_expire` reports `Waiting` and
     /// the node pauses with `resume_after: None` — SP-DATA-3's never-auto-woken class — on
     /// every drive, forever.
     ///
@@ -18452,9 +18453,12 @@ mod human_agent {
     /// pausing forever with no question anyone can answer.
     ///
     /// This is the exact mirror of `a_gate_that_recorded_a_wait_without_a_menu_fails_loudly`
-    /// (s2), and s3 shipped without it. `Fold::deadlines` is written by all THREE waiting
-    /// kinds — `SignalAwaited`, `GateAwaited`, `AgentAwaited` — and `wait_or_expire_by_id`
-    /// reads only that shared map. So a node whose id already carries a `SignalAwaited`
+    /// (s2), and s3 shipped without it. `Fold::deadlines` is written by all FOUR waiting
+    /// kinds — `SignalAwaited`, `GateAwaited`, `AgentAwaited` and, since SP-6 s4,
+    /// `LoopGateAwaited` — and `wait_or_expire_by_id` reads only that shared map, so every
+    /// widening of that set widens this arm's reachable set too (s4's loop gate publishes
+    /// its question into `Fold::loop_gate_asks`, never into `agent_prompts`, so a node
+    /// bearing one lands HERE). So a node whose id already carries a `SignalAwaited`
     /// returned `Waiting`, never took the `NotYetAsking` arm, and never published an
     /// `AgentAwaited`. Review drove that shape three times and got three `RunPaused` rows
     /// and ZERO journaled questions.
