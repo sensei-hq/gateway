@@ -228,6 +228,16 @@ human path reuses its work. The implementation calls `assemble_prompt_parts`, wh
 `assemble_prompt` stopping one step short of joining its two halves; the model path re-joins them
 and is byte-identical.
 
+> **Superseded in part by SP-6 s4** (`docs/superpowers/specs/2026-09-02-sp-6-s4-human-loop-gate-design.md`).
+> s4's human LOOP GATE does not route through `drive_agent`, so the no-drift property moved out of
+> this branch's POSITION and into a shared seam, `Executor::human_question_for`. Two clauses above
+> no longer hold literally: the human path no longer *reuses* the assembly done before the branch —
+> the seam re-assembles, so `assemble_prompt_parts` runs twice on that path — and the branch's
+> position is now load-bearing for the zero-spend half only. The call above the branch stays where
+> it is for a different reason s3 did not name: its `?` raises `UnknownSkillRef` before the
+> `!top_level` refusal can journal a `NodeFailed`, which
+> `an_unknown_skill_beats_the_non_top_level_refusal` pins.
+
 **Consequence, named because it is load-bearing: the question's two halves have two different
 OWNERS, and so are bounded by two different rules.** An assembled prompt is routinely multi-KB, so
 §6's size bound is a real constraint rather than a theoretical one — but it applies only to the
