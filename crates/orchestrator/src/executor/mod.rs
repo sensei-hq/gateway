@@ -172,11 +172,10 @@ struct Fold {
     /// kind wrote it — so a reader that reasons about which kinds can be present is
     /// reasoning off THIS sentence. All four do: `run_await_signal`'s missing-ask arm,
     /// `run_human_gate`'s missing-menu arm, `run_human_agent`'s missing-question arm and
-    /// `run_human_loop_gate`'s missing-ask arm, each pairing this shared map with its own
+    /// `run_human_loop_gate`'s missing-menu arm, each pairing this shared map with its own
     /// kind-specific record ([`Fold::signal_asks`], [`Fold::menus`],
-    /// [`Fold::agent_prompts`], [`Fold::loop_gate_asks`]). s4's fold landed one task ahead
-    /// of its reader, as s3's did: the fourth WRITER is here now, and
-    /// `run_human_loop_gate` arrives with the executor arm.
+    /// [`Fold::agent_prompts`], [`Fold::loop_gate_asks`]). All four writers and all four
+    /// readers now exist.
     ///
     /// FIRST record wins — the opposite of `signals`, and deliberately
     /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
@@ -255,8 +254,9 @@ struct Fold {
     /// [`run_human_agent`](Executor::run_human_agent) (s3) and `drive_agent`'s
     /// human-backed-in-a-nested-position refusal (`agent.rs`, also s3) through
     /// `gate_precheck_by_id`, which is the same body over a bare `NodeId`. s4's
-    /// `run_human_loop_gate` makes a fifth (design §5.2 step 0) — five callers, still ONE
-    /// reader.
+    /// `run_human_loop_gate` is the fifth, through `gate_failure_by_id` (design §5.2
+    /// step 0) — which is that same body again, one wrapper further in, because a loop
+    /// gate's step type is not a `NodeExec`. Five callers, still ONE reader.
     ///
     /// It is deliberately not consulted anywhere else, and the fence is on the READER, not
     /// on the caller count — which is why the count growing is not a loosening: a further
@@ -403,12 +403,9 @@ impl Fold {
     ///
     /// Read through [`wait_or_expire`](Executor::wait_or_expire) — SP-6 s2's shared arm,
     /// called on EVERY execution by `run_await_signal`, `run_human_gate` and (through
-    /// `wait_or_expire_by_id`) `run_human_agent`. (s4's `LoopGateAwaited` is already a
-    /// WRITER as of this task; its reader, `run_human_loop_gate`, lands with the executor
-    /// arm — the fold deliberately goes in first so the durable record exists before
-    /// anything reads it, exactly as s3's did.) It is the durable half of the
-    /// never-recompute rule; the caller must not fall back to `now + timeout` when this
-    /// returns `Some`, in EITHER of its two inner shapes.
+    /// `wait_or_expire_by_id`) `run_human_agent` and s4's `run_human_loop_gate`. It is the
+    /// durable half of the never-recompute rule; the caller must not fall back to
+    /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
     fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         self.deadlines.get(node).copied()
     }
@@ -480,7 +477,7 @@ impl Fold {
     /// SP-6 s1: did the `AwaitSignal` kind itself begin waiting at this node?
     ///
     /// The third member of the [`Fold::menu_for`]/[`Fold::prompt_for`] family — s4's
-    /// [`Fold::loop_gate_prompt_for`] is the fourth — and it exists for the same reason
+    /// [`Fold::loop_gate_menu_for`] is the fourth — and it exists for the same reason
     /// all of them do: [`Fold::deadline_for`] answers "has SOME waiting kind begun here?"
     /// — all four of `SignalAwaited`/`GateAwaited`/`AgentAwaited`/`LoopGateAwaited` write
     /// that map — and a node kind that acts on that shared answer alone acts on another
@@ -498,39 +495,46 @@ impl Fold {
 
     /// SP-6 s4: the menu a loop gate published, or `None` if it never began asking.
     ///
-    /// `expect(dead_code)` rather than `allow`, on the s3 precedent: the fold lands
-    /// ahead of its only non-test consumer (`run_human_loop_gate`, s4 Task 6), and an
-    /// `expect` that is no longer needed is itself a `-D warnings` failure — so the
-    /// attribute deletes itself the moment that arm reads the menu, where a stale
-    /// `allow` would silently outlive its reason. It is gated on `not(test)` because the
-    /// fold test in this module calls it today, and an ungated `expect` would be
-    /// unfulfilled in the lib-test target and fail `clippy --all-targets` from the other
-    /// side.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "SP-6 s4 Task 6's run_human_loop_gate is the consumer; the fold lands first"
-        )
-    )]
+    /// **It answers BOTH of this family's questions at once, which is why it is the one
+    /// the arm reads.** `None` means "the LOOP GATE kind never began asking here" — the
+    /// [`Fold::menu_for`]/[`Fold::prompt_for`]/[`Fold::has_signal_ask`] question, narrower
+    /// than [`Fold::deadline_for`], which all FOUR waiting kinds write — and `Some` is the
+    /// menu the decision must then be validated against. `run_human_loop_gate` needs the
+    /// second thing anyway, so a separate "did this kind ask?" probe would be a second
+    /// read of the same record for no extra information (`LoopGateAsk` holds the prompt
+    /// and the menu together precisely so "one present, the other absent" is
+    /// unrepresentable).
+    ///
+    /// Task 4 carried an `expect(dead_code)` here because the fold landed one task ahead
+    /// of its only non-test consumer. Task 6 shipped that consumer — `run_human_loop_gate`
+    /// (`executor/human.rs`) reads this on the already-asking path — so the attribute is
+    /// gone, exactly as its own doc said it would be: an `expect` that is no longer needed
+    /// is itself a `-D warnings` failure, which is what made it delete itself rather than
+    /// silently outlive its reason the way a stale `allow` would.
     fn loop_gate_menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::LoopGateOption]> {
         self.loop_gate_asks.get(node).map(|a| a.menu.as_slice())
     }
 
-    /// SP-6 s4: the question a loop gate published. Answers "did the LOOP GATE kind begin
-    /// here?" — narrower than [`Fold::deadline_for`], which all FOUR waiting kinds write.
+    /// SP-6 s4: the question a loop gate published.
     ///
-    /// The exact counterpart of [`Fold::menu_for`], [`Fold::prompt_for`] and
-    /// [`Fold::has_signal_ask`], and it exists for the reason all three of those do: a
-    /// node kind that acts on the shared map's answer alone acts on another kind's
-    /// record. See [`Fold::loop_gate_menu_for`] for why this is `expect(dead_code)`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "SP-6 s4 Task 6's run_human_loop_gate is the consumer; the fold lands first"
-        )
-    )]
+    /// `#[cfg(test)]`, and — unlike its three siblings — it has no production consumer at
+    /// all. Task 4 predicted one and was wrong about which accessor the arm would use:
+    /// `run_human_loop_gate` reads [`Fold::loop_gate_menu_for`], which answers the same
+    /// "did the LOOP GATE kind begin here?" question AND hands back the thing the arm
+    /// actually needs, so a prompt read alongside it would be a second read of the same
+    /// `LoopGateAsk` for nothing. `torii` does not want it either: every operator surface
+    /// folds the raw journal itself (`cmd::gate`'s own `GateAwaited` scrape) rather than
+    /// borrowing the executor's `Fold`.
+    ///
+    /// So it is gated rather than carrying a permanent `expect(dead_code)`, on the
+    /// precedent Task 5 set for `HumanQuestion::text`: an `expect` whose stated occasion
+    /// never arrives is the stale `allow` in disguise, while `#[cfg(test)]` says plainly
+    /// what it is. What it earns its place for is real — `LoopGateAsk.prompt` is folded
+    /// FIRST-wins, and
+    /// `the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision`
+    /// asserts that a second ask does not overwrite the question a person was shown. Drop
+    /// the attribute, do not re-add an `expect`, if a production reader ever appears.
+    #[cfg(test)]
     fn loop_gate_prompt_for(&self, node: &NodeId) -> Option<&str> {
         self.loop_gate_asks.get(node).map(|a| a.prompt.as_str())
     }
@@ -540,15 +544,10 @@ impl Fold {
     /// Read only AFTER the ask has been journaled and only AFTER `gate_precheck`/
     /// `wait_or_expire` have had their say — s4 mirrors s2's ordering rather than s3's
     /// (design §5.2), so an EXPIRED gate fails even if a decision landed late, and an
-    /// answer counts only while the node was still asking. See
-    /// [`Fold::loop_gate_menu_for`] for why this is `expect(dead_code)`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "SP-6 s4 Task 6's run_human_loop_gate is the consumer; the fold lands first"
-        )
-    )]
+    /// answer counts only while the node was still asking.
+    ///
+    /// Task 6's `run_human_loop_gate` is that reader, so Task 4's `expect(dead_code)` is
+    /// gone — see [`Fold::loop_gate_menu_for`].
     fn loop_gate_decision_for(&self, node: &NodeId) -> Option<&LoopGateDecision> {
         self.loop_gate_decisions.get(node)
     }

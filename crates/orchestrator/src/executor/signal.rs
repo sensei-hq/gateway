@@ -104,10 +104,32 @@ impl Executor {
     /// arrangement exists to prevent: s1's whole-slice review found real defects in exactly
     /// these arms, and a second copy is a second place for them to return.
     pub(super) fn gate_precheck_by_id(&self, node: &NodeId, fold: &Fold) -> Option<NodeExec> {
-        fold.failure_for(node).map(|error| NodeExec::Failed {
-            message: error.to_string(),
-            output: None,
-        })
+        self.gate_failure_by_id(node, fold)
+            .map(|message| NodeExec::Failed {
+                message,
+                output: None,
+            })
+    }
+
+    /// [`Executor::gate_precheck_by_id`] as a bare MESSAGE, and — since SP-6 s4 — the ONE
+    /// implementation of the whole family: the two forms above are wrappers that dress this
+    /// verdict up as the [`NodeExec`] their callers return.
+    ///
+    /// It exists because s4's human LOOP GATE does not return a `NodeExec` at all. Its arm
+    /// reports a [`LoopGateStep`](super::human::LoopGateStep), whose `Failed` carries a
+    /// `String` and whose `Decided { stop }` has no `NodeExec` shape to be — so the gate
+    /// arm would otherwise have to `match` a `NodeExec` it knows can only be `Failed`,
+    /// leaving either an `unreachable!` (forbidden: a panic in a node kind unwinds through
+    /// `Scheduler::tick`, stranding a claimed lease) or an `if let` whose non-matching path
+    /// falls THROUGH and silently ignores a recorded failure — fail-OPEN, in the one guard
+    /// whose entire purpose is fail-closed.
+    ///
+    /// **Every word of `gate_precheck`'s contract applies here, and one in particular: call
+    /// it FIRST, before reading the node's answer.** This is not a second, laxer entry
+    /// point — it is the same read of the same `fold.failed`, and it journals nothing, so
+    /// a dead node does not append a fresh `NodeFailed` on every drive.
+    pub(super) fn gate_failure_by_id(&self, node: &NodeId, fold: &Fold) -> Option<String> {
+        fold.failure_for(node).map(str::to_string)
     }
 
     /// Arms 2–4 of §6.2, shared: read the recorded deadline or compute a fresh one, and

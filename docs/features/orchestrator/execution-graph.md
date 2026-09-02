@@ -39,10 +39,40 @@ source: crates/orchestrator*
 > iteration output into the next planning input (the **refine** that powers the
 > coordinator). **`GateSpec`** is **`Pure(LoopGate)`** (a deterministic predicate over
 > the iteration output — recomputed on resume, no journaling; the leaf-body convergence
-> path) or **`Agent { agent, stop_when }`** — a **gate-agent** driven at the reserved
+> path), **`Agent { agent, stop_when }`** — a **gate-agent** driven at the reserved
 > `"{loop}/{i}/__gate__"` whose journaled answer feeds a pure `stop_when` predicate (the
 > semantic Continue|Stop is an LLM decision, memoized ⇒ a resume replays it; graph bodies
-> converge via the gate-agent, since a pure gate can't match a nested sink map).
+> converge via the gate-agent, since a pure gate can't match a nested sink map) — or
+> **`Human { agent, menu }`** (SP-6 s4), where a PERSON picks from an enumerated
+> `menu: Vec<LoopGateOption { name, stops }>` at that same reserved path, once per
+> iteration, and the chosen option's `stops` is the decision (`true` converges, `false`
+> runs another iteration subject to `max_iters`). It journals
+> `LoopGateAwaited{node,deadline,prompt,menu}` and pauses; a
+> `LoopGateDecided{node,option,actor}` resumes it (both new variants ⇒ `FORMAT_VERSION`
+> stays 1). The `AgentRef` earns its place twice — the role's `system_prompt` and
+> activated skills compose the question through the MODEL path's own prompt assembly
+> (the iteration output arrives as `## Context`, truncated; the authored half fails
+> loudly over its own cap), and its `backed_by: human { timeout }` is the SLA — which is
+> why the variant takes a role rather than a bare question string. There is deliberately
+> no `stop_when`: under a human backing a pure predicate is either inert or applied to a
+> magic option-name vocabulary, where `TextContains("halt")` against a menu emitting
+> `"stop"` silently yields a loop that runs to `max_iters`. Two rules diverge from the
+> gate-agent on purpose. The **menu is DURABLE**: after the first ask every decision is
+> validated against the JOURNALED menu, so editing the graph cannot retroactively change
+> what an answer meant, and an option matching nothing in it fails loudly rather than
+> defaulting either way. And the **deadline is read BEFORE the decision** — s2's
+> ordering, inverting s3's — because "continue" authorizes another iteration of SPEND,
+> which is an approval, so a late one must not sanction tokens the SLA said to stop
+> waiting for; an expired undecided gate FAILS the Loop rather than converging (silence
+> is not consent, and "silence means stop" would report SUCCESS with nobody asked).
+> `validate_dag` rejects an empty menu, duplicate or empty option names, and a menu with
+> no `stops: true` option — a loop that provably cannot converge however the human
+> answers — at every depth it recurses into. The gate resolves no chain and never
+> reaches the gateway, so it spends NOTHING, which matters more here than at any other
+> human site: the decision being made *is* whether to spend more. (Operator surface —
+> `torii run gate decide` on a `"{loop}/{i}/__gate__"` node and `run list-paused`
+> rendering its question — lands later in SP-6 s4; until then the arm is reachable from
+> a library caller and from the durable journal only.)
 > Cap-without-Stop completes best-effort (`converged: false`) — never a bare fail
 > (§10.3); a body/gate failure fails the Loop (naming the iteration), a body/gate pause
 > pauses it. Resume replays completed iterations + gate decisions from the memo (zero

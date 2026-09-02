@@ -11,6 +11,7 @@ use orchestrator_core::{
     OrchestratorError, RunId, effect_id,
 };
 
+use super::human::LoopGateStep;
 use super::support::{build_request, input_hash};
 use super::{AgentStep, Executor, Fold, NodeExec};
 
@@ -428,14 +429,18 @@ impl Executor {
     /// `Pure` (an SP-1 pure predicate over the iteration output, no journaling),
     /// `Agent` — a gate-agent driven over the output at `"{loop}/{i}/__gate__"`,
     /// whose journaled answer feeds the pure `stop_when` (a gate-agent Failed fails the
-    /// Loop, a gate-agent Paused pauses it) — or `Human` — a person picks from an
-    /// enumerated menu, once per iteration (SP-6 s4; the arm is a stub until Task 7).
+    /// Loop, a gate-agent Paused pauses it) — or `Human` — a PERSON picks from an
+    /// enumerated menu at that same reserved path, once per iteration, and the chosen
+    /// option's `stops` is the decision (SP-6 s4, [`Executor::run_human_loop_gate`]: a
+    /// gate failure fails the Loop and a pending decision pauses it, exactly as the
+    /// gate-agent's do; no chain is resolved, so the gate itself spends nothing).
     /// Cap-without-Stop
     /// completes best-effort (`converged: false`), never a bare fail; a body failure
     /// fails the Loop; a body pause pauses the Loop. Resume replays completed
     /// iterations (memo-hit, no re-spend) and recomputes the gate — a pure gate from
-    /// the memoized output, a gate-agent from its memoized turns — so it stops at the
-    /// same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are
+    /// the memoized output, a gate-agent from its memoized turns, a human gate from its
+    /// journaled `LoopGateDecided` — so it stops at the same iteration. The Loop's own
+    /// `NodeStarted`/`NodeCompleted` are
     /// fold-guarded (like `run_map`) so a replayed completed Loop does not re-journal
     /// them.
     pub(super) async fn run_loop(
@@ -570,22 +575,70 @@ impl Executor {
                         AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
                     }
                 }
-                // SP-6 s4: the real arm lands in Task 7. Temporary — but a FAILURE, not a
-                // panic. `GateSpec::Human` is a public re-exported variant, so it is
-                // reachable from any caller and from a `scheduled_runs.graph` jsonb row;
-                // `unreachable!` would assert something false. A panic here unwinds through
-                // `Scheduler::tick`, which has already claimed a batch and taken its leases
-                // — the run stays `'waking'`, the next worker reclaims the stale lease and
-                // dies the same way, and because a panic is not an `Err` it bypasses
-                // `worker serve`'s consecutive-failure backoff entirely. `graph.rs:548` and
-                // `tick`'s own comment both record that doctrine. A silent `false` is worse
-                // still: the loop would run to `max_iters` with nobody ever asked.
-                GateSpec::Human { .. } => {
-                    let msg = format!(
-                        "loop {:?}: a human loop gate is not yet wired (SP-6 s4, Task 7)",
-                        loop_node.id
-                    );
-                    return self.fail_loop(run, &loop_node.id, msg).await;
+                // SP-6 s4: a PERSON decides. Same reserved `"{loop}/{i}/__gate__"` path as
+                // the gate-agent above, but no agent is driven at all —
+                // `run_human_loop_gate` resolves no chain and never reaches the gateway, so
+                // zero token spend is STRUCTURAL. That matters more here than anywhere else
+                // in SP-6: the decision being made IS whether to spend more, so a gate that
+                // itself cost tokens would be self-undermining.
+                //
+                // The iteration `output` is passed as the thing being JUDGED (it becomes
+                // the question's `## Context`); the graph's `menu` is passed for the first
+                // ask only — every later drive resolves the decision against the JOURNALED
+                // copy. See `run_human_loop_gate`.
+                GateSpec::Human { agent, menu } => {
+                    let gate_path = NodeId(format!("{path}/__gate__"));
+                    match self
+                        .run_human_loop_gate(run, &gate_path, agent, menu, &output, fold)
+                        .await?
+                    {
+                        LoopGateStep::Decided { stop } => stop,
+                        // A gate failure fails the Loop, exactly as the gate-AGENT arm
+                        // above does — no new outcome shape (AC10). An expired gate lands
+                        // here, and so does a decision naming an option the published menu
+                        // does not contain.
+                        //
+                        // **But it journals the Loop's own `NodeFailed` only on the drive
+                        // that produced the verdict.** A human gate's failure is TERMINAL:
+                        // `run_human_loop_gate`'s step 0 reads it back forever, while the
+                        // run it kills journals no `RunCompleted` and so stays resumable —
+                        // so every later wake re-drives this iteration and re-reaches this
+                        // arm. Appending here unconditionally grows the journal by a row
+                        // per wake for a run that can never progress, which is exactly the
+                        // defect `gate_precheck` exists to prevent, one level further out
+                        // (measured: three drives, three `NodeFailed(lp)` rows). The
+                        // gate-agent arm above needs no such guard because a model
+                        // failure is not terminal — it re-attempts on resume.
+                        //
+                        // `newly_journaled` is carried on the step rather than re-derived
+                        // from `Fold::failed` here: that map has exactly ONE reader family
+                        // by design (`gate_precheck` and its `_by_id` forms, on behalf of
+                        // the WAITING kinds), and a `Loop` is not one of them.
+                        LoopGateStep::Failed {
+                            message,
+                            newly_journaled,
+                        } => {
+                            let msg = format!(
+                                "loop {:?} human gate failed at iteration {i}: {message}",
+                                loop_node.id
+                            );
+                            return if newly_journaled {
+                                self.fail_loop(run, &loop_node.id, msg).await
+                            } else {
+                                Ok(NodeExec::Failed {
+                                    message: msg,
+                                    output: None,
+                                })
+                            };
+                        }
+                        // Waiting on a person pauses the whole Loop, like every other body
+                        // or gate pause. The `RunPaused` is already journaled, on the
+                        // deadline the GATE recorded, so the SP-DATA-3 scheduler wakes this
+                        // run at the SLA rather than immediately.
+                        LoopGateStep::Paused(reason) => {
+                            return Ok(NodeExec::Paused { reason });
+                        }
+                    }
                 }
             };
             if stop {

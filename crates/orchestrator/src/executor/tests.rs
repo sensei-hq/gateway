@@ -15692,9 +15692,10 @@ mod human_gate {
     /// A fixed instant, so every deadline in these tests is an exact literal.
     ///
     /// `pub(super)` because SP-6 s3's `mod human_agent` reuses it rather than deriving a
-    /// third copy: `mod await_signal` and this module already carry one each, and a
-    /// literal-instant helper that drifts between the three waiting kinds' suites makes a
-    /// failed deadline assertion read as "which second was that?".
+    /// third copy, and s4's `mod human_loop_gate` a fourth: `mod await_signal` and this
+    /// module already carry one each, and a literal-instant helper that drifts between the
+    /// four waiting kinds' suites makes a failed deadline assertion read as "which second
+    /// was that?".
     pub(super) fn at(unix_secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(unix_secs, 0).expect("valid timestamp")
     }
@@ -15772,9 +15773,10 @@ mod human_gate {
     /// [`a_timed_gate_pauses_on_the_absolute_deadline_it_recorded`] for what its absence
     /// from this module let through.
     ///
-    /// `pub(super)` for SP-6 s3's `mod human_agent`: all three waiting kinds end on the
-    /// SAME `pause_awaiting`, so they must all be able to assert on the SAME field, and a
-    /// third copy of this filter is a third thing to keep in step.
+    /// `pub(super)` for SP-6 s3's `mod human_agent` and s4's `mod human_loop_gate`: all
+    /// FOUR waiting kinds end on the SAME `pause_awaiting`, so they must all be able to
+    /// assert on the SAME field, and a fourth copy of this filter is a fourth thing to
+    /// keep in step.
     pub(super) fn paused_resume_afters(
         events: &[(Seq, JournalEvent)],
     ) -> Vec<Option<DateTime<Utc>>> {
@@ -17161,8 +17163,9 @@ mod postgres_e2e {
 ///
 /// Modelled on `mod human_gate` and deliberately reusing its `at`/`paused_resume_afters`
 /// (and `crate::test_support`'s `FakeClock`/`recording_gateway`) rather than deriving a
-/// third copy of each: all three waiting kinds share one `pause_awaiting`, so they must
-/// assert on the same field with the same helper.
+/// third copy of each: all four waiting kinds share one `pause_awaiting`, so they must
+/// assert on the same field with the same helper. SP-6 s4's `mod human_loop_gate` reuses
+/// this module's own `reviewer`/`human_registry`/`exec_at` for the same reason.
 ///
 /// **Every registry below gives the human-backed agent `chain: None` with no binding
 /// table.** That is not laziness — it is the structural half of AC12. `resolve_chain`
@@ -17182,11 +17185,22 @@ mod human_agent {
 
     /// The question every test asks. It is the agent's `system_prompt`, which is what
     /// `assemble_prompt` composes into the journaled question.
-    const QUESTION: &str = "Read the contract and say whether it permits sub-processing.";
+    ///
+    /// `pub(super)` alongside [`reviewer`]: s4's gate tests assert that the ROLE's own
+    /// prompt reached the journaled loop-gate question, which is only meaningful against
+    /// the same constant the role is built from.
+    pub(super) const QUESTION: &str =
+        "Read the contract and say whether it permits sub-processing.";
 
     /// A human-backed `reviewer` role with the given SLA. `chain: None` and no bindings —
     /// see the module doc for why that is load-bearing.
-    fn reviewer(timeout: Option<Duration>, skills: Vec<String>) -> AgentDefinition {
+    ///
+    /// `pub(super)` for SP-6 s4's `mod human_loop_gate`, on the same reasoning that made
+    /// `human_gate::at` shared: the four waiting kinds must be able to assert against ONE
+    /// definition of "the human-backed reviewer role", and a fourth copy of this literal
+    /// is a fourth thing to keep in step — most sharply its `chain: None`, which is the
+    /// structural half of every zero-spend claim in this file.
+    pub(super) fn reviewer(timeout: Option<Duration>, skills: Vec<String>) -> AgentDefinition {
         AgentDefinition {
             name: "reviewer".into(),
             area: "review".into(),
@@ -17201,7 +17215,7 @@ mod human_agent {
         }
     }
 
-    fn human_registry(timeout: Option<Duration>) -> Arc<Registry> {
+    pub(super) fn human_registry(timeout: Option<Duration>) -> Arc<Registry> {
         Arc::new(Registry::default().with_agent(reviewer(timeout, vec![])))
     }
 
@@ -17217,7 +17231,13 @@ mod human_agent {
     /// wake the run for a worker to drive it) and the shape any library caller has. The
     /// clock and the gateway call log are handed back: the clock to cross a deadline, the
     /// log to prove AC12.
-    async fn exec_at(
+    ///
+    /// `pub(super)` for SP-6 s4's `mod human_loop_gate`, which needs exactly this triple
+    /// for exactly these reasons — a journal it can append a `LoopGateDecided` to between
+    /// drives, a clock it can push past the SLA, and a call log for s4's own zero-spend
+    /// AC. The `recording_gateway` inside also serves s4's `LoopBody::ModelCall`, so the
+    /// loop's body runs while the GATE stays free.
+    pub(super) async fn exec_at(
         journal: &InMemoryJournal,
         registry: Arc<Registry>,
         now: DateTime<Utc>,
@@ -19116,5 +19136,409 @@ mod human_agent {
             rows.iter().any(|r| r.contains("top-level")),
             "and the refusal still names the rule: {rows:?}"
         );
+    }
+}
+
+/// SP-6 s4 — a `Loop` whose stop decision is made by a PERSON, from an enumerated menu,
+/// once per iteration.
+///
+/// The FOURTH waiting kind, and the first that is not a node of the author's graph: it
+/// runs at the synthesized, already-reserved path `"{loop}/{i}/__gate__"` — the same path
+/// the SP-3 s5 gate-AGENT uses — so there is no `Node` for it anywhere, which is why the
+/// arm reaches the shared machinery through the `_by_id` forms.
+///
+/// **Structure follows `run_human_gate` (s2), not `run_human_agent` (s3), and the
+/// difference is the expiry ordering** (design §5.2/§3): "continue" AUTHORIZES ANOTHER
+/// ITERATION OF SPEND, which is an approval in the strict sense s2 built its ordering
+/// for, so expiry is read BEFORE the decision. Task 8 owns the test that reddens if the
+/// two are swapped; the tests here are the ask/decide/continue/cap behaviours underneath
+/// it.
+///
+/// Deliberately reusing `mod human_agent`'s `reviewer`/`human_registry`/`exec_at` and
+/// `mod human_gate`'s `at` rather than deriving a fourth copy of each: all four waiting
+/// kinds share one `pause_awaiting`, one `gate_precheck` and one `wait_or_expire`, so
+/// they must be asserted against one set of fixtures. The reviewer's `chain: None` with
+/// no binding table is load-bearing here too — `resolve_chain` would fail for that role,
+/// so an arm that ever drove the gate ROLE through the model path could not silently cost
+/// tokens; it would error.
+mod human_loop_gate {
+    use super::human_agent::{QUESTION, exec_at, human_registry};
+    use super::human_gate::at;
+    use super::*;
+    use chrono::{DateTime, Duration, Utc};
+    use orchestrator_core::LoopGateOption;
+
+    fn lp() -> NodeId {
+        NodeId("lp".into())
+    }
+
+    /// The reserved gate path for iteration `i` — `RESERVED_GATE_ID` under the loop's
+    /// per-iteration path, written out here exactly as an operator would type it into
+    /// `torii run gate decide --node`.
+    fn gate(i: usize) -> NodeId {
+        NodeId(format!("lp/{i}/__gate__"))
+    }
+
+    /// A `Loop` gated by a human, with a `ModelCall` body on the recording chain `"c"`.
+    ///
+    /// The menu carries BOTH senses of `stops` and they are named for what they do to the
+    /// LOOP, not to the node: `revise` runs another iteration, `ship` converges. A
+    /// one-option menu could not distinguish "the decision was honoured" from "the arm
+    /// always continues"/"always stops", and `validate_dag` requires at least one
+    /// `stops: true` in any case.
+    fn human_gated_loop_graph(max_iters: usize) -> Graph {
+        Graph {
+            nodes: vec![Node {
+                id: lp(),
+                kind: NodeKind::Loop {
+                    body: LoopBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({ "prompt": "draft it" }),
+                    gate: GateSpec::Human {
+                        agent: AgentRef("reviewer".into()),
+                        menu: vec![
+                            LoopGateOption {
+                                name: "revise".into(),
+                                stops: false,
+                            },
+                            LoopGateOption {
+                                name: "ship".into(),
+                                stops: true,
+                            },
+                        ],
+                    },
+                    max_iters,
+                },
+                deps: vec![],
+            }],
+        }
+    }
+
+    fn decided(node: &NodeId, option: &str, actor: &str) -> JournalEvent {
+        JournalEvent::LoopGateDecided {
+            node: node.clone(),
+            option: option.to_string(),
+            actor: actor.to_string(),
+        }
+    }
+
+    /// One journaled ask, destructured: everything `LoopGateAwaited` carries, so a test
+    /// can assert on any part of it without a second scraper — and so a field ADDED to
+    /// the event forces this alias, and every test reading it, to be looked at.
+    type Ask = (NodeId, String, Vec<LoopGateOption>, Option<DateTime<Utc>>);
+
+    /// Every `LoopGateAwaited` this run journaled, in order. A correct implementation
+    /// writes exactly one per ITERATION, at that iteration's own reserved path.
+    fn asks(events: &[(Seq, JournalEvent)]) -> Vec<Ask> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::LoopGateAwaited {
+                    node,
+                    prompt,
+                    menu,
+                    deadline,
+                } => Some((node.clone(), prompt.clone(), menu.clone(), *deadline)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC3 — after iteration 0 the gate journals ONE `LoopGateAwaited` at the reserved
+    /// path, carrying the question, the menu and the deadline, and the run pauses.
+    ///
+    /// The menu assertion is by VALUE, not by length: the durable menu is what every
+    /// later decision is validated against (§5.3), so a fold or an append that dropped
+    /// `stops` — or reordered the options — would silently change what an operator's
+    /// answer means, and a `len() == 2` check cannot see either.
+    #[tokio::test]
+    async fn a_human_loop_gate_asks_once_per_iteration_and_pauses() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
+        assert!(
+            out.paused.is_some(),
+            "the run pauses on the human gate rather than deciding for itself: {out:?}"
+        );
+        assert!(
+            out.failed.is_none(),
+            "and it is a pause, not a failure: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("journal loads");
+        let asked = asks(&events);
+        assert_eq!(
+            asked.len(),
+            1,
+            "exactly ONE question so far — one per iteration, and only iteration 0 has \
+             run: {asked:?}"
+        );
+        let (node, prompt, menu, deadline) = &asked[0];
+        assert_eq!(
+            node,
+            &gate(0),
+            "at the reserved `{{loop}}/{{i}}/__gate__` path"
+        );
+        assert_eq!(
+            menu,
+            &vec![
+                LoopGateOption {
+                    name: "revise".into(),
+                    stops: false,
+                },
+                LoopGateOption {
+                    name: "ship".into(),
+                    stops: true,
+                },
+            ],
+            "the whole menu is journaled VERBATIM — names, order and `stops` — because it \
+             is what every later decision is validated against"
+        );
+        assert_eq!(
+            deadline,
+            &Some(at(1_000) + Duration::hours(1)),
+            "the role's `backed_by: human` SLA is the gate's deadline, fixed at the ask"
+        );
+        assert!(
+            prompt.contains(QUESTION),
+            "the question is the ROLE's own prompt, assembled by the model path's \
+             assembler: {prompt}"
+        );
+        assert!(
+            prompt.contains("revise") && prompt.contains("ship"),
+            "…and it states what is being decided, so the durable question is \
+             self-contained: {prompt}"
+        );
+        assert!(
+            prompt.contains("canned-response"),
+            "…over the ITERATION OUTPUT, which is what the person is judging: {prompt}"
+        );
+
+        // The pause is the ordinary timed one the SP-DATA-3 scheduler already wakes.
+        assert_eq!(
+            super::human_gate::paused_resume_afters(&events),
+            vec![Some(at(1_000) + Duration::hours(1))],
+            "one pause, re-armed on the deadline the gate RECORDED"
+        );
+    }
+
+    /// AC4 — a `stops: true` decision converges the loop.
+    #[tokio::test]
+    async fn a_stopping_decision_converges_the_loop() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        let graph = human_gated_loop_graph(3);
+
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        journal
+            .append(run, decided(&gate(0), "ship", "jerry"))
+            .await
+            .expect("the decision lands");
+
+        let out = ex.start(run, &graph).await.expect("resumes");
+        assert!(out.failed.is_none(), "the loop completes: {out:?}");
+        assert!(out.paused.is_none(), "and does not pause again: {out:?}");
+        assert!(out.completed.contains(&lp()), "the Loop completed: {out:?}");
+        let o = &out.outputs[&lp()];
+        assert_eq!(
+            o["converged"],
+            serde_json::json!(true),
+            "`stops: true` CONVERGED the loop rather than merely ending it: {o}"
+        );
+        assert_eq!(
+            o["iterations"],
+            serde_json::json!(1),
+            "at iteration 0, not at the max_iters=3 cap: {o}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "one body call across BOTH drives — iteration 0 replayed from its memo on the \
+             resume, and the gate itself never reaches the gateway"
+        );
+    }
+
+    /// AC5 + AC3 — a `stops: false` decision runs ANOTHER iteration, which asks its OWN
+    /// question at its own path. This is the feature, not s3's accidental re-asking: it is
+    /// authored deliberately at a site whose whole purpose is a per-iteration decision.
+    #[tokio::test]
+    async fn a_continuing_decision_runs_another_iteration_that_asks_again() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        let graph = human_gated_loop_graph(3);
+
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        journal
+            .append(run, decided(&gate(0), "revise", "jerry"))
+            .await
+            .expect("the decision lands");
+
+        let out = ex.start(run, &graph).await.expect("resumes");
+        assert!(
+            out.paused.is_some(),
+            "it pauses again, on iteration 1's own gate: {out:?}"
+        );
+        assert!(out.failed.is_none(), "{out:?}");
+
+        let events = journal.load(run).await.expect("loads");
+        let paths: Vec<NodeId> = asks(&events).into_iter().map(|(n, ..)| n).collect();
+        assert_eq!(
+            paths,
+            vec![gate(0), gate(1)],
+            "iteration 1 asks its OWN question at its OWN path — iteration 0's is not \
+             re-asked and not reused"
+        );
+    }
+
+    /// AC6 — `max_iters` still bounds a human who keeps choosing to continue. Without it
+    /// the gate would be an unbounded claim on human attention, and a `stops: false` menu
+    /// would be a way around the cap.
+    #[tokio::test]
+    async fn max_iters_bounds_a_human_who_keeps_continuing() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        let graph = human_gated_loop_graph(2);
+
+        for i in 0..2 {
+            let out = ex.start(run, &graph).await.expect("drives");
+            assert!(
+                out.paused.is_some(),
+                "iteration {i} pauses on its own gate: {out:?}"
+            );
+            journal
+                .append(run, decided(&gate(i), "revise", "jerry"))
+                .await
+                .expect("the decision lands");
+        }
+
+        let out = ex.start(run, &graph).await.expect("resumes");
+        assert!(
+            out.paused.is_none(),
+            "capped at max_iters — NOT asked a third time: {out:?}"
+        );
+        assert!(
+            out.failed.is_none(),
+            "the cap completes best-effort: {out:?}"
+        );
+        let o = &out.outputs[&lp()];
+        assert_eq!(
+            o["iterations"],
+            serde_json::json!(2),
+            "exactly max_iters iterations ran: {o}"
+        );
+        assert_eq!(
+            o["converged"],
+            serde_json::json!(false),
+            "and it is reported as NOT converged — nobody ever chose to stop: {o}"
+        );
+        assert_eq!(
+            asks(&journal.load(run).await.expect("loads")).len(),
+            2,
+            "two questions for two iterations, and no third"
+        );
+    }
+
+    /// A gate that is DEAD stops writing to the journal: re-driving the run appends no
+    /// further `NodeFailed`, for the gate node OR for the `Loop`.
+    ///
+    /// **This guards the `LoopGateStep::Failed { newly_journaled }` flag, which is not in
+    /// the s4 plan's sketch and was added after measuring the defect.** A human gate's
+    /// failure is terminal — `run_human_loop_gate`'s step 0 reads the verdict back rather
+    /// than re-deriving it — but the run it kills journals no `RunCompleted`, so it stays
+    /// resumable and every later wake (`torii run wake`, a scheduler retry, any re-`start`)
+    /// re-drives the iteration and re-reaches the gate. Reading the GATE's verdict back was
+    /// only half the fix: `run_loop` still wrapped it and called `fail_loop`, so the LOOP's
+    /// own row was appended per drive. Measured before the flag: 2 rows after the failing
+    /// drive, **3** after one more wake, growing without bound for a run that can never
+    /// progress. That is the defect `gate_precheck` exists to prevent, one level out.
+    ///
+    /// The gate is killed by expiry because that is the canonical way a loop gate dies; the
+    /// ORDERING that expiry implies (AC8) and terminality against a late decision (AC9) are
+    /// Task 8's subject, and this test deliberately asserts neither — only that the durable
+    /// record stops growing, and that the message an operator sees is the SAME one on every
+    /// drive rather than a freshly-derived near-copy.
+    #[tokio::test]
+    async fn a_dead_loop_gate_stops_appending_node_failed_rows_on_every_wake() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        let graph = human_gated_loop_graph(3);
+
+        let failures = |events: &[(Seq, JournalEvent)]| -> Vec<(NodeId, String)> {
+            events
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    JournalEvent::NodeFailed { node, error } => Some((node.clone(), error.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        clock.set(at(1_000) + Duration::hours(2));
+
+        let first = ex
+            .start(run, &graph)
+            .await
+            .expect("drives past the deadline");
+        let (_, first_message) = first.failed.clone().expect("the gate killed the Loop");
+        let after_death = failures(&journal.load(run).await.expect("loads"));
+        assert_eq!(
+            after_death
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>(),
+            vec![gate(0), lp()],
+            "the failing drive journals exactly two rows: the GATE's verdict and the \
+             LOOP's own failure"
+        );
+
+        // Two more wakes of a run that can never make progress.
+        for wake in 1..=2 {
+            let again = ex.start(run, &graph).await.expect("re-drives");
+            let (_, message) = again.failed.clone().expect("it stays failed");
+            assert_eq!(
+                message, first_message,
+                "wake {wake}: the verdict is READ BACK, not re-derived into a near-copy"
+            );
+            assert_eq!(
+                failures(&journal.load(run).await.expect("loads")),
+                after_death,
+                "wake {wake}: a dead run must append NOTHING — before the \
+                 `newly_journaled` flag this grew by one `NodeFailed(lp)` per drive"
+            );
+        }
     }
 }

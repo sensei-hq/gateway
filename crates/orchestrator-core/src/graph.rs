@@ -46,7 +46,8 @@ pub enum NodeKind {
     /// a bare fail (§10.3); a body failure fails the Loop. Output:
     /// `{ iterations, converged, output }`. The body drives a leaf effect
     /// (`ModelCall`/`Agent`) or a whole graph (`Subgraph`/`Expand`, SP-3 s5) per
-    /// iteration; the gate is a pure predicate or a journaled gate-agent.
+    /// iteration; the gate is a pure predicate, a journaled gate-agent, or — since
+    /// SP-6 s4 — a PERSON picking from an enumerated menu ([`GateSpec`]).
     Loop {
         body: LoopBody,
         input: serde_json::Value,
@@ -2233,6 +2234,89 @@ mod tests {
              execution-graph.md: {undocumented:?} — each needs its own \
              `> - **`Name {{ … }}`** — …` bullet (a mention in someone else's prose is not \
              documentation; see this test's doc comment)"
+        );
+    }
+
+    /// Every `GateSpec` variant must be named where the feature doc ENUMERATES them.
+    ///
+    /// The sibling of `every_node_kind_is_documented_in_the_execution_graph_feature_doc`,
+    /// and it exists because that test cannot see this: a `Loop`'s gate is not a
+    /// `NodeKind`, so SP-6 s4 could add a third way for a loop to stop with the whole
+    /// workspace green while the page still read "**`GateSpec`** is **`Pure(LoopGate)`**
+    /// … or **`Agent { … }`**". That sentence is a CLOSED enumeration — it says what
+    /// `GateSpec` *is* — so a variant it omits is a variant the page states does not
+    /// exist, which is the same failure the node-kind guard was written for, one type
+    /// away. It cost s1 a reader who concluded HITL was unavailable.
+    ///
+    /// Bounded to the enumeration itself rather than to the whole file, for that test's
+    /// reason: `Human` occurs in this page's prose in several unrelated senses
+    /// (`AwaitSignal`'s "a human answers", `HumanGate`'s bullet), and a bare
+    /// `doc.contains` would have been GREEN before this slice wrote a word.
+    ///
+    /// Only rule 1 (the enumeration) applies. There is no per-gate-kind bullet convention
+    /// to hold a variant to — the gate kinds are documented inside the `Loop` paragraph,
+    /// which is where an author reading about loops will be.
+    #[test]
+    fn every_gate_spec_variant_is_documented_in_the_execution_graph_feature_doc() {
+        let src = include_str!("graph.rs");
+        let body = src
+            .split_once("pub enum GateSpec {")
+            .expect("the enum is declared here")
+            .1
+            .split_once("\n}\n")
+            .expect("the enum ends")
+            .0;
+        let variants: Vec<&str> = body
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                // A variant line is four-space-indented and starts a `Name {` or `Name(`.
+                if l.starts_with("    ") && !l.starts_with("     ") && !t.starts_with("//") {
+                    t.split(|c: char| !c.is_alphanumeric())
+                        .next()
+                        .filter(|n| n.chars().next().is_some_and(char::is_uppercase))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            variants,
+            vec!["Pure", "Agent", "Human"],
+            "the variant scrape broke, or a gate kind was added/renamed — update this \
+             expectation together with the feature doc"
+        );
+
+        let doc = include_str!("../../../docs/features/orchestrator/execution-graph.md");
+        // The enumeration, bounded to its own markdown paragraph. Everything after it in
+        // the same blockquote is about what a gate DOES, not about which kinds exist.
+        let enumeration = doc
+            .split_once("**`GateSpec`** is")
+            .expect("the feature doc still enumerates the gate kinds")
+            .1
+            .split("\n>\n")
+            .next()
+            .expect("the enumeration paragraph ends");
+
+        // A backticked name whose next character is non-alphanumeric, so `` `Pure(LoopGate)` ``
+        // documents `Pure` while `` `HumanGate` `` — a DIFFERENT node kind this page also
+        // discusses — does not document `Human`.
+        let named = |v: &str| {
+            let needle = format!("`{v}");
+            enumeration.match_indices(&needle).any(|(i, m)| {
+                enumeration[i + m.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_alphanumeric() && c != '_')
+            })
+        };
+        let unlisted: Vec<&str> = variants.iter().copied().filter(|v| !named(v)).collect();
+        assert!(
+            unlisted.is_empty(),
+            "gate kinds implemented but MISSING FROM THE ENUMERATION in \
+             docs/features/orchestrator/execution-graph.md: {unlisted:?} — the \
+             \"**`GateSpec`** is …\" sentence says what a gate CAN be, so a kind it omits \
+             is a kind the page states does not exist"
         );
     }
 }
