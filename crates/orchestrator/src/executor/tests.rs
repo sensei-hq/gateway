@@ -2523,6 +2523,16 @@ fn label(event: &JournalEvent) -> String {
         // label a future event "unknown".
         JournalEvent::AgentAwaited { node, .. } => format!("AgentAwaited({})", node.0),
         JournalEvent::AgentAnswered { node, .. } => format!("AgentAnswered({})", node.0),
+        // SP-6 s4 (Task 3): same reasoning a third time — Task 6 adds the
+        // `GateSpec::Human` loop-gate arm that journals these. Worth recording WHY the
+        // arms keep being worth the trouble: this labeler is the only `match` on
+        // `JournalEvent` anywhere in the workspace that enumerates every variant, which
+        // is how adding the pair above was noticed at all — it was the single
+        // compile error the whole `--all-targets` build produced. `fold_journal`
+        // (`executor/support.rs`) carries a `_` catch-all and absorbed both variants
+        // silently, so the fold is NOT a guard; this is.
+        JournalEvent::LoopGateAwaited { node, .. } => format!("LoopGateAwaited({})", node.0),
+        JournalEvent::LoopGateDecided { node, .. } => format!("LoopGateDecided({})", node.0),
     }
 }
 
