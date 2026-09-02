@@ -404,6 +404,44 @@ pub enum JournalEvent {
         text: String,
         actor: String,
     },
+    /// SP-6 s4: a `GateSpec::Human` loop gate has begun asking, carrying the QUESTION and
+    /// the MENU it published.
+    ///
+    /// The menu is journaled for s2's reason, which transfers exactly: a graph can be
+    /// edited between the ask and the decision — a `scheduled_runs.graph` row, a
+    /// resubmitted `run submit`, or a runtime `Expand` subgraph — and an operator's answer
+    /// must keep meaning what it meant when they were asked. Reading the graph's menu at
+    /// decision time would let an author flip an option's `stops` after a human picked it
+    /// and silently invert their decision.
+    ///
+    /// The prompt is journaled for s3's reason: an operator must be able to read the
+    /// question off the journal alone, and `torii`'s read path has no `Registry` and no
+    /// blackboard with which to recompose it.
+    ///
+    /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited`/
+    /// `AgentAwaited` do — overwriting the deadline is the never-expires bug.
+    LoopGateAwaited {
+        node: NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        prompt: String,
+        menu: Vec<crate::graph::LoopGateOption>,
+    },
+    /// SP-6 s4: a human picked one of a loop gate's options.
+    ///
+    /// A loop gate is answerable ONLY by this event, never by `SignalReceived`,
+    /// `GateDecided` or `AgentAnswered` — each of the other three would bypass the
+    /// menu match, and `GateDecided` would additionally carry a `GateOutcome` this kind
+    /// cannot interpret.
+    ///
+    /// `actor` is ATTRIBUTION, NOT AUTHENTICATION: whatever string the caller supplied. It
+    /// is `Option` here, unlike `GateDecided`'s required `actor`, because a loop gate can
+    /// legitimately be decided by an automated operator on a schedule; the CLI still
+    /// defaults it.
+    LoopGateDecided {
+        node: NodeId,
+        option: String,
+        actor: Option<String>,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
@@ -508,7 +546,7 @@ pub trait ExecutionJournal: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::ObservationMeta;
+    use super::{FORMAT_VERSION, ObservationMeta};
     use crate::{EffectClass, EffectOutput, JournalEvent, NodeId, effect_id};
 
     /// An OLD journal — serialized before this slice — must still deserialize, with
@@ -834,6 +872,58 @@ mod tests {
         }
     }
 
+    /// AC20 — new VARIANTS are additive, so the durable format is unchanged. The existing
+    /// variant-count assertion in this module is the guard that a variant was added
+    /// deliberately; this asserts the version did not move with it.
+    #[test]
+    fn the_loop_gate_variants_do_not_move_the_format_version() {
+        assert_eq!(
+            FORMAT_VERSION, 1,
+            "adding variants must not break the format"
+        );
+    }
+
+    /// The two variants round-trip, carrying everything an operator needs to see the
+    /// question, the menu and the deadline off the journal alone.
+    #[test]
+    fn the_loop_gate_events_round_trip() {
+        let awaited = JournalEvent::LoopGateAwaited {
+            node: NodeId("lp/0/__gate__".into()),
+            deadline: None,
+            prompt: "Continue?".into(),
+            menu: vec![crate::graph::LoopGateOption {
+                name: "done".into(),
+                stops: true,
+            }],
+        };
+        let json = serde_json::to_string(&awaited).expect("serialises");
+        let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+        match back {
+            JournalEvent::LoopGateAwaited {
+                node,
+                prompt,
+                menu,
+                deadline,
+            } => {
+                assert_eq!(node.0, "lp/0/__gate__");
+                assert_eq!(prompt, "Continue?");
+                assert_eq!(menu.len(), 1);
+                assert!(menu[0].stops);
+                assert!(deadline.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let decided = JournalEvent::LoopGateDecided {
+            node: NodeId("lp/0/__gate__".into()),
+            option: "done".into(),
+            actor: Some("jerry".into()),
+        };
+        let json = serde_json::to_string(&decided).expect("serialises");
+        let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+        assert!(matches!(back, JournalEvent::LoopGateDecided { .. }));
+    }
+
     /// No doc comment in this file may link a `JournalEvent` variant by its BARE name.
     ///
     /// An enum variant is not in scope as a bare rustdoc path, so a link whose whole
@@ -872,7 +962,9 @@ mod tests {
             })
             .collect();
         assert!(
-            variants.len() > 10 && variants.contains(&"GateAwaited"),
+            variants.len() > 10
+                && variants.contains(&"GateAwaited")
+                && variants.contains(&"LoopGateAwaited"),
             "variant scrape broke — it found {variants:?}, so the guard below would \
              pass vacuously"
         );
