@@ -37,7 +37,16 @@ source: crates/orchestrator*
 > **`Subgraph`** drives an authored DAG fresh each iteration (no thread — the gate
 > decides stop) and **`Expand`** plans+executes each iteration, threading the whole
 > iteration output into the next planning input (the **refine** that powers the
-> coordinator). **`GateSpec`** is **`Pure(LoopGate)`** (a deterministic predicate over
+> coordinator).
+> <!-- The CLOSED list of GateSpec variants lives between the two markers below, and
+>      every_gate_spec_variant_is_documented_in_the_execution_graph_feature_doc
+>      (orchestrator-core/src/graph.rs) asserts every implemented variant is named inside
+>      them. Keep prose about what a gate DOES outside them: the guard was previously
+>      bounded by a heuristic that grew to cover three later paragraphs, at which point a
+>      passing mention of `Human` anywhere in them would have kept it green with the
+>      sentence below silently emptied. -->
+> <!-- gate-spec-enumeration -->
+> **`GateSpec`** is **`Pure(LoopGate)`** (a deterministic predicate over
 > the iteration output — recomputed on resume, no journaling; the leaf-body convergence
 > path), **`Agent { agent, stop_when }`** — a **gate-agent** driven at the reserved
 > `"{loop}/{i}/__gate__"` whose journaled answer feeds a pure `stop_when` predicate (the
@@ -46,10 +55,14 @@ source: crates/orchestrator*
 > **`Human { agent, menu }`** (SP-6 s4), where a PERSON picks from an enumerated
 > `menu: Vec<LoopGateOption { name, stops }>` at that same reserved path, once per
 > iteration, and the chosen option's `stops` is the decision (`true` converges, `false`
-> runs another iteration subject to `max_iters`). It journals
+> runs another iteration subject to `max_iters`).
+> <!-- /gate-spec-enumeration -->
+> It journals
 > `LoopGateAwaited{node,deadline,prompt,menu}` and pauses; a
-> `LoopGateDecided{node,option,actor}` resumes it (both new variants ⇒ `FORMAT_VERSION`
-> stays 1). The `AgentRef` earns its place twice — the role's `system_prompt` and
+> `LoopGateDecided{node,option,actor}` resumes it, and the drive that HONOURS that
+> decision records a `LoopGateSettled{node,option}` so no later drive re-derives an
+> already-settled gate against a clock that has since passed its deadline (all three new
+> variants ⇒ `FORMAT_VERSION` stays 1). The `AgentRef` earns its place twice — the role's `system_prompt` and
 > activated skills compose the question through the MODEL path's own prompt assembly
 > (the iteration output arrives as `## Context`, truncated; the authored half fails
 > loudly over its own cap), and its `backed_by: human { timeout }` is the SLA — which is

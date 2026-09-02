@@ -93,12 +93,34 @@ pub struct LoopGateOption {
 }
 ```
 
-Journal (both additive variants; `FORMAT_VERSION` stays 1):
+Journal (all additive variants; `FORMAT_VERSION` stays 1):
 
 ```rust
 LoopGateAwaited { node: NodeId, deadline: Option<DateTime<Utc>>, prompt: String, menu: Vec<LoopGateOption> },
 LoopGateDecided { node: NodeId, option: String, actor: String },
+LoopGateSettled { node: NodeId, option: String },
 ```
+
+`LoopGateSettled` is a **third** variant this section did not originally specify. It was added by
+the Tasks 6+7 review, which reproduced a Critical defect the design's own §5.7 claim ("a decided
+gate replays … a resume reaches the identical decision") turned out to be false about. `run_loop`
+re-enters `for i in 0..max_iters` from zero on every drive, so iteration 0's gate is re-derived
+forever while the deadline it recorded stays fixed. With expiry read first — §3's decision, and the
+right one — the moment wall-clock passed that deadline the *already-honoured* gate reported
+`Expired` and the whole `Loop` died: a 3-iteration loop whose operator answered at +30m and +70m
+under a 1h SLA, each strictly inside its **own** gate's SLA, failed at `lp/0/__gate__`; and a loop
+that had already **converged** was destroyed a day later when a downstream signal woke the run. Any
+multi-iteration human-gated loop with a finite SLA was unusable, and §7's "a 10-iteration loop asks
+10 questions and pauses 10 times — nothing new is required" was wrong.
+
+The fix is the SUCCESS mirror of what §5.2 step 0 already does for the FAILURE verdict: the drive
+that honours a decision journals it, and every later drive reads it back instead of re-deriving it.
+Reordering to read the decision first would fix the same symptom and reopen AC8, so the ordering is
+**settled → clock → decision** rather than **decision → clock**. `option` is the name that was
+honoured, and the replay resolves *that* against the journaled menu — not `LoopGateDecided`, whose
+LAST-wins rule exists so an operator can correct a decision *before the run resumes*; a settlement
+is exactly the line after which "before" has passed, since the loop has already spent an iteration
+on the strength of the answer.
 
 `actor` is a **required `String`**, exactly as `GateDecided.actor` and `AgentAnswered.actor` are.
 This section originally specified `Option<String>` and never argued for it, which made it an
@@ -139,13 +161,22 @@ Mirrors `run_human_gate` (s2), **not** `run_human_agent` (s3):
    never re-derived**. This is s3's unbounded-journal-growth fix and it applies verbatim: a refusal
    here is terminal for the node, but the run it kills journals no `RunCompleted`, so every later
    wake would otherwise re-drive the iteration and append a fresh `NodeFailed` to a dead node.
+0b. **`Fold::loop_gate_settled_with`** — an already-HONOURED gate replays its decision, and the
+   clock is not consulted. The success mirror of step 0, added by the Tasks 6+7 review (§4). It sits
+   above the SLA read as well as above the clock: a settled gate needs no role, no question and no
+   deadline, so a role edit cannot turn a loop nobody is waiting on into a terminal failure.
 1. **`wait_or_expire_by_id`** → `WaitState`, **acted on immediately**. This is the s2/s3 divergence
    and the reason this is a single `match` rather than s3's split `let state = …`. Collapsing it
-   the other way silently reinstates s3's ordering.
+   the other way silently reinstates s3's ordering. Because of step 0b the clock now only ever
+   judges a gate that is still LIVE, which is the only reading under which §3's ordering and §5.7's
+   resume claim are both true.
 2. **`NotYetAsking`** → bound the authored half against `MAX_HUMAN_TEXT_BYTES` (loud `NodeFailed` —
    a config error, actionable by its author), redact, clamp, append `LoopGateAwaited`, pause.
-3. **Decided** → match `option` against the **journaled** menu, then `stops` sets `converged`. A name
-   matching **nothing** in the journaled menu is a loud `NodeFailed`, never a default and never a
+3. **Decided** → match `option` against the **journaled** menu, journal `LoopGateSettled`, then
+   `stops` sets `converged`. The settlement is written *before* `run_loop` spends anything on the
+   strength of the answer, and *after* the option resolves, so a decision naming an option nobody
+   was offered leaves no settlement behind. A name matching **nothing** in the journaled menu is a
+   loud `NodeFailed`, never a default and never a
    silent continue. `torii` refuses such a name at its own boundary (reciting the menu), so this arm
    is reachable only from a journal not written by `torii` — which is exactly why it must fail rather
    than guess. Defaulting either way would be a decision no human made: to stop, or to spend more.
@@ -214,9 +245,17 @@ self-undermining. Asserted by a test, not by inspection.
 
 ### 5.7 Determinism and resume
 
-A decided gate replays from `LoopGateDecided` with no re-ask and no gateway call, exactly as the
+A decided gate replays from `LoopGateSettled` with no re-ask and no gateway call, exactly as the
 model gate-agent replays from its memo. The pure part — `stops` → `converged` — is recomputed from
-the journaled option name, so a resume reaches the identical decision.
+the journaled option name against the journaled menu, so a resume reaches the identical decision.
+
+**It replays from the SETTLEMENT, not from the decision, and that distinction is the whole of
+§4's Critical fix.** A replay that re-derived the gate from `LoopGateDecided` would have to pass
+the clock on the way, and the clock has no idea the answer was already honoured — which is how the
+version of this section that named `LoopGateDecided` came to be false in practice for every
+multi-iteration loop with a finite SLA. It also bounds `LoopGateDecided`'s LAST-wins rule: a
+correction reaches a gate right up to the drive that acts on it, and not after, so a loop cannot
+have its convergence point moved retroactively under work it has already done.
 
 Like every other waiting kind this node journals no `NodeStarted`/`NodeCompleted`, and so carries
 the family's known asymmetry: re-`start`ing an already-terminal run reports it in neither `outputs`
@@ -259,8 +298,11 @@ surfaces the pending question with its deadline, so the run is visible before th
 
 **A loop gate can pause a run many times.** A 10-iteration loop asks 10 questions and pauses 10
 times. Each pause is an ordinary `RunPaused { resume_after: deadline }` that the SP-DATA-3 scheduler
-wakes normally, so nothing new is required — but the operator-facing cost is real, and an author who
-wants one decision for the whole loop does not have that here (§2, non-goals).
+wakes normally, so nothing new is required of the SCHEDULER — but the operator-facing cost is real,
+and an author who wants one decision for the whole loop does not have that here (§2, non-goals).
+(Something new *was* required of the executor, and this sentence originally said otherwise:
+`LoopGateSettled` (§4). Without it the tenth question could never be reached, because the first
+gate's deadline expired the whole `Loop` long before.)
 
 **`actor` is attribution, never authentication.** Inherited from s2 verbatim: it must not be
 branched on, and nothing in this slice does.
@@ -306,6 +348,11 @@ and this slice's answer is yes.
 10. An expired undecided gate **fails the `Loop`**, not just the gate node.
 11. **Zero token spend** on the gate path: no `EffectRecorded`, no gateway call, no folded `usage`.
 12. A decided gate **resumes from the journal** — no re-ask, no gateway call, identical decision.
+12b. A decision honoured **inside** its gate's SLA stays honoured however long the run lives: a
+    multi-iteration loop whose total human latency exceeds one gate's timeout still converges, and a
+    loop that has already converged is not re-killed by its own gate's stale deadline when a later
+    wake re-drives the graph. The guarding tests must **advance the clock across iterations** — every
+    s4 test written before this one held it fixed, which is why the suite was green over the defect.
 13. A human-backed role in `GateSpec::Agent` still fails loudly, and the message names
     `GateSpec::Human`. The `non_top_level_sites` row stands.
 14. A model-backed role in `GateSpec::Human` fails loudly.

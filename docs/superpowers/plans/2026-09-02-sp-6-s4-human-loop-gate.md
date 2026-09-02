@@ -747,7 +747,7 @@ implements them; the doc states them here so Task 6's append site cannot ship wi
 
 The `variants.len() > 10 && variants.contains(&"GateAwaited")` check in
 `no_doc_comment_links_a_journal_event_variant_by_its_bare_name` is a **scrape sanity check**, not
-a variant census — it is a LOWER bound (23 variants against a bound of 10) and cannot notice a
+a variant census — it is a LOWER bound (24 variants against a bound of 10) and cannot notice a
 variant being added. Add `variants.contains(&"LoopGateAwaited")` as a second sentinel, and fix
 the assertion MESSAGE, which said only "variant scrape broke": a legitimately removed sentinel
 now fails it too, and the message must say so.
@@ -1666,6 +1666,82 @@ path is synthesized per iteration and cannot be decided before it exists through
 operator surface, so the early-decision race s2 resolves in-execution is unreachable here
 and costs at most one extra wake from a hand-written journal.
 
+**One thing that did NOT land and was not recorded: the AC7 executor test.** This plan's
+own Self-review found that gap and closed it in writing — "Add this to Task 6's test set",
+with the test written out in full — and Tasks 6+7 shipped without it while the deviation
+list above enumerated five other things. Whole-slice review found it re-opened and
+mutation-proved it unguarded. It is now in `mod human_loop_gate` as
+`the_loop_gate_menu_is_read_from_the_journal_not_the_graph`, with one correction to the
+sketch: the sketch flips `ship` alone to `stops: false`, and that graph does not survive
+`validate_dag` ("no stopping option, so the loop can never converge"), so the shipped test
+SWAPS the two options' meanings instead — a legal graph, which is what makes the test about
+the menu's durability rather than about validation catching the edit for us.
+
+---
+
+**The Tasks 6+7 whole-slice review, and the Critical it found.** Twenty-three findings at
+Minor or above across four reviewers; the code half is recorded here because it changes the
+DESIGN, not only this plan.
+
+**Critical — a decided gate was killed by its own stale deadline.** `run_loop` re-enters
+`for i in 0..max_iters` from zero on every drive, so iteration 0's gate is re-derived
+forever, while the deadline it recorded is fixed at its own ask. Expiry is read first (§3,
+and rightly), and `wait_or_expire_by_id` knows nothing about a decision an earlier drive
+already read, honoured and spent an iteration against — so the moment wall-clock passed
+iteration 0's deadline the whole `Loop` died. Two reproductions: (1) a 3-iteration loop
+under a 1h SLA answered at +30m and +70m, both strictly inside their OWN gates' SLAs, failed
+at `lp/0/__gate__`; (2) a loop that had already CONVERGED, whose run parked on a downstream
+`AwaitSignal`, was destroyed a day later when the signal arrived, cascade-skipping the very
+node it was delivered for. Any multi-iteration human-gated loop with a finite SLA was
+unusable. Every existing s4 test held the clock at `at(1_000)`, which is why the suite was
+green — the guarding tests advance it ACROSS iterations.
+
+The fix is a THIRD journal variant, `LoopGateSettled { node, option }` (design §4, §5.2 step
+0b, §5.7, AC12b): the drive that honours a decision records it, and every later drive reads
+it back before the clock is consulted. Reordering to read the decision first would fix the
+same symptom and reopen AC8 — mutation-checked both ways.
+
+**Deviation 1 above is REVERSED.** `LoopGateStep::Failed` is `Failed(String)` after all, as
+the original sketch had it. The `newly_journaled` flag it carried was a second claim about
+the journal that could disagree with the first — it meant "this drive wrote the GATE's row"
+while `run_loop` consumed it as "the LOOP's row is missing" — so a transient journal error
+between `fail_loop_gate`'s append and `fail_loop`'s left the Loop's failure permanently
+unwritten, in-process `RunOutcome.failed` disagreeing with `torii run status` and the
+`on_node_failed` hook forever. `fail_loop` now takes the `&Fold` and appends only if the
+`Loop` has no recorded failure: idempotent, self-healing, and true for all THREE of
+`run_loop`'s failure paths rather than special-cased for one. Deviation 2's argument
+("`newly_journaled: true` is unforgeable") goes with it; `fail_loop_gate` still returns the
+whole step, which is now simply the tidier shape.
+
+**Two bounded-growth defects one edge further out.** `cascade_skip_from` was not
+fold-guarded, so a terminally-dead run appended one `NodeSkipped` per hard dependent per
+wake (measured 1 / 2 / 3) — the `newly_journaled` fix had bounded the `NodeFailed` rows and
+left these growing, while the test named for the property watched one of the six event kinds
+it could grow by. `Fold::skipped` now guards the append, and the test asserts over EVERY
+journaled row against a fixture that has a dependent.
+
+**Deviation 5's bound was not what its comment said.** The enumeration guard bounded to the
+first blank blockquote line, which by then was 46 lines / 3.8 KB away and covered three
+further paragraphs about human loop gates — re-creating the `doc.contains` weakness it was
+written to avoid. `execution-graph.md` now carries an explicit
+`<!-- gate-spec-enumeration -->` marker pair and the test bounds to it.
+
+**Three tests the slice was missing, all mutation-proven, all now in `mod
+human_loop_gate`:** the AC7 test above; `a_loop_gate_that_recorded_a_wait_without_a_menu_
+fails_loudly`, the fourth kind-swap sibling (s3 shipped its copy missing too, and review
+found that one as well); and `a_decision_after_the_deadline_does_not_continue_the_loop`,
+which **Task 8 no longer owns** — the arm's own doc named it in the present tense while it
+existed only in this plan, so it landed with the fix that needed it as a fence. Task 8
+should confirm it still reddens against the s3-shaped hoist and add AC9's remaining
+coverage rather than re-writing it.
+
+**Task 12 gains a precondition.** `signal_states` (`torii/src/cmd/run.rs`) folds
+`SignalAwaited`/`GateAwaited`/`AgentAwaited` and NOT `LoopGateAwaited`, so a run paused on a
+human loop gate is invisible to `run list-paused` and no verb can write a `LoopGateDecided`.
+Nothing is mis-delivered (both `run signal` and `run gate decide` see no ask and refuse),
+but the arm is live on `develop` and a run that reaches a `GateSpec::Human` today can only
+wait for its SLA and be destroyed by it (§7). Close the window before anything authors one.
+
 ---
 
 ### Task 7: Wire the arm into `run_loop`
@@ -1758,6 +1834,24 @@ does. No new outcome shape."
 - Test: `crates/orchestrator/src/executor/tests.rs`
 
 The single most important test in the slice. It is the one that reddens if someone "simplifies" the arm into s3's shape.
+
+> **AC8's test ALREADY LANDED, with the Tasks 6+7 review.** The arm's own doc comment named
+> `a_decision_after_the_deadline_does_not_continue_the_loop` in the present tense — "the test
+> that reddens when it is [collapsed]" — while it existed only in this plan, so the slice's
+> headline safety property was live on `develop` protected by nothing but a comment, and
+> review mutation-proved that an s3-shaped hoist landed green. It could not wait, because the
+> Critical fix in that same review (`LoopGateSettled`, design §4) touches this exact ordering
+> and needed a fence to be reviewed against. The shipped test is in `mod human_loop_gate` and
+> covers AC8 plus AC9's terminality and no-second-`NodeFailed` halves; it is mutation-proven
+> against the hoist BEFORE and AFTER the Critical fix.
+>
+> What is left for this task: AC10's own assertion, whatever of AC9 the shipped test does not
+> reach, and — new — **AC12b**, the multi-iteration clock-advancing case the Critical fix
+> introduced. Two of those tests exist already
+> (`a_decision_honoured_inside_its_sla_survives_a_later_iterations_clock`,
+> `a_converged_loop_is_not_re_killed_by_its_own_gates_stale_deadline`); this task should
+> extend rather than duplicate them, and must keep advancing the clock ACROSS iterations —
+> every s4 test written before them held it fixed, which is how the Critical shipped green.
 
 - [ ] **Step 1: Write the failing tests (AC8, AC9, AC10)**
 
@@ -1878,6 +1972,21 @@ arm has not read the fold and cannot know whether one exists."
 **Files:**
 - Modify: `crates/orchestrator/src/executor/human.rs` (unmatched option), `crates/orchestrator/src/executor/agent.rs` (the `GateSpec::Agent` message)
 - Test: `crates/orchestrator/src/executor/tests.rs`
+
+> **A FOURTH refusal belongs here and was never scheduled: the kind swap.** Its three
+> siblings each ship one (`a_signal_node_that_recorded_a_wait_without_a_signal_ask_fails_
+> loudly`, `a_gate_that_recorded_a_wait_without_a_menu_fails_loudly`,
+> `an_agent_node_that_recorded_a_wait_without_a_question_fails_loudly`) — a convention
+> `fold_journal`'s writer-list comment reasons from explicitly — and s3 shipped ITS copy
+> missing before review found it. s4 repeated that exactly. The Tasks 6+7 review landed
+> `a_loop_gate_that_recorded_a_wait_without_a_menu_fails_loudly`, mutation-proven against
+> `fold.loop_gate_menu_for(node_id).or(Some(menu))` — the silent fallback to the GRAPH's
+> menu that the arm's own comment forbids and that had been shipping green. Nothing is left
+> for this task on that refusal; note it here so the convention is scheduled next time.
+>
+> Since that review the refusal has TWO call sites — the live `Waiting` arm and the settled
+> replay (`decide_from_published_menu`, design §5.2 step 0b) — sharing one message builder.
+> AC14b's test should reach both, and the `LoopGateSettled`-shaped input is the second.
 
 - [ ] **Step 1: Write the failing tests (AC13, AC14, AC14b)**
 
@@ -2234,6 +2343,18 @@ call; the pure part is recomputed from the journaled option name."
 - Test: `crates/torii/src/cmd/gate.rs` and `crates/torii/src/cmd/run.rs` inline tests
 
 `gate_menu` (`gate.rs:716`) already reads the menu from the **journal**, which is why this extends rather than rewrites.
+
+> **PRECONDITION, from the Tasks 6+7 review.** The executing arm is live on `develop` and
+> this surface is not, so the window is open right now: `signal_states` (`run.rs`) folds
+> `SignalAwaited`/`GateAwaited`/`AgentAwaited` and **not** `LoopGateAwaited`, so a run paused
+> on a human loop gate is INVISIBLE to `run list-paused`, and no verb can write a
+> `LoopGateDecided`. Nothing is silently mis-delivered — both `run signal` and `run gate
+> decide` see no ask for that node and refuse — but a run that reaches a `GateSpec::Human`
+> today can only wait for its SLA and then be destroyed by it, which is §7's sharpest cost
+> reached with no operator recourse at all. Close it before anything authors a
+> `GateSpec::Human`, and add `LoopGateAwaited` to `signal_states` as the first step, not the
+> last. (`LoopGateSettled` needs no operator surface: it is executor bookkeeping, and a
+> settled gate is one nobody is waiting on.)
 
 > **SETTLED out of band, between Tasks 4 and 5 — was "carried forward from Task 3's review".** No
 > task of this plan owns the change; see the correction blockquote at Task 3 Step 1. The question

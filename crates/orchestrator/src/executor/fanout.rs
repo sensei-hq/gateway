@@ -391,27 +391,56 @@ impl Executor {
         }
     }
 
-    /// Fail a `Loop` node: journal its `NodeFailed` and return the matching
-    /// [`NodeExec::Failed`]`{ output: None }`. Colocating the append-then-return
-    /// pairing keeps the invariant in ONE place — a `Failed` return from `run_loop`
-    /// must always be preceded by the `NodeFailed` append (skipping it would corrupt
-    /// replay). Both `run_loop` failure paths (a body-iteration failure and a
-    /// gate-agent failure) go through here. (A `Map` aggregation failure carries its
-    /// manifest out via `output: Some(..)`, so it does NOT use this helper.)
+    /// Fail a `Loop` node: journal its `NodeFailed` — unless one is already recorded —
+    /// and return the matching [`NodeExec::Failed`]`{ output: None }`.
+    ///
+    /// Colocating the append-then-return pairing keeps the invariant in ONE place, and
+    /// the invariant is: **when `run_loop` returns `Failed`, this `Loop` has a
+    /// `NodeFailed` in the journal, written exactly once.** All THREE of `run_loop`'s
+    /// failure paths go through here — a body-iteration failure, a gate-AGENT failure and
+    /// (SP-6 s4) a human-gate failure. (A `Map` aggregation failure carries its manifest
+    /// out via `output: Some(..)`, so it does NOT use this helper.)
+    ///
+    /// **The guard is what makes "exactly once" true, and it is not cosmetic.** A human
+    /// loop gate's verdict is TERMINAL — `run_human_loop_gate`'s step 0 reads it back
+    /// forever — while the run it kills journals no `RunCompleted` and so stays resumable,
+    /// so every later wake re-drives the iteration and re-reaches this helper. Appending
+    /// unconditionally grew the journal by a row per wake for a run that can never
+    /// progress: exactly the defect `gate_precheck` exists to prevent, one level further
+    /// out (measured: three drives, three `NodeFailed(lp)` rows).
+    ///
+    /// It is guarded HERE, on the `Loop`'s own recorded failure, rather than by a flag
+    /// carried out of the gate. The first shipped shape did the latter and the two claims
+    /// came apart: the flag meant "this drive wrote the GATE's row" while the caller
+    /// needed "the LOOP's row is missing", so a transient journal error between the two
+    /// appends left the durable record showing the gate dead and the Loop untouched
+    /// FOREVER — in-process `RunOutcome.failed` named the `Loop` while `torii run status`,
+    /// anything folding `NodeFailed`, and the `on_node_failed` hook never heard of it.
+    /// Reading the fold is self-healing instead: the next drive writes the missing row.
+    ///
+    /// This makes `run_loop` a SECOND reader of [`Fold::failed`], whose doc reserves it
+    /// for `gate_precheck`'s family. The fence that doc sets is about TERMINALITY — "may a
+    /// node kind treat a recorded failure as final?" — and this read does not ask that
+    /// question: the `Loop` still fails, on this drive's own verdict, whatever the map
+    /// says. It asks only "is that row already durable?", and the answer changes nothing
+    /// but an append.
     pub(super) async fn fail_loop(
         &self,
         run: RunId,
         node: &NodeId,
         message: String,
+        fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        self.append(
-            run,
-            JournalEvent::NodeFailed {
-                node: node.clone(),
-                error: message.clone(),
-            },
-        )
-        .await?;
+        if fold.failure_for(node).is_none() {
+            self.append(
+                run,
+                JournalEvent::NodeFailed {
+                    node: node.clone(),
+                    error: message.clone(),
+                },
+            )
+            .await?;
+        }
         Ok(NodeExec::Failed {
             message,
             output: None,
@@ -544,7 +573,7 @@ impl Executor {
                 Ok(o) => o,
                 Err(message) => {
                     let msg = format!("loop {:?} failed at iteration {i}: {message}", loop_node.id);
-                    return self.fail_loop(run, &loop_node.id, msg).await;
+                    return self.fail_loop(run, &loop_node.id, msg, fold).await;
                 }
             };
             ran = i + 1;
@@ -569,7 +598,7 @@ impl Executor {
                                 "loop {:?} gate agent failed at iteration {i}: {m}",
                                 loop_node.id
                             );
-                            return self.fail_loop(run, &loop_node.id, msg).await;
+                            return self.fail_loop(run, &loop_node.id, msg, fold).await;
                         }
                         // A gate-agent pause (in-doubt Mutation / quota) pauses the Loop.
                         AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
@@ -598,38 +627,20 @@ impl Executor {
                         // here, and so does a decision naming an option the published menu
                         // does not contain.
                         //
-                        // **But it journals the Loop's own `NodeFailed` only on the drive
-                        // that produced the verdict.** A human gate's failure is TERMINAL:
-                        // `run_human_loop_gate`'s step 0 reads it back forever, while the
-                        // run it kills journals no `RunCompleted` and so stays resumable —
-                        // so every later wake re-drives this iteration and re-reaches this
-                        // arm. Appending here unconditionally grows the journal by a row
-                        // per wake for a run that can never progress, which is exactly the
-                        // defect `gate_precheck` exists to prevent, one level further out
-                        // (measured: three drives, three `NodeFailed(lp)` rows). The
-                        // gate-agent arm above needs no such guard because a model
-                        // failure is not terminal — it re-attempts on resume.
-                        //
-                        // `newly_journaled` is carried on the step rather than re-derived
-                        // from `Fold::failed` here: that map has exactly ONE reader family
-                        // by design (`gate_precheck` and its `_by_id` forms, on behalf of
-                        // the WAITING kinds), and a `Loop` is not one of them.
-                        LoopGateStep::Failed {
-                            message,
-                            newly_journaled,
-                        } => {
+                        // A human gate's failure is TERMINAL, unlike the gate-agent's
+                        // above: `run_human_loop_gate`'s step 0 reads it back forever,
+                        // while the run it kills journals no `RunCompleted` and so stays
+                        // resumable, so every later wake re-drives this iteration and
+                        // re-reaches this arm. `fail_loop` is idempotent for exactly that
+                        // reason — see its doc; this arm needs no special case, and the
+                        // flag it used to carry to get one was a second claim that could
+                        // (and did) come apart from the first.
+                        LoopGateStep::Failed(message) => {
                             let msg = format!(
                                 "loop {:?} human gate failed at iteration {i}: {message}",
                                 loop_node.id
                             );
-                            return if newly_journaled {
-                                self.fail_loop(run, &loop_node.id, msg).await
-                            } else {
-                                Ok(NodeExec::Failed {
-                                    message: msg,
-                                    output: None,
-                                })
-                            };
+                            return self.fail_loop(run, &loop_node.id, msg, fold).await;
                         }
                         // Waiting on a person pauses the whole Loop, like every other body
                         // or gate pause. The `RunPaused` is already journaled, on the

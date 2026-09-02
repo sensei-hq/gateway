@@ -115,6 +115,16 @@ pub(crate) fn fold_journal(
             JournalEvent::NodeFailed { node, error } => {
                 fold.failed.entry(node.clone()).or_insert(error.clone());
             }
+            // The cascade-skip record, folded so `cascade_skip_from` appends each node's
+            // `NodeSkipped` at most once ACROSS drives. It was a `_` catch-all until the
+            // SP-6 s4 review measured a terminally-failed-but-still-resumable run growing
+            // by one row per hard dependent per wake — the same bounded-growth class as
+            // the `NodeFailed` arm above, one edge further out. Read only by that guard;
+            // it does not make a node terminal (`ready_nodes` works off the per-drive
+            // `DriveState`, which is rebuilt from the graph every time).
+            JournalEvent::NodeSkipped { node } => {
+                fold.skipped.insert(node.clone());
+            }
             // The intent phase of a two-phase Mutation (§7.3). An effect id in
             // `intents` with no matching `EffectRecorded` is in-doubt on resume.
             JournalEvent::EffectIntent {
@@ -266,12 +276,19 @@ pub(crate) fn fold_journal(
             // an explicit enumeration of these writers: `run_await_signal`,
             // `run_human_gate`, `run_human_agent`, and s4's `run_human_loop_gate`.
             //
-            // And the enumeration is restated OUTSIDE those arms, not only in them: the
-            // `..._fails_loudly` kind-swap tests in `tests.rs` spell out the writer list
-            // in their rustdoc to explain why their arm is reachable at all, `human.rs`'s
-            // module header counts the kinds, and `durable-journal.md` states it for the
-            // feature docs. s4 updated the three arms and left all of those saying THREE;
-            // the whole-slice review caught it. So the instruction is
+            // And the enumeration is restated OUTSIDE those arms, not only in them: FOUR
+            // `..._fails_loudly` kind-swap tests in `tests.rs`, one per kind, spell out the
+            // writer list in their rustdoc to explain why their arm is reachable at all;
+            // `human.rs`'s module header counts the kinds; and `durable-journal.md` states
+            // it for the feature docs. (There were only three of those tests until the s4
+            // review added `a_loop_gate_that_recorded_a_wait_without_a_menu_fails_loudly` —
+            // s3 shipped ITS copy missing and review found it, then s4 shipped the same
+            // way, so this sentence overstated what the suite held for two slices running.)
+            //
+            // s4's Task 4 updated the three arms and left every one of those sites saying
+            // THREE; its whole-slice review caught that, and the Tasks 6+7 review then
+            // found four more that had only become stale once the fourth EXECUTING kind
+            // landed. So the instruction is
             // `rg -in 'all (THREE|FOUR|FIVE)|(three|four|five) waiting kinds' crates docs`
             // and fix the WHOLE set — updating only the arms is how this went stale.
             //
@@ -342,6 +359,19 @@ pub(crate) fn fold_journal(
                         actor: actor.clone(),
                     },
                 );
+            }
+            // SP-6 s4: the drive that HONOURED a decision, recorded so no later drive
+            // re-derives that gate against a clock which has since passed its deadline.
+            // FIRST wins — the executor writes at most one, so a second can only come from
+            // a journal it did not write, and the first is the one that happened.
+            //
+            // This is the arm that makes `LoopGateDecided`'s LAST-wins rule bounded rather
+            // than unbounded: a correction wins right up to the drive that acts on the
+            // answer, and not after it.
+            JournalEvent::LoopGateSettled { node, option } => {
+                fold.loop_gate_settlements
+                    .entry(node.clone())
+                    .or_insert_with(|| option.clone());
             }
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
