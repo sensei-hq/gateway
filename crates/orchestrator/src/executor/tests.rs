@@ -17739,6 +17739,131 @@ mod human_agent {
         );
     }
 
+    /// SP-6 s4: the SEAM this path shares with the human LOOP GATE — resolve a
+    /// human-backed `AgentRef` into the QUESTION to ask and the SLA to ask it under.
+    ///
+    /// The property it exists to protect is the one
+    /// `the_journaled_prompt_is_the_assembled_prompt` pins for s3: a human's question is
+    /// composed by the MODEL path's own `assemble_prompt_parts`, so the two cannot drift
+    /// on what "the agent's prompt" means. s3 got that for free by putting its human
+    /// branch INSIDE `drive_agent`; s4's `GateSpec::Human` does not route through
+    /// `drive_agent` at all (no ReAct loop, no turns, no `stop_when`, and threading a menu
+    /// through it would put a parameter there every model caller passes as `None`), so
+    /// without a shared function s4 would need a SECOND prompt builder. That is the drift
+    /// this guards.
+    ///
+    /// So the assertions are on the three things only real prompt assembly produces — the
+    /// role's `system_prompt`, an ACTIVATED skill body, and the node input `compose` adds
+    /// as `## Task` — rather than on "some non-empty string". A hand-rolled
+    /// `format!("{}: {}", agent.system_prompt, input)` would satisfy a bare non-empty
+    /// assertion and silently drop the skill.
+    ///
+    /// The SLA is asserted BY VALUE. Returning it is what keeps the caller from re-reading
+    /// the registry to find the deadline it must pause on — a second read is a second
+    /// place for the role and its SLA to come apart, which is the arrangement
+    /// `AgentBacking::Human { timeout }` exists to prevent.
+    #[tokio::test]
+    async fn the_human_question_seam_composes_the_same_prompt_the_model_path_would() {
+        let journal = InMemoryJournal::new();
+        let registry = Arc::new(
+            Registry::default()
+                .with_agent(reviewer(
+                    Some(Duration::hours(1)),
+                    vec!["cite-the-clause".into()],
+                ))
+                .with_skill(SkillDef {
+                    name: "cite-the-clause".into(),
+                    description: None,
+                    body: "ALWAYS QUOTE THE CLAUSE NUMBER.".into(),
+                    activation: Activation::Always,
+                }),
+        );
+        let (ex, _clock, calls) = exec_at(&journal, registry, at(1_000)).await;
+
+        let (question, timeout) = ex
+            .human_question_for(
+                &AgentRef("reviewer".into()),
+                // The same marker the s3 test uses, and for the same reason: it appears
+                // nowhere else in the fixture, so `contains` can only pass if the input
+                // really reached the question.
+                &serde_json::json!("THE-ACME-MSA-2026"),
+                &[],
+            )
+            .expect("a human-backed role composes a question");
+
+        let text = question.text();
+        assert!(
+            text.contains(QUESTION),
+            "the role's own system_prompt is in the question: {text}"
+        );
+        assert!(
+            text.contains("ALWAYS QUOTE THE CLAUSE NUMBER."),
+            "an ACTIVATED skill body is in the question — the evidence that this went \
+             through `assemble_prompt_parts` and not a second builder: {text}"
+        );
+        assert!(
+            text.contains("THE-ACME-MSA-2026"),
+            "the node input reaches the question, as `## Task`: {text}"
+        );
+        assert_eq!(
+            timeout,
+            Some(Duration::hours(1)),
+            "the role's `backed_by: human` timeout comes back with the question, so the \
+             caller never re-reads the registry for the SLA"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "and it costs nothing: the seam sits above `resolve_chain`, so zero token \
+             spend on the loop-gate path is STRUCTURAL"
+        );
+    }
+
+    /// The seam refuses a MODEL-backed role, loudly and by name.
+    ///
+    /// Unreachable from `drive_agent` — its human branch has already matched the backing —
+    /// so this is the seam's guard for its OTHER caller, SP-6 s4's `GateSpec::Human`,
+    /// where an author naming a model-backed role is a config error. Design §5.5: silence
+    /// there would let an author believe a person is in the loop while the run quietly
+    /// decides for itself. AC14 asserts the same refusal end-to-end through the gate arm;
+    /// this one pins it at the function that owns it, so the message cannot be lost by a
+    /// caller that stops propagating the error.
+    #[tokio::test]
+    async fn the_human_question_seam_refuses_a_model_backed_role() {
+        let journal = InMemoryJournal::new();
+        let registry = Arc::new(Registry::default().with_agent(agent_def("c")));
+        let (ex, _clock, _calls) = exec_at(&journal, registry, at(1_000)).await;
+
+        // `match` rather than `expect_err`: that would require `HumanQuestion: Debug`, and
+        // a `Debug` on the type whose whole content is an UNREDACTED question is a leak
+        // shape this file should not create for a test's convenience.
+        let err = match ex.human_question_for(&AgentRef("a".into()), &serde_json::json!("x"), &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("a model-backed role must not be asked of a person"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"a\"") && msg.contains("model-backed"),
+            "the refusal names the role and the defect: {msg}"
+        );
+        assert!(
+            msg.contains("backed_by: human"),
+            "…and the fix, so the author can act on it: {msg}"
+        );
+
+        // An unknown ref is the OTHER resolution failure, and it stays `UnknownAgent` —
+        // the same error `drive_agent` has always produced for it.
+        let unknown =
+            match ex.human_question_for(&AgentRef("ghost".into()), &serde_json::json!("x"), &[]) {
+                Err(e) => e,
+                Ok(_) => panic!("an unresolvable role must fail"),
+            };
+        assert!(
+            matches!(unknown, OrchestratorError::UnknownAgent(ref n) if n == "ghost"),
+            "an unknown ref is UnknownAgent, not the model-backed refusal: {unknown:?}"
+        );
+    }
+
     /// Every site at which a human-backed role is NOT legal, paired with the node id its
     /// refusal is journaled against. Two families, and the second is the one the whole-slice
     /// review had to add:
