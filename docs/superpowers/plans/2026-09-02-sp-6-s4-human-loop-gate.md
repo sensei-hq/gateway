@@ -77,11 +77,28 @@ fn a_human_gate_spec_round_trips_through_serde() {
         }
         other => panic!("wrong variant: {other:?}"),
     }
+
+    // Pin the BYTES too, not just the round-trip. A symmetric round-trip is invariant
+    // under any rename, so it would stay green under `#[serde(rename = "halts")]` on
+    // `stops`. The mutation with teeth is `#[serde(default)]` alongside such a rename: a
+    // missing field then reads as `false`, so every stopping option in every persisted
+    // `scheduled_runs.graph` row becomes NON-stopping and every human-gated loop silently
+    // runs to `max_iters` with nobody's answer honoured — verbatim the failure this design
+    // exists to prevent. Run it and paste what serde actually emits; do not trust this
+    // string unverified.
+    assert_eq!(json, r#"{"Human":{"agent":"reviewer","menu":[{"name":"keep-going","stops":false},{"name":"good-enough","stops":true}]}}"#);
 }
 
 /// AC1 — additivity: a graph using no `Human` gate serialises exactly as it does
-/// today. Guards against someone adding `#[serde(tag = …)]` or reordering variants
-/// and silently changing every existing `scheduled_runs.graph` row.
+/// today. Guards against a change to the TAGGING REPRESENTATION — `#[serde(tag = …)]`,
+/// `untagged`, a rename — silently rewriting every existing `scheduled_runs.graph` row.
+///
+/// It does NOT catch variant REORDERING, and that is not a gap: externally-tagged serde
+/// keys JSON by variant NAME, so order cannot affect the output or name-matched
+/// deserialisation. Order would only matter under `untagged` or an index-based binary
+/// format, and this workspace persists `Graph` as JSON/jsonb everywhere — no crate pulls
+/// a binary serde format. If one is ever added, this test becomes insufficient and a
+/// round-trip through THAT format is what would be needed.
 #[test]
 fn an_existing_pure_gate_serialises_unchanged_by_the_new_variant() {
     let gate = GateSpec::Pure(LoopGate::TextContains("DONE".into()));
@@ -162,10 +179,26 @@ Run: `cargo build --workspace`
 Expected: **exit 0.** Adding an enum variant makes every non-exhaustive `match` on `GateSpec` a compile error — there is exactly one, in `crates/orchestrator/src/executor/fanout.rs` at the gate match. If it errors, add a temporary arm:
 
 ```rust
-GateSpec::Human { .. } => unreachable!("SP-6 s4: wired in Task 7"),
+                // SP-6 s4: the real arm lands in Task 7. Temporary — but a FAILURE, not a
+                // panic. `GateSpec::Human` is a public re-exported variant, so it is
+                // reachable from any caller and from a `scheduled_runs.graph` jsonb row;
+                // `unreachable!` would assert something false. A panic here unwinds through
+                // `Scheduler::tick`, which has already claimed a batch and taken its leases
+                // — the run stays `'waking'`, the next worker reclaims the stale lease and
+                // dies the same way, and because a panic is not an `Err` it bypasses
+                // `worker serve`'s consecutive-failure backoff entirely. `graph.rs:548` and
+                // `tick`'s own comment both record that doctrine. A silent `false` is worse
+                // still: the loop would run to `max_iters` with nobody ever asked.
+                GateSpec::Human { .. } => {
+                    let msg = format!(
+                        "loop {:?}: a human loop gate is not yet wired (SP-6 s4, Task 7)",
+                        loop_node.id
+                    );
+                    return self.fail_loop(run, &loop_node.id, msg).await;
+                }
 ```
 
-and delete it in Task 7. Do **not** leave it past Task 7.
+and delete it in Task 7. Do **not** leave it past Task 7. This mirrors the gate-agent-failure arm three lines above (`fanout.rs:558`), which is the shape this file already uses for "the gate could not decide".
 
 - [ ] **Step 7: Commit**
 
@@ -384,7 +417,15 @@ Run: `cargo test -p sensei-orchestrator-core validate_dag_rejects_a_bad_human_lo
 
 Expected under the mutation: **FAIL.** After reverting: **PASS.**
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Restore the doc pointer Task 1 correctly omitted**
+
+Task 1's `GateSpec::Human` doc comment ends *"…so `validate_dag` can reject a menu that
+cannot converge."* with no pointer, because the block did not exist yet. It does now —
+append `See the `GateSpec::Human` block in [`Graph::validate_dag`].` so the type doc points
+at its own validation. Without this the two drift silently: the type claims a guarantee and
+nothing links to the code that provides it.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 cargo fmt --all
