@@ -13,7 +13,7 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{AgentAnswer, Fold, GateDecision};
+use super::{AgentAnswer, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -259,11 +259,14 @@ pub(crate) fn fold_journal(
             // The deadline goes into the SHARED map because `wait_or_expire` reads
             // `deadline_for` and knows nothing about which kind recorded it. That makes
             // this the THIRD writer of `Fold::deadlines` (after `SignalAwaited` and
-            // `GateAwaited`); when a fourth is added, update the writer lists on
-            // `Fold::deadlines` and `Fold::deadline_for`, and give it a kind-specific
-            // record of its own plus the missing-ask arm that reads it — the three that
-            // exist (`run_await_signal`, `run_human_gate`, `run_human_agent`) all reason
-            // from an explicit enumeration of these writers.
+            // `GateAwaited`; SP-6 s4's `LoopGateAwaited`, two arms below, is the FOURTH).
+            // When a FIFTH is added, update the writer lists on `Fold::deadlines` and
+            // `Fold::deadline_for`, and give it a kind-specific record of its own plus
+            // the missing-ask arm that reads it — every reader of this map reasons from
+            // an explicit enumeration of these writers: `run_await_signal`,
+            // `run_human_gate`, `run_human_agent`, and s4's `run_human_loop_gate` (which
+            // arrives with s4's executor arm — the fold lands one task ahead of its
+            // reader, exactly as s3's did).
             //
             // `deadline` is folded THROUGH, `None` included — never `if
             // deadline.is_some()`. The key alone answers "has this node begun asking?",
@@ -286,6 +289,48 @@ pub(crate) fn fold_journal(
                     node.clone(),
                     AgentAnswer {
                         text: text.clone(),
+                        actor: actor.clone(),
+                    },
+                );
+            }
+            // SP-6 s4: the ask. EXPLICIT, never folded by a catch-all.
+            //
+            // FIRST wins for the deadline, the prompt AND the menu (`entry().or_insert`).
+            // This is the FOURTH writer of the SHARED `Fold::deadlines` map, after
+            // `SignalAwaited`, `GateAwaited` and `AgentAwaited` — the writer lists on
+            // `Fold::deadlines` and `Fold::deadline_for` name it, and the missing-ask arm
+            // that reads its kind-specific record is `run_human_loop_gate`'s, which lands
+            // with the executor arm later in this slice (the fold goes in first, so the
+            // durable record exists before anything reads it — the s3 ordering).
+            //
+            // `deadline` is folded THROUGH, `None` included. A role with
+            // `backed_by: human { timeout: None }` gating a loop is a real configuration,
+            // and dropping the `None` would make it re-journal `LoopGateAwaited` on every
+            // drive — the bug s1 shipped on the `SignalAwaited` arm.
+            JournalEvent::LoopGateAwaited {
+                node,
+                deadline,
+                prompt,
+                menu,
+            } => {
+                fold.deadlines.entry(node.clone()).or_insert(*deadline);
+                fold.loop_gate_asks
+                    .entry(node.clone())
+                    .or_insert(LoopGateAsk {
+                        prompt: prompt.clone(),
+                        menu: menu.clone(),
+                    });
+            }
+            // SP-6 s4: the decision. LAST wins (`insert` overwrites).
+            JournalEvent::LoopGateDecided {
+                node,
+                option,
+                actor,
+            } => {
+                fold.loop_gate_decisions.insert(
+                    node.clone(),
+                    LoopGateDecision {
+                        option: option.clone(),
                         actor: actor.clone(),
                     },
                 );
@@ -1103,6 +1148,96 @@ mod tests {
             fold.prompt_for(&NodeId("review".into())),
             Some("Ship it?"),
             "the question is durable even when the SLA is not"
+        );
+    }
+
+    /// The menu is FIRST-wins: a second ask must not retroactively change what a human's
+    /// answer meant. The decision is LAST-wins: an operator may correct it before resume.
+    #[test]
+    fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision() {
+        let node = NodeId("lp/0/__gate__".into());
+        let opt = |name: &str, stops: bool| orchestrator_core::LoopGateOption {
+            name: name.into(),
+            stops,
+        };
+        let events = vec![
+            (
+                1,
+                JournalEvent::LoopGateAwaited {
+                    node: node.clone(),
+                    deadline: None,
+                    prompt: "first question".into(),
+                    menu: vec![opt("done", true)],
+                },
+            ),
+            (
+                2,
+                JournalEvent::LoopGateAwaited {
+                    node: node.clone(),
+                    deadline: None,
+                    prompt: "second question".into(),
+                    menu: vec![opt("done", false)],
+                },
+            ),
+            (
+                3,
+                JournalEvent::LoopGateDecided {
+                    node: node.clone(),
+                    option: "done".into(),
+                    actor: Some("a".into()),
+                },
+            ),
+            (
+                4,
+                JournalEvent::LoopGateDecided {
+                    node: node.clone(),
+                    option: "done".into(),
+                    actor: Some("b".into()),
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&events);
+
+        let menu = fold.loop_gate_menu_for(&node).expect("menu folded");
+        assert!(
+            menu[0].stops,
+            "FIRST menu wins: the second ask must not flip `stops`"
+        );
+        assert_eq!(
+            fold.loop_gate_prompt_for(&node).expect("prompt folded"),
+            "first question",
+            "FIRST prompt wins"
+        );
+        let decision = fold.loop_gate_decision_for(&node).expect("decision folded");
+        assert_eq!(decision.actor.as_deref(), Some("b"), "LAST decision wins");
+        // The OPTION as well as the actor: it is what Task 6 matches against the journaled
+        // menu, so a decision that folds without its name is a decision no arm can honour.
+        assert_eq!(decision.option, "done");
+    }
+
+    /// `LoopGateAwaited` is the FOURTH writer of the SHARED `deadlines` map, so
+    /// "has this node begun asking?" still has one answer for every waiting kind. The
+    /// `None` is folded THROUGH — dropping it is the re-ask-every-drive bug s1 shipped.
+    #[test]
+    fn a_deadline_less_loop_gate_records_that_it_began_asking() {
+        let node = NodeId("lp/0/__gate__".into());
+        let (fold, _, _) = fold_journal(&[(
+            1,
+            JournalEvent::LoopGateAwaited {
+                node: node.clone(),
+                deadline: None,
+                prompt: "q".into(),
+                menu: vec![orchestrator_core::LoopGateOption {
+                    name: "done".into(),
+                    stops: true,
+                }],
+            },
+        )]);
+        assert_eq!(
+            fold.deadline_for(&node),
+            Some(None),
+            "the key must be PRESENT with a None value: present = began asking, \
+             None = no deadline"
         );
     }
 
