@@ -23,9 +23,19 @@ pre-existing `cloud-providers` doctest. Both required checks green; merge state 
 
 ## Remaining
 
-Nothing from SP-6. **Next slice chosen: `GateSpec::Agent` backed by a HUMAN** — "a human
-decides whether the loop continues", named by the s3 review as *the most valuable rejected
-site and the obvious next slice*. Status: **design not started.**
+Nothing from SP-6. **Next slice: SP-6 s4, the human loop gate** — "a human decides whether
+the loop continues", named by the s3 review as *the most valuable rejected site and the
+obvious next slice*. Status: **spec written and committed (`1633a96`), awaiting user
+review. No code yet, no plan yet.**
+
+Spec: `docs/superpowers/specs/2026-09-02-sp-6-s4-human-loop-gate-design.md` (20 ACs).
+The four decisions it turns on, all made: an enumerated **menu** rather than free text; a
+new **`GateSpec::Human { agent, menu }`** carrying the menu on the GRAPH (so `validate_dag`
+can statically reject a menu with no stopping option); a new **`LoopGateAwaited`/
+`LoopGateDecided`** event pair with `LoopGateOption { name, stops }`, because
+`GateOutcome{Complete,Fail}` cannot express "continue"; and **expiry read BEFORE the
+decision**, inverting s3 — "continue" authorizes another iteration of spend, so it is an
+approval in the sense s2 built its ordering for.
 
 What is already true (verified, not assumed): `GateSpec::Agent` **exists and works** for a
 MODEL-backed agent (`fanout.rs:552`, driving the gate at `"{loop}/{i}/__gate__"`). The
@@ -47,7 +57,13 @@ Open design questions, none answered yet:
 
 ## Next command
 
-Design first, no code yet: write `docs/superpowers/specs/2026-09-02-sp-6-s4-human-loop-gate-design.md`.
+After the user signs off on the spec: write the implementation plan to
+`docs/superpowers/plans/2026-09-02-sp-6-s4-human-loop-gate.md`, then build it red-first.
+
+Two preconditions the plan must RE-VERIFY rather than inherit from the spec: that
+`RESERVED_GATE_ID` (`orchestrator-core/src/plan.rs:22`) still blocks a planner-authored
+`__gate__` node, and that `validate_dag` really recurses into `Loop`/`Subgraph` bodies for
+the new variant.
 
 ## Known-broken
 
