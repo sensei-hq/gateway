@@ -139,11 +139,23 @@ Mirrors `run_human_gate` (s2), **not** `run_human_agent` (s3):
 ### 5.3 The menu is read from the journal, never from the graph
 
 The graph supplies the menu at ask time; every read after that is of the **journaled** copy. This is
-s2's rule and the reason is unchanged: a graph can be edited between the ask and the decision — a
-`scheduled_runs.graph` row, a resubmitted `run submit`, or a runtime `Expand` subgraph — and an
-operator's answer must keep meaning what it meant when they were asked. `torii` already works this
+s2's rule and the reason is unchanged, in s2's own general form: **nothing binds the graph handed to
+a later `Executor::start`** to the one the human was shown. There is no graph fence — the SP-DATA-2
+config-version fence covers the registry, not the graph — so an operator's answer must be validated
+against the menu it was given, not against whatever the graph says later. `torii` already works this
 way (`cmd/gate.rs:262`, "the menu comes from the JOURNAL"), which is why its decide path needs
 extending rather than rewriting.
+
+The concrete vector on the shipped `worker serve` path is the **`scheduled_runs.graph` row**, which
+`Scheduler::tick` re-drives from and which an operator can edit between drives; a library embedder
+passing a different `Graph` to the next `start` is the same hazard with no table involved.
+Correction to an earlier draft of this section, which listed three vectors of which two were false:
+a **resubmitted `run submit` is not one** (`cmd::run::submit` pre-checks `Scheduler::status`, and
+`SchedulerStore::enqueue` is the real guard — `on conflict do nothing` plus a `rows_affected == 0`
+error, so a run id is submittable once), and a **runtime `Expand` subgraph is the one path that IS
+bound** (`PlanExpanded` journals the subgraph before it is driven and `drive_expand_with` reuses
+`fold.expansions` verbatim rather than re-invoking the planner). `Expand` remains a **trust** point —
+an untrusted planner can author the menu in the first place, §7 — but it is not a **drift** point.
 
 An option name in the journaled menu that no longer exists in the graph is therefore **honoured**,
 and a name added to the graph after the ask is **not** offered. Both follow from the rule; both get
