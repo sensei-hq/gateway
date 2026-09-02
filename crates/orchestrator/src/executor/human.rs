@@ -361,39 +361,16 @@ impl Executor {
     /// two callers differ in what a failure means (s3's `?`-propagates as it always has;
     /// s4's gate arm turns it into a `NodeFailed` that fails the `Loop`). Deciding that
     /// here would take the choice away from the caller that owns it.
-    /// The SLA half of [`Executor::human_question_for`] alone: resolve the role, assert the
-    /// backing is `Human`, and hand back its `timeout`.
     ///
-    /// Two registry lookups instead of one, and worth it: this is the only part of the seam
-    /// a caller needs on EVERY drive, while composing the question is only needed on the
-    /// drive that ASKS. `run_human_loop_gate` is re-entered for every iteration's gate on
-    /// every wake of the run, so composing eagerly there meant, on a loop sitting at
-    /// iteration N, N `assemble_prompt_parts` runs and N redaction passes over up to
-    /// `MAX_HUMAN_CONTEXT_BYTES` of iteration output — all discarded by an arm that pauses
-    /// or replays a decision.
-    ///
-    /// Extracted rather than duplicated so the LOUD model-backed refusal has one message
-    /// (AC14, design §5.5): an author naming a model-backed role in a `GateSpec::Human`
-    /// must be told the same thing wherever the seam is entered.
-    pub(super) fn human_sla_for(
-        &self,
-        agent_ref: &AgentRef,
-    ) -> Result<Option<chrono::Duration>, OrchestratorError> {
-        let agent: &AgentDefinition = self
-            .registry
-            .agent(&agent_ref.0)
-            .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
-        let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by else {
-            return Err(OrchestratorError::InvalidGraph(format!(
-                "agent {:?} is model-backed but is named where a human-backed role is \
-                 required; set `backed_by: human` in its frontmatter, or use a gate kind \
-                 that takes a model",
-                agent_ref.0
-            )));
-        };
-        Ok(timeout)
-    }
-
+    /// **[`Executor::human_sla_for`] — the SLA half alone — is defined BELOW this function,
+    /// not above it, and that is not a stylistic preference.** Rustdoc attaches a doc block
+    /// to the item that FOLLOWS it, so the change that extracted the SLA read put its `fn`
+    /// between these hundred lines and the function they describe, silently re-parenting
+    /// the whole argument about prompt assembly onto a function that composes no prompt —
+    /// and leaving this one with no doc at all. Nothing in the compiler or in
+    /// `clippy -D warnings` says a word about it; only reading the rendered page does.
+    /// Caller-then-callee also happens to be the better reading order here, since the SLA
+    /// read is a step of this function rather than a peer of it.
     pub(super) fn human_question_for(
         &self,
         agent_ref: &AgentRef,
@@ -419,6 +396,46 @@ impl Executor {
             ),
             timeout,
         ))
+    }
+
+    /// The SLA half of [`Executor::human_question_for`] alone: resolve the role, assert the
+    /// backing is `Human`, and hand back its `timeout`.
+    ///
+    /// Two registry lookups instead of one, and worth it: this is the only part of the seam
+    /// a caller needs on EVERY drive, while composing the question is only needed on the
+    /// drive that ASKS. `run_human_loop_gate` is re-entered for every iteration's gate on
+    /// every wake of the run, so composing eagerly there meant, on a loop sitting at
+    /// iteration N, N `assemble_prompt_parts` runs and N redaction passes over up to
+    /// `MAX_HUMAN_CONTEXT_BYTES` of iteration output — all discarded by an arm that pauses
+    /// or replays a decision.
+    ///
+    /// Extracted rather than duplicated so the LOUD model-backed refusal has one message
+    /// (AC14, design §5.5): an author naming a model-backed role in a `GateSpec::Human`
+    /// must be told the same thing wherever the seam is entered. It is the same refusal for
+    /// the same reason at both entry points, and it is the ONLY thing this function can
+    /// fail on beyond an unresolvable name — so a caller that needs the deadline and not
+    /// the question still gets AC14's loudness on every drive that could still ask.
+    ///
+    /// It resolves no chain and touches no gateway, which is what lets
+    /// `run_human_loop_gate` call it unconditionally without weakening its structural
+    /// zero-spend claim.
+    pub(super) fn human_sla_for(
+        &self,
+        agent_ref: &AgentRef,
+    ) -> Result<Option<chrono::Duration>, OrchestratorError> {
+        let agent: &AgentDefinition = self
+            .registry
+            .agent(&agent_ref.0)
+            .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
+        let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by else {
+            return Err(OrchestratorError::InvalidGraph(format!(
+                "agent {:?} is model-backed but is named where a human-backed role is \
+                 required; set `backed_by: human` in its frontmatter, or use a gate kind \
+                 that takes a model",
+                agent_ref.0
+            )));
+        };
+        Ok(timeout)
     }
 
     /// Execute one human-backed `Agent` node.
@@ -1024,11 +1041,29 @@ impl Executor {
             // `LoopGateAwaited` writes `Fold::loop_gate_asks`, so this arm is reachable the
             // same way its three siblings' are: some OTHER kind's awaited record sits at
             // this id. Its siblings get there by an edit to a live run's graph; a gate path
-            // is SYNTHESIZED, so the vectors here are (a) an authored node id that collides
-            // with the reserved `"{loop}/{i}/__gate__"` path — `validate_dag` rejects one
-            // an author wrote and `plan::feasible` rejects one a planner wrote, but
-            // `Executor::start` takes the graph as an unvalidated caller parameter — and
-            // (b) a journal `torii` did not write, which is a first-class case for a
+            // is SYNTHESIZED, so the two vectors here are different ones.
+            //
+            // **(a) An authored `__gate__` SEGMENT, inside the gated `Loop`'s own
+            // `Subgraph` body.** `drive_nested` namespaces that body under `"{loop}/{i}"`,
+            // so an inner node the author simply named `__gate__` lands at exactly this
+            // path. `validate_dag` does not stop it: SP-6 s1's rule bans the `/` SEPARATOR
+            // in an author-supplied id, which makes the reserved path unauthorable in one
+            // piece but says nothing about a bare segment that only becomes that path once
+            // nesting has flattened it. `plan::feasible` DOES reserve the segment
+            // (`PlanError::ReservedNodeId`, the SP-3 s5 review's fix), so a planner cannot
+            // emit it, and an `Expand` body is covered by that; the author-supplied segment
+            // is the door left open. Guarded by
+            // `an_authored_gate_id_in_a_loop_body_collides_and_fails_loudly`.
+            //
+            // An earlier version of this comment described (a) as a `/`-containing id
+            // reaching the executor because "`Executor::start` takes the graph as an
+            // unvalidated caller parameter". Both halves are false: `start_inner` and
+            // `run_inner` each call `graph.validate_dag()?` before anything is journaled,
+            // and validation recurses into `Subgraph`, `Loop` and `Branch` bodies — so no
+            // caller, embedder included, gets an unvalidated graph past the front door. The
+            // real vector needed no separator at all.
+            //
+            // **(b) A journal `torii` did not write**, which is a first-class case for a
             // durable log an embedder may append to directly.
             //
             // What is NOT a vector, though an earlier version of this comment claimed it:
