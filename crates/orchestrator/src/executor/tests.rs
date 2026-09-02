@@ -20043,6 +20043,94 @@ mod human_loop_gate {
         );
     }
 
+    /// **The BOUNDARY between the two properties above, in one run.** A gate that was
+    /// settled inside its own SLA replays, and — on the very same drive — a LATER
+    /// iteration's gate that nobody answered still expires and still kills the `Loop`.
+    ///
+    /// The two halves are guarded separately today and they pull in opposite directions:
+    /// AC8 says a decision arriving after the deadline must not continue the loop, and
+    /// AC12b says a decision arriving BEFORE it must keep meaning what it meant however
+    /// long the run subsequently lives. Conflating them is exactly how the Critical
+    /// shipped — the arm re-derived every settled gate against a clock that had moved on —
+    /// and the natural OVER-correction conflates them the other way: suppress expiry once
+    /// the loop has made progress, and a question nobody ever answered stops costing
+    /// anything. Neither existing test can see that: `a_decision_after_the_deadline_does_
+    /// not_continue_the_loop` has no settlement in its journal at all, and the two AC12b
+    /// tests never let a gate expire. This one has both states live at once, so the arm has
+    /// to tell them apart by NODE rather than by run.
+    ///
+    /// The discriminating assertion is WHICH gate the failure names. Under the Critical's
+    /// own mutation (delete step 1's settled replay) the message names `lp/0/__gate__` —
+    /// the gate that was answered on time — instead of `lp/1/__gate__`, the one that
+    /// actually ran out. An operator sent to look at a question they already answered has
+    /// been told the wrong thing about their own run.
+    ///
+    /// The clock advances ACROSS iterations, which is the property every s4 test written
+    /// before the Critical fix was missing.
+    #[tokio::test]
+    async fn a_settled_gate_replays_while_a_later_iterations_gate_still_expires() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let (ex, clock, calls) =
+            exec_at(&journal, human_registry(Some(Duration::hours(1))), t0).await;
+        let graph = human_gated_loop_graph(3);
+
+        // Iteration 0 asks; its deadline is t0 + 1h. The human answers "continue".
+        ex.start(run, &graph).await.expect("pauses on gate 0");
+        journal
+            .append(run, decided(&gate(0), "revise", "jerry"))
+            .await
+            .expect("the decision lands, well inside its SLA");
+
+        // +30m: gate 0 is honoured and SETTLED, iteration 1 runs, and gate 1 asks with a
+        // deadline of its own — t0 + 30m + 1h = t0 + 90m.
+        clock.set(t0 + Duration::minutes(30));
+        let second = ex.start(run, &graph).await.expect("drives iteration 1");
+        assert!(
+            second.paused.is_some() && second.failed.is_none(),
+            "iteration 1 asks its own question and pauses: {second:?}"
+        );
+
+        // +3h: gate 1's SLA ran out ninety minutes ago, and only NOW does its decision
+        // land — a late "continue", the shape AC8 exists to refuse.
+        clock.set(t0 + Duration::hours(3));
+        journal
+            .append(run, decided(&gate(1), "revise", "late"))
+            .await
+            .expect("the late decision lands");
+
+        let out = ex.start(run, &graph).await.expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!(
+                "gate 1 was never answered inside its SLA, so it must still fail the Loop \
+                 — a settled EARLIER gate does not buy the loop an exemption from the \
+                 deadline on a question nobody answered: {out:?}"
+            )
+        });
+        assert_eq!(node, lp(), "the expired gate fails the whole Loop: {out:?}");
+        assert!(
+            message.contains(&gate(1).0) && message.contains("deadline"),
+            "the failure names the gate that ACTUALLY expired: {message}"
+        );
+        assert!(
+            !message.contains(&gate(0).0),
+            "…and never gate 0, which was answered at +30m and merely replays — naming it \
+             sends an operator to re-read a question they already answered: {message}"
+        );
+        assert_eq!(
+            asks(&journal.load(run).await.expect("loads")).len(),
+            2,
+            "iteration 2 was never entered, so nobody was asked a third question"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "…and no third iteration was SPENT — iterations 0 and 1 replayed from their \
+             memos and the late `revise` authorized nothing"
+        );
+    }
+
     /// If the GATE's `NodeFailed` was journaled but the `Loop`'s own append did not land,
     /// the next drive writes it. The guard is self-healing, not a one-shot flag.
     ///
