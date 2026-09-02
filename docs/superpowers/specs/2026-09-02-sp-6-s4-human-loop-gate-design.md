@@ -248,8 +248,10 @@ and this slice's answer is yes.
 1. `GateSpec::Human { agent, menu }` and `LoopGateOption { name, stops }` exist; a graph using
    neither serialises byte-identically to today.
 2. `validate_dag` **rejects** an empty menu, duplicate option names, and a menu with no
-   `stops: true` option — including inside a nested `Subgraph`/`Loop` body, which it already
-   recurses into.
+   `stops: true` option — including at every depth it already recurses into: a `Subgraph`
+   node's graph and a `Loop`'s `Subgraph` body (block 2c), and a `Branch`'s arm graphs and
+   its `default` (block **2d** — not 2c, which never sees a `Branch`). All four are
+   asserted, each mutation-checked by disabling that one recursion.
 3. After each iteration the gate journals one `LoopGateAwaited` at `"{loop}/{i}/__gate__"`, carrying
    the question, the deadline and the menu, and the run pauses.
 4. A `stops: true` decision converges the loop; the `Loop` completes with the last iteration's
