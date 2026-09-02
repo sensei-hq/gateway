@@ -361,11 +361,14 @@ impl Executor {
             // answer could be an answer to.
             //
             // The exact mirror of `run_human_gate`'s missing-menu arm, and s3 shipped
-            // without it. `Fold::deadlines` is written by all THREE waiting kinds while
-            // only `AgentAwaited` carries a prompt, so this arm is reachable the same way
-            // s2's is: by editing a live run's graph to change a waiting node's KIND. An
-            // `AwaitSignal` node re-pointed at a human-backed `Agent` arrives here exactly
-            // as the `AwaitSignal`→`HumanGate` swap arrives there — `gate.rs`'s own comment
+            // without it. `Fold::deadlines` is written by all FOUR waiting kinds (SP-6
+            // s4's `LoopGateAwaited` is the fourth, and it carries a prompt of its own —
+            // into `Fold::loop_gate_asks`, never into this map, because a loop gate is
+            // not answerable by `AgentAnswered`) while only `AgentAwaited` writes a prompt
+            // HERE, so this arm is reachable the same way s2's is: by editing a live run's
+            // graph to change a waiting node's KIND. An `AwaitSignal` node re-pointed at a
+            // human-backed `Agent` arrives here exactly as the `AwaitSignal`→`HumanGate`
+            // swap arrives there — `gate.rs`'s own comment
             // already noted that s3 WIDENS that reachable set, and this is the guard it was
             // noting the absence of.
             //

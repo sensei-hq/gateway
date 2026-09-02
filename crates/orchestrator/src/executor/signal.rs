@@ -375,9 +375,10 @@ impl Executor {
             // Already waiting by the SHARED map's reckoning — but did THIS kind begin
             // waiting here?
             //
-            // `Fold::deadlines` is written by all three waiting kinds while only
-            // `SignalAwaited` records membership in `signal_asks`, so this arm is reachable
-            // exactly the way `run_human_gate`'s missing-menu arm and `run_human_agent`'s
+            // `Fold::deadlines` is written by all four waiting kinds (SP-6 s4's
+            // `LoopGateAwaited` is the fourth) while only `SignalAwaited` records
+            // membership in `signal_asks`, so this arm is reachable exactly the way
+            // `run_human_gate`'s missing-menu arm and `run_human_agent`'s
             // missing-question arm are: by editing a live run's graph to change a waiting
             // node's KIND (`Executor::start` takes the graph as an unfenced caller
             // parameter, and `scheduled_runs.graph` is an editable row). s2 and s3 each
