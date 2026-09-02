@@ -1241,6 +1241,39 @@ Sharing this function keeps the property without the coupling. Behaviour
 preserving; the s3 suite is the regression guard."
 ```
 
+**What actually landed (`9286702`), and four deviations from the steps above.**
+
+1. **The fixtures.** Step 1's `executor_with_human_reviewer()` does not exist, as the task's
+   own framing warned. The real ones live in `mod human_agent`: `reviewer(timeout, skills)`,
+   `human_registry`, `exec_at(&journal, registry, at(1_000))` and `human_gate::at`. The test
+   sits in that module, beside the s3 fixtures it reuses.
+2. **The assertions are stronger than the sketch.** `question.text().contains("the Acme MSA")`
+   plus `timeout.is_some()` is satisfied by a hand-rolled `format!("{system_prompt}: {input}")`
+   — i.e. by the second prompt builder this seam exists to prevent. The shipped test also
+   asserts an **ACTIVATED skill body** is present (only real assembly produces it) and pins
+   the SLA **by value**. Mutation-proven: composing from `agent.system_prompt` instead of
+   `parts.authored` reddens the skill assertion and nothing else in the crate.
+3. **`HumanQuestion::text()` is `#[cfg(test)]`, not `pub(super)`.** A plain `pub(super)`
+   accessor is dead code in the lib target and fails the hook's `-D warnings`; more to the
+   point, no production caller wants the raw text — every one goes through
+   `redact_and_clamp`, and an accessor handing out the UNREDACTED string is exactly the
+   shortcut a bypass would take.
+4. **A second test ships with the seam: `the_human_question_seam_refuses_a_model_backed_role`.**
+   The refusal is new code in this task (unreachable from `drive_agent`, whose branch has
+   already matched the backing), so it gets its own red-first guard rather than waiting for
+   AC14's end-to-end version in Task 9 — which stays as planned; the two are complementary.
+   It also pins that an unknown ref remains `UnknownAgent` rather than being swallowed by the
+   new refusal.
+
+**And one correction to Step 3's note.** It anticipates a double *lookup* ("a `HashMap` hit and
+clarity wins"); what the extraction actually duplicates on the human path is
+`assemble_prompt_parts` as well, since the seam re-assembles. Kept, for a reason the note did
+not have: hoisting the assembly below the human branch to avoid it is **not**
+behaviour-preserving. Today a non-top-level human role naming an unknown skill fails with
+`assemble_prompt_parts`'s `UnknownSkillRef` (a fatal `?`) *before* the `!top_level` refusal is
+reached; after the hoist the refusal would win and journal a `NodeFailed` instead. The comment
+at the call site records this so a later "obvious" cleanup does not silently make the change.
+
 ---
 
 ### Task 6: `run_human_loop_gate` — ask, and honour a decision
