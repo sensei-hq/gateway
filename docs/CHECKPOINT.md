@@ -9,10 +9,10 @@ not running, so this file is the only durable record.
 
 ## Done
 
-- **Tasks 1–4** — `GateSpec::Human` + `LoopGateOption`; `validate_dag` rejects a menu that
+- **Tasks 1–5** — `GateSpec::Human` + `LoopGateOption`; `validate_dag` rejects a menu that
   cannot converge, at every depth; the `LoopGateAwaited`/`LoopGateDecided` variants; the
-  fold (ask FIRST-wins into the SHARED `deadlines` map, decision LAST-wins).
-- **Task 5** (`9286702`, `7c671ea`) — the `human_question_for` seam.
+  fold (ask FIRST-wins into the SHARED `deadlines` map, decision LAST-wins); the
+  `human_question_for` seam (`9286702`, `7c671ea`).
 - **Tasks 6+7** (`6a20fea`, `eba6083`, `e177e3c`) — the arm at `{loop}/{i}/__gate__` and
   `run_loop`'s third gate arm; `LoopGateSettled` closed the Critical (settled → clock →
   decision, so AC8 still holds).
