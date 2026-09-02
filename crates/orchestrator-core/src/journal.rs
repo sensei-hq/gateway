@@ -495,21 +495,37 @@ pub enum JournalEvent {
     /// plaintext leak on this exact field (design §6; see the commentary at
     /// `torii/src/cmd/human.rs`).
     ///
-    /// **What `None` means.** The field is `Option` where `GateDecided.actor` is a
-    /// required `String`, and the asymmetry is NOT a semantic difference: a loop gate's
-    /// decider is exactly as attributable as a `HumanGate`'s. No operator-facing path can
-    /// produce `None` — torii's `cmd::gate::actor_or`/`actor_or_user` never yield an empty
-    /// actor (an unresolvable one is named `unknown`, precisely because a blank audit row
-    /// is indistinguishable from a bug), and the s4 CLI decide path MUST route through
-    /// them for the same reason. So `None` is reachable only from a direct library append,
-    /// and an audit reader should take it as "written by an embedder, not by an operator"
-    /// — not as "decided by a machine". An earlier version of this doc justified the
-    /// `Option` as room for "an automated operator on a schedule", which is wrong twice
-    /// over: an automated operator has a name, and naming it is what `actor_or` exists for.
+    /// **Why `actor` is REQUIRED**, a plain `String` exactly like
+    /// [`JournalEvent::GateDecided`]'s and [`JournalEvent::AgentAnswered`]'s. A gate
+    /// decision is an APPROVAL, and an approval always records who claimed to give it.
+    /// That is not an analogy to s2: it is the same argument the s4 design makes for
+    /// itself one section earlier (§3, "Expiry vs decision"), where reading expiry before
+    /// the decision is justified on the ground that answering `continue` **authorizes
+    /// another iteration of spend**. An authorization with no attribution at all is the
+    /// row an audit cannot use. So the type refuses to express one.
+    ///
+    /// The field carried an `Option<String>` from its introduction (s4 Task 3) until it
+    /// was narrowed here (s4 Task 5). The spec that specified the `Option` never argued
+    /// for it, and no reading of the slice's own reasoning supports it — a loop gate's
+    /// decider is exactly as attributable as a `HumanGate`'s. It was narrowed while
+    /// nothing yet wrote the event (Task 6 is the first writer), so
+    /// there is no `None` in any journal to migrate; a stored row without the field now
+    /// fails to deserialize, loudly, which is the correct treatment of an approval whose
+    /// attribution was lost. (An earlier doc justified the `Option` as room for "an
+    /// automated operator on a schedule". That is wrong twice over: an automated operator
+    /// has a name, and naming it is what `actor_or` exists for.)
+    ///
+    /// The remaining degenerate value is `""`, and nothing normalises it away — the fold
+    /// stores what was appended, so an audit reader sees exactly the string the writer
+    /// chose. It is a WRITER BUG rather than a legal encoding of "anonymous": torii's
+    /// `cmd::gate::actor_or`/`actor_or_user` never yield an empty actor (an unresolvable
+    /// one is named `unknown`, precisely because a blank audit row is indistinguishable
+    /// from a bug), and the s4 CLI decide path MUST route through them for that reason.
+    /// An embedder appending directly owes the same discipline.
     LoopGateDecided {
         node: NodeId,
         option: String,
-        actor: Option<String>,
+        actor: String,
     },
 }
 
@@ -996,6 +1012,11 @@ mod tests {
     /// fails the match per AC14b), and `deadline` is the input to the
     /// expiry-before-decision rule — so the guard has to be able to see them. All three
     /// mutations redden this version.
+    ///
+    /// The `actor` half also pins the field's REQUIREDNESS, not just its value: see the
+    /// unattributed-row case below, which is the only thing standing between the
+    /// variant's "an approval always records who claimed to give it" contract and a
+    /// one-attribute regression back to a silently blank audit row.
     #[test]
     fn the_loop_gate_events_round_trip() {
         let asked_at =
@@ -1036,7 +1057,7 @@ mod tests {
         let decided = JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "done".into(),
-            actor: Some("jerry".into()),
+            actor: "jerry".into(),
         };
         let json = serde_json::to_string(&decided).expect("serialises");
         let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
@@ -1048,26 +1069,46 @@ mod tests {
             } => {
                 assert_eq!(node.0, "lp/0/__gate__");
                 assert_eq!(option, "done");
-                assert_eq!(actor.as_deref(), Some("jerry"));
+                assert_eq!(actor, "jerry");
             }
             other => panic!("wrong variant: {other:?}"),
         }
 
-        // An actor-less decision is a LEGAL SHAPE, not a second durability check — the
-        // `Some` case above is what a `#[serde(skip)]` on `actor` reddens. This one pins
-        // that the `Option` (the deliberate difference from `GateDecided`'s required
-        // `String`) decodes rather than erroring, which is the only thing a reader of a
-        // library-appended row can rely on. See the variant's doc for what `None` MEANS.
-        let anonymous = JournalEvent::LoopGateDecided {
+        // A decision whose `actor` field is ABSENT from the row must FAIL to decode, not
+        // decode as `""`. This is the guard on the variant's central doc claim — that the
+        // type refuses to express an unattributed approval — and it is a real guard, not
+        // a restatement of serde's defaults, because one attribute (`#[serde(default)]`
+        // on `actor`) turns the refusal back into a silent `""` and there is otherwise
+        // nothing to notice. It replaces the `actor: None` case this test carried while
+        // the field was an `Option`, whose premise (an anonymous decision is a legal
+        // shape) is exactly what the narrowing removed.
+        //
+        // Hand-written JSON rather than a serialised value: the shape being pinned is one
+        // the type can no longer construct, which is the point.
+        let unattributed = r#"{"LoopGateDecided":{"node":"lp/0/__gate__","option":"again"}}"#;
+        let err = serde_json::from_str::<JournalEvent>(unattributed)
+            .expect_err("an approval with no attribution must not decode");
+        assert!(
+            err.to_string().contains("actor"),
+            "the failure must name the missing field so an operator reading a decode \
+             error can see WHICH row is unusable; got: {err}"
+        );
+
+        // …and the degenerate value that IS still expressible, `""`, round-trips
+        // VERBATIM. Nothing in the wire format normalises it to `unknown` or drops it:
+        // resolving an unresolvable actor to a name is torii's job at the WRITE side
+        // (`cmd::gate::actor_or`), and a reader inventing one here would launder a writer
+        // bug into a plausible-looking audit row.
+        let claimed_empty = JournalEvent::LoopGateDecided {
             node: NodeId("lp/0/__gate__".into()),
             option: "again".into(),
-            actor: None,
+            actor: String::new(),
         };
-        let json = serde_json::to_string(&anonymous).expect("serialises");
+        let json = serde_json::to_string(&claimed_empty).expect("serialises");
         match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
             JournalEvent::LoopGateDecided { option, actor, .. } => {
                 assert_eq!(option, "again");
-                assert!(actor.is_none());
+                assert_eq!(actor, "", "an empty actor is preserved, never re-labelled");
             }
             other => panic!("wrong variant: {other:?}"),
         }
