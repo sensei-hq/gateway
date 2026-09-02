@@ -1,45 +1,58 @@
 # Checkpoint
 
-**SP-6 is COMPLETE and ON `main`** — PR #48 merged 2026-08-28 as `5ecf01e` (75 commits,
-49 files, +15227/−3694). All open items are closed. `develop` is at `a530916`, 4 commits
-ahead of `main`, CI green **against a real Postgres**.
+**PR #49 is MERGED** — `78c5138` on `main`, 2026-09-02, 6 commits. `develop` and `main` are
+now **identical (0/0)**. Everything through SP-6 plus the SP-6 follow-through is on `main`.
 
 ## Done
 
+PR #49 closed the last of SP-6's review debt and a CI blind spot:
+
 - `e987865` fix — the 9 code LOWs the SP-6 s3 + budget reviews left open, red-first.
-  None had been closed by earlier commits; nothing was skipped.
-- `9e68537` docs — 5 stale claims. Item 12's false `load_since` claim lives in the
-  SP-DATA-5 **spec**, not `scheduler.rs`; `orchestrator-overview.md:165` was already true.
-- `171ccf5` test — a skipped Postgres test is now **`ignored`, not counted as passed**.
-- `62f6cbd` docs — the 25th private-item doc link was ours; demoted to a code span rather
-  than widening a private item's visibility.
-- `a530916` ci — a digest-pinned `postgres:16` service container. **CI-verified:** the
-  Postgres suites really ran (orchestrator 368/0, store 69/0, zero still-ignored).
+- `9e68537` docs — 5 stale claims (item 12's false `load_since` claim is in the SP-DATA-5
+  **spec**, not `scheduler.rs`).
+- `171ccf5` test — a skipped Postgres test is **`ignored`, not counted as passed**. The
+  blind spot was **48 tests**: every DB test early-returned and libtest counts that as a
+  PASS. Workspace 1623/7 → **1575/55**; `55 − 7 = 48` closes exactly.
+- `62f6cbd` docs — the 25th `cargo doc` private-item link was ours; back to the 24 baseline.
+- `a530916` ci — digest-pinned `postgres:16` service container.
+- `4287d91` docs — checkpoint.
 
-**Two earlier records were WRONG and are corrected:** the "pre-existing PG flake" is fixed
-(`dd9a3c1` + 3), and its recorded diagnosis was false on both counts — the advisory lock
-already existed in two crates; `postgres_e2e` had **no guard at all**, and the race is
-**intra-process**. And "pre-existing" is no longer accepted as a reason to defer.
-
-**The CI blind spot was 48 tests, not 7** — every DB test early-returned, and libtest
-counts that as a PASS. Workspace went 1623 passed/7 ignored → **1575/55**, arithmetic
-closing exactly.
-
-**Measured at `a530916`:** `cargo test --workspace` **1575 passed / 0 failed, exit 0**;
-clippy `-D warnings` 0; fmt 0; `cargo doc` private-item links back to the **24** baseline;
-live PG **9/9 exit 0** across 3 consecutive DEFAULT-parallel-threads rounds.
+**CI-verified on the merged run (33636750338), not just locally:** the PG suites really
+ran — orchestrator **368/0**, store **69/0**; the only `ignored` in the whole run is one
+pre-existing `cloud-providers` doctest. Both required checks green; merge state was CLEAN.
 
 ## Remaining
 
-Nothing open.
+Nothing from SP-6. **Next slice chosen: `GateSpec::Agent` backed by a HUMAN** — "a human
+decides whether the loop continues", named by the s3 review as *the most valuable rejected
+site and the obvious next slice*. Status: **design not started.**
+
+What is already true (verified, not assumed): `GateSpec::Agent` **exists and works** for a
+MODEL-backed agent (`fanout.rs:552`, driving the gate at `"{loop}/{i}/__gate__"`). The
+slice is the HUMAN backing at that site, which `drive_agent`'s `!top_level` arm refuses
+today — `fanout.rs:555` passes a literal `false`, and `non_top_level_sites` carries a
+`"GateSpec::Agent"` row asserting the refusal.
+
+Open design questions, none answered yet:
+
+1. **Expiry ordering** — s2 `HumanGate` reads expiry BEFORE the decision (an approval must
+   not self-approve late); s3 human-agent reads the answer FIRST (work product). A
+   continue/stop decision looks like an approval, so it likely inverts s3 — but that must
+   be argued, not inherited.
+2. **What expiry DOES** — fail the loop, or converge it? Failing is louder.
+3. **Per-iteration re-asking** is the point here, not the bug s3 fixed. The refusal must
+   narrow to this one site without reopening the `Subgraph`-wrapper bypass.
+4. **`torii` surface** — does `run agent answer --node "{loop}/{i}/__gate__"` serve it, or
+   does the three-way cross-refusal need a fourth arm?
 
 ## Next command
 
-When wanted: open a `develop`→`main` PR for the 4 commits. `main`'s ruleset is strict —
-`develop` must contain `main`'s merge commits; it does. Deferred, non-blocking: SP-7
-prompt budgeting; `GateSpec::Agent`; the SP-DATA-5 carry-forwards.
+Design first, no code yet: write `docs/superpowers/specs/2026-09-02-sp-6-s4-human-loop-gate-design.md`.
 
 ## Known-broken
 
 Nothing. `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it; use a
 throwaway container on an `lsof`-checked free port, and remove it afterwards.
+
+The **sensei daemon is not running**, so `/sensei:checkpoint` could not write the durable
+record; this file is the only copy. `sensei start` to restore it.
