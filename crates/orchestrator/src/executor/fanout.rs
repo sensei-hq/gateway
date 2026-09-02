@@ -568,6 +568,23 @@ impl Executor {
                         AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
                     }
                 }
+                // SP-6 s4: the real arm lands in Task 7. Temporary — but a FAILURE, not a
+                // panic. `GateSpec::Human` is a public re-exported variant, so it is
+                // reachable from any caller and from a `scheduled_runs.graph` jsonb row;
+                // `unreachable!` would assert something false. A panic here unwinds through
+                // `Scheduler::tick`, which has already claimed a batch and taken its leases
+                // — the run stays `'waking'`, the next worker reclaims the stale lease and
+                // dies the same way, and because a panic is not an `Err` it bypasses
+                // `worker serve`'s consecutive-failure backoff entirely. `graph.rs:548` and
+                // `tick`'s own comment both record that doctrine. A silent `false` is worse
+                // still: the loop would run to `max_iters` with nobody ever asked.
+                GateSpec::Human { .. } => {
+                    let msg = format!(
+                        "loop {:?}: a human loop gate is not yet wired (SP-6 s4, Task 7)",
+                        loop_node.id
+                    );
+                    return self.fail_loop(run, &loop_node.id, msg).await;
+                }
             };
             if stop {
                 converged = true;
