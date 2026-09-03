@@ -994,6 +994,16 @@ All three must be `exit=0`. Record the counts.
 database was started and `$DATABASE_URL` was not read, so the `have_database_url` suites are among
 the 56 ignored — see the round-1 note above for the one budget test that hides there.
 
+**Re-verified at `2fe0332`, the tip after the four commits that followed the first measurement**
+(`27b28a7` source, `ef44318`/`90897fe`/`2fe0332` docs): identical — **1682 / 0 / 56, exit=0**, 35
+suites, clippy **exit=0**, fmt **exit=0**, doc-links **16**. Run TWICE, once before this pass's
+edits and once after; both 1682 / 0 / 56. The second run is a formality rather than evidence, and
+saying so is the point: this pass changed only `.md` files under `docs/`, `git diff --name-only`
+over `crates/` returned **zero**, and the only `include_str!` of a doc reads
+`execution-graph.md`, which was not touched — so no Rust behaviour and no rustdoc link could have
+moved. The straggler flake reproduced in **neither** run, which at a measured 1-in-6 is what two
+runs are expected to show and is NOT evidence it is gone.
+
 **One PRE-EXISTING flake surfaced, and it is worth writing down because "run it again" is the wrong
 response.** `agent::sandbox::tests::a_backgrounded_straggler_is_reaped_on_clean_exit` (SP-4 s4,
 untouched since `fb4db2f`) failed **1 of 6** full-suite runs and **0 of 10** in isolation, on its
@@ -1063,6 +1073,21 @@ finds the descriptions, but a stale *justification* survives that grep when it i
 reason for some other decision. The four surfaces round 1 fixed were all found by the claim-grep;
 this one was only found by reading what the clamp made newly possible and asking which existing
 "we can't do X because Y" arguments depended on Y.
+
+**The release-gate re-run found a SIXTH surface — the same stale justification, one file away from
+the §8 entry that falsified it.** The s5 spec's §6.5a enumerates three candidate fixes for the
+concurrent-fan-out Critical and rejects the second, "Reserve tokens before the call", because "a
+reservation needs an output-token estimate, **which §8 deliberately does not have**". §8 of that
+same document was edited this slice to mark exactly that deferral **ADDRESSED**, so the file now
+contradicted itself: §6.5a cited §8 for the absence of a thing §8 announces. Neither grep would
+have caught it — the claim-grep because the sentence contains no `overshoot`/`floor-trigger`/
+`unknowable` (checked, not assumed), and the round-2 "read what the clamp made possible" pass
+because it stopped at two sites. Why it stopped is a guess, but the plausible one is that having
+just fixed this exact argument in `dispatch.rs` and the overview, it read as closed. Amended in place,
+matching the wording already in `dispatch_metered`'s module doc, the overview's Critical-1
+narrative, and the clamp spec's §8. Two lessons: fixing a stale justification at N sites does not
+tell you N was the count, and an internal cross-reference (`§X does not have`) becomes a defect the
+moment §X is edited — worth grepping for `§`-references INTO any section a slice rewrites.
 
 - [x] **Step 5: Checkpoint**
 
