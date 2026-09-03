@@ -21846,7 +21846,18 @@ mod human_loop_gate {
     /// * **It re-offers the PUBLISHED menu**, so what `run status` invites an operator to
     ///   pick from is what their answer will be validated against (§5.3). Asserted on the
     ///   reason string because that is the only operator-visible carrier of it on a
-    ///   re-pause — no second `LoopGateAwaited` is written, by the rule above.
+    ///   re-pause — no second `LoopGateAwaited` is written, by the rule above, and it is
+    ///   asserted against a graph whose menu has been RENAMED between the two drives.
+    ///   That rename is what makes the assertion mean anything: re-driving from the same
+    ///   builder produces the same two names whichever source the arm reads, so the
+    ///   earlier version of this test — same graph on both drives, `contains("revise")`
+    ///   only — passed unchanged when the arm was mutated to hand `pause_gate` the
+    ///   graph's `menu`. Verification measured that survival; the rename is the fix.
+    ///
+    /// It is a DIFFERENT door onto §5.3 from `the_loop_gate_menu_is_read_from_the_journal_
+    /// not_the_graph`, which drifts the graph and then checks how a DECISION resolves.
+    /// This one carries no decision at all: the menu drift shows up only in what the
+    /// re-pause offers, which is the half an operator reads before they answer.
     ///
     /// The deadline the re-pause carries is the sibling test's subject, not this one's.
     #[tokio::test]
@@ -21864,8 +21875,29 @@ mod human_loop_gate {
 
         // Drive 2, at +15m and with NOTHING appended in between: the person has not
         // answered, and the SLA has not run out.
+        //
+        // Re-driven from a graph whose menu has been RENAMED — the author edited it while
+        // the person was thinking, the same drift `scheduled_runs.graph` (an editable
+        // jsonb row) or any library embedder can produce between two wakes. Nothing else
+        // about the node changes, so iteration 0's body still replays from its memo; the
+        // rename is legal, because `publish` stops and the loop can still converge.
         clock.set(t0 + Duration::minutes(15));
-        let out = ex.start(run, &graph).await.expect("re-drives");
+        let renamed = Graph {
+            nodes: vec![human_gated_loop_node(
+                3,
+                vec![
+                    LoopGateOption {
+                        name: "polish".into(),
+                        stops: false,
+                    },
+                    LoopGateOption {
+                        name: "publish".into(),
+                        stops: true,
+                    },
+                ],
+            )],
+        };
+        let out = ex.start(run, &renamed).await.expect("re-drives");
         assert!(
             out.failed.is_none(),
             "a wake with no answer yet is the ORDINARY case, not a failure — the SLA has \
@@ -21899,6 +21931,16 @@ mod human_loop_gate {
              `run status` alone rather than going to the graph for the option names — and \
              what they are invited to pick is what the decision will be validated \
              against: {}",
+            reasons[1]
+        );
+        assert!(
+            !reasons[1].contains("polish") && !reasons[1].contains("publish"),
+            "…and NEVER the graph's, which was renamed under the run between the two \
+             drives. Offering `polish | publish` would invite an operator to type a name \
+             `torii run gate decide` refuses (it recites the JOURNALED menu) and the \
+             executor's own resolution refuses too (`published.iter().find(…)`, whose \
+             miss is terminal) — a gate an operator cannot answer through the surface \
+             that told them how: {}",
             reasons[1]
         );
         assert_eq!(
