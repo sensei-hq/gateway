@@ -19,16 +19,26 @@ call" (§2 non-goals, §8).
 That framing assumed we must *predict* the cost. We do not have to — we can **bound** it. Every
 `Payload::Chat` carries `max_tokens: Option<u32>`, and the orchestrator sets it to `None` at
 **all four** producer call sites (`support.rs:499`, `support.rs:538`, `dispatch.rs:446`, plus the
-test-support builder). So today output is bounded only by the provider default, and "overshoot by
-one call" can mean a model's entire output limit.
+test-support builder). So today output is bounded only by whatever the adapter substitutes for
+`None`.
 
-This slice sets `max_tokens` on budgeted runs to what the remaining budget can afford. Enforcement
-moves from our arithmetic to the provider's: the call *cannot* return more than the cap allows.
+> **Correction, from the whole-slice review.** This section first said that overshoot by one call
+> "can mean a model's entire output limit". That is true only of the `openai_compat` family and
+> the local engine, which pass the `Option` through. `anthropic`, `gemini` and `bedrock` each
+> substitute their own `DEFAULT_MAX_TOKENS = 1024` (`anthropic/mod.rs:27`, `gemini.rs:43`,
+> `bedrock/mod.rs:62`), so for three of the five families `None` already meant 1024. The
+> consequence for the design is in §6: on those three, a budgeted call's output ceiling can now be
+> HIGHER than the same unbudgeted call's, bounded by the model's own limit.
+
+This slice sets `max_tokens` on budgeted runs to what the remaining budget can afford, bounded by
+the model's own maximum output. Enforcement moves from our arithmetic to the provider's: the call
+*cannot* return more than the cap allows.
 
 ## 2. Goals / Non-goals
 
 **Goals**
-- On a budgeted run, clamp `Payload::Chat.max_tokens` to `remaining − est_input`.
+- On a budgeted run, clamp `Payload::Chat.max_tokens` to `remaining − est_input`, and never above
+  the chain's own smallest `max_output_tokens`.
 - Refuse below a `MIN_OUTPUT_TOKENS` floor, through the **existing** `Refusal::BudgetExhausted`
   durable-pause path — no new refusal kind, no new operator verb, no new terminal state.
 - A pessimistic input estimate for the budget path, distinct from the window-fit estimate.
@@ -102,13 +112,33 @@ For a budgeted run with a `Payload::Chat` only:
 remaining  = cap − spent                       // cap > spent: the existing gate already refused otherwise
 est_input  = est_input_tokens_pessimistic(&payload)
 allowance  = remaining.saturating_sub(est_input)
+ceiling    = gateway.min_max_output_tokens(chain)      // None ⇒ no ceiling from here
 
-if allowance < MIN_OUTPUT_TOKENS  →  Refusal::BudgetExhausted { spent, budget: cap }
-else                              →  max_tokens = min(allowance, caller's max_tokens ?? allowance)
+if allowance < MIN_OUTPUT_TOKENS  →  Refusal::BudgetExhausted { .., cause: BelowFloor }
+else                              →  max_tokens = min(allowance, ceiling ?? ∞, caller's max_tokens ?? ∞)
 ```
 
 `saturating_sub` matters: `est_input` can exceed `remaining`, and the floor check must see `0`
 rather than wrap.
+
+**The `ceiling` term was added by the whole-slice review, and it is not optional.** `allowance` is
+a pure budget figure that knows nothing about the model: for any realistic whole-run cap it exceeds
+every current model's maximum output, and the providers reject that — Anthropic with a 400
+`invalid_request_error` — while every adapter here forwards the value verbatim. Without it, setting
+a budget HARD-FAILED the first call of a run that succeeds unbudgeted (measured: a cap of 10240 sent
+`Some(10239)` and the node failed). It is a `min` over the CHAIN, not over the selected model,
+because the clamp runs before selection and a request that fails over lands on a different entry;
+`None` (unknown chain) means "no ceiling from here", matching `over_budget`'s treatment of an
+unknown context window.
+
+**The floor check is ordered before the ceiling deliberately.** The floor asks whether the BUDGET
+can buy a useful reply; a model whose own limit is below `MIN_OUTPUT_TOKENS` is not a budget problem
+and must not be refused as one.
+
+The floor's refusal reuses `Refusal::BudgetExhausted` as §2 requires, but carries a `cause` so the
+two situations do not render as one message. Reusing the exhausted wording reported a spend that
+did not happen ("0 of 300 tokens spent" on a fresh run) and gave no hint of how far the cap must be
+raised.
 
 ### 5.3 The estimate
 
@@ -165,20 +195,49 @@ notes, not just the code.
 answering one word needs far less, and a planner emitting a graph needs far more. One constant will
 be wrong for somebody, which is the argument for the deferred per-agent knob.
 
+**On three of the five provider families, a budgeted call's output ceiling RISES.** `anthropic`,
+`gemini` and `bedrock` substitute their own 1024 for a `None` `max_tokens`, so an unbudgeted call
+on those adapters is capped at 1024 today. A budgeted one is capped at
+`min(remaining − est, model.max_output_tokens)`, which for a large cap is the model's limit — 4096
+or 8192 in the shipped catalog. Adding a budget can therefore make an individual reply LONGER, even
+though the run's total is now enforced where before it was not.
+
+This was considered and accepted rather than overlooked. The alternative — also taking
+`min(…, 1024)` so the clamp can only ever narrow — would hard-cap every budgeted reply at another
+provider's arbitrary fallback constant, silently truncating budgeted runs on the `openai_compat`
+and local paths where `None` means the model's own maximum, and would import that constant into the
+orchestrator. That trades a surprising-but-bounded widening for a silent truncation, which is
+worse. The run's total spend stays bounded either way; only the per-call shape moves.
+
+**A budget below `MIN_OUTPUT_TOKENS` is now refused by the CLI**, not accepted and paused on
+immediately. `parse_budget_tokens` previously rejected only `0`, on the stated ground that a budget
+which can never dispatch a call belongs on the precondition side; the floor widened that range.
+
 ## 7. Acceptance criteria
 
-1. A budgeted `Chat` request reaches the provider with `max_tokens = Some(remaining − est_input)`.
+1. A budgeted `Chat` request reaches the provider with `max_tokens = Some(remaining − est_input)`,
+   and **never above the chain's own smallest `max_output_tokens`** — asserted against a double
+   that REFUSES an over-large value the way a real provider does.
 2. An **unbudgeted** run's request is byte-identical to today, and the estimator is not called.
 3. A caller-supplied `max_tokens` is never widened — `min` is taken, proven with a caller value
    both above and below the allowance.
 4. `allowance < MIN_OUTPUT_TOKENS` ⇒ `Refusal::BudgetExhausted`, the durable pause, and **no
-   gateway call is made** (asserted on a call counter, not on the outcome alone).
+   gateway call is made** (asserted on a call counter, not on the outcome alone). Its reason names
+   the allowance, the floor and the smallest cap that would unblock the call — distinguishable from
+   an exhausted cap, which is a different situation with a different remedy.
 5. `est_input > remaining` does not wrap: the floor sees `0` and refuses.
 6. A non-`Chat` payload on a budgeted run is unchanged and still gated by the existing rule.
 7. Against a fake provider that honours `max_tokens`, a budgeted run's total spend does not exceed
    `cap + (actual_input − est_input)` — the §4 claim, asserted as arithmetic rather than prose.
 8. The pessimistic estimator returns **≥** `est_tokens` for the same text, on both prose and a
-   JSON-heavy tool schema.
+   JSON-heavy tool schema, and its DIVISOR is pinned from both sides — `≥ chars/3` and
+   `≤ chars/3` rounded up. The strict inequality alone is not enough: `div_ceil(4)` still beats
+   floor-division by a token on most lengths, so the sign of the difference says nothing about its
+   size, which is the whole point.
+
+8b. `est_input_tokens` counts every part of what the provider is sent — system prompt, message
+   bodies, an assistant turn's `tool_calls` (name AND arguments), and each tool's name, description
+   and JSON schema — each term proven by deleting it alone.
 9. `est_tokens`'s existing window-fit behaviour is unchanged (its own tests still pass untouched).
 10. The clamp-bit signal fires when `output_tokens == allowance` and not otherwise.
 11. The estimate-wrong signal fires when `input_tokens > est_input` and not otherwise.
