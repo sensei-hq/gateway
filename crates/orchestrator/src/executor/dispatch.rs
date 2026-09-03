@@ -296,6 +296,23 @@ impl Executor {
                     // already built and already documented.
                     return Ok(Err(Refusal::BudgetExhausted { spent, budget: cap }));
                 }
+                // The MODEL's own output limit, which the allowance knows nothing
+                // about. `allowance` is a pure budget figure: for any realistic
+                // whole-run cap it is far larger than any model's maximum output, and
+                // the providers do not shrug that off — Anthropic answers a 400
+                // `invalid_request_error`, and every adapter here forwards `max_tokens`
+                // verbatim. Without this bound, setting a budget would hard-FAIL the
+                // first call of a run that succeeds unbudgeted: the clamp causing the
+                // failure it exists to prevent.
+                //
+                // `None` (an unknown chain, or one with no resolvable models) means "no
+                // ceiling from here", matching how `over_budget` treats an unknown
+                // context window — a missing catalog entry must not silently truncate
+                // every reply, and the budget allowance still bounds the call.
+                let ceiling = match request.chain.as_deref() {
+                    Some(chain) => self.gateway.min_max_output_tokens(chain).await,
+                    None => None,
+                };
                 let mut r = request.clone();
                 if let Payload::Chat { max_tokens, .. } = &mut r.payload {
                     // NEVER widen: a caller's own limit wins whenever it is lower. A
@@ -305,11 +322,14 @@ impl Executor {
                     // producer passes `None` today, so this guards a future caller
                     // rather than a present one.
                     //
-                    // `u32::MAX` on an allowance too large for the `u32` field is the
-                    // safe saturation: it is a ceiling of "no lower than the provider's
-                    // own default", and a budget with more than 4 billion tokens left is
-                    // not the case this exists to constrain.
+                    // `u32::MAX` on an allowance too large for the `u32` field: this is
+                    // saturation of the u64→u32 conversion ONLY, not a claim that
+                    // `u32::MAX` is ever emitted. The `min` with `ceiling` on the next
+                    // line is what actually bounds it whenever the chain resolves, and a
+                    // budget with more than 4 billion tokens left is not the case the
+                    // budget half exists to constrain anyway.
                     let want = u32::try_from(allowance).unwrap_or(u32::MAX);
+                    let want = ceiling.map_or(want, |limit| want.min(limit));
                     *max_tokens = Some(max_tokens.map_or(want, |caller| caller.min(want)));
                 }
                 clamped = r;

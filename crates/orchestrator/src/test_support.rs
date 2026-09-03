@@ -157,8 +157,24 @@ impl ChatModel for RecordingAdapter {
     }
 }
 
+/// The fixture chain's model output limit, and the ceiling the SP-DATA-5 clamp must
+/// respect.
+///
+/// Named rather than repeated because two places must agree on it and a drift between
+/// them would make the ceiling test pass for the wrong reason: `single_chain_config`
+/// declares it as the model's `max_output_tokens` (what
+/// [`Gateway::min_max_output_tokens`](sensei_gateway::Gateway::min_max_output_tokens)
+/// reads), and [`ClampObservingAdapter`] enforces it as the provider would.
+///
+/// 1024 is the value the real cloud adapters in this repo substitute for a `None`
+/// `max_tokens` (`cloud-providers/src/anthropic/mod.rs:27`, `gemini.rs:43`,
+/// `bedrock/mod.rs:62`), which makes it a realistic figure for the fixture even though
+/// nothing here depends on the coincidence.
+pub const FIXTURE_MAX_OUTPUT_TOKENS: u32 = 1024;
+
 /// The shared single-chain `GatewayConfig` for the test harness: chain `"c"`
-/// resolves `TextChat` to router `"r"` / model `"m"` (context window 4096).
+/// resolves `TextChat` to router `"r"` / model `"m"` (context window 4096,
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`] of output).
 /// Factored out of `build_gateway` so `scripted_gateway` (a different adapter,
 /// same topology) doesn't duplicate the routers/models/chains assembly.
 fn single_chain_config() -> GatewayConfig {
@@ -185,7 +201,7 @@ fn single_chain_config() -> GatewayConfig {
             family: None,
             capabilities: vec![Capability::TextChat],
             context_window: 4096,
-            max_output_tokens: 1024,
+            max_output_tokens: FIXTURE_MAX_OUTPUT_TOKENS,
             pricing: None,
             catalog: None,
         },
@@ -404,12 +420,22 @@ pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 /// stops GENERATING at `max_tokens`, so `output_tokens` lands at or below it. `min` is
 /// the same observable, without pretending to know where a real reply would have
 /// ended.
+///
+/// The one place it does model a provider faithfully is `max_output`: a real provider
+/// REJECTS a `max_tokens` above the model's own output limit rather than quietly
+/// honouring it (Anthropic answers a 400 `invalid_request_error`), and every adapter in
+/// this repo forwards the value verbatim. A double that accepted any number would let
+/// the clamp emit a request no real provider would run, which is exactly the regression
+/// the whole-slice review found.
 pub struct ClampObservingAdapter {
     seen: MaxTokensLog,
     input_tokens: u32,
     /// What the model WOULD emit unclamped; the reported output is capped by
     /// `max_tokens`.
     scripted_output: u32,
+    /// The model's own output limit. A request asking for more is REFUSED, as a real
+    /// provider refuses it — see the struct doc.
+    max_output: u32,
 }
 
 impl Model for ClampObservingAdapter {
@@ -429,6 +455,17 @@ impl ChatModel for ClampObservingAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(req.max_tokens);
+        if req.max_tokens.is_some_and(|m| m > self.max_output) {
+            return Err(GatewayError::ProviderError {
+                adapter: "r".into(),
+                message: format!(
+                    "max_tokens: {} > {}, the maximum output tokens for this model",
+                    req.max_tokens.unwrap_or_default(),
+                    self.max_output
+                ),
+                status: Some(400),
+            });
+        }
         let output_tokens = match req.max_tokens {
             Some(cap) => self.scripted_output.min(cap),
             None => self.scripted_output,
@@ -447,9 +484,10 @@ impl ChatModel for ClampObservingAdapter {
     }
 }
 
-/// A gateway on chain `"c"` whose adapter records and honours `max_tokens`. Returns
-/// the shared log so a test can assert what actually reached the provider — see
-/// [`ClampObservingAdapter`] for why both halves matter.
+/// A gateway on chain `"c"` whose adapter records and honours `max_tokens`, and
+/// refuses one above [`FIXTURE_MAX_OUTPUT_TOKENS`] the way a real provider does.
+/// Returns the shared log so a test can assert what actually reached the provider —
+/// see [`ClampObservingAdapter`] for why each half matters.
 pub async fn clamp_observing_gateway(
     input_tokens: u32,
     scripted_output: u32,
@@ -461,6 +499,7 @@ pub async fn clamp_observing_gateway(
             seen: seen.clone(),
             input_tokens,
             scripted_output,
+            max_output: FIXTURE_MAX_OUTPUT_TOKENS,
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
@@ -975,10 +1014,25 @@ mod tests {
             "with no max_tokens the full scripted output is reported"
         );
 
+        // And the third half: a `max_tokens` above the model's own output limit is
+        // REFUSED, as a real provider refuses it. This is what makes
+        // `a_budgeted_call_is_never_clamped_above_the_models_output_limit` a claim about
+        // the provider's contract rather than about a number the double invented.
+        let refused = gw
+            .execute(&chat_request(Some(FIXTURE_MAX_OUTPUT_TOKENS + 1)))
+            .await
+            .expect_err("a max_tokens above the model's output limit is rejected");
+        assert!(
+            refused.to_string().contains("max_tokens"),
+            "the refusal names the offending parameter, as a provider 400 does: {refused}"
+        );
+
         assert_eq!(
             *seen.lock().unwrap_or_else(|e| e.into_inner()),
-            vec![Some(64), None],
-            "both calls are recorded, in order, with the max_tokens each carried"
+            vec![Some(64), None, Some(FIXTURE_MAX_OUTPUT_TOKENS + 1)],
+            "all three calls are recorded, in order, with the max_tokens each carried — \
+             including the refused one, so a test can tell 'never sent' from 'sent and \
+             rejected'"
         );
     }
 }
