@@ -11974,20 +11974,31 @@ async fn shell_stdout_is_redacted() {
 /// first call, so no call goes out at all and a test asserting anything about the
 /// `spent >= cap` gate never reaches it.
 ///
-/// So each of those fixtures had its token magnitudes multiplied by a common factor —
-/// ten, except for `spending_exactly_the_cap_stops_the_run`, which needs its two calls
-/// to land exactly on the cap and so uses 16/3 (75→400 against 150→800). Every ratio, call
-/// count, pause site and reason string they assert is unchanged; only the absolute
-/// numbers moved, into the regime where the floor-trigger really is the binding
-/// constraint. This is the clamp design's §6 accepted cost — "a run can now pause
-/// where it previously completed" — meeting a suite written before a floor existed.
+/// So each of those fixtures had its token magnitudes multiplied by ten, with two
+/// exceptions that are worth naming because a reader auditing the factor against the
+/// diff will otherwise find it contradicted:
+///
+/// - `spending_exactly_the_cap_stops_the_run` uses **16/3** (75→400 against 150→800),
+///   because its two calls must land exactly on the cap.
+/// - `a_re_driven_selector_replays_its_call_instead_of_respending` scales its per-call
+///   usage by ten but its cap by **fifty** (100→5000). Ten would leave the second of its
+///   five drives with 230 tokens — under the floor — so the run would pause before the
+///   assertions the test exists for; see its own comment.
+///
+/// Every ratio, call count, pause site and reason string they assert is unchanged; only
+/// the absolute numbers moved, into the regime where the floor-trigger really is the
+/// binding constraint. This is the clamp design's §6 accepted cost — "a run can now
+/// pause where it previously completed" — meeting a suite written before a floor
+/// existed.
 ///
 /// The gate itself was NOT weakened to accommodate any of this, and that was checked by
 /// mutation rather than asserted: delete the `spent >= cap` block from
-/// `dispatch_metered` and `a_fresh_budgeted_run_pauses_mid_drive_after_one_call` fails
-/// with "attempt to subtract with overflow" on the clamp's `cap - spent`. One thing the
-/// clamp DID cost is recorded on `spending_exactly_the_cap_stops_the_run`, whose
-/// `>=`-versus-`>` mutation no longer bites.
+/// `dispatch_metered` and eleven tests redden — nine with "attempt to subtract with
+/// overflow" on the clamp's `cap - spent`, plus
+/// `a_non_chat_payload_is_gated_but_not_clamped` (a payload the clamp skips, so the gate
+/// is the only thing left) and `spending_exactly_the_cap_stops_the_run` (whose reason
+/// assertion now tells the gate's message from the floor's). The `>=`-versus-`>`
+/// boundary is pinned by both of those, from opposite sides.
 fn run_started_with_budget(cap: u64) -> JournalEvent {
     JournalEvent::RunStarted {
         version: "v1".into(),
@@ -12414,13 +12425,19 @@ async fn the_planner_selector_journals_its_spend_to_the_ledger() {
 /// The two assertions are the two halves of that: the run stops dispatching, and what
 /// it did dispatch is fully accounted for.
 ///
-/// *Mutation:* drop the `fold.memo` lookup from `SelectorDispatch::complete` and this
-/// goes red on both (5 calls, ledger 770).
+/// *Mutation:* drop the `fold.memo` lookup from `SelectorDispatch::complete` and both
+/// go red — the dispatch count first, at `left: 5, right: 1`, and the ledger behind it
+/// at `left: 770, right: 3850`, which is the frozen-ledger defect itself: five billed
+/// calls, one effect id, `usage.insert` keyed rather than summed.
 #[tokio::test]
 async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
-    // 10x the original fixture (77/call against a cap of 100): a cap under the clamp's
-    // floor refuses the selector's FIRST call, so there would be nothing journaled for
-    // the later drives to replay. See [`run_started_with_budget`].
+    // 10x the original fixture's per-call usage (77 against a cap of 100), but a cap of
+    // 5000 rather than 1000, and that is not cosmetic. At 1000 the SECOND drive has only
+    // 230 tokens left, under the clamp's 256-token floor, so under the mutation this
+    // test documents the run PAUSES on drive 1 and neither assertion below is ever
+    // reached — the guard would be an incidental `out.failed.is_some()` in the loop.
+    // 5000 keeps all five drives clear of the floor, which is what makes the documented
+    // failure (5 calls, ledger 770) the real one. See [`run_started_with_budget`].
     let (gateway, calls) = metered_latency_gateway(
         Some(kernel::types::cost::TokenUsage {
             input_tokens: 70,
@@ -12436,9 +12453,11 @@ async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
     let graph = Graph {
         nodes: vec![expand_select_node("e", vec![])],
     };
-    // A 1000-token cap: ONE 770-token selector call fits, a second must not happen.
+    // A 5000-token cap: it comfortably affords all five drives, so nothing but the memo
+    // can hold the dispatch count at one. The BUDGET is not the guard here — it is the
+    // thing the guard protects.
     journal
-        .append(run, run_started_with_budget(1_000))
+        .append(run, run_started_with_budget(5_000))
         .await
         .unwrap();
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
@@ -13004,7 +13023,7 @@ async fn a_round_boundary_snapshot_carries_the_spend_ledger_and_the_cap() {
 /// rather than spent blind (mirrors the sandbox/`shell`/fence precedent of never
 /// trusting an unenforceable boundary). `recording_gateway` always returns
 /// `usage: None`, so the very first call trips `Refusal::Unmetered` even though
-/// the budget itself is nowhere near exhausted (spent 0 < cap 10_000) — proving the
+/// the budget itself is nowhere near exhausted (spent 0 < cap 1_000) — proving the
 /// refusal is about METERABILITY, not the cap.
 ///
 /// The cap must sit clear of the clamp's floor for that premise to hold at all: below
@@ -13012,6 +13031,10 @@ async fn a_round_boundary_snapshot_carries_the_spend_ledger_and_the_cap() {
 /// is never produced. See [`run_started_with_budget`].
 #[tokio::test]
 async fn an_unmetered_call_fails_the_node_when_a_budget_is_set() {
+    // 10x the original cap of 100, the same factor as every other rescaled budget
+    // fixture. Nothing here depends on the magnitude beyond clearing the clamp's floor:
+    // this test is about METERABILITY, and the cap is never approached.
+
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
@@ -13023,7 +13046,7 @@ async fn an_unmetered_call_fails_the_node_when_a_budget_is_set() {
         }],
     };
     journal
-        .append(run, run_started_with_budget(10_000))
+        .append(run, run_started_with_budget(1_000))
         .await
         .unwrap();
 
@@ -13331,30 +13354,34 @@ async fn the_consolidate_producer_journals_its_reported_usage() {
 /// cap: two calls at 400 tokens against a cap of 800 means node 3 sees `spent == cap`
 /// and must be stopped.
 ///
-/// # The SP-DATA-5 clamp took this test's mutation away
+/// # The clamp took this test's mutation away, and the floor's own wording gave it back
 ///
-/// The claim this comment used to make — "`spent >= cap` → `spent > cap` and this
-/// fails with three calls and a completed run" — is **no longer true**, and it was
-/// re-run to confirm that rather than reasoned about. UNDER THAT MUTATION node 3 falls
-/// through to the clamp, sees `allowance = (cap − spent) − est = 0`, which is below
-/// `MIN_OUTPUT_TOKENS`, and is refused with the *same*
-/// `BudgetExhausted { spent: 800, budget: 800 }` the gate would have produced. (In the
-/// UNMUTATED build the gate returns first and the clamp's floor is never reached here
-/// at all.) The two arms are observationally identical for a `Chat` payload, so the
-/// mutation leaves this green.
+/// The claim this comment carried when the clamp landed — "`spent >= cap` → `spent >
+/// cap` and this fails with three calls and a completed run" — was wrong twice over, and
+/// both were established by running it rather than reasoning about it.
 ///
-/// That is defence in depth rather than lost safety — the boundary is refused either
-/// way — but it does mean this test no longer distinguishes `>` from `>=`, and deleting
-/// the `spent >= cap` block entirely does not redden it either: nine other tests panic
-/// with "attempt to subtract with overflow" on the clamp's `cap - spent` (which is why
-/// that subtraction is deliberately not saturating), and this one is not among them.
+/// Under that mutation the run is still refused, and never gets a third call: node 3
+/// falls THROUGH the gate into the clamp, whose floor sees
+/// `allowance = (cap − spent) − est = 0`. (In the unmutated build the gate returns first
+/// and the floor is never reached here at all.) While the floor reused the gate's
+/// message the two were indistinguishable and the mutation left this green — which is
+/// what the clamp cost. Now that the floor names its own cause, the same mutation fails
+/// this test's REASON assertion:
 ///
-/// A test that can still tell `>` from `>=` needs a payload the clamp SKIPS — a
-/// non-`Chat` one, where the gate is the only thing standing between the run and the
-/// provider. That is now
-/// [`a_non_chat_payload_is_gated_but_not_clamped`], which lands an `Embed` exactly on
-/// the cap and is mutation-proven against `>`. This test keeps the `Chat` half of the
-/// boundary: on the cap, a budgeted run stops.
+/// ```text
+/// the reason reports the boundary honestly: budget: only 0 tokens left for output
+/// after the input estimate, below the 256-token floor (800 of 800 spent); ...
+/// ```
+///
+/// So the `Chat` boundary is pinned again, by the wording rather than by the call count.
+/// Deleting the `spent >= cap` block entirely reddens this test for the same reason, and
+/// ten others besides — nine with "attempt to subtract with overflow" on the clamp's
+/// `cap - spent`, which is why that subtraction is deliberately not saturating.
+///
+/// [`a_non_chat_payload_is_gated_but_not_clamped`] pins the same boundary from the other
+/// side, on an `Embed` — the one payload the clamp SKIPS, where the gate is the only
+/// thing between a budgeted run and the provider, so the refusal itself is the
+/// observable and no message needs to be read.
 #[tokio::test]
 async fn spending_exactly_the_cap_stops_the_run() {
     // 400/call against a cap of 800, scaled up from 75 against 150. The RATIO is what
@@ -13438,7 +13465,8 @@ async fn spending_exactly_the_cap_stops_the_run() {
 ///
 /// Mutation-verified two ways: seed the fresh fold with `Fold::default()` (dropping the
 /// budget) or hand the chokepoint `fold.spent()` instead of the live meter, and this
-/// fails with all three nodes completed and 450 tokens spent against a cap of 100.
+/// fails at `left: 3, right: 1` — all three nodes dispatched, three calls' worth of
+/// spend against a cap one call already exceeds.
 #[tokio::test]
 async fn a_fresh_budgeted_run_pauses_mid_drive_after_one_call() {
     // 10x the original fixture (cap 100, 150/call): a cap under the clamp's floor never
@@ -13645,12 +13673,13 @@ const FANOUT_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
 /// dispatches NO child and the concurrency claim below becomes vacuous. See
 /// [`run_started_with_budget`].
 ///
-/// Exactly ONE call may escape — the floor-trigger bound of §6.5. Before the fix this
-/// produced **6 calls, 900 tokens, `Completed`, zero pauses**: every child read the
-/// ledger while the others were still awaiting the provider.
+/// Exactly ONE call may escape — the floor-trigger bound of §6.5. Before the fix every
+/// child read the ledger while the others were still awaiting the provider, so **all six
+/// dispatched, the run `Completed`, and it paused not once** — the full 6x spend against
+/// a cap one call exceeds.
 ///
-/// *Mutation:* drop the `budget.is_some()` serial gate from `dispatch_metered` and
-/// this fails with 6 calls and a completed run.
+/// *Mutation:* drop the `budget.is_some()` serial gate from `dispatch_metered` and this
+/// fails at `left: 6, right: 1`.
 #[tokio::test]
 async fn a_budgeted_map_fanout_dispatches_exactly_one_child_before_the_gate_fires() {
     let (gateway, calls) = metered_latency_gateway(
