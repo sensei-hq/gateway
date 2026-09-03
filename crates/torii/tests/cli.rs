@@ -516,6 +516,14 @@ fn gate_help_lists_all_three_verbs() {
 /// The `--note` half is the second claim: `decide` REFUSES that flag on a loop gate rather
 /// than dropping it, and a flag that is rejected by one of the two kinds a command serves
 /// has to say so where the flag is documented.
+///
+/// **That half was keyed on the bare word `note` and could not fail.** Clap prints
+/// `--note <NOTE>` on `decide --help` whatever the doc says, and the group help's `--as`
+/// paragraph already contains "a decision note is not a credential channel" — so with EVERY
+/// mention of the loop gate's refusal deleted from both surfaces, `contains("note")` still
+/// passed on both (measured, by stripping them and reading the built binary's stdout). It is
+/// keyed on `records no note` now, which is the sentence both surfaces actually carry and
+/// which nothing else in either help says.
 #[test]
 fn gate_help_names_the_loop_gate_it_can_now_decide() {
     for args in [
@@ -533,9 +541,10 @@ fn gate_help_names_the_loop_gate_it_can_now_decide() {
             args.join(" ")
         );
         assert!(
-            lower.contains("note"),
-            "`{}` must document the flag a loop gate refuses, on the surface an operator \
-             reads before typing it:\n{text}",
+            lower.contains("records no note"),
+            "`{}` must say that a loop gate RECORDS NO NOTE and refuses the flag, on the \
+             surface an operator reads before typing it — the bare word `note` is not a \
+             key, clap prints `--note <NOTE>` here regardless:\n{text}",
             args.join(" ")
         );
     }

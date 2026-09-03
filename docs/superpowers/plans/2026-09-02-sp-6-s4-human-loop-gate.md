@@ -2954,6 +2954,17 @@ code or the record:
    `agent_help_does_not_enumerate_the_waiting_kinds_as_three`, in the shape
    `agent_help_names_the_question_list_paused_now_shows` established for this recurring drift.
 
+   > **CORRECTION (verification round).** The `--note` half of the first guard was keyed on
+   > the bare word `note` and could not fail: clap prints `--note <NOTE>` on `decide --help`
+   > whatever the doc says, and the group help's `--as` paragraph already contains "a
+   > decision note is not a credential channel". Measured by deleting every mention of the
+   > loop gate's refusal from both surfaces and reading the built binary's stdout —
+   > `contains("note")` still passed on both, so the drift this guard exists to catch would
+   > have gone through it. Re-keyed on `records no note`, the sentence both surfaces actually
+   > carry; rewording it alone now reddens the test. The `loop` half was already falsifiable
+   > on both surfaces, but on `decide --help` it rides entirely on the `--note` arg doc,
+   > which is the only place that word appears there.
+
 **And the guards for properties that were correct and held by nothing** — each added, then
 proved by mutating the source, watching the new test redden, and reverting:
 `a_secret_shaped_loop_gate_question_is_redacted_in_the_listing` (the SECOND
@@ -2966,7 +2977,21 @@ independently, one mutation each);
 `an_overlong_loop_gate_question_is_capped_but_still_shows_the_ask` plus an empty-label
 assertion in `a_reserved_question_cell_is_still_bounded_and_falls_back_cleanly` (the `## Task`
 reserve's `0 + 2` branch is taken by every REAL loop gate and by no test — a probe showed
-every test reaching that arm passed `"agent: "`); the exact widened header line plus
+every test reaching that arm passed `"agent: "`);
+
+> **CORRECTION (verification round).** The empty-label assertion is the ONE item in this
+> list whose "proved by mutating the source" does not hold as written. It shipped as
+> `cell.chars().count() <= QUESTION_MAX`, and the only mutation that direction catches is an
+> UNDER-count — which the `"agent: "` assertion at the top of the same test already catches,
+> and catches FIRST. Re-measured: reverting `overhead` to the pre-generalisation hardcoded
+> `"agent: \"\"".chars().count()`, i.e. the actual regression the generalisation exists to
+> prevent, over-counts the empty label by 7, renders 293 of a 300 budget, and left all 259
+> torii lib tests GREEN. Its comment also named that over-count as the case that "would push
+> the cell past `QUESTION_MAX`", which is backwards — over-counting makes the cell shorter.
+> Both corrected: the assertion is now `assert_eq!(…, QUESTION_MAX)`, which is red in both
+> directions (293 ≠ 300 measured on the revert), and the comment says what is true.
+
+the exact widened header line plus
 `a_gate_only_fleets_header_keeps_the_s2_wording` (forcing `any_loop_gate` either way left the
 suite green); the `--json` assertions on the fourth `AwaitingNode` shape; `contains("Loop's
 human gate")` on both cross-refusals (rewriting both arms to "a HumanGate" left the suite
