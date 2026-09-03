@@ -285,6 +285,32 @@ pub fn est_tokens(s: &str) -> usize {
     s.chars().count() / 4
 }
 
+/// A deliberately pessimistic token estimate, for the BUDGET path only.
+///
+/// [`est_tokens`]'s `chars / 4` is the standard rough figure for English prose. The
+/// orchestrator's prompts are not mostly English prose: they carry JSON tool schemas and
+/// a `## Context` section rendered from upstream outputs, and JSON tokenizes nearer 3
+/// chars/token. So `chars / 4` UNDER-counts precisely where these prompts are heaviest.
+///
+/// Under-counting is harmless for `est_tokens`'s own caller — [`over_budget`], a
+/// window-fit check that logs and proceeds — and harmful for the budget clamp, which
+/// computes `max_tokens = remaining − est`: an estimate that is too low leaves an
+/// allowance that is too high, and the cap is overshot by the error. This function
+/// inverts the bias, so it is wrong in the direction of refusing early rather than
+/// overspending. It does not make the overshoot zero (the clamp design's §4 writes out
+/// the arithmetic); it bounds it by the remaining estimate error.
+///
+/// `chars / 3` rather than a multiplier on `est_tokens`, so the two are independent: a
+/// later change to the window-fit heuristic must not silently move the budget's floor.
+/// Neither is a real tokenizer — a real one needs a per-model vocabulary and a per-chain
+/// mapping, and would still need a heuristic like this as its fallback for an unknown
+/// model, so it is additional work on top of this rather than instead of it.
+///
+/// Rounds UP, so any non-empty text costs at least one token, and `""` costs none.
+pub fn est_tokens_pessimistic(s: &str) -> usize {
+    s.chars().count().div_ceil(3)
+}
+
 /// True when the assembled prompt (system + messages + tool schemas) is estimated
 /// to exceed the chain's smallest context window. An unknown window (`None`) is
 /// never a hard fail — the caller logs and proceeds.
@@ -700,6 +726,50 @@ mod tests {
     #[test]
     fn est_tokens_is_chars_over_four() {
         assert_eq!(est_tokens("abcdefgh"), 2); // 8 chars / 4
+    }
+
+    /// The budget estimate is never below the window-fit one, on prose AND on the
+    /// JSON-heavy text that is the whole reason it exists.
+    ///
+    /// `est_tokens` is `chars / 4`. English prose is roughly that; JSON tool schemas
+    /// and materialized `## Context` outputs tokenize nearer 3 chars/token, so
+    /// `chars / 4` UNDER-counts exactly where the orchestrator's prompts are heaviest.
+    /// The clamp computes `allowance = remaining − est`, so clamping on an under-count
+    /// leaves too large an allowance and overshoots the cap by the error — the budget
+    /// path needs the bias inverted.
+    ///
+    /// `>=` on every input and STRICTLY `>` on the JSON one: `>=` alone would pass for
+    /// a function that just delegated to `est_tokens`, which is the obvious wrong
+    /// implementation and the one that silently reintroduces the under-count.
+    #[test]
+    fn the_pessimistic_estimate_is_never_below_the_window_fit_one() {
+        let prose = "The quick brown fox jumps over the lazy dog, repeatedly and at length.";
+        let json = r#"{"name":"fs_write","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string"}},"required":["path","contents"]}}"#;
+        for s in [prose, json, "", "a"] {
+            assert!(
+                est_tokens_pessimistic(s) >= est_tokens(s),
+                "pessimistic must not undercut the window-fit estimate for {s:?}: {} < {}",
+                est_tokens_pessimistic(s),
+                est_tokens(s)
+            );
+        }
+        assert!(
+            est_tokens_pessimistic(json) > est_tokens(json),
+            "and must be strictly higher on JSON, which is the case it exists for: {} vs {}",
+            est_tokens_pessimistic(json),
+            est_tokens(json)
+        );
+    }
+
+    /// The empty string costs nothing under either estimate.
+    ///
+    /// The boundary is worth its own test because the clamp subtracts this value:
+    /// rounding UP is right for every non-empty input and wrong for the empty one, so
+    /// a `div_ceil` on a length that had been nudged (a `+1`, a `max(1)`) would charge
+    /// a token for a system prompt that is not there.
+    #[test]
+    fn the_pessimistic_estimate_of_nothing_is_zero() {
+        assert_eq!(est_tokens_pessimistic(""), 0);
     }
 
     #[test]
