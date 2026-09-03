@@ -979,7 +979,7 @@ cap + (actual_input - est_input). Unclamped that run would have spent
 
 ### Task 9: Docs and the release gate
 
-- [ ] **Step 1: Full verification, real exit codes**
+- [x] **Step 1: Full verification, real exit codes**
 
 ```bash
 cargo test --workspace > /tmp/gate1.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/gate1.log | awk '{p+=$4; f+=$6; i+=$8} END {print "passed="p" failed="f" ignored="i}'
@@ -988,12 +988,20 @@ cargo fmt --all --check; echo "exit=$?"
 ```
 All three must be `exit=0`. Record the counts.
 
-- [ ] **Step 2: Doc-link baseline**
+**Measured at the tip (re-run AFTER this task's own doc edits, not before):** `cargo test
+--workspace` **1682 passed / 0 failed / 56 ignored, exit=0** across 35 suites · `cargo clippy
+--workspace --all-targets -- -D warnings` **exit=0** · `cargo fmt --all --check` **exit=0**. No
+database was started and `$DATABASE_URL` was not read, so the `have_database_url` suites are among
+the 56 ignored — see the round-1 note above for the one budget test that hides there.
+
+- [x] **Step 2: Doc-link baseline**
 
 ```bash
 cargo clean --doc && cargo doc --workspace --no-deps --document-private-items 2>&1 | grep -c 'unresolved link'
 ```
 Expected: **16**, the current baseline. Higher means this slice added broken links — fix them.
+
+**Measured: 16, exactly the baseline**, both before this task's doc edits and again after them.
 
 - [x] **Step 3: Update the SP-DATA-5 spec's §8** — done in review round 2 (`§2` non-goal, `§6.5` amendment note, `§8` entry).
 
@@ -1027,19 +1035,41 @@ bounded by `max_tokens`; the run can refuse before the cap):
 
 So Step 4 is the overview entry only. Re-check the four above rather than assuming.
 
-- [ ] **Step 5: Checkpoint**
+**The re-check was worth doing: it found a FIFTH surface, and the only one whose stale claim was an
+ARGUMENT rather than a description.** `dispatch_metered`'s module doc explains why a budgeted
+fan-out serialises instead of reserving, and its stated reason was "a reservation would need an
+output-token estimate that is unknowable before the call (§8)". **This slice falsified exactly that
+reason** — the clamp gives every budgeted `Chat` an explicit `max_tokens`, so a reservation could
+hold `est_input + max_tokens` and be conservative without predicting anything. The decision is still
+correct, for a reason nothing had written down: that reservation is essentially the WHOLE remaining
+allowance, so the first child to claim it drops every sibling below `MIN_OUTPUT_TOKENS` and they are
+refused rather than queued — safe fan-out that is not concurrent, and strictly worse than
+serialising. Corrected in `dispatch.rs`, in the overview's Critical-1 narrative (which carried the
+same sentence), and recorded as a rejected alternative in the clamp spec's §8.
+
+Worth generalising for the next slice's sweep: grepping for the CLAIM (`overshoot`, `floor-trigger`)
+finds the descriptions, but a stale *justification* survives that grep when it is phrased as a
+reason for some other decision. The four surfaces round 1 fixed were all found by the claim-grep;
+this one was only found by reading what the clamp made newly possible and asking which existing
+"we can't do X because Y" arguments depended on Y.
+
+- [x] **Step 5: Checkpoint**
 
 Rewrite `docs/CHECKPOINT.md` (**under 40 lines**, one current entry): what shipped, the measured
 numbers from Step 1, the next command. Note the sensei daemon is not running, so it is the only
 durable record.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
 git add docs/
 git commit -m "docs: the budget clamp, and the claim it is careful not to make"
 ```
+
+Staged BY NAME rather than `git add docs/`, because this step also touches `dispatch.rs` (the fifth
+surface above) — a directory-wide add would have left that source edit uncommitted while the doc
+claiming it was fixed shipped.
 
 ---
 
