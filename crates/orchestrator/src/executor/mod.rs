@@ -292,13 +292,9 @@ struct Fold {
     /// gate's step type is not a `NodeExec`. Five callers, still ONE reader.
     ///
     /// **There is now a second reader, and it is a different question.**
-    /// [`fail_loop`](Executor::fail_loop) (SP-6 s4 review) asks whether the `Loop`'s own
-    /// `NodeFailed` is ALREADY DURABLE, so that its append is idempotent — a dead run
-    /// otherwise grew a row per wake. It makes no terminality claim whatsoever: the `Loop`
-    /// fails on this drive's own verdict either way, and the map decides only whether a row
-    /// is written. That is why it is not a loosening of the fence below, which is about
-    /// which kinds may treat a recorded failure as FINAL. Any third reader owes the same
-    /// distinction explicitly.
+    /// ([`fail_loop`](Executor::fail_loop) once read THIS map for its idempotence guard.
+    /// It reads [`Fold::failure_messages`] instead — see that field for why FIRST-wins is
+    /// the wrong question to ask about "is this row already written".)
     ///
     /// The fence is on the READER, not on the caller count — which is why the count growing
     /// is not a loosening: a further
@@ -313,6 +309,24 @@ struct Fold {
     /// generalization is refused: only a node kind whose failure is by definition
     /// irreversible — a deadline that has passed — may read it.
     failed: HashMap<NodeId, String>,
+    /// SP-6 s4 (whole-slice review): every DISTINCT `NodeFailed.error` already journaled
+    /// for a node, so an append can ask "is THIS row already durable?".
+    ///
+    /// [`Fold::failed`] cannot answer that question and must not be changed to: it is
+    /// FIRST-wins on purpose, so the verdict a resume reads back is the one the run
+    /// actually stopped on, and every waiting kind's `gate_precheck` depends on that. But a
+    /// node may legitimately fail more than once with DIFFERENT causes — a `ModelCall` or
+    /// `Agent` whose provider died re-attempts on resume, and `ready_nodes` works off the
+    /// per-drive `DriveState`, which never consults `failed`. Keying an idempotence guard
+    /// on the first message therefore did one of two wrong things depending on how it was
+    /// written: suppress the new cause forever (presence), or append it on every wake
+    /// (equality against the first). Both were measured while fixing the other.
+    ///
+    /// Read by [`fail_loop`](Executor::fail_loop) alone, and it makes NO terminality claim:
+    /// the `Loop` fails on this drive's own verdict either way, and this set decides only
+    /// whether a row is written. That is why it is not a loosening of [`Fold::failed`]'s
+    /// fence, which is about which kinds may treat a recorded failure as FINAL.
+    failure_messages: HashMap<NodeId, std::collections::HashSet<String>>,
     /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
     /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
     /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
@@ -463,6 +477,14 @@ impl Fold {
     /// read makes no terminality claim — see `fail_loop`'s own doc.
     fn failure_for(&self, node: &NodeId) -> Option<&str> {
         self.failed.get(node).map(String::as_str)
+    }
+
+    /// Has this exact `NodeFailed` row already been journaled for `node`? See
+    /// [`Fold::failure_messages`] — the idempotence question, never the terminality one.
+    fn has_failure_message(&self, node: &NodeId, message: &str) -> bool {
+        self.failure_messages
+            .get(node)
+            .is_some_and(|seen| seen.contains(message))
     }
 
     /// SP-6 s2: the decision folded for this `HumanGate`, if a human has answered.

@@ -19717,6 +19717,98 @@ mod human_loop_gate {
         }
     }
 
+    /// The other side of that guard: a Loop that fails again for a DIFFERENT reason must
+    /// record the new cause. SP-6 s4 whole-slice review, Minor.
+    ///
+    /// `fail_loop`'s guard was keyed on the mere PRESENCE of a `NodeFailed` for the `Loop`,
+    /// which is right for the case it was written for — a human gate's verdict is terminal,
+    /// so every later wake re-derives the same message and must not append it again — and
+    /// wrong for the two paths beside it. A body-iteration failure and a gate-AGENT failure
+    /// are explicitly NON-terminal ("a `ModelCall` or `Agent` whose provider died
+    /// re-attempts on resume"), `DriveState` is per-drive and `ready_nodes` does not consult
+    /// `fold.failed`, so a `Loop` that failed once is re-driven, can succeed, and can later
+    /// fail for a wholly different cause — at which point the durable record kept the FIRST
+    /// message forever.
+    ///
+    /// The journal, `on_node_failed` and everything folding `NodeFailed` then attribute the
+    /// run's death to a stale transient provider error rather than to a missed human SLA.
+    /// `RunOutcome.failed` is correct in-process and the gate's own row carries the truth,
+    /// so this is diagnostic fidelity rather than control flow — but the durable record is
+    /// the one an audit reads. The guard is keyed on the MESSAGE now: identical ⇒ nothing
+    /// to add, different ⇒ a genuinely new cause lands.
+    ///
+    /// The stale row is journaled directly rather than produced by a flaky gateway: the
+    /// state under test is "a `NodeFailed` for this `Loop` with some OTHER message already
+    /// exists", and forging it is exactly that state with no dependence on how a provider
+    /// happens to word an error.
+    #[tokio::test]
+    async fn a_loop_that_dies_of_a_new_cause_does_not_keep_reporting_the_old_one() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+        let graph = human_gated_loop_graph_with_dependent(3);
+
+        // Drive 1 leaves the earlier, TRANSIENT cause on the record — the shape a body
+        // iteration produces when a provider 500s — and the gate then asks.
+        journal
+            .append(
+                run,
+                JournalEvent::NodeFailed {
+                    node: lp(),
+                    error: "loop \"lp\" failed at iteration 0: upstream gateway 503".into(),
+                },
+            )
+            .await
+            .unwrap();
+        ex.start(run, &graph).await.expect("pauses on the gate");
+
+        // Nobody answers, and the SLA fires.
+        clock.set(at(1_000) + Duration::hours(2));
+        let out = ex
+            .start(run, &graph)
+            .await
+            .expect("drives past the deadline");
+        let (_, reported) = out.failed.clone().expect("the gate killed the Loop");
+        assert!(
+            reported.contains("human gate") && reported.contains("deadline"),
+            "precondition: the in-process outcome names the real cause: {reported}"
+        );
+
+        let journaled: Vec<String> = journal
+            .load(run)
+            .await
+            .expect("loads")
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::NodeFailed { node, error } if node == &lp() => Some(error.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            journaled.iter().any(|e| e.contains("human gate")),
+            "the DURABLE record must name the missed SLA too — it is what `torii run \
+             status`, `on_node_failed` and an audit read, and suppressing it leaves the \
+             run's death attributed to a transient error it recovered from: {journaled:?}"
+        );
+
+        // And the growth guard still holds: the same cause, re-derived on every later
+        // wake, is written once.
+        let after = rows(&journal.load(run).await.expect("loads"));
+        for wake in 1..=2 {
+            ex.start(run, &graph).await.expect("re-drives");
+            assert_eq!(
+                rows(&journal.load(run).await.expect("loads")),
+                after,
+                "wake {wake}: an unchanged verdict appends nothing, of any kind"
+            );
+        }
+    }
+
     /// AC7 — the menu comes from the JOURNAL, never from the graph (design §5.3).
     ///
     /// Mutating the graph between the ask and the decision must not change what the answer
