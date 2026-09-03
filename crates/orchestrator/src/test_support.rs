@@ -381,6 +381,91 @@ pub async fn metered_latency_gateway(
     (Gateway::new(single_chain_config(), adapters, cb), calls)
 }
 
+/// One entry per call: the `max_tokens` that call's request carried.
+/// See [`ClampObservingAdapter`].
+pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
+
+/// Records the `max_tokens` each call carried, and HONOURS it in the usage it reports
+/// — `output_tokens = min(scripted_output, max_tokens)`.
+///
+/// Both halves are load-bearing, and neither existing double has either. Every other
+/// adapter in this module logs `(model, prompt)` at most, so before this one **no test
+/// in the suite could see a clamp at all**.
+///
+/// Recording is what lets a test assert the clamp was applied. Honouring is what makes
+/// "a budgeted run does not exceed its cap" a real end-to-end claim rather than an
+/// assertion about a number we invented: a double that reported `scripted_output`
+/// regardless of `max_tokens` would let the whole clamp be deleted with the suite
+/// green, because the only thing left checking it would be a test reading back the
+/// value it had just watched us compute.
+///
+/// It is a stand-in for a provider's behaviour, not a model of one: a real provider
+/// stops GENERATING at `max_tokens`, so `output_tokens` lands at or below it. `min` is
+/// the same observable, without pretending to know where a real reply would have
+/// ended.
+pub struct ClampObservingAdapter {
+    seen: MaxTokensLog,
+    input_tokens: u32,
+    /// What the model WOULD emit unclamped; the reported output is capped by
+    /// `max_tokens`.
+    scripted_output: u32,
+}
+
+impl Model for ClampObservingAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl ChatModel for ClampObservingAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        req: &ChatRequest,
+    ) -> Result<ChatResponse, GatewayError> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.max_tokens);
+        let output_tokens = match req.max_tokens {
+            Some(cap) => self.scripted_output.min(cap),
+            None => self.scripted_output,
+        };
+        Ok(ChatResponse {
+            content: Some("canned-response".into()),
+            tool_calls: Vec::new(),
+            usage: Some(TokenUsage {
+                input_tokens: self.input_tokens,
+                output_tokens,
+                total_tokens: self.input_tokens.saturating_add(output_tokens),
+            }),
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway on chain `"c"` whose adapter records and honours `max_tokens`. Returns
+/// the shared log so a test can assert what actually reached the provider — see
+/// [`ClampObservingAdapter`] for why both halves matter.
+pub async fn clamp_observing_gateway(
+    input_tokens: u32,
+    scripted_output: u32,
+) -> (Gateway, MaxTokensLog) {
+    let seen: MaxTokensLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(ClampObservingAdapter {
+            seen: seen.clone(),
+            input_tokens,
+            scripted_output,
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), seen)
+}
+
 /// Chat adapter that replays a scripted queue of responses (one per turn), so a
 /// test can drive a multi-turn ReAct loop: e.g. [turn0: a `calc` tool_call, turn1:
 /// a final text]. Records each call's prompt like `RecordingAdapter`.
@@ -811,5 +896,88 @@ impl FakeClock {
 impl Clock for FakeClock {
     fn now(&self) -> DateTime<Utc> {
         *self.0.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chat request on the fixture chain carrying `max_tokens`, shaped exactly like
+    /// the one the executor's `build_request` compiles a `ModelCall` into — so this
+    /// exercises the same path a real clamped dispatch takes.
+    fn chat_request(max_tokens: Option<u32>) -> InferenceRequest {
+        InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("c".to_string()),
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+        }
+    }
+
+    /// The fixture's own proof, and it is not ceremony: every clamp assertion in the
+    /// executor suite is only as good as this double.
+    ///
+    /// It checks BOTH halves. Recording is what lets a test see the clamp at all —
+    /// and it also proves the value survives `InferenceRequest` → `ChatRequest`
+    /// (`gateway::dispatch::to_chat_request`), which is the precondition that makes
+    /// the clamp observable end-to-end rather than only inside the executor.
+    /// Honouring is what makes "a budgeted run does not exceed its cap" a
+    /// measurement instead of an assertion about a number we invented: a double that
+    /// reported its scripted output regardless would let the clamp be deleted with
+    /// the suite green.
+    ///
+    /// The `None` leg matters too — it is the unbudgeted/additivity path, and a
+    /// fixture that capped output unconditionally would make an unclamped run look
+    /// clamped.
+    #[tokio::test]
+    async fn the_clamp_observing_fixture_records_and_honours_max_tokens() {
+        let (gw, seen) = clamp_observing_gateway(10, 5_000).await;
+
+        let clamped = gw
+            .execute(&chat_request(Some(64)))
+            .await
+            .expect("the fixture chain dispatches");
+        assert_eq!(
+            clamped
+                .usage
+                .expect("the fixture always reports usage")
+                .output_tokens,
+            64,
+            "the scripted 5000 is capped BY max_tokens — without this the double \
+             cannot witness a clamp being honoured"
+        );
+
+        let unclamped = gw
+            .execute(&chat_request(None))
+            .await
+            .expect("the fixture chain dispatches");
+        assert_eq!(
+            unclamped
+                .usage
+                .expect("the fixture always reports usage")
+                .output_tokens,
+            5_000,
+            "with no max_tokens the full scripted output is reported"
+        );
+
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![Some(64), None],
+            "both calls are recorded, in order, with the max_tokens each carried"
+        );
     }
 }
