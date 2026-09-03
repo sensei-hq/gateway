@@ -33,7 +33,8 @@ person's prose is the wrong shape, and §3 records the argument.
 - **Static validation in `validate_dag`** — non-empty menu, unique names, at least one `stops: true`.
 - Two new journal variants, `LoopGateAwaited { node, deadline, prompt, menu }` and
   `LoopGateDecided { node, option, actor }`. New *variants*, so `FORMAT_VERSION` stays 1.
-- Expiry is read **before** the decision, and an expired undecided gate **fails the loop**.
+- Expiry is read **before** the decision, and an **expired** gate **fails the loop** — decided or
+  not. "Undecided" would describe a check the arm deliberately does not make; see §5.2 step 4.
 - The question reuses s3's `assemble_prompt_parts` → `HumanQuestion::compose` through an extracted
   shared seam, so the person sees the iteration output as `## Context` under the same bounds.
 - `torii run gate decide --node "{loop}/{i}/__gate__" --option <name>`; `run list-paused` renders
@@ -180,8 +181,18 @@ Mirrors `run_human_gate` (s2), **not** `run_human_agent` (s3):
    silent continue. `torii` refuses such a name at its own boundary (reciting the menu), so this arm
    is reachable only from a journal not written by `torii` — which is exactly why it must fail rather
    than guess. Defaulting either way would be a decision no human made: to stop, or to spend more.
-4. **Expired, undecided** → `NodeFailed`, which `fanout.rs:560`'s existing arm turns into a failed
-   `Loop`.
+4. **Expired** (decided or not) → `NodeFailed`, which `fanout.rs:560`'s existing arm turns into a
+   failed `Loop`.
+
+   **The arm does not — and must not — check decidedness here**, and this item said "Expired,
+   undecided" until the Tasks 8–9 review caught it. That qualifier IS the s3 ordering §3 exists to
+   refuse: the one-line "fix" that makes the code match it,
+   `Ok(WaitState::Expired(d)) if fold.loop_gate_decision_for(node_id).is_none()`, is exactly what
+   `a_decision_after_the_deadline_does_not_continue_the_loop` reddens on, and a reviewer chasing that
+   red while holding the old wording would conclude the test was wrong. The arm has deliberately not
+   read the fold at this point and structurally cannot know whether a decision exists — see the code
+   comment at `human.rs`'s `Expired` arm, which gets this right and explains why the message names
+   the DEADLINE and never "no decision".
 
 ### 5.3 The menu is read from the journal, never from the graph
 
@@ -311,6 +322,32 @@ sharpest cost in the slice. Two things bound it: the SLA is the role's own
 `backed_by: human { timeout }`, so it is set by the person who owns the role; and `run list-paused`
 surfaces the pending question with its deadline, so the run is visible before the deadline fires.
 
+**And so does an ANSWERED one, if no drive happens between the answer and the deadline.** This
+sentence read "an unanswered gate" alone until the Tasks 8–9 review, and neither bound above touches
+the case: a decision journaled at t0+59m under a 1h SLA, first driven at t0+1h, fails on the
+deadline. Both bounds address an operator who did not answer; this operator did.
+
+The mechanism is structural, not a race. `LoopGateDecided` carries **no timestamp**, so the executor
+cannot tell "answered at +59m" from "answered at +61m" and — by §3's ordering — refuses both rather
+than honouring a late decision it cannot distinguish from an in-time one. Adding a timestamp to the
+event is the obvious alternative and is **rejected**: a decision's time would then be attested by
+whoever wrote the row, which makes the SLA enforceable only against honest clients, and the whole
+expiry rule exists to fail closed against a journal `torii` did not write.
+
+It is also the *ordinary* path, not a worker-outage path: `pause_awaiting` arms
+`RunPaused { resume_after: deadline }` on the deadline instant itself, and `wait_or_expire` expires
+at `now >= deadline`, so on a shipped `worker serve` the scheduler's wake IS the expiry drive. Sizing
+an SLA from this section therefore has to budget for "will a person answer AND will a drive occur
+before the deadline", not just the first half.
+
+**The mitigation belongs at the CLI boundary, and Task 12 owes it.** `torii run gate decide` must
+refuse to append a `LoopGateDecided` when the journaled `LoopGateAwaited.deadline` has already
+passed, so the operator gets a visible refusal instead of a success message followed by a durable row
+that kills their run. That is exactly what s2's `cmd::gate::decide` already does for `HumanGate`
+(`SignalState::Awaiting { deadline: Some(d) } if now >= d`, with `a_decision_exactly_at_the_gates_
+deadline_is_refused` pinning the boundary against the executor's own `>=`), so the loop-gate verb
+inherits a proven shape rather than inventing one.
+
 **A loop gate can pause a run many times.** A 10-iteration loop asks 10 questions and pauses 10
 times. Each pause is an ordinary `RunPaused { resume_after: deadline }` that the SP-DATA-3 scheduler
 wakes normally, so nothing new is required of the SCHEDULER — but the operator-facing cost is real,
@@ -360,7 +397,8 @@ and this slice's answer is yes.
    the loop. This is the test that reddens if the ordering is flipped to s3's.
 9. A fired expiry is terminal: a later decision cannot resurrect the node, and re-driving appends no
    second `NodeFailed`.
-10. An expired undecided gate **fails the `Loop`**, not just the gate node.
+10. An **expired** gate **fails the `Loop`**, not just the gate node — whether or not a decision was
+    journaled (§5.2 step 4). AC8 is the same rule read from the other side.
 11. **Zero token spend** on the gate path: no `EffectRecorded`, no gateway call, no folded `usage`.
 12. A decided gate **resumes from the journal** — no re-ask, no gateway call, identical decision.
 12b. A decision honoured **inside** its gate's SLA stays honoured however long the run lives: a

@@ -870,6 +870,15 @@ impl Executor {
         //    drive that could still ask, not on a replay whose answer is already durable.
         //    Coupling a settled decision to live config would turn a role edit into a
         //    terminal failure of a loop nobody is waiting on.
+        //
+        //    **That ordering is a TEST, not only this comment.** It shipped as prose in
+        //    three places and review mutation-proved it unguarded: moving this block below
+        //    the SLA read left the whole workspace green while a `torii config push` that
+        //    edited or deleted the gate role destroyed a loop that had converged hours
+        //    earlier and cascade-skipped its downstream node — the Critical this slice
+        //    already shipped once, reached through config instead of the clock. Guarded now
+        //    by `a_settled_gate_replays_when_a_config_push_breaks_its_role`, which is the
+        //    exact mutation.
         if let Some(option) = fold.loop_gate_settled_with(node_id) {
             return self
                 .decide_from_published_menu(run, node_id, option, fold)
@@ -1119,6 +1128,11 @@ impl Executor {
                 // decision naming an option nobody was offered leaves no settlement behind:
                 // that failure is terminal through step 0 either way, and a settlement row
                 // for a decision that was never honoured would be a durable lie.
+                //
+                // The RUN OUTCOME cannot see that ordering — step 0 fences the node whether
+                // the row was written or not — so it is asserted directly on the journal, in
+                // `a_decision_naming_an_unknown_option_fails_the_loop_gate`. Review found
+                // the swap green across the whole crate before that assertion existed.
                 self.append(
                     run,
                     JournalEvent::LoopGateSettled {

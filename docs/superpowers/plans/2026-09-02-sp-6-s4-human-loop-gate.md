@@ -4,7 +4,7 @@
 
 **Goal:** A `Loop` whose stop decision is made by a person picking from an enumerated menu, once per iteration.
 
-**Architecture:** A third `GateSpec` variant, `Human { agent, menu }`, drives a new executor arm at the already-reserved path `"{loop}/{i}/__gate__"`. The menu lives on the graph so `validate_dag` can statically reject a loop that cannot converge; the decision lives in two new journal variants so `FORMAT_VERSION` stays 1. Expiry is read **before** the decision (s2's ordering, inverting s3) and an expired undecided gate fails the loop.
+**Architecture:** A third `GateSpec` variant, `Human { agent, menu }`, drives a new executor arm at the already-reserved path `"{loop}/{i}/__gate__"`. The menu lives on the graph so `validate_dag` can statically reject a loop that cannot converge; the decision lives in two new journal variants so `FORMAT_VERSION` stays 1. Expiry is read **before** the decision (s2's ordering, inverting s3) and an **expired** gate fails the loop, decided or not — the arm has not read the fold at that point and deliberately cannot know (design §5.2 step 4; this line said "undecided" until the Tasks 8–9 review).
 
 **Tech Stack:** Rust, `chrono`, `serde`, `sqlx` (Postgres e2e only). Test framework is plain `cargo test`; assertions are `assert!`/`assert_eq!`.
 
@@ -1953,12 +1953,24 @@ Steps 1–3's sketches were both already on `develop`, under the names the Tasks
 gave them, so writing them again would have been a duplicate rather than a test. What was
 executed instead:
 
-1. **The mandated mutation, re-run at this commit.** The s3-shaped hoist — a decision-first
-   read (published menu → `loop_gate_decision_for` → resolve → settle → `Decided`) inserted
-   above the `wait_or_expire_by_id` match — reddens
-   `a_decision_after_the_deadline_does_not_continue_the_loop` **and nothing else**: 13
-   passed, 1 failed. The test is a real guard, and the two AC12b tests staying green under
-   it is itself the evidence that they distinguish a LATE decision from a REPLAYED one.
+1. **The mandated mutation.** The s3-shaped hoist — a decision-first read (published menu →
+   `loop_gate_decision_for` → resolve → settle → `Decided`) inserted above the
+   `wait_or_expire_by_id` match — reddens
+   `a_decision_after_the_deadline_does_not_continue_the_loop`. The test is a real guard, and
+   the two AC12b tests staying green under it is itself the evidence that they distinguish a
+   LATE decision from a REPLAYED one.
+
+   **Correction (Tasks 8–9 review).** This bullet originally read "re-run at this commit …
+   **and nothing else**: 13 passed, 1 failed", and both halves were wrong. 13 + 1 = 14 is
+   exactly the size of `mod human_loop_gate` at `b4a1d44`'s PARENT `e177e3c` (counted:
+   14 `#[tokio::test]`s), so the figure was carried forward from before `b4a1d44` added
+   `a_settled_gate_replays_while_a_later_iterations_gate_still_expires` and was never
+   measured at the commit it named. Re-run at the review commit, with that boundary test
+   present and the settled-replay test this review adds: **18 passed, 2 failed** — the
+   ordering test AND the boundary test. That is not a contradiction but extra evidence: the
+   boundary test's whole subject is telling a settled gate from an expired one by NODE, so a
+   decision-first read that skips the expiry check is exactly what it is built to catch.
+   Reproduce with the hoist above, `cargo test -p sensei-orchestrator --lib human_loop_gate`.
 2. **AC9 and AC10 were already reached** and are not re-asserted. AC9's terminality and
    "no second `NodeFailed`" are the second half of the ordering test; AC10's "fails the
    `Loop`, not just the gate node" is its `assert_eq!(node, lp())` plus
@@ -2155,9 +2167,19 @@ Expected: **3 failures.**
 - [x] **Step 4: Run to verify passing, and that the site table still holds**
 
 Run: `cargo test -p sensei-orchestrator -- unknown_option model_backed_role_in_a_human gate_spec_agent_still_refuses`
-Run: `cargo test -p sensei-orchestrator non_top_level`
+Run: `cargo test -p sensei-orchestrator rejected_outside_a_top_level`
 
 Expected: **all pass.** The `non_top_level_sites` table must be **unchanged** — if a row had to be deleted, a bypass was opened. Stop and re-read §5.4 of the spec.
+
+**Correction (Tasks 8–9 review): the second command used to read `cargo test -p
+sensei-orchestrator non_top_level`, and that filter never ran the table.** Substring
+matching against the full test path returns exactly one name —
+`executor::tests::human_agent::an_unknown_skill_beats_the_non_top_level_refusal`, an
+unrelated error-taxonomy test. The test that actually drives the table is
+`a_human_backed_agent_is_rejected_outside_a_top_level_agent_node`, whose name contains
+`top_level` but not `non_top_level`, so it was filtered OUT and the step's green proved
+nothing about the thing it exists to prove. Verified with `-- --list` both ways. The
+property does hold; the instruction did not.
 
 - [x] **Step 5: Commit**
 
@@ -2192,6 +2214,18 @@ records both.
 `GateSpec::Agent` row looked up BY NAME rather than a hand-written second copy, with an
 `expect` that says a deleted row means a bypass was opened. Deleting it now fails two tests
 in two modules.
+
+**Correction (Tasks 8–9 review): as written at `be42bad` that last sentence was false, and
+the review made it true rather than softening it.** Deleting the `GateSpec::Agent` row
+reddened exactly ONE test — the AC13 lookup — because the table's own consumer,
+`a_human_backed_agent_is_rejected_outside_a_top_level_agent_node`, was a bare
+`for (site, graph, failing) in non_top_level_sites()` with no arity or name assertion: a
+deleted row simply made it iterate one fewer time and stay green. That test now pins the
+site list BY VALUE before it loops, so deleting any row — including the `Subgraph`,
+`LoopBody::Subgraph` and `Branch arm` rows the s3 review added to close the wrapper bypass,
+which no test looks up by name — reddens it. Mutation-measured both ways: with the
+assertion, deleting `GateSpec::Agent` gives 383 passed / **2** failed across two modules,
+and deleting `Branch arm` reddens the table test that previously could not see it.
 
 **The message clause is attached to the `Loop` gate ITEM of the enumeration**, not appended
 at the end as Step 3 sketched. The message is shared by all six refused sites, and a
@@ -2450,6 +2484,24 @@ call; the pure part is recomputed from the journaled option name."
 > `GateSpec::Human`, and add `LoopGateAwaited` to `signal_states` as the first step, not the
 > last. (`LoopGateSettled` needs no operator surface: it is executor bookkeeping, and a
 > settled gate is one nobody is waiting on.)
+
+> **SECOND PRECONDITION, from the Tasks 8–9 review: `decide` must REFUSE a past deadline.**
+> Design §7 recorded the accepted cost as "an unanswered gate destroys the run", and that
+> understates it — an ANSWERED gate destroys it too whenever no drive occurs between the
+> answer landing and the deadline. `LoopGateDecided` carries no timestamp, so the executor
+> structurally cannot tell an in-time decision from a late one and (by §3) refuses both;
+> and `pause_awaiting` arms `resume_after` on the deadline instant while `wait_or_expire`
+> expires at `now >= deadline`, so on `worker serve` the scheduler's wake IS the expiry
+> drive. Without a CLI guard the operator sees a success message and then a dead run.
+>
+> The verb must therefore read the journaled `LoopGateAwaited.deadline` and refuse when
+> `now >= d`, naming the deadline — the shape s2 already ships for `HumanGate`
+> (`gate.rs:315`, `SignalState::Awaiting { deadline: Some(d) } if now >= d`). Inherit its
+> boundary too: `a_decision_exactly_at_the_gates_deadline_is_refused` exists because `now ==
+> deadline` is EXPIRED for the executor, so a CLI that accepted it would deliver a decision
+> the executor then refuses. Test both sides — exactly-at refused, before-it delivered — as
+> that pair does. Deterministic, not a race: the deadline is durable and `now` is a
+> parameter.
 
 > **SETTLED out of band, between Tasks 4 and 5 — was "carried forward from Task 3's review".** No
 > task of this plan owns the change; see the correction blockquote at Task 3 Step 1. The question
