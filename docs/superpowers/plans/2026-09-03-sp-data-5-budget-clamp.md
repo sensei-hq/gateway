@@ -286,6 +286,13 @@ pub fn est_tokens_pessimistic(s: &str) -> usize {
 }
 ```
 
+**Correction applied when this task shipped:** the doc-comment sketch above says under-counting is
+harmless for `est_tokens`'s caller, "a window-fit check that logs and proceeds". That is false —
+`over_budget` HALTS, raising `PromptOverBudget` and journaling `NodeFailed` (`agent.rs:368`) — and
+`est_tokens` has two callers, not one (`over_budget` and `est_prompt_tokens`). The shipped comment
+makes the stronger and true argument instead: the two estimates want OPPOSITE biases, since an
+over-count halts a turn that would have fitted while an under-count overspends.
+
 - [ ] **Step 4: Run to verify passing**
 
 Run: `cargo test -p sensei-orchestrator est_tokens_pessimistic > /tmp/t3b.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t3b.log`
@@ -471,8 +478,39 @@ Expected: `exit=0`, 2 passed.
 - [ ] **Step 5: Run the whole suite — the existing budget tests are the real gate**
 
 Run: `cargo test --workspace > /tmp/t4c.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t4c.log | tail -3`
-Expected: `exit=0`, 0 failed. Any existing budget test that reddens means the clamp changed
-behaviour it should not have — fix the clamp, not the test.
+
+**This step's original expectation ("`exit=0`, 0 failed … fix the clamp, not the test") was
+WRONG, and Task 4 corrected it in place.** Seven existing budget tests reddened, all with the
+same symptom — zero gateway calls where the test expected one or more:
+
+`a_fresh_budgeted_run_pauses_mid_drive_after_one_call`, `spending_exactly_the_cap_stops_the_run`,
+`a_budgeted_agent_stops_between_react_turns`,
+`a_budgeted_map_fanout_dispatches_exactly_one_child_before_the_gate_fires`,
+`a_compacted_map_cannot_let_a_budgeted_run_overshoot_across_drives`,
+`an_unmetered_call_fails_the_node_when_a_budget_is_set`,
+`a_re_driven_selector_replays_its_call_instead_of_respending`.
+
+The cause is not a defect: every one of them uses a cap of 100–700 tokens, chosen when no floor
+existed, and `MIN_OUTPUT_TOKENS` is 256 — so the clamp refuses those runs *before the first call*.
+That is spec §6's named accepted cost, "a run can now pause where it previously completed",
+landing on stale fixtures. The fix is the fixture: each test's token magnitudes are multiplied by
+a common factor (10, except 16/3 for `spending_exactly_the_cap_stops_the_run`, whose two calls
+must still land exactly on the cap), preserving every ratio, call count, pause site and reason
+string. The reasoning is recorded once, on `run_started_with_budget`'s doc comment.
+
+The gate was **not** weakened to accommodate this, and that was verified rather than asserted:
+delete the `spent >= cap` block and `a_fresh_budgeted_run_pauses_mid_drive_after_one_call` fails
+with `attempt to subtract with overflow`, which is why `cap - spent` is deliberately not
+saturating.
+
+**⚠️ One coverage loss, carried to Task 6.** `spending_exactly_the_cap_stops_the_run`'s documented
+mutation (`spent >= cap` → `spent > cap`) **no longer reddens it** — re-run to confirm, not
+reasoned about. At `spent == cap` the clamp's floor sees `allowance == 0` and returns an identical
+`BudgetExhausted`, so the two arms are observationally the same for a `Chat` payload. The boundary
+is now covered twice rather than left unsafe, but nothing distinguishes `>` from `>=` any more.
+The only payload the clamp skips is a non-`Chat` one, so **Task 6's
+`a_non_chat_payload_is_gated_but_not_clamped` should carry that guard**: land an `Embed` dispatch
+exactly on the cap and mutation-check `>=` → `>` there.
 
 - [ ] **Step 6: Commit**
 
@@ -644,6 +682,15 @@ builds a budgeted `Meter`, calls `dispatch_metered` once against `clamp_observin
 returns the single recorded `max_tokens`. **Fill in `a_non_chat_payload_is_gated_but_not_clamped`'s
 body** using the same helper shape with a `Payload::Embed { texts: vec!["x".into()] }`; the stub
 above is a signature sketch, not a finished test — do not leave it empty.
+
+**⚠️ Carried forward from Task 4 — this test must also re-home a guard the clamp took away.**
+`spending_exactly_the_cap_stops_the_run` used to be the only thing pinning `spent >= cap` against
+`spent > cap`, and it no longer is: at `spent == cap` the clamp's floor computes `allowance == 0`
+and returns an identical `BudgetExhausted`, so the mutation leaves it green (verified by running
+it, not by reasoning). A non-`Chat` payload is the only one the clamp SKIPS, so this test is now
+the natural home for that boundary: dispatch an `Embed` with the meter sitting exactly on the cap,
+assert it is refused, and mutation-check `spent >= cap` → `spent > cap` reddens it. Without that,
+the `>=` boundary ships unguarded for the first time since it was pinned.
 
 - [ ] **Step 2: Run to verify failure, then implement if needed**
 
