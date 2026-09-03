@@ -14468,6 +14468,91 @@ async fn a_non_chat_payload_is_gated_but_not_clamped() {
     );
 }
 
+/// The design's §4 claim, asserted as arithmetic rather than prose: a budgeted run's
+/// total spend does not exceed `cap + Σ(actual_input − est_input)`.
+///
+/// This is the only test whose outcome depends on the fixture HONOURING `max_tokens`
+/// rather than merely recording it, which is what makes it a measurement instead of a
+/// reading-back of a number we just watched ourselves compute. A double that reported
+/// its scripted 5000 regardless would put the spend at ~10_000 against a 2000 cap and
+/// this would fail — that is the sense in which the honouring half is load-bearing.
+///
+/// The overshoot is asserted from BOTH sides, deliberately. Upward, because the bound is
+/// the claim. Downward — `spent > cap` — because the claim this slice is NOT allowed to
+/// make is that the overshoot is eliminated: it is bounded by the input-estimate error
+/// and biased toward refusing early, and here the error is real and shows up in the
+/// ledger. A test that asserted `spent <= cap` would be asserting something false.
+#[tokio::test]
+async fn a_budgeted_run_does_not_overshoot_beyond_the_estimate_error() {
+    const CAP: u64 = 2_000;
+    // 10 real input tokens per call against a 1-token estimate for the 2-character
+    // prompt: the residual is 9 per call, and two calls go out.
+    const ACTUAL_INPUT: u64 = 10;
+    const ESTIMATED_INPUT: u64 = 1;
+    let (gateway, seen) = clamp_observing_gateway(ACTUAL_INPUT as u32, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    let spent = crate::spend_of(&journal.load(run).await.unwrap()).0;
+    let bound = CAP + calls * (ACTUAL_INPUT - ESTIMATED_INPUT);
+    assert!(
+        spent <= bound,
+        "spend {spent} must stay within cap {CAP} plus the input-estimate error over \
+         {calls} calls (bound {bound})"
+    );
+    assert!(
+        spent > CAP,
+        "and it DOES overshoot — bounded and biased safe, not eliminated. A spend at or \
+         under the cap here would mean this test is measuring something else: {spent}"
+    );
+    // The counterfactual, which is the whole point of clamping: unclamped, the fixture
+    // reports its scripted 5000 per call and two calls put the run five times past its
+    // cap.
+    assert!(
+        spent < 5_000,
+        "the clamp bit — unclamped this run spends ~10_000 against a 2_000 cap: {spent}"
+    );
+}
+
+/// A CLAMPED call still journals its REAL usage, and folds by effect id exactly as
+/// before.
+///
+/// The rest of the budget suite proves this for unclamped calls only, so without this
+/// the fold could silently mis-handle a clamped one — and the ledger is what every gate,
+/// every resume and every `run status` reads.
+#[tokio::test]
+async fn a_clamped_call_still_journals_its_real_usage() {
+    const INPUT: u32 = 10;
+    let (gateway, seen) = clamp_observing_gateway(INPUT, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(2_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    let allowance =
+        seen.lock().unwrap_or_else(|e| e.into_inner())[0].expect("the first call carried a clamp");
+    let recorded = journaled_usage_totals(&journal.load(run).await.unwrap(), |n| n == "n1");
+    assert_eq!(
+        recorded,
+        vec![Some(INPUT + allowance.min(5_000))],
+        "the journaled usage is the CLAMPED count the provider really returned, not the \
+         unclamped script and not the allowance we asked for"
+    );
+}
+
 // ============================= SP-DATA-3 scheduler driver =====================
 
 /// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded
