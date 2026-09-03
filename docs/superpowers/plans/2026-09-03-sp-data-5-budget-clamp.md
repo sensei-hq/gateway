@@ -499,9 +499,10 @@ must still land exactly on the cap), preserving every ratio, call count, pause s
 string. The reasoning is recorded once, on `run_started_with_budget`'s doc comment.
 
 The gate was **not** weakened to accommodate this, and that was verified rather than asserted:
-delete the `spent >= cap` block and `a_fresh_budgeted_run_pauses_mid_drive_after_one_call` fails
-with `attempt to subtract with overflow`, which is why `cap - spent` is deliberately not
-saturating.
+delete the `spent >= cap` block and eleven tests redden, nine of them on the clamp's own
+`debug_assert!` ("the `spent >= cap` gate was bypassed or reordered"). That assertion replaced a
+bare `cap - spent` in review round 1 — the overflow panic it relied on is debug-only, and a release
+build would have wrapped instead. See the round-1 section below.
 
 **⚠️ One coverage loss, carried to Task 6.** `spending_exactly_the_cap_stops_the_run`'s documented
 mutation (`spent >= cap` → `spent > cap`) **no longer reddens it** — re-run to confirm, not
@@ -939,10 +940,21 @@ clamping bounds the cost without predicting it. Say that, rather than deleting t
 - [ ] **Step 4: Update the overview**
 
 `docs/superpowers/orchestrator-overview.md`'s SP-DATA-5 entry ends with a "Still open from s5"
-list naming pre-flight estimation. Move it to done with a one-line description in the house style,
-and check whether `TokenBudget`'s doc comment in `crates/orchestrator-core/src/budget.rs` still
-calls the budget a pure "FLOOR-TRIGGER" — it now has a clamp in front of it, and that sentence
-needs the qualification.
+list naming pre-flight estimation. Move it to done with a one-line description in the house style.
+
+**Review round 1 did the rest of this sweep already** — four surfaces described the pre-clamp
+contract and none said a budgeted run can now pause with `spent < cap`, which is the wrong mental
+model for debugging one that paused at zero spent. All four now say both things (the output half is
+bounded by `max_tokens`; the run can refuse before the cap):
+
+- `crates/orchestrator-core/src/budget.rs` — `TokenBudget`'s "FLOOR-TRIGGER … overshot by at most
+  one call"
+- `crates/orchestrator/src/executor/dispatch.rs` — `dispatch_metered`'s own contract, which said
+  "output tokens are unknowable until the call returns" forty lines above the block that bounds them
+- `crates/torii/src/main.rs` — the `--budget-tokens` help, which is what an operator actually reads
+- `crates/torii/tests/e2e_pg.rs` — the AC6 e2e's step 1
+
+So Step 4 is the overview entry only. Re-check the four above rather than assuming.
 
 - [ ] **Step 5: Checkpoint**
 
@@ -959,6 +971,63 @@ git commit -m "docs: the budget clamp, and the claim it is careful not to make"
 ```
 
 ---
+
+---
+
+## Whole-slice review round 1 — what changed, and what the plan had wrong
+
+Three reviewers read Tasks 1–4 at `c301901` and raised twenty findings at Minor or above. Every one
+is addressed on `develop`; the ones that changed the DESIGN rather than a comment are recorded here
+so a later reader does not have to reconstruct them from the log.
+
+**Two Criticals, both real.**
+
+1. *The clamp had no upper bound.* `allowance = remaining − est` is a pure budget figure, so at a
+   cap of 10240 it emitted `Some(10239)` and the fixture provider answered a 400: a run that
+   succeeds unbudgeted hard-FAILED at its first call the moment an operator set `--budget-tokens`.
+   Fixed with a new read-only `Gateway::min_max_output_tokens(chain)` — the output twin of
+   `min_context_window` — and `min(allowance, ceiling)` in the clamp. See the spec's §5.2. Task 2's
+   `ClampObservingAdapter` now REFUSES an over-large `max_tokens` so this cannot regress unseen.
+2. *The Postgres AC6 e2e was left un-rescaled.* `CAP = 100 / PER_CALL = 150` in
+   `crates/torii/tests/e2e_pg.rs` falls under the floor, so the first call never dispatched. It is
+   `#[cfg_attr(not(have_database_url), ignore)]`, so the local suite structurally cannot see it and
+   CI would have gone red on a required check. Scaled ×10 and verified with an in-process replica.
+
+**Task 9 Step 1's gate list is incomplete.** `cargo test --workspace` on a dev box SKIPS the
+Postgres suites. Any change to budget behaviour must also be reasoned about (or replicated in
+process) for:
+
+- `crates/torii/tests/e2e_pg.rs` — `a_budget_exhausted_run_is_raised_by_an_operator_and_completes_in_a_fresh_process`
+
+It is the only DB-gated test in the workspace that sets a `TokenBudget`; the other five in
+`executor/tests.rs` and the `orchestrator-store` suites do not.
+
+**Tasks 5, 6 and most of 8 landed in this round**, because the findings that named them were
+"UNTESTED" findings and the remedy is the test. All the mutations the plan asks for were run and
+their failures are quoted in the commit messages. What is NOT yet landed from Task 8: the two
+`tracing` signals (AC10/AC11). No finding touched them and they need no behaviour change.
+
+**Three plan/spec claims corrected in place:**
+
+- Task 4 Step 5's rescale factor was "ten, except 16/3". It was also 100 for one fixture and now
+  needs to be 50 for another (`a_re_driven_selector_replays_its_call_instead_of_respending`, whose
+  cap of 1000 left the second of its five drives under the floor, so the mutation the test
+  documents never reached either of its assertions).
+- Task 4 Step 5's mutation evidence quoted "attempt to subtract with overflow". That tripwire was
+  DEBUG-ONLY — the workspace release profile sets no `overflow-checks` — so `cap - spent` is now a
+  `checked_sub` behind an explicit `debug_assert!`: loud in debug, fail-closed in release.
+- Task 6's carried-forward `>=` boundary is re-homed onto the `Embed` path as planned, AND is
+  pinned again on `spending_exactly_the_cap_stops_the_run`, because the floor no longer renders the
+  same message as the gate.
+
+**One direction not followed, and why.** Finding 1 proposed that as "a floor of correctness" the
+clamp should also take `min(…, 1024)`, since three adapters substitute that for a `None`
+`max_tokens` and the clamp therefore widens their per-call ceiling. Rejected: it would hard-cap
+every budgeted reply at another provider's arbitrary fallback constant, silently truncating
+budgeted runs on the `openai_compat` and local paths where `None` means the model's own maximum,
+and would import that constant into the orchestrator. The widening is real, bounded by the model's
+own limit, and is now written down as an accepted cost in the spec's §6 rather than fixed by
+creating a worse defect.
 
 ## Self-review
 
