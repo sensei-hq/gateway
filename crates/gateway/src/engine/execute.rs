@@ -60,10 +60,12 @@ impl super::Gateway {
         let result = svc.select_all(&criteria);
 
         // 4. No candidates? Selection admitted nothing. If every skip was a gate
-        // (health-lock / cooling / breaker-open / over-budget), this is a durable
-        // `AllGated` pause rather than a bare `NoCandidates` — only an
-        // all-structural (misconfig / wrong-capability / nothing-configured)
-        // selection stays `NoCandidates`.
+        // (health-lock / cooling / breaker-open / model-lockout / over-budget), this
+        // is an `AllGated` rather than a bare `NoCandidates` — a durable pause when
+        // any of those gates is TIMED, and a human-action failure when every one is
+        // terminal (`exhaustion::all_gated_error` takes `resume_after` from the timed
+        // ones alone). Only an all-structural (misconfig / wrong-capability /
+        // nothing-configured) selection stays `NoCandidates`.
         if result.all_candidates.is_empty() {
             tracing::warn!("no candidates available for request");
             if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {
