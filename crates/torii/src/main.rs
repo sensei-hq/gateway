@@ -73,8 +73,9 @@ enum RunAction {
         ///
         /// A run can also PAUSE BEFORE reaching the cap: when what is left cannot buy a
         /// reply worth the input tokens, it stops rather than paying for a truncated
-        /// one, and says by how much the cap must rise. Small budgets are refused
-        /// outright for the same reason.
+        /// one, and says by how much the cap must rise. A cap under 256 tokens is
+        /// refused outright for the same reason: below that no chat call can be
+        /// dispatched whatever the prompt.
         ///
         /// Omit it and the run is unbudgeted, exactly as before. A budgeted run runs
         /// its model calls one at a time, so a wide fan-out is slower than an
@@ -257,6 +258,9 @@ enum RunAction {
         /// Raise (or lower) the run's token cap before waking it — the way to restart
         /// a run that stopped at its budget. Lowering it below what the run has
         /// already spent is legitimate, and halts the run at its next model call.
+        /// Must be at least 256 whichever direction you move it: under that, no chat
+        /// call can be dispatched whatever the prompt, so the parser refuses it here
+        /// rather than letting the run pause again immediately.
         //
         // Recorded as `BudgetRaised` BEFORE the wake is queued; see `cmd::run::wake`'s
         // doc comment for why that order is load-bearing.

@@ -118,13 +118,27 @@ re-dispatched at all, and a genuinely re-driven call *should* see the budget as 
 Verified against the code rather than assumed; a plan step re-checks it, because a future change
 that folded transport parameters into the hash would turn every budgeted resume into a hard halt.
 
-**There are THREE determinism keys, and each needs its own guard.** They are two functions across
-three CALL SITES: `support::input_hash(chain, payload)` is called by `run_node`'s `ModelCall` arm
-(and the `Map` producer) and again — with a `{system, user}` payload — by
-`SelectorDispatch::complete`, while `support::agent_input_hash`
-(`{chain}|{system}|{messages}|{tools}`) is called only by `agent_turn_output`. A guard therefore
-attaches to a call site, not to a function: a budget term folded in at one leaves the other two
-hashing as before, so one resume test pins one site.
+**There are FIVE determinism call sites, and a guard attaches to a SITE, not to a function.**
+Two functions: `support::input_hash(chain, payload)` and `support::agent_input_hash`
+(`{chain}|{system}|{messages}|{tools}`). The production call sites are:
+
+| site | function | guard |
+|---|---|---|
+| `mod.rs` — `run_node`'s `ModelCall` arm | `input_hash` | named resume test |
+| `agent.rs` — `agent_turn_output` | `agent_input_hash` | named resume test |
+| `dispatch.rs` — `SelectorDispatch::complete` | `input_hash` (`{system, user}`) | named, measured as the control |
+| `fanout.rs` — the `Map` child producer | `input_hash` | **incidental only** — the gate test hand-computes the hash, so an author folding a term in would update that line and never see a failure |
+| `fanout.rs` — the `Consolidate` synthesis | `input_hash` | **incidental only** — its sole red is a compaction test named nowhere in this argument |
+
+**Corrected 2026-09-03 by the whole-slice review.** This section said THREE, lumping the `Map`
+producer into the `ModelCall` entry one sentence before ruling that a guard attaches to a site
+rather than a function — under its own rule those are two sites — and omitting `Consolidate`
+entirely. The count is load-bearing precisely because it is written to be inherited: it is the
+argument deciding how many resume guards this change needs, and the next author folding a
+budget-derived term into either `fanout.rs` site would have consulted it, seen everything
+accounted for, and shipped unguarded. The review proved the gap by doing exactly that: folding
+`fold.budget.saturating_sub(fold.spent())` into the `Consolidate` hash reddened one test, and that
+test was about Map compaction.
 
 The slice first shipped a single `ModelCall` resume test whose comment claimed all three. Folding
 the remaining budget in at `agent_turn_output` took the whole orchestrator suite green, so the agent
