@@ -1,6 +1,6 @@
 //! Prompt assembly + per-turn window budgeting for the agent runtime.
 
-use kernel::types::request::{Message, ToolDefinition};
+use kernel::types::request::ToolDefinition;
 use orchestrator_core::{AgentDefinition, ContextKey, OrchestratorError, Registry};
 
 /// An assembled prompt with its two halves still SEPARATE.
@@ -26,8 +26,9 @@ pub struct PromptParts {
 impl PromptParts {
     /// Re-join the two halves into the system prompt the MODEL receives, using the
     /// unbounded [`render_context_section`] — the model's own context window is the bound
-    /// that applies on that path (`over_budget`, below, which HALTS rather than truncating
-    /// so a model is never silently asked about half a document).
+    /// that applies on that path, and it is applied by the GATEWAY's `ContextWindowGate`
+    /// (SP-7a) rather than truncated here, so a model is never silently asked about half
+    /// a document.
     ///
     /// **The model path calls THIS**, and so does [`assemble_prompt`]. That is the whole
     /// reason it exists as a method rather than three lines inlined at each site. Before
@@ -213,12 +214,16 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
 /// bytes in total.
 ///
 /// The model path must NOT use this — [`render_context_section`] is its renderer, and a
-/// model's own context window is the bound that applies there (`over_budget`, below, which
-/// HALTS rather than truncating so a model is never silently asked about half a document).
+/// model's own context window is the bound that applies there. That bound is enforced by
+/// the gateway's `ContextWindowGate` (SP-7a), which SKIPS a candidate the prompt does not
+/// fit rather than truncating, so a model is never silently asked about half a document.
+///
 /// This is the human path's answer to the same problem, and it differs because the failure
-/// modes differ: an over-window model call can be retried against a bigger chain, whereas a
-/// human-backed node that fails takes the whole run terminal AFTER the upstream tokens have
-/// been spent.
+/// modes differ: an over-window model call falls through to a LARGER candidate in the same
+/// chain — true since SP-7a, and the reason that slice exists; before it, the orchestrator
+/// refused such a call outright against the chain's smallest window — whereas a
+/// human-backed node that fails takes the whole run terminal AFTER the upstream tokens
+/// have been spent.
 ///
 /// The budget is split EVENLY across dependencies rather than first-come-first-served, so
 /// one verbose upstream cannot crowd the others out of the question entirely — the human is
@@ -293,12 +298,20 @@ pub fn est_tokens(s: &str) -> usize {
 /// chars/token. So `chars / 4` UNDER-counts precisely where these prompts are heaviest.
 ///
 /// The two estimates want OPPOSITE biases, which is why this is a second function and not
-/// a fix to the first. `est_tokens`'s callers — [`over_budget`] and the `est_prompt_tokens`
-/// diagnostic that reports its `est` — ask "will this prompt fit the window", and an
-/// over-count there halts a turn (`NodeFailed`) that would in fact have fitted. The budget
-/// asks "what is the worst this call can cost", and an under-count there is the expensive
-/// direction: the clamp computes `max_tokens = remaining − est`, so too low an estimate
-/// leaves too high an allowance and the cap is overshot by the difference.
+/// a fix to the first. [`est_tokens`] answered "will this prompt fit the window", where an
+/// over-count halts a turn that would in fact have fitted. The budget asks "what is the
+/// worst this call can cost", and an under-count there is the expensive direction: the
+/// clamp computes `max_tokens = remaining − est`, so too low an estimate leaves too high
+/// an allowance and the cap is overshot by the difference.
+///
+/// **`est_tokens` has had no production caller since SP-7a**, which deleted both of them
+/// (`over_budget` and `executor::support::est_prompt_tokens`) along with the window
+/// pre-check they served. It is kept as the documented prose baseline this function's
+/// bias is defined against, and the tests below compare the two — but it is no longer
+/// used by anything that runs, and this sentence exists so the next reader does not infer
+/// a caller from its presence. Note the gateway now owns the window estimate outright
+/// (`engine::util::estimate_input_tokens_pessimistic`, a THIRD function, over bytes
+/// rather than chars, because the gateway crate cannot depend on this one).
 ///
 /// So this one inverts the bias — it is wrong toward refusing early rather than toward
 /// overspending. It does not make the overshoot zero (the clamp design's §4 writes out the
@@ -330,29 +343,19 @@ pub fn est_tokens_pessimistic(s: &str) -> usize {
     s.chars().count().div_ceil(3)
 }
 
-/// True when the assembled prompt (system + messages + tool schemas) is estimated
-/// to exceed the chain's smallest context window. An unknown window (`None`) is
-/// never a hard fail — the caller logs and proceeds.
-pub fn over_budget(
-    min_window: Option<u32>,
-    system: &str,
-    messages: &[Message],
-    tools: &[ToolDefinition],
-) -> bool {
-    let Some(window) = min_window else {
-        return false;
-    };
-    let mut est = est_tokens(system);
-    for m in messages {
-        est += est_tokens(m.content.as_text());
-    }
-    for t in tools {
-        est += est_tokens(&t.name)
-            + t.description.as_deref().map(est_tokens).unwrap_or(0)
-            + est_tokens(&t.input_schema.to_string());
-    }
-    est as u64 > window as u64
-}
+// `over_budget(min_window, system, messages, tools)` lived here until SP-7a. It answered
+// "does this prompt fit the chain's SMALLEST context window", and `executor/agent.rs`
+// called it before every live ReAct turn, failing the node when it said yes.
+//
+// The question was asked in the wrong place and against the wrong number. Selection is
+// the gateway's job, and a chain minimum is not a fact about any candidate: on
+// `[gpt-4o 128k, fallback 8k]` this refused every prompt over 8k, including the ones the
+// primary would have served. The gateway's `ContextWindowGate` now asks it per candidate.
+//
+// Deleted rather than left for a future caller. Its last caller was the halt this slice
+// removed, and a function kept because it might be wanted again is exactly the kind of
+// thing that gets called again by mistake — a second, chain-minimum window check
+// re-introduced beside the per-candidate one would silently restore the bug.
 
 #[cfg(test)]
 mod tests {
@@ -828,16 +831,11 @@ mod tests {
         assert_eq!(est_tokens_pessimistic(""), 0);
     }
 
-    #[test]
-    fn over_budget_true_when_estimate_exceeds_window_and_false_otherwise() {
-        let (reg, agent) = registry();
-        let (system, tools) = assemble_prompt(&reg, &agent, &[], "").unwrap();
-        let msgs = vec![kernel::types::request::Message::text(
-            kernel::types::request::MessageRole::User,
-            "hi",
-        )];
-        assert!(over_budget(Some(4), &system, &msgs, &tools)); // tiny window → over
-        assert!(!over_budget(Some(100_000), &system, &msgs, &tools)); // huge window → fits
-        assert!(!over_budget(None, &system, &msgs, &tools)); // unknown window → never a hard fail
-    }
+    // `over_budget_true_when_estimate_exceeds_window_and_false_otherwise` was here. It
+    // tested the deleted `over_budget` against a chain MINIMUM, which is the behaviour
+    // SP-7a replaced rather than a property that moved: its "tiny window → over" case is
+    // now `gates::context_window::over_window_skips_and_under_window_admits` (asked per
+    // candidate, so the same request gets two different answers) and its "unknown window
+    // → never a hard fail" case is `no_estimate_admits`. Removed with the function; the
+    // behaviour it asserted has a home, and it is in the gateway.
 }

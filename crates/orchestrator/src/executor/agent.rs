@@ -11,11 +11,11 @@ use orchestrator_core::{
 };
 
 use super::support::{
-    GatewayDisposition, agent_input_hash, build_chat_request, classify_gateway_error,
-    est_prompt_tokens, render_input, tool_input_hash,
+    GatewayDisposition, agent_input_hash, build_chat_request, classify_gateway_error, render_input,
+    tool_input_hash,
 };
 use super::{AgentStep, Executor, Fold};
-use crate::agent::prompt::{assemble_prompt_parts, over_budget};
+use crate::agent::prompt::assemble_prompt_parts;
 
 /// The 3-way outcome of one tool effect (or one ReAct turn's tools, §7.3): a
 /// value/transcript, a node failure (already journaled `NodeFailed`), or a durable
@@ -27,15 +27,18 @@ enum ToolOutcome<T> {
 }
 
 /// The invariant-across-turns context of one agent invocation — assembled once
-/// (agent lookup, prompt, chain, window budget) so the per-turn helpers share it
-/// instead of each threading the same six values through their signatures.
+/// (agent lookup, prompt, chain) so the per-turn helpers share it instead of each
+/// threading the same values through their signatures.
+///
+/// It carried a `min_win` — `Gateway::min_context_window(chain)` — until SP-7a. Window
+/// fit is now decided by the gateway's `ContextWindowGate`, per CANDIDATE, so the
+/// orchestrator no longer reads or holds that number.
 struct AgentRun<'a> {
     run: RunId,
     node_id: &'a NodeId,
     chain: String,
     system: String,
     tools: Vec<ToolDefinition>,
-    min_win: Option<u32>,
     fold: &'a Fold,
     // The acting agent's authorization surface (owned clones, built once per
     // agent-node-run) — the SP-4 s1 gate in `execute_tool_effect` checks each tool
@@ -268,14 +271,12 @@ impl Executor {
         let (system, tools) = parts.join();
 
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();
-        let min_win = self.gateway.min_context_window(&chain).await;
         let ar = AgentRun {
             run,
             node_id,
             chain,
             system,
             tools,
-            min_win,
             fold,
             agent_tools: agent.tools.clone(),
             agent_grants: agent.grants.clone(),
@@ -340,10 +341,19 @@ impl Executor {
 
     /// Produce one ReAct turn's model output: a memoized turn replays from the
     /// journal (no gateway call; a hash mismatch is a fatal `DeterminismViolation`);
-    /// otherwise a live turn runs the budget gate → `NodeStarted` (once, tracked in
-    /// `node_started`) → gateway → `EffectRecorded`. The inner `Result` is the
-    /// turn's output value, or a node-level failure message (over-budget or a
-    /// gateway error, already journaled `NodeFailed`).
+    /// otherwise a live turn runs `NodeStarted` (once, tracked in `node_started`) →
+    /// gateway → `EffectRecorded`. The inner `Result` is the turn's output value, or a
+    /// node-level failure message (a gateway error, already journaled `NodeFailed`).
+    ///
+    /// There is no window pre-check here any more. It used to run first, testing this
+    /// turn's prompt against `min_context_window(chain)` — the chain's SMALLEST window —
+    /// and failing the node before dispatch. SP-7a moved that question to the gateway's
+    /// `ContextWindowGate`, which asks it per CANDIDATE, so a chain of `[128k, 8k]` now
+    /// serves a 20k prompt the primary can hold instead of refusing it against the 8k
+    /// entry. An over-EVERY-window prompt is still a terminal node failure, but it
+    /// arrives as an `AllGated` naming each candidate's own window and the remedy, and
+    /// selection still refuses it before any provider is called — so the "halts before
+    /// spending" property the pre-check had is preserved rather than traded away.
     async fn agent_turn_output(
         &self,
         ar: &AgentRun<'_>,
@@ -364,25 +374,7 @@ impl Executor {
             return Ok(ToolOutcome::Ok(self.materialize(output).await?));
         }
 
-        // Live turn. Budget-gate before spending; halt loud if over.
-        if over_budget(ar.min_win, &ar.system, messages, &ar.tools) {
-            let message = OrchestratorError::PromptOverBudget {
-                node: ar.node_id.clone(),
-                turn,
-                est: est_prompt_tokens(&ar.system, messages, &ar.tools),
-                min_win: ar.min_win.unwrap_or(0),
-            }
-            .to_string();
-            self.append(
-                ar.run,
-                JournalEvent::NodeFailed {
-                    node: ar.node_id.clone(),
-                    error: message.clone(),
-                },
-            )
-            .await?;
-            return Ok(ToolOutcome::Failed(message));
-        }
+        // Live turn.
         if !*node_started {
             self.append(
                 ar.run,
@@ -394,8 +386,9 @@ impl Executor {
             *node_started = true;
         }
         // Best-effort hook (§15): a LIVE turn about to dispatch (a memoized replay
-        // returned above, and an over-budget turn already halted) — so a resume
-        // never re-fires a replayed turn.
+        // returned above) — so a resume never re-fires a replayed turn. It used to
+        // say "and an over-budget turn already halted" too; SP-7a deleted that halt,
+        // and an over-window turn now fires this hook and then fails at the gateway.
         if let Some(h) = &self.hooks {
             h.on_agent_turn(ar.run, ar.node_id, turn).await;
         }

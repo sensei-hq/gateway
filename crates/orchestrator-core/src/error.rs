@@ -72,13 +72,17 @@ pub enum OrchestratorError {
     WorkspaceEscape(String),
     #[error("unknown agent {0:?}")]
     UnknownAgent(String),
-    #[error("prompt over budget at node {node:?} turn {turn}: est {est} > window {min_win}")]
-    PromptOverBudget {
-        node: NodeId,
-        turn: usize,
-        est: usize,
-        min_win: u32,
-    },
+    // `PromptOverBudget { node, turn, est, min_win }` lived here until SP-7a. The
+    // executor raised it before dispatching a live agent turn whose prompt exceeded
+    // `Gateway::min_context_window(chain)` — the chain's SMALLEST window — which refused
+    // requests a larger entry in the same chain could have served. Window fit is now the
+    // gateway's `ContextWindowGate`, asked per candidate, and an over-every-window
+    // request surfaces as `GatewayError::AllGated` carrying each candidate's own window
+    // and a `UseLargerContextWindow` remedy.
+    //
+    // REMOVED rather than left unconstructed: a variant no code can produce is a claim
+    // the type makes and the code does not honour, and callers matching on it would be
+    // writing dead arms against a decision this crate no longer owns.
     #[error("agent node {node:?} exceeded max_steps")]
     AgentMaxStepsExceeded { node: NodeId },
     #[error(

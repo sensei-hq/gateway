@@ -431,18 +431,33 @@ async fn phase_override_wins_over_base_route_through_from_config() {
     assert!(outcome.outputs.contains_key(&n1));
 }
 
+/// An agent prompt no candidate's window can hold fails the node, before any spend —
+/// and says which window, and what to do about it.
+///
+/// This test was `agent_node_halts_over_budget_before_any_gateway_call` and asserted the
+/// orchestrator's own `PromptOverBudget` halt. SP-7a deleted that halt, so the test's
+/// wording had to change; its two CLAIMS did not, and neither did its fixture. That is
+/// why it was updated rather than removed:
+///
+/// - **"an over-window prompt fails the node"** still holds. The gateway's
+///   `ContextWindowGate` skips every candidate, `all_gated_error` aggregates that into an
+///   `AllGated` with no timed gate, and `classify_gateway_error` fails on anything that
+///   is not a timed pause. Terminal before, terminal now.
+/// - **"before any gateway call"** still holds, and is worth keeping precisely because it
+///   is the property a reader would expect the move to have cost. It did not: the refusal
+///   happens during SELECTION, so no adapter is reached and no tokens are spent. The call
+///   log is asserted for exactly that reason.
+///
+/// What changed is the DIAGNOSIS, which is the slice's whole benefit: the old message
+/// named one number — the chain's smallest window, possibly belonging to a model this
+/// request never wanted — and no remedy. The new one names the candidate, its own window,
+/// the estimate that exceeded it, and the lever.
 #[tokio::test]
-async fn agent_node_halts_over_budget_before_any_gateway_call() {
+async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis() {
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
-    // max_context of chain "c" is 4096; force a tiny window via max_steps? No —
-    // budget uses the chain window. Use a registry whose agent has a huge body.
-    let big = AgentDefinition {
-        system_prompt: "x".repeat(100_000),
-        ..agent_def("c")
-    };
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
-        .with_registry(Arc::new(Registry::default().with_agent(big)))
+        .with_registry(over_window_agent_registry())
         .with_tools(Arc::new(ToolRegistry::default()));
 
     let graph = Graph {
@@ -453,14 +468,29 @@ async fn agent_node_halts_over_budget_before_any_gateway_call() {
     match &outcome.failed {
         Some((node, msg)) => {
             assert_eq!(node.0, "n1");
-            assert!(msg.contains("over budget"), "{msg}");
+            assert!(
+                msg.contains("4096-token context window"),
+                "the failure names the CANDIDATE's own window, not a chain-wide \
+                 figure: {msg}"
+            );
+            assert!(
+                msg.contains("33334"),
+                "and the estimate that exceeded it, so an operator can see how far \
+                 over the request is: {msg}"
+            );
+            assert!(
+                msg.contains("route to a model with a larger context window"),
+                "and the remedy — the old PromptOverBudget named none, so an operator \
+                 could not tell it apart from a money problem: {msg}"
+            );
         }
-        None => panic!("expected an over-budget failure"),
+        None => panic!("an over-every-window prompt is still a terminal node failure"),
     }
     assert_eq!(
         calls.lock().unwrap().len(),
         0,
-        "over-budget halts before spending"
+        "and it still halts before spending — selection refuses the request, so no \
+         adapter is reached"
     );
 }
 
@@ -4630,8 +4660,22 @@ async fn tampered_upstream_context_on_resume_halts_with_determinism_violation() 
     );
 }
 
-/// Acceptance §8.7 (over-budget) — an oversized dependency context busts the
-/// per-turn window and halts loud (`over budget`), never silently truncated.
+/// Acceptance §8.7 — an oversized dependency context busts the window and halts LOUD,
+/// never silently truncated.
+///
+/// The invariant this test exists for is "never silently truncated", and it is untouched
+/// by SP-7a: `PromptParts::join` renders the model path's `## Context` section unbounded,
+/// so an oversized upstream output reaches the request whole and the run halts rather
+/// than quietly asking the model about half a document.
+///
+/// What SP-7a moved is WHO notices. Before it, the orchestrator compared the assembled
+/// prompt against the chain's smallest window and raised `PromptOverBudget` — hence the
+/// old `msg.contains("over budget")`. Now selection notices, per candidate, and the halt
+/// carries the gateway's diagnosis instead. The assertion below therefore checks the
+/// same property through its new wording rather than being relaxed: it still requires a
+/// LOUD failure at B, and it now also requires the failure to name the window that was
+/// busted — which the old one did not, since "over budget" alone reads as a money
+/// problem.
 #[tokio::test]
 async fn oversized_dependency_context_halts_over_budget_never_truncates() {
     use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
@@ -4660,9 +4704,15 @@ async fn oversized_dependency_context_halts_over_budget_never_truncates() {
     match &out.failed {
         Some((node, msg)) => {
             assert_eq!(node.0, "B");
-            assert!(msg.contains("over budget"), "{msg}");
+            assert!(
+                msg.contains("4096-token context window"),
+                "B must halt naming the window its context busted: {msg}"
+            );
         }
-        None => panic!("expected B to halt over budget"),
+        None => panic!(
+            "expected B to halt loud — a truncated `## Context` would let it succeed \
+             silently on half of A's output, which is the failure this test exists for"
+        ),
     }
 }
 
@@ -24071,4 +24121,239 @@ mod human_loop_gate {
             Some(t0 + Duration::minutes(30) + sla),
         );
     }
+}
+
+// =============================================================================
+// SP-7a — what the deleted pre-dispatch window check was, and was not, shielding.
+// =============================================================================
+
+/// An agent whose SYSTEM PROMPT alone dwarfs the fixture chain's 4096-token window:
+/// 100 000 bytes ⇒ ~33 334 tokens at `chars/3`, eight times over.
+///
+/// A system prompt rather than an input, because the system half is what both
+/// estimators count and what the deleted `over_budget` check measured.
+fn over_window_agent_registry() -> Arc<Registry> {
+    Arc::new(Registry::default().with_agent(AgentDefinition {
+        system_prompt: "x".repeat(100_000),
+        ..agent_def("c")
+    }))
+}
+
+/// SP-7a's benefit has a BOUNDARY, and this test is where it lies.
+///
+/// On an UNBUDGETED run — every pre-SP-DATA-5 run, and the default — an over-window
+/// agent prompt now reaches `Gateway::execute`, where the `ContextWindowGate` answers
+/// PER CANDIDATE and the node's failure names each model's own window and the remedy.
+/// That is the whole of what this slice buys, and it is a better-diagnosed terminal
+/// failure rather than a recoverable one (`AllGated` with no timed gate does not pause).
+///
+/// On a BUDGETED run it does NOT reach the gate, and deleting the orchestrator's
+/// pre-check does not change that. The SP-DATA-5 clamp runs first
+/// (`executor/dispatch.rs`) and bounds `max_tokens` by `min_context_window(chain) − est`
+/// — the chain MINIMUM, the very figure this slice exists to stop trusting — then
+/// refuses with `Refusal::BudgetExhausted { cause: BelowFloor }` when the resulting
+/// ceiling falls under `MIN_OUTPUT_TOKENS`. So the run PAUSES on the budget and the
+/// operator is pointed at a cap raise that cannot help, which the clamp's own comment
+/// already records as a known gap.
+///
+/// Both halves are asserted here so the boundary is a fact in the suite rather than a
+/// paragraph in a spec, and so the pause/fail split cannot drift without a red test. The
+/// unbudgeted arm asserts only the OUTCOME KIND, because
+/// [`an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis`] already
+/// pins the message; what is under test here is that the two runs end differently at all.
+///
+/// Moving the clamp's window term to the SELECTED candidate is the clamp spec's own §8
+/// item — it needs selection to have happened first — and is not this slice's to fix.
+#[tokio::test]
+async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked() {
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "hi")],
+    };
+
+    // (a) UNBUDGETED: the request reaches the gateway, which gates on the window.
+    let (gateway, calls) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .start(run, &graph)
+        .await
+        .expect("drives");
+    let (node, msg) = out
+        .failed
+        .as_ref()
+        .expect("an over-window prompt still fails the node — see the spec's §3 row");
+    assert_eq!(node.0, "n1");
+    assert!(
+        msg.contains("context window"),
+        "the failure must carry the GATEWAY's diagnosis, which is the only way to tell \
+         it apart from the budgeted arm below: {msg}"
+    );
+    assert!(
+        out.paused.is_none(),
+        "and it FAILS rather than pausing — an all-terminal AllGated has no deadline \
+         to wait for: {out:?}"
+    );
+    assert!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and still no provider call — selection refuses before any dispatch, so the \
+         'halts before spending' property the pre-check had is preserved"
+    );
+
+    // (b) BUDGETED, with a cap far above anything in play: the clamp refuses first and
+    // the gate is never asked. A PAUSE, not a failure — a different outcome, a different
+    // remedy, and neither of them the window.
+    let (gateway_b, calls_b) = clamp_observing_gateway(10, 100).await;
+    let journal_b = InMemoryJournal::new();
+    let run_b = RunId(uuid::Uuid::new_v4());
+    journal_b
+        .append(run_b, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out_b = Executor::new(Arc::new(gateway_b), Arc::new(journal_b.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .start(run_b, &graph)
+        .await
+        .expect("drives");
+    let pause = out_b
+        .paused
+        .as_ref()
+        .expect("the budgeted run pauses on the clamp rather than failing on the window");
+    assert_eq!(pause.node.0, "n1");
+    assert!(
+        pause.reason.contains("budget"),
+        "the clamp's refusal is worded as a budget problem even though the WINDOW is \
+         the binding term — the known gap, pinned so a fix to it reddens here rather \
+         than passing unnoticed: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains("context window"),
+        "and it says nothing about the window, which is exactly why AC1 does not hold \
+         on a budgeted run: {}",
+        pause.reason
+    );
+    assert!(
+        out_b.failed.is_none(),
+        "a budgeted over-window run does not reach the gate at all: {:?}",
+        out_b.failed
+    );
+    assert!(
+        calls_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "neither path spends"
+    );
+}
+
+/// AC9 — a resumed agent turn replays from its memo across a drive where selection
+/// could have picked a different candidate.
+///
+/// This is the property that makes SP-7a safe to ship without SP-7b.
+/// `support::agent_input_hash` covers `{chain, system, messages, tools}`, and this slice
+/// changes NO prompt bytes — it picks a different model WITHIN the same chain, and the
+/// CHAIN STRING is what the hash carries, not the model. Truncation would change
+/// `system` and therefore the key, which is precisely why it is a separate slice (spec
+/// §5).
+///
+/// It passes on arrival, because the property already holds. The point is to pin it
+/// BEFORE the pre-check is deleted, so a later change that does alter prompt bytes — or
+/// that folds anything request- or candidate-dependent into the hash — reddens here with
+/// a `DeterminismViolation` instead of at a customer's resume.
+///
+/// # Why the run has to die MID-node
+///
+/// The obvious shape — drive to completion, then `start` again — proves nothing. A
+/// terminal resume of a COMPLETED agent node returns the folded outcome without
+/// re-entering the ReAct loop at all (see
+/// `agent_node_terminal_resume_yields_canonical_output_shape`), so `agent_input_hash` is
+/// never recomputed and the memo comparison never runs. Written that way this test stayed
+/// GREEN with a per-drive-varying value folded into the hash, which is the exact defect
+/// it claims to catch. So run 1 dies at turn 1 with turn 0 already journaled, and run 2
+/// re-enters the loop, recomputes turn 0's key, and must find it equal.
+///
+/// Run 2's gateway also answers as a DIFFERENT model, which is the "selection may
+/// differ" half: the memo key covers the CHAIN string, not the model that served it, so
+/// a drive routed elsewhere within the same chain still replays.
+#[tokio::test]
+async fn an_agent_turn_replays_from_its_memo_though_selection_may_differ() {
+    use kernel::types::io::ChatResponse;
+
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "add 2 and 3")],
+    };
+
+    // Run 1: turn 0 (a calc tool call) is journaled; turn 1 errors because the script is
+    // exhausted. The node fails mid-loop, so no `RunCompleted` is written and the resume
+    // must re-enter the loop rather than replaying a finished node.
+    let (gw1, calls1) = scripted_gateway(vec![tool_call_response(
+        "t1",
+        "calc",
+        "{\"op\":\"add\",\"a\":2,\"b\":3}",
+    )])
+    .await;
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .run(run, &graph)
+        .await
+        .expect("run 1 yields an outcome");
+    assert!(out1.failed.is_some(), "run 1 dies at turn 1");
+    assert_eq!(
+        calls1.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        2,
+        "run 1 called the gateway for turn 0 and the failing turn 1"
+    );
+
+    // Run 2: a fresh gateway over the SAME journal, serving only turn 1 — and answering
+    // as `a-different-model`, standing in for a drive that selected another candidate
+    // from the same chain.
+    let (gw2, calls2) = scripted_gateway(vec![ChatResponse {
+        content: Some("the answer is 5".into()),
+        tool_calls: Vec::new(),
+        usage: None,
+        model: Some("a-different-model".into()),
+        degraded: false,
+    }])
+    .await;
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .start(run, &graph)
+        .await
+        .expect("resume drives");
+    assert!(
+        out2.failed.is_none(),
+        "no DeterminismViolation: this slice changes no prompt bytes, so turn 0's \
+         recomputed key equals the journaled one: {:?}",
+        out2.failed
+    );
+    assert_eq!(
+        calls2.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "turn 0 replayed from its memo — the single call is turn 1's: {:?}",
+        calls2.lock().unwrap_or_else(|e| e.into_inner())
+    );
+
+    // And it was replayed rather than re-run: turn 0's model effect appears in exactly
+    // ONE `EffectRecorded` across BOTH drives. `calls2 == 1` alone cannot show this — a
+    // wrongly re-run turn 0 would consume that one scripted response and finalize.
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, e)| matches!(
+                e,
+                JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &effect_id_of_turn0()
+            ))
+            .count(),
+        1,
+        "turn 0's model call was recorded once, in run 1, and not re-appended on resume"
+    );
+}
+
+/// `effect_id` for node `n1`'s turn 0 model call — the iteration-aware id
+/// `effect_id(node, turn, 0)` that `agent_turn_output` memoizes on.
+fn effect_id_of_turn0() -> EffectId {
+    effect_id("n1", 0, 0)
 }

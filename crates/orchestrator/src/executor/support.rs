@@ -600,24 +600,14 @@ pub(crate) fn classify_gateway_error(
     }
 }
 
-/// Estimate a prompt's tokens (for the over-budget diagnostic's `est`).
-pub(crate) fn est_prompt_tokens(
-    system: &str,
-    messages: &[Message],
-    tools: &[ToolDefinition],
-) -> usize {
-    use crate::agent::prompt::est_tokens;
-    let mut est = est_tokens(system);
-    for m in messages {
-        est += est_tokens(m.content.as_text());
-    }
-    for t in tools {
-        est += est_tokens(&t.name)
-            + t.description.as_deref().map(est_tokens).unwrap_or(0)
-            + est_tokens(&t.input_schema.to_string());
-    }
-    est
-}
+// `est_prompt_tokens` lived here: it computed the `est` figure the deleted
+// `OrchestratorError::PromptOverBudget` reported. SP-7a moved window fit to the
+// gateway's `ContextWindowGate`, which computes its own (pessimistic, tool-schema
+// counting) estimate and reports it in the skip, so this one had no remaining caller and
+// `clippy -D warnings` named it. Deleted rather than kept behind an `#[allow]` — a
+// diagnostic helper for a diagnostic that no longer exists is dead weight, and the
+// gateway's `engine::util::estimate_input_tokens_pessimistic` is the estimate that
+// matters now.
 
 #[cfg(test)]
 mod tests {
