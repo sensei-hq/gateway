@@ -14181,6 +14181,78 @@ async fn a_budgeted_call_is_never_clamped_above_the_models_output_limit() {
     );
 }
 
+/// Below the floor the gate refuses, and **makes no gateway call**.
+///
+/// Asserted on the call log, not on the outcome: a test that only checked the pause
+/// would pass even if we spent the input tokens first and threw the reply away, which is
+/// the exact waste the floor exists to prevent. The floor is also the single most
+/// behaviour-changing line in the slice — it is what turns a run that used to complete
+/// into a run that pauses — and until this test existed the whole arm was reachable by
+/// nothing in the workspace: replacing its `return` with `unreachable!()` left
+/// `cargo test --workspace` at exit=0.
+#[tokio::test]
+async fn below_the_floor_the_gate_refuses_without_calling_the_provider() {
+    // A cap barely above the floor: the prompt's own estimate pushes the allowance
+    // under it, so the refusal is the FLOOR's and not the `spent >= cap` gate's —
+    // nothing has been spent at all.
+    let cap = orchestrator_core::MIN_OUTPUT_TOKENS + 5;
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(cap))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    // A prompt long enough that `chars/3` alone clears the 5 tokens of headroom — the
+    // property is "allowance below the floor", not "an empty prompt costs something".
+    let (graph, ..) = two_node_graph("a prompt whose estimate eats the headroom", "p2");
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    let pause = out.paused.as_ref().expect("the run pauses on the budget");
+    assert_eq!(
+        pause.node.0, "n1",
+        "it pauses at the very first node: {out:?}"
+    );
+    assert!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and NO call was made — the point of the floor is not paying for a doomed reply"
+    );
+    assert_eq!(
+        crate::spend_of(&journal.load(run).await.unwrap()).0,
+        0,
+        "nothing was spent, which is what separates this refusal from an exhausted cap"
+    );
+}
+
+/// An estimate larger than the whole remaining budget must not wrap.
+///
+/// With `saturating_sub` the allowance is 0, which is below the floor, so the run
+/// pauses. Without it the subtraction underflows: a debug build panics with "attempt to
+/// subtract with overflow" (which is what makes this test bite), and a RELEASE build —
+/// the workspace profile sets no `overflow-checks` — wraps to an allowance near
+/// `u64::MAX`, i.e. a clamp wider than the cap, which is worse than no clamp at all.
+#[tokio::test]
+async fn an_estimate_larger_than_the_budget_does_not_wrap() {
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // One token of budget against a prompt that estimates far above it.
+    journal
+        .append(run, run_started_with_budget(1))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("a prompt that costs far more than one token", "p2");
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    assert!(out.paused.is_some(), "a 1-token budget pauses: {out:?}");
+    assert!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "no call was made"
+    );
+}
+
 // ============================= SP-DATA-3 scheduler driver =====================
 
 /// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded
