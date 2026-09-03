@@ -14663,6 +14663,250 @@ async fn a_clamped_call_replays_from_its_memo_when_the_budget_moved() {
     );
 }
 
+// --------------------- the clamp's two diagnostics (AC10, AC11) ---------------------
+//
+// The clamp's signals are `tracing` records and deliberately NOT journal events (design
+// §5.4): they describe our own ESTIMATOR, not run state. Nothing folds them, no resume
+// depends on them, and no operator decision keys on them, so making them durable would
+// cost a `FORMAT_VERSION` concern and a fold arm to carry what the ledger already
+// implies — `usage` is journaled, and the allowance is recomputable from the fold.
+//
+// That choice is what forces the little subscriber below. There is no journal to read
+// them back from, so the only way to assert a `tracing` record fired — or, just as
+// importantly, did NOT fire — is to install a subscriber and look. Without it these two
+// signals would be the one part of the slice with no test at all, which for a
+// diagnostic whose entire job is to be emitted is the same as not having it.
+
+/// One captured `tracing` event: its rendered message plus every integer field.
+///
+/// Integers only, because integers are all the clamp emits. A visitor that tried to be
+/// general would have to decide how to stringify every `Value` shape for no caller.
+#[derive(Debug, Clone, PartialEq)]
+struct CapturedEvent {
+    message: String,
+    fields: Vec<(String, u64)>,
+}
+
+impl CapturedEvent {
+    fn field(&self, name: &str) -> Option<u64> {
+        self.fields.iter().find(|(k, _)| k == name).map(|(_, v)| *v)
+    }
+}
+
+/// Pulls an event's message and its integer fields out of `tracing`'s visitor API.
+struct CapturingVisitor(CapturedEvent);
+
+impl tracing::field::Visit for CapturingVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.fields.push((field.name().to_string(), value));
+    }
+
+    /// The catch-all `tracing` routes the `message` field through. Every non-integer
+    /// field lands here too and is dropped on the floor — see [`CapturedEvent`].
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.message = format!("{value:?}");
+        }
+    }
+}
+
+/// A minimal `tracing::Subscriber` that records every event it is handed.
+///
+/// Hand-written rather than pulled from `tracing-subscriber`, which is not a dependency
+/// of this crate (only `torii` has it, for the CLI's `env-filter`). The seven required
+/// methods are six no-ops and one line of real work, which is less than the `Layer` +
+/// `Registry` wiring would be — and it keeps a test-only concern from adding a
+/// dependency edge to a crate that ships.
+///
+/// Spans are ignored outright: the clamp emits bare events, and a subscriber that
+/// tracks no span state can hand out a constant `Id` because nothing ever looks one up.
+#[derive(Clone, Default)]
+struct CapturingSubscriber(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+impl CapturingSubscriber {
+    /// Everything captured so far whose message names the clamp.
+    ///
+    /// Filtered rather than returned whole because a drive emits unrelated records (the
+    /// permission and jail denials in `agent.rs`, and anything a future change adds), and
+    /// a test that asserted on the total count would break for reasons that have nothing
+    /// to do with the clamp.
+    fn clamp_signals(&self) -> Vec<CapturedEvent> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|e| e.message.contains("budget clamp"))
+            .cloned()
+            .collect()
+    }
+}
+
+impl tracing::Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = CapturingVisitor(CapturedEvent {
+            message: String::new(),
+            fields: Vec::new(),
+        });
+        event.record(&mut visitor);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(visitor.0);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Both clamp diagnostics fire, on a call where both conditions really hold.
+///
+/// The fixture makes each one true for a DIFFERENT reason, so neither rides on the
+/// other. The scripted 5000-token reply is far larger than the 999-token allowance, so
+/// the provider stops at the clamp; and the fixture's 10 real input tokens are ten times
+/// the 1-token estimate of a two-character prompt, so the estimate is measurably low.
+///
+/// That second signal is the feedback loop the whole design rests on. The residual
+/// overshoot is `actual_input − est_input` (design §4) and the estimator is a
+/// `chars / 3` heuristic, so without a record of where it was wrong the bound is an
+/// article of faith. Here it is the difference between a run that spends 1009 against a
+/// 1000-token cap and one that does not: the 9-token overshoot is exactly what the warn
+/// reports.
+#[tokio::test]
+async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
+    const CAP: u64 = 1_000;
+    let capture = CapturingSubscriber::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    // One call: it returns 10 + 999 = 1009 tokens, which puts the ledger past the cap,
+    // so n2 is refused by the `spent >= cap` gate and emits nothing.
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec![Some(999)],
+        "one clamped call, the allowance being 1000 − 1 for the two-character prompt"
+    );
+
+    let signals = capture.clamp_signals();
+    let bit = signals
+        .iter()
+        .find(|e| e.message.contains("clamp bit"))
+        .unwrap_or_else(|| panic!("the clamp-bit signal fired: {signals:?}"));
+    assert_eq!(
+        (
+            bit.field("max_tokens"),
+            bit.field("allowance"),
+            bit.field("output_tokens")
+        ),
+        (Some(999), Some(999), Some(999)),
+        "it reports what was SENT, the budget term it came from, and what came back. \
+         The first two being equal is what says the BUDGET truncated this reply rather \
+         than the model's own limit: {bit:?}"
+    );
+
+    let low = signals
+        .iter()
+        .find(|e| e.message.contains("under-estimated"))
+        .unwrap_or_else(|| panic!("the estimate-wrong signal fired: {signals:?}"));
+    assert_eq!(
+        (low.field("estimated"), low.field("actual")),
+        (Some(1), Some(10)),
+        "and the estimate-wrong signal reports both sides, so the residual overshoot \
+         the design's §4 bounds is measurable rather than assumed: {low:?}"
+    );
+}
+
+/// Neither signal fires when its condition does not hold — the half of AC10/AC11 that
+/// keeps them meaningful.
+///
+/// A diagnostic that fires on every call is not a diagnostic; it is noise that trains an
+/// operator to ignore the one that matters. So this drives two runs where each signal
+/// would be wrong, and the second is the sharper of the two.
+///
+/// **Phase 1, budgeted, neither condition met.** A 5-token reply against a 999-token
+/// allowance was not truncated, and 1 real input token against a 1-token estimate is not
+/// an under-estimate. `>=` and `>` respectively: an estimate that lands exactly right is
+/// not an error to report.
+///
+/// **Phase 2, UNBUDGETED, where the estimate-wrong condition WOULD hold.** 10 real input
+/// tokens against an estimate of… nothing, because on an unbudgeted run no estimate is
+/// made at all. Both signals live inside `if let Some(clamp)` for that reason, and this
+/// is what pins them there: hoist either check out and every unbudgeted call — every
+/// pre-SP-DATA-5 run in the system — starts warning that a clamp it never applied
+/// mis-estimated an input it never measured.
+#[tokio::test]
+async fn neither_clamp_signal_fires_when_its_condition_does_not_hold() {
+    let capture = CapturingSubscriber::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    // Phase 1: budgeted, clamped, and the clamp did not bite.
+    let (gateway, seen) = clamp_observing_gateway(1, 5).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(1_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|m| m.is_some()),
+        "the calls WERE clamped — otherwise this proves nothing about the signals"
+    );
+    assert_eq!(
+        capture.clamp_signals(),
+        Vec::new(),
+        "a reply well under its allowance, and an estimate that was not low, are the \
+         normal case and must be silent"
+    );
+
+    // Phase 2: unbudgeted, with input tokens that WOULD trip the estimate-wrong check
+    // if it were evaluated outside the clamp.
+    let (gateway, seen) = clamp_observing_gateway(10, 5).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    exec.run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("drives");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|m| m.is_none()),
+        "no budget ⇒ no clamp, which is the premise of the assertion below"
+    );
+    assert_eq!(
+        capture.clamp_signals(),
+        Vec::new(),
+        "and an unbudgeted run says nothing about an estimate it never made"
+    );
+}
+
 // ============================= SP-DATA-3 scheduler driver =====================
 
 /// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded
