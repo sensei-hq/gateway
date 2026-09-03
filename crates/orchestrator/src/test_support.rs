@@ -162,8 +162,7 @@ impl ChatModel for RecordingAdapter {
 ///
 /// Named rather than repeated because two places must agree on it and a drift between
 /// them would make the ceiling test pass for the wrong reason: `single_chain_config`
-/// declares it as the model's `max_output_tokens` (what
-/// [`Gateway::min_max_output_tokens`](sensei_gateway::Gateway::min_max_output_tokens)
+/// declares it as the model's `max_output_tokens` (what `Gateway::min_max_output_tokens`
 /// reads), and [`ClampObservingAdapter`] enforces it as the provider would.
 ///
 /// 1024 is the value the real cloud adapters in this repo substitute for a `None`
@@ -437,7 +436,7 @@ pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 /// Records the `max_tokens` each call carried, and HONOURS it in the usage it reports
 /// — `output_tokens = min(scripted_output, max_tokens)`.
 ///
-/// All three halves are load-bearing, and no other double in this module has any of
+/// All three legs are load-bearing, and no other double in this module has any of
 /// them. The existing adapters record some slice of the prompt — the user text, the
 /// system text, or both — and `max_tokens` is read by none of them, so before this one
 /// **no test in the suite could see a clamp at all**.
@@ -493,7 +492,7 @@ impl ChatModel for ClampObservingAdapter {
             .push(req.max_tokens);
         if req.max_tokens.is_some_and(|m| m > self.max_output) {
             return Err(GatewayError::ProviderError {
-                adapter: "r".into(),
+                adapter: self.id().to_string(),
                 message: format!(
                     "max_tokens: {} > {}, the maximum output tokens for this model",
                     req.max_tokens.unwrap_or_default(),
@@ -580,7 +579,7 @@ impl gateway::adapters::capability::EmbedModel for MeteredEmbedAdapter {
     }
 }
 
-/// A gateway whose chain `"emb"` resolves `TextEmbedding` to [`MeteredEmbedAdapter`].
+/// A gateway whose chain `"emb"` resolves `TextEmbed` to [`MeteredEmbedAdapter`].
 /// Returns the shared call counter, so a test can tell "refused before the provider"
 /// from "dispatched" — the distinction the whole non-`Chat` arm rests on.
 pub async fn metered_embed_gateway(total_tokens: u32) -> (Gateway, Arc<Mutex<usize>>) {
