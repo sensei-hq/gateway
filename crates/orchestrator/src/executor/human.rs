@@ -1010,10 +1010,15 @@ impl Executor {
                         .await;
                 }
 
-                // Redact BEFORE the durable write, not only at display time — the journal
-                // row is otherwise the one place a credential sitting in the role's
-                // `system_prompt`, an activated skill body or the iteration output lands in
-                // the clear (`torii config push` scrubs nothing). Then clamp, because
+                // Redact BEFORE the durable write, not only at display time — this row is
+                // otherwise the last unscrubbed door into the JOURNAL for a credential
+                // sitting in the role's `system_prompt`, an activated skill body or the
+                // iteration output. Nothing upstream scrubs the first two: they are
+                // authored in an agent's markdown and `torii config push` copies them into
+                // `config_agents` as jsonb verbatim, so this is not their first durable
+                // copy — an earlier version of this comment said "the one place", and the
+                // config file on disk alone disproves it. It is the copy read BACK, on
+                // every drive and by every operator surface. Then clamp, because
                 // `[REDACTED]` is LONGER than the shortest span it replaces and can push a
                 // question that fitted over the bound; clamping rather than failing keeps
                 // "your prompt contained a secret" from becoming a terminal run.
@@ -1023,13 +1028,30 @@ impl Executor {
                 );
 
                 // **The MENU is redacted too, and it is a deliberate answer rather than a
-                // reflex.** Option names are author free text arriving through the same
-                // `torii config push` that scrubs nothing, and this append is where they
-                // become durable — so leaving them alone made the SAME string scrubbed in
-                // `prompt` (which quotes them, via `gate_ask`) and plaintext in `menu` and
-                // in the pause reason built from it, on one drive. That is the exact defect
-                // class s2 and s3 each shipped and each had to fix, and review measured it
-                // here.
+                // reflex.** Option names are author free text out of the GRAPH: `torii run
+                // submit --graph <file>` deserializes the file and hands it straight to the
+                // scheduler, scrubbing nothing. NOT `torii config push`, which an earlier
+                // version of this comment named — design §4 puts the menu on the graph
+                // precisely so `validate_dag` can see it, and explicitly rejects the
+                // registry as its home, so a pushed config never carries an option name at
+                // all. (The role's `system_prompt` and its skill bodies, redacted just
+                // above, DO arrive that way. Two intakes, neither of them scrubbing.)
+                //
+                // Nor is this append the LAST durable copy of those names, which the same
+                // sentence used to claim. On the scheduler path `Scheduler::submit` calls
+                // `store.enqueue` BEFORE it drives anything, and that inserts the whole
+                // submitted graph — menu included — into `scheduled_runs.graph` as jsonb,
+                // in the clear. What this append is the last line of defence for is the
+                // JOURNAL: the copy every later drive folds, that `run status` and `run
+                // list-paused` print, that `gate_ask` shows the person, and that a decision
+                // is resolved against. `scheduled_runs.graph` is the operator's own
+                // submitted input and is read by `claim_due` alone — `ScheduledRun`, the
+                // shape both observe commands return, carries no graph.
+                //
+                // So leaving them alone made the SAME string scrubbed in `prompt` (which
+                // quotes them, via `gate_ask`) and plaintext in `menu` and in the pause
+                // reason built from it, on one drive. That is the exact defect class s2 and
+                // s3 each shipped and each had to fix, and review measured it here.
                 //
                 // The reflex answer would have been to leave it: a menu is not display
                 // text, it is the VOCABULARY every later decision is resolved against
