@@ -21001,4 +21001,319 @@ mod human_loop_gate {
              for"
         );
     }
+
+    /// An executor whose loop BODY answers `body_text`, so a test can choose what the
+    /// human is asked to judge.
+    ///
+    /// [`exec_at`]'s `recording_gateway` always answers `"canned-response"`, which suits
+    /// every test above — none of them cares what the iteration produced. The two bounds
+    /// tests below care about nothing else: a gate's `## Context` section IS the iteration
+    /// output, so a fixture that cannot choose it can exercise neither the truncation rule
+    /// nor the redaction one. One scripted response is enough because both fixtures pause
+    /// on iteration 0's gate and never reach iteration 1's body.
+    ///
+    /// No `ContentStore`/`ContextStore` is wired, and that is load-bearing rather than
+    /// lazy: with a CAS, the 37 KiB output below would exceed the default 4096-byte
+    /// `cas_threshold` and be journaled as a `ContentRef`, so `run_loop` would hand the
+    /// gate a ref instead of the text and the truncation this test is named for would
+    /// never happen. Inline is also what `exec_at` does, so the two fixtures differ in
+    /// exactly the gateway.
+    ///
+    /// The clock is fixed at `at(1_000)` like `exec_at`'s and is not handed back: neither
+    /// caller crosses a deadline — a gate that fails its bound and a gate that asks are
+    /// both single-drive stories.
+    async fn exec_with_body_output(
+        journal: &InMemoryJournal,
+        registry: Arc<Registry>,
+        body_text: &str,
+    ) -> (Executor, CallLog) {
+        let (gw, calls) = scripted_gateway(vec![final_response(body_text)]).await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_clock(crate::test_support::FakeClock::new(at(1_000)));
+        (ex, calls)
+    }
+
+    /// AC15, the LOUD half — an oversized AUTHORED question fails the gate, and the `Loop`
+    /// with it, before anything oversized becomes durable.
+    ///
+    /// The authored half of a gate's question is the role's `system_prompt`, its activated
+    /// skill bodies, and the menu-derived `## Task` ask. All three are author-controlled at
+    /// config time, which is what makes a loud terminal failure the right answer here and
+    /// the wrong one for the `## Context` half (its sibling below). The overflow is
+    /// delivered through a SKILL body — the largest of the three in practice, and the one
+    /// an author is least likely to have measured.
+    ///
+    /// The failure MESSAGE is asserted in three parts because each is a separate thing an
+    /// operator needs: which half broke (`authored prompt`), the limit it broke, and — the
+    /// part that is easy to lose in a refactor — an explicit statement that the `##
+    /// Context` section is NOT what is being counted. Without that last sentence an author
+    /// reading this failure has every reason to go and shorten the wrong thing, since the
+    /// iteration output is the visibly enormous part of the question.
+    ///
+    /// Mutation-proven: deleting the `authored_bytes > MAX_HUMAN_TEXT_BYTES` guard in
+    /// `run_human_loop_gate` leaves the gate journaling a 4 KiB-plus question and pausing,
+    /// which reddens every assertion here.
+    #[tokio::test]
+    async fn an_oversized_authored_prompt_fails_the_loop_gate() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        // The SAME `reviewer` every other test in this module uses, plus one skill whose
+        // body alone exceeds the bound — so a failure here can only be about size.
+        let registry = Arc::new(
+            Registry::default()
+                .with_agent(reviewer(
+                    Some(Duration::hours(1)),
+                    vec!["the-whole-playbook".into()],
+                ))
+                .with_skill(orchestrator_core::SkillDef {
+                    name: "the-whole-playbook".into(),
+                    description: None,
+                    body: "X".repeat(orchestrator_core::MAX_HUMAN_TEXT_BYTES),
+                    activation: orchestrator_core::Activation::Always,
+                }),
+        );
+        let (ex, _clock, calls) = exec_at(&journal, registry, at(1_000)).await;
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("an over-bound question fails the gate rather than journaling it: {out:?}")
+        });
+        assert_eq!(
+            node,
+            lp(),
+            "the gate's refusal fails the LOOP (AC10): {out:?}"
+        );
+        assert!(
+            message.contains(&gate(0).0),
+            "the message names the GATE that broke, not just the loop — the loop id alone \
+             would send an operator to a node whose config is fine: {message}"
+        );
+        assert!(
+            message.contains("authored prompt")
+                && message.contains(&orchestrator_core::MAX_HUMAN_TEXT_BYTES.to_string()),
+            "…which half broke, and the limit it broke: {message}"
+        );
+        assert!(
+            message.contains("truncated"),
+            "…and that the `## Context` half is NOT what was counted. Without this the \
+             author goes and shortens the iteration output, which is the visibly enormous \
+             part of the question and not the cause: {message}"
+        );
+        assert!(
+            out.paused.is_none(),
+            "it does not also pause — a question nobody can be shown is not a wait: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        assert!(
+            asks(&events).is_empty(),
+            "and NOTHING oversized became durable: the whole point of the cap is that a \
+             multi-KB string stays out of the journal, out of `torii run list-paused` and \
+             out of every later fold of this run: {:?}",
+            asks(&events)
+                .iter()
+                .map(|(_, p, ..)| p.len())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "iteration 0's BODY had already run and its tokens are spent — which is \
+             exactly why the OTHER half must not fail this way"
+        );
+    }
+
+    /// AC15, the TRUNCATING half — a verbose iteration output degrades the question
+    /// instead of killing the gate.
+    ///
+    /// **This is the load-bearing one at this site.** The `## Context` half of a gate's
+    /// question is the iteration's output, i.e. a model answer essentially always, so run
+    /// data no operator can bound at config time. Charging one cap against both halves —
+    /// the shape s3 shipped and its whole-slice review fixed — would kill the node on
+    /// ordinary data, AFTER the iteration's tokens were spent, and unrecoverably:
+    /// `run_human_loop_gate`'s step 0 reads the `NodeFailed` back on every later drive.
+    ///
+    /// Mutation-proven, with the mutation the plan's own Task 6 sketch originally
+    /// prescribed: swap the seam's two arguments at the gate's call site, so the iteration
+    /// output goes in as `input` (the `## Task`, charged to the loud cap) instead of as a
+    /// `context` entry. The gate then fails on this perfectly ordinary body output, which
+    /// is the defect in one line.
+    ///
+    /// The `## Context` assertions are ANCHORED inside that section rather than run over
+    /// the whole prompt: `redact_and_clamp` writes its own "(truncated: …)" marker, so a
+    /// whole-string `contains("truncated")` is satisfied by the wrong clamp — the same trap
+    /// s3's sibling test records.
+    #[tokio::test]
+    async fn a_verbose_iteration_output_truncates_the_question_instead_of_killing_the_gate() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        // Past `MAX_HUMAN_CONTEXT_BYTES`, and so far past `MAX_HUMAN_TEXT_BYTES` that a
+        // one-cap implementation cannot survive it: both bounds are exercised.
+        let verbose = "L".repeat(orchestrator_core::MAX_HUMAN_CONTEXT_BYTES + 5_000);
+        let (ex, _calls) =
+            exec_with_body_output(&journal, human_registry(Some(Duration::hours(1))), &verbose)
+                .await;
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
+        assert!(
+            out.failed.is_none(),
+            "a verbose ITERATION OUTPUT must not kill the gate — the tokens are already \
+             spent and the operator has no way to make the model terser: {out:?}"
+        );
+        assert!(
+            out.paused.is_some(),
+            "it asks the person, exactly as it would over a short output: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        let asked = asks(&events);
+        assert_eq!(asked.len(), 1, "exactly one question: {asked:?}");
+        let prompt = &asked[0].1;
+
+        // The two things that must survive truncation, in priority order: the role's
+        // standing instructions and the ask itself. §5.4's rule is one-directional — never
+        // show the human LESS than the model would have had — and an ask deleted by the
+        // clamp is a question with no question in it.
+        assert!(
+            prompt.contains(QUESTION),
+            "the role's own system prompt survives: {}",
+            &prompt[..prompt.len().min(400)]
+        );
+        assert!(
+            prompt.contains("`revise`") && prompt.contains("`ship`"),
+            "so does the menu-derived ask — the human must still know what they are \
+             choosing between: {}",
+            &prompt[prompt.len().saturating_sub(400)..]
+        );
+
+        let head = prompt
+            .split("\n\n## Task\n")
+            .next()
+            .expect("split always yields a head");
+        let context = &head[head
+            .find("\n\n## Context")
+            .expect("the section exists — the gate always passes the iteration output")..];
+        assert!(
+            context.contains("### iteration output") && context.contains("truncated"),
+            "the context section names what it is showing and says OUT LOUD that it was \
+             cut, so nobody mistakes a clipped draft for the whole one: {}",
+            &context[..context.len().min(400)]
+        );
+        assert!(
+            context.len() <= orchestrator_core::MAX_HUMAN_CONTEXT_BYTES,
+            "and it is bounded by ITS OWN budget — `MAX_HUMAN_CONTEXT_BYTES`, not the sum \
+             the whole row is clamped to: {} bytes",
+            context.len()
+        );
+        assert!(
+            context.contains(&"L".repeat(1_000)),
+            "carrying a REAL prefix of the iteration output, not just the marker"
+        );
+
+        // The durable row is still bounded — the cap's actual justification. A multi-MB
+        // question is re-decoded by every drive, every `list-paused` and every fold for
+        // the life of the run.
+        assert!(
+            prompt.len()
+                <= orchestrator_core::MAX_HUMAN_TEXT_BYTES
+                    + orchestrator_core::MAX_HUMAN_CONTEXT_BYTES,
+            "the journaled question is bounded: {} bytes",
+            prompt.len()
+        );
+        assert!(
+            prompt.len() > orchestrator_core::MAX_HUMAN_TEXT_BYTES,
+            "and the bound that applied is NOT the authored half's 4 KiB one, which is the \
+             conflation this test exists to prevent: {} bytes",
+            prompt.len()
+        );
+    }
+
+    /// AC16 — the journaled question is REDACTED before the durable write, not only at
+    /// display time.
+    ///
+    /// This is the one place a credential sitting in a gate role's `system_prompt`, an
+    /// activated skill body, or an iteration output reaches durable storage in the clear:
+    /// `torii config push` scrubs nothing, and `LoopGateAwaited.prompt` goes straight into
+    /// `journal_events`.
+    ///
+    /// **The two authored sources are the discriminating half.** The iteration-output
+    /// secret is already scrubbed upstream by the shared `model_output` chokepoint (SP-4
+    /// s2), so it would stay clean even with the gate's own pass deleted; it is asserted
+    /// anyway, as the guard that the composed question does not RE-introduce plaintext the
+    /// chokepoint had removed. The `system_prompt` and skill-body secrets pass through no
+    /// other scrub at all, so they are what redden when `redact_and_clamp`'s redactor is
+    /// mutated to the identity — the mutation this test was written against.
+    ///
+    /// Every secret is assembled at RUNTIME: the Semgrep CWE-798 pre-commit hook blocks a
+    /// literal credential-shaped fixture, and a test that had to be `nosemgrep`'d would be
+    /// a worse guard than one that does not need it.
+    #[tokio::test]
+    async fn the_journaled_loop_gate_question_is_redacted() {
+        let in_system = format!("sk-{}", "a".repeat(40));
+        let in_skill = format!("sk-{}", "b".repeat(40));
+        let in_output = format!("sk-{}", "c".repeat(40));
+
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let mut role = reviewer(Some(Duration::hours(1)), vec!["the-playbook".into()]);
+        role.system_prompt = format!("{QUESTION} The console key is {in_system}.");
+        let registry = Arc::new(Registry::default().with_agent(role).with_skill(
+            orchestrator_core::SkillDef {
+                name: "the-playbook".into(),
+                description: None,
+                body: format!("Escalate with {in_skill} if unsure."),
+                activation: orchestrator_core::Activation::Always,
+            },
+        ));
+
+        let (gw, _calls) = scripted_gateway(vec![final_response(&format!(
+            "The vendor left {in_output} in the draft."
+        ))])
+        .await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_clock(crate::test_support::FakeClock::new(at(1_000)))
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
+        assert!(out.paused.is_some(), "the gate still asks: {out:?}");
+
+        let events = journal.load(run).await.expect("loads");
+        let asked = asks(&events);
+        assert_eq!(asked.len(), 1, "exactly one question: {asked:?}");
+        let prompt = &asked[0].1;
+        for (what, secret) in [
+            ("the gate role's system_prompt", &in_system),
+            ("an activated skill body", &in_skill),
+            ("the iteration output", &in_output),
+        ] {
+            assert!(
+                !prompt.contains(secret.as_str()),
+                "a credential from {what} reached the durable journal in plaintext: {prompt}"
+            );
+        }
+        assert!(
+            prompt.contains("[REDACTED]"),
+            "and it is VISIBLY redacted, so the person answering knows something was \
+             removed rather than silently reading a mangled question: {prompt}"
+        );
+        // Redaction is by credential SHAPE, not blanket: the question is still the
+        // question, so nobody is handed a page of `[REDACTED]` and asked to decide on it.
+        assert!(
+            prompt.contains(QUESTION)
+                && prompt.contains("Escalate with")
+                && prompt.contains("`ship`"),
+            "everything that is not credential-shaped survives: {prompt}"
+        );
+    }
 }

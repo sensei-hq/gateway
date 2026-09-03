@@ -454,10 +454,18 @@ pub enum JournalEvent {
     ///   scrubs it (`torii config push` redacts nothing). s3 shipped the unredacted form
     ///   first and its review caught it.
     ///
-    /// Neither is optional (design §6, AC15/AC16). They are recorded on the TYPE, ahead of
-    /// any code that honours them, precisely because the s4 plan builds the append site
-    /// (Task 6) four tasks before the enforcement (Task 10) — so the contract has to be
-    /// legible to the writer who arrives first.
+    /// Neither is optional (design §6, AC15/AC16). They were recorded on the TYPE ahead of
+    /// any code that honoured them, because the s4 plan builds the append site (Task 6)
+    /// four tasks before the enforcement (Task 10) — the contract had to be legible to the
+    /// writer who arrived first. Both are now honoured by `Executor::run_human_loop_gate`
+    /// and each is guarded by the test named for the mutation that undoes it:
+    /// `an_oversized_authored_prompt_fails_the_loop_gate` (delete the authored-bytes
+    /// check), `a_verbose_iteration_output_truncates_the_question_instead_of_killing_the_gate`
+    /// (pass the iteration output as the seam's `input` instead of as a `context` entry —
+    /// the reversal the plan's own Task 6 sketch had, which fails the gate on a perfectly
+    /// ordinary 37 KiB model answer) and `the_journaled_loop_gate_question_is_redacted`
+    /// (swap the redactor for the identity). A SECOND append site owes all three, and
+    /// inherits none of them.
     ///
     /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited`/
     /// `AgentAwaited` do — overwriting the deadline is the never-expires bug.
@@ -494,6 +502,27 @@ pub enum JournalEvent {
     /// question — s3's whole-slice review found an unredacted `--as` to be a real
     /// plaintext leak on this exact field (design §6; see the commentary at
     /// `torii/src/cmd/human.rs`).
+    ///
+    /// **That obligation is the APPENDING writer's alone, and nothing downstream is a
+    /// second line of defence.** Recorded here because the opposite is the natural
+    /// assumption: the executor scrubs the QUESTION at its own chokepoint
+    /// (`fail_loop_gate`, and `redact_and_clamp` on [`JournalEvent::LoopGateAwaited`]), so
+    /// a reader may expect the actor to be caught somewhere on the way through too. It is
+    /// not, and structurally cannot be. `Executor::run_human_loop_gate` reads only
+    /// `option` off this event; it interpolates the actor into no message and puts it in
+    /// no node output. Contrast both siblings, which is why the difference is worth
+    /// stating: [`JournalEvent::GateDecided`]'s actor IS interpolated by `run_human_gate`
+    /// into its rejection `NodeFailed` (so it passes a redacting chokepoint on the way
+    /// out), and [`JournalEvent::AgentAnswered`]'s becomes half the node's OUTPUT and is
+    /// redacted there. A loop gate's actor is written once and read only by an operator
+    /// surface, so whatever reaches this field is what an audit reads forever.
+    ///
+    /// The redaction therefore belongs at torii's decide path, and it has to be ADDED
+    /// there rather than inherited: `cmd::human::answer` redacts `--as` through
+    /// `redact_answer`, while `cmd::gate::decide` — the verb that will write THIS event —
+    /// deliberately does not, measuring the actor `Measured::AsGiven` on the ground that
+    /// `GateDecided.actor` goes through no redaction. A loop-gate branch bolted onto that
+    /// path inherits the gap silently, which is precisely how the s3 leak happened.
     ///
     /// **Why `actor` is REQUIRED**, a plain `String` exactly like
     /// [`JournalEvent::GateDecided`]'s and [`JournalEvent::AgentAnswered`]'s. A gate
