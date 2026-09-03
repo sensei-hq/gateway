@@ -4,7 +4,7 @@
 
 **Goal:** Stop failing prompts that a model in the chain could serve, by making model selection aware of each candidate's context window.
 
-**Architecture:** A sixth `AdmissionGate` in `crates/gateway/src/gates/`, mirroring `BudgetGate`. `SelectionCtx` gains a second, deliberately pessimistic token estimate that counts tool schemas; the gate skips any candidate whose `context_window` cannot hold it. When every candidate is skipped, the existing `all_gated_error` path turns that into a durable `AllGated` pause. The orchestrator's pre-dispatch `min_context_window` check and its terminal `PromptOverBudget` failure are deleted.
+**Architecture:** A sixth `AdmissionGate` in `crates/gateway/src/gates/`, mirroring `BudgetGate`. `SelectionCtx` gains a second, deliberately pessimistic token estimate that counts tool schemas and tool calls; the gate skips any candidate whose `context_window` cannot hold it. When every candidate is skipped, the existing `all_gated_error` path turns that into `AllGated` — a durable pause when some gate is TIMED, and a terminal human-action failure when every gate is terminal, which is the over-window case (see the review section below; the original line here said "durable pause" flatly and that was wrong). The orchestrator's pre-dispatch `min_context_window` check and its terminal `PromptOverBudget` failure are deleted.
 
 **Tech Stack:** Rust. Tests are plain `cargo test` with `assert!`/`assert_eq!`/`matches!`.
 
@@ -29,10 +29,41 @@
 - `HumanAction` is in **`crates/kernel/src/types/error.rs:9`** — `TopUpCredits`, `RotateCredential`,
   `RaiseBudget`. None fits "your prompt is bigger than every model's window". **Confirmed.**
 - `all_gated_error` (`crates/gateway/src/engine/exhaustion.rs:48`) turns an all-skipped selection
-  into a durable pause when no `HardFailure` contributed. **Confirmed.**
+  into an `AllGated` when no `HardFailure` contributed. **Confirmed** — and re-read during the
+  Task 1–4 review: `resume_after` comes from the TIMED skips only, so it is a durable pause only
+  when at least one gate is timed. All-terminal ⇒ `resume_after: None` ⇒ the orchestrator FAILS the
+  node. The original wording of this precondition ("into a durable pause") is what the slice's
+  headline claim was built on, and it was too loose.
 - The orchestrator halt is `executor/agent.rs:368-378`: `over_budget(ar.min_win, …)` →
   `OrchestratorError::PromptOverBudget` → `NodeFailed` → `ToolOutcome::Failed`. `min_win` is set at
   `agent.rs:271` from `gateway.min_context_window(&chain)`. **Confirmed.**
+
+## Review of Tasks 1–4 (2026-09-03) — what changed, and what it moved into later tasks
+
+Five reviewers went over the four landed commits. Two findings were Critical, and both were the
+same one: **the slice's headline claim did not hold.** The corrections are in the spec; the parts
+that land in this plan:
+
+- **`AllGated` is not a pause when every gate is terminal.** `all_gated_error` takes `resume_after`
+  from TIMED skips only, and `classify_gateway_error` pauses only on `Some(t)`. An
+  over-window-everything request was, and remains, a terminal `NodeFailed`. Spec §3 / §2 / AC3 are
+  corrected; the two comments in `skip_reason.rs` that asserted otherwise are rewritten. Reversing
+  that behaviour is now an explicit **deferred** item with its argument, not an assumed benefit.
+- **`AllGated` rendered neither `skipped` nor `human_action`.** Every number this slice adds was
+  being dropped at the orchestrator boundary, which would have made Task 6 a diagnostics
+  REGRESSION against `PromptOverBudget`. Fixed in `kernel::types::error` with its own test; this is
+  what makes the corrected AC3 worth having.
+- **The estimator priced an assistant turn's `tool_calls` at zero** — the ReAct loop's own shape.
+  Now counted. Attachments stay uncounted, and the doc and spec §4 now say so plainly instead of
+  letting "pessimistic" imply completeness.
+- **Six tests could not fail** (the tools term guarded only as a whole, `/3` and `div_ceil`
+  unpinned, bytes-vs-chars untested, Stt's AC10 half satisfied by any value, the gate's window
+  frozen to a constant, the message's two numbers swappable). Each now has a named mutation that
+  reddens it, quoted in its commit.
+
+**Still open, and owned by the later tasks:** the composed `engine::execute` wiring test (Task 5),
+the enumeration sweep now that a sixth gate exists (Task 5 + 7), and the SP-DATA-5 clamp
+interaction that bounds where AC1 applies (Task 6, step 0).
 
 ## Working rules for every task
 
@@ -121,8 +152,13 @@ Add to `skip_reason.rs`'s `mod tests`:
     ///
     /// `Timed` would be wrong — no deadline passes that makes a model's window bigger —
     /// and `Structural` would be wrong too, because the candidate is perfectly well
-    /// configured; it is this REQUEST that does not fit it. Terminal-with-a-remedy is the
-    /// only classification that produces an actionable `AllGated` pause.
+    /// configured; it is this REQUEST that does not fit it. Terminal is the classification
+    /// that carries a `HumanAction`; a Structural skip contributes nothing to
+    /// `all_gated_error` and would surface as a bare `NoCandidates`.
+    ///
+    /// (As SHIPPED this doc says more than the draft did, and less: the review found that
+    /// Terminal does NOT make the run pausable either — see the spec's §3 row. The
+    /// classification is unchanged; only the reason for it was wrong.)
     #[test]
     fn over_context_window_is_terminal_and_names_the_window_remedy() {
         let r = SkipReason::OverContextWindow {
@@ -225,7 +261,9 @@ In `util.rs`'s test module:
     /// schemas entirely — and an agent's activated schemas routinely outweigh its prompt.
     /// For COST that is optimistic pricing; for a WINDOW it admits a candidate the
     /// request does not fit, which is the failure the gate exists to prevent. So this one
-    /// counts the schemas and uses the JSON-ish `chars/3` rather than the prose `chars/4`.
+    /// counts the schemas and uses the JSON-ish `/3` rather than the prose `/4`. (As
+    /// SHIPPED it also counts an assistant turn's `tool_calls`, which the draft missed and
+    /// the review caught, and divides BYTES rather than characters.)
     #[test]
     fn the_pessimistic_estimate_counts_tools_and_never_undercuts_the_cost_estimate() {
         let no_tools = Payload::Chat {
@@ -288,7 +326,7 @@ Add to `util.rs`, beside `estimate_input_tokens`:
 ///    agent's activated schemas routinely outweigh its prompt, so omitting them is not a
 ///    rounding error — it is most of the payload on exactly the requests this gate exists
 ///    to catch.
-/// 2. **`chars / 3`, not `chars / 4`.** The `/4` figure is the rough one for English
+/// 2. **`/3`, not `/4`, over BYTES.** The `/4` figure is the rough one for English
 ///    prose; JSON tokenizes nearer 3 chars/token, and schemas are pure JSON.
 ///
 /// Kept SEPARATE rather than widening the shared estimator, because the two gates want
@@ -531,8 +569,10 @@ built and reuse them:
         );
     }
 
-    /// AC3 — over EVERY window is an all-gated selection, which the caller turns into a
-    /// durable pause rather than a hard failure.
+    /// AC3 — over EVERY window is an all-gated selection, recorded with a typed reason
+    /// per candidate rather than degrading to a bare `NoCandidates`. (What the caller
+    /// then does with it is asserted at the engine boundary — see the self-review test —
+    /// and it is a terminal failure, not a pause.)
     #[test]
     fn a_prompt_over_every_window_gates_every_candidate() {
         let cfg = two_model_chain_windows(128_000, 8_192);
@@ -601,7 +641,33 @@ Expected: COMPILE ERROR — `SelectionCriteria` has no `input_tokens_pessimistic
 
 and the `SelectionCriteria` literal gains `input_tokens_pessimistic: Some(input_tokens_pessimistic),`.
 
-5. **Delete the `#[allow(dead_code)]` above `estimate_input_tokens_pessimistic` in
+**This step needs a test of its own, and it is the one thing the Task 1–4 review could not
+close.** `engine/util.rs`'s tests now compose payload → estimator → `SelectionCtx` → gate, so a
+unit mismatch or a dropped estimator term reddens there. What none of them can see is THIS
+assignment: passing `Some(input_tokens)` here — the cost figure — compiles, keeps every existing
+test green, and silently admits exactly the over-window requests the slice exists to catch. Add a
+test at the `engine::execute` boundary that builds a `Payload::Chat` whose TOOL SCHEMAS alone
+exceed a small candidate's window (see
+`util.rs::tool_schemas_alone_push_a_request_over_a_small_candidates_window` for a fixture that
+measures ~11.5k tokens from 80 schemas and ~40 bytes of prose) and asserts the small model is
+skipped while the large one is selected. Mutation to run before believing it: change this line to
+`Some(input_tokens)` and watch it redden.
+
+5. **Name the sixth gate everywhere the five are enumerated.** Registering it makes six prose
+   sites wrong at once, and they are wrong in the file that owns the pipeline. The
+   `ModelLockoutGate` omission in the same four `selection.rs` sites was fixed during the Task 1–4
+   review, so these now read "capability, connection cooldown, circuit breaker, model lockout,
+   budget" and need `context_window` added:
+
+   - `crates/gateway/src/selection.rs` — the `ModelSelectionService` type doc, the `gates` field
+     doc, `validate_direct`'s doc, `validate_chain_entry`'s doc (four sites);
+   - `crates/gateway/src/engine/execute.rs` — the selection-empty branch's cause list;
+   - `crates/gateway/src/engine/stream.rs` — the same list in its mirror branch.
+
+   Also drop "not registered yet: Task 5 adds it" from `gates/context_window.rs`'s type doc, which
+   becomes false the moment this task lands.
+
+6. **Delete the `#[allow(dead_code)]` above `estimate_input_tokens_pessimistic` in
    `engine/util.rs`.** Task 3 added it because nothing in a non-test build called the function
    between Task 3 and this one, and the pre-commit gate is `clippy --workspace --all-targets
    -D warnings`. This step is what makes it unnecessary; leaving it would silence a real signal
@@ -637,6 +703,29 @@ circuit-open should surface the breaker, which is the recoverable one."
 **Files:**
 - Modify: `crates/orchestrator/src/executor/agent.rs:271` (`min_win`), `:368-378` (the halt), and `AgentRun`'s `min_win` field
 - Modify: `crates/orchestrator-core/src/error.rs:76` (`PromptOverBudget`)
+
+- [ ] **Step 0: Verify what the pre-check is actually shielding on a BUDGETED run**
+
+Do this BEFORE deleting anything. The Task 1–4 review established by reading `dispatch.rs` that on
+a budgeted run the SP-DATA-5 clamp refuses **before `Gateway::execute` is ever called**:
+
+```text
+window  = min_context_window(chain).saturating_sub(est)   // chain MINIMUM
+ceiling = min(min_max_output_tokens(chain), window)
+if ceiling < MIN_OUTPUT_TOKENS  =>  Refusal::BudgetExhausted { cause: BelowFloor }
+```
+
+For AC1's own chain `[big 128k, small 8k]` with a 20k prompt that is `8192 − 20000 = 0`, `0 < 256`,
+and the run refuses with a message the clamp's own comment admits "names a raise that will not
+help". So deleting the pre-check does not make AC1 work on a budgeted run — the gate never gets
+asked.
+
+Write a test at the `dispatch_metered` boundary pinning that this is the behaviour (budgeted +
+over-chain-minimum ⇒ `BelowFloor`, unbudgeted ⇒ reaches the gateway and selects the big model), so
+the boundary of the slice's benefit is a fact in the suite rather than a paragraph. Then record it
+in the commit message and in Task 7's docs sweep. Do **not** try to fix the clamp here: moving its
+window term to the selected candidate is the clamp spec's own §8 item and needs selection to have
+already happened.
 
 - [ ] **Step 1: Write the failing test (AC9)**
 
@@ -736,7 +825,10 @@ Deletes the pre-dispatch min_context_window halt and PromptOverBudget.
 The orchestrator was guessing ahead of the selector against the chain's
 SMALLEST window and failing the node terminally; the gateway now asks the
 question per candidate, where it has a correct answer, and an
-over-everything request becomes a durable AllGated pause instead.
+over-everything request becomes an AllGated naming every candidate's own
+window and the estimate that exceeded it. Still terminal (AllGated with no
+timed gate does not pause), but diagnosed per candidate instead of against
+the chain minimum.
 
 PromptOverBudget is removed rather than left unconstructed: a variant no
 code can produce is a claim the type makes and the code does not honour."
@@ -797,47 +889,75 @@ git commit -m "docs: window-aware selection, and the two claims it made false"
 
 | AC | Task | AC | Task |
 |---|---|---|---|
-| AC1 heterogeneous chain serves | 5 | AC6 counts tool schemas | 3 |
-| AC2 skip records both numbers | 2, 4 | AC7 pessimistic ≥ cost estimate | 3 |
-| AC3 all-gated durable pause | 5 | AC8 `PromptOverBudget` gone | 6 |
+| AC1 heterogeneous chain serves | 4 (unit), 5 (composed) | AC6 counts schemas + tool calls | 3 (composed, in `util.rs`) |
+| AC2 skip records both numbers | 2, 4 | AC7 pessimistic ≥ cost, unit pinned absolutely | 3 |
+| AC3 `AllGated` names the numbers | 1 (`Display`), 5 (engine boundary) | AC8 `PromptOverBudget` gone | 6 |
 | AC4 in-window byte-identical | 5 | AC9 memo replays | 6 |
-| AC5 no estimate admits | 4 | AC10 Embed/Stt unaffected | 3 |
+| AC5 no estimate admits (vs a ZERO window) | 4 | AC10 Stt unaffected / Embed gated | 3 |
 
-**Gap found and closed:** AC3 says the all-gated case must be a **durable pause**, but Task 5's test
-only asserts that selection admits nothing and records the reason — it never reaches
-`all_gated_error`, so nothing pins that an over-window-everything request is *recoverable* rather
-than a hard failure. That is the single most valuable behavioural claim in the slice. Add to Task 5:
+Three rows moved during the Task 1–4 review. **AC6** was booked to Task 3 on the strength of a
+test that proved the estimator counts schemas, while a separate Task 4 test proved the gate skips
+on a number — nothing joined them, which is exactly how the `tool_calls` gap survived; the
+composed form now lives in `util.rs`. **AC10** was booked to a test that could not fail for it
+(Stt's `pess >= cost` is satisfied by any value when `cost == 0`) and asserted "unaffected" of a
+payload kind that is in fact gated; both halves are now pinned, one as an absolute zero and one as
+a deliberate skip. **AC3** lost its pause claim and gained a `Display` obligation in the kernel.
+
+**Gap found and closed:** AC3 says the all-gated case must be recorded as `AllGated`, but Task 5's
+selection-level test only asserts that selection admits nothing and records the reason — it never
+reaches `all_gated_error`, so nothing pins what the CALLER receives. Add to Task 5:
 
 ```rust
     /// AC3, the half the selection-level test cannot see: an all-gated selection must
-    /// reach the caller as a RECOVERABLE error, not a bare `NoCandidates`.
+    /// reach the caller as an `AllGated` naming the cause and the remedy, not as a bare
+    /// `NoCandidates`. Asserted at the engine boundary, because `all_gated_error` is
+    /// what makes the distinction and it lives there.
     ///
-    /// This is the whole improvement over the old terminal `NodeFailed` — the run
-    /// survives and an operator can widen the chain and wake it. Asserted at the engine
-    /// boundary, because `all_gated_error` is what makes the distinction and it lives
-    /// there.
+    /// Both the typed variant AND the rendered string, deliberately. The typed check is
+    /// the contract; the rendered one is what an operator actually gets, because
+    /// `classify_gateway_error` builds its `NodeFailed` reason from `err.to_string()`
+    /// and nothing downstream destructures the error.
     #[tokio::test]
-    async fn a_request_over_every_window_is_recoverable_not_a_hard_failure() {
+    async fn a_request_over_every_window_is_all_gated_with_the_numbers() {
         let cfg = two_model_chain_windows(128_000, 8_192);
         let gw = gateway_with(cfg);
         let err = gw
             .execute(&chat_request_of_length(200_000))
             .await
             .expect_err("nothing can hold it");
+        let GatewayError::AllGated { skipped, human_action, .. } = &err else {
+            panic!(
+                "an all-gated selection must not degrade to another error — \
+                 NoCandidates is the structural 'nothing is configured' case and tells \
+                 an operator nothing about what to do: {err:?}"
+            );
+        };
+        assert_eq!(*human_action, Some(HumanAction::UseLargerContextWindow));
         assert!(
-            !matches!(err, GatewayError::NoCandidates { .. }),
-            "an all-gated selection must not degrade to a bare NoCandidates — that is \
-             the structural 'nothing is configured' error, and it tells an operator \
-             nothing about what to do: {err:?}"
+            skipped.iter().any(|s| s.contains("8192-token context window")),
+            "the diagnostics must name a candidate's own window: {skipped:?}"
         );
         assert!(
-            format!("{err}").contains("context window"),
-            "and the error must name the cause: {err}"
+            format!("{err}").contains("8192-token context window"),
+            "and it must survive Display, which is the only channel that reaches a \
+             NodeFailed: {err}"
         );
     }
 ```
 
 Write `gateway_with` and `chat_request_of_length` from the existing engine-test fixtures.
+
+**Two corrections to the draft this replaces**, both from the Task 1–4 review:
+
+- it asserted `format!("{err}").contains("context window")`, which **could not pass**:
+  `AllGated`'s `#[error]` rendered only "all candidates gated, human action required" and dropped
+  `skipped` entirely. That is now fixed in `kernel::types::error`, so the assertion is
+  reachable — and it is written against a labelled substring rather than a bare number so a
+  swapped-placeholder message cannot satisfy it;
+- its first assertion (`!matches!(err, NoCandidates)`) was far weaker than the AC3 it claimed to
+  close: `AllGated{None}` satisfies it while still hard-failing the node. The destructuring form
+  above says what is actually required. The pause-vs-fail question it seemed to be about is
+  **not** AC3 any more — see the spec's §3 row and §8.
 
 **Placeholder scan:** none. Every code step carries real code. Three steps say "check the real
 fixture names before writing" — that is an instruction to verify against the codebase, not a
