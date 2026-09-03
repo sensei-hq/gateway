@@ -22,13 +22,27 @@ That framing assumed we must *predict* the cost. We do not have to — we can **
 test-support builder). So today output is bounded only by whatever the adapter substitutes for
 `None`.
 
-> **Correction, from the whole-slice review.** This section first said that overshoot by one call
-> "can mean a model's entire output limit". That is true only of the `openai_compat` family and
-> the local engine, which pass the `Option` through. `anthropic`, `gemini` and `bedrock` each
-> substitute their own `DEFAULT_MAX_TOKENS = 1024` (`anthropic/mod.rs:27`, `gemini.rs:43`,
-> `bedrock/mod.rs:62`), so for three of the five families `None` already meant 1024. The
-> consequence for the design is in §6: on those three, a budgeted call's output ceiling can now be
-> HIGHER than the same unbudgeted call's, bounded by the model's own limit.
+> **Correction, from the whole-slice review, itself corrected in round 2.** This section first
+> said that overshoot by one call "can mean a model's entire output limit". The first correction
+> replaced that with "true only of `openai_compat` and the local engine; `anthropic`, `gemini` and
+> `bedrock` substitute 1024" — which is wrong for two of the five, and the second round measured
+> each adapter rather than reading its constant. What `max_tokens: None` actually means:
+>
+> | family | `None` ⇒ | source |
+> |---|---|---|
+> | `openai_compat` | field OMITTED (`skip_serializing_if`) ⇒ the model's own maximum | `openai_compat/mod.rs:73`, `:128`; `convert.rs:31` |
+> | `anthropic` | `unwrap_or(DEFAULT_MAX_TOKENS)` = **1024** | `anthropic/mod.rs:155`, `:218` |
+> | `bedrock` | `unwrap_or(DEFAULT_MAX_TOKENS)` = **1024** | `bedrock/mod.rs:205`, `:271` |
+> | `gemini` | **no `generationConfig` at all** ⇒ Gemini's own default | `gemini.rs:636`, `:685` |
+> | local engine | `unwrap_or(default_max_tokens)` = **512** | `llama_cpp/mod.rs:398`, `:597`, `:142` |
+>
+> Gemini is the one that needs explaining: `generation_config` is built only when
+> `(max_tokens.is_some() || temperature.is_some())`, and every orchestrator producer sends
+> `temperature: None` (`support.rs:500`, `support.rs:539`, `dispatch.rs`'s selector request). So
+> with `max_tokens: None` the `DEFAULT_MAX_TOKENS = 1024` at `gemini.rs:43` is never reached. The
+> consequence for the design is in §6, and the DIRECTION of the change is not the one first
+> recorded: the clamp widens on `anthropic`, `bedrock` and the local engine, and narrows on
+> `openai_compat` and `gemini`.
 
 This slice sets `max_tokens` on budgeted runs to what the remaining budget can afford, bounded by
 the model's own maximum output. Enforcement moves from our arithmetic to the provider's: the call
@@ -104,6 +118,21 @@ re-dispatched at all, and a genuinely re-driven call *should* see the budget as 
 Verified against the code rather than assumed; a plan step re-checks it, because a future change
 that folded transport parameters into the hash would turn every budgeted resume into a hard halt.
 
+**There are THREE determinism keys, and each needs its own guard.** They are two functions across
+three CALL SITES: `support::input_hash(chain, payload)` is called by `run_node`'s `ModelCall` arm
+(and the `Map` producer) and again — with a `{system, user}` payload — by
+`SelectorDispatch::complete`, while `support::agent_input_hash`
+(`{chain}|{system}|{messages}|{tools}`) is called only by `agent_turn_output`. A guard therefore
+attaches to a call site, not to a function: a budget term folded in at one leaves the other two
+hashing as before, so one resume test pins one site.
+
+The slice first shipped a single `ModelCall` resume test whose comment claimed all three. Folding
+the remaining budget in at `agent_turn_output` took the whole orchestrator suite green, so the agent
+site — a budgeted agent that pauses mid-ReAct-loop, is raised, and must replay turn 0 from its memo
+— needed its own test. That sequence is the design's OWN recovery story, which makes it the worst
+one to leave unguarded: the raise that exists to un-stick the run would be the thing that halts it.
+The selector site was measured as the control and is already guarded.
+
 ### 5.2 The rule
 
 For a budgeted run with a `Payload::Chat` only:
@@ -139,6 +168,29 @@ The floor's refusal reuses `Refusal::BudgetExhausted` as §2 requires, but carri
 two situations do not render as one message. Reusing the exhausted wording reported a spend that
 did not happen ("0 of 300 tokens spent" on a fresh run) and gave no hint of how far the cap must be
 raised.
+
+**The raise the refusal names, and why it is not derived from the allowance.** AC4 asks for "the
+smallest cap that would unblock the call". A dispatch needs `(cap − spent) − est ≥ floor`, so that
+cap is:
+
+```
+needed = spent + est_input + MIN_OUTPUT_TOKENS
+```
+
+The tempting one-liner `budget + (floor − allowance)` is algebraically identical whenever
+`est_input ≤ remaining`, and silently wrong when it is not — which is precisely the AC5 saturating
+branch. `allowance` is `remaining.saturating_sub(est_input)`, so once `est_input ≥ remaining` the
+saturation has already destroyed `est_input − remaining` and the allowance-derived figure
+understates the raise by exactly that much. It shipped that way: a cap of 1 against a 15-token
+estimate reported "raise the cap to at least 257" when the true answer is 271, and each operator
+round trip bought only another `MIN_OUTPUT_TOKENS`. Because the pause is `resume_after: None`,
+every one of those round trips is a manual `BudgetRaised` + `force_wake`. `BudgetRefusal::BelowFloor`
+therefore carries `est_input` alongside `allowance`, and the message is computed from the same three
+terms the refusal itself used.
+
+"At least" remains the right hedge, but only for the reason stated: a LATER, longer prompt can still
+land under the floor at the new cap. It is not a hedge against this call, which the figure above
+unblocks exactly.
 
 ### 5.3 The estimate
 
@@ -213,19 +265,57 @@ notes, not just the code.
 answering one word needs far less, and a planner emitting a graph needs far more. One constant will
 be wrong for somebody, which is the argument for the deferred per-agent knob.
 
-**On three of the five provider families, a budgeted call's output ceiling RISES.** `anthropic`,
-`gemini` and `bedrock` substitute their own 1024 for a `None` `max_tokens`, so an unbudgeted call
-on those adapters is capped at 1024 today. A budgeted one is capped at
-`min(remaining − est, model.max_output_tokens)`, which for a large cap is the model's limit — 4096
-or 8192 in the shipped catalog. Adding a budget can therefore make an individual reply LONGER, even
-though the run's total is now enforced where before it was not.
+**On three of the five provider families, a budgeted call's output ceiling RISES — and they are
+not the three this section first named.** `anthropic` and `bedrock` substitute their own 1024 for a
+`None` `max_tokens`, and the local engine substitutes its configured `default_max_tokens` (512 from
+the chat builder), so an unbudgeted call on those three is capped low today. A budgeted one is
+capped at `min(remaining − est, chain's smallest max_output_tokens)`, which for a large cap is that
+chain limit — 2048 to 8192 across the shipped example catalog and presets. Adding a budget can
+therefore make an individual
+reply LONGER, even though the run's total is now enforced where before it was not.
+
+The other two NARROW. `openai_compat` omits the field when it is `None`, and `gemini` sends no
+`generationConfig` at all (see §1's corrected table), so on both an unbudgeted call gets the
+model's or the provider's own maximum and a budgeted one gets our value instead. §1 first recorded
+gemini among the widening three and the local engine among the pass-throughs; both were wrong, and
+the release-notes sentence had the direction of the change backwards for gemini as a result.
 
 This was considered and accepted rather than overlooked. The alternative — also taking
 `min(…, 1024)` so the clamp can only ever narrow — would hard-cap every budgeted reply at another
 provider's arbitrary fallback constant, silently truncating budgeted runs on the `openai_compat`
-and local paths where `None` means the model's own maximum, and would import that constant into the
-orchestrator. That trades a surprising-but-bounded widening for a silent truncation, which is
-worse. The run's total spend stays bounded either way; only the per-call shape moves.
+and `gemini` paths where `None` means the model's or the provider's own maximum, and would import
+that constant into the orchestrator. That trades a surprising-but-bounded widening for a silent
+truncation, which is worse. The run's total spend stays bounded either way; only the per-call shape
+moves.
+
+**On a HETEROGENEOUS chain a budgeted run's replies are narrowed from the FIRST call, independent
+of the cap.** `ceiling` is `min` over every entry in the chain, so a budgeted run on
+`[gpt-4o 16384, small-fallback 4096]` emits `max_tokens: 4096` on the primary throughout, however
+much budget remains — where the same run unbudgeted would get 16384 on an `openai_compat` router.
+This is a different effect from the shortening below, which is a near-the-cap one; an operator
+setting `--budget-tokens 1000000` on such a chain should expect it. Not silent (the clamp-bit
+`tracing::info!` logs both bounds), and the alternative — bounding by the SELECTED model, after
+selection — moves the clamp downstream of the selector and is §8 work. It is accepted here because
+the clamp runs before selection deliberately: a request that fails over lands on a different entry,
+and a value the fallback would reject turns a survivable failover into a hard 400.
+
+**The pessimism assumes a Latin script.** `chars / 3` over-counts only where a token is worth three
+or more characters. CJK, Cyrillic and emoji run nearer 1–3 tokens PER character, so on such a prompt
+the estimate under-counts by a multiple, §4's residual (`actual_input − est_input`) becomes a
+fraction of the prompt rather than a small error, and the "biased toward refusing early" half of the
+claim flips sign. The bound does not vanish, but it widens by a factor a reader could not otherwise
+anticipate from these docs. The AC11 `budget clamp under-estimated the input` warning is the
+mitigation and a non-Latin prompt is exactly the case it is expected to fire on; the real tokenizer
+(§8) is the fix, and this paragraph is the honest cost of deferring it.
+
+**A model with `max_output_tokens: 0` is now rejected at config validation.** `min` over the chain
+means one such entry gives `ceiling = Some(0)` and the clamp would emit `max_tokens: Some(0)` —
+"generate nothing" — on every budgeted `Chat` call, and the floor cannot catch it because the floor
+runs first, by design. The field is a plain required `u32` and several fixtures in this repo use `0`
+as don't-care filler, so it was reachable. Rejected in `collect_validation_errors` rather than
+special-cased in the clamp, because zero output is broken for every reader of the field (`budget.rs`
+prices such a model at zero and it wins any cheapest-first selection). The unchecked `Gateway::new`
+/ `update_config` paths still validate nothing, by their own documented design.
 
 **A budget below `MIN_OUTPUT_TOKENS` is now refused by the CLI**, not accepted and paused on
 immediately. `parse_budget_tokens` previously rejected only `0`, on the stated ground that a budget
@@ -243,7 +333,10 @@ which can never dispatch a call belongs on the precondition side; the floor wide
    gateway call is made** (asserted on a call counter, not on the outcome alone). Its reason names
    the allowance, the floor and the smallest cap that would unblock the call — distinguishable from
    an exhausted cap, which is a different situation with a different remedy.
-5. `est_input > remaining` does not wrap: the floor sees `0` and refuses.
+5. `est_input > remaining` does not wrap: the floor sees `0` and refuses — **and the raise that
+   refusal names is APPLIED and the call then goes out.** Asserting the pause alone is what let the
+   allowance-derived arithmetic of §5.2 ship: on this branch, and only on this branch, the figure was
+   wrong, and re-driving at exactly the cap the message asked for is the assertion that catches it.
 6. A non-`Chat` payload on a budgeted run is unchanged and still gated by the existing rule.
 7. Against a fake provider that honours `max_tokens`, a budgeted run's total spend does not exceed
    `cap + (actual_input − est_input)` — the §4 claim, asserted as arithmetic rather than prose.
@@ -259,14 +352,21 @@ which can never dispatch a call belongs on the precondition side; the floor wide
 9. `est_tokens`'s existing window-fit behaviour is unchanged (its own tests still pass untouched).
 10. The clamp-bit signal fires when `output_tokens >= emitted_max_tokens` and not otherwise —
     against the value SENT, not against `allowance`; see §5.4's correction for why the original
-    wording would have been silent on the cases the signal exists for.
+    wording would have been silent on the cases the signal exists for. Pinned on a fixture where the
+    two operands DIFFER (the model ceiling binding below a large cap), because every other signal
+    test drives `emitted == allowance` and cannot tell the comparisons apart.
 11. The estimate-wrong signal fires when `input_tokens > est_input` and not otherwise. "Not
     otherwise" includes an UNBUDGETED call, where no estimate is made at all: both signals sit
-    inside the clamp's own `if let`, and a test pins them there.
+    inside the clamp's own `if let`, and a test pins them there. The "not otherwise" test carries a
+    positive CONTROL — a third drive whose signal must fire — because `set_default` is thread-local
+    and an assertion that a capture is empty is satisfied just as well by a dead capture.
 12. A clamped call still journals its real `usage` and folds by effect id exactly as before.
 13. **A clamped call replays from its memo on resume rather than raising `DeterminismViolation`** —
     §5.1's fence argument, asserted by resuming a run whose remaining budget (and therefore whose
-    clamp) has changed between drives.
+    clamp) has changed between drives. **Twice: once through `input_hash` (a `ModelCall` graph) and
+    once through `agent_input_hash` (a budgeted agent paused mid-ReAct-loop, raised, and replaying
+    turn 0).** One test cannot cover both — they are separate functions with separate callers, and
+    the agent leg took the mutation green while a comment claimed otherwise.
 
 ## 8. Deferred
 

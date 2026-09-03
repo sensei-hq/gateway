@@ -1,38 +1,37 @@
 # Checkpoint
 
-**Slice: SP-DATA-5 follow-on — the budget clamp.** On `develop`, unpushed. Tasks 1–8 done;
-Task 9 (docs + release gate) is all that remains.
+**Slice: SP-DATA-5 follow-on — the budget clamp.** On `develop`, unpushed. Tasks 1–8 done; Task 9
+is down to Steps 1–2 and 5–6 (its doc steps 3–4 landed in review round 2).
 
 ## Done
 
-Tasks 1–4 shipped at `c301901`; a three-reviewer whole-slice review raised 20 findings at Minor or
-above, all fixed in nine commits, and Tasks 5, 6 and most of 8 landed with them. Two Criticals were
-real: the clamp had no upper bound (a cap of 10240 sent `Some(10239)` and the provider answered a
-400 — a budgeted run hard-failing where the unbudgeted one succeeds; fixed with
-`min(allowance, Gateway::min_max_output_tokens(chain))`), and the Postgres AC6 e2e was left under
-the floor at `CAP = 100`, invisible to the local suite and red in CI.
+Tasks 1–4 at `c301901`; round-1 raised 20 findings and Tasks 5, 6 and most of 8 landed with the
+fixes. Then Task 7 (`cd992df`), Task 8 (`f4f97b0`), the ledger (`bc902c4`).
 
-Since then — **Task 7** (`cd992df`): AC13, a clamped call replays from its memo when the budget
-moved between drives. The first drive is made to stop half-way so the second must replay `n1` AND
-dispatch `n2`; the plan's own fixture sketch could not have shown the clamp differing at all.
-**Task 8** (`f4f97b0`): the two `tracing` signals, plus the two tests the plan never asked for. The
-clamp-bit condition is `output_tokens >= the max_tokens SENT`, not `== allowance` as the spec said
-— keying on the allowance is silent on every chain whose model limit sits below it.
+**Review round 2 — 18 findings, all fixed.** One real bug: `BelowFloor`'s recommended raise was
+derived from the SATURATED allowance, so on the `est ≥ remaining` branch it understated the answer
+("at least 257" where 271 was needed) and each `BudgetRaised` + `force_wake` bought only another
+256 tokens. Now `spent + est_input + floor`, with the wrap test re-driving at the cap it names.
+Three UNTESTED properties got red-first guards: the AGENT determinism call site (a budgeted agent
+paused mid-loop, raised, replaying turn 0 — folding the remaining budget in there was green across
+the whole suite), AC10's clamp-bit signal keyed on `emitted` not `allowance`, and the
+`--budget-tokens` whitespace trim the floor rescale deleted. `max_output_tokens: 0` is now a
+config-validation error (`ceiling = Some(0)` ⇒ `max_tokens: Some(0)`), and "neither signal fires"
+gained a positive control so a dead thread-local capture cannot pass it. The rest were false doc
+claims: the five-family adapter survey was wrong for gemini and the local engine in four places,
+three stale mutation counts are now properties, and the pre-clamp contract still read as current
+in the overview and the older SP-DATA-5 spec.
 
 ## Verified at the gate — real exit codes
 
-`cargo test --workspace` **1679 passed / 0 failed / 56 ignored, exit 0** ·
-`cargo clippy --workspace --all-targets -- -D warnings` exit 0 · `cargo fmt --all --check` exit 0.
-All seven mutations are tabulated with their failures in the plan's "mutation ledger"; each was run
-against a clean tree and reverted.
+`cargo test --workspace` **1682 passed / 0 failed / 56 ignored, exit 0** · `clippy --workspace
+--all-targets -- -D warnings` exit 0 · `fmt --all --check` exit 0 · `cargo doc` unresolved links
+**16**, the baseline. Every round-2 mutation is tabulated with its failure in the plan's ledger.
 
-## Remaining, and the next command
+## Remaining, the next command, and known-broken
 
-**Task 9** only: the overview entry, the older SP-DATA-5 spec's §8/§2, the doc-link baseline
-(expect 16), the release gate. The four prose surfaces Step 4 used to own are already swept.
-Run `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`, then Task 9.
-
-## Known-broken
-
-Nothing. `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it. The **sensei
-daemon is not running**, so this file is the only durable record; `sensei start` restores it.
+Task 9 Steps 5–6, re-running Steps 1–2 at the tip; `develop` → `main` is still the batched PR. Run
+`cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`. Broken:
+nothing. `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it. The Postgres AC6
+budget e2e is `ignore`d without `have_database_url`, so a local `--workspace` run misses it, and
+the **sensei daemon is not running**, so this file is the only durable record.

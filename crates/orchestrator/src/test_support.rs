@@ -165,10 +165,17 @@ impl ChatModel for RecordingAdapter {
 /// declares it as the model's `max_output_tokens` (what `Gateway::min_max_output_tokens`
 /// reads), and [`ClampObservingAdapter`] enforces it as the provider would.
 ///
-/// 1024 is the value the real cloud adapters in this repo substitute for a `None`
-/// `max_tokens` (`cloud-providers/src/anthropic/mod.rs:27`, `gemini.rs:43`,
-/// `bedrock/mod.rs:62`), which makes it a realistic figure for the fixture even though
-/// nothing here depends on the coincidence.
+/// 1024 is the value `anthropic` and `bedrock` substitute for a `None` `max_tokens`
+/// (`cloud-providers/src/anthropic/mod.rs:27`, `bedrock/mod.rs:62`), which makes it a
+/// realistic figure for the fixture even though nothing here depends on the coincidence.
+///
+/// `gemini.rs:43` declares the same constant and does NOT reach it from this
+/// orchestrator: its `generationConfig` is built only when `max_tokens` or `temperature`
+/// is `Some`, and every producer here sends both as `None` on an unbudgeted call, so no
+/// `generationConfig` is sent at all. The two families that genuinely default to 1024 are
+/// anthropic and bedrock; the local engine defaults to 512 and `openai_compat` omits the
+/// field entirely. See `dispatch.rs`'s clamp comment for the full five-family survey —
+/// an earlier version of this sentence listed gemini among the substituting three.
 pub const FIXTURE_MAX_OUTPUT_TOKENS: u32 = 1024;
 
 /// The shared single-chain `GatewayConfig` for the test harness: chain `"c"`
@@ -446,10 +453,19 @@ pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 /// rather than a reading-back of a number we just watched ourselves compute — the
 /// difference matters because a test of the first kind cannot tell a correct clamp from
 /// one the provider ignored. Both claims were checked by mutation rather than asserted:
-/// report `scripted_output` regardless of `max_tokens` and
-/// `a_budgeted_run_does_not_overshoot_beyond_the_estimate_error` fails with "spend 5010
-/// must stay within cap 2000", while `a_clamped_call_still_journals_its_real_usage`
-/// fails on the journaled count.
+/// report `scripted_output` regardless of `max_tokens` and FIVE tests redden —
+/// `a_budgeted_run_does_not_overshoot_beyond_the_estimate_error` with "spend 5010 must
+/// stay within cap 2000", `a_clamped_call_still_journals_its_real_usage` on the journaled
+/// count, `both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` and
+/// `the_clamp_bit_signal_fires_against_the_value_sent_not_the_allowance` on the reported
+/// `output_tokens`, and this module's own
+/// `the_clamp_observing_fixture_records_and_honours_max_tokens`.
+///
+/// Re-measured here rather than carried forward. Both this list and the "only test that
+/// depends on honouring" claim in `a_budgeted_run_does_not_overshoot_beyond_the_estimate_error`
+/// were stale within the slice that wrote them; a mutation result is only evidence for as
+/// long as it reproduces, so if a later change makes this list wrong, re-run the mutation
+/// rather than trusting the sentence.
 ///
 /// It is a stand-in for a provider's behaviour, not a model of one: a real provider
 /// stops GENERATING at `max_tokens`, so `output_tokens` lands at or below it. `min` is

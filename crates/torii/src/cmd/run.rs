@@ -1744,6 +1744,16 @@ pub(crate) mod tests {
             Ok(orchestrator_core::MIN_OUTPUT_TOKENS),
             "the floor itself is accepted; it is only BELOW it that nothing can dispatch"
         );
+        // The `s.trim()` leg, at a magnitude above the floor. It used to be carried by
+        // `parse_budget_tokens(" 12 ")`, which the floor rescale turned into a rejection
+        // — so the case was deleted rather than moved, and nothing else here passes a
+        // padded value: `""` and `"many"` fail to parse trimmed or not. Drop the `trim`
+        // and `--budget-tokens ' 50000'` is refused as "not a whole number".
+        assert_eq!(
+            parse_budget_tokens(" 50000 "),
+            Ok(50_000),
+            "whitespace is trimmed"
+        );
     }
 
     /// A cap below `MIN_OUTPUT_TOKENS` can never dispatch a single `Chat` call, for the

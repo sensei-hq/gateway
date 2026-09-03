@@ -204,6 +204,25 @@ impl Gateway {
     /// fallback model would reject turns a survivable failover into a hard 400. The
     /// smallest limit in the chain is the only one safe for every entry in it.
     ///
+    /// **The cost of that `min` on a HETEROGENEOUS chain, stated plainly.** A budgeted
+    /// run on `[gpt-4o 16384, small-fallback 4096]` has its replies capped at 4096 on the
+    /// PRIMARY, from the very first call and however much budget remains — while the same
+    /// run unbudgeted sends `max_tokens: None` and, on an `openai_compat` router, gets the
+    /// selected model's own 16384. So this is a narrowing that is independent of how near
+    /// the cap the run is, which is a different effect from the clamp's "replies get
+    /// shorter as the budget runs down". Visible rather than silent (the clamp emits a
+    /// `tracing::info!` naming both bounds), and recorded in the clamp design's §6. The
+    /// alternative — bounding by the SELECTED model after selection — needs the clamp to
+    /// move downstream of the selector and is §8 work.
+    ///
+    /// **`Some(0)` is possible and is a config bug, not a limit.** One entry with
+    /// `max_output_tokens: 0` makes the whole chain's ceiling zero, and the budget clamp
+    /// would then emit `max_tokens: Some(0)` — "generate nothing" — on every budgeted
+    /// `Chat` call. `collect_validation_errors` rejects such a model, so it cannot arrive
+    /// through `GatewayBuilder::build`, `Gateway::try_new` or `try_update_config`; the
+    /// unchecked `Gateway::new` / `update_config` pair validate nothing by their own
+    /// documented design, so this is narrowed rather than made unrepresentable.
+    ///
     /// Selection, gates and `execute` are untouched — this is a read of the same config
     /// table they read.
     pub async fn min_max_output_tokens(&self, chain: &str) -> Option<u32> {

@@ -503,10 +503,18 @@ must still land exactly on the cap), preserving every ratio, call count, pause s
 string. The reasoning is recorded once, on `run_started_with_budget`'s doc comment.
 
 The gate was **not** weakened to accommodate this, and that was verified rather than asserted:
-delete the `spent >= cap` block and eleven tests redden, nine of them on the clamp's own
-`debug_assert!` ("the `spent >= cap` gate was bypassed or reordered"). That assertion replaced a
-bare `cap - spent` in review round 1 — the overflow panic it relied on is debug-only, and a release
-build would have wrapped instead. See the round-1 section below.
+delete the `spent >= cap` block and every budget test that drives past the cap reddens on the
+clamp's own `debug_assert!` ("the `spent >= cap` gate was bypassed or reordered"), plus
+`a_non_chat_payload_is_gated_but_not_clamped` and `spending_exactly_the_cap_stops_the_run`, neither
+of which touches it. That assertion replaced a bare `cap - spent` in review round 1 — the overflow
+panic it relied on is debug-only, and a release build would have wrapped instead. See the round-1
+section below.
+
+> An absolute count stood here and in two code comments ("eleven redden, nine of them on the
+> `debug_assert!`"). It was correct at `9c88ccc` and went stale at `f4f97b0`, which added a Task 8
+> test that also reddens on the `debug_assert!` — measured at `bc902c4` as twelve and ten, and it
+> moved again in round 2. Restated as a property so it cannot re-stale; the two named guards are the
+> part that carried information.
 
 **⚠️ One coverage loss, carried to Task 6.** `spending_exactly_the_cap_stops_the_run`'s documented
 mutation (`spent >= cap` → `spent > cap`) **no longer reddens it** — re-run to confirm, not
@@ -987,7 +995,7 @@ cargo clean --doc && cargo doc --workspace --no-deps --document-private-items 2>
 ```
 Expected: **16**, the current baseline. Higher means this slice added broken links — fix them.
 
-- [ ] **Step 3: Update the SP-DATA-5 spec's §8**
+- [x] **Step 3: Update the SP-DATA-5 spec's §8** — done in review round 2 (`§2` non-goal, `§6.5` amendment note, `§8` entry).
 
 `docs/superpowers/specs/2026-08-23-sp-data-5-token-budget-design.md` §8 lists
 "**Pre-flight estimation** to eliminate the one-call overshoot" as deferred. Mark it addressed,
@@ -1000,7 +1008,7 @@ Also update §2's non-goals bullet ("Pre-flight estimation to prevent overshoot 
 unknowable before the call)") — the reasoning was sound but the conclusion no longer holds, because
 clamping bounds the cost without predicting it. Say that, rather than deleting the line.
 
-- [ ] **Step 4: Update the overview**
+- [x] **Step 4: Update the overview** — done in review round 2 (the floor-trigger sentence, the s5 "Also deferred" list, and the SP-DATA "Still open from s5" list, all three of which still read as pre-clamp).
 
 `docs/superpowers/orchestrator-overview.md`'s SP-DATA-5 entry ends with a "Still open from s5"
 list naming pre-flight estimation. Move it to done with a one-line description in the house style.
@@ -1092,6 +1100,32 @@ The fourth is the sharpest and the reason it is worth a row of its own: `input_h
 `{chain, payload}` and not `max_tokens`, which is the only reason a budgeted resume is not a hard
 halt. If that ever became false, raising a cap — the operator's remedy for a run that paused on its
 budget — would GUARANTEE the violation it is meant to clear.
+
+**Round 2 added four rows, three of which were holes this ledger could not have shown** — a
+mutation ledger records the guards that exist, so a property with no test leaves no row and no gap
+either. Each was measured in this tree with real exit codes.
+
+| Mutation applied to | Change | Reddens | Failure |
+|---|---|---|---|
+| `agent.rs` | fold `fold.budget() − fold.spent()` into `agent_turn_output`'s `agent_input_hash` | `a_budgeted_agent_turn_replays_from_its_memo_when_the_budget_moved` | `resumes: DeterminismViolation { node: NodeId("n1"), … }` — and NOTHING else: 420 passed / 1 failed, which is the hole |
+| `dispatch.rs` | the same fold into `SelectorDispatch::complete`'s `input_hash` (the CONTROL for the row above) | `a_re_driven_selector_replays_its_call_instead_of_respending` **and** `every_dispatch_a_selector_makes_is_its_own_ledger_entry` | 419 passed / 2 failed — the selector leg was already guarded, which is what makes the agent leg's 1-failure result a gap rather than a property of the mutation |
+| `dispatch.rs` | `output_tokens >= clamp.emitted` → `>= clamp.allowance` | `the_clamp_bit_signal_fires_against_the_value_sent_not_the_allowance` | `the clamp-bit signal fires when the reply stops at the value we SENT …` — 419 passed / 1 failed before this test existed, i.e. AC10's load-bearing clause was unpinned |
+| `tests.rs` | `CapturingSubscriber::enabled` → `false` (a DEAD capture) | `neither_clamp_signal_fires_when_its_condition_does_not_hold` | `the capture is LIVE for a record emitted from inside a drive …` — green before the phase-3 control was added, because `assert_eq!(clamp_signals(), [])` is satisfied by a dead listener |
+| `run.rs` (torii) | `let t = s.trim();` → `let t = s;` | `parse_budget_tokens_accepts_a_positive_value` | `whitespace is trimmed — left: Err("… \" 50000 \" is not a whole number")` — the floor rescale had deleted the only case covering `trim` |
+
+Two rows above were also **re-measured and found stale**: deleting the `spent >= cap` gate reddens
+more than the "eleven / nine" this plan and two code comments recorded (twelve and ten at
+`bc902c4`, and it moved again in round 2), and deleting `ClampObservingAdapter`'s honouring leg
+reddens **five** tests, not the two its own doc named. Both are now stated as properties or as
+re-measured lists; see `test_support.rs` and `run_started_with_budget`.
+
+One genuine BUG came out of the round-2 review rather than a mutation:
+`BudgetRefusal::BelowFloor`'s recommended raise was derived from the saturated `allowance`, so on
+the AC5 branch (`est_input ≥ remaining`) it understated the answer by `est_input − remaining` — "at
+least 257" where 271 was needed, and each operator round trip bought only another
+`MIN_OUTPUT_TOKENS` against a `resume_after: None` pause. Fixed by carrying `est_input` on the
+variant and computing `spent + est_input + floor`; `an_estimate_larger_than_the_budget_does_not_wrap`
+now asserts the exact string AND re-drives at the cap it names.
 
 **Three plan/spec claims corrected in place:**
 
