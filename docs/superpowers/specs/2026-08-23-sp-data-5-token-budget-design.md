@@ -228,6 +228,18 @@ Three candidate fixes, and why only the third works:
    still check together against an unchanged ledger.
 2. **Reserve tokens before the call.** No: a reservation needs an output-token estimate, which §8
    deliberately does not have.
+
+   > **The follow-on clamp slice falsified this reason, and the decision survives on a different
+   > one.** §8's deferral is now marked ADDRESSED, so a bullet pointing at it for the estimate it
+   > lacks contradicts its own document. Every budgeted `Chat` carries an explicit `max_tokens`, so
+   > a reservation could hold `est_input + max_tokens` and be conservative without predicting
+   > anything. What rules it out now is STARVATION rather than ignorance: that reservation is
+   > essentially the whole remaining allowance, so the first child to claim it drops every sibling
+   > below `MIN_OUTPUT_TOKENS` and they are refused — a fan-out made safe without being made
+   > concurrent, and strictly worse than option 3, which at least runs the siblings. Written down
+   > rather than deleted, because "a reservation is impossible" is the wrong reason for the next
+   > person to inherit. The same correction is in `dispatch_metered`'s module doc and the
+   > overview's Critical-1 narrative.
 3. **Hold a 1-permit gate across check → dispatch → charge.** Yes. At most one model call per run is
    in flight, so the ledger is always current when the next call reads it.
 
