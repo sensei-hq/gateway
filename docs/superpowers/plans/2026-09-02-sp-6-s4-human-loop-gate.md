@@ -2511,11 +2511,14 @@ async fn a_decided_loop_gate_replays_from_the_journal_without_re_asking() {
 >
 > **CORRECTED after review**: the reason given here and on the test was "a count cannot
 > distinguish 'the gate journaled an effect' from 'the body ran twice'". Both of those give a
-> length other than 1, so `len() == 1` catches both — it just cannot say WHICH. The shape a count
-> structurally cannot see is ONE effect at the WRONG node (`["lp/0/__gate__"]` passes
-> `len() == 1`), which this single drive cannot produce but a resume drive can, the body having
-> replayed from its memo. The by-node form is still the right assertion; the argument for it was
-> not.
+> length other than 1, so `len() == 1` catches both. The honest reason is smaller and is about
+> the FAILURE rather than the detection — `["lp/0","lp/1","lp/2"]` and `["lp/0","lp/0/__gate__"]`
+> are two different bugs with two different fixes, and the assertion prints which one happened.
+> `effect_nodes` is a WHOLE-RUN scrape, so there is no list a count would let through: the only
+> shape that could (exactly one effect, at the gate path, not the body's) needs a scrape scoped to
+> one drive, which no fixture in this module has — a resume drive does not give it either, since
+> drive 1's `lp/0` is still in the journal being scraped. The by-node form is still the right
+> assertion; the argument for it was not, in the first version OR in the first correction of it.
 >
 > AC11's third clause — "no folded `usage`" — deliberately gets **no** assertion:
 > `Fold::usage` is written only from an `EffectRecorded`'s `usage` field and a `MapCompacted`
