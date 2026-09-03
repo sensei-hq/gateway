@@ -543,7 +543,7 @@ duplicating that judgement here would skip candidates it can still serve."
 - Modify: `crates/gateway/src/selection.rs:20-27` (criteria), `:84-95` (gate list), `:148-157` (ctx)
 - Modify: `crates/gateway/src/engine/execute.rs:43-51`
 
-- [ ] **Step 1: Write the failing test (AC1, AC3, AC4)**
+- [x] **Step 1: Write the failing test (AC1, AC3, AC4)**
 
 In `selection.rs`'s test module — read its existing fixtures for how a two-model chain config is
 built and reuse them:
@@ -617,12 +617,12 @@ Write `two_model_chain_windows(big: u32, small: u32) -> GatewayConfig` and
 existing fixtures in that module. Check `SelectionResult`'s real field names before using
 `all_candidates` / `skipped`.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p sensei-gateway -- a_chain_serves_a_prompt a_prompt_over_every_window an_in_window_request > /tmp/t5.log 2>&1; echo "exit=$?"; tail -20 /tmp/t5.log`
 Expected: COMPILE ERROR — `SelectionCriteria` has no `input_tokens_pessimistic`.
 
-- [ ] **Step 3: Plumb it**
+- [x] **Step 3: Plumb it**
 
 1. `SelectionCriteria` gains `pub input_tokens_pessimistic: Option<u32>,`.
 2. The `SelectionCtx` literal at `:148` gains
@@ -674,17 +674,17 @@ skipped while the large one is selected. Mutation to run before believing it: ch
    for the next person who breaks the plumbing. If clippy then reports the function as dead,
    step 4 above did not actually land.
 
-- [ ] **Step 4: Fix every other `SelectionCriteria` construction**
+- [x] **Step 4: Fix every other `SelectionCriteria` construction**
 
 Run: `cargo build --workspace --all-targets > /tmp/t5b.log 2>&1; echo "exit=$?"`
 Fix each missing-field error. `None` is correct in fixtures that are not about this gate.
 
-- [ ] **Step 5: Run to verify passing**
+- [x] **Step 5: Run to verify passing**
 
 Run: `cargo test -p sensei-gateway > /tmp/t5c.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t5c.log | tail -3`
 Expected: `exit=0`, 0 failed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
@@ -704,7 +704,7 @@ circuit-open should surface the breaker, which is the recoverable one."
 - Modify: `crates/orchestrator/src/executor/agent.rs:271` (`min_win`), `:368-378` (the halt), and `AgentRun`'s `min_win` field
 - Modify: `crates/orchestrator-core/src/error.rs:76` (`PromptOverBudget`)
 
-- [ ] **Step 0: Verify what the pre-check is actually shielding on a BUDGETED run**
+- [x] **Step 0: Verify what the pre-check is actually shielding on a BUDGETED run**
 
 Do this BEFORE deleting anything. The Task 1–4 review established by reading `dispatch.rs` that on
 a budgeted run the SP-DATA-5 clamp refuses **before `Gateway::execute` is ever called**:
@@ -727,7 +727,7 @@ in the commit message and in Task 7's docs sweep. Do **not** try to fix the clam
 window term to the selected candidate is the clamp spec's own §8 item and needs selection to have
 already happened.
 
-- [ ] **Step 1: Write the failing test (AC9)**
+- [x] **Step 1: Write the failing test (AC9)**
 
 In `crates/orchestrator/src/executor/tests.rs`:
 
@@ -773,7 +773,7 @@ In `crates/orchestrator/src/executor/tests.rs`:
 
 Check `scripted_gateway` and `tool_agent_registry`'s real names and signatures in `tests.rs` first.
 
-- [ ] **Step 2: Run — expect PASS, then prove it is not vacuous**
+- [x] **Step 2: Run — expect PASS, then prove it is not vacuous**
 
 Run: `cargo test -p sensei-orchestrator an_agent_turn_replays_from_its_memo > /tmp/t6.log 2>&1; echo "exit=$?"`
 Expected: `exit=0`. It passes on arrival because the property already holds — the point is to pin it
@@ -783,7 +783,7 @@ Prove it: in a throwaway worktree (`git worktree add /tmp/gw-ac9 HEAD`), fold an
 request-dependent into `support::agent_input_hash`'s hashed string, re-run, confirm it FAILS with
 `DeterminismViolation`, then `git worktree remove --force /tmp/gw-ac9`. Quote the failure.
 
-- [ ] **Step 3: Delete the pre-check**
+- [x] **Step 3: Delete the pre-check**
 
 In `agent.rs`, remove:
 - the `min_win` field from `AgentRun` and its initialiser at `:271`;
@@ -797,7 +797,7 @@ Remove the now-unused `over_budget` / `est_prompt_tokens` imports if nothing els
 If they become dead, delete them and say so; a function kept only because it might be wanted is the
 thing this codebase argues against.
 
-- [ ] **Step 4: Delete `PromptOverBudget`**
+- [x] **Step 4: Delete `PromptOverBudget`**
 
 Remove the variant from `crates/orchestrator-core/src/error.rs`. A variant no code can construct is
 a claim the type makes that the code does not honour.
@@ -805,7 +805,7 @@ a claim the type makes that the code does not honour.
 Run: `cargo build --workspace --all-targets > /tmp/t6b.log 2>&1; echo "exit=$?"`
 Fix every reference the compiler names, including tests asserting it.
 
-- [ ] **Step 5: Run the whole suite**
+- [x] **Step 5: Run the whole suite**
 
 Run: `cargo test --workspace > /tmp/t6c.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t6c.log | awk '{p+=$4;f+=$6;i+=$8} END {print "passed="p" failed="f" ignored="i}'`
 
@@ -814,7 +814,7 @@ behaviour** — read each one and decide deliberately: if it asserted "an over-w
 node", the behaviour genuinely moved to the gateway and the test's home moves with it. Do not simply
 delete an assertion to get green; say in the commit which tests moved and which were removed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
@@ -833,6 +833,58 @@ the chain minimum.
 PromptOverBudget is removed rather than left unconstructed: a variant no
 code can produce is a claim the type makes and the code does not honour."
 ```
+
+---
+
+## What Tasks 5–6 shipped, and where they departed from the draft above
+
+Both landed (`b6c2b73`, `3528d05`); workspace **1708 passed / 0 failed / 56 ignored**,
+`clippy --workspace --all-targets -D warnings` and `fmt --check` clean.
+
+**Task 5 also wired `engine::execute_stream`.** The draft named only `execute.rs`.
+`execute_stream` builds its own `SelectionCriteria` in its own copy of the block, so
+wiring one and not the other would have left every streaming caller ungated *and* made
+`stream.rs`'s own selection-empty comment false the moment the sixth gate was named in
+it. Streaming is also where an unfit candidate costs most — the provider's 400 lands
+after the caller has committed. Pinned by
+`execute_stream_gates_on_the_context_window_like_execute`.
+
+**The Task-5 wiring test needed a fixture the draft's over-everything payload could not
+provide.** A 600 KB prose request is over-window on BOTH estimates, so it cannot tell
+them apart: the first version of the stream test passed with the cost estimate wired in.
+Both wiring tests now use `schema_heavy_chat_payload()` — 80 tool schemas, 14 bytes of
+prose — whose cost figure FITS the 8 k candidate and whose pessimistic figure does not,
+and the fixture asserts both halves of that itself so no caller silently loses its
+discriminating power.
+
+**Task 6's AC9 test as drafted could not fail.** Drive-to-completion-then-`start`-again
+is a *terminal* resume: it returns the folded outcome without re-entering the ReAct loop,
+so `agent_input_hash` is never recomputed and the memo comparison never runs. Written
+that way it stayed GREEN with `SystemTime::now()` folded into the hashed string. It is
+now a MID-node crash (turn 0 journaled, turn 1 dies on an exhausted script), and the same
+mutation produces `DeterminismViolation { node: "n1" }`.
+
+**Two helpers died with the halt and were deleted:** `executor::support::est_prompt_tokens`
+(clippy named it) and `agent::prompt::over_budget` — which *was* the chain-minimum check,
+so keeping it would leave a second window check available to be called beside the
+per-candidate one. **`agent::prompt::est_tokens` survives with NO production caller**; its
+doc now says so outright rather than letting a reader infer one from its presence. Worth a
+decision in Task 7 or later: it is retained as the prose baseline `est_tokens_pessimistic`'s
+bias is defined against, and the tests compare the two.
+
+**The two reddened orchestrator tests were both updated in place, and one was removed:**
+
+| Test | Disposition |
+|---|---|
+| `agent_node_halts_over_budget_before_any_gateway_call` | **Renamed** `an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis`. Same fixture, same two claims (fails the node; zero provider calls — selection refuses before an adapter is reached). New wording, plus assertions on the window, the estimate and the remedy the old message never carried. |
+| `oversized_dependency_context_halts_over_budget_never_truncates` | **Kept, name and all.** Its invariant is "never silently truncated" and it is untouched: the model path's `## Context` is unbounded. Only who NOTICES moved, so the assertion now requires the halt to name the window rather than say "over budget", which read as a money problem. |
+| `prompt::tests::over_budget_true_when_estimate_exceeds_window_and_false_otherwise` | **Removed with the function.** It asserted a chain-MINIMUM answer, which is the thing replaced rather than a property that moved. Its two cases have homes in the gateway: `gates::context_window::over_window_skips_and_under_window_admits` (per candidate, so one request gets two answers) and `no_estimate_admits`. |
+
+**Step 0's boundary is now a test**, `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`:
+unbudgeted ⇒ the gateway gates and the node FAILS; budgeted ⇒ the SP-DATA-5 clamp refuses
+first and the run PAUSES on a budget message that says nothing about the window. Proven
+non-vacuous by dropping the clamp's window term (`(Some(a), Some(b)) => Some(a)`), which
+makes the budgeted arm fail instead of pause.
 
 ---
 
