@@ -13,6 +13,15 @@ pub enum HumanAction {
     RotateCredential,
     /// Every candidate was over budget — raise the budget.
     RaiseBudget,
+    /// Every candidate's context window is smaller than the request — no waiting helps,
+    /// and no budget change helps either. The human must route to a model with a larger
+    /// window (widen or reorder the chain) or make the request smaller.
+    ///
+    /// Distinct from [`HumanAction::RaiseBudget`], which is about MONEY: an over-budget
+    /// skip is fixed by spending more at the same model, and this one cannot be fixed by
+    /// spending at all — the window is a property of the model, not of the cap. Rendering
+    /// them alike would send an operator to the wrong lever.
+    UseLargerContextWindow,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,6 +170,40 @@ impl GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `UseLargerContextWindow` is its OWN remedy, not a spelling of `RaiseBudget`.
+    ///
+    /// The two are easy to conflate — both are terminal, both are "your request was
+    /// too big for this candidate" — but they point at opposite levers. An over-budget
+    /// skip is about MONEY and clears the moment someone raises the cap at the same
+    /// model. An over-window skip cannot be cleared by spending anything: the window is
+    /// a property of the model, so the operator must route to a bigger one (widen or
+    /// reorder the chain) or send less. Collapsing them would hand an operator the
+    /// wrong lever and let them "fix" it by burning budget that changes nothing.
+    #[test]
+    fn use_larger_context_window_is_a_distinct_remedy_from_raise_budget() {
+        assert_ne!(
+            HumanAction::UseLargerContextWindow,
+            HumanAction::RaiseBudget,
+            "an over-window skip is not fixed by spending more — the two remedies must \
+             not compare equal, or a caller switching on the action sends the operator \
+             to the wrong lever"
+        );
+        // And it must be carriable on the error that actually reaches a caller, which
+        // is the only way the remedy is ever seen.
+        let e = GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec!["r:m — estimated 20000 input tokens exceeds …".to_string()],
+            human_action: Some(HumanAction::UseLargerContextWindow),
+        };
+        assert!(matches!(
+            e,
+            GatewayError::AllGated {
+                human_action: Some(HumanAction::UseLargerContextWindow),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn error_display_messages() {
