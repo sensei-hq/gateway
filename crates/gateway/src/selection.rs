@@ -149,6 +149,10 @@ impl<'a> ModelSelectionService<'a> {
             capability: criteria.capability.clone(),
             budget: criteria.budget,
             input_tokens: criteria.input_tokens,
+            // `None` until SP-7a Task 5 gives `SelectionCriteria` the matching field and
+            // `engine::execute` computes it. `None` admits (see `ContextWindowGate`), and
+            // the gate is not in `self.gates` yet either, so selection is unchanged.
+            input_tokens_pessimistic: None,
             health: self.health,
             now: Instant::now(),
             config: self.config,
