@@ -212,6 +212,9 @@ mod tests {
             capability: Capability::TextChat,
             budget: None,
             input_tokens: None,
+            // Not a window test — `None` admits, so this fixture is unaffected by
+            // `ContextWindowGate`.
+            input_tokens_pessimistic: None,
             health: &endpoint_health,
             now,
             config: &gateway_config,
