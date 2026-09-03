@@ -1,9 +1,9 @@
 use super::*;
 use crate::test_support::{
-    CallLog, clamp_observing_gateway, content_gated_gateway, demo_reference_gateway,
-    demo_reference_tool_gateway, echo_system_gateway, failing_after_gateway, final_response,
-    metered_gateway, metered_latency_gateway, prompt_recording_gateway, recording_gateway,
-    scripted_gateway, tool_call_response,
+    CallLog, FIXTURE_MAX_OUTPUT_TOKENS, clamp_observing_gateway, content_gated_gateway,
+    demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
+    failing_after_gateway, final_response, metered_gateway, metered_latency_gateway,
+    prompt_recording_gateway, recording_gateway, scripted_gateway, tool_call_response,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -14063,13 +14063,22 @@ async fn a_compacted_map_cannot_let_a_budgeted_run_overshoot_across_drives() {
 
 /// A budgeted `Chat` request reaches the provider with `max_tokens` set to what the
 /// remaining budget can afford.
+///
+/// This is the BUDGET half of the clamp, so the fixture is chosen to keep the budget the
+/// binding constraint throughout — a cap just under the fixture chain's own
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`], and a scripted reply small enough that the first call
+/// leaves room for a second. Let the model ceiling bind instead and every assertion
+/// below would read the same constant twice and prove nothing about the budget; that is
+/// `a_budgeted_call_is_never_clamped_above_the_models_output_limit`'s job, from the other
+/// side.
 #[tokio::test]
 async fn a_budgeted_call_reaches_the_provider_clamped() {
-    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    const CAP: u64 = 1_000;
+    let (gateway, seen) = clamp_observing_gateway(10, 300).await;
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
     journal
-        .append(run, run_started_with_budget(10_000))
+        .append(run, run_started_with_budget(CAP))
         .await
         .unwrap();
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
@@ -14083,9 +14092,14 @@ async fn a_budgeted_call_reaches_the_provider_clamped() {
         "every budgeted call carries a clamp: {seen:?}"
     );
     assert!(
-        seen[0].unwrap() < 10_000,
+        seen[0].unwrap() < u32::try_from(CAP).unwrap(),
         "the clamp is below the cap — the prompt's own estimate is subtracted: {:?}",
         seen[0]
+    );
+    assert!(
+        seen[0].unwrap() < FIXTURE_MAX_OUTPUT_TOKENS,
+        "and it is the BUDGET doing the work here, not the model's output limit — \
+         otherwise the assertions below compare a constant with itself: {seen:?}"
     );
     // The clamp TIGHTENS as the ledger fills. Without this the first assertion would
     // also pass for a clamp pinned to the cap-minus-a-constant, which enforces nothing
@@ -14114,6 +14128,56 @@ async fn an_unbudgeted_call_is_not_clamped() {
     assert!(
         seen.iter().all(|m| m.is_none()),
         "no budget ⇒ max_tokens stays None: {seen:?}"
+    );
+}
+
+/// The clamp is bounded on BOTH sides: never above the model's own output limit.
+///
+/// `allowance = remaining − est` is a pure budget figure and knows nothing about the
+/// model. Any realistic whole-run cap — 100k, a million — exceeds every model's output
+/// limit, so an unbounded clamp sends a `max_tokens` no provider will accept: Anthropic
+/// answers a 400 `invalid_request_error`, and every adapter in this repo forwards the
+/// value verbatim. The failure mode is the worst kind of regression, because it is
+/// caused BY the budget: the identical run succeeds unbudgeted and hard-fails the moment
+/// an operator sets `--budget-tokens`.
+///
+/// Both assertions matter and neither subsumes the other. The first is the observable a
+/// real operator would see; the second is the invariant, and it holds even for a double
+/// that chose to honour an over-large value rather than refuse it.
+///
+/// The ceiling comes from `Gateway::min_max_output_tokens`, a `min` over the chain
+/// rather than the selected model — the clamp is applied before selection, and a request
+/// that fails over lands on a different entry.
+#[tokio::test]
+async fn a_budgeted_call_is_never_clamped_above_the_models_output_limit() {
+    // A cap ten times the fixture model's output limit, so the budget is nowhere near
+    // the binding constraint and only the model ceiling can hold the value down.
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(
+            run,
+            run_started_with_budget(u64::from(FIXTURE_MAX_OUTPUT_TOKENS) * 10),
+        )
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    assert!(
+        out.failed.is_none(),
+        "a budgeted run must not be failed by its own clamp: {:?}",
+        out.failed
+    );
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(!seen.is_empty(), "the provider was called");
+    assert!(
+        seen.iter()
+            .all(|m| m.is_some_and(|m| m <= FIXTURE_MAX_OUTPUT_TOKENS)),
+        "every clamp is at or below the model's own output limit \
+         ({FIXTURE_MAX_OUTPUT_TOKENS}): {seen:?}"
     );
 }
 
