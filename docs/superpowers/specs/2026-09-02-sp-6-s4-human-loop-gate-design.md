@@ -34,13 +34,17 @@ person's prose is the wrong shape, and §3 records the argument.
 - Two new journal variants, `LoopGateAwaited { node, deadline, prompt, menu }` and
   `LoopGateDecided { node, option, actor }`. New *variants*, so `FORMAT_VERSION` stays 1.
 - Expiry is read **before** the decision, and an **expired** gate **fails the loop** — decided or
-  not. "Undecided" would describe a check the arm deliberately does not make; see §5.2 step 4.
+  not. "Undecided" would describe a check the arm deliberately does not make; see §5.2 step 3c.
 - The question reuses s3's `assemble_prompt_parts` → `HumanQuestion::compose` through an extracted
   shared seam, so the person sees the iteration output as `## Context` under the same bounds.
 - `torii run gate decide --node "{loop}/{i}/__gate__" --option <name>`; `run list-paused` renders
   the question and the menu.
 - Zero token spend on the gate path, **structurally** — no chain is resolved.
-- Additive: a graph with no `GateSpec::Human` is byte-identical.
+- Additive: a graph with no `GateSpec::Human` is byte-identical **apart from four deliberate
+  shared-path changes, recorded in §5.8**. This bullet said "byte-identical" flat, and the
+  whole-slice review found four behaviour changes on paths every graph takes that the spec both
+  omitted and contradicted. AC1's narrower claim — a graph *serialises* byte-identically — is still
+  true and tested.
 
 **Non-goals**
 
@@ -186,24 +190,38 @@ Both are closed now, and by rules that had to be ADDED:
 
 ### 5.2 The order of operations
 
-Mirrors `run_human_gate` (s2), **not** `run_human_agent` (s3):
+Mirrors `run_human_gate` (s2), **not** `run_human_agent` (s3). **The numbering is the CODE's**,
+step for step, and it was not until the whole-slice review: this list omitted the SLA read entirely
+while §5.5 spoke of "the SLA at step 2", which under the old numbering pointed at the
+`NotYetAsking` arm — the one place §5.5 says the check must NOT live. A reader implementing from
+this clause got no step that AC14's second half depends on.
 
 0. **`gate_precheck_by_id`** — an already-failed node stays failed, and the verdict is **read back,
    never re-derived**. This is s3's unbounded-journal-growth fix and it applies verbatim: a refusal
    here is terminal for the node, but the run it kills journals no `RunCompleted`, so every later
    wake would otherwise re-drive the iteration and append a fresh `NodeFailed` to a dead node.
-0b. **`Fold::loop_gate_settled_with`** — an already-HONOURED gate replays its decision, and the
+1. **`Fold::loop_gate_settled_with`** — an already-HONOURED gate replays its decision, and the
    clock is not consulted. The success mirror of step 0, added by the Tasks 6+7 review (§4). It sits
    above the SLA read as well as above the clock: a settled gate needs no role, no question and no
    deadline, so a role edit cannot turn a loop nobody is waiting on into a terminal failure.
-1. **`wait_or_expire_by_id`** → `WaitState`, **acted on immediately**. This is the s2/s3 divergence
+2. **`human_sla_for`** — resolve the role, assert the backing is `Human`, take its `timeout`. A
+   model-backed or unresolvable role is a loud `NodeFailed` **here**, on every drive that could
+   still ask, and not inside the arm that composes the question — §5.5 has the argument and AC14's
+   second half is the test. Only the SLA: composing the question on every drive of every
+   iteration's gate would run `assemble_prompt_parts` and a full redaction pass over the iteration
+   output and throw the result away on the pause and replay paths a human loop spends nearly all
+   its life on.
+3. **`wait_or_expire_by_id`** → `WaitState`, **acted on immediately**. This is the s2/s3 divergence
    and the reason this is a single `match` rather than s3's split `let state = …`. Collapsing it
-   the other way silently reinstates s3's ordering. Because of step 0b the clock now only ever
+   the other way silently reinstates s3's ordering. Because of step 1 the clock now only ever
    judges a gate that is still LIVE, which is the only reading under which §3's ordering and §5.7's
    resume claim are both true.
-2. **`NotYetAsking`** → bound the authored half against `MAX_HUMAN_TEXT_BYTES` (loud `NodeFailed` —
-   a config error, actionable by its author), redact, clamp, append `LoopGateAwaited`, pause.
-3. **Decided** → match `option` against the **journaled** menu, journal `LoopGateSettled`, then
+3a. **`NotYetAsking`** → refuse if the reserved path already carries a `NodeStarted`/`NodeCompleted`
+   (§5.1's third rule); otherwise compose the question, bound the authored half against
+   `MAX_HUMAN_TEXT_BYTES` (loud `NodeFailed` — a config error, actionable by its author), redact
+   the prompt AND the menu, refuse a menu redaction has made ambiguous, clamp, append
+   `LoopGateAwaited`, pause.
+3b. **Decided** → match `option` against the **journaled** menu, journal `LoopGateSettled`, then
    `stops` sets `converged`. The settlement is written *before* `run_loop` spends anything on the
    strength of the answer, and *after* the option resolves, so a decision naming an option nobody
    was offered leaves no settlement behind. A name matching **nothing** in the journaled menu is a
@@ -211,7 +229,7 @@ Mirrors `run_human_gate` (s2), **not** `run_human_agent` (s3):
    silent continue. `torii` refuses such a name at its own boundary (reciting the menu), so this arm
    is reachable only from a journal not written by `torii` — which is exactly why it must fail rather
    than guess. Defaulting either way would be a decision no human made: to stop, or to spend more.
-4. **Expired** (decided or not) → `NodeFailed`, which `fanout.rs:560`'s existing arm turns into a
+3c. **Expired** (decided or not) → `NodeFailed`, which `fanout.rs:560`'s existing arm turns into a
    failed `Loop`.
 
    **The arm does not — and must not — check decidedness here**, and this item said "Expired,
@@ -278,8 +296,9 @@ mirror of §5.4, and for the same reason: silence would let an author believe a 
 while the run quietly decides for itself.
 
 **The refusal is owed on every drive that could still ask, not only on the drive that asks**, which
-is why the arm reads the SLA at step 2 rather than inside the `NotYetAsking` arm that composes the
-question. The vector is `torii config push` — replace-all against a live registry — so a role can be
+is why the arm reads the SLA at **§5.2's step 2** — its own step, above the wait match — rather than
+inside the `NotYetAsking` arm that composes the question. The vector is `torii config push` —
+replace-all against a live registry — so a role can be
 edited from `backed_by: human` to `backed_by: model` while a run sits paused on its gate. On the
 re-pause drive the arm composes nothing, so step 2 is the ONLY place the backing is checked; without
 it the run re-pauses on a durable question addressed to a role that can no longer answer it, and a
@@ -288,7 +307,10 @@ this untested and it is now `a_role_edited_to_model_backed_mid_wait_fails_a_driv
 — the ask-time test cannot reach it, because `human_question_for` re-raises the identical error and
 the `NotYetAsking` arm's own `Err` branch catches it, so deleting step 2 leaves that test green.
 
-Deliberately asymmetric with §5.2's step 0b: a gate that has already been **settled** replays ABOVE
+(§5.2 did not list that step at all until the whole-slice review, so this cross-reference pointed at
+the `NotYetAsking` arm — the one place this paragraph says the check must not live.)
+
+Deliberately asymmetric with §5.2's step 1: a gate that has already been **settled** replays ABOVE
 the SLA read, so the same config edit cannot retroactively kill a loop nobody is waiting on. Live
 gates refuse; settled ones are already answered and are none of the registry's business.
 
@@ -331,6 +353,40 @@ library entry point bypasses it, and an embedder may append to the journal direc
 Like every other waiting kind this node journals no `NodeStarted`/`NodeCompleted`, and so carries
 the family's known asymmetry: re-`start`ing an already-terminal run reports it in neither `outputs`
 nor `completed`. Pre-existing, not new.
+
+### 5.8 What this slice changed on paths every graph takes
+
+§2's additivity bullet is qualified by exactly these four. All are improvements, all are argued at
+their sites, and none of them was in the spec — which matters because the spec is what the diff is
+read against, and a shared-path change the contract omits is how a reviewer's diff misses one.
+
+1. **`Executor::fail_loop` is now idempotent, keyed on the MESSAGE.** It gained a `&Fold` and skips
+   the `NodeFailed` append when this `Loop` already has one carrying this exact error, so a
+   re-driven failing `Loop` of ANY gate kind journals one row instead of one per wake. It exists
+   because a human gate's verdict is terminal while the run it kills journals no `RunCompleted` and
+   so stays resumable (measured: three drives, three `NodeFailed(lp)` rows). It is keyed on the
+   message rather than on presence because the other two failure paths are explicitly NON-terminal —
+   a `Loop` that failed transiently can be re-driven, succeed, and later die of something else, and
+   a presence-keyed guard kept the stale cause in the durable record forever. And it reads a new
+   `Fold::failure_messages` SET rather than `Fold::failed`, because `failed` is FIRST-wins by design
+   (`gate_precheck`'s whole family depends on that), so equality against it appends on every wake
+   instead. Both wrong answers were measured while fixing the other.
+2. **`cascade_skip_from` gained the same guard**, via a new `Fold::skipped` set and a new explicit
+   `NodeSkipped` arm in `fold_journal` (previously a `_` catch-all). Same defect one edge further
+   out — a terminally-failed-but-resumable run grew a `NodeSkipped` per hard dependent per wake
+   (measured 1 / 2 / 3) — and it changes `NodeSkipped` volume for every node kind, not only a
+   gated `Loop`. Both guards are mutation-pinned by
+   `a_dead_loop_gate_stops_appending_node_failed_rows_on_every_wake`, whose assertion is over the
+   WHOLE journal rather than the `NodeFailed` subset for exactly this reason.
+3. **s2's `HumanGate` validation reports a different FIRST error.** Extracting
+   `check_menu_option_names` (shared by 2b-ter and the new 2b-ter-bis) put the empty/empty-name/
+   duplicate rules ahead of the `Complete`-option rule, so a menu with a duplicate name AND no
+   `Complete` option now names the duplicate where it previously named the missing `Complete`.
+   Deliberate — "no Complete option" sends an author hunting for a flag on options that do not
+   exist — and the graph is refused either way, with nothing downstream branching on which.
+4. **`Graph::validate_dag` rejects a bare `__plan__`/`__gate__`/`__select__` node id** (block 1c),
+   and `plan::feasible`'s reserved-id walk recurses. §5.1 has the full argument; recorded here too
+   because it refuses graphs that used to validate, whatever gate kind they carry.
 
 ## 6. Bounds and safety
 
@@ -486,7 +542,7 @@ and this slice's answer is yes.
 9. A fired expiry is terminal: a later decision cannot resurrect the node, and re-driving appends no
    second `NodeFailed`.
 10. An **expired** gate **fails the `Loop`**, not just the gate node — whether or not a decision was
-    journaled (§5.2 step 4). AC8 is the same rule read from the other side.
+    journaled (§5.2 step 3c). AC8 is the same rule read from the other side.
 11. **Zero token spend** on the gate path: no `EffectRecorded`, no gateway call, no folded `usage`.
 12. A decided gate **resumes from the journal** — no re-ask, no gateway call, identical decision.
 12b. A decision honoured **inside** its gate's SLA stays honoured however long the run lives: a

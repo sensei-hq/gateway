@@ -4,7 +4,7 @@
 
 **Goal:** A `Loop` whose stop decision is made by a person picking from an enumerated menu, once per iteration.
 
-**Architecture:** A third `GateSpec` variant, `Human { agent, menu }`, drives a new executor arm at the already-reserved path `"{loop}/{i}/__gate__"`. The menu lives on the graph so `validate_dag` can statically reject a loop that cannot converge; the decision lives in two new journal variants so `FORMAT_VERSION` stays 1. Expiry is read **before** the decision (s2's ordering, inverting s3) and an **expired** gate fails the loop, decided or not — the arm has not read the fold at that point and deliberately cannot know (design §5.2 step 4; this line said "undecided" until the Tasks 8–9 review).
+**Architecture:** A third `GateSpec` variant, `Human { agent, menu }`, drives a new executor arm at the already-reserved path `"{loop}/{i}/__gate__"`. The menu lives on the graph so `validate_dag` can statically reject a loop that cannot converge; the decision lives in two new journal variants so `FORMAT_VERSION` stays 1. Expiry is read **before** the decision (s2's ordering, inverting s3) and an **expired** gate fails the loop, decided or not — the arm has not read the fold at that point and deliberately cannot know (design §5.2 step 3c; this line said "undecided" until the Tasks 8–9 review).
 
 **Tech Stack:** Rust, `chrono`, `serde`, `sqlx` (Postgres e2e only). Test framework is plain `cargo test`; assertions are `assert!`/`assert_eq!`.
 
@@ -1697,7 +1697,7 @@ unusable. Every existing s4 test held the clock at `at(1_000)`, which is why the
 green — the guarding tests advance it ACROSS iterations.
 
 The fix is a THIRD journal variant, `LoopGateSettled { node, option }` (design §4, §5.2 step
-0b, §5.7, AC12b): the drive that honours a decision records it, and every later drive reads
+1, §5.7, AC12b): the drive that honours a decision records it, and every later drive reads
 it back before the clock is consulted. Reordering to read the decision first would fix the
 same symptom and reopen AC8 — mutation-checked both ways.
 
@@ -2027,7 +2027,7 @@ arm has not read the fold and cannot know whether one exists."
 > for this task on that refusal; note it here so the convention is scheduled next time.
 >
 > Since that review the refusal has TWO call sites — the live `Waiting` arm and the settled
-> replay (`decide_from_published_menu`, design §5.2 step 0b) — sharing one message builder.
+> replay (`decide_from_published_menu`, design §5.2 step 1) — sharing one message builder.
 > **Both of the replay site's refusals are now covered**, by `eba6083`'s verify follow-up:
 > `a_settled_loop_gate_with_no_published_menu_fails_loudly` and
 > `a_settled_loop_gate_naming_an_option_outside_its_menu_fails_loudly`. The replay path was
