@@ -1527,10 +1527,10 @@ fn collided_option_name(menu: &[LoopGateOption]) -> Option<String> {
 /// anyway; not interpolating them is the first line, not the only one.
 fn ambiguous_menu_message(node_id: &NodeId, name: &str) -> String {
     format!(
-        "loop_gate: node {}'s menu offers the option name {name:?} more than once after \
-         redaction, so a decision naming it could not be resolved to one option — it would \
-         silently take whichever came first, and the two may disagree about whether the \
-         loop stops. Two option names of credential SHAPE both scrub to the same \
+        "loop_gate: node {}'s menu offers the option name {name:?} more than once, so a \
+         decision naming it could not be resolved to one option — it would silently take \
+         whichever came first, and the two may disagree about whether the loop stops. The \
+         usual cause is two option names of credential SHAPE scrubbing to the same \
          placeholder; rename them to something that is not credential-shaped.",
         node_id.0
     )
