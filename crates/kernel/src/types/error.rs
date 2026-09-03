@@ -2,9 +2,9 @@ use super::capability::Capability;
 use super::config::{FallbackTrigger, MeterUnit, Window};
 
 /// A caller-actionable remedy attached to a terminal `AllGated` when no candidate
-/// has a timed retry (all locks are terminal / all over budget). Guides the
-/// caller — the gateway never acts on it (tenant-agnostic; the caller owns
-/// credentials/budget).
+/// has a timed retry (every candidate is health-locked terminally, over budget, or
+/// over its context window). Guides the caller — the gateway never acts on it
+/// (tenant-agnostic; the caller owns credentials/budget/routing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HumanAction {
     /// Provider credits/billing exhausted — top up.
@@ -22,6 +22,26 @@ pub enum HumanAction {
     /// spending at all — the window is a property of the model, not of the cap. Rendering
     /// them alike would send an operator to the wrong lever.
     UseLargerContextWindow,
+}
+
+/// The remedy as a sentence an operator can act on, because a `Debug`-rendered
+/// variant name is not one.
+///
+/// This exists so [`GatewayError::AllGated`] can say WHICH action is required rather
+/// than only that one is: the bare "human action required" it printed before named the
+/// need and hid the lever. Kept as `Display` on the enum rather than a `match` at each
+/// rendering site so the four remedies cannot drift apart per site.
+impl std::fmt::Display for HumanAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            HumanAction::TopUpCredits => "top up the provider account's credits",
+            HumanAction::RotateCredential => "rotate the provider credential",
+            HumanAction::RaiseBudget => "raise the budget",
+            HumanAction::UseLargerContextWindow => {
+                "route to a model with a larger context window, or send less"
+            }
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,13 +107,31 @@ pub enum GatewayError {
     },
 
     /// Every candidate was gated (health-locked / cooling / breaker-open / over
-    /// budget) — none was attemptable. `resume_after` is the **wall-clock**
-    /// earliest eligibility (min over timed gates); `None` ⇒ all gates are
-    /// terminal ⇒ `human_action` carries the remedy and the caller must not pause
-    /// forever. `skipped` is human-readable diagnostics. Distinct from
+    /// budget / over its context window) — none was attemptable. `resume_after` is
+    /// the **wall-clock** earliest eligibility (min over timed gates); `None` ⇒ all
+    /// gates are terminal ⇒ `human_action` carries the remedy and the caller must
+    /// not pause forever. `skipped` is human-readable diagnostics. Distinct from
     /// `AllAttemptsFailed` (a candidate genuinely failed) and `NoCandidates`
     /// (nothing configured/eligible). Never triggers fallback.
-    #[error("all candidates gated{}", resume_after.map(|t| format!(", resume after {t}")).unwrap_or_else(|| ", human action required".into()))]
+    ///
+    /// **`Display` renders all three fields**, and that is load-bearing rather than
+    /// cosmetic: the orchestrator's `classify_gateway_error` turns this error into a
+    /// `NodeFailed` whose reason is `err.to_string()`, so anything `Display` drops
+    /// never reaches the operator who has to act. It rendered only the first field
+    /// for several slices, which silently discarded every per-candidate reason and
+    /// the remedy alike — the caller was told "human action required" and not which.
+    #[error("all candidates gated{}{}",
+        resume_after
+            .map(|t| format!(", resume after {t}"))
+            .unwrap_or_else(|| match human_action {
+                Some(h) => format!(", human action required: {h}"),
+                None => ", human action required".to_string(),
+            }),
+        if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(" (skipped: {})", skipped.join(" | "))
+        })]
     AllGated {
         resume_after: Option<chrono::DateTime<chrono::Utc>>,
         skipped: Vec<String>,
@@ -171,38 +209,79 @@ impl GatewayError {
 mod tests {
     use super::*;
 
-    /// `UseLargerContextWindow` is its OWN remedy, not a spelling of `RaiseBudget`.
+    /// `UseLargerContextWindow` RENDERS as its own remedy, not as a spelling of
+    /// `RaiseBudget`.
     ///
     /// The two are easy to conflate — both are terminal, both are "your request was
     /// too big for this candidate" — but they point at opposite levers. An over-budget
     /// skip is about MONEY and clears the moment someone raises the cap at the same
     /// model. An over-window skip cannot be cleared by spending anything: the window is
     /// a property of the model, so the operator must route to a bigger one (widen or
-    /// reorder the chain) or send less. Collapsing them would hand an operator the
-    /// wrong lever and let them "fix" it by burning budget that changes nothing.
+    /// reorder the chain) or send less.
+    ///
+    /// Asserted on the rendered TEXT rather than on `assert_ne!` over two unit variants,
+    /// because that comparison is a tautology over a derived `PartialEq` and no
+    /// plausible source defect breaks it. The defect that IS plausible is a `Display`
+    /// arm that points the operator at the wrong lever — writing "raise the budget" for
+    /// a window problem — and this reddens on exactly that.
     #[test]
-    fn use_larger_context_window_is_a_distinct_remedy_from_raise_budget() {
+    fn use_larger_context_window_renders_a_different_remedy_from_raise_budget() {
+        let window = HumanAction::UseLargerContextWindow.to_string();
+        let budget = HumanAction::RaiseBudget.to_string();
         assert_ne!(
-            HumanAction::UseLargerContextWindow,
-            HumanAction::RaiseBudget,
-            "an over-window skip is not fixed by spending more — the two remedies must \
-             not compare equal, or a caller switching on the action sends the operator \
-             to the wrong lever"
+            window, budget,
+            "the two remedies must not render alike: an operator handed 'raise the \
+             budget' for an over-window skip can burn any amount of money and change \
+             nothing"
         );
-        // And it must be carriable on the error that actually reaches a caller, which
-        // is the only way the remedy is ever seen.
+        assert!(
+            window.contains("context window"),
+            "the window remedy must name the window as the thing to change: {window}"
+        );
+        assert!(
+            !window.contains("budget"),
+            "and must not mention budget at all, which is the lever that cannot help \
+             here: {window}"
+        );
+    }
+
+    /// The `AllGated` message names every candidate's reason AND the remedy.
+    ///
+    /// This string is the only channel that survives to an operator on the orchestrator
+    /// path: `classify_gateway_error` builds its `NodeFailed` reason from
+    /// `err.to_string()`, so a field that `Display` drops is a field nobody reads. The
+    /// variant carried `skipped` and `human_action` for a whole slice while rendering
+    /// neither, which made every doc comment claiming "`AllGated` renders these strings
+    /// verbatim" false.
+    #[test]
+    fn all_gated_renders_each_candidates_reason_and_the_remedy() {
         let e = GatewayError::AllGated {
             resume_after: None,
-            skipped: vec!["r:m — estimated 20000 input tokens exceeds …".to_string()],
+            skipped: vec![
+                "anthropic:small — estimated 20000 input tokens exceeds the model's \
+                 8192-token context window"
+                    .to_string(),
+                "openai:tiny — estimated 20000 input tokens exceeds the model's \
+                 4096-token context window"
+                    .to_string(),
+            ],
             human_action: Some(HumanAction::UseLargerContextWindow),
         };
-        assert!(matches!(
-            e,
-            GatewayError::AllGated {
-                human_action: Some(HumanAction::UseLargerContextWindow),
-                ..
-            }
-        ));
+        let shown = e.to_string();
+        assert!(
+            shown.contains("estimated 20000") && shown.contains("8192-token"),
+            "the per-candidate diagnostics must reach the operator — both the estimate \
+             and the window it exceeded: {shown}"
+        );
+        assert!(
+            shown.contains("4096-token"),
+            "and EVERY candidate's reason, not just the first: {shown}"
+        );
+        assert!(
+            shown.contains("larger context window"),
+            "as must the remedy, or the message says 'human action required' without \
+             saying which: {shown}"
+        );
     }
 
     #[test]
