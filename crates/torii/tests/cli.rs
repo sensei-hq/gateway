@@ -498,6 +498,81 @@ fn gate_help_lists_all_three_verbs() {
     }
 }
 
+/// **SP-6 s4: the help must describe the surface that SHIPS.** The same rule
+/// `agent_help_names_the_question_list_paused_now_shows` enforces, and for the same reason
+/// its doc calls help/behaviour drift "the recurring defect of this feature" — this time on
+/// the command that gained a whole new node KIND without its help being swept.
+///
+/// `list-paused` now prints rows labelled `loop gate:`, and the help is the only place an
+/// operator maps a row label to a verb. Reading `run --help` they see `signal`
+/// (`AwaitSignal`), `gate` ("Decide a `HumanGate`") and `agent` ("a role the registry says
+/// a person fills") — and a loop gate IS backed by an agent role, so the natural guess is
+/// the one verb that refuses it. The cross-refusals recover them, but the discovery surface
+/// should not have sent them there.
+///
+/// Asserted on BOTH surfaces, like the `--as` pair below: the group help is what an
+/// operator browses, `decide --help` is what they read when they type the flag.
+///
+/// The `--note` half is the second claim: `decide` REFUSES that flag on a loop gate rather
+/// than dropping it, and a flag that is rejected by one of the two kinds a command serves
+/// has to say so where the flag is documented.
+#[test]
+fn gate_help_names_the_loop_gate_it_can_now_decide() {
+    for args in [
+        vec!["run", "gate", "--help"],
+        vec!["run", "gate", "decide", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("loop"),
+            "`{}` must name the second kind this command decides — `list-paused` prints \
+             `loop gate:` rows and this is the only place they map to a verb:\n{text}",
+            args.join(" ")
+        );
+        assert!(
+            lower.contains("note"),
+            "`{}` must document the flag a loop gate refuses, on the surface an operator \
+             reads before typing it:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
+/// The other side of the same sweep: `run agent --help` enumerated the waiting kinds as
+/// THREE ("The third waiting kind … Each of the three refuses the other two") in the very
+/// commit that added a fourth and a fourth refusal arm to this command.
+///
+/// Keyed on the stale ENUMERATION rather than on a positive phrase, because the defect is
+/// a count that silently goes out of date: an operator who reads "each of the three" and
+/// counts the three verbs concludes the matrix is closed, and a loop gate — which this
+/// command refuses — is not in it.
+#[test]
+fn agent_help_does_not_enumerate_the_waiting_kinds_as_three() {
+    for args in [
+        vec!["run", "agent", "--help"],
+        vec!["run", "agent", "answer", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lower = text.to_lowercase();
+        assert!(
+            !lower.contains("the third waiting kind") && !lower.contains("each of the three"),
+            "`{}` still counts the waiting kinds as three, and there are four:\n{text}",
+            args.join(" ")
+        );
+        assert!(
+            lower.contains("loop"),
+            "`{}` must name the fourth kind, which it REFUSES — an operator sent here by a \
+             `loop gate:` row needs to be told where to go instead:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
 /// AC10 at the binary level: clap itself must refuse a reject with no reason, before any
 /// connection is opened.
 #[test]

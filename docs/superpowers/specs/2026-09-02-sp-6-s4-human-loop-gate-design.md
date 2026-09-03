@@ -471,6 +471,11 @@ and this slice's answer is yes.
     transform the value really went through
     (`a_loop_gate_actor_that_only_exceeds_the_cap_after_redaction_is_rejected`). The `HumanGate`
     arm beside it keeps `AsGiven` and no scrub, which is the asymmetry §6 predicted.
+    **Review-round correction:** the named test asserted the byte COUNT only, which both
+    discriminants produce — swapping them left the whole torii suite green, so the sentence above
+    named a guard that did not hold its property. It now asserts the WORDING (`once redacted`), and
+    its `HumanGate` sibling `an_oversized_actor_is_rejected_before_anything_is_journaled` asserts
+    the NEGATIVE, so the asymmetry is pinned from both ends.
 17. `torii run gate decide --node "{loop}/{i}/__gate__" --option <name>` decides a loop gate; a bad
     name recites the journaled menu; `run signal` and `run agent answer` refuse it, each naming the
     verb that would work. **SHIPPED.** `gate_menu` returns a `PublishedMenu::{Human,Loop}` and
@@ -479,12 +484,36 @@ and this slice's answer is yes.
     `--note` is REFUSED on a loop gate rather than dropped (the event has no note field), and the
     verb refuses a decision at or after the journaled deadline, the guard §7 says Task 12 owes —
     boundary pinned on both sides.
+    **Review round, two gaps in "each naming the verb that would work".** (a) Both refusals named
+    the VERB and nothing asserted they named the KIND: rewriting both `PublishedMenu::Loop` arms to
+    say "a HumanGate" left the suite green, because `contains("run gate decide")` is satisfied by
+    the `HumanGate` wording too — so the per-kind split, whose whole purpose is the message, was
+    inert on the operator-facing side. Both tests now assert `Loop's human gate` and the negative.
+    (b) `cmd::human::answer` did not refuse a menu-bearing node at all — it read the QUESTION
+    first, so a journal with a `LoopGateAwaited` and an `AgentAwaited` at one id was ANSWERED
+    (exit 0) at a path whose only reader reads `LoopGateDecided`. The `gate_menu` match now runs
+    ahead of the question check, matching `run signal` and the listing. The reachable journal is
+    the executor `Waiting` arm's case (b) — an embedder's direct append; the executor does not
+    write that shape itself, and the fix's comment records the limit rather than overclaiming.
+    **The operator's DISCOVERY surface was not swept either:** `run gate --help` still said
+    "Decide a `HumanGate`" and `run agent --help` still counted the waiting kinds as three. Both
+    now name the loop gate, guarded at the binary level in `tests/cli.rs`.
 18. `run list-paused` renders the loop gate's question and menu. **SHIPPED**, as the FOURTH
     `AwaitingNode` shape: `options` and `question` both present, which is what tells a loop gate
     from the other three. Additive for a `--json` consumer, because `options`-present ⇒
     `gate decide` is evaluated first everywhere. A gate whose decision has been HONOURED
     (`LoopGateSettled`) leaves the listing — without that, `run_loop` re-deriving every iteration's
     gate leaves each decided one advertised for the life of the run.
+    **Review round.** "Evaluated first everywhere" was false in one place and the `--json` claim
+    had no test: `awaiting_nodes` resolved the loop-gate kind through a rule PARALLEL to
+    `cmd::gate::gate_menu` and disagreed with it on a `GateAwaited` + `LoopGateAwaited` journal
+    (the row said `loop gate: revise`; `decide` refused `revise` and recited `ship|hold`). It now
+    CALLS `gate_menu` — one resolver, no second order — and the fourth shape's `--json` keys, the
+    conditional header wording in both directions, the new cell's `one_line`/`cap_chars` and the
+    `## Task` reserve's empty-label branch each have a mutation-proved guard. The redaction of the
+    loop gate's question in the listing was a second, unguarded call site of `redact_question`;
+    it is now `a_secret_shaped_loop_gate_question_is_redacted_in_the_listing`, asserted on the
+    table AND on `--json`.
 19. **Cross-process**: a loop gate awaited in one process, decided through `torii`, resumes and
     converges in another against a real Postgres.
 20. `FORMAT_VERSION` is still 1.
