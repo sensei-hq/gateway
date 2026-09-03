@@ -512,10 +512,75 @@ impl Executor {
                 // which is the case the floor-before-ceiling ordering exists to serve.
                 // The residual is the documented unchecked `Gateway::new` /
                 // `update_config` path, which validates nothing at all.
+                //
+                // **The output limit is not the only model bound, and on its own it is
+                // not enough.** A provider enforces `prompt + max_tokens <=
+                // context_window` as well, and the unbudgeted path never trips that
+                // because `max_tokens: None` is OMITTED from the wire entirely
+                // (`openai_compat/convert.rs`'s `skip_serializing_if`), so the sum is
+                // never formed. Bounding only by `max_output_tokens` therefore
+                // reintroduces the very regression the paragraph above describes, by the
+                // other route: a long-prompt call that succeeds unbudgeted hard-FAILS
+                // once a budget is set. Worse than the output-limit case, because it
+                // arrives as a `NodeFailed` rather than a budget pause — `torii run wake
+                // --budget-tokens N` cannot recover it and the operator's only remedy is
+                // to drop the budget.
+                //
+                // Not hypothetical: the shipped presets are `8192 / 4096`
+                // (`gateway/src/catalog/presets.rs`), so any prompt past ~4096 tokens is
+                // in this territory, and SP-6 s4 bounds ONE `## Context` section at
+                // 32 KiB — ~10.9k tokens by itself under `chars/3`. Found by the
+                // whole-slice review, which reproduced the provider's 400 against a
+                // double applying the documented sum rule.
+                //
+                // `est` is subtracted rather than the real prompt count for the reason
+                // the whole clamp uses it: the real count is not known until the response
+                // comes back, and `est` is biased HIGH, so this bound errs toward asking
+                // for less. Same `None` handling as the output limit — an unknown chain
+                // yields no bound from here rather than a silent truncation.
                 let ceiling = match request.chain.as_deref() {
-                    Some(chain) => self.gateway.min_max_output_tokens(chain).await,
+                    Some(chain) => {
+                        let out = self.gateway.min_max_output_tokens(chain).await;
+                        let window = self
+                            .gateway
+                            .min_context_window(chain)
+                            .await
+                            .map(|w| w.saturating_sub(u32::try_from(est).unwrap_or(u32::MAX)));
+                        match (out, window) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    }
                     None => None,
                 };
+                // The floor again, now against the bound that will ACTUALLY be emitted.
+                // The check above tests the budget allowance alone, which is the right
+                // question for "has this run got enough left"; this one catches the case
+                // where the run has budget to spare but the MODEL cannot fit a useful
+                // reply beside the prompt. Without it a window term of 0 (a prompt at or
+                // past the whole context window) would emit `max_tokens: Some(0)` —
+                // "generate nothing" — which the paragraph above rules out for the output
+                // limit and which is no more acceptable here.
+                //
+                // Deliberately a refusal rather than "ignore a ceiling under the floor":
+                // ignoring it sends an over-large `max_tokens` at a model that cannot
+                // take it, which is the 400 this whole block exists to avoid.
+                //
+                // KNOWN GAP, and it is the honest one to state: when the WINDOW is the
+                // binding term the message still reads as a budget problem and names a
+                // raise that will not help, because no cap change makes a prompt fit.
+                // Recorded rather than papered over; the refusal wording is the subject
+                // of its own review finding.
+                if ceiling.is_some_and(|c| u64::from(c) < orchestrator_core::MIN_OUTPUT_TOKENS) {
+                    return Ok(Err(Refusal::BudgetExhausted {
+                        spent,
+                        budget: cap,
+                        cause: BudgetRefusal::BelowFloor {
+                            allowance: ceiling.map_or(allowance, u64::from),
+                            est_input: est,
+                        },
+                    }));
+                }
                 let mut r = request.clone();
                 if let Payload::Chat { max_tokens, .. } = &mut r.payload {
                     // NEVER widen: a caller's own limit wins whenever it is lower. A
