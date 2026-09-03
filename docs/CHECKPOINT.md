@@ -1,7 +1,7 @@
 # Checkpoint
 
 **Slice: SP-6 s4 — the human loop gate.** Spec (`1633a96`), plan (`f7641c1`).
-**Tasks 1–9 of 14 DONE**, every review round closed. **Task 10 is next.**
+**Tasks 1–11 of 14 DONE**, every review round closed. **Task 12 is next.**
 Everything through SP-6 is on `main` (PR #49, `78c5138`); `develop` is ahead by this slice.
 `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it. The sensei daemon is
 down, so this file is the only durable record.
@@ -12,28 +12,24 @@ down, so this file is the only durable record.
   non-converging-menu refusal at every depth, the two journal variants, the fold, the
   `human_question_for` seam, the arm at `{loop}/{i}/__gate__`, `run_loop`'s third gate arm.
   `LoopGateSettled` closed the Critical (settled → clock → decision, so AC8 still holds).
-- **Task 8** (`b4a1d44`) — the boundary AC8/AC12b could not see: a settled gate replays while
-  a LATER iteration's gate still expires, told apart by which gate the failure names.
-- **Task 9** (`be42bad`) — the loud refusals: unmatched option on the LIVE arm; a
-  model-backed role at the ask AND on a drive that does not ask (step 2's SLA read was
-  load-bearing and untested); `GateSpec::Agent` refusing while naming `GateSpec::Human`.
-- **Tasks 8–9 review fixes** — step 1's SETTLED half (a `config push` editing or deleting the
-  gate role must not retroactively kill a converged loop) was prose in three places and
-  guarded by nothing; red-first tested now, as is "no `LoopGateSettled` for an unmatched
-  option". `non_top_level_sites`' "two tests in two modules" was false (one); the table test
-  now pins the site list by value, making it true. Three false doc claims corrected: AC8's
-  hoist at HEAD is **18 passed / 2 failed** (13/1 was `e177e3c`'s 14-test module); expiry
-  fails an EXPIRED gate, decided or not ("undecided" ×4); §7 now admits an ANSWERED gate dies
-  too if no drive precedes the deadline — Task 12's `decide` must refuse that at the CLI.
+- **Tasks 8–9** (`b4a1d44`, `be42bad`, `c7142c2`) — the AC8/AC12b boundary in one run; the
+  three loud refusals; the review fixes (step 1's settled half vs a `config push`).
+- **Task 10** (`7969c1e`) — bounds + redaction. Authored half fails loud, `## Context` half
+  truncates, journaled question redacted. All three already held, so each went red-first by
+  MUTATION (disable the byte check / pass the iteration output as the seam's `input` / swap
+  the redactor for the identity). New fixture `exec_with_body_output` — no CAS, or a 37 KiB
+  output becomes a `ContentRef` and the truncation never happens.
+- **Task 11** (`33f7823`) — AC11 zero spend (effect list BY NODE `["lp/0"]`); AC12 landed as
+  `a_decided_loop_gate_replays_from_its_settlement_without_re_asking` (3 drives, third at
+  +45m INSIDE a 1h SLA) because the sketch duplicated `a_stopping_decision_converges_the_loop`.
 
 ## Remaining
 
-Tasks 10–14. **Task 12 preconditions**: `signal_states` does not fold `LoopGateAwaited` (run
-invisible to `run list-paused`, no verb can decide it); route its loop branch through
-`actor_or_user`; refuse a decision at/after the journaled deadline. Task 14 owns
-`durable-journal.md`; doc-link baseline 16.
+Tasks 12–14. **Task 12 preconditions**: `signal_states` does not fold `LoopGateAwaited`;
+route its loop branch through `actor_or_user`; refuse a decision at/after the journaled
+deadline; **and REDACT `actor` before appending** — Task 10 proved the executor never touches
+that field, so AC16's second half is torii's alone and `cmd::gate::decide` does not redact
+today (`cmd::human::answer` does). Task 14 owns `durable-journal.md`; doc-link baseline 16.
 
-**Next:** `cargo test -p sensei-orchestrator --lib human_loop_gate` (20 passing), then
-Task 10. **Known-broken:** nothing; the plan's open question is not a blocker
-(`validate_dag` does not reserve the `__gate__` segment, so an authored one in a `Loop` body
-collides with the gate path).
+**Next:** `cargo test --workspace` (1618 passing, 0 failed), then Task 12.
+**Known-broken:** nothing.
