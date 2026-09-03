@@ -351,34 +351,40 @@ SP-DATA-4 alone — so each of these names the mutation that must break it.
 - **Money denomination.** `Cost` and `ModelPricing` already exist; what is missing is durable,
   current per-model pricing. The token ledger is designed so a cost model can price it
   retrospectively — the journal records raw counts, which is the honest primitive.
-- **Budgeting `LlmPlannerSelector::select`** (§6.3). It needs a `PlannerSelector` trait signature
-  carrying run/fold context, and a decision about whether the selector's call should become a
-  journaled effect so it can be ledgered at all. Bounded exposure today: one call per
-  `PlannerRef::Select` node.
-- **⚠️ `Snapshot` carries no spend — a DORMANT third instance of the Critical-2 family.** Found while
-  auditing for more of the same after §6.5b. `Snapshot { seq, completed, skipped, outputs }` has no
-  `usage` and no `budget`, and its own doc comment states the design intent plainly: *"A resume seeds
-  from the latest snapshot and folds only the journal **tail** (events with `Seq >` seq)."* The moment
-  anyone wires that, every `EffectRecorded.usage` at or below `snapshot.seq` stops being folded and
-  the ledger silently loses the run's whole prefix — the exact failure compaction had, but **worse**:
-  `write_snapshot` runs at *every round boundary*, not only after a `Consolidate` over a `Map`.
-  **Not a live defect today** — `Executor::start` folds the FULL journal via `load()`, so the
-  snapshot-seeded resume is built but unwired. **Correction (2026-08-28):** the justification as
-  first written — "nothing in the workspace calls `load_since`/`latest_snapshot` outside the stores'
-  own tests" — was FALSE for `load_since`, and `e820d87`'s commit message repeats it. There is one
-  production caller: `Scheduler::earliest_resume_after` (`orchestrator/src/scheduler.rs`), on the
-  driver path. It does not affect the conclusion, and the reason is worth stating rather than
-  re-deriving: that call folds NO run state. It filters the tail for `RunPaused { resume_after }` and
-  takes the `min()`, so `Snapshot.spent`/`budget` are irrelevant to it — a scheduler asking "when is
-  this run due?" cannot lose a ledger it never reads. `latest_snapshot` has no non-test caller, which
-  is the narrower claim `docs/superpowers/orchestrator-overview.md` makes and which remains true.
-  The dormancy therefore stands, on the correct ground: it is `Executor::start`, and only
-  `Executor::start`, that would have to change. Recorded here rather than fixed because fixing it
-  means designing what a snapshot must carry (a folded `spent` scalar plus the effective `budget`,
-  and an argument for why re-folding the tail on top cannot double-count) — the same
-  keyed-by-effect-id reasoning §6.5b needed, but over a summary rather than a per-child manifest.
-  **Whoever wires snapshot-seeded resume owns this**; a tail-only fold that compiles will pass the
-  entire suite while quietly un-capping every budgeted run.
+- ~~**Budgeting `LlmPlannerSelector::select`** (§6.3)~~ — **CLOSED, in this same slice.** Stale until
+  2026-09-03. `SelectorDispatch` (`executor/dispatch.rs`) binds one `select()` to one run + Expand
+  node so every call it makes gates on the budget, charges the live meter, and journals its spend
+  under `RESERVED_SELECT_ID` (`"{node}/__select__"`), off the node's own effect ids. The selector
+  supplies prompts only: it cannot widen the capability, choose a provider, or skip the gate. Four
+  tests pin it — `budget_gate_stops_the_planner_selector_producer`,
+  `the_planner_selector_journals_its_spend_to_the_ledger`,
+  `a_re_driven_selector_replays_its_call_instead_of_respending`, and
+  `every_dispatch_a_selector_makes_is_its_own_ledger_entry` (the port permits more than one call per
+  `select()`; each is its own entry).
+
+- **`Snapshot` and a snapshot-seeded resume — the DATA half is closed; the CONSUMER is a
+  precondition on future work.** Rewritten 2026-09-03; the entry below said "`Snapshot` carries no
+  spend", which stopped being true at `e820d87` (2026-08-28) and was never updated.
+
+  **What is done:** `Snapshot` carries `#[serde(default)] spent: u64` and
+  `#[serde(default)] budget: Option<u64>` — "the ledger reduced to the two scalars a tail-only fold
+  cannot re-derive". `write_snapshot` populates them, and
+  `a_round_boundary_snapshot_carries_the_spend_ledger_and_the_cap` is a deliberate CONTRACT test
+  (it cannot be red-first through behaviour, because the consuming path does not exist; its point is
+  to make "a tail-only fold that compiles passes the entire suite" false). The `serde` defaults mean
+  pre-existing snapshots deserialize as `(0, None)` — the prior behaviour exactly.
+
+  **What is NOT done, and is the precondition:** nothing seeds a resume from a snapshot.
+  `Executor::start_inner` still folds the FULL journal via `load(run)`. `latest_snapshot` has no
+  non-test caller; `load_since`'s one production caller is `Scheduler::earliest_resume_after`, which
+  folds no run state (it filters the tail for `RunPaused { resume_after }` and takes the `min()`), so
+  it cannot lose a ledger it never reads.
+
+  **Whoever wires snapshot-seeded resume owns the remaining half:** an argument for why re-folding
+  the tail ON TOP of a seeded `spent` cannot double-count — the same keyed-by-effect-id reasoning
+  §6.5b needed, but over a summary rather than a per-child manifest. Carrying the scalars makes that
+  argument *possible*; it does not make it. Until then this is an unwired optimisation, not a latent
+  bug.
 - **Fleet-wide / per-tenant budgets**, and a precedence rule against the per-run cap.
 - **Pre-flight estimation** to eliminate the one-call overshoot.
 - **Budget-aware scheduling** — e.g. refusing to wake a run whose remaining budget cannot plausibly
