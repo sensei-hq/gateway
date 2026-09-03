@@ -437,17 +437,20 @@ pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 /// Records the `max_tokens` each call carried, and HONOURS it in the usage it reports
 /// — `output_tokens = min(scripted_output, max_tokens)`.
 ///
-/// Both halves are load-bearing, and no other double in this module has either. The
-/// existing adapters record some slice of the prompt — the user text, the system text,
-/// or both — and `max_tokens` is read by none of them, so before this one **no test in
-/// the suite could see a clamp at all**.
+/// All three halves are load-bearing, and no other double in this module has any of
+/// them. The existing adapters record some slice of the prompt — the user text, the
+/// system text, or both — and `max_tokens` is read by none of them, so before this one
+/// **no test in the suite could see a clamp at all**.
 ///
 /// Recording is what lets a test assert the clamp was applied. Honouring is what makes
-/// "a budgeted run does not exceed its cap" a real end-to-end claim rather than an
-/// assertion about a number we invented: a double that reported `scripted_output`
-/// regardless of `max_tokens` would let the whole clamp be deleted with the suite
-/// green, because the only thing left checking it would be a test reading back the
-/// value it had just watched us compute.
+/// "a budgeted run's spend stays within its cap plus the estimate error" a MEASUREMENT
+/// rather than a reading-back of a number we just watched ourselves compute — the
+/// difference matters because a test of the first kind cannot tell a correct clamp from
+/// one the provider ignored. Both claims were checked by mutation rather than asserted:
+/// report `scripted_output` regardless of `max_tokens` and
+/// `a_budgeted_run_does_not_overshoot_beyond_the_estimate_error` fails with "spend 5010
+/// must stay within cap 2000", while `a_clamped_call_still_journals_its_real_usage`
+/// fails on the journaled count.
 ///
 /// It is a stand-in for a provider's behaviour, not a model of one: a real provider
 /// stops GENERATING at `max_tokens`, so `output_tokens` lands at or below it. `min` is
@@ -1058,14 +1061,18 @@ mod tests {
     /// The fixture's own proof, and it is not ceremony: every clamp assertion in the
     /// executor suite is only as good as this double.
     ///
-    /// It checks BOTH halves. Recording is what lets a test see the clamp at all —
+    /// It checks all three legs. Recording is what lets a test see the clamp at all —
     /// and it also proves the value survives `InferenceRequest` → `ChatRequest`
     /// (`gateway::dispatch::to_chat_request`), which is the precondition that makes
     /// the clamp observable end-to-end rather than only inside the executor.
-    /// Honouring is what makes "a budgeted run does not exceed its cap" a
-    /// measurement instead of an assertion about a number we invented: a double that
-    /// reported its scripted output regardless would let the clamp be deleted with
-    /// the suite green.
+    /// Honouring is what
+    /// `a_budgeted_run_does_not_overshoot_beyond_the_estimate_error` and
+    /// `a_clamped_call_still_journals_its_real_usage` rest on: both fail if this
+    /// double reports its scripted output regardless, which is how we know the claim
+    /// is a measurement and not a reading-back of a number the clamp just computed.
+    /// Refusing an over-large `max_tokens` is what makes
+    /// `a_budgeted_call_is_never_clamped_above_the_models_output_limit` a claim about a
+    /// provider's contract rather than about the fixture's own arithmetic.
     ///
     /// The `None` leg matters too — it is the unbudgeted/additivity path, and a
     /// fixture that capped output unconditionally would make an unclamped run look
