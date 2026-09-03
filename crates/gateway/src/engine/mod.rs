@@ -31,8 +31,8 @@ mod panel;
 mod stream;
 mod util;
 use util::{
-    call_estimate, estimate_input_tokens, request_input_text, stream_error_code, usage_value,
-    window_start,
+    call_estimate, estimate_input_tokens, estimate_input_tokens_pessimistic, request_input_text,
+    stream_error_code, usage_value, window_start,
 };
 
 /// Core gateway orchestrator.

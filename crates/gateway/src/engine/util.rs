@@ -161,14 +161,11 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// would actually have fitted, sending the request to a larger, likely costlier
 /// candidate. That is the cheaper error — the alternative is a provider 400 — and it is
 /// visible, because the skip records both numbers.
-//
-// TEMPORARY, and it must not survive the slice: nothing in a non-test build calls this
-// until SP-7a Task 5 computes it in `engine::execute` and puts it on `SelectionCriteria`.
-// `clippy -D warnings` (the pre-commit gate) rejects the dead function in between, and the
-// alternative — dragging Task 5's plumbing into Task 3 so the estimator lands already
-// wired — would fuse two commits whose reviews are about different things. Task 5 DELETES
-// this attribute; if you are reading it after Task 5 landed, the plumbing is missing.
-#[allow(dead_code)]
+/// Called once per request by `engine::execute` and once by `engine::execute_stream`,
+/// beside [`estimate_input_tokens`], and carried to the gate on
+/// `SelectionCriteria::input_tokens_pessimistic`. Those two call sites are the whole of
+/// its production use: if `clippy -D warnings` ever reports this function dead, the
+/// plumbing has been removed and every request is silently ungated on the window again.
 pub(super) fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
     let chars: usize = match payload {
         Payload::Chat {
