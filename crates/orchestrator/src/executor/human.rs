@@ -1,26 +1,57 @@
 //! The human-backed `Agent` node (SP-6 s3): a role answered by a person, not a model.
 //!
 //! s1 shipped `AwaitSignal` (pause, accept any JSON), s2 `HumanGate` (the typed menu).
-//! This is the third and last waiting kind: an `Agent` node whose `AgentRef` resolves to
+//! This is the THIRD waiting kind: an `Agent` node whose `AgentRef` resolves to
 //! a human-backed definition pauses ONCE, journals the question it is asking, and
 //! completes when a human answers.
 //!
-//! The waiting machinery is SHARED with both siblings, not copied — `gate_precheck` and
-//! `wait_or_expire` live in `signal.rs`, reached here through their `_by_id` forms
-//! because this node kind is driven from `drive_agent`, which holds only a `NodeId`.
-//! s1's review found real defects in exactly those arms; a third copy would be a third
-//! place for them to return.
+//! It is not the last, though s3 wrote that it was. SP-6 s4 adds a FOURTH — the human
+//! LOOP GATE, a `Loop` whose `GateSpec::Human` asks a person whether to iterate again.
+//! Only its EXECUTOR ARM, [`Executor::run_human_loop_gate`], lives here; the pieces it
+//! reasons from are elsewhere, and an earlier version of this paragraph pointed at the
+//! wrong crate for two of the three. Its journal variants
+//! (`LoopGateAwaited`/`LoopGateDecided`/`LoopGateSettled`) are in
+//! `orchestrator-core/src/journal.rs`; the fold arms that read them are in
+//! `executor/support.rs`'s `fold_journal`, with their accessors on `Fold` in
+//! `executor/mod.rs`. `LoopGateAwaited` is the FOURTH writer of the SHARED
+//! `Fold::deadlines` map, and that count matters because the missing-question arm below
+//! reasons from it explicitly.
+//!
+//! The two kinds in this file are siblings, not layers, and they differ in exactly one
+//! ordering: `run_human_agent` reads the ANSWER before the deadline, `run_human_loop_gate`
+//! reads the DEADLINE before the decision. Each function's doc argues its own side; the
+//! short version is that an agent's answer is work product while a loop gate's "continue"
+//! authorizes another iteration of spend, which is an approval. They are next to each
+//! other so that the divergence is visible rather than discovered.
+//!
+//! The waiting machinery is SHARED with all three siblings, not copied — `gate_precheck`
+//! and `wait_or_expire` live in `signal.rs`, reached here through their `_by_id` forms.
+//! BOTH kinds in this file need those forms, for two different reasons: the human-backed
+//! `Agent` because it is driven from `drive_agent`, which holds only a `NodeId`; and the
+//! loop gate because it runs at a SYNTHESIZED path, `"{loop}/{i}/__gate__"`, which has no
+//! `Node` in the graph at all. s1's review found real defects in exactly those arms; a
+//! third copy would be a third place for them to return.
 //!
 //! A new file rather than more of `agent.rs`, matching how s2 put `run_human_gate` in
-//! its own `gate.rs`: `agent.rs` is the model path and stays that.
+//! its own `gate.rs`: `agent.rs` is the model path and stays that. s4's shared seam,
+//! [`Executor::human_question_for`], is here for the same reason — it is wholly a
+//! human-path function, `drive_agent` merely calls it, and its second caller
+//! (`run_human_loop_gate`) is in this file. It landed in `agent.rs` first, next to the
+//! `assemble_prompt_parts` call it was extracted from, which put ~100 lines of human-path
+//! doc in the model path's file and left BOTH module headers describing a layout that no
+//! longer held; review caught it and it moved.
 
 use orchestrator_core::{
-    JournalEvent, MAX_HUMAN_CONTEXT_BYTES, MAX_HUMAN_TEXT_BYTES, NodeId, OrchestratorError, RunId,
+    AgentDefinition, AgentRef, ContextKey, JournalEvent, LoopGateOption, MAX_HUMAN_CONTEXT_BYTES,
+    MAX_HUMAN_TEXT_BYTES, NodeId, OrchestratorError, RunId,
 };
 
-use crate::agent::prompt::{render_context_section_bounded, truncate_prompt_to_bound};
+use crate::agent::prompt::{
+    assemble_prompt_parts, render_context_section_bounded, truncate_prompt_to_bound,
+};
 
 use super::signal::WaitState;
+use super::support::render_input;
 use super::{Executor, Fold, NodeExec};
 
 /// The question a human-backed node asks, carried as one string PLUS the count of its bytes
@@ -127,6 +158,20 @@ impl HumanQuestion {
         }
     }
 
+    /// The composed question, for a test in a SIBLING module to assert on.
+    ///
+    /// `#[cfg(test)]` rather than an `expect(dead_code)`: no production caller wants the
+    /// raw text — every one of them goes through [`HumanQuestion::redact_and_clamp`], and
+    /// an accessor that hands out the UNREDACTED string is exactly the shortcut that
+    /// bypass would take. `human.rs`'s own tests read the field directly; this exists
+    /// because `executor::tests` cannot (a private field is visible only to the defining
+    /// module and its descendants), and SP-6 s4's seam test lives there, beside the s3
+    /// human-agent fixtures it reuses.
+    #[cfg(test)]
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
     /// Redact the question and bring it under `bound`, **cutting only the `## Context`
     /// half**.
     ///
@@ -182,7 +227,217 @@ impl HumanQuestion {
     }
 }
 
+/// What one human loop gate decided, in the shape [`Executor::run_loop`] needs (SP-6 s4).
+///
+/// Neither [`NodeExec`] nor `AgentStep`, and for the same reason each of those exists: the
+/// whole output of this node is a `bool` — does the LOOP continue — and `NodeExec` has
+/// nowhere to put it that `run_loop` would not have to parse back out of a
+/// `serde_json::Value`. A gate is also not a node of the graph: it produces no output, is
+/// never a dependency, and journals no `NodeStarted`/`NodeCompleted`, so the two `NodeExec`
+/// shapes it could borrow would both be lies.
+///
+/// `Failed` and `Paused` carry their operator-facing string because the DURABLE write has
+/// already happened by the time either is constructed — `NodeFailed` through
+/// [`Executor::fail_loop_gate`], `RunPaused` through `pause_awaiting`. `run_loop` maps them
+/// onto the Loop, exactly as it already maps a gate-AGENT's failure and pause.
+pub(super) enum LoopGateStep {
+    /// A person decided. `stop` is the CHOSEN OPTION's `stops`, recomputed from the
+    /// journaled option name on every drive — which is what makes a resume reach the
+    /// identical decision without re-asking (design §5.7).
+    Decided { stop: bool },
+    /// The gate could not decide: the SLA fired, the role is misconfigured, or the
+    /// recorded decision names an option that is not in the menu the human was shown.
+    /// A `NodeFailed` for the GATE path is journaled either way; `run_loop` fails the
+    /// whole `Loop`, which is the existing gate-agent behaviour and needs no new outcome
+    /// shape.
+    ///
+    /// It carries no "did this drive write it?" flag. The first shipped shape did, to stop
+    /// `run_loop` re-appending the LOOP's row on every wake of a dead run, and the flag was
+    /// a SECOND claim about the journal that could disagree with the first: it meant "this
+    /// drive wrote the GATE's row" while the caller consumed it as "the LOOP's row is
+    /// missing", so a transient journal error between the two appends left the Loop's
+    /// failure permanently unwritten. The guard belongs on the append itself — see
+    /// [`Executor::fail_loop`], which is idempotent against the `Loop`'s own recorded
+    /// failure and therefore self-healing.
+    Failed(String),
+    /// Waiting on a person. `RunPaused` is already journaled — on the deadline this gate
+    /// RECORDED, so the SP-DATA-3 scheduler re-arms on the same instant — and `run_loop`
+    /// propagates the pause, stopping the whole `Loop` until an answer arrives.
+    Paused(String),
+}
+
+/// The `## Context` heading the iteration's output is shown under, and the only context
+/// entry a loop gate has.
+///
+/// A named constant because it is operator-visible in the journaled question and in what
+/// `torii run list-paused` renders, so it must not drift between the compose site and
+/// anything that reads the question back.
+const ITERATION_OUTPUT_KEY: &str = "iteration output";
+
 impl Executor {
+    /// Resolve a human-backed `AgentRef` into the QUESTION to ask and the SLA to ask it
+    /// under — the seam `drive_agent`'s human branch (SP-6 s3) and `run_human_loop_gate`
+    /// (SP-6 s4) share.
+    ///
+    /// **It exists so s4 needs no second prompt builder.** s3's central property is that a
+    /// human's question is composed by the MODEL path's own [`assemble_prompt_parts`], so
+    /// the two cannot drift on what "the agent's prompt" means — s3 secured it by putting
+    /// its human branch INSIDE `drive_agent`, immediately after that call. s4's
+    /// `GateSpec::Human` cannot be routed the same way: it has no ReAct loop, no turns and
+    /// no `stop_when`, and threading a menu through `drive_agent` would put a parameter
+    /// there that every model caller must pass as `None`. Sharing this function keeps the
+    /// property without the coupling. `the_human_question_seam_composes_the_same_prompt_
+    /// the_model_path_would` is the guard: it computes `assemble_prompt_parts` itself and
+    /// requires the composed question to contain `parts.authored` VERBATIM, with an
+    /// INACTIVE skill's body absent — a hand-rolled second builder that concatenated every
+    /// declared skill, or joined them with a different separator, is what that reddens on.
+    ///
+    /// # Which half a caller's data belongs in
+    ///
+    /// The two parameters are NOT interchangeable, and picking wrong is a terminal
+    /// data-dependent node failure rather than a compile error:
+    ///
+    /// - **`input` is the ASK.** It becomes the `## Task` section and is counted in
+    ///   [`HumanQuestion`]'s `authored_bytes`, which [`Executor::run_human_agent`] checks
+    ///   against [`MAX_HUMAN_TEXT_BYTES`] (4096) with a LOUD, terminal `NodeFailed` — and
+    ///   which s4's gate arm checks the same way. So it must be AUTHOR-SCALE: a node input
+    ///   an operator wrote, or a short synthesized ask, never an upstream node's output. It
+    ///   is also the query `assemble_prompt_parts` evaluates every skill's and tool's
+    ///   `activation.is_active` against.
+    /// - **`context` is RUN DATA.** It becomes the `## Context` section, which
+    ///   `render_context_section_bounded` TRUNCATES per dependency to
+    ///   [`MAX_HUMAN_CONTEXT_BYTES`] (32 KiB) with a visible marker, and which
+    ///   `authored_bytes` deliberately excludes. Anything a model produced belongs here.
+    ///
+    /// That asymmetry is the s3 whole-slice review's central fix and it is load-bearing for
+    /// s4: a loop gate's context is a model iteration's output essentially always, so
+    /// passing that output as `input` would kill the gate on ordinary data — after the
+    /// iteration's tokens were already spent, and unrecoverably, since `gate_precheck_by_id`
+    /// reads the `NodeFailed` back on every later drive. `run_human_loop_gate` will
+    /// therefore pass the iteration output as a `context` entry and a short menu-derived ask
+    /// as `input`. Written down here because the s4 PLAN's own sketch of that call had the
+    /// two the wrong way round and review caught it before the task ran; design §6 and AC15
+    /// are the record.
+    ///
+    /// # Why the input is in the question at all
+    ///
+    /// `assemble_prompt_parts` takes `query` only to evaluate activation and never puts it
+    /// in `authored`. The model path supplies the input SEPARATELY, as the first user
+    /// message (`Message::text(MessageRole::User, query)`). So journaling the system string
+    /// alone showed the human the role's standing instructions and the upstream context but
+    /// NOT the thing being asked about — a reviewer role reading "say whether the contract
+    /// permits sub-processing" with no contract named. Design §5.4's rule is "the human sees
+    /// precisely what the model would have", and its accepted cost is explicitly
+    /// one-directional: never show the human LESS than the model would have had.
+    ///
+    /// The result is a type rather than a `format!` because the two halves must be bounded
+    /// by the two DIFFERENT rules above, and once they are concatenated that distinction is
+    /// unrecoverable. [`HumanQuestion::compose`] owns both and documents them.
+    ///
+    /// # The rest of the contract
+    ///
+    /// **The SLA comes back with the question** so no caller re-reads the registry to find
+    /// the deadline it must pause on. A second read is a second place for a role and its
+    /// SLA to come apart, which is the arrangement `AgentBacking::Human { timeout }` exists
+    /// to prevent.
+    ///
+    /// **Fails loudly on a MODEL-backed role**, which is unreachable from `drive_agent`
+    /// (its branch has already matched the backing) and is s4's case: an author naming a
+    /// model-backed role in a `GateSpec::Human`. Design §5.5 — silence there would let an
+    /// author believe a person is in the loop while the run quietly decides for itself, the
+    /// mirror of the refusal `drive_agent` gives a human-backed role at an illegal
+    /// position. The message names the role, the defect and the fix, because the only
+    /// person who can act on it is the one who wrote the config.
+    ///
+    /// **It ADDS no token spend** — it resolves no chain and touches no gateway. That is
+    /// not the same as guaranteeing zero spend on a caller's path, and this function cannot:
+    /// nothing stops a caller resolving a chain the line after. Each caller still owes the
+    /// STRUCTURAL placement — `drive_agent`'s human branch returns above `resolve_chain`
+    /// (guarded by the role's `chain: None`, so a mis-ordered branch reddens `mod
+    /// human_agent` wholesale), and s4's gate arm drives no agent at all. See the comment
+    /// at `drive_agent`'s branch, which is the authoritative statement for that caller.
+    ///
+    /// It returns `Err`, not a `NodeFailed`: it has no `RunId`, journals nothing, and its
+    /// two callers differ in what a failure means (s3's `?`-propagates as it always has;
+    /// s4's gate arm turns it into a `NodeFailed` that fails the `Loop`). Deciding that
+    /// here would take the choice away from the caller that owns it.
+    ///
+    /// **[`Executor::human_sla_for`] — the SLA half alone — is defined BELOW this function,
+    /// not above it, and that is not a stylistic preference.** Rustdoc attaches a doc block
+    /// to the item that FOLLOWS it, so the change that extracted the SLA read put its `fn`
+    /// between these hundred lines and the function they describe, silently re-parenting
+    /// the whole argument about prompt assembly onto a function that composes no prompt —
+    /// and leaving this one with no doc at all. Nothing in the compiler or in
+    /// `clippy -D warnings` says a word about it; only reading the rendered page does.
+    /// Caller-then-callee also happens to be the better reading order here, since the SLA
+    /// read is a step of this function rather than a peer of it.
+    pub(super) fn human_question_for(
+        &self,
+        agent_ref: &AgentRef,
+        input: &serde_json::Value,
+        context: &[(ContextKey, serde_json::Value)],
+    ) -> Result<(HumanQuestion, Option<chrono::Duration>), OrchestratorError> {
+        let timeout = self.human_sla_for(agent_ref)?;
+        let agent: &AgentDefinition = self
+            .registry
+            .agent(&agent_ref.0)
+            .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
+        let query = render_input(input);
+        let parts = assemble_prompt_parts(&self.registry, agent, context, &query)?;
+        Ok((
+            HumanQuestion::compose(
+                &parts.authored,
+                &parts.context,
+                &query,
+                // The executor's own pure redactor, applied to each context body BEFORE the
+                // bound cuts it — see `compose`. Identity when none is wired, which is the
+                // default, so the composed question stays byte-identical there.
+                |t| self.redact_text(t),
+            ),
+            timeout,
+        ))
+    }
+
+    /// The SLA half of [`Executor::human_question_for`] alone: resolve the role, assert the
+    /// backing is `Human`, and hand back its `timeout`.
+    ///
+    /// Two registry lookups instead of one, and worth it: this is the only part of the seam
+    /// a caller needs on EVERY drive, while composing the question is only needed on the
+    /// drive that ASKS. `run_human_loop_gate` is re-entered for every iteration's gate on
+    /// every wake of the run, so composing eagerly there meant, on a loop sitting at
+    /// iteration N, N `assemble_prompt_parts` runs and N redaction passes over up to
+    /// `MAX_HUMAN_CONTEXT_BYTES` of iteration output — all discarded by an arm that pauses
+    /// or replays a decision.
+    ///
+    /// Extracted rather than duplicated so the LOUD model-backed refusal has one message
+    /// (AC14, design §5.5): an author naming a model-backed role in a `GateSpec::Human`
+    /// must be told the same thing wherever the seam is entered. It is the same refusal for
+    /// the same reason at both entry points, and it is the ONLY thing this function can
+    /// fail on beyond an unresolvable name — so a caller that needs the deadline and not
+    /// the question still gets AC14's loudness on every drive that could still ask.
+    ///
+    /// It resolves no chain and touches no gateway, which is what lets
+    /// `run_human_loop_gate` call it unconditionally without weakening its structural
+    /// zero-spend claim.
+    pub(super) fn human_sla_for(
+        &self,
+        agent_ref: &AgentRef,
+    ) -> Result<Option<chrono::Duration>, OrchestratorError> {
+        let agent: &AgentDefinition = self
+            .registry
+            .agent(&agent_ref.0)
+            .ok_or_else(|| OrchestratorError::UnknownAgent(agent_ref.0.clone()))?;
+        let orchestrator_core::AgentBacking::Human { timeout } = agent.backed_by else {
+            return Err(OrchestratorError::InvalidGraph(format!(
+                "agent {:?} is model-backed but is named where a human-backed role is \
+                 required; set `backed_by: human` in its frontmatter, or use a gate kind \
+                 that takes a model",
+                agent_ref.0
+            )));
+        };
+        Ok(timeout)
+    }
+
     /// Execute one human-backed `Agent` node.
     ///
     /// | fold state | behaviour |
@@ -235,7 +490,8 @@ impl Executor {
         timeout: Option<chrono::Duration>,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        // 0. This node has ALREADY failed ⇒ it stays failed. Shared with both siblings,
+        // 0. This node has ALREADY failed ⇒ it stays failed. Shared with all three
+        //    siblings,
         //    and FIRST — ahead of the answer read — for the fail-closed reason spelled out
         //    on `gate_precheck`. The verdict is READ BACK, never re-derived, so a dead
         //    node does not append a fresh `NodeFailed` on every drive.
@@ -361,11 +617,14 @@ impl Executor {
             // answer could be an answer to.
             //
             // The exact mirror of `run_human_gate`'s missing-menu arm, and s3 shipped
-            // without it. `Fold::deadlines` is written by all THREE waiting kinds while
-            // only `AgentAwaited` carries a prompt, so this arm is reachable the same way
-            // s2's is: by editing a live run's graph to change a waiting node's KIND. An
-            // `AwaitSignal` node re-pointed at a human-backed `Agent` arrives here exactly
-            // as the `AwaitSignal`→`HumanGate` swap arrives there — `gate.rs`'s own comment
+            // without it. `Fold::deadlines` is written by all FOUR waiting kinds (SP-6
+            // s4's `LoopGateAwaited` is the fourth, and it carries a prompt of its own —
+            // into `Fold::loop_gate_asks`, never into this map, because a loop gate is
+            // not answerable by `AgentAnswered`) while only `AgentAwaited` writes a prompt
+            // HERE, so this arm is reachable the same way s2's is: by editing a live run's
+            // graph to change a waiting node's KIND. An `AwaitSignal` node re-pointed at a
+            // human-backed `Agent` arrives here exactly as the `AwaitSignal`→`HumanGate`
+            // swap arrives there — `gate.rs`'s own comment
             // already noted that s3 WIDENS that reachable set, and this is the guard it was
             // noting the absence of.
             //
@@ -501,6 +760,706 @@ impl Executor {
         self.pause_awaiting(run, reason, deadline).await
     }
 
+    /// Execute one human LOOP GATE (SP-6 s4, design §5.2): ask a person, once per `Loop`
+    /// iteration, whether the loop continues.
+    ///
+    /// | fold state | behaviour |
+    /// |---|---|
+    /// | failure recorded | `Failed` — shared `gate_precheck`, checked FIRST, verdict READ BACK |
+    /// | a decision already HONOURED | `Decided` — replayed from `LoopGateSettled`, no clock |
+    /// | the role is model-backed / unknown | `Failed` — a config error, named |
+    /// | asking, deadline passed | `Failed` — **before any decision is read** |
+    /// | no wait recorded yet | journal `LoopGateAwaited`, pause |
+    /// | no wait, but the path already COMPLETED | `Failed` — the kind swap, silent half |
+    /// | a wait recorded by ANOTHER kind, so no menu | `Failed` — the kind swap, loud half |
+    /// | decided, option in the JOURNALED menu | journal `LoopGateSettled`, `Decided { stop }` |
+    /// | decided, option NOT in that menu | `Failed`, loudly — never a default |
+    /// | not decided, deadline not passed | re-pause on the SAME absolute instant |
+    ///
+    /// **The deadline is read BEFORE the decision, and that is the deliberate divergence
+    /// from [`Executor::run_human_agent`] two functions up.** s3 reads its answer first
+    /// because an agent's answer is WORK PRODUCT: there is nothing to self-approve, and
+    /// discarding a human's in-time answer because a worker was down punishes them for
+    /// infrastructure they had no part in. That argument does not transfer. Answering
+    /// `continue` here AUTHORIZES ANOTHER ITERATION OF SPEND, which is an approval in the
+    /// strict sense s2 built its ordering for, so honouring a late one would sanction
+    /// tokens the operator's own SLA said to stop waiting for. This function therefore
+    /// copies `run_human_gate`'s shape, not its neighbour's.
+    ///
+    /// Structurally that is why the wait state is a single `match` whose every arm
+    /// returns, rather than s3's `let state = …` with the answer read in between:
+    /// collapsing it the other way silently reinstates s3's ordering, and
+    /// `a_decision_after_the_deadline_does_not_continue_the_loop` is the test that reddens
+    /// when it is.
+    ///
+    /// **But the clock only ever judges a gate that is STILL LIVE, and step 1 is what
+    /// makes that true.** `run_loop` re-enters `for i in 0..max_iters` from zero on every
+    /// drive, so iteration 0's gate is re-derived forever while the SLA it recorded stays
+    /// fixed — and `wait_or_expire_by_id` answers from `now >= recorded deadline` alone.
+    /// The arm as first shipped therefore killed a gate whose decision an earlier drive
+    /// had already read, honoured and spent an iteration against: under any finite SLA the
+    /// loop's TOTAL human latency was silently capped at one gate's timeout, and a loop
+    /// that had already CONVERGED was destroyed retroactively the next time anything woke
+    /// the run. So the SUCCESS verdict gets the same treatment as the failure one — made
+    /// durable by the drive that produces it (`LoopGateSettled`) and READ BACK afterwards,
+    /// never re-derived. Note the ordering that buys both properties at once: settled ⇒
+    /// replay; not settled ⇒ the clock, then the decision. Reading the decision first
+    /// instead would fix the same symptom and reopen AC8.
+    ///
+    /// **The menu is read from the JOURNAL, never from the graph.** `menu` — the graph's
+    /// copy — is used for the very first ask and NOWHERE else; every later drive resolves
+    /// the decision against `fold.loop_gate_menu_for`. Nothing binds the graph handed to a
+    /// later `Executor::start` to the one the human was shown (there is no graph fence;
+    /// `scheduled_runs.graph` is an editable row and a library embedder simply passes a
+    /// `Graph`), so an author who flipped an option's `stops` after a person picked it
+    /// would otherwise invert their decision silently. Its absence on the already-asking
+    /// path is a kind-swapped node and fails loudly rather than falling back — see that
+    /// arm.
+    ///
+    /// **Zero token spend is STRUCTURAL.** No chain is resolved and the gateway is never
+    /// touched: the only registry reads are [`Executor::human_sla_for`] and, on the drive
+    /// that asks, [`Executor::human_question_for`], which composes a prompt and returns.
+    /// That matters more here than at any other human site, because the decision being
+    /// made IS whether to spend more — a gate that itself cost tokens would be
+    /// self-undermining. It is a property of this function's code, not of a call count,
+    /// and `run_loop`'s arm adds nothing to it.
+    ///
+    /// Like every other waiting kind this journals no `NodeStarted`/`NodeCompleted` — it
+    /// is not a node of the graph at all — so the family's known re-`start` asymmetry
+    /// applies unchanged. A decided gate replays from `LoopGateSettled` with no re-ask and
+    /// no gateway call; `stops` → `stop` is recomputed from the journaled option name
+    /// against the journaled menu, so a resume reaches the identical decision (§5.7).
+    ///
+    /// This node kind must never panic. A panic here is not local: it unwinds through
+    /// `Scheduler::tick`, which has already claimed a batch of runs and taken their
+    /// leases, so the claimed rows stay `waking` and the next worker reclaims the stale
+    /// lease and dies the same way — and because a panic is not an `Err` it bypasses
+    /// `worker serve`'s consecutive-failure backoff entirely. Every failure below is a
+    /// `NodeFailed`.
+    pub(super) async fn run_human_loop_gate(
+        &self,
+        run: RunId,
+        node_id: &NodeId,
+        agent_ref: &AgentRef,
+        menu: &[LoopGateOption],
+        iteration_output: &serde_json::Value,
+        fold: &Fold,
+    ) -> Result<LoopGateStep, OrchestratorError> {
+        // 0. This gate has ALREADY failed ⇒ it stays failed. Shared with all three
+        //    siblings, and FIRST — ahead of everything, including the question — for the
+        //    fail-closed reason spelled out on `gate_precheck`. The verdict is READ BACK,
+        //    never re-derived: this refusal is terminal for the gate, but the run it kills
+        //    journals no `RunCompleted`, so every later wake re-drives the iteration and a
+        //    re-derived verdict would append a fresh `NodeFailed` on each of them.
+        //    `gate_failure_by_id` rather than `gate_precheck_by_id` because this kind's
+        //    step type is not a `NodeExec`; it is the same read of the same map.
+        if let Some(message) = self.gate_failure_by_id(node_id, fold) {
+            // The ONE `Failed` this function returns without writing anything: the row is
+            // already durable, and `fail_loop`'s own guard keeps the LOOP's copy from
+            // being re-appended too.
+            return Ok(LoopGateStep::Failed(message));
+        }
+
+        // 1. This gate's decision has ALREADY BEEN HONOURED ⇒ replay it, WITHOUT consulting
+        //    the clock. The success mirror of step 0, and it exists for the same reason: a
+        //    verdict is settled by the drive that produced it and read back afterwards.
+        //
+        //    Without it this function re-derived every settled gate on every drive — see
+        //    the doc comment. It sits ABOVE the SLA read as well as above the clock,
+        //    deliberately: a gate that is already settled needs no role, no question and no
+        //    deadline, so AC14's loud model-backed refusal is owed at the ASK and on every
+        //    drive that could still ask, not on a replay whose answer is already durable.
+        //    Coupling a settled decision to live config would turn a role edit into a
+        //    terminal failure of a loop nobody is waiting on.
+        //
+        //    **That ordering is a TEST, not only this comment.** It shipped as prose in
+        //    three places and review mutation-proved it unguarded: moving this block below
+        //    the SLA read left the whole workspace green while a `torii config push` that
+        //    edited or deleted the gate role destroyed a loop that had converged hours
+        //    earlier and cascade-skipped its downstream node — the Critical this slice
+        //    already shipped once, reached through config instead of the clock. Guarded now
+        //    by `a_settled_gate_replays_when_a_config_push_breaks_its_role`, which is the
+        //    exact mutation.
+        if let Some(option) = fold.loop_gate_settled_with(node_id) {
+            return self
+                .decide_from_published_menu(run, node_id, option, fold)
+                .await;
+        }
+
+        // 2. The SLA, through the seam shared with `drive_agent`'s human branch — so the
+        //    role and its deadline travel together and no caller re-reads the registry to
+        //    find one. A model-backed role named in a `GateSpec::Human`, or an unresolvable
+        //    one, fails loudly HERE (AC14): silence would let an author believe a person is
+        //    in the loop while the run quietly decides for itself.
+        //
+        //    Only the SLA. The QUESTION is composed inside the `NotYetAsking` arm, which is
+        //    the only arm that uses it: composing it here ran `assemble_prompt_parts` and a
+        //    full redaction pass over the iteration output on EVERY drive of EVERY
+        //    iteration's gate, and threw the result away on the pause and replay paths that
+        //    a long-running human loop spends nearly all its life on.
+        let timeout = match self.human_sla_for(agent_ref) {
+            Ok(t) => t,
+            Err(error) => {
+                return self
+                    .fail_loop_gate(run, node_id, format!("loop_gate: {error}"))
+                    .await;
+            }
+        };
+
+        // 3. What this gate has recorded — and ACTED ON IMMEDIATELY. See the doc comment:
+        //    this being one `match` rather than a `let` is the s2-not-s3 ordering.
+        match self.wait_or_expire_by_id(node_id, timeout, fold) {
+            // The overflow guard's second layer (`signal.rs` explains why a node kind may
+            // not panic on its own). Nothing is journaled beyond the failure itself: a
+            // `LoopGateAwaited` carrying a nonsense deadline would be folded first-wins
+            // forever. The helper's message is unprefixed so each kind names itself.
+            Err(message) => {
+                self.fail_loop_gate(run, node_id, format!("loop_gate: {message}"))
+                    .await
+            }
+
+            // The recorded deadline has passed ⇒ FAIL, before any decision is read, so a
+            // late "continue" cannot authorize spend the SLA had already stopped waiting
+            // for. An expired gate fails the whole `Loop` (AC10) — `run_loop`'s existing
+            // gate-failure arm does that, so no new outcome shape is needed. Converging
+            // instead ("silence means stop") was rejected in §3: it would decide the
+            // loop's outcome with nobody asked and report SUCCESS.
+            //
+            // **The message names the DEADLINE, never "no decision"** — this arm has not
+            // read the fold and cannot know whether one exists. `run_human_agent`'s
+            // "with no answer" is accurate for the opposite reason: it reads its answer
+            // first, so reaching its expiry proves the absence. Telling an operator whose
+            // decision DID land "no decision" would send them hunting a delivery bug that
+            // does not exist, in a durable message every later drive re-emits.
+            Ok(WaitState::Expired(deadline)) => {
+                self.fail_loop_gate(
+                    run,
+                    node_id,
+                    format!(
+                        "loop_gate: node {} passed its deadline {deadline}; the gate fails \
+                         on the deadline BEFORE any decision is read, so a decision that \
+                         had already landed does not authorize another iteration",
+                        node_id.0
+                    ),
+                )
+                .await
+            }
+
+            // The first — and only — ask this gate ever makes. `menu` (the GRAPH's copy)
+            // is read here and nowhere else, which is what makes the menu durable. It is
+            // also SCRUBBED here and nowhere else: what this arm journals is the redacted
+            // copy, and every later drive reads that one back out of the fold.
+            Ok(WaitState::NotYetAsking(fresh)) => {
+                // **Before anything: is this reserved path already occupied by a node
+                // that COMPLETED here?**
+                //
+                // The `Waiting` arm below catches an occupant that recorded a WAIT,
+                // because `Fold::deadlines` is shared. A node kind that simply ran and
+                // finished writes nothing there, so without this check the gate would
+                // reach the ask and publish `LoopGateAwaited` at an id that already
+                // carries `NodeStarted`/`NodeCompleted`. `torii`'s `signal_states` folds
+                // `NodeCompleted` as terminal, so the row is INVISIBLE: `run list-paused`
+                // omits the node and `run gate decide` refuses it as already completed,
+                // while the executor sits paused waiting for a decision — forever under an
+                // indefinite SLA, and until the whole `Loop` dies under a finite one.
+                //
+                // `validate_dag` block 1c closes the door an AUTHOR could walk through (a
+                // bare `__gate__` segment in the `Loop`'s own `Subgraph` body, which
+                // namespaces onto this path). Two doors it cannot close remain, and this
+                // is the guard for them: a mid-run edit of the gate KIND — `GateSpec::
+                // Agent` drives a real agent HERE, and `drive_agent` journals
+                // `NodeStarted`/`NodeCompleted` at the gate path, so an
+                // `Agent`→`Human` edit of `scheduled_runs.graph` between drives lands
+                // exactly in this state with both graphs individually legal — and a
+                // journal the executor did not write.
+                //
+                // Fail-closed, the same answer the missing-menu arm gives, and for the
+                // same reason: the alternative is a person being waited on with no surface
+                // that can tell them so. Guarded by
+                // `a_loop_gate_refuses_to_ask_at_a_path_another_kind_already_completed`.
+                if fold.started.contains(node_id) || fold.completed.contains(node_id) {
+                    return self
+                        .fail_loop_gate(run, node_id, occupied_path_message(node_id))
+                        .await;
+                }
+
+                // The question, through the seam shared with `drive_agent`'s human branch
+                // — so a person is shown a question built by the MODEL path's own prompt
+                // assembly and the two cannot drift. Composed HERE rather than at step 2
+                // because this is the only arm that uses it.
+                //
+                // **Which argument each half goes in is a contract, not a style choice**
+                // (see `human_question_for`'s doc, design §6, AC15). The iteration output
+                // is RUN DATA — a model answer, so over 4 KiB essentially always — and
+                // belongs in `context`, which truncates per dependency to
+                // `MAX_HUMAN_CONTEXT_BYTES`. Passing it as `input` would charge it to the
+                // LOUD `MAX_HUMAN_TEXT_BYTES` cap below and kill the gate on ordinary
+                // data, after the iteration's tokens were already spent and unrecoverably
+                // (step 0 reads the `NodeFailed` back forever). The `input` is a short ask
+                // synthesized from the menu instead: author-scale by construction, so
+                // everything charged to the loud cap stays author-controlled.
+                let context = [(
+                    ContextKey(ITERATION_OUTPUT_KEY.into()),
+                    iteration_output.clone(),
+                )];
+                let question = match self.human_question_for(
+                    agent_ref,
+                    &serde_json::Value::String(gate_ask(menu)),
+                    &context,
+                ) {
+                    // The SLA came back at step 2 from the same seam over the same role,
+                    // so this copy is redundant by construction.
+                    Ok((question, _)) => question,
+                    Err(error) => {
+                        return self
+                            .fail_loop_gate(run, node_id, format!("loop_gate: {error}"))
+                            .await;
+                    }
+                };
+
+                // Bound the AUTHORED half before it becomes durable: the gate role's
+                // `system_prompt`, its activated skill bodies, and the menu-derived ask.
+                // All three are author-controlled at config time, which is what makes a
+                // LOUD terminal failure the right answer — the person who wrote the config
+                // can act on it. The `## Context` half is the ITERATION OUTPUT and is
+                // deliberately NOT counted: it is run data, and it truncates to its own
+                // budget instead. That asymmetry is s3's whole-slice fix and it is
+                // load-bearing here, where the context is a model answer every time.
+                if question.authored_bytes > MAX_HUMAN_TEXT_BYTES {
+                    return self
+                        .fail_loop_gate(
+                            run,
+                            node_id,
+                            format!(
+                                "loop_gate: node {}'s authored prompt is {} bytes, over the \
+                                 {MAX_HUMAN_TEXT_BYTES}-byte limit — trim the gate role's \
+                                 system prompt, its skills, or the menu option names. (The \
+                                 `## Context` section, which is this iteration's OUTPUT, is \
+                                 NOT counted here: it is run data, and it is truncated to \
+                                 fit its own {MAX_HUMAN_CONTEXT_BYTES}-byte budget rather \
+                                 than failing the gate.)",
+                                node_id.0, question.authored_bytes
+                            ),
+                        )
+                        .await;
+                }
+
+                // Redact BEFORE the durable write, not only at display time — this row is
+                // otherwise the last unscrubbed door into the JOURNAL for a credential
+                // sitting in the role's `system_prompt`, an activated skill body or the
+                // iteration output. Nothing upstream scrubs the first two: they are
+                // authored in an agent's markdown and `torii config push` copies them into
+                // `config_agents` as jsonb verbatim, so this is not their first durable
+                // copy — an earlier version of this comment said "the one place", and the
+                // config file on disk alone disproves it. It is the copy read BACK, on
+                // every drive and by every operator surface. Then clamp, because
+                // `[REDACTED]` is LONGER than the shortest span it replaces and can push a
+                // question that fitted over the bound; clamping rather than failing keeps
+                // "your prompt contained a secret" from becoming a terminal run.
+                let prompt = question.redact_and_clamp(
+                    |t| self.redact_text(t),
+                    MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES,
+                );
+
+                // **The MENU is redacted too, and it is a deliberate answer rather than a
+                // reflex.** Option names are author free text out of the GRAPH: `torii run
+                // submit --graph <file>` deserializes the file and hands it straight to the
+                // scheduler, scrubbing nothing. NOT `torii config push`, which an earlier
+                // version of this comment named — design §4 puts the menu on the graph
+                // precisely so `validate_dag` can see it, and explicitly rejects the
+                // registry as its home, so a pushed config never carries an option name at
+                // all. (The role's `system_prompt` and its skill bodies, redacted just
+                // above, DO arrive that way. Two intakes, neither of them scrubbing.)
+                //
+                // Nor is this append the LAST durable copy of those names, which the same
+                // sentence used to claim. On the scheduler path `Scheduler::submit` calls
+                // `store.enqueue` BEFORE it drives anything, and that inserts the whole
+                // submitted graph — menu included — into `scheduled_runs.graph` as jsonb,
+                // in the clear. What this append is the last line of defence for is the
+                // JOURNAL: the copy every later drive folds, that `run status` and `run
+                // list-paused` print, that `gate_ask` shows the person, and that a decision
+                // is resolved against. `scheduled_runs.graph` is the operator's own
+                // submitted input and is read by `claim_due` alone — `ScheduledRun`, the
+                // shape both observe commands return, carries no graph.
+                //
+                // So leaving them alone made the SAME string scrubbed in `prompt` (which
+                // quotes them, via `gate_ask`) and plaintext in `menu` and in the pause
+                // reason built from it, on one drive. That is the exact defect class s2 and
+                // s3 each shipped and each had to fix, and review measured it here.
+                //
+                // The reflex answer would have been to leave it: a menu is not display
+                // text, it is the VOCABULARY every later decision is resolved against
+                // (`find(|o| o.name == decision.option)`), so scrubbing it changes what an
+                // operator must type. That is exactly why it is redacted HERE, at the one
+                // append, rather than at each reader: the published copy is the only copy
+                // anybody can see — `torii run gate decide` recites it and refuses anything
+                // else — so redacting it keeps ONE vocabulary, matching the question, and
+                // resolution keeps matching journal against journal.
+                //
+                // What it must not do is make two options indistinguishable.
+                // `check_menu_option_names` already rejects a duplicate name at
+                // `validate_dag` time ("`--option x` would be ambiguous"), but redaction
+                // runs long afterwards and can RE-CREATE the duplicate: two different
+                // credential-shaped names both collapse to `[REDACTED]`, `find` takes the
+                // first, and an operator picking the only name they were offered gets
+                // whichever `stops` happened to come first — a decision inverted silently,
+                // which is precisely what §5.3 journals the menu to prevent. So the gate
+                // refuses, on the authored-bytes cap's reasoning: this is author-controlled
+                // config, a loud failure is actionable by the person who wrote it, and both
+                // alternatives are worse (keeping the plaintext re-opens the leak;
+                // inventing disambiguating suffixes offers a human an option their config
+                // does not contain).
+                //
+                // It cannot move to `validate_dag`, where the duplicate rule lives: that
+                // function is pure over the graph and has no `Redactor`. The redactor is an
+                // executor injection (`with_redactor`, default none), so the same graph is
+                // legal under one executor and not another — a redactor-dependent rule in a
+                // pure graph validator would be a lie about the graph. The check runs
+                // unconditionally rather than only when a redactor is wired, which costs
+                // nothing and also catches a duplicate that reached the executor without
+                // passing `validate_dag` at all.
+                //
+                // BEFORE the append, so a menu nobody could answer unambiguously leaves no
+                // durable row behind — the same ordering the authored-bytes cap uses.
+                let published = self.redact_menu(menu);
+                if let Some(name) = collided_option_name(&published) {
+                    return self
+                        .fail_loop_gate(run, node_id, ambiguous_menu_message(node_id, &name))
+                        .await;
+                }
+                self.append(
+                    run,
+                    JournalEvent::LoopGateAwaited {
+                        node: node_id.clone(),
+                        deadline: fresh,
+                        prompt,
+                        menu: published.clone(),
+                    },
+                )
+                .await?;
+
+                // Then pause, WITHOUT reading a decision first — unlike `run_human_gate`,
+                // which falls through so an early `GateDecided` is honoured in the same
+                // execution. The race it resolves cannot arise here: a loop gate's path is
+                // SYNTHESIZED per iteration and does not exist until that iteration has
+                // run, and `torii run gate decide` refuses a node with no journaled menu,
+                // so nothing an operator can do produces a decision before the ask. A
+                // hand-written journal still can, and it costs exactly one extra wake —
+                // the ask is durable, and the very next drive honours the decision against
+                // it. Pausing is also the behaviour AC3 states: the gate asks, and the run
+                // pauses.
+                //
+                // On the PUBLISHED menu, not the graph's: the reason recites the options,
+                // and an operator must be offered the same names on this drive as on every
+                // later one.
+                self.pause_gate(run, node_id, &published, fresh).await
+            }
+
+            // Already asking by the SHARED map's reckoning — but did THIS kind begin
+            // asking here?
+            //
+            // `Fold::deadlines` is written by all FOUR waiting kinds while only
+            // `LoopGateAwaited` writes `Fold::loop_gate_asks`, so this arm is reachable the
+            // same way its three siblings' are: some OTHER kind's awaited record sits at
+            // this id. Its siblings get there by an edit to a live run's graph; a gate path
+            // is SYNTHESIZED, so its vector is a different one.
+            //
+            // **A journal `torii` did not write**, which is a first-class case for a
+            // durable log an embedder may append to directly. It is now the ONLY vector
+            // this arm has, and the two sentences that used to stand here were wrong about
+            // the others.
+            //
+            // The vector this arm shipped for was an authored `__gate__` SEGMENT inside
+            // the gated `Loop`'s own `Subgraph` body: `drive_nested` namespaces that body
+            // under `"{loop}/{i}"`, so an inner node named `__gate__` lands at exactly this
+            // path, and s1's `/` ban — which reserves the SEPARATOR — never saw it.
+            // `validate_dag` block 1c now rejects the bare segment at every depth it
+            // recurses into, so that door is shut before anything is journaled
+            // (`an_authored_gate_id_in_a_loop_body_is_refused_before_the_run_starts`).
+            //
+            // The claim that `plan::feasible` already reserved the segment "so a planner
+            // cannot emit it" was FALSE when it was written: that walk saw
+            // `plan.graph.nodes` alone and did not recurse, and `feasible` measured
+            // `Ok(())` on `Loop { body: Subgraph([__gate__]), gate: Human }`. It recurses
+            // now, and `feasible` runs `validate_dag` in any case, so a planner really is
+            // covered — by two rules that had to be added, not by one that was there.
+            //
+            // An earlier version also described the authored case as a `/`-containing id
+            // reaching the executor because "`Executor::start` takes the graph as an
+            // unvalidated caller parameter". Both halves are false: `start_inner` and
+            // `run_inner` each call `graph.validate_dag()?` before anything is journaled,
+            // and validation recurses into `Subgraph`, `Loop` and `Branch` bodies — so no
+            // caller, embedder included, gets an unvalidated graph past the front door.
+            //
+            // **An occupant that COMPLETED rather than waited** does not arrive here at
+            // all — it writes nothing into the shared `deadlines` map, so the arm above
+            // sees `NotYetAsking`. Its guard is there; see the comment at the top of that
+            // arm for the mid-run gate-KIND edit that reaches it.
+            //
+            // What is NOT a vector, though an earlier version of this comment claimed it:
+            // a `Loop` whose gate was `Agent` over a human-backed role. That role never
+            // reaches `run_human_agent` at all — `drive_agent`'s `!top_level` arm refuses
+            // it before the seam, journaling a `NodeFailed` at the gate path rather than an
+            // `AgentAwaited` — and design §5.4 keeps that refusal deliberately unchanged.
+            //
+            // **Loud, and never a fallback to the graph's `menu`.** Validating a decision
+            // against a menu no human was ever shown is precisely the non-durable menu
+            // §5.3 rejects, and it would do it silently. Journaling a fresh
+            // `LoopGateAwaited` on top of the other kind's record is the other candidate
+            // and is worse: `deadlines` folds first-wins, so the question would be
+            // published against a deadline some other kind chose, and the run would carry
+            // two contradictory durable claims about what it is waiting for.
+            Ok(WaitState::Waiting(deadline)) => {
+                let Some(published) = fold.loop_gate_menu_for(node_id) else {
+                    return self
+                        .fail_loop_gate(run, node_id, missing_menu_message(node_id))
+                        .await;
+                };
+
+                // No decision yet ⇒ re-pause on the deadline this gate RECORDED (never
+                // `now + timeout`; see `pause_awaiting`). The menu offered is the
+                // PUBLISHED one, so what an operator is invited to pick from is what their
+                // answer will be validated against.
+                let Some(decision) = fold.loop_gate_decision_for(node_id) else {
+                    return self.pause_gate(run, node_id, published, deadline).await;
+                };
+
+                // Resolve the decision against the JOURNALED menu. An option matching
+                // NOTHING in it fails loudly: the gate neither continues nor stops, because
+                // defaulting either way would be a decision no human made — to stop, or to
+                // spend more. `torii run gate decide` refuses such a name at its own
+                // boundary (reciting the menu), so this arm is reachable only from a
+                // journal `torii` did not write, which is exactly why it must fail rather
+                // than guess.
+                let Some(chosen) = published.iter().find(|o| o.name == decision.option) else {
+                    return self
+                        .fail_loop_gate(
+                            run,
+                            node_id,
+                            unmatched_option_message(node_id, &decision.option, published),
+                        )
+                        .await;
+                };
+                let stop = chosen.stops;
+
+                // SETTLE, durably, BEFORE `run_loop` spends anything on the strength of
+                // this answer. From here on the gate replays through step 1 and its
+                // recorded deadline — long since passed, by the time a multi-iteration loop
+                // is done — has no further say. Resolved first and settled second so a
+                // decision naming an option nobody was offered leaves no settlement behind:
+                // that failure is terminal through step 0 either way, and a settlement row
+                // for a decision that was never honoured would be a durable lie.
+                //
+                // The RUN OUTCOME cannot see that ordering — step 0 fences the node whether
+                // the row was written or not — so it is asserted directly on the journal, in
+                // `a_decision_naming_an_unknown_option_fails_the_loop_gate`. Review found
+                // the swap green across the whole crate before that assertion existed.
+                self.append(
+                    run,
+                    JournalEvent::LoopGateSettled {
+                        node: node_id.clone(),
+                        option: decision.option.clone(),
+                    },
+                )
+                .await?;
+
+                // The pure part, recomputed from the journaled option NAME rather than
+                // carried in the fold — which is what makes a resume reach the identical
+                // decision at zero cost.
+                Ok(LoopGateStep::Decided { stop })
+            }
+        }
+    }
+
+    /// Resolve an option name against the menu this gate PUBLISHED, for the replay path.
+    ///
+    /// The step-1 counterpart of the live resolution inside
+    /// [`Executor::run_human_loop_gate`]'s `Waiting` arm, and it must reach the same three
+    /// answers for the same three states — hence the shared message builders rather than a
+    /// second pair of near-identical strings. What it deliberately does NOT re-read is
+    /// `Fold::loop_gate_decision_for`: `LoopGateDecided` folds LAST-wins so an operator can
+    /// correct a decision *before the run resumes*, and a settlement is exactly the line
+    /// after which "before" has passed — the loop has already spent an iteration on the
+    /// strength of the answer, so a later correction must not move where it converged.
+    ///
+    /// **That is a TEST, not only this paragraph**, and it was not until the whole-slice
+    /// review: inserting the re-read here left all 394 orchestrator lib tests green,
+    /// `mod human_loop_gate` included, because every s4 journal in the suite held exactly
+    /// one decision and both readings agreed. It reddens
+    /// `a_correction_appended_after_the_settlement_cannot_move_a_converged_loop` (a
+    /// converged loop un-converging under a late `LoopGateDecided`) and
+    /// `a_correction_to_an_earlier_gate_cannot_converge_a_loop_already_past_it` (the same
+    /// rule in flight, discarding an iteration already paid for). The FOLD's half of the
+    /// same fence — `LoopGateSettled` is first-wins, so a late settlement cannot do what a
+    /// late decision cannot — is pinned by the first of those two as well.
+    ///
+    /// Both failures here are reachable only from a journal the executor did not write (a
+    /// settlement with no ask, or with an option absent from the ask's menu), which is why
+    /// they must fail rather than guess — the same argument the live arm makes.
+    async fn decide_from_published_menu(
+        &self,
+        run: RunId,
+        node_id: &NodeId,
+        option: &str,
+        fold: &Fold,
+    ) -> Result<LoopGateStep, OrchestratorError> {
+        let Some(published) = fold.loop_gate_menu_for(node_id) else {
+            return self
+                .fail_loop_gate(run, node_id, missing_menu_message(node_id))
+                .await;
+        };
+        let Some(chosen) = published.iter().find(|o| o.name == option) else {
+            return self
+                .fail_loop_gate(
+                    run,
+                    node_id,
+                    unmatched_option_message(node_id, option, published),
+                )
+                .await;
+        };
+        Ok(LoopGateStep::Decided { stop: chosen.stops })
+    }
+
+    /// The durable pause both of this gate's waiting arms end on, so the reason string has
+    /// ONE definition — an operator reading `torii run status` on the drive that asked and
+    /// on a drive that re-paused must not see two different sentences about the same wait.
+    ///
+    /// `menu` is the PUBLISHED menu on every drive — the copy the asking arm scrubbed and
+    /// journaled, read back out of the fold on every later one. Listing it here is what
+    /// lets an operator answer from `run status` alone, and it is the same courtesy
+    /// `run_human_gate`'s pause reason extends. (It was the GRAPH's copy on the first ask
+    /// until review found that the same option name was scrubbed in `prompt` and plaintext
+    /// here; the asking arm now hands over the redacted copy, which also keeps the two
+    /// drives' sentences identical rather than merely similar.)
+    ///
+    /// **The reason is then run through the redactor, as the write chokepoint** — the same
+    /// argument [`Executor::fail_loop_gate`] makes for the messages it journals, and made
+    /// at the write rather than per arm for the same reason: s2 shipped a per-arm scrub
+    /// that missed an arm.
+    ///
+    /// Its value here is entirely FORWARD-LOOKING, and saying otherwise would overstate it.
+    /// Today it scrubs nothing the caller has not already scrubbed: the menu arrives
+    /// redacted from the asking arm, and the only other interpolation is the NODE ID, which
+    /// this cannot meaningfully protect — a node id is a structural key, plaintext in
+    /// `NodeStarted`, `EffectRecorded` and `LoopGateAwaited.node` in the same journal, so a
+    /// credential in one leaks whatever this line does. What it buys is that a future arm
+    /// which interpolates something new — or an edit that hands this function the GRAPH's
+    /// menu again, which is what review caught — cannot re-open the leak from here.
+    ///
+    /// One difference from [`Executor::redact_menu`] worth knowing: that pass sees each
+    /// name alone, this one sees them JOINED by ` | `, so a pattern spanning the separator
+    /// would scrub more here than there. Strictly more, never less — and the `menu` field
+    /// is the one that must not drift, since it is the vocabulary a decision is resolved
+    /// against, while this string is read by people only.
+    ///
+    /// This is an asymmetry with the other three waiting kinds, stated plainly rather than
+    /// papered over: `run_await_signal`, `run_human_gate` and `run_human_agent` call
+    /// `pause_awaiting` directly with an unredacted reason. Widening the scrub to all four
+    /// is a change to three shipped slices' behaviour and is not this one's to make; s4's
+    /// site is the one that interpolates a whole author-authored MENU, which is what forced
+    /// the question here first.
+    async fn pause_gate(
+        &self,
+        run: RunId,
+        node_id: &NodeId,
+        menu: &[LoopGateOption],
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<LoopGateStep, OrchestratorError> {
+        let reason = self.redact_text(format!(
+            "loop_gate: waiting for a decision on node {} ({}){}",
+            node_id.0,
+            menu_names(menu, " | "),
+            deadline
+                .map(|d| format!(" (deadline {d})"))
+                .unwrap_or_default()
+        ));
+        // `pause_awaiting` journals the `RunPaused` and echoes the reason into a
+        // `NodeExec::Paused` this kind has no use for; the SAME string is returned as the
+        // step, so the two cannot disagree.
+        self.pause_awaiting(run, reason.clone(), deadline).await?;
+        Ok(LoopGateStep::Paused(reason))
+    }
+
+    /// Scrub a loop gate's menu into the copy that becomes durable.
+    ///
+    /// Only the NAMES: `stops` is a `bool` and carries nothing to leak, and it is also the
+    /// half a redaction must never touch — it is what the loop's convergence is decided
+    /// from, and the human is shown it in the question (`gate_ask` annotates each option
+    /// with what picking it does). So the scrubbed menu says the same thing about the LOOP
+    /// as the authored one and differs only in what an operator types.
+    ///
+    /// Through [`Executor::redact_text`], the same wrapper `fail_loop_gate` uses, so the
+    /// option name reaching the journal is byte-identical to the one `gate_ask` put in the
+    /// already-redacted question. Two passes over the same string with the same pure
+    /// redactor, not two different scrubs — which is what keeps the `menu` field and the
+    /// `prompt` field one vocabulary.
+    fn redact_menu(&self, menu: &[LoopGateOption]) -> Vec<LoopGateOption> {
+        menu.iter()
+            .map(|o| LoopGateOption {
+                name: self.redact_text(o.name.clone()),
+                stops: o.stops,
+            })
+            .collect()
+    }
+
+    /// Journal a `NodeFailed` for a loop gate and return the step that reports it. Every
+    /// failure path in [`Executor::run_human_loop_gate`] routes through here EXCEPT step 0,
+    /// which writes nothing by design — so the journaled message and the returned one
+    /// cannot drift, and every one of them is redacted at this single chokepoint.
+    ///
+    /// **It returns the whole [`LoopGateStep`], not just the message**, where
+    /// [`Executor::fail_human_agent`] returns a [`NodeExec`]. What that buys is that every
+    /// arm's "I failed" and the row recording it are produced by ONE expression: a helper
+    /// returning a bare `String` leaves each call site free to append here and then build
+    /// some other step. It also makes `fail_human_agent`'s "`output: None` on every one of
+    /// them" property STRUCTURAL rather than merely upheld: [`LoopGateStep::Failed`] has no
+    /// output field at all, so an expired or unmatched gate cannot produce a defaulted
+    /// result by mistake.
+    ///
+    /// An earlier version of this paragraph justified the return type by a
+    /// `newly_journaled: true` flag it made "unforgeable". There is no such field —
+    /// `Failed(String)`, and the variant's own doc explains that the flag was the FIRST
+    /// shipped shape and was removed because it was a second claim about the journal that
+    /// disagreed with the first. The guard it was reaching for lives on
+    /// [`Executor::fail_loop`]'s append, where reading the fold makes it self-healing.
+    ///
+    /// **What the redaction protects, precisely:** these arms interpolate a NODE ID (the
+    /// author's loop id plus the reserved suffix), an OPTION NAME (arbitrary by
+    /// definition on the unmatched path — it matched nothing in the menu), the MENU's
+    /// names (author free text), a byte count, a deadline, and `human_question_for`'s
+    /// error text (which names the agent). The option name is the live surface and it is
+    /// the exact leak s2 shipped when each arm scrubbed for itself: an undeclared option
+    /// reached the journal in plaintext, and because `fold.failed` is read back by
+    /// `gate_precheck`, it was re-emitted on every later drive. Scrubbing once, where the
+    /// journal write happens, is what makes a future arm safe by construction.
+    ///
+    /// **Guarded by `a_credential_in_a_loop_gate_failure_message_never_reaches_the_journal`,
+    /// and it was not until the whole-slice review.** Deleting the `redact_text` line below
+    /// left all 394 orchestrator lib tests green, while the identical deletion in the s3
+    /// twin `fail_human_agent` reddens
+    /// `human_agent::a_failure_message_is_redacted_before_it_reaches_the_journal`.
+    /// `a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly` cannot serve
+    /// as the guard: `ambiguous_menu_message` interpolates the ALREADY-redacted placeholder,
+    /// so it passes with the scrub gone. The guard uses the unmatched-option arm instead,
+    /// whose message quotes the operator's own `--option` verbatim.
+    async fn fail_loop_gate(
+        &self,
+        run: RunId,
+        node_id: &NodeId,
+        message: String,
+    ) -> Result<LoopGateStep, OrchestratorError> {
+        let message = self.redact_text(message);
+        self.append(
+            run,
+            JournalEvent::NodeFailed {
+                node: node_id.clone(),
+                error: message.clone(),
+            },
+        )
+        .await?;
+        Ok(LoopGateStep::Failed(message))
+    }
+
     /// Journal a `NodeFailed` and return it. Every failure path routes through here — the
     /// four in `run_human_agent` above AND `drive_agent`'s non-top-level refusal, which
     /// review found appending its own `NodeFailed` inline and bypassing this — so the
@@ -545,6 +1504,171 @@ impl Executor {
             output: None,
         })
     }
+}
+
+/// The `## Task` half of a loop gate's question: a short statement of what is being
+/// decided, synthesized from the menu.
+///
+/// A free `fn` so it is pure and unit-testable without an executor, and so the ask has ONE
+/// definition rather than being inlined at the append site.
+///
+/// **Why a synthesized ask rather than the iteration output, and rather than a bare
+/// constant.** The seam's `input` becomes `## Task` and is charged to the LOUD
+/// `MAX_HUMAN_TEXT_BYTES` cap, so whatever goes there must be author-scale — the iteration
+/// output is not (design §6). Deriving it from the menu keeps everything charged to that
+/// cap author-controlled at config time, which is the whole principle behind which half
+/// fails loudly: menu names are author free text, and their being over 4 KiB really is a
+/// config error the author can act on. And it makes the journaled `LoopGateAwaited.prompt`
+/// SELF-CONTAINED — `torii run list-paused` renders the `menu` field beside it, but the
+/// durable question should still say what is being decided, the same reason s3 added
+/// `## Task` at all (§5.4: never show the human LESS than the model would have had).
+///
+/// Each option is annotated with what picking it does to the LOOP. `stops` is the only
+/// thing a `LoopGateOption` carries beyond its name, and a menu of bare names would make a
+/// person guess which of `revise`/`ship` ends the run — a guess the type exists to remove.
+/// That annotation is pinned by `gate_ask_says_which_option_ends_the_loop`, on the EXACT
+/// rendered string: until the whole-slice review it was pinned by nothing in either lib
+/// crate — swapping the two arms left 394 orchestrator and 259 torii tests green, because
+/// the executor tests assert only that both NAMES appear and the one real assertion lived
+/// in a `DATABASE_URL`-gated e2e that returns early when the variable is unset.
+///
+/// **One consequence, accepted deliberately:** the seam evaluates every skill's and tool's
+/// `activation.is_active` against this same string, so a gate role's `OnKeywords` skills
+/// match on the menu text rather than on the iteration output. That is a live limitation,
+/// not an oversight — the seam has ONE `input` serving both `## Task` and the activation
+/// query, and splitting it in two is a change to s3's path as well. `Always` skills (the
+/// default, and what a gate role wants) are unaffected.
+fn gate_ask(menu: &[LoopGateOption]) -> String {
+    let options = menu
+        .iter()
+        .map(|o| {
+            format!(
+                "`{}` ({})",
+                o.name,
+                if o.stops {
+                    "stop the loop"
+                } else {
+                    "run another iteration"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Review the iteration output above and choose one: {options}.")
+}
+
+/// A loop-gate menu's option names, for a human to read. `sep` differs by site — a failure
+/// lists them as prose (`revise, ship`), a pause offers them as choices (`revise | ship`).
+///
+/// The exact counterpart of `gate.rs`'s `names`, kept separate because the two menus are
+/// different types carrying different vocabularies: a [`LoopGateOption`] says `stops` (the
+/// continue/stop axis) where a `GateOption` says `outcome` (`{Complete, Fail}`). Making one
+/// function generic over both would invite the very confusion `graph.rs`'s warning — that
+/// the HITL and loop-stop senses of "gate" are unrelated — exists to prevent.
+fn menu_names(menu: &[LoopGateOption], sep: &str) -> String {
+    menu.iter()
+        .map(|o| o.name.as_str())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// The kind-swap refusal: this node recorded a wait but published no MENU.
+///
+/// A free `fn` because TWO arms reach this state — the live `Waiting` arm and the settled
+/// replay in [`Executor::decide_from_published_menu`] — and an operator who sees it on one
+/// drive and then again on the next must read the same sentence. The failure is durable and
+/// re-emitted by `gate_precheck` on every later drive, so a near-copy would look like a
+/// second, different problem.
+///
+/// It deliberately does not recite the GRAPH's menu, which is the fallback this refusal
+/// exists to reject: naming options nobody was shown would suggest they are answerable.
+fn missing_menu_message(node_id: &NodeId) -> String {
+    format!(
+        "loop_gate: node {} recorded that it began waiting but published no menu, so there \
+         is nothing a decision could be validated against. A waiting node's kind cannot be \
+         changed mid-run; fail the run and start a new one.",
+        node_id.0
+    )
+}
+
+/// The other kind-swap refusal: the reserved gate path is already occupied by a node that
+/// STARTED or COMPLETED there.
+///
+/// Its sibling [`missing_menu_message`] covers an occupant that recorded a WAIT (the
+/// shared `Fold::deadlines` map makes that one visible to `wait_or_expire_by_id`); this
+/// one covers an occupant that simply ran, which writes nothing that map can see. The two
+/// are separate messages because the remedies differ: a waiting occupant means a kind swap
+/// on a live wait, while a completed one means the gate's own path was consumed by
+/// something else — most plausibly a `GateSpec::Agent`→`GateSpec::Human` edit between
+/// drives, which no validator can refuse because both graphs are legal.
+///
+/// It does not recite the menu, for [`missing_menu_message`]'s reason: nothing here is
+/// answerable, and naming options would suggest otherwise.
+fn occupied_path_message(node_id: &NodeId) -> String {
+    format!(
+        "loop_gate: node {} already has a completed node's record at its reserved gate \
+         path, so a question published here would be folded as already answered and no \
+         operator surface could show it. The usual cause is a gate whose kind was changed \
+         mid-run (a `GateSpec::Agent` drives a real agent at this same path); a gate's \
+         kind cannot be changed mid-run — fail the run and start a new one.",
+        node_id.0
+    )
+}
+
+/// The first option name that appears twice in a menu, if any.
+///
+/// Run over the REDACTED menu at the one append site, where it catches the duplicate that
+/// `check_menu_option_names` structurally cannot: two distinct credential-shaped names
+/// that collapse to the same placeholder. `validate_dag`'s copy of this rule runs on the
+/// authored graph, before any redactor exists — see the append site for why the rule
+/// cannot move there.
+///
+/// It returns the NAME rather than a `bool` so the failure can say which one, and the name
+/// it returns is post-redaction by construction: the collision is only observable in the
+/// scrubbed vocabulary, and the plaintext must not be recited back in any case.
+fn collided_option_name(menu: &[LoopGateOption]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    menu.iter()
+        .find(|o| !seen.insert(o.name.as_str()))
+        .map(|o| o.name.clone())
+}
+
+/// The refusal for a menu that cannot be offered unambiguously.
+///
+/// It quotes the COLLIDED name — which is the placeholder, not the config — and says what
+/// to do about it, because the operator reading this cannot see the authored names from
+/// here and the message must not show them. `fail_loop_gate` redacts everything it
+/// journals, so a future edit that interpolated the authored names would be scrubbed
+/// anyway; not interpolating them is the first line, not the only one.
+fn ambiguous_menu_message(node_id: &NodeId, name: &str) -> String {
+    format!(
+        "loop_gate: node {}'s menu offers the option name {name:?} more than once, so a \
+         decision naming it could not be resolved to one option — it would silently take \
+         whichever came first, and the two may disagree about whether the loop stops. The \
+         usual cause is two option names of credential SHAPE scrubbing to the same \
+         placeholder; rename them to something that is not credential-shaped.",
+        node_id.0
+    )
+}
+
+/// The other refusal both resolution sites share: a decision naming an option that is not
+/// in the menu the human was actually shown.
+///
+/// `published` — never the graph's copy. The names recited back are the ones an operator
+/// could legitimately have picked, which is the whole point of reciting them.
+fn unmatched_option_message(
+    node_id: &NodeId,
+    option: &str,
+    published: &[LoopGateOption],
+) -> String {
+    format!(
+        "loop_gate: node {} was decided with option {option:?}, which is not in the menu it \
+         published ({}). The decision is durable but cannot be honoured: the gate neither \
+         continues nor stops, because defaulting either way would be a decision no human \
+         made.",
+        node_id.0,
+        menu_names(published, ", ")
+    )
 }
 
 #[cfg(test)]
@@ -738,6 +1862,46 @@ mod tests {
              redactor's whole-match never fired and key material reached the durable \
              `AgentAwaited.prompt`: {}",
             &out[..out.len().min(400)]
+        );
+    }
+
+    /// **The sentence that tells a person which option ENDS the run.** SP-6 s4 whole-slice
+    /// review, Minor.
+    ///
+    /// [`gate_ask`]'s per-option annotation had no unit or executor test. Swapping the two
+    /// arms — so `stops: true` renders "run another iteration" and `stops: false` renders
+    /// "stop the loop" — left all 394 orchestrator lib tests and all 259 torii lib tests
+    /// green. The only assertion in the repo was in `torii/tests/e2e_pg.rs`, which returns
+    /// early printing SKIP whenever `DATABASE_URL` is unset, so the house workflow
+    /// `cargo test --workspace` was green over the inversion on any DB-free box.
+    ///
+    /// The annotation is the whole justification for `LoopGateOption.stops` existing on the
+    /// human-facing side: a menu of bare names "would make a person guess which of
+    /// `revise`/`ship` ends the run". Inverted, every operator is told the opposite of what
+    /// their pick does, in a slice whose only purpose is that a person decides. The lib
+    /// tests that touch the prompt assert only that both names appear, which holds either
+    /// way.
+    ///
+    /// Asserted as the EXACT string, not by `contains`: `gate_ask` is pure, its output is
+    /// durable in `LoopGateAwaited.prompt`, and the annotation is the part a `contains`
+    /// check on the names cannot see. `gate_ask`'s own doc advertises it as "pure and
+    /// unit-testable without an executor"; this is that claim cashed in.
+    #[test]
+    fn gate_ask_says_which_option_ends_the_loop() {
+        let menu = vec![
+            LoopGateOption {
+                name: "revise".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "ship".into(),
+                stops: true,
+            },
+        ];
+        assert_eq!(
+            gate_ask(&menu),
+            "Review the iteration output above and choose one: `revise` (run another \
+             iteration), `ship` (stop the loop).",
         );
     }
 

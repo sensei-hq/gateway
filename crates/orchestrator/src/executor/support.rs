@@ -13,7 +13,7 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{AgentAnswer, Fold, GateDecision};
+use super::{AgentAnswer, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -114,6 +114,24 @@ pub(crate) fn fold_journal(
             // the one the run actually stopped on.
             JournalEvent::NodeFailed { node, error } => {
                 fold.failed.entry(node.clone()).or_insert(error.clone());
+                // SP-6 s4 review: the SET beside the first-wins verdict. `failed` answers
+                // "what did this run stop on"; this answers "is this exact row already
+                // written", which is the only question an idempotent append may ask. See
+                // `Fold::failure_messages`.
+                fold.failure_messages
+                    .entry(node.clone())
+                    .or_default()
+                    .insert(error.clone());
+            }
+            // The cascade-skip record, folded so `cascade_skip_from` appends each node's
+            // `NodeSkipped` at most once ACROSS drives. It was a `_` catch-all until the
+            // SP-6 s4 review measured a terminally-failed-but-still-resumable run growing
+            // by one row per hard dependent per wake — the same bounded-growth class as
+            // the `NodeFailed` arm above, one edge further out. Read only by that guard;
+            // it does not make a node terminal (`ready_nodes` works off the per-drive
+            // `DriveState`, which is rebuilt from the graph every time).
+            JournalEvent::NodeSkipped { node } => {
+                fold.skipped.insert(node.clone());
             }
             // The intent phase of a two-phase Mutation (§7.3). An effect id in
             // `intents` with no matching `EffectRecorded` is in-doubt on resume.
@@ -259,11 +277,28 @@ pub(crate) fn fold_journal(
             // The deadline goes into the SHARED map because `wait_or_expire` reads
             // `deadline_for` and knows nothing about which kind recorded it. That makes
             // this the THIRD writer of `Fold::deadlines` (after `SignalAwaited` and
-            // `GateAwaited`); when a fourth is added, update the writer lists on
-            // `Fold::deadlines` and `Fold::deadline_for`, and give it a kind-specific
-            // record of its own plus the missing-ask arm that reads it — the three that
-            // exist (`run_await_signal`, `run_human_gate`, `run_human_agent`) all reason
-            // from an explicit enumeration of these writers.
+            // `GateAwaited`; SP-6 s4's `LoopGateAwaited`, two arms below, is the FOURTH).
+            // When a FIFTH is added, update the writer lists on `Fold::deadlines` and
+            // `Fold::deadline_for`, and give it a kind-specific record of its own plus
+            // the missing-ask arm that reads it — every reader of this map reasons from
+            // an explicit enumeration of these writers: `run_await_signal`,
+            // `run_human_gate`, `run_human_agent`, and s4's `run_human_loop_gate`.
+            //
+            // And the enumeration is restated OUTSIDE those arms, not only in them: FOUR
+            // `..._fails_loudly` kind-swap tests in `tests.rs`, one per kind, spell out the
+            // writer list in their rustdoc to explain why their arm is reachable at all;
+            // `human.rs`'s module header counts the kinds; and `durable-journal.md` states
+            // it for the feature docs. (There were only three of those tests until the s4
+            // review added `a_loop_gate_that_recorded_a_wait_without_a_menu_fails_loudly` —
+            // s3 shipped ITS copy missing and review found it, then s4 shipped the same
+            // way, so this sentence overstated what the suite held for two slices running.)
+            //
+            // s4's Task 4 updated the three arms and left every one of those sites saying
+            // THREE; its whole-slice review caught that, and the Tasks 6+7 review then
+            // found four more that had only become stale once the fourth EXECUTING kind
+            // landed. So the instruction is
+            // `rg -in 'all (THREE|FOUR|FIVE)|(three|four|five) waiting kinds' crates docs`
+            // and fix the WHOLE set — updating only the arms is how this went stale.
             //
             // `deadline` is folded THROUGH, `None` included — never `if
             // deadline.is_some()`. The key alone answers "has this node begun asking?",
@@ -289,6 +324,62 @@ pub(crate) fn fold_journal(
                         actor: actor.clone(),
                     },
                 );
+            }
+            // SP-6 s4: the ask. EXPLICIT, never folded by a catch-all.
+            //
+            // FIRST wins for the deadline, the prompt AND the menu (`entry().or_insert`).
+            // This is the FOURTH writer of the SHARED `Fold::deadlines` map, after
+            // `SignalAwaited`, `GateAwaited` and `AgentAwaited` — the writer lists on
+            // `Fold::deadlines` and `Fold::deadline_for` name it, and the arm that reads
+            // its kind-specific record is `run_human_loop_gate`'s missing-MENU arm (this
+            // kind's version of the missing-ask guard: it reads `Fold::loop_gate_menu_for`,
+            // which answers "did the LOOP GATE kind begin here?" and hands back the menu
+            // the decision must be validated against in the same call).
+            //
+            // `deadline` is folded THROUGH, `None` included. A role with
+            // `backed_by: human { timeout: None }` gating a loop is a real configuration,
+            // and dropping the `None` would make it re-journal `LoopGateAwaited` on every
+            // drive — the bug s1 shipped on the `SignalAwaited` arm.
+            JournalEvent::LoopGateAwaited {
+                node,
+                deadline,
+                prompt,
+                menu,
+            } => {
+                fold.deadlines.entry(node.clone()).or_insert(*deadline);
+                fold.loop_gate_asks
+                    .entry(node.clone())
+                    .or_insert(LoopGateAsk {
+                        prompt: prompt.clone(),
+                        menu: menu.clone(),
+                    });
+            }
+            // SP-6 s4: the decision. LAST wins (`insert` overwrites).
+            JournalEvent::LoopGateDecided {
+                node,
+                option,
+                actor,
+            } => {
+                fold.loop_gate_decisions.insert(
+                    node.clone(),
+                    LoopGateDecision {
+                        option: option.clone(),
+                        actor: actor.clone(),
+                    },
+                );
+            }
+            // SP-6 s4: the drive that HONOURED a decision, recorded so no later drive
+            // re-derives that gate against a clock which has since passed its deadline.
+            // FIRST wins — the executor writes at most one, so a second can only come from
+            // a journal it did not write, and the first is the one that happened.
+            //
+            // This is the arm that makes `LoopGateDecided`'s LAST-wins rule bounded rather
+            // than unbounded: a correction wins right up to the drive that acts on the
+            // answer, and not after it.
+            JournalEvent::LoopGateSettled { node, option } => {
+                fold.loop_gate_settlements
+                    .entry(node.clone())
+                    .or_insert_with(|| option.clone());
             }
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
@@ -1103,6 +1194,240 @@ mod tests {
             fold.prompt_for(&NodeId("review".into())),
             Some("Ship it?"),
             "the question is durable even when the SLA is not"
+        );
+    }
+
+    fn lopt(name: &str, stops: bool) -> orchestrator_core::LoopGateOption {
+        orchestrator_core::LoopGateOption {
+            name: name.to_string(),
+            stops,
+        }
+    }
+
+    /// The DEADLINE, the prompt and the menu are FIRST-wins: a second ask must not
+    /// retroactively change what a human's answer meant, nor when it is due. The decision
+    /// is LAST-wins: an operator may correct it before resume.
+    ///
+    /// The s4 twin of `gate_decisions_are_last_wins_and_the_menu_is_first_wins` (s2) and
+    /// `agent_answers_are_last_wins_and_the_prompt_is_first_wins` (s3), and it asserts the
+    /// same three things they do for the same reasons — including the deadline, which the
+    /// first version of this test dropped. `Fold::deadlines` is SHARED, `wait_or_expire`
+    /// reads it without knowing which kind wrote it, and a LAST-wins deadline is the
+    /// never-expires bug: a run force-woken every ten minutes under a one-hour SLA
+    /// re-arms its deadline on every drive and never fires it.
+    #[test]
+    fn the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision() {
+        let node = NodeId("lp/0/__gate__".into());
+        let events = vec![
+            (
+                1,
+                JournalEvent::LoopGateAwaited {
+                    node: node.clone(),
+                    deadline: Some(at(1_000)),
+                    prompt: "first question".into(),
+                    menu: vec![lopt("done", true), lopt("again", false)],
+                },
+            ),
+            (
+                2,
+                JournalEvent::LoopGateAwaited {
+                    node: node.clone(),
+                    deadline: Some(at(9_999)),
+                    prompt: "second question".into(),
+                    menu: vec![lopt("done", false)],
+                },
+            ),
+            (
+                3,
+                JournalEvent::LoopGateDecided {
+                    node: node.clone(),
+                    option: "again".into(),
+                    actor: "a".into(),
+                },
+            ),
+            (
+                4,
+                JournalEvent::LoopGateDecided {
+                    node: node.clone(),
+                    option: "done".into(),
+                    actor: "b".into(),
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&events);
+
+        assert_eq!(
+            fold.deadline_for(&node),
+            Some(Some(at(1_000))),
+            "FIRST ask wins — a later one must not push the deadline forward; \
+             overwriting it IS the never-expires bug"
+        );
+
+        let menu = fold.loop_gate_menu_for(&node).expect("menu folded");
+        assert_eq!(
+            menu.len(),
+            2,
+            "FIRST menu wins — the human was shown THIS menu, not the later one-option ask"
+        );
+        assert_eq!(
+            menu[0].name, "done",
+            "the option NAME survives the fold, in order: it is the side of the match \
+             Task 6 checks a decision against"
+        );
+        assert!(
+            menu[0].stops,
+            "FIRST menu wins: the second ask must not flip `stops`"
+        );
+        assert_eq!(
+            menu[1].name, "again",
+            "the whole menu is folded, not just its head"
+        );
+        // `stops` is as much a part of the offer as the name — s2's twin makes the same
+        // point about `GateOutcome`. A menu whose options all read the same way would make
+        // every "keep going" answer converge the loop, or every "we're done" answer spin it.
+        assert!(!menu[1].stops, "per-option `stops`, not a single flag");
+
+        assert_eq!(
+            fold.loop_gate_prompt_for(&node).expect("prompt folded"),
+            "first question",
+            "FIRST prompt wins"
+        );
+        let decision = fold.loop_gate_decision_for(&node).expect("decision folded");
+        assert_eq!(decision.actor, "b", "LAST decision wins");
+        // The OPTION as well as the actor: it is what Task 6 matches against the journaled
+        // menu, so a decision that folds without its name is a decision no arm can honour.
+        // The two decisions name DIFFERENT options on purpose — with one option this
+        // assertion would hold even if the fold dropped the name and kept the first.
+        assert_eq!(
+            decision.option, "done",
+            "LAST decision's option, not the first"
+        );
+    }
+
+    /// The fold copies `actor` VERBATIM and never launders a degenerate one.
+    ///
+    /// This replaces a test that pinned the `Option`-shaped distinction between "nobody
+    /// said who" (`None`) and "somebody claimed to be the empty string" (`Some("")`).
+    /// That premise is gone: `LoopGateDecided.actor` is now a required `String`, because
+    /// a loop-gate decision is an approval — answering `continue` authorizes another
+    /// iteration of spend — and an approval always records who claimed to give it. There
+    /// is no unattributed state left to distinguish.
+    ///
+    /// What survives is worth keeping, because the narrowing did not make it automatic.
+    /// `""` is still expressible, and a plausible-looking "helpful" fold — `if
+    /// actor.is_empty() { "unknown".into() }` — would mirror what torii's
+    /// `cmd::gate::actor_or` legitimately does at the WRITE side. Doing it HERE instead
+    /// is a laundering bug: it makes a journal row that literally reads `""` display as
+    /// `unknown`, which is precisely what a row written THROUGH `actor_or` (an operator
+    /// whose `$USER` was unresolvable) also displays as. Two different failures — the CLI
+    /// was bypassed, versus the CLI could not name the operator — would become one
+    /// indistinguishable audit line, and the fold is where a run's history stops being
+    /// re-derivable from the journal.
+    #[test]
+    fn a_loop_gate_decisions_actor_folds_verbatim_including_an_empty_one() {
+        let claimed_empty = NodeId("lp/0/__gate__".into());
+        let named = NodeId("lp/1/__gate__".into());
+        let (fold, _, _) = fold_journal(&[
+            (
+                1,
+                JournalEvent::LoopGateDecided {
+                    node: claimed_empty.clone(),
+                    option: "done".into(),
+                    actor: String::new(),
+                },
+            ),
+            (
+                2,
+                JournalEvent::LoopGateDecided {
+                    node: named.clone(),
+                    option: "done".into(),
+                    actor: "unknown".into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            fold.loop_gate_decision_for(&claimed_empty)
+                .expect("decided")
+                .actor,
+            "",
+            "an empty actor folds as the empty string — never re-labelled `unknown`, \
+             which is what a WRITER that routed through `actor_or` would have stored"
+        );
+        // The sibling catches a DIFFERENT mutation, NOT the laundering one: the assertion
+        // above already catches that unaided — `if actor.is_empty() { "unknown".into() }`
+        // in the fold arm reddens it on ITS line, mutation-proven, and execution never
+        // reaches this assertion at all.
+        //
+        // What the assertion above cannot see is a fold that BLANKS the actor regardless
+        // of what was appended, because its expected value IS `""`, so such a fold agrees
+        // with it; only a node whose actor is non-empty notices. Mutation: `actor:
+        // String::new()` in the fold arm reddens HERE and leaves the one above green.
+        //
+        // The non-empty value is `"unknown"` rather than an arbitrary name because it is
+        // also the exact string the laundering bug would invent, so the pair doubles as
+        // the audit distinction — bypassed CLI versus unnameable operator — held apart.
+        assert_eq!(
+            fold.loop_gate_decision_for(&named).expect("decided").actor,
+            "unknown",
+            "…and a genuinely-`unknown` actor is still stored as written, so the two \
+             stay distinguishable from each other"
+        );
+    }
+
+    /// `LoopGateAwaited` is the FOURTH writer of the SHARED `deadlines` map, so
+    /// "has this node begun asking?" still has one answer for every waiting kind. The
+    /// `None` is folded THROUGH — dropping it is the re-ask-every-drive bug s1 shipped.
+    ///
+    /// It also writes ONLY its own kind-specific record. That is the other half of the
+    /// four-writer bookkeeping and it is load-bearing in both directions: the shared map
+    /// must see this ask, and no other kind's per-kind record may. If a loop gate leaked
+    /// into `agent_prompts`, `run_human_agent`'s missing-question arm — which exists
+    /// precisely to fail loud when a node bears ANOTHER kind's awaited record — would
+    /// instead resume a human-backed `Agent` with a loop gate's question and let
+    /// `AgentAnswered` complete it.
+    #[test]
+    fn a_deadline_less_loop_gate_records_that_it_began_asking() {
+        let node = NodeId("lp/0/__gate__".into());
+        let (fold, _, _) = fold_journal(&[(
+            1,
+            JournalEvent::LoopGateAwaited {
+                node: node.clone(),
+                deadline: None,
+                prompt: "q".into(),
+                menu: vec![lopt("done", true)],
+            },
+        )]);
+        assert_eq!(
+            fold.deadline_for(&node),
+            Some(None),
+            "the key must be PRESENT with a None value: present = began asking, \
+             None = no deadline"
+        );
+        assert_eq!(
+            fold.loop_gate_prompt_for(&node),
+            Some("q"),
+            "the question is durable even when the SLA is not"
+        );
+        assert!(
+            fold.loop_gate_menu_for(&node).is_some(),
+            "and so is the menu it was asked with"
+        );
+
+        // The SHARED map, and nothing else. One negative assertion per sibling kind.
+        assert!(
+            fold.prompt_for(&node).is_none(),
+            "a loop gate is not answerable by `AgentAnswered`, so its prompt must not \
+             land in `agent_prompts`"
+        );
+        assert!(
+            fold.menu_for(&node).is_none(),
+            "nor its menu in the `HumanGate` menu map — the two vocabularies differ \
+             (`stops` vs `GateOutcome`)"
+        );
+        assert!(
+            !fold.has_signal_ask(&node),
+            "nor may it claim to be an `AwaitSignal` ask"
         );
     }
 

@@ -10,9 +10,9 @@ source: crates/orchestrator*
 
 # Execution Graph
 
-> **Status: Partial (Phase 3 · SP-1/3 · SP-6-3).** Design §10. Implemented node kinds:
+> **Status: Partial (Phase 3 · SP-1/3 · SP-6-4).** Design §10. Implemented node kinds:
 > `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`** (leaf + graph bodies +
-> gate-agent), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
+> gate-agent + **human gate**), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
 > PlanDelta / planner-driven), **`AwaitSignal`** (SP-6 s1 — the HITL primitive) and
 > **`HumanGate`** (SP-6 s2 — the typed menu over it).
 > Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
@@ -26,7 +26,16 @@ source: crates/orchestrator*
 > `SignalReceived` completed both). The rule is purely syntactic, checks only what the
 > author wrote — the executor's own `{map}/{i}`, `{loop}/{i}/__gate__`,
 > `{expand}/__plan__` paths are generated after validation — and holds for runtime plans
-> too, since `plan::feasible` validates through the same function. **`Loop`** (SP-1 loop-node
+> too, since `plan::feasible` validates through the same function.
+> **And (SP-6 s4) an author-supplied node id may not BE one of the reserved segments
+> `__plan__` / `__gate__` / `__select__`** (equality on the whole id, so `my__gate__` is
+> fine). The separator ban alone was not enough: a `Loop`'s `Subgraph` body is namespaced
+> under `"{loop}/{i}"`, so an inner node named `__gate__` lands on exactly that `Loop`'s
+> own gate path with no separator written anywhere. Where the colliding node COMPLETES
+> rather than waits, the gate went on to ask at an id already carrying `NodeCompleted` —
+> which `torii` folds as terminal, so `run list-paused` omitted the node and
+> `run gate decide` refused it, leaving the run paused on a question no operator surface
+> could show or answer. **`Loop`** (SP-1 loop-node
 > [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)
 > + SP-3 slice 5 loops-of-graphs
 > [`../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md`](../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md)):
@@ -37,12 +46,66 @@ source: crates/orchestrator*
 > **`Subgraph`** drives an authored DAG fresh each iteration (no thread — the gate
 > decides stop) and **`Expand`** plans+executes each iteration, threading the whole
 > iteration output into the next planning input (the **refine** that powers the
-> coordinator). **`GateSpec`** is **`Pure(LoopGate)`** (a deterministic predicate over
+> coordinator).
+> <!-- The CLOSED list of GateSpec variants lives between the two markers below, and
+>      every_gate_spec_variant_is_documented_in_the_execution_graph_feature_doc
+>      (orchestrator-core/src/graph.rs) asserts every implemented variant is named inside
+>      them. Keep prose about what a gate DOES outside them: the guard was previously
+>      bounded by a heuristic that grew to cover three later paragraphs, at which point a
+>      passing mention of `Human` anywhere in them would have kept it green with the
+>      sentence below silently emptied. -->
+> <!-- gate-spec-enumeration -->
+> **`GateSpec`** is **`Pure(LoopGate)`** (a deterministic predicate over
 > the iteration output — recomputed on resume, no journaling; the leaf-body convergence
-> path) or **`Agent { agent, stop_when }`** — a **gate-agent** driven at the reserved
+> path), **`Agent { agent, stop_when }`** — a **gate-agent** driven at the reserved
 > `"{loop}/{i}/__gate__"` whose journaled answer feeds a pure `stop_when` predicate (the
 > semantic Continue|Stop is an LLM decision, memoized ⇒ a resume replays it; graph bodies
-> converge via the gate-agent, since a pure gate can't match a nested sink map).
+> converge via the gate-agent, since a pure gate can't match a nested sink map) — or
+> **`Human { agent, menu }`** (SP-6 s4), where a PERSON picks from an enumerated
+> `menu: Vec<LoopGateOption { name, stops }>` at that same reserved path, once per
+> iteration, and the chosen option's `stops` is the decision (`true` converges, `false`
+> runs another iteration subject to `max_iters`).
+> <!-- /gate-spec-enumeration -->
+> It journals
+> `LoopGateAwaited{node,deadline,prompt,menu}` and pauses; a
+> `LoopGateDecided{node,option,actor}` resumes it, and the drive that HONOURS that
+> decision records a `LoopGateSettled{node,option}` so no later drive re-derives an
+> already-settled gate against a clock that has since passed its deadline (all three new
+> variants ⇒ `FORMAT_VERSION` stays 1). The `AgentRef` earns its place twice — the role's `system_prompt` and
+> activated skills compose the question through the MODEL path's own prompt assembly
+> (the iteration output arrives as `## Context`, truncated; the authored half fails
+> loudly over its own cap), and its `backed_by: human { timeout }` is the SLA — which is
+> why the variant takes a role rather than a bare question string. There is deliberately
+> no `stop_when`: under a human backing a pure predicate is either inert or applied to a
+> magic option-name vocabulary, where `TextContains("halt")` against a menu emitting
+> `"stop"` silently yields a loop that runs to `max_iters`. Two rules diverge from the
+> gate-agent on purpose. The **menu is DURABLE**: after the first ask every decision is
+> validated against the JOURNALED menu, so editing the graph cannot retroactively change
+> what an answer meant, and an option matching nothing in it fails loudly rather than
+> defaulting either way. And the **deadline is read BEFORE the decision** — s2's
+> ordering, inverting s3's — because "continue" authorizes another iteration of SPEND,
+> which is an approval, so a late one must not sanction tokens the SLA said to stop
+> waiting for. An **expired** gate FAILS the Loop rather than converging, **whether or
+> not a decision was journaled**: the arm has not read the fold at that point and
+> structurally cannot know, so its message names the DEADLINE and never "no decision".
+> (This sentence said "expired UNDECIDED gate", which is the s3 ordering the whole rule
+> exists to refuse — the one-line "fix" that makes the code match it is exactly what
+> `a_decision_after_the_deadline_does_not_continue_the_loop` reddens on.) Converging
+> instead is refused for its own reason: silence is not consent, and "silence means stop"
+> would report SUCCESS with nobody asked.
+> `validate_dag` rejects an empty menu, duplicate or empty option names, and a menu with
+> no `stops: true` option — a loop that provably cannot converge however the human
+> answers — at every depth it recurses into. The gate resolves no chain and never
+> reaches the gateway, so it spends NOTHING, which matters more here than at any other
+> human site: the decision being made *is* whether to spend more.
+> **Operator surface (SP-6 s4, shipped):** `torii run gate decide <run> --node
+> "{loop}/{i}/__gate__" --option <name>` — the same verb a `HumanGate` takes, validating
+> the option and the deadline against the JOURNAL before appending anything and refusing
+> `--note` (a loop gate's decision records none, so it could only be dropped); `run
+> signal` and `run agent answer` each refuse the node naming the verb and the kind that
+> would work; and `run list-paused` renders it as the FOURTH row shape — `options` and
+> `question` both present, which is what tells a loop gate from the other three — leaving
+> the listing once its decision has been HONOURED.
 > Cap-without-Stop completes best-effort (`converged: false`) — never a bare fail
 > (§10.3); a body/gate failure fails the Loop (naming the iteration), a body/gate pause
 > pauses it. Resume replays completed iterations + gate decisions from the memo (zero
@@ -96,7 +159,11 @@ source: crates/orchestrator*
 >   **fails** it. `HumanGate` (s2, landed) and **human-as-Agent (s3, landed —
 >   `AgentBacking::Human` on an `AgentDefinition`, so a `NodeKind::Agent` whose `AgentRef`
 >   resolves to a human-backed role waits instead of calling a model; legal ONLY as a
->   top-level `Agent` node)** are the typed wrappers over it. A
+>   top-level `Agent` node)** are the typed wrappers over it. That position rule is about
+>   the NODE KIND, not about the role: since SP-6 s4 a human-backed role has a second legal
+>   use site, as the `agent` of a `GateSpec::Human` (above), where it supplies the loop
+>   gate's question and its SLA — and where a MODEL-backed role is refused loudly, the
+>   mirror of the same rule. A
 >   three-way fold read over two node-keyed journal events (`SignalAwaited{node,deadline}`
 >   · `SignalReceived{node,payload}`, both new variants ⇒ `FORMAT_VERSION` stays 1),
 >   **preceded by a terminal check**: a folded `NodeFailed` for this node returns `Failed`

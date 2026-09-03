@@ -173,8 +173,10 @@ top-up credits / rotate credential / raise budget) — never a pause-forever. Wi
 at the top-level `ModelCall` node and every agent turn (`dispatch_model_turn`);
 agent children of a `Map`/`Loop` pause the whole Map/Loop via `MapChildPaused`.
 **Deferred:** ModelCall *bodies* inside `Map`/`Consolidate`/`Loop` pausing on a
-gate (they fail); the durable scheduler that re-arms at `resume_after` (SP-DATA);
-`RateLimit`→journaled-`Timer` backoff.
+gate (they fail); `RateLimit`→journaled-`Timer` backoff. (~~the durable scheduler
+that re-arms at `resume_after`~~ **shipped in SP-DATA-3** — `Scheduler` over a
+`scheduled_runs` `SchedulerStore` wakes a paused run at its deadline in any
+process, exactly-once.)
 
 ## Deferred
 
@@ -190,8 +192,15 @@ Held off to later SP-1 slices (and beyond); slice 1 ships none of these:
     services), author-supplied idempotency keys, saga/compensation, and the tool
     permission model + sandbox + workspace isolation. Slice 4 ships demo tools
     (`Search`/`RecordNote`) and a sink-backed test reconciler only.
-  - **SP-6** — `AwaitSignal`/`HumanGate` + signal delivery + pause-expiry; slice 4
-    emits a durable `RunPaused` resolved out-of-band, with no re-arm mechanism yet.
+  - ~~**SP-6** — `AwaitSignal`/`HumanGate` + signal delivery + pause-expiry; slice 4
+    emits a durable `RunPaused` resolved out-of-band, with no re-arm mechanism yet.~~
+    **Done — all four SP-6 slices.** `AwaitSignal` (s1), `HumanGate` (s2),
+    human-as-`Agent` (s3) and `GateSpec::Human`, the human LOOP GATE (s4), are the
+    four waiting kinds; `torii run signal` / `run gate decide` / `run agent answer`
+    are the three delivery verbs; SP-DATA-3's scheduler is the re-arm mechanism, and
+    each waiting kind journals its own ABSOLUTE deadline so an expiry cannot be
+    pushed forward by a resume. See
+    [execution-graph](execution-graph.md) and [durable-journal](durable-journal.md).
 - ~~`Loop` (loops of graphs)~~ **Done** (deterministic gate + `max_iters`; see
   [execution-graph](execution-graph.md)). ~~`OrchestratorHooks`~~ **Done** (see
   [hooks](hooks.md)). ~~quota→pause~~ **Done** (see [gateway-error mapping](#gateway-error--pause-vs-fail-112)).

@@ -27,9 +27,9 @@ use orchestrator::test_support::{
 };
 use orchestrator::{Executor, Scheduler};
 use orchestrator_core::{
-    ConfigSource, ContextKey, ContextStore, ExecutionJournal, GateOption, GateOutcome, Graph,
-    JournalEvent, Node, NodeId, NodeKind, RegistryHandle, RunId, RunStatus, SchedulerStore, Scope,
-    TokenBudget,
+    ConfigSource, ContextKey, ContextStore, ExecutionJournal, GateOption, GateOutcome, GateSpec,
+    Graph, JournalEvent, LoopBody, LoopGateOption, Node, NodeId, NodeKind, RegistryHandle, RunId,
+    RunStatus, SchedulerStore, Scope, TokenBudget,
 };
 use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
@@ -346,6 +346,106 @@ fn human_agent_graph_ids(marker: &str) -> (NodeId, NodeId, NodeId) {
         NodeId(format!("n1-{marker}")),
         NodeId(format!("review-{marker}")),
         NodeId(format!("n2-{marker}")),
+    )
+}
+
+/// SP-6 s4 AC19: [`human_agent_graph`]'s shape with the middle node a `Loop` whose STOP
+/// DECISION is a person's — `n1 → lp → n2`, where `lp` runs a `ModelCall` body and then
+/// asks the human-backed [`reviewer`] to pick from `revise | ship` once per iteration.
+///
+/// The fourth waiting kind, and the only one whose waiting node **exists in no graph**:
+/// its id is synthesized per iteration as `"{loop}/{i}/__gate__"` (see
+/// [`human_loop_gate_node_ids`]). That is what makes this e2e say something the other
+/// three cannot — everything an operator needs to act, the node id and the menu and the
+/// question, has to come out of the DATABASE, because there is no graph copy to fall back
+/// on even in principle.
+///
+/// `max_iters: 3` with a `ship` decision on iteration 0, so convergence is a statement
+/// about the DECISION rather than about the cap: a `Loop` that ignored the human entirely
+/// would run all three iterations and complete `converged: false`, spending two more
+/// gateway calls the assertions below count.
+///
+/// The menu carries BOTH senses of `stops` — `revise` runs another iteration, `ship`
+/// converges — for the reason the executor's own fixture does: a one-option menu could not
+/// distinguish "the decision was honoured" from "the arm always stops", and `validate_dag`
+/// requires at least one `stops: true` in any case.
+///
+/// **No `timeout` parameter**, exactly like [`human_agent_graph`] and for the same reason:
+/// s3 put the SLA on the ROLE (`AgentBacking::Human { timeout }`), and s4's loop gate reads
+/// it through the same seam (`human_sla_for`), so the deadline is threaded through
+/// [`human_registry`] rather than through the graph.
+///
+/// Everything else is [`signal_graph`]'s reasoning verbatim, including the run-unique node
+/// ids: each `ModelCall`'s prompt IS its node id (so a recorded call is attributable to the
+/// run AND the node), and `context_refs`' `(scope_kind, scope_id, ctx_key)` primary key
+/// makes a shared bare `n1` collide LOUDLY on this suite's second run against a persistent
+/// database. The `Loop`'s own id is run-unique for that reason too — it publishes its
+/// aggregate output to the blackboard under it — and so, consequently, is the gate path
+/// derived from it.
+fn human_loop_gate_graph(marker: &str) -> Graph {
+    let (n1, lp, n2, _) = human_loop_gate_node_ids(marker);
+    let model = |id: &NodeId, deps: Vec<orchestrator_core::Dep>| Node {
+        id: id.clone(),
+        kind: NodeKind::ModelCall {
+            chain: "c".into(),
+            payload: serde_json::json!({ "prompt": id.0 }),
+        },
+        deps,
+    };
+    Graph {
+        nodes: vec![
+            model(&n1, vec![]),
+            Node {
+                id: lp.clone(),
+                kind: NodeKind::Loop {
+                    body: LoopBody::ModelCall { chain: "c".into() },
+                    // The iteration-0 prompt IS the `Loop`'s own node id, on the same
+                    // attribution rule every `ModelCall` here follows. Only iteration 0
+                    // carries it: `run_loop` threads each iteration's answer TEXT forward
+                    // as the next input, so `calls_for(&log, &lp.0)` counts exactly the
+                    // first body call and nothing else — which is what lets the
+                    // zero-re-spend assertion below say "the iteration process A paid for
+                    // was replayed" rather than "some call did not happen".
+                    input: serde_json::json!({ "prompt": lp.0 }),
+                    gate: GateSpec::Human {
+                        agent: orchestrator_core::AgentRef("reviewer".into()),
+                        menu: vec![
+                            LoopGateOption {
+                                name: "revise".into(),
+                                stops: false,
+                            },
+                            LoopGateOption {
+                                name: "ship".into(),
+                                stops: true,
+                            },
+                        ],
+                    },
+                    max_iters: 3,
+                },
+                deps: vec![orchestrator_core::Dep::hard(n1.0.clone())],
+            },
+            model(&n2, vec![orchestrator_core::Dep::hard(lp.0.clone())]),
+        ],
+    }
+}
+
+/// [`human_loop_gate_graph`]'s three AUTHORED node ids plus the SYNTHESIZED one an operator
+/// actually acts on: `(n1, lp, n2, lp/0/__gate__)`.
+///
+/// The fourth is the point of the helper. `RESERVED_GATE_ID` under the loop's
+/// per-iteration path is not in the graph, is not returned by any API, and is discoverable
+/// at runtime only from `torii run list-paused` — so a test that hand-wrote the literal
+/// would be free to drift from the executor's own construction and pass while asserting
+/// nothing. Written here exactly once, in the form an operator types into
+/// `torii run gate decide --node`.
+fn human_loop_gate_node_ids(marker: &str) -> (NodeId, NodeId, NodeId, NodeId) {
+    let lp = NodeId(format!("lp-{marker}"));
+    let gate = NodeId(format!("{}/0/__gate__", lp.0));
+    (
+        NodeId(format!("n1-{marker}")),
+        lp,
+        NodeId(format!("n2-{marker}")),
+        gate,
     )
 }
 
@@ -1617,8 +1717,9 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
 
 /// SP-6 s3 AC13 — a human-backed ROLE, end to end, across a process boundary.
 ///
-/// The third and last waiting kind. s1's `AwaitSignal` waits for arbitrary JSON and s2's
-/// `HumanGate` for a named option; here the waiting thing is an ordinary top-level
+/// The third waiting kind (SP-6 s4's human loop gate is the fourth). s1's `AwaitSignal`
+/// waits for arbitrary JSON and s2's `HumanGate` for a named option; here the waiting
+/// thing is an ordinary top-level
 /// [`NodeKind::Agent`] whose `AgentRef` happens to resolve to an `AgentBacking::Human`
 /// definition — so the GRAPH is the model-backed graph, unchanged, and the substitution
 /// lives entirely in the registry. That is the property this test exists to show over a
@@ -1964,5 +2065,405 @@ async fn a_human_backed_agent_answered_in_another_process_completes_the_run() {
         ctx.load(&published).await.unwrap(),
         serde_json::json!({ "text": ANSWER, "actor": "counsel" }),
         "the human's free text — and who gave it — is what the role returned into the graph"
+    );
+}
+
+/// SP-6 s4 AC19 — a `Loop` whose stop decision is a PERSON's, end to end, across a process
+/// boundary. The property the whole durable stack exists for, applied to the newest thing
+/// in it.
+///
+/// The fourth waiting kind, and the one whose cross-process claim is strongest, because its
+/// waiting node **exists in no graph**. s1's `AwaitSignal`, s2's `HumanGate` and s3's
+/// human-backed `Agent` are all authored nodes: an operator holding the submitted graph
+/// could in principle discover them without the database. A loop gate's id is SYNTHESIZED
+/// per iteration (`"{loop}/{i}/__gate__"`), and its menu and question are composed at
+/// runtime from the registry and from the iteration's own model output — so every single
+/// thing needed to act on it, and to interpret the answer afterwards, has to survive in
+/// Postgres or the run is unrecoverable.
+///
+/// 1. **Process A** submits `n1 → lp → n2`. `n1` costs a real gateway call and so does the
+///    `Loop`'s iteration 0; the gate then journals its QUESTION, its MENU and its ABSOLUTE
+///    deadline at the reserved path, and takes a durable, timed pause with `n2` unreached.
+/// 2. **The operator, light tier** (`run list-paused`) discovers the synthesized node, its
+///    menu and its question on its OWN pool — no gateway, no model credentials, no graph
+///    and no registry in hand.
+/// 3. **Discrimination**: a bare `run wake` is a RESUME, not a DECISION. The run comes back
+///    still paused, re-armed on the same instant, having spent nothing. Without this the
+///    completion in step 5 would be ambiguous, since `gate decide` queues a wake too.
+/// 4. **The operator decides** on a THIRD pool, through torii's own `run gate decide
+///    --option ship` — the same command path a person types, not a hand-appended event.
+/// 5. **Process B** — a fresh store/journal/content-store/context-store/gateway/registry,
+///    sharing nothing in-process with A — drives it through torii's real
+///    `worker serve --once`, and the run reaches `Completed`.
+/// 6. **The decision was HONOURED, not merely survived:** the loop converged on iteration
+///    0 (`converged: true, iterations: 1`, read back from the durable blackboard), so
+///    `revise`'s two further iterations were never spent; and the zero-re-spend assertion
+///    is per node, `n1` and the iteration-0 body both replayed from the durable journal +
+///    CAS while `n2` — the node the decision unblocked — is driven exactly once.
+///
+/// Completion is asserted through the scheduler's `RunStatus`, the journal's `RunCompleted`
+/// and the durable blackboard, never through a terminal re-`start`'s `RunOutcome`. See the
+/// `AwaitSignal` e2e above for that argument in full.
+#[cfg_attr(
+    not(have_database_url),
+    ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+)]
+#[tokio::test]
+async fn a_loop_gate_decided_in_another_process_resumes_and_converges() {
+    let Some(url) = db_url() else { return };
+    let _guard = scheduler_guard().await;
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let marker = run.0.to_string();
+    let (n1, lp, n2, gate) = human_loop_gate_node_ids(&marker);
+    let graph = human_loop_gate_graph(&marker);
+    // An hour out, so the deadline is far beyond every instant this test reaches: nothing
+    // but an operator can make this run claimable, which is what turns the convergence
+    // below into a statement about the DECISION.
+    let sla = Some(Duration::hours(1));
+    let t0 = DateTime::<Utc>::from_timestamp(9_000_000, 0).unwrap();
+    let clock = FakeClock::new(t0);
+
+    // ---- Process A: the prefix and iteration 0 are paid for, then the gate asks --------
+    let store_a = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_a = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let (gw_a, calls_a) = recording_gateway().await;
+    let exec_a = Executor::new(Arc::new(gw_a), journal_a.clone(), "v1")
+        .with_content_store(Arc::new(PostgresContentStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_context_store(Arc::new(PostgresContextStore::new(
+            connect(&url).await.unwrap(),
+        )))
+        .with_registry(human_registry(sla))
+        .with_clock(clock.clone());
+    let sched_a = Scheduler::new(store_a.clone(), exec_a, journal_a.clone(), clock.clone());
+    let submitted = torii::cmd::run::submit(&sched_a, run, graph.clone(), None, || {})
+        .await
+        .expect("a gate-paused run is not an error");
+    assert_eq!(submitted.code, torii::errors::EXIT_OK, "{}", submitted.text);
+    assert!(
+        submitted.text.starts_with("paused:") && submitted.text.contains("loop_gate"),
+        "the human loop gate must PAUSE the run (resumable), naming itself as the cause — \
+         not fail it, and not decide the loop's own convergence: {}",
+        submitted.text
+    );
+
+    // The prefix is REAL — this is the spend the zero-re-spend assertions later protect.
+    // The `Loop`'s iteration 0 is half of it, and that half is the one this slice adds: a
+    // gate that spends nothing itself still sits behind an iteration that did.
+    assert_eq!(
+        (
+            calls_for(&calls_a, &n1.0),
+            calls_for(&calls_a, &lp.0),
+            calls_for(&calls_a, &n2.0)
+        ),
+        (1, 1, 0),
+        "n1 and the Loop's iteration 0 both spend; n2 is behind the undecided gate and \
+         must not have run"
+    );
+
+    let deadline = t0 + Duration::hours(1);
+    let paused = store_a
+        .status(run)
+        .await
+        .unwrap()
+        .expect("a schedule record");
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(
+        paused.next_wake,
+        Some(deadline),
+        "the pause carries the gate's ABSOLUTE deadline, so the scheduler re-arms on the \
+         same instant however often the run is woken early: {paused:?}"
+    );
+
+    // ---- The operator, light tier: WHICH node, on WHAT menu, about WHAT output? --------
+    // A separate pool and a separate journal handle — no gateway, no model credentials, no
+    // registry, nothing in-process shared with A. Everything asserted here is folded out of
+    // A's durable `LoopGateAwaited`, and for this kind there is nowhere else it COULD come
+    // from: `list-paused` holds no graph, and the graph would not contain this node anyway.
+    let store_b = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_b = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let listed = torii::cmd::run::list_paused(store_b.as_ref(), journal_b.as_ref(), false)
+        .await
+        .expect("list-paused");
+    assert_eq!(listed.code, torii::errors::EXIT_OK, "{}", listed.text);
+    // Anchored on this run's OWN row INSIDE the awaiting block, for both of the reasons the
+    // two e2es above record. `scheduled_runs` is GLOBAL, so a leftover paused run from an
+    // earlier invocation is legitimately listed too and an unanchored `contains("ship")`
+    // could be satisfied by a stranger's row. And this run's own TABLE row already carries
+    // the menu incidentally, because the executor's pause reason recites it
+    // (`loop_gate: waiting for a decision on node lp-…/0/__gate__ (revise | ship)`) — so a
+    // whole-output search finds the menu with the awaiting block empty, which is exactly
+    // how the `HumanGate` e2e's first cut passed while asserting nothing.
+    let block = listed
+        .text
+        .split_once("AWAITING A SIGNAL")
+        .unwrap_or_else(|| {
+            panic!(
+                "list-paused must render the awaiting block for a loop gate:\n{}",
+                listed.text
+            )
+        })
+        .1;
+    let row = block
+        .lines()
+        .find(|l| l.starts_with(&marker) && l.contains(&gate.0))
+        .unwrap_or_else(|| {
+            panic!(
+                "the awaiting block must name the SYNTHESIZED gate node — it is in no \
+                 graph, so this listing is the only place an operator can learn it \
+                 exists:\n{}",
+                listed.text
+            )
+        });
+    assert!(
+        row.contains("loop gate:"),
+        "…and must mark it a LOOP GATE rather than a `gate:` or an `agent:` row. The kind \
+         decides the verb, and a mislabelled row sends an operator to a refusal for a node \
+         they had correctly identified: {row}"
+    );
+    assert!(
+        row.contains("revise") && row.contains("ship"),
+        "…and its MENU, which is the vocabulary `gate decide --option` validates against: \
+         {row}"
+    );
+    assert!(
+        row.contains(REVIEWER_PROMPT),
+        "…and the QUESTION, which for this kind is not redundant with the menu: 'which \
+         option' is meaningless without 'of what'. The role's standing instructions are \
+         its opening: {row}"
+    );
+    assert!(
+        row.contains("canned-response"),
+        "…composed over the ITERATION OUTPUT — the work the person is actually judging, \
+         which exists nowhere but in this run's own journal: {row}"
+    );
+    assert!(
+        row.contains(&format!(
+            "deadline {}",
+            deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )),
+        "…and the deadline it will FAIL at: {row}"
+    );
+
+    // ---- Discrimination: a bare `wake` is a RESUME, not a DECISION --------------------
+    // Without this the convergence below would be ambiguous: `gate decide` also queues a
+    // wake, so a loop gate that converged on ANY resume would pass every assertion after
+    // it. Here the very same run is woken with no decision on the journal, driven by a real
+    // worker tick, and must come back untouched.
+    let woken_at = t0 + Duration::seconds(60);
+    let woken = torii::cmd::run::wake(store_b.as_ref(), journal_b.as_ref(), run, woken_at, None)
+        .await
+        .expect("wake");
+    assert_eq!(woken.code, torii::errors::EXIT_OK, "{}", woken.text);
+    let (sched_w, calls_w) = fresh_human_worker(&url, woken_at + Duration::seconds(1), sla).await;
+    let served_w = serve_once(&sched_w).await;
+    assert_eq!(served_w.code, torii::errors::EXIT_OK, "{}", served_w.text);
+    let after_wake = store_b.status(run).await.unwrap().unwrap();
+    assert_eq!(
+        (after_wake.status, after_wake.next_wake),
+        (RunStatus::Paused, Some(deadline)),
+        "a wake with no decision must leave the gate waiting, re-armed on the deadline it \
+         RECORDED — never converged, never failed: {after_wake:?}"
+    );
+    assert_eq!(
+        (
+            calls_for(&calls_w, &n1.0),
+            calls_for(&calls_w, &lp.0),
+            calls_for(&calls_w, &n2.0)
+        ),
+        (0, 0, 0),
+        "and it must cost nothing: n1 and iteration 0 replay from the durable journal + \
+         CAS, and n2 is still behind an undecided gate"
+    );
+
+    // ---- The operator decides, on a THIRD pool ---------------------------------------
+    // Two minutes in — far short of the hour — so the gate is genuinely still waiting and
+    // the convergence below cannot be the timeout firing.
+    //
+    // `note: None` because a loop gate's decision records none: `LoopGateDecided` is
+    // `{node, option, actor}`, and `decide` REFUSES a `--note` on this kind rather than
+    // dropping it silently. Passing `Some` here would not test the note, it would test the
+    // refusal — and get exit 2 instead of a decision.
+    let decided_at = t0 + Duration::seconds(120);
+    let store_c = Arc::new(PostgresSchedulerStore::new(connect(&url).await.unwrap()));
+    let journal_c = Arc::new(PostgresJournal::new(connect(&url).await.unwrap()));
+    let decided = torii::cmd::gate::decide(
+        store_c.as_ref(),
+        journal_c.as_ref(),
+        run,
+        gate.clone(),
+        "ship",
+        "ops",
+        None,
+        decided_at,
+    )
+    .await
+    .expect("decide");
+    assert_eq!(decided.code, torii::errors::EXIT_OK, "{}", decided.text);
+    assert!(
+        decided.text.starts_with("decided:") && decided.text.contains(&gate.0),
+        "{}",
+        decided.text
+    );
+
+    // Deciding QUEUES; it does not drive — exactly what the message claims.
+    let after_decide = store_c.status(run).await.unwrap().unwrap();
+    assert_eq!(
+        (after_decide.status, after_decide.next_wake),
+        (RunStatus::Paused, Some(decided_at)),
+        "the decision is journaled and the wake is queued, but a worker tick does the \
+         driving: {after_decide:?}"
+    );
+
+    // ---- Process B: a FRESH worker drives it -----------------------------------------
+    // The only things carried over from A are the run id and the config — everything else
+    // B needs, the graph included, it reads out of Postgres. (Why the config is rebuilt
+    // rather than read back: see `human_registry`.)
+    let (sched_b, calls_b) = fresh_human_worker(&url, decided_at + Duration::seconds(1), sla).await;
+    let served = serve_until_settled(&sched_b, store_b.as_ref(), run).await;
+    assert_eq!(served.code, torii::errors::EXIT_OK, "{}", served.text);
+
+    // ---- The run completed — asserted at the scheduler AND in the journal -------------
+    assert_eq!(
+        store_b.status(run).await.unwrap().unwrap().status,
+        RunStatus::Completed,
+        "the decided run runs to completion in the fresh process: {}",
+        served.text
+    );
+    let events = journal_b.load(run).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "…and says so durably, in the journal the scheduler read it from"
+    );
+
+    // ---- ZERO RE-SPEND of the completed prefix, per node -------------------------------
+    // Attributable, not an empty log: `calls_for` counts the recording gateway's calls
+    // whose PROMPT is the node id, so the SAME filter that returns 1 for `n2` returns 0 for
+    // `n1` and for the iteration-0 body. A bare total would be meaningless — `tick()`
+    // legitimately drives every due run in the shared `scheduled_runs` table, leftovers
+    // from other suites included.
+    assert_eq!(
+        (calls_for(&calls_b, &n1.0), calls_for(&calls_b, &lp.0)),
+        (0, 0),
+        "n1 and the Loop's iteration 0 were paid for by process A — B must replay both \
+         from the durable journal + CAS, never call the gateway for them again"
+    );
+    assert_eq!(
+        calls_for(&calls_b, &n2.0),
+        1,
+        "exactly the one node the decision unblocked, driven once"
+    );
+
+    // ---- The gate asked ONCE, at the synthesized path, and asked nothing more ----------
+    // A's pause, the bare wake's re-pause and B's convergence — and exactly one
+    // `LoopGateAwaited`, at iteration 0's path and no other. Two things would be invisible
+    // to every assertion above: a question or menu re-published per drive (which would let
+    // an author edit a live run's CONFIG and retroactively change what the human's answer
+    // meant, since the menu is what the decision is resolved against), and a gate asked for
+    // an iteration the `ship` decision should have prevented from running at all.
+    let asked: Vec<_> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::LoopGateAwaited {
+                node,
+                deadline,
+                prompt,
+                menu,
+            } => Some((node.clone(), *deadline, prompt.clone(), menu.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "exactly one ask, ever: {asked:?}");
+    let (asked_node, asked_deadline, question, asked_menu) = &asked[0];
+    assert_eq!(
+        asked_node, &gate,
+        "at the reserved `{{loop}}/{{i}}/__gate__` path of iteration 0 — the id the \
+         operator was shown and typed back"
+    );
+    assert_eq!(
+        *asked_deadline,
+        Some(deadline),
+        "the gate publishes its ABSOLUTE deadline once, at first execution, and folds it \
+         thereafter"
+    );
+    assert_eq!(
+        asked_menu,
+        &vec![
+            LoopGateOption {
+                name: "revise".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "ship".into(),
+                stops: true,
+            },
+        ],
+        "the whole menu is journaled VERBATIM — names, order and `stops` — because it is \
+         what the decision is resolved against on the far side of the process boundary"
+    );
+    // Asserted WHOLE-ish rather than by substring as the listing row was: the row is capped
+    // for display, the journal is not, and this is the durable value the operator's
+    // decision was made against.
+    assert!(
+        question.starts_with(REVIEWER_PROMPT),
+        "the question opens with the gate role's standing instructions: {question:?}"
+    );
+    assert!(
+        question.contains("canned-response"),
+        "…carries the iteration output under `## Context`, which is what is being judged: \
+         {question:?}"
+    );
+    assert!(
+        question.ends_with("`revise` (run another iteration), `ship` (stop the loop)."),
+        "…and closes with the synthesized ask, each option annotated with what picking it \
+         does to the LOOP — so the durable question is self-contained and a person is not \
+         guessing which name ends the run: {question:?}"
+    );
+
+    // ---- The decision was HONOURED, and the loop CONVERGED on it ------------------------
+    // Read back through a THIRD context store on its own pool, so this is the durable row,
+    // not B's in-process blackboard.
+    //
+    // `converged: true` with `iterations: 1` is the assertion that distinguishes this from
+    // every weaker thing that also ends in `Completed`. A `Loop` that ignored the human and
+    // ran to its `max_iters: 3` cap would complete too — best-effort, `converged: false` —
+    // and would have spent two more gateway calls on iterations nobody authorized. This is
+    // therefore also where "the menu is read from the JOURNAL" pays off across the
+    // boundary: process B resolved `ship` against A's journaled `stops: true`.
+    let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
+    let published = ctx
+        .get(Scope::Run, ContextKey(lp.0.clone()))
+        .await
+        .unwrap()
+        .expect("the completed Loop published its output to the durable blackboard");
+    let out = ctx.load(&published).await.unwrap();
+    assert_eq!(
+        (out.get("converged"), out.get("iterations")),
+        (Some(&serde_json::json!(true)), Some(&serde_json::json!(1))),
+        "the human's `ship` stopped the loop after iteration 0 — not the `max_iters: 3` \
+         cap, which would have completed `converged: false` after two more paid \
+         iterations: {out}"
+    );
+
+    // And the SETTLEMENT is durable, at the same synthesized path. This is the row that
+    // makes the honoured decision survive a clock that has moved past the gate's deadline:
+    // `run_human_loop_gate` replays it instead of re-deriving a verdict, so a later wake of
+    // this run cannot retroactively kill a loop every person answered inside their SLA.
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::LoopGateSettled { node, option } if node == &gate =>
+                    Some(option.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["ship".to_string()],
+        "the drive that honoured the decision settled it durably, once, naming the option \
+         it honoured"
     );
 }

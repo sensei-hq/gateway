@@ -360,10 +360,13 @@ pub enum JournalEvent {
     ///
     /// A writer must also REDACT it before appending (design §6), and `run_human_agent`
     /// does: it runs the executor's own redactor over the WHOLE composed question and
-    /// appends that value. s3 originally shipped `prompt: prompt.to_string()`, which made
-    /// this row the one place a credential in a `system_prompt` or a skill body reached
-    /// durable storage in the clear — nothing upstream scrubs it (`torii config push`
-    /// redacts nothing). The residue worth knowing: `Executor::with_redactor` is opt-in and
+    /// appends that value. s3 originally shipped `prompt: prompt.to_string()`, which let a
+    /// credential in a `system_prompt` or a skill body into the JOURNAL in the clear —
+    /// nothing between the authored config and this append scrubs it (`torii config push`
+    /// redacts nothing). s3's own note called this row "the one place" such a credential
+    /// reached durable storage; it is not, since the agent's markdown and the
+    /// `config_agents` jsonb hold it verbatim already. It is the last door into the copy
+    /// that is read BACK. The residue worth knowing: `Executor::with_redactor` is opt-in and
     /// defaults to `None`, so a library embedder that wires no redactor still writes the
     /// question as composed.
     ///
@@ -403,6 +406,241 @@ pub enum JournalEvent {
         node: NodeId,
         text: String,
         actor: String,
+    },
+    /// SP-6 s4: a `GateSpec::Human` loop gate has begun asking, carrying the QUESTION and
+    /// the MENU it published.
+    ///
+    /// The menu is journaled for s2's reason, which transfers exactly: an operator's
+    /// answer must keep meaning what it meant when they were asked, and nothing BINDS
+    /// the graph handed to a later `Executor::start` to the one the human was shown.
+    /// There is no graph fence (the SP-DATA-2 config-version fence covers the registry,
+    /// not the graph), so reading the graph's menu at decision time would let an author
+    /// flip an option's `stops` after a human picked it and silently invert their
+    /// decision. The concrete vector on the shipped `worker serve` path is the
+    /// `scheduled_runs.graph` row, which `Scheduler::tick` re-drives from and an operator
+    /// can edit between drives; a library embedder simply passing a different `Graph` to
+    /// the next `start` is the same hazard with no table involved.
+    ///
+    /// The general form is deliberate. An earlier version of this paragraph enumerated
+    /// three vectors and two of them were false, which is worse than saying less: a
+    /// resubmitted `run submit` cannot re-drive an existing run at all (`cmd::run::submit`
+    /// pre-checks `Scheduler::status`, and `SchedulerStore::enqueue` is the real guard —
+    /// `on conflict do nothing` plus a `rows_affected == 0` error), and a runtime `Expand`
+    /// subgraph is the ONE path that is bound, since `PlanExpanded` journals the subgraph
+    /// before it is driven and `drive_expand_with` reuses `fold.expansions` verbatim
+    /// rather than re-invoking the planner. (`Expand` is still a TRUST point — an
+    /// untrusted planner can author the menu in the first place, see design §7 — but it
+    /// is not a DRIFT point, and conflating the two is what made the list wrong.)
+    ///
+    /// The prompt is journaled for s3's reason: an operator must be able to read the
+    /// question off the journal alone, and `torii`'s read path has no `Registry` and no
+    /// blackboard with which to recompose it.
+    ///
+    /// `prompt` carries the same MODEL-EQUIVALENT question
+    /// [`JournalEvent::AgentAwaited`] does, so it inherits that variant's writer
+    /// obligations verbatim — they are restated here rather than left to a pointer,
+    /// because a writer who adds a second append site reads THIS doc:
+    ///
+    /// - **Bound it by two rules, not one.** The AUTHORED bytes (the role's
+    ///   `system_prompt` + activated skill bodies + the menu-derived `## Task` ask) fail
+    ///   LOUDLY over [`MAX_HUMAN_TEXT_BYTES`]; the `## Context` bytes are TRUNCATED with a
+    ///   visible marker against [`MAX_HUMAN_CONTEXT_BYTES`]. Charging one cap against both
+    ///   is not a smaller version of the rule but a different behaviour, and it was the s3
+    ///   whole-slice review's worst finding — an ordinary verbose upstream killed the node
+    ///   terminally after its tokens were already spent. It bites harder here than at s3's
+    ///   site: a loop gate's `## Context` is a model iteration's output essentially
+    ///   always.
+    ///
+    ///   The third authored term is where this restatement is NOT verbatim, and getting it
+    ///   verbatim was a bug in an earlier version of this bullet. At `AgentAwaited`'s site
+    ///   the third term is the node INPUT; at a loop gate's it is `gate_ask(menu)`, the ask
+    ///   synthesized from the option names, and the iteration output is the whole of the
+    ///   `## Context` half. Naming the iteration data as the loudly-capped term inverts the
+    ///   rule the bullet exists to state — which is why the executor's own failure message
+    ///   says "trim the gate role's system prompt, its skills, or the menu option names".
+    /// - **REDACT it before appending** (design §6), through the executor's own
+    ///   `Redactor`, then clamp — `[REDACTED]` is longer than the shortest span it
+    ///   replaces. Nothing upstream scrubs the authored halves: `torii config push` writes
+    ///   an agent's `system_prompt` and a skill's body to `config_agents`/`config_skills`
+    ///   as jsonb, verbatim. So this is the last unscrubbed door into the JOURNAL for a
+    ///   credential in one of them — not the one place it reaches durable storage at all,
+    ///   which is what an earlier version of this bullet claimed and the config tables
+    ///   already disprove. The journal's copy is the one read BACK: folded on every drive,
+    ///   printed by the operator surfaces, and shown to the person. s3 shipped the
+    ///   unredacted form first and its review caught it.
+    /// - **Redact the `menu` too, and refuse a menu that redaction makes AMBIGUOUS.** This
+    ///   obligation is s4's own — `AgentAwaited` has no menu — and it is the one the first
+    ///   shipped append site missed: `prompt` quotes the option names (through `gate_ask`)
+    ///   and was scrubbed, while `menu` was appended straight from the graph, so one author
+    ///   string was clean in one durable field and plaintext in another on the same write.
+    ///   Option names arrive by a DIFFERENT unscrubbed intake from the prompt's: the graph
+    ///   file `torii run submit --graph` deserializes. `torii config push` never carries
+    ///   one — the menu lives on the graph so `validate_dag` can see it — and
+    ///   `Scheduler::submit` has already put that graph in `scheduled_runs.graph`, in the
+    ///   clear, before the executor drives. This append governs the journal's copy.
+    ///
+    ///   The refusal is the non-obvious half. `menu` is not display text: it is the
+    ///   vocabulary a decision is resolved against, and redacting it is only safe while the
+    ///   names stay DISTINCT. `Graph::validate_dag` rejects a duplicate name, but it runs on
+    ///   the authored graph and cannot see a redactor at all (the redactor is an executor
+    ///   injection, so the same graph is legal under one executor and not another), and
+    ///   redaction can re-create the duplicate: two credential-shaped names both collapse to
+    ///   the placeholder, the resolver takes the first match, and an operator picking the
+    ///   only name they were offered gets whichever `stops` came first. A silently inverted
+    ///   decision is worse than either the leak or a loud failure, so the writer must check
+    ///   the redacted names for collision and fail the gate BEFORE appending.
+    ///
+    /// None of the three is optional (design §6, AC15/AC16). The first two were recorded on
+    /// the TYPE ahead of any code that honoured them, because the s4 plan builds the append
+    /// site (Task 6) four tasks before the enforcement (Task 10) — the contract had to be
+    /// legible to the writer who arrived first; the third was added after review found the
+    /// shipped site honouring the prompt rule and not the menu one. All three are now
+    /// honoured by `Executor::run_human_loop_gate`, and each is guarded by the test named
+    /// for the mutation that undoes it:
+    /// `an_oversized_authored_prompt_fails_the_loop_gate` (delete the authored-bytes
+    /// check), `a_verbose_iteration_output_truncates_the_question_instead_of_killing_the_gate`
+    /// (pass the iteration output as the seam's `input` instead of as a `context` entry —
+    /// the reversal the plan's own Task 6 sketch had, which fails the gate on a perfectly
+    /// ordinary 37 KiB model answer), `the_journaled_loop_gate_question_is_redacted`
+    /// (swap the redactor for the identity),
+    /// `a_credential_in_a_menu_option_name_never_reaches_the_journal` (append the graph's
+    /// menu instead of the scrubbed one) and
+    /// `a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly` (delete the
+    /// collision refusal). A SECOND append site owes all of them, and inherits none.
+    ///
+    /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited`/
+    /// `AgentAwaited` do — overwriting the deadline is the never-expires bug.
+    LoopGateAwaited {
+        node: NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        prompt: String,
+        menu: Vec<crate::graph::LoopGateOption>,
+    },
+    /// SP-6 s4: a human picked one of a loop gate's options.
+    ///
+    /// A loop gate is answerable ONLY by this event, never by `SignalReceived`,
+    /// `GateDecided` or `AgentAnswered`. `SignalReceived` and `AgentAnswered` carry no
+    /// option name at all, so either would bypass the menu match outright.
+    /// [`JournalEvent::GateDecided`] is the near miss worth naming precisely, because it
+    /// DOES carry an `option: String` and so looks menu-matchable: the two menus are not
+    /// interchangeable vocabularies. A `HumanGate`'s [`GateOption`] carries an
+    /// [`GateOutcome`](crate::graph::GateOutcome) of `{Complete, Fail}`; a loop gate's
+    /// [`LoopGateOption`](crate::graph::LoopGateOption) carries `stops`, and "continue"
+    /// has no representation in the former at all. A decision recorded as `GateDecided`
+    /// at a loop-gate node would therefore fold into the wrong side-map
+    /// (`Fold::gate_decisions`, `executor/support.rs`) and be validated against the wrong
+    /// menu — which is the cross-kind refusal the s4 plan's Tasks 9 and 12 have to
+    /// enforce, in the executor and at the CLI respectively.
+    ///
+    /// (`GateDecided` does not itself carry a `GateOutcome` — it is `{node, option, actor,
+    /// note}`, and the outcome lives on the MENU, `GateAwaited.options`. An earlier
+    /// version of this doc said it did. The reason to keep the events apart is the menu
+    /// vocabulary, not the decision's field set.)
+    ///
+    /// `actor` is ATTRIBUTION, NOT AUTHENTICATION: whatever string the caller supplied,
+    /// so it answers "who claimed to decide", never "who decided", and must not be
+    /// branched on. A writer must REDACT it before appending, exactly as it redacts the
+    /// question — s3's whole-slice review found an unredacted `--as` to be a real
+    /// plaintext leak on this exact field (design §6; see the commentary at
+    /// `torii/src/cmd/human.rs`).
+    ///
+    /// **That obligation is the APPENDING writer's alone, and nothing downstream is a
+    /// second line of defence.** Recorded here because the opposite is the natural
+    /// assumption: the executor scrubs the QUESTION at its own chokepoint
+    /// (`fail_loop_gate`, and `redact_and_clamp` on [`JournalEvent::LoopGateAwaited`]), so
+    /// a reader may expect the actor to be caught somewhere on the way through too. It is
+    /// not, and structurally cannot be. `Executor::run_human_loop_gate` reads only
+    /// `option` off this event; it interpolates the actor into no message and puts it in
+    /// no node output. Contrast both siblings, which is why the difference is worth
+    /// stating: [`JournalEvent::GateDecided`]'s actor IS interpolated by `run_human_gate`
+    /// into its rejection `NodeFailed` (so it passes a redacting chokepoint on the way
+    /// out), and [`JournalEvent::AgentAnswered`]'s becomes half the node's OUTPUT and is
+    /// redacted there. A loop gate's actor is written once and read only by an operator
+    /// surface, so whatever reaches this field is what an audit reads forever.
+    ///
+    /// The redaction therefore belongs at torii's decide path, and it has to be ADDED
+    /// there rather than inherited: `cmd::human::answer` redacts `--as` through
+    /// `redact_answer`, while `cmd::gate::decide` — the verb that will write THIS event —
+    /// deliberately does not, measuring the actor `Measured::AsGiven` on the ground that
+    /// `GateDecided.actor` goes through no redaction. A loop-gate branch bolted onto that
+    /// path inherits the gap silently, which is precisely how the s3 leak happened.
+    ///
+    /// **Why `actor` is REQUIRED**, a plain `String` exactly like
+    /// [`JournalEvent::GateDecided`]'s and [`JournalEvent::AgentAnswered`]'s. A gate
+    /// decision is an APPROVAL, and an approval always records who claimed to give it.
+    /// That is not an analogy to s2: it is the same argument the s4 design makes for
+    /// itself one section earlier (§3, "Expiry vs decision"), where reading expiry before
+    /// the decision is justified on the ground that answering `continue` **authorizes
+    /// another iteration of spend**. An authorization with no attribution at all is the
+    /// row an audit cannot use. So the type refuses to express one.
+    ///
+    /// The field carried an `Option<String>` from its introduction (s4 Task 3) until it
+    /// was narrowed here. The narrowing belongs to no task of the s4 plan: it landed OUT
+    /// OF BAND, between that plan's Tasks 4 and 5, because it changes the JOURNAL's shape
+    /// and such a change is cheap only while nothing writes the event (Task 6 is the
+    /// first writer). The spec that specified the `Option` never argued for it, and no
+    /// reading of the slice's own reasoning supports it — a loop gate's decider is
+    /// exactly as attributable as a `HumanGate`'s. Since no journal holds a `None` to
+    /// migrate, a stored row without the field now fails to deserialize, loudly, which is
+    /// the correct treatment of an approval whose attribution was lost. (An earlier doc
+    /// justified the `Option` as room for "an automated operator on a schedule". That is
+    /// wrong twice over: an automated operator has a name, and naming it is what
+    /// `actor_or` exists for.)
+    ///
+    /// The remaining degenerate value is `""`, and nothing normalises it away — the fold
+    /// stores what was appended, so an audit reader sees exactly the string the writer
+    /// chose. It is a WRITER BUG rather than a legal encoding of "anonymous": torii's
+    /// `cmd::gate::actor_or`/`actor_or_user` never yield an empty actor (an unresolvable
+    /// one is named `unknown`, precisely because a blank audit row is indistinguishable
+    /// from a bug), and the s4 CLI decide path MUST route through them for that reason.
+    /// An embedder appending directly owes the same discipline.
+    LoopGateDecided {
+        node: NodeId,
+        option: String,
+        actor: String,
+    },
+    /// SP-6 s4: a drive HONOURED a loop gate's decision while that gate was still live —
+    /// the durable half of "the decision was made in time".
+    ///
+    /// **It exists because a `Loop` re-derives every iteration's gate on every drive, and
+    /// the SLA is per-GATE while the clock is global.** `run_loop` re-enters
+    /// `for i in 0..max_iters` from zero on each wake, so iteration 0's gate is
+    /// recomputed forever; `wait_or_expire_by_id` answers only from `now >= recorded
+    /// deadline`, and knows nothing about a decision an earlier drive already read,
+    /// honoured and spent an iteration against. Without this row, the moment wall-clock
+    /// passed the FIRST gate's deadline the whole `Loop` died — even though every person
+    /// had answered inside their own gate's SLA — taking every earlier iteration's tokens
+    /// with it, unrecoverably. Reproduced twice by review: a 3-iteration loop whose
+    /// operator answered at +30m and +70m under a 1h SLA, and a loop that had already
+    /// CONVERGED and was retroactively killed a day later when a downstream signal woke
+    /// the run.
+    ///
+    /// It is the SUCCESS mirror of the `NodeFailed` the expiry path writes, and it is
+    /// written for the same reason: a verdict is settled by the drive that produces it and
+    /// READ BACK afterwards, never re-derived against a moving clock. The alternative —
+    /// reading the decision before the deadline — is the s3 ordering this slice
+    /// deliberately inverts (§3, "Expiry vs decision"), and it reopens the hole AC8 exists
+    /// for: a "continue" arriving after the SLA would authorize another iteration of
+    /// spend. Ordering the row this way keeps both properties at once, because an
+    /// UNSETTLED gate still meets the clock first.
+    ///
+    /// `option` is the name that was honoured, and the replay resolves THAT against the
+    /// journaled menu rather than re-reading `LoopGateDecided`. The difference is
+    /// deliberate and narrow: `LoopGateDecided` is folded LAST-wins so an operator can
+    /// correct a decision *before the run resumes*, and this row is exactly the line
+    /// after which "before" has passed — the loop has already spent an iteration on the
+    /// strength of the answer, so a later correction must not retroactively move where
+    /// the loop converged.
+    ///
+    /// FIRST record wins when folded. The executor writes at most one (it reads the row
+    /// back ahead of everything that could write another), so a second can only come from
+    /// a journal the executor did not write, and the first is the one that describes what
+    /// actually happened.
+    ///
+    /// Additive, like the pair above: `FORMAT_VERSION` stays 1.
+    LoopGateSettled {
+        node: NodeId,
+        option: String,
     },
 }
 
@@ -508,7 +746,7 @@ pub trait ExecutionJournal: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::ObservationMeta;
+    use super::{FORMAT_VERSION, ObservationMeta};
     use crate::{EffectClass, EffectOutput, JournalEvent, NodeId, effect_id};
 
     /// An OLD journal — serialized before this slice — must still deserialize, with
@@ -834,6 +1072,186 @@ mod tests {
         }
     }
 
+    /// AC20 — the durable format version is PINNED, so it cannot move unannounced.
+    ///
+    /// Named for what it checks rather than for the slice that added it, because a
+    /// constant comparison cannot observe a slice: no change to any variant can fail
+    /// this, and a legitimate future bump will. The first version of this test was
+    /// called `the_loop_gate_variants_do_not_move_the_format_version`, which promised an
+    /// additivity guard it could not deliver — under a genuine wire break
+    /// (`#[serde(rename_all = "snake_case")]` on the enum, say) it stays GREEN.
+    ///
+    /// Additivity is proven elsewhere and deliberately not restated here:
+    /// `an_old_journal_event_deserializes_with_the_new_fields_absent` and
+    /// `adding_the_signal_events_does_not_break_old_event_loading` decode genuine
+    /// pre-slice JSON literals, and those are the two that redden on that mutation.
+    /// Nothing else in the workspace asserts `FORMAT_VERSION`; the only other readers
+    /// are `PostgresJournal`'s resume fence and its `IncompatibleFormat` error.
+    ///
+    /// **Nothing in this crate notices that a variant was ADDED.** An earlier version of
+    /// this doc claimed "the existing variant-count assertion in this module" did; there
+    /// is no such assertion. The `variants.len() > 10` check in
+    /// `no_doc_comment_links_a_journal_event_variant_by_its_bare_name` is a LOWER bound
+    /// that guards its own scrape against silently finding nothing, and 24 variants
+    /// against a bound of 10 cannot detect one more. `fold_journal`
+    /// (`orchestrator::executor::support`) carries a `_` catch-all and absorbs an
+    /// unknown variant silently. The one real detector is the exhaustive `label` helper
+    /// in `crates/orchestrator/src/executor/tests.rs` — and being `#[cfg(test)]`, it is
+    /// invisible to `cargo build --workspace`; only `--all-targets` compiles it.
+    /// (Verified: with its three loop-gate arms deleted, `cargo build --workspace` exits 0
+    /// while `cargo check --workspace --all-targets` exits 101 with one `E0004`. It earned
+    /// its keep again when the s4 review added `LoopGateSettled`: that arm was the single
+    /// compile error the whole `--all-targets` build produced.)
+    #[test]
+    fn the_durable_journal_format_version_is_pinned_at_1() {
+        assert_eq!(
+            FORMAT_VERSION, 1,
+            "the durable journal format version moved. Adding a VARIANT must never move \
+             it — if this failed alongside a new variant, that variant is not additive \
+             and the change is a format break. A DELIBERATE break edits this assertion \
+             too, together with the resume fence's migration story \
+             (`JournalError::IncompatibleFormat`)."
+        );
+    }
+
+    /// The THREE variants round-trip, carrying everything an operator needs to see the
+    /// question, the menu, the deadline and the decision off the journal alone — plus, for
+    /// the executor, which decision a drive already HONOURED.
+    ///
+    /// Every field is asserted BY VALUE, and that is the point of the test rather than
+    /// pedantry. The version this slice first shipped asserted the decided half with
+    /// `matches!(.., JournalEvent::LoopGateDecided { .. })` — the variant TAG only — and
+    /// built the awaited half with `deadline: None`, which `assert!(deadline.is_none())`
+    /// cannot tell apart from a DROPPED field, because `None` is exactly what serde's
+    /// default yields. Mutation-proven vacuous: `#[serde(skip)]` on
+    /// `LoopGateDecided::option`, on its `actor`, and on `LoopGateAwaited::deadline` each
+    /// left it green. Those three are the fields the slice turns on — `option` is the
+    /// decision Task 6 matches against the journaled menu (a lost value becomes `""` and
+    /// fails the match per AC14b), and `deadline` is the input to the
+    /// expiry-before-decision rule — so the guard has to be able to see them. All three
+    /// mutations redden this version.
+    ///
+    /// The `actor` half also pins the field's REQUIREDNESS, not just its value: see the
+    /// unattributed-row case below, which is the only thing standing between the
+    /// variant's "an approval always records who claimed to give it" contract and a
+    /// one-attribute regression back to a silently blank audit row.
+    #[test]
+    fn the_loop_gate_events_round_trip() {
+        let asked_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(3_000_000, 0).expect("a valid instant");
+        let awaited = JournalEvent::LoopGateAwaited {
+            node: NodeId("lp/0/__gate__".into()),
+            deadline: Some(asked_at),
+            prompt: "Continue?".into(),
+            menu: vec![crate::graph::LoopGateOption {
+                name: "done".into(),
+                stops: true,
+            }],
+        };
+        let json = serde_json::to_string(&awaited).expect("serialises");
+        let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+        match back {
+            JournalEvent::LoopGateAwaited {
+                node,
+                prompt,
+                menu,
+                deadline,
+            } => {
+                assert_eq!(node.0, "lp/0/__gate__");
+                assert_eq!(prompt, "Continue?");
+                assert_eq!(menu.len(), 1);
+                // The NAME as well as the flag: the name is what `torii run gate decide
+                // --option` is matched against, so a menu that survives the wire without
+                // its names is a menu no operator can answer.
+                assert_eq!(menu[0].name, "done");
+                assert!(menu[0].stops);
+                // The exact instant, not merely `is_some()` — this is the field whose
+                // silent loss is the never-expires bug the variant's own doc names.
+                assert_eq!(deadline, Some(asked_at));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let decided = JournalEvent::LoopGateDecided {
+            node: NodeId("lp/0/__gate__".into()),
+            option: "done".into(),
+            actor: "jerry".into(),
+        };
+        let json = serde_json::to_string(&decided).expect("serialises");
+        let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+        match back {
+            JournalEvent::LoopGateDecided {
+                node,
+                option,
+                actor,
+            } => {
+                assert_eq!(node.0, "lp/0/__gate__");
+                assert_eq!(option, "done");
+                assert_eq!(actor, "jerry");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // A decision whose `actor` field is ABSENT from the row must FAIL to decode, not
+        // decode as `""`. This is the guard on the variant's central doc claim — that the
+        // type refuses to express an unattributed approval — and it is a real guard, not
+        // a restatement of serde's defaults, because one attribute (`#[serde(default)]`
+        // on `actor`) turns the refusal back into a silent `""` and there is otherwise
+        // nothing to notice. It replaces the `actor: None` case this test carried while
+        // the field was an `Option`, whose premise (an anonymous decision is a legal
+        // shape) is exactly what the narrowing removed.
+        //
+        // Hand-written JSON rather than a serialised value: the shape being pinned is one
+        // the type can no longer construct, which is the point.
+        let unattributed = r#"{"LoopGateDecided":{"node":"lp/0/__gate__","option":"again"}}"#;
+        let err = serde_json::from_str::<JournalEvent>(unattributed)
+            .expect_err("an approval with no attribution must not decode");
+        assert!(
+            err.to_string().contains("actor"),
+            "the failure must name the missing field so an operator reading a decode \
+             error can see WHICH row is unusable; got: {err}"
+        );
+
+        // …and the degenerate value that IS still expressible, `""`, round-trips
+        // VERBATIM. Nothing in the wire format normalises it to `unknown` or drops it:
+        // resolving an unresolvable actor to a name is torii's job at the WRITE side
+        // (`cmd::gate::actor_or`), and a reader inventing one here would launder a writer
+        // bug into a plausible-looking audit row.
+        let claimed_empty = JournalEvent::LoopGateDecided {
+            node: NodeId("lp/0/__gate__".into()),
+            option: "again".into(),
+            actor: String::new(),
+        };
+        let json = serde_json::to_string(&claimed_empty).expect("serialises");
+        match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
+            JournalEvent::LoopGateDecided { option, actor, .. } => {
+                assert_eq!(option, "again");
+                assert_eq!(actor, "", "an empty actor is preserved, never re-labelled");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // The settlement, whose `option` is the field the whole variant exists to carry:
+        // it is what the replay resolves against the journaled menu, so a value lost on
+        // the wire becomes `""`, matches nothing in any menu, and turns a settled gate
+        // into a terminal `NodeFailed` — killing a `Loop` that had already succeeded, on
+        // the very resume path the variant was added to protect. Asserted BY VALUE for
+        // the reason the two above are, and mutation-proven the same way
+        // (`#[serde(skip)]` on `option` reddens this).
+        let settled = JournalEvent::LoopGateSettled {
+            node: NodeId("lp/0/__gate__".into()),
+            option: "again".into(),
+        };
+        let json = serde_json::to_string(&settled).expect("serialises");
+        match serde_json::from_str::<JournalEvent>(&json).expect("deserialises") {
+            JournalEvent::LoopGateSettled { node, option } => {
+                assert_eq!(node.0, "lp/0/__gate__");
+                assert_eq!(option, "again");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     /// No doc comment in this file may link a `JournalEvent` variant by its BARE name.
     ///
     /// An enum variant is not in scope as a bare rustdoc path, so a link whose whole
@@ -872,9 +1290,16 @@ mod tests {
             })
             .collect();
         assert!(
-            variants.len() > 10 && variants.contains(&"GateAwaited"),
-            "variant scrape broke — it found {variants:?}, so the guard below would \
-             pass vacuously"
+            variants.len() > 10
+                && variants.contains(&"GateAwaited")
+                && variants.contains(&"LoopGateAwaited"),
+            "the scrape found {variants:?}. Either it broke — in which case the guard \
+             below would pass vacuously, which is what this check exists to prevent — \
+             or one of the two named sentinels was legitimately REMOVED, in which case \
+             pick a different one. This is a LOWER bound and two spot-checks, not a \
+             variant census: it cannot notice a variant being added, and nothing in \
+             this crate can (see \
+             `the_durable_journal_format_version_is_pinned_at_1`)."
         );
 
         // Every ``[`target`]`` NOT followed by `(` — i.e. a link with no explicit

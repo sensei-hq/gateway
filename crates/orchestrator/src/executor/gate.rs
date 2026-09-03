@@ -155,13 +155,14 @@ impl Executor {
             // journal.
             //
             // Its absence here is not a case to paper over. `deadlines` is folded from
-            // ALL THREE waiting kinds — `SignalAwaited`, `GateAwaited` and, since SP-6 s3,
-            // `AgentAwaited` (one answer to "has this node begun asking?", shared by every
-            // kind) — while only `GateAwaited` carries a menu, so this arm is reachable by
-            // editing a live run's graph to swap a waiting node's KIND. s3 WIDENS that
-            // reachable set rather than changing this arm's handling: an `Agent` node
-            // backed by a human that has already asked, re-pointed at a `HumanGate`,
-            // arrives here exactly like the s1 `AwaitSignal` swap does. Falling back to
+            // ALL FOUR waiting kinds — `SignalAwaited`, `GateAwaited`, and since SP-6 s3
+            // and s4 `AgentAwaited` and `LoopGateAwaited` (one answer to "has this node
+            // begun asking?", shared by every kind) — while only `GateAwaited` carries
+            // THIS kind's menu, so this arm is reachable by editing a live run's graph to
+            // swap a waiting node's KIND. s3 WIDENS that reachable set rather than
+            // changing this arm's handling: an `Agent` node backed by a human that has
+            // already asked, re-pointed at a `HumanGate`, arrives here exactly like the s1
+            // `AwaitSignal` swap does. Falling back to
             // the graph's `options` in any of those cases would validate a human's answer
             // against a menu no human was ever shown — the non-durable menu §4 rejects —
             // and would do it silently.

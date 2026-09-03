@@ -360,16 +360,32 @@ pub struct AwaitingNode {
     /// operator is most likely to lose track of, so it renders explicitly rather than
     /// blank.
     pub deadline: Option<DateTime<Utc>>,
-    /// SP-6 s2: the menu, for a `HumanGate`. `Some` therefore means exactly one thing — a
-    /// gate, decidable with `torii run gate decide --option <name>`.
+    /// SP-6 s2: the menu, for a gate. `Some` means exactly one thing for the OPERATOR — a
+    /// node decidable with `torii run gate decide --option <name>` — and that stayed true
+    /// when SP-6 s4 added the second menu-bearing kind, which takes the same verb.
     ///
     /// **`None` alone does NOT mean "an `AwaitSignal`"** — SP-6 s3 added a third waiting
     /// kind, a human-backed `Agent` answered with `torii run agent answer --text`, and it
     /// publishes no menu either. It is told apart by [`question`](Self::question) being
-    /// `Some`, so the full discriminator is the PAIR: `options` ⇒ a gate, `question` ⇒ a
-    /// human-backed agent, neither ⇒ an `AwaitSignal`. A script that read absence of
-    /// `options` alone as "arbitrary JSON, use `run signal`" would issue a command
-    /// `cmd::run::signal` REFUSES for an agent node.
+    /// `Some`, so the full discriminator is the PAIR: `options` alone ⇒ a `HumanGate`,
+    /// `question` alone ⇒ a human-backed agent, BOTH ⇒ a `Loop`'s human gate (s4), neither
+    /// ⇒ an `AwaitSignal`. A script that read absence of `options` alone as "arbitrary
+    /// JSON, use `run signal`" would issue a command `cmd::run::signal` REFUSES for an
+    /// agent node.
+    ///
+    /// **The fourth case is additive for a script written against s2 or s3**, deliberately:
+    /// the rule "`options` present ⇒ `gate decide`" is evaluated FIRST everywhere (here,
+    /// in [`awaiting_section`]'s cell match, and in every cross-refusal), so a consumer
+    /// that never heard of a loop gate still builds the right command for one. What it
+    /// must not do is test `question` first and conclude `agent answer`, which is the one
+    /// verb a loop gate refuses.
+    ///
+    /// "Everywhere" is measured, not assumed — this sentence shipped once while it was
+    /// false. `cmd::human::answer` gated its whole refusal block on `agent_question(..)`,
+    /// i.e. it read the QUESTION first, and answered a menu-bearing node with exit 0;
+    /// `cmd::run::awaiting_nodes` derived the kind from a parallel rule that disagreed with
+    /// `gate_menu` on a `GateAwaited` + `LoopGateAwaited` journal. Both are fixed, and the
+    /// listing now resolves the kind by CALLING `gate_menu` rather than by re-deriving it.
     ///
     /// Read from the journaled `GateAwaited`, so `list-paused` needs no graph load —
     /// which matters because `list-paused` folds one journal per paused run and has no
@@ -383,10 +399,12 @@ pub struct AwaitingNode {
     /// `gate decide` without loading the graph either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
-    /// SP-6 s3: the QUESTION, for a human-backed `Agent`. `Some` means exactly one thing —
-    /// a role answered by a person, answerable with `torii run agent answer --text`.
+    /// SP-6 s3: the QUESTION, for a human-backed `Agent` — or, since s4 and only when
+    /// [`options`](Self::options) is `Some` beside it, for a `Loop`'s human gate. Alone it
+    /// means a role answered by a person, answerable with `torii run agent answer --text`.
     ///
-    /// Read from the journaled `AgentAwaited`, first-wins, so — like the menu above — no
+    /// Read from the journaled `AgentAwaited` (or `LoopGateAwaited`), first-wins, so — like
+    /// the menu above — no
     /// graph load is needed. That is not a convenience: `list-paused` folds one journal per
     /// paused run and holds no graph, and even with one the graph could not answer, because
     /// the question is composed largely from the REGISTRY (the agent's system prompt and its
@@ -526,25 +544,61 @@ const TASK_SEP: &str = " ## Task ";
 /// `--json` is unaffected and still carries the whole question — the display-only transforms
 /// (`one_line`, the caps) live here rather than on `AwaitingNode`, matching the split
 /// `json`/`table` already draw for a pause reason.
-fn question_cell(q: &str) -> String {
+/// `label` is everything the cell puts before the opening quote — `"agent: "` for a
+/// human-backed `Agent`, and the empty string for a loop gate, whose row leads with its
+/// MENU instead (see [`loop_gate_cell`]). It is charged against [`QUESTION_MAX`] like every
+/// other character of the cell, so the bound means the same thing whichever label is used.
+fn question_cell(label: &str, q: &str) -> String {
     // No marker ⇒ nothing to reserve. Reachable two ways, both fine: a question composed
     // by something other than `compose`, and — the real one — a secret whose redacted span
     // swallowed the delimiter, in which case there is no ask to protect.
     let Some(split) = q.rfind(TASK_MARKER) else {
-        return cap_chars(&format!("agent: \"{}\"", one_line(q)), QUESTION_MAX);
+        return cap_chars(&format!("{label}\"{}\"", one_line(q)), QUESTION_MAX);
     };
     let ask = cap_chars(&one_line(&q[split + TASK_MARKER.len()..]), QUESTION_ASK_MAX);
-    // `agent: "` + `"` are 9 characters of the cell that are not the question, and the
-    // separator sits between the two halves — all charged against `QUESTION_MAX` so the
-    // rendered cell is bounded by exactly the same number the no-marker arm is.
+    // The label and the two quotes are the characters of the cell that are not the
+    // question, and the separator sits between the two halves — all charged against
+    // `QUESTION_MAX` so the rendered cell is bounded by exactly the same number the
+    // no-marker arm is.
     // …plus one for the `…` `cap_chars` appends BEYOND its `max` when it truncates. Without
     // that char the reserve would render one character over `QUESTION_MAX`.
-    let overhead = "agent: \"\"".chars().count() + TASK_SEP.chars().count() + 1;
+    let overhead = label.chars().count() + 2 + TASK_SEP.chars().count() + 1;
     let room = QUESTION_MAX.saturating_sub(overhead + ask.chars().count());
     format!(
-        "agent: \"{}{TASK_SEP}{ask}\"",
+        "{label}\"{}{TASK_SEP}{ask}\"",
         cap_chars(&one_line(&q[..split]), room)
     )
+}
+
+/// Render the `loop gate:` cell for one `Loop` gate decided by a person — the only waiting
+/// kind that publishes BOTH a menu and a question, and so the only one whose cell carries
+/// both.
+///
+/// It needs both because they answer different questions and neither implies the other: the
+/// MENU is the vocabulary `torii run gate decide --option` is validated against (an operator
+/// who cannot see it cannot type a name that will be accepted), and the QUESTION is the work
+/// — a loop gate asks about one iteration's output, so "which option" is meaningless without
+/// "of what". Neither is recoverable from anywhere else: the node's path is synthesized per
+/// iteration and exists in no graph.
+///
+/// The two halves are bounded SEPARATELY — the menu by [`MENU_MAX`], the question by
+/// [`QUESTION_MAX`], exactly as each is bounded in the row it appears in alone — rather than
+/// squeezing both into one budget, which would let a verbose menu delete the question or a
+/// verbose question delete the menu. The cost is a row up to the sum of the two, which is
+/// the honest price of a kind that genuinely carries twice as much.
+fn loop_gate_cell(options: &[String], q: &str) -> String {
+    let menu = cap_chars(
+        &format!(
+            "loop gate: {}",
+            options
+                .iter()
+                .map(|o| one_line(o))
+                .collect::<Vec<_>>()
+                .join("|")
+        ),
+        MENU_MAX,
+    );
+    format!("{menu}  {}", question_cell("", q))
 }
 
 /// One run's awaiting set — or, when that run's journal could not be folded, the reason.
@@ -602,18 +656,33 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
     let any_gate = rows
         .iter()
         .any(|(_, a)| matches!(a, Ok(nodes) if nodes.iter().any(|n| n.options.is_some())));
+    // BOTH gate kinds take this one verb, so they share the line rather than adding a
+    // fourth: the operator's vocabulary stays three commands. The wording widens only when
+    // a loop gate is actually present, which keeps an s2/s3 fleet's output byte-identical
+    // — the same rule the agent line below follows.
+    let any_loop_gate = rows.iter().any(
+        |(_, a)| matches!(a, Ok(nodes) if nodes.iter().any(|n| n.options.is_some() && n.question.is_some())),
+    );
     if any_gate {
-        s.push_str(
+        s.push_str(if any_loop_gate {
+            "                   a `gate:` or `loop gate:` row takes a named option instead — \
+             `torii run gate decide <run> --node <node> --option <name>`\n"
+        } else {
             "                   a `gate:` row takes a named option instead — \
-             `torii run gate decide <run> --node <node> --option <name>`\n",
-        );
+             `torii run gate decide <run> --node <node> --option <name>`\n"
+        });
     }
     // The same conditional shape the gate line uses, and for the same two reasons: a fleet
     // with no human-backed agent sees byte-identical s1/s2 output, and an operator is only
     // told about a verb they can actually use here.
-    let any_agent = rows
-        .iter()
-        .any(|(_, a)| matches!(a, Ok(nodes) if nodes.iter().any(|n| n.question.is_some())));
+    //
+    // `question.is_some()` is NOT sufficient since s4: a loop gate publishes a question too
+    // and is decided with `gate decide`, so keying on the question alone would print "an
+    // `agent:` row takes free text" for a fleet whose only waiting node refuses free text —
+    // advertising the one verb it rejects. The pair is the discriminator.
+    let any_agent = rows.iter().any(
+        |(_, a)| matches!(a, Ok(nodes) if nodes.iter().any(|n| n.question.is_some() && n.options.is_none())),
+    );
     if any_agent {
         s.push_str(
             "                   an `agent:` row takes free text instead — \
@@ -629,15 +698,27 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
                     // and cap a node id does: a raw newline would forge an extra row, and
                     // an ESC could rewrite what is already on screen.
                     //
-                    // The MENU is checked first, matching the order `cmd::run::signal`
-                    // checks its two refusals in (`gate_menu`, then `agent_question`). One
-                    // node cannot legitimately publish both — they are different node kinds
-                    // and the executor writes exactly one event per kind — but a corrupt or
-                    // hand-written journal could, and when the listing and the refusals
-                    // disagree about which kind a node is, the listing sends an operator to
-                    // a command that refuses them.
+                    // The MENU is checked first, matching the order every refusal path
+                    // checks in (`gate_menu`, then `agent_question` — `cmd::run::signal`
+                    // and `cmd::human::answer` both, the latter only since the review that
+                    // measured it reading the question first), so a node the listing and
+                    // the refusals could disagree about is never sent to a command that
+                    // refuses it.
+                    //
+                    // BOTH ⇒ a loop gate, and that is a construction rather than a
+                    // convention: `cmd::run::awaiting_nodes` resolves a node's kind through
+                    // `cmd::gate::gate_menu` — the SAME function the refusals call — and
+                    // fills `question` beside a menu only for the `Loop` variant. So this
+                    // arm cannot be reached by a hand-written journal that published a
+                    // `GateAwaited` and an `AgentAwaited` at one id (that node has no
+                    // `question` at all here), nor by one that published a `GateAwaited`
+                    // and a `LoopGateAwaited` (the resolver's first-wins-in-journal-order
+                    // decides which, and the refusals get the same answer by construction).
+                    // Both journals were rendered as a kind the refusals disagreed with
+                    // before those two fixes.
                     let cell = match (&a.options, &a.question) {
-                        (Some(opts), _) => cap_chars(
+                        (Some(opts), Some(q)) => loop_gate_cell(opts, q),
+                        (Some(opts), None) => cap_chars(
                             &format!(
                                 "gate: {}",
                                 opts.iter()
@@ -667,7 +748,7 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
                         // The cell is built by [`question_cell`] rather than inline,
                         // because it does more than cap: it RESERVES the `## Task` tail,
                         // which `compose` puts last and a front-cut would delete.
-                        (None, Some(q)) => question_cell(q),
+                        (None, Some(q)) => question_cell("agent: ", q),
                         (None, None) => "signal".to_string(),
                     };
                     s.push_str(&format!(
@@ -737,7 +818,7 @@ mod tests {
             "x".repeat(5_000),
             "y".repeat(5_000)
         );
-        let cell = question_cell(&composed);
+        let cell = question_cell("agent: ", &composed);
         assert!(
             cell.chars().count() <= QUESTION_MAX,
             "the reserve must not overrun the cap: {} chars",
@@ -752,9 +833,47 @@ mod tests {
             "and the head still leads the cell: {cell}"
         );
 
+        // **The EMPTY label — the loop gate's, and the case the reserve arithmetic was
+        // generalised for.** `overhead` went from a hardcoded `"agent: \"\"".chars()
+        // .count()` to `label.chars().count() + 2`, and the `0 + 2` branch is taken by every
+        // real loop gate (`HumanQuestion::compose` appends `TASK_MARKER` unconditionally)
+        // and, until this assertion, by no test: every test that reached the marker arm
+        // passed `"agent: "`, measured with a probe.
+        //
+        // **EXACT, not `<=`, and that is the whole guard.** The two errors the label term
+        // can make are not symmetric and the `<=` this block first shipped with caught only
+        // one of them — the one the `"agent: "` case above already catches, since it runs
+        // first and panics first. An UNDER-count overruns the cap (drop the `+ 2` and the
+        // agent assertion at the top of this test fires at 302 chars). An OVER-count does
+        // the opposite: reverting to the hardcoded `"agent: \"\"".chars().count()` charges
+        // this label 9 instead of 2 and renders 293 — seven characters of budget silently
+        // unspent, on the widest cell in the block, and `<=` passes. Measured: that exact
+        // revert left all 259 torii lib tests green. An earlier version of this comment
+        // named the over-count as the one that "would push the cell past `QUESTION_MAX`",
+        // which is backwards.
+        //
+        // The cell is exactly `QUESTION_MAX` because that is what the arithmetic means:
+        // `room` is whatever `QUESTION_MAX` has left after the overhead and the reserved
+        // ask, and a 5,000-char head always fills it.
+        let cell = question_cell("", &composed);
+        assert_eq!(
+            cell.chars().count(),
+            QUESTION_MAX,
+            "the empty label must be charged exactly its two quotes — no more (budget \
+             silently unspent) and no less (the cap overrun): {cell}"
+        );
+        assert!(
+            cell.contains(TASK_SEP) && cell.contains("yyyy"),
+            "…and the ask's share is reserved for it too: {cell}"
+        );
+        assert!(
+            cell.starts_with("\"standing"),
+            "…with no label, so the cell opens on the quote: {cell}"
+        );
+
         // No marker ⇒ the pre-reserve rendering, unchanged.
         let plain = "q".repeat(5_000);
-        let cell = question_cell(&plain);
+        let cell = question_cell("agent: ", &plain);
         assert_eq!(
             cell,
             cap_chars(&format!("agent: \"{plain}\""), QUESTION_MAX),
