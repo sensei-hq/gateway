@@ -1,55 +1,44 @@
 # Checkpoint
 
-**Slice: SP-DATA-5 follow-on — the budget clamp. COMPLETE, reviewed, pushed.** PR #51 is open
-against `main` and awaiting the mandatory human review. Next action: merge it.
+**SP-DATA-5 budget clamp is COMPLETE and ON `main`** (PR #51, `41411f8`). `develop` is 2 commits
+ahead with the sandbox-flake fix; no slice in flight.
 
 ## Done
 
 A budgeted `Chat` carries `max_tokens = min(remaining − est_input, the chain's smallest
 max_output_tokens, the chain's context window − est_input, the caller's own)`, set at the single
-`dispatch_metered` chokepoint, so the PROVIDER enforces the cap rather than our arithmetic. Below a
-`MIN_OUTPUT_TOKENS` (256) allowance the run refuses through the existing durable pause and makes
-**no call at all**. Unbudgeted runs byte-identical. **The claim this slice does NOT make:** the
-overshoot is **bounded by the input-estimate error, biased toward refusing early — NOT eliminated**.
+`dispatch_metered` chokepoint, so the PROVIDER enforces the cap. Below a `MIN_OUTPUT_TOKENS` (256)
+allowance the run refuses through the existing durable pause and makes **no call**. Unbudgeted runs
+byte-identical. **The claim it does NOT make:** the overshoot is bounded by the input-estimate error
+and biased toward refusing early — **not eliminated**.
 
-## The whole-slice review (`/sensei:review`) — 4 HIGH, 6 MEDIUM, all fixed
+`/sensei:review` found **4 HIGH + 6 MEDIUM**, all fixed (`b22cce2` clamp bounded output but not the
+CONTEXT WINDOW, so a long-prompt call that succeeds unbudgeted hard-failed once budgeted, plus the
+clamp being unobserved on the agent/selector paths · `210d098` the floor's raise went stale ·
+`d19f2bf` six doc surfaces).
 
-Five parallel adversarial lenses. Security returned NO FINDINGS; the sensei daemon was down so every
-MCP check was NOT RUN and fell back to git/grep.
+## The sandbox flake is FIXED (`5ea6ebe`) — it was never a timing flake
 
-- `b22cce2` **A** — the ceiling bounded OUTPUT but not the CONTEXT WINDOW, so a long-prompt call that
-  succeeds unbudgeted hard-FAILED once a budget was set, as `NodeFailed` (unrecoverable by `wake`).
-  Plus two coverage holes: the clamp was unobserved on the AGENT and SELECTOR paths, and the
-  estimate's `system`/`tools` terms were unwired at the call site — both mutations reddened nothing.
-- `210d098` **B** — the floor's recommended raise went stale (a sibling spends after the pause, since
-  `drive` does not stop at one), and the follow-up `Spent` message named no figure at all. Now stated
-  as headroom above FINAL spend.
-- `d19f2bf` **C** — six doc surfaces still describing the pre-clamp contract, incl. a config
-  reference claiming to list "all" validation rules while listing 4 of 5, and the fence census
-  saying 3 `input_hash` call sites where there are 5.
+`spawn_capped` drained stdout and stderr with two SEQUENTIAL `recv_timeout(CAPTURE_GRACE)` calls, so
+the real bound was `2 × CAPTURE_GRACE` = 4s against a test asserting < 5s. Full-suite load ate that
+margin; isolation did not, which is why it read as noise. The streams now share ONE deadline —
+measured **4.02s → 2.01s**. Widening the test number would have left a 4s stall in production.
+`CAPTURE_GRACE` is module-scope and **all four** wall assertions derive from it; two had the same
+sub-second margin and had simply not failed yet. **6 consecutive full-suite runs, 0 failures.**
 
-## Verified at `d19f2bf` — real exit codes
+## Verified at `fa685dd` — real exit codes
 
 `cargo test --workspace` **1686 passed / 0 failed / 56 ignored, exit 0** · `clippy --workspace
---all-targets -- -D warnings` **exit 0** · `fmt --all --check` **exit 0** · `cargo doc` unresolved
-links **16**, the baseline. No database started; `$DATABASE_URL` never read.
+--all-targets -- -D warnings` **0** · `fmt --all --check` **0** · `cargo doc` unresolved links
+**16** (baseline). No database started; `$DATABASE_URL` never read.
 
 ## Next command
 
-`gh pr merge 51 --merge`, then `git merge origin/main && git push origin develop`.
+Open the batched `develop` → `main` PR for the 2 commits when wanted:
+`gh pr create --base main --head develop`.
 
-## The sandbox flake is FIXED (`5ea6ebe`) — it was not a timing flake
+## Known-broken
 
-`spawn_capped` drained stdout and stderr with two SEQUENTIAL `recv_timeout(CAPTURE_GRACE)` calls, so
-the real bound was `2 × CAPTURE_GRACE` = 4s while the test asserted < 5s. Under a second of margin,
-which full-suite load ate; in isolation it held, which is why it read as noise. The two streams now
-share ONE deadline — measured 4.02s → 2.01s on the escaped-descendant path. Widening the test number
-would have left a 4s stall in production. `CAPTURE_GRACE` is module-scope and **all four** wall
-assertions derive from it; two of them had the same sub-second margin and had simply not failed yet.
-**Verified 6 consecutive full-suite runs, 0 failures**, at the rate that previously produced one.
-
-## Known-broken / open
-
-Nothing broken; no known flakes. Known gap written into the clamp's code rather than hidden: when
-the WINDOW is the binding term, the refusal still reads as a budget problem and names a raise that
-cannot help. **The sensei daemon is not running, so this file is the only durable record.**
+Nothing, and no known flakes. One gap written into the clamp's code rather than hidden: when the
+WINDOW is the binding term the refusal still reads as a budget problem and names a raise that cannot
+help. **The sensei daemon is not running, so this file is the only durable record.**
