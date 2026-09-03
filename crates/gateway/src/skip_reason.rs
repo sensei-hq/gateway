@@ -23,6 +23,21 @@ pub enum SkipReason {
         estimated: f64,
         budget: f64,
     },
+    /// The candidate's context window cannot hold this request's estimated input.
+    ///
+    /// Carries both numbers because the remedy depends on the gap: a request slightly
+    /// over a small model's window is a ROUTING problem (widen or reorder the chain),
+    /// and one over every window is a PROMPT problem (send less). A single "too big"
+    /// would not distinguish them, and `AllGated` renders these strings verbatim, so
+    /// whatever is not here is not recoverable by the operator reading it.
+    ///
+    /// `estimated` is the pessimistic figure from
+    /// `engine::util::estimate_input_tokens_pessimistic`, NOT the cost estimate — see
+    /// that function for why the two deliberately differ.
+    OverContextWindow {
+        estimated: u32,
+        window: u32,
+    },
     CircuitOpen {
         until: Instant,
     },
@@ -46,6 +61,13 @@ impl std::fmt::Display for SkipReason {
                 write!(
                     f,
                     "over budget (estimated {estimated:.4}, budget {budget:.4})"
+                )
+            }
+            SkipReason::OverContextWindow { estimated, window } => {
+                write!(
+                    f,
+                    "estimated {estimated} input tokens exceeds the model's \
+                     {window}-token context window"
                 )
             }
             SkipReason::CircuitOpen { .. } => write!(f, "circuit breaker open"),
@@ -72,6 +94,13 @@ impl SkipReason {
                 _ => HumanAction::RotateCredential, // Auth (terminal); rate/quota are never terminal (until is Some)
             }),
             SkipReason::OverBudget { .. } => GateStatus::Terminal(HumanAction::RaiseBudget),
+            // Terminal, not Timed: no deadline passes that makes a model's window
+            // bigger. And not Structural either — the candidate is well configured, it
+            // is this request that does not fit it, and a Structural skip would not make
+            // the run pausable at all.
+            SkipReason::OverContextWindow { .. } => {
+                GateStatus::Terminal(HumanAction::UseLargerContextWindow)
+            }
             SkipReason::ModelNotFound
             | SkipReason::RouterNotFound
             | SkipReason::RouterDisabled
@@ -90,6 +119,37 @@ mod tests {
             SkipReason::UnsupportedCapability(crate::types::capability::Capability::TextEmbed),
             SkipReason::UnsupportedCapability(_)
         ));
+    }
+
+    /// An over-window skip is TERMINAL and points at the window, not at money.
+    ///
+    /// `Timed` would be wrong — no deadline passes that makes a model's window bigger —
+    /// and `Structural` would be wrong too, because the candidate is perfectly well
+    /// configured; it is this REQUEST that does not fit it. Structural skips do not make
+    /// a run pausable at all, so classifying it there would turn an operator-fixable
+    /// situation back into the hard failure this slice exists to remove.
+    /// Terminal-with-a-remedy is the only classification that produces an actionable
+    /// `AllGated` pause.
+    #[test]
+    fn over_context_window_is_terminal_and_names_the_window_remedy() {
+        let r = SkipReason::OverContextWindow {
+            estimated: 20_000,
+            window: 8_192,
+        };
+        assert!(
+            matches!(
+                r.gate_status(),
+                GateStatus::Terminal(HumanAction::UseLargerContextWindow)
+            ),
+            "over-window must be terminal with the window remedy, got {:?}",
+            r.gate_status()
+        );
+        let shown = r.to_string();
+        assert!(
+            shown.contains("20000") && shown.contains("8192"),
+            "the message must name BOTH the estimate and the window it exceeded, so an \
+             operator can see how far over they are: {shown}"
+        );
     }
 
     #[test]
