@@ -99,7 +99,7 @@ Describes one model and what it can do.
 | `provider` | `String` | Router id that serves this model. Must match a key in `routers` (builder validation). |
 | `capabilities` | `Vec<Capability>` | Capabilities this model supports (e.g. `TextChat`, `TextEmbed`). |
 | `context_window` | `u32` | Max context window in tokens. |
-| `max_output_tokens` | `u32` | Max output tokens. |
+| `max_output_tokens` | `u32` | Max output tokens. Must be non-zero (rule 5 below). |
 | `pricing` | `Option<ModelPricing>` | Cost model; `None` for free/local models. Omitted from JSON when `None`. |
 
 ### `ModelPricing`
@@ -150,7 +150,10 @@ validates before producing a `GatewayConfig`:
   1. at least one router must be configured;
   2. every router `url` must be non-empty;
   3. every chain entry's `model` must reference a known model;
-  4. every model's `provider` must have a corresponding router.
+  4. every model's `provider` must have a corresponding router;
+  5. every model's `max_output_tokens` must be non-zero — a model that can emit no
+     output cannot serve a chat call, and the SP-DATA-5 budget clamp would otherwise
+     send it `max_tokens: Some(0)` on every budgeted request.
 - `build() -> Result<GatewayConfig, Vec<String>>` returns `Err` with the full
   error list if validation fails.
 - `from_config(GatewayConfig)` reconstitutes a builder from an existing config

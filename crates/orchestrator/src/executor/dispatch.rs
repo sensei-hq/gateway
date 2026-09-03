@@ -32,7 +32,9 @@
 //! Map child's `MapChildPaused`).
 
 use gateway::GatewayError;
-use kernel::types::request::{InferenceRequest, InferenceResponse};
+use kernel::types::request::{
+    InferenceRequest, InferenceResponse, Message, Payload, ToolDefinition,
+};
 use orchestrator_core::{JournalEvent, NodeId, OrchestratorError, RunId};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -59,13 +61,22 @@ use super::Executor;
 /// tokens and completed. That is a deterministic check-then-act, not a memory-ordering
 /// race, so no atomic ordering fixes it. Re-checking inside the fan-out semaphore does
 /// not either — those permits ARE the concurrency, so N holders still check together
-/// against an unchanged ledger. A reservation would need an output-token estimate that
-/// is unknowable before the call (§8).
+/// against an unchanged ledger. A reservation was rejected because it would need an
+/// output-token estimate unknowable before the call — and that reason no longer holds:
+/// the SP-DATA-5 clamp below gives every budgeted `Chat` an explicit `max_tokens`, so a
+/// reservation could simply hold `est_input + max_tokens` and be conservative without
+/// predicting anything. What rules it out now is starvation rather than ignorance. That
+/// reservation is essentially the WHOLE remaining allowance, so the first child to claim
+/// it leaves every sibling under `MIN_OUTPUT_TOKENS` and refused — i.e. it would make a
+/// concurrent fan-out safe without making it concurrent, and pause siblings that
+/// serialising would have run. Recorded rather than deleted because "a reservation is
+/// impossible" is the wrong reason to carry forward if anyone revisits this.
 ///
 /// So a run WITH a budget takes [`gate`](Meter::gate) — a 1-permit `tokio::sync::Mutex`
 /// held across the whole check → dispatch → charge sequence — and therefore has at most
 /// one model call in flight at a time. That is what makes §6.5's "overshoot bounded by
-/// at most one call" true under fan-out, with no estimation.
+/// at most one call" true under fan-out, and it does so with no estimation of its own —
+/// the clamp's estimate bounds the size of that one call, not the number in flight.
 ///
 /// **The trade, stated plainly: a budgeted run gives up fan-out throughput for an exact
 /// cap.** A 6-wide `Map` under a budget dispatches its children one after another. That
@@ -133,19 +144,127 @@ impl<'a> Meter<'a> {
     }
 }
 
+/// The pessimistic input estimate for the budget clamp: the system prompt, every
+/// message body, every assistant turn's tool CALLS, and the tool schemas.
+///
+/// # What is counted, and what is not
+///
+/// Tool schemas are counted rather than waved off as small for two reasons. They are pure
+/// JSON, which is the worst case for a chars-per-token heuristic and the reason
+/// [`est_tokens_pessimistic`](crate::agent::prompt::est_tokens_pessimistic) exists at all;
+/// and an agent's activated schemas routinely outweigh its prompt. `over_budget` already
+/// counts them, for the same reason, and is the reference this mirrors — including its
+/// treatment of `description` as optional.
+///
+/// A message's `tool_calls` are counted for a plainer reason: they are SENT. The ReAct
+/// loop appends an assistant turn carrying them on every turn (`agent.rs`) and re-sends
+/// the whole transcript on every turn after that; `anthropic/convert.rs` renders each as
+/// a `ToolUse` block and `openai_compat/convert.rs` as a `tool_calls` array. Those turns
+/// have an EMPTY `content`, so counting only `as_text()` priced a serialized plan or an
+/// `fs_write` body — the largest payloads the loop produces — at zero, which under-counts
+/// in the one direction this function must not: `allowance = remaining − est`, so an
+/// estimate that is too low leaves an allowance that is too high.
+///
+/// `attachments` are NOT counted, and this is not an oversight to be silent about: the
+/// orchestrator never populates them (`agent.rs:469` and this module's own builder both
+/// pass `Vec::new()`), so counting them would be dead arithmetic. A producer that starts
+/// attaching media owes this function a term, and there is no way for it to find out
+/// except by reading this paragraph.
+///
+/// Deliberately NOT shared with `over_budget`/`est_prompt_tokens`: those answer "will this
+/// fit the context window", which wants to avoid false alarms and so wants the opposite
+/// bias. One function cannot serve both, and merging them would silently change a
+/// window-fit behaviour this slice has no business touching. `over_budget` has the same
+/// `tool_calls` gap and keeps it: an under-count there is the SAFE direction (it lets a
+/// turn through that might not fit) where here it is the expensive one.
+fn est_input_tokens(system: Option<&str>, messages: &[Message], tools: &[ToolDefinition]) -> u64 {
+    let est = |s: &str| crate::agent::prompt::est_tokens_pessimistic(s) as u64;
+    let mut total = system.map_or(0, est);
+    for m in messages {
+        total += est(m.content.as_text());
+        for call in &m.tool_calls {
+            total += est(&call.name) + est(&call.arguments);
+        }
+    }
+    for t in tools {
+        total += est(&t.name)
+            + t.description.as_deref().map_or(0, est)
+            + est(&t.input_schema.to_string());
+    }
+    total
+}
+
+/// What the clamp did on one call, kept so the two post-response diagnostics can be
+/// emitted against it (design §5.4). `None` on an unbudgeted run and on a non-`Chat`
+/// payload — the two paths the clamp does not touch — which is what keeps both signals
+/// silent there.
+///
+/// One struct rather than three loose `Option`s because the three numbers are only ever
+/// meaningful together: a reader of `emitted` alone cannot tell whether the budget or
+/// the model's limit produced it, and a reader of `est_input` alone cannot tell whether
+/// an estimate was made at all.
+struct ClampRecord {
+    /// `remaining − est_input`, the BUDGET's own term before any other bound.
+    allowance: u64,
+    /// The `max_tokens` actually sent, i.e. `min(allowance, model ceiling, caller's)`.
+    /// Equal to `allowance` exactly when the budget was the binding term.
+    emitted: u64,
+    /// The pessimistic input estimate the allowance was computed from.
+    est_input: u64,
+}
+
 /// Why a metered dispatch refused to run. Constructed ONLY by
 /// [`Executor::dispatch_metered`] and consumed ONLY by
 /// [`Executor::record_refusal`] — a producer never invents or interprets one.
 pub(super) enum Refusal {
-    /// The run has already spent its budget. Carries `(spent, budget)` for the
-    /// operator-facing message.
-    BudgetExhausted { spent: u64, budget: u64 },
+    /// A budgeted run may not make this call. Carries `(spent, budget)` for the
+    /// operator-facing message and `cause` for WHICH of the two budget checks said so
+    /// — see [`BudgetRefusal`], which is the whole reason this is not just a pair of
+    /// numbers.
+    BudgetExhausted {
+        spent: u64,
+        budget: u64,
+        cause: BudgetRefusal,
+    },
     /// A budget is set but the provider reported no usage, so this call's spend would
     /// be invisible to the ledger. Fail closed: a budget you cannot measure is not a
     /// budget. (SP-DATA-5 Task 4 owns capturing usage and the tests for this arm;
     /// today it is unreachable in practice because nothing sets a budget until
     /// Task 5 wires `--budget-tokens`.)
     Unmetered { model: String },
+}
+
+/// Which of the two budget checks refused, and therefore what the operator is being
+/// told.
+///
+/// ONE refusal kind with a cause, not two kinds: the clamp design's §2 requires the
+/// floor to travel the EXISTING `BudgetExhausted` durable-pause path — same
+/// `RunPaused`, same `resume_after: None` HOTL class, same recovery verb — and a second
+/// variant would invite a second pause class to grow next to it. What §2 does not ask
+/// for is a single message for two different situations, and reusing one was a real
+/// defect: a fresh run with a cap of 300 paused reporting "budget: 0 of 300 tokens
+/// spent", which is not true (nothing was spent), and told the operator to raise the cap
+/// without saying by how much.
+///
+/// The two situations have different remedies. `Spent` means the run is out of budget
+/// and any raise buys more work. `BelowFloor` means the cap must clear
+/// `MIN_OUTPUT_TOKENS` plus this call's input estimate before the run can move AT ALL —
+/// a raise smaller than that leaves it stuck in exactly the same place.
+pub(super) enum BudgetRefusal {
+    /// `spent >= cap`: the ledger has already reached the cap.
+    Spent,
+    /// The output allowance left after the pessimistic input estimate is below
+    /// [`orchestrator_core::MIN_OUTPUT_TOKENS`].
+    ///
+    /// Carries BOTH terms the message needs, and the second is not redundant. The
+    /// allowance is what the operator is told is left; the ESTIMATE is what the required
+    /// raise must be computed from, because the allowance is
+    /// `remaining.saturating_sub(est)` and that saturation is reachable — a long prompt
+    /// against a nearly spent budget floors it at 0 and destroys `est − remaining`.
+    /// Deriving the raise from the allowance instead (`budget + floor − allowance`)
+    /// agrees everywhere else and understates it by exactly that difference here, which
+    /// is the arm nothing else can observe.
+    BelowFloor { allowance: u64, est_input: u64 },
 }
 
 /// What a journaled refusal means for the producer that hit it: a durable pause the
@@ -164,10 +283,20 @@ impl Executor {
     /// in-drive tally is updated HERE, at the same single chokepoint that reads it — so
     /// a producer can neither bypass the gate nor forget to account for what it spent.
     ///
-    /// The check is `spent >= cap` BEFORE the call, which makes the budget a
-    /// FLOOR-TRIGGER rather than a ceiling: output tokens are unknowable until the
-    /// call returns, so a cap can be overshot by at most one call. `budget: None`
-    /// (every pre-SP-DATA-5 run) never gates — the additivity guarantee.
+    /// There are TWO budget checks here, not one, and a reader who knows only the first
+    /// has the wrong model of when a budgeted run stops.
+    ///
+    /// The first is `spent >= cap` BEFORE the call — a floor-trigger, which on its own
+    /// permits an overshoot of one whole call. The second is the SP-DATA-5 clamp below
+    /// it, which bounds that call's OUTPUT half by setting `max_tokens` to what the
+    /// remaining budget affords, and REFUSES when what is left cannot buy a reply worth
+    /// paying input tokens for. So a budgeted run can pause with `spent < cap`, and the
+    /// residual overshoot is the input estimate's error rather than a model's whole
+    /// output limit. Bounded and biased safe, not eliminated — the clamp block's own
+    /// comment writes out the arithmetic.
+    ///
+    /// `budget: None` (every pre-SP-DATA-5 run) never gates and never clamps — the
+    /// additivity guarantee.
     ///
     /// Tokens are charged on a successful RESPONSE rather than after the caller
     /// journals its `EffectRecorded`: the provider has been paid either way, so a
@@ -198,8 +327,294 @@ impl Executor {
         if let Some(cap) = meter.budget()
             && spent >= cap
         {
-            return Ok(Err(Refusal::BudgetExhausted { spent, budget: cap }));
+            return Ok(Err(Refusal::BudgetExhausted {
+                spent,
+                budget: cap,
+                cause: BudgetRefusal::Spent,
+            }));
         }
+        // The SP-DATA-5 clamp. The gate immediately above is a FLOOR-TRIGGER — it
+        // refuses only once `spent` has ALREADY passed the cap — so without this a
+        // single call can overshoot by however much output the adapter allows when
+        // `max_tokens` is `None`. That is not one number; it is five different ones, and
+        // the survey below was re-read against the adapters rather than assumed, because
+        // an earlier version of this comment got two of the five wrong:
+        //
+        // - `openai_compat` (`openai_compat/mod.rs:73`, `:128`) is the only true
+        //   pass-through: the wire field is `skip_serializing_if = "Option::is_none"`, so
+        //   `None` OMITS it and the model's own maximum applies.
+        // - `anthropic` (`anthropic/mod.rs:155`, `:218`) and `bedrock`
+        //   (`bedrock/mod.rs:205`, `:271`) substitute their own `DEFAULT_MAX_TOKENS` of
+        //   1024 unconditionally.
+        // - `gemini` (`gemini.rs:636`, `:685`) builds `generationConfig` only when
+        //   `max_tokens.is_some() || temperature.is_some()`, and every producer here
+        //   sends `temperature: None` (`support.rs:500`, `support.rs:539`, and this
+        //   module's own selector request). So with `max_tokens: None` NO
+        //   `generationConfig` is sent at all and gemini's 1024 is never reached —
+        //   Gemini's own server-side default applies.
+        // - the local engine (`llama_cpp/mod.rs:398`, `:597`) does
+        //   `max_tokens.unwrap_or(default_max_tokens)`, which the chat builder sets to
+        //   512 (`:142`). `None` there means 512, not the model's maximum.
+        //
+        // Setting `max_tokens` replaces all five with one rule under our control: the
+        // call CANNOT return more output than the remaining budget affords.
+        //
+        // The DIRECTION of the change therefore differs by family, and it is not the
+        // split the design first recorded. Against a large cap the emitted value is the
+        // chain's own `max_output_tokens` (2048 to 8192 across the shipped example
+        // catalog and presets), so the
+        // clamp WIDENS on `anthropic`, `bedrock` and the local engine — all three of
+        // which substitute a small constant for `None` — and NARROWS on `openai_compat`
+        // and `gemini`, where `None` meant the model's or the provider's own maximum. The
+        // design's §6 records both directions as accepted costs, with the alternative
+        // that was rejected. The run's TOTAL is bounded either way, which is the property
+        // this exists for; only the per-call shape moves.
+        //
+        // What this does NOT do is eliminate the overshoot, and the distinction is the
+        // whole reason the design argues for a pessimistic estimate. With
+        // `max_tokens = remaining − est_input`, the real total is
+        // `actual_input + output ≤ actual_input + (remaining − est_input)`, which
+        // exceeds `remaining` by exactly `actual_input − est_input`. So the residual is
+        // the ESTIMATE's error, biased toward refusing early because
+        // `est_tokens_pessimistic` over-counts on the JSON-heavy prompts this
+        // orchestrator actually sends. Bounded and biased safe, not zero.
+        //
+        // "Biased toward refusing early" carries a SCRIPT assumption, and it is worth
+        // naming because nothing else in the code does. `chars / 3` over-counts only
+        // where a token is worth three or more characters, which is Latin-script text.
+        // CJK, Cyrillic and emoji run nearer 1–3 tokens PER character, so on such a
+        // prompt the estimate under-counts by a multiple and the §4 residual
+        // (`actual_input − est_input`) stops being a small error and becomes a fraction
+        // of the prompt. The bias flips sign; the bound does not vanish, but it widens by
+        // a factor a reader could not otherwise anticipate. The AC11 `tracing::warn!`
+        // below is the mitigation — a non-Latin prompt is exactly the case it is expected
+        // to fire on — and a real tokenizer (design §8) is the fix.
+        //
+        // Only for a budgeted run, and only for `Chat`: `Embed`/`Stt` have no
+        // `max_tokens` to set, so they fall through to the pre-existing floor-trigger
+        // behaviour unchanged. `budget: None` never even computes the estimate — the
+        // additivity guarantee the whole pre-SP-DATA-5 suite rests on.
+        //
+        // The request is CLONED and the clone modified: `dispatch_metered` takes a
+        // `&InferenceRequest` and the caller's copy must not change under it. That is
+        // safe for the memo fence because every determinism key covers the SEMANTIC
+        // inputs and none of them covers a transport parameter: `support::input_hash`
+        // hashes `{chain}|{payload}`, `agent_input_hash` hashes
+        // `{chain}|{system}|{messages}|{tools}`, and the selector hashes
+        // `{chain}|{system,user}`. `max_tokens` appears in none of the three, so a call
+        // whose clamp differs between drives still hashes identically and replays from
+        // its memo rather than raising `DeterminismViolation`.
+        let clamped;
+        let mut clamp: Option<ClampRecord> = None;
+        let request = match (meter.budget(), &request.payload) {
+            (
+                Some(cap),
+                Payload::Chat {
+                    system,
+                    messages,
+                    tools,
+                    ..
+                },
+            ) => {
+                let est = est_input_tokens(system.as_deref(), messages, tools);
+                // `cap - spent` cannot underflow while the gate at the top of this
+                // function stands: it returned when `spent >= cap`, reading the same two
+                // values (`cap` from `meter.budget()`, a plain field read, and this same
+                // `spent` local). The gate is the ONLY thing keeping that true, so this
+                // subtraction is written to do two different jobs depending on the
+                // build, and both are deliberate.
+                //
+                // In a DEBUG build the `debug_assert!` panics with a message naming the
+                // cause, which is what makes removing or reordering the gate loud rather
+                // than silently absorbed: delete the gate and every budget-producer test
+                // that drives past the cap reddens on this `debug_assert!`'s own message,
+                // plus two that do not touch it —
+                // `a_non_chat_payload_is_gated_but_not_clamped` (the one payload the
+                // clamp skips, so the gate is all that is left) and
+                // `spending_exactly_the_cap_stops_the_run` (whose reason assertion tells
+                // the gate's message from the floor's). Stated as a property rather than
+                // a count: the count moved the last two times a budget test was added,
+                // and a stale number in a load-bearing comment is worse than no number.
+                //
+                // In a RELEASE build there is no tripwire to rely on — the workspace
+                // profile sets no `overflow-checks`, so a plain `cap - spent` would WRAP
+                // to something near `u64::MAX` and sail past the floor into a dispatch
+                // that should have been refused. `checked_sub` fails CLOSED instead: the
+                // impossible case refuses the call, which is the same answer the gate
+                // would have given. That is the whole point of not writing
+                // `saturating_sub` here — a saturating subtraction would produce 0 and
+                // refuse too, but SILENTLY, in debug as well, and the gate's removal
+                // would then be invisible to the suite.
+                debug_assert!(
+                    spent <= cap,
+                    "the `spent >= cap` gate was bypassed or reordered: spent {spent} > cap {cap}"
+                );
+                let Some(remaining) = cap.checked_sub(spent) else {
+                    return Ok(Err(Refusal::BudgetExhausted {
+                        spent,
+                        budget: cap,
+                        cause: BudgetRefusal::Spent,
+                    }));
+                };
+                // `saturating_sub` on the ESTIMATE is a different matter and is
+                // load-bearing: `est` genuinely can exceed what is left, for a long
+                // prompt against a nearly spent budget, and a plain subtraction there
+                // would wrap to an enormous allowance — a clamp WIDER than the cap,
+                // which is worse than no clamp at all.
+                let allowance = remaining.saturating_sub(est);
+                if allowance < orchestrator_core::MIN_OUTPUT_TOKENS {
+                    // Below the floor, refuse rather than clamp — and refuse BEFORE the
+                    // call, so no input tokens are spent on a reply that would arrive
+                    // truncated mid-sentence and flow downstream as work product. This
+                    // is the EXISTING durable pause, not a new refusal kind: the
+                    // operator's recovery (`torii run wake --budget-tokens N`) is
+                    // already built and already documented.
+                    return Ok(Err(Refusal::BudgetExhausted {
+                        spent,
+                        budget: cap,
+                        cause: BudgetRefusal::BelowFloor {
+                            allowance,
+                            est_input: est,
+                        },
+                    }));
+                }
+                // The MODEL's own output limit, which the allowance knows nothing
+                // about. `allowance` is a pure budget figure: for any realistic
+                // whole-run cap it is far larger than any model's maximum output, and
+                // the providers do not shrug that off — Anthropic answers a 400
+                // `invalid_request_error`, and every adapter here forwards `max_tokens`
+                // verbatim. Without this bound, setting a budget would hard-FAIL the
+                // first call of a run that succeeds unbudgeted: the clamp causing the
+                // failure it exists to prevent.
+                //
+                // `None` (an unknown chain, or one with no resolvable models) means "no
+                // ceiling from here", matching how `over_budget` treats an unknown
+                // context window — a missing catalog entry must not silently truncate
+                // every reply, and the budget allowance still bounds the call.
+                //
+                // It is a `min` over the CHAIN, which has a cost §6 records: on a
+                // HETEROGENEOUS fallback chain the weakest entry's limit binds from the
+                // very first call, however much budget remains. A budgeted run on
+                // [gpt-4o 16384, small-fallback 4096] gets 4096-token replies on the
+                // primary throughout, where the same run unbudgeted would get 16384.
+                // That is the price of setting `max_tokens` before selection, and it is
+                // paid deliberately: a request that fails over lands on a different
+                // entry, and a value the fallback would reject turns a survivable
+                // failover into a hard 400.
+                //
+                // A ceiling of `Some(0)` would emit `max_tokens: Some(0)` — "generate
+                // nothing" — and is NOT special-cased here. It is rejected one layer
+                // down instead: `collect_validation_errors` refuses a model with
+                // `max_output_tokens == 0`, because zero output is broken for every
+                // reader of that field and not just this one. Deliberately not widened
+                // to "ignore any ceiling below MIN_OUTPUT_TOKENS" — that would send an
+                // over-large `max_tokens` to a model whose limit is genuinely small,
+                // which is the case the floor-before-ceiling ordering exists to serve.
+                // The residual is the documented unchecked `Gateway::new` /
+                // `update_config` path, which validates nothing at all.
+                //
+                // **The output limit is not the only model bound, and on its own it is
+                // not enough.** A provider enforces `prompt + max_tokens <=
+                // context_window` as well, and the unbudgeted path never trips that
+                // because `max_tokens: None` is OMITTED from the wire entirely
+                // (`openai_compat/convert.rs`'s `skip_serializing_if`), so the sum is
+                // never formed. Bounding only by `max_output_tokens` therefore
+                // reintroduces the very regression the paragraph above describes, by the
+                // other route: a long-prompt call that succeeds unbudgeted hard-FAILS
+                // once a budget is set. Worse than the output-limit case, because it
+                // arrives as a `NodeFailed` rather than a budget pause — `torii run wake
+                // --budget-tokens N` cannot recover it and the operator's only remedy is
+                // to drop the budget.
+                //
+                // Not hypothetical: the shipped presets are `8192 / 4096`
+                // (`gateway/src/catalog/presets.rs`), so any prompt past ~4096 tokens is
+                // in this territory, and SP-6 s4 bounds ONE `## Context` section at
+                // 32 KiB — ~10.9k tokens by itself under `chars/3`. Found by the
+                // whole-slice review, which reproduced the provider's 400 against a
+                // double applying the documented sum rule.
+                //
+                // `est` is subtracted rather than the real prompt count for the reason
+                // the whole clamp uses it: the real count is not known until the response
+                // comes back, and `est` is biased HIGH, so this bound errs toward asking
+                // for less. Same `None` handling as the output limit — an unknown chain
+                // yields no bound from here rather than a silent truncation.
+                let ceiling = match request.chain.as_deref() {
+                    Some(chain) => {
+                        let out = self.gateway.min_max_output_tokens(chain).await;
+                        let window = self
+                            .gateway
+                            .min_context_window(chain)
+                            .await
+                            .map(|w| w.saturating_sub(u32::try_from(est).unwrap_or(u32::MAX)));
+                        match (out, window) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    }
+                    None => None,
+                };
+                // The floor again, now against the bound that will ACTUALLY be emitted.
+                // The check above tests the budget allowance alone, which is the right
+                // question for "has this run got enough left"; this one catches the case
+                // where the run has budget to spare but the MODEL cannot fit a useful
+                // reply beside the prompt. Without it a window term of 0 (a prompt at or
+                // past the whole context window) would emit `max_tokens: Some(0)` —
+                // "generate nothing" — which the paragraph above rules out for the output
+                // limit and which is no more acceptable here.
+                //
+                // Deliberately a refusal rather than "ignore a ceiling under the floor":
+                // ignoring it sends an over-large `max_tokens` at a model that cannot
+                // take it, which is the 400 this whole block exists to avoid.
+                //
+                // KNOWN GAP, and it is the honest one to state: when the WINDOW is the
+                // binding term the message still reads as a budget problem and names a
+                // raise that will not help, because no cap change makes a prompt fit.
+                // Recorded rather than papered over; the refusal wording is the subject
+                // of its own review finding.
+                if ceiling.is_some_and(|c| u64::from(c) < orchestrator_core::MIN_OUTPUT_TOKENS) {
+                    return Ok(Err(Refusal::BudgetExhausted {
+                        spent,
+                        budget: cap,
+                        cause: BudgetRefusal::BelowFloor {
+                            allowance: ceiling.map_or(allowance, u64::from),
+                            est_input: est,
+                        },
+                    }));
+                }
+                let mut r = request.clone();
+                if let Payload::Chat { max_tokens, .. } = &mut r.payload {
+                    // NEVER widen: a caller's own limit wins whenever it is lower. A
+                    // clamp that could RAISE a caller's ceiling is the same defect as a
+                    // tool that supplies argv and thereby widens its own sandbox policy,
+                    // which SP-4 s4 spent a slice ruling out. Every orchestrator
+                    // producer passes `None` today, so this guards a future caller
+                    // rather than a present one.
+                    //
+                    // `u32::MAX` on an allowance too large for the `u32` field: this is
+                    // saturation of the u64→u32 conversion ONLY, not a claim that
+                    // `u32::MAX` is ever emitted. The `min` with `ceiling` on the next
+                    // line is what actually bounds it whenever the chain resolves, and a
+                    // budget with more than 4 billion tokens left is not the case the
+                    // budget half exists to constrain anyway.
+                    let want = u32::try_from(allowance).unwrap_or(u32::MAX);
+                    let want = ceiling.map_or(want, |limit| want.min(limit));
+                    // Bound before it is stored, rather than read back out of
+                    // `max_tokens` afterwards: the signals below need this number and
+                    // reading it back would need an `expect` on an `Option` this line
+                    // just filled.
+                    let emitted = max_tokens.map_or(want, |caller| caller.min(want));
+                    *max_tokens = Some(emitted);
+                    clamp = Some(ClampRecord {
+                        allowance,
+                        emitted: u64::from(emitted),
+                        est_input: est,
+                    });
+                }
+                clamped = r;
+                &clamped
+            }
+            _ => request,
+        };
         let response = self.gateway.execute(request).await?;
         let Some(usage) = &response.usage else {
             if meter.budget().is_some() {
@@ -213,6 +628,64 @@ impl Executor {
             // Unbudgeted and unmetered: nothing to charge, nothing to gate.
             return Ok(Ok(response));
         };
+        // The clamp's two diagnostics, and they say DIFFERENT things: the first that our
+        // budget cut a reply short, the second that our estimate of the input was low.
+        //
+        // Both are `tracing` records and neither is a journal event — a decision, not a
+        // deferral (design §5.4). They describe our own ESTIMATOR, not run state:
+        // nothing folds them, no resume depends on them, and no operator decision keys
+        // on them. A journal event would make them durable FORMAT — a `FORMAT_VERSION`
+        // concern, a fold arm, and a row on every clamped call of every budgeted run —
+        // to carry what the ledger already implies, since `usage` is journaled and the
+        // allowance is recomputable from the fold. They earn their place by being cheap.
+        //
+        // Both live inside this `if let` because both are statements ABOUT the clamp.
+        // Hoisting either out would make every unbudgeted call — every pre-SP-DATA-5
+        // run in the system — report against an estimate that was never made, which is
+        // the additivity guarantee broken in the log rather than in the request.
+        if let Some(clamp) = &clamp {
+            if u64::from(usage.output_tokens) >= clamp.emitted {
+                // The reply stopped AT the limit we imposed, so it was almost certainly
+                // cut short rather than finished. Inferred from the token count because
+                // `InferenceResponse` carries no finish reason — only a streaming chunk
+                // does — so this is the available signal, not the ideal one.
+                //
+                // Compared against `emitted` and not `allowance`: `emitted` is what the
+                // provider was actually told, and on any chain whose model limit is
+                // below the allowance (the common case for a large cap) a reply can
+                // never reach `allowance` at all, so keying on that would report nothing
+                // on exactly the runs where replies get truncated. Both numbers are
+                // logged so the reader can tell WHICH bound bit: equal means the budget
+                // truncated this reply, `emitted < allowance` means the model's own
+                // limit (or a caller's own `max_tokens`) did and the budget merely did
+                // not prevent it.
+                //
+                // `>=` rather than `==` is fail-loud: a provider that reported one token
+                // more than it was allowed should still surface here, not fall silently
+                // between the two comparisons.
+                tracing::info!(
+                    max_tokens = clamp.emitted,
+                    allowance = clamp.allowance,
+                    output_tokens = u64::from(usage.output_tokens),
+                    "budget clamp bit: the reply stopped at the clamped output limit"
+                );
+            }
+            if u64::from(usage.input_tokens) > clamp.est_input {
+                // The residual overshoot the design's §4 bounds, and the reason the
+                // claim is "bounded and biased safe" rather than "eliminated": the total
+                // exceeds the remaining budget by exactly `actual_input − est_input`.
+                // Emitted so that term is MEASURABLE in production instead of assumed —
+                // the provider reports the real input count at the same chokepoint that
+                // made the estimate, which is the only feedback loop a `chars / 3`
+                // heuristic can have.
+                tracing::warn!(
+                    estimated = clamp.est_input,
+                    actual = u64::from(usage.input_tokens),
+                    "budget clamp under-estimated the input; the cap may be exceeded by \
+                     the difference"
+                );
+            }
+        }
         meter.record(u64::from(usage.total_tokens));
         Ok(Ok(response))
     }
@@ -236,10 +709,87 @@ impl Executor {
         refusal: Refusal,
     ) -> Result<RefusalKind, OrchestratorError> {
         match refusal {
-            Refusal::BudgetExhausted { spent, budget } => {
-                let reason = format!(
-                    "budget: {spent} of {budget} tokens spent; raise it with `torii run wake --budget-tokens N`"
-                );
+            Refusal::BudgetExhausted {
+                spent,
+                budget,
+                cause,
+            } => {
+                // Both messages start `budget: ` — that prefix is the operator- and
+                // test-visible marker for "this pause is about the cap", and torii's
+                // status/list-paused surfaces match on it.
+                let reason = match cause {
+                    // Names a concrete lower bound, not just the arithmetic. It used to
+                    // end at "raise it", which is a dead end precisely where an operator
+                    // most needs a number: this is the arm a run lands on after applying
+                    // a stale figure from the floor arm below, so it is the SECOND round
+                    // trip of a sequence that is manual at every step. "More than
+                    // {spent}" is the honest bound — it is what unblocks the gate — and
+                    // the caveat is stated rather than implied, because clearing the gate
+                    // only to refuse on the floor one line later is the same round trip
+                    // wasted again.
+                    BudgetRefusal::Spent => format!(
+                        "budget: {spent} of {budget} tokens spent; raise the cap above \
+                         {spent} — and far enough above it that the next call's input \
+                         estimate still leaves {} tokens, or it will refuse on the floor \
+                         instead; raise it with `torii run wake --budget-tokens N`",
+                        orchestrator_core::MIN_OUTPUT_TOKENS
+                    ),
+                    // The floor. Reusing the wording above here would report a spend
+                    // that did not happen ("0 of 300 tokens spent" on a fresh run) and
+                    // give no hint of how far the cap must move. The raise it names is
+                    // the SMALLEST one that unblocks THIS call — a later, longer prompt
+                    // can still land under the floor at that cap, which is why it says
+                    // "at least".
+                    //
+                    // Computed from the same three terms the refusal itself used, and
+                    // deliberately NOT from the allowance. A dispatch needs
+                    // `(cap − spent) − est >= floor`, so the smallest cap that clears it
+                    // is `spent + est + floor`. The tempting one-liner
+                    // `budget + (floor − allowance)` is algebraically identical WHENEVER
+                    // `est <= remaining` — and silently wrong when it is not, because
+                    // `allowance` is `remaining.saturating_sub(est)` and the saturation
+                    // has already thrown away `est − remaining`. That is the arm AC5
+                    // exists for, so it is exactly where the operator would be handed a
+                    // number that re-pauses the run on the same node.
+                    //
+                    // `saturating_add` for the u64 sum: it cannot realistically overflow
+                    // (a cap near `u64::MAX` is not a budget), and a wrap would name a
+                    // raise SMALLER than the current cap.
+                    //
+                    // **And it is stated as HEADROOM ABOVE THE FINAL SPEND, not as an
+                    // absolute cap.** `spent` here is the ledger as it stood at THIS
+                    // call, and the drive does not stop when a node pauses: `drive`'s
+                    // `for node in ready` loop marks the refusing node terminal and keeps
+                    // going, so an independent sibling can dispatch afterwards and push
+                    // the ledger past any absolute figure computed here. An operator who
+                    // applied that figure verbatim would re-pause — on the `Spent` arm,
+                    // whose message named no figure at all, so the second round trip had
+                    // nothing to work from. Every round trip is manual: this pause is
+                    // `resume_after: None`, so it is a `BudgetRaised` plus a `force_wake`
+                    // by a human each time.
+                    //
+                    // A headroom cannot go stale, because it is relative to whatever the
+                    // ledger ends at rather than to what it read mid-drive. The absolute
+                    // is still shown — it is the right answer when nothing else spends,
+                    // which is the common single-node case — but it is labelled as a
+                    // floor under the real requirement rather than as the answer.
+                    BudgetRefusal::BelowFloor {
+                        allowance,
+                        est_input,
+                    } => {
+                        let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+                        let headroom = est_input.saturating_add(floor);
+                        let needed = spent.saturating_add(headroom);
+                        format!(
+                            "budget: only {allowance} tokens left for output after the input \
+                             estimate, below the {floor}-token floor ({spent} of {budget} \
+                             spent); the cap must exceed this run's final spend by at least \
+                             {headroom} (≥ {needed} if nothing else in this drive spends — \
+                             independent nodes may still run after this pause and push it \
+                             higher); raise it with `torii run wake --budget-tokens N`"
+                        )
+                    }
+                };
                 // `resume_after: None` is the HOTL pause class (SP-DATA-3): the
                 // scheduler records a NULL `next_wake` and never auto-wakes the run.
                 // Correct here — no amount of waiting refills a budget, only an
@@ -503,5 +1053,127 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             )
             .await?;
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel::types::request::{MessageContent, MessageRole, ToolCall};
+
+    fn user(text: &str) -> Message {
+        Message::text(MessageRole::User, text)
+    }
+
+    fn tool(name: &str, description: Option<&str>, schema: serde_json::Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            input_schema: schema,
+        }
+    }
+
+    /// Every term of the estimate is COUNTED, proven one term at a time.
+    ///
+    /// The estimate is the whole clamp: `allowance = remaining − est`, so a term that
+    /// silently contributes nothing leaves the allowance too high and the cap is
+    /// overshot by exactly that much. Before this test, deleting the tool loop or
+    /// replacing the system term with `0` left `cargo test --workspace` green, and the
+    /// only guarded term was messages — guarded by one token of margin, because every
+    /// clamp test used a two-character prompt.
+    ///
+    /// Strict `>` on each step, against the same call with that one term absent. A
+    /// weaker `>=` would pass for a function that ignored the term entirely.
+    #[test]
+    fn every_part_of_the_input_is_counted_in_the_estimate() {
+        let msgs = vec![user("the user's question, which is not short")];
+        let bare = est_input_tokens(None, &msgs, &[]);
+        assert!(bare > 0, "the message body itself costs something");
+
+        assert!(
+            est_input_tokens(Some("a system prompt the agent was given"), &msgs, &[]) > bare,
+            "the system prompt is counted"
+        );
+
+        let named = tool("fs_write", None, serde_json::json!({}));
+        let with_name = est_input_tokens(None, &msgs, std::slice::from_ref(&named));
+        assert!(with_name > bare, "a tool's NAME is counted");
+
+        let described = tool(
+            "fs_write",
+            Some("write a file, creating parent directories"),
+            serde_json::json!({}),
+        );
+        assert!(
+            est_input_tokens(None, &msgs, &[described]) > with_name,
+            "a tool's DESCRIPTION is counted — it is optional, not free"
+        );
+
+        let schemad = tool(
+            "fs_write",
+            None,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "contents": { "type": "string" }
+                },
+                "required": ["path", "contents"]
+            }),
+        );
+        assert!(
+            est_input_tokens(None, &msgs, &[schemad]) > with_name,
+            "a tool's JSON SCHEMA is counted — the term the estimate exists for"
+        );
+    }
+
+    /// An assistant turn's `tool_calls` are counted, because the provider is sent them.
+    ///
+    /// The ReAct loop appends exactly such a message every turn (`agent.rs`), and every
+    /// subsequent turn re-sends it: `anthropic/convert.rs` emits a `ToolUse` block per
+    /// entry, `openai_compat/convert.rs` emits `tool_calls`. `Message::content` is empty
+    /// on those turns, so counting only `as_text()` made a serialized plan or an
+    /// `fs_write` body — the biggest payloads the loop produces — cost zero.
+    ///
+    /// That under-counts in the one direction the design forbids: `allowance =
+    /// remaining − est` comes out too high, so the residual overshoot exceeds the
+    /// design's §4 bound and "biased toward refusing early" stops being true for the
+    /// agent path, which is the path that generates the large arguments.
+    #[test]
+    fn an_assistant_turns_tool_call_arguments_are_counted() {
+        let plain = Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text {
+                text: String::new(),
+            },
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let calling = Message {
+            tool_calls: vec![ToolCall {
+                id: "t0".into(),
+                name: "fs_write".into(),
+                arguments: serde_json::json!({
+                    "path": "notes.md",
+                    "contents": "a body long enough to matter to a token budget"
+                })
+                .to_string(),
+            }],
+            ..plain.clone()
+        };
+
+        let without = est_input_tokens(None, std::slice::from_ref(&plain), &[]);
+        let with = est_input_tokens(None, std::slice::from_ref(&calling), &[]);
+        assert!(
+            with > without,
+            "a tool call's arguments are sent to the provider, so they are estimated: \
+             {with} vs {without}"
+        );
+        // And by roughly what they cost: the arguments alone are ~90 characters, so a
+        // token or two of difference would mean only the NAME was counted.
+        assert!(
+            with - without >= 20,
+            "the ARGUMENTS are counted, not just the call's name: {with} vs {without}"
+        );
     }
 }

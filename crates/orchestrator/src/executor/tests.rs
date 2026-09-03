@@ -1,7 +1,8 @@
 use super::*;
 use crate::test_support::{
-    CallLog, content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
-    echo_system_gateway, failing_after_gateway, final_response, metered_gateway,
+    CallLog, FIXTURE_MAX_OUTPUT_TOKENS, clamp_observing_gateway, content_gated_gateway,
+    demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
+    failing_after_gateway, final_response, metered_embed_gateway, metered_gateway,
     metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
     tool_call_response,
 };
@@ -11961,6 +11962,50 @@ async fn shell_stdout_is_redacted() {
 
 /// A budgeted `RunStarted` for a seeded journal. `"v1"` matches the executor's
 /// fence version, so `start` resumes rather than refusing.
+///
+/// # Why the caps below are in the thousands and not the hundreds
+///
+/// Several budget tests in this file were written before the SP-DATA-5 clamp and used
+/// caps of 100–700 tokens, chosen only to be "small enough that one call blows it".
+/// The clamp added a SECOND, EARLIER refusal at the same chokepoint: a budgeted `Chat`
+/// call whose `allowance = (cap − spent) − est_input` falls under
+/// [`orchestrator_core::MIN_OUTPUT_TOKENS`] pauses BEFORE dispatching, rather than
+/// paying for a reply too short to be useful. At a cap of 100 that fires on the very
+/// first call, so no call goes out at all and a test asserting anything about the
+/// `spent >= cap` gate never reaches it.
+///
+/// So each of those fixtures had its token magnitudes multiplied by ten, with two
+/// exceptions that are worth naming because a reader auditing the factor against the
+/// diff will otherwise find it contradicted:
+///
+/// - `spending_exactly_the_cap_stops_the_run` uses **16/3** (75→400 against 150→800),
+///   because its two calls must land exactly on the cap.
+/// - `a_re_driven_selector_replays_its_call_instead_of_respending` scales its per-call
+///   usage by ten but its cap by **fifty** (100→5000). Ten would leave the second of its
+///   five drives with 230 tokens — under the floor — so the run would pause before the
+///   assertions the test exists for; see its own comment.
+///
+/// Every ratio, call count, pause site and reason string they assert is unchanged; only
+/// the absolute numbers moved, into the regime where the floor-trigger really is the
+/// binding constraint. This is the clamp design's §6 accepted cost — "a run can now
+/// pause where it previously completed" — meeting a suite written before a floor
+/// existed.
+///
+/// The gate itself was NOT weakened to accommodate any of this, and that was checked by
+/// mutation rather than asserted: delete the `spent >= cap` block from `dispatch_metered`
+/// and every budget-producer test that drives past the cap reddens on the clamp's own
+/// `debug_assert!` ("the `spent >= cap` gate was bypassed or reordered"), plus two that
+/// do not touch it — `a_non_chat_payload_is_gated_but_not_clamped` (a payload the clamp
+/// skips, so the gate is the only thing left) and `spending_exactly_the_cap_stops_the_run`
+/// (whose reason assertion now tells the gate's message from the floor's). The
+/// `>=`-versus-`>` boundary is pinned by both of those, from opposite sides.
+///
+/// Named rather than counted, deliberately. This comment and two others carried an
+/// absolute count ("eleven redden, nine of them on the `debug_assert!`") that was right
+/// when written and went stale the next time a budget test was added — twice, once
+/// silently. The two named guards are the part that carries information; the total is a
+/// number that re-stales itself on every addition, which is the same remedy already
+/// applied to `a_budgeted_map_fanout`.
 fn run_started_with_budget(cap: u64) -> JournalEvent {
     JournalEvent::RunStarted {
         version: "v1".into(),
@@ -12387,15 +12432,24 @@ async fn the_planner_selector_journals_its_spend_to_the_ledger() {
 /// The two assertions are the two halves of that: the run stops dispatching, and what
 /// it did dispatch is fully accounted for.
 ///
-/// *Mutation:* drop the `fold.memo` lookup from `SelectorDispatch::complete` and this
-/// goes red on both (5 calls, ledger 77).
+/// *Mutation:* drop the `fold.memo` lookup from `SelectorDispatch::complete` and both
+/// go red — the dispatch count first, at `left: 5, right: 1`, and the ledger behind it
+/// at `left: 770, right: 3850`, which is the frozen-ledger defect itself: five billed
+/// calls, one effect id, `usage.insert` keyed rather than summed.
 #[tokio::test]
 async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
+    // 10x the original fixture's per-call usage (77 against a cap of 100), but a cap of
+    // 5000 rather than 1000, and that is not cosmetic. At 1000 the SECOND drive has only
+    // 230 tokens left, under the clamp's 256-token floor, so under the mutation this
+    // test documents the run PAUSES on drive 1 and neither assertion below is ever
+    // reached — the guard would be an incidental `out.failed.is_some()` in the loop.
+    // 5000 keeps all five drives clear of the floor, which is what makes the documented
+    // failure (5 calls, ledger 770) the real one. See [`run_started_with_budget`].
     let (gateway, calls) = metered_latency_gateway(
         Some(kernel::types::cost::TokenUsage {
-            input_tokens: 7,
-            output_tokens: 70,
-            total_tokens: 77,
+            input_tokens: 70,
+            output_tokens: 700,
+            total_tokens: 770,
         }),
         std::time::Duration::ZERO,
     )
@@ -12406,9 +12460,11 @@ async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
     let graph = Graph {
         nodes: vec![expand_select_node("e", vec![])],
     };
-    // A 100-token cap: ONE 77-token selector call fits, a second must not happen.
+    // A 5000-token cap: it comfortably affords all five drives, so nothing but the memo
+    // can hold the dispatch count at one. The BUDGET is not the guard here — it is the
+    // thing the guard protects.
     journal
-        .append(run, run_started_with_budget(100))
+        .append(run, run_started_with_budget(5_000))
         .await
         .unwrap();
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
@@ -12430,7 +12486,7 @@ async fn a_re_driven_selector_replays_its_call_instead_of_respending() {
     let events = journal.load(run).await.unwrap();
     assert_eq!(
         crate::spend_of(&events).0,
-        77 * dispatched,
+        770 * dispatched,
         "the durable ledger accounts for every selector dispatch"
     );
 }
@@ -12974,10 +13030,18 @@ async fn a_round_boundary_snapshot_carries_the_spend_ledger_and_the_cap() {
 /// rather than spent blind (mirrors the sandbox/`shell`/fence precedent of never
 /// trusting an unenforceable boundary). `recording_gateway` always returns
 /// `usage: None`, so the very first call trips `Refusal::Unmetered` even though
-/// the budget itself is nowhere near exhausted (spent 0 < cap 100) — proving the
+/// the budget itself is nowhere near exhausted (spent 0 < cap 1_000) — proving the
 /// refusal is about METERABILITY, not the cap.
+///
+/// The cap must sit clear of the clamp's floor for that premise to hold at all: below
+/// it the run pauses before dispatching, and the unmetered response this test is about
+/// is never produced. See [`run_started_with_budget`].
 #[tokio::test]
 async fn an_unmetered_call_fails_the_node_when_a_budget_is_set() {
+    // 10x the original cap of 100, the same factor as every other rescaled budget
+    // fixture. Nothing here depends on the magnitude beyond clearing the clamp's floor:
+    // this test is about METERABILITY, and the cap is never approached.
+
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
@@ -12989,7 +13053,7 @@ async fn an_unmetered_call_fails_the_node_when_a_budget_is_set() {
         }],
     };
     journal
-        .append(run, run_started_with_budget(100))
+        .append(run, run_started_with_budget(1_000))
         .await
         .unwrap();
 
@@ -13294,17 +13358,50 @@ async fn the_consolidate_producer_journals_its_reported_usage() {
 
 /// The gate is `spent >= cap`, but every other budget test overshoots strictly, so
 /// mutating it to `spent > cap` left the workspace green. This lands EXACTLY on the
-/// cap: two calls at 75 tokens against a cap of 150 means node 3 sees `spent == cap`
+/// cap: two calls at 400 tokens against a cap of 800 means node 3 sees `spent == cap`
 /// and must be stopped.
 ///
-/// *Mutation:* `spent >= cap` → `spent > cap` and this fails with three calls and a
-/// completed run.
+/// # The clamp took this test's mutation away, and the floor's own wording gave it back
+///
+/// The claim this comment carried when the clamp landed — "`spent >= cap` → `spent >
+/// cap` and this fails with three calls and a completed run" — was wrong twice over, and
+/// both were established by running it rather than reasoning about it.
+///
+/// Under that mutation the run is still refused, and never gets a third call: node 3
+/// falls THROUGH the gate into the clamp, whose floor sees
+/// `allowance = (cap − spent) − est = 0`. (In the unmutated build the gate returns first
+/// and the floor is never reached here at all.) While the floor reused the gate's
+/// message the two were indistinguishable and the mutation left this green — which is
+/// what the clamp cost. Now that the floor names its own cause, the same mutation fails
+/// this test's REASON assertion:
+///
+/// ```text
+/// the reason reports the boundary honestly: budget: only 0 tokens left for output
+/// after the input estimate, below the 256-token floor (800 of 800 spent); ...
+/// ```
+///
+/// So the `Chat` boundary is pinned again, by the wording rather than by the call count.
+/// Deleting the `spent >= cap` block entirely reddens this test for the same reason, and
+/// every other budget test that drives past the cap besides — those on the clamp's own
+/// `debug_assert!`, "the `spent >= cap` gate was bypassed or reordered: spent 1500 > cap
+/// 1000", which is why that subtraction is a `checked_sub` behind a debug tripwire and
+/// not a `saturating_sub`. (An absolute count stood here and went stale as budget tests
+/// were added; see [`run_started_with_budget`] for why it is now a property.)
+///
+/// [`a_non_chat_payload_is_gated_but_not_clamped`] pins the same boundary from the other
+/// side, on an `Embed` — the one payload the clamp SKIPS, where the gate is the only
+/// thing between a budgeted run and the provider, so the refusal itself is the
+/// observable and no message needs to be read.
 #[tokio::test]
 async fn spending_exactly_the_cap_stops_the_run() {
+    // 400/call against a cap of 800, scaled up from 75 against 150. The RATIO is what
+    // this test needs — two calls landing exactly on the cap — and the magnitudes have
+    // to clear the clamp's floor twice over, since call 2 must dispatch with only half
+    // the budget left. See [`run_started_with_budget`].
     let (gateway, calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
-        input_tokens: 25,
-        output_tokens: 50,
-        total_tokens: 75,
+        input_tokens: 130,
+        output_tokens: 270,
+        total_tokens: 400,
     }))
     .await;
     let journal = InMemoryJournal::new();
@@ -13333,7 +13430,7 @@ async fn spending_exactly_the_cap_stops_the_run() {
         .run_budgeted(
             run,
             &graph,
-            Some(orchestrator_core::TokenBudget { total_tokens: 150 }),
+            Some(orchestrator_core::TokenBudget { total_tokens: 800 }),
         )
         .await
         .expect("drives");
@@ -13349,11 +13446,11 @@ async fn spending_exactly_the_cap_stops_the_run() {
         .expect("landing on the cap pauses the run");
     assert_eq!(pause.node.0, "n3");
     assert!(
-        pause.reason.starts_with("budget: 150 of 150"),
+        pause.reason.starts_with("budget: 800 of 800"),
         "the reason reports the boundary honestly: {}",
         pause.reason
     );
-    assert_eq!(crate::spend_of(&journal.load(run).await.unwrap()).0, 150);
+    assert_eq!(crate::spend_of(&journal.load(run).await.unwrap()).0, 800);
 }
 
 // ---- Task 6: the gate fires WITHIN a drive, not only at a drive boundary ----------
@@ -13378,13 +13475,17 @@ async fn spending_exactly_the_cap_stops_the_run() {
 ///
 /// Mutation-verified two ways: seed the fresh fold with `Fold::default()` (dropping the
 /// budget) or hand the chokepoint `fold.spent()` instead of the live meter, and this
-/// fails with all three nodes completed and 450 tokens spent against a cap of 100.
+/// fails at `left: 3, right: 1` — all three nodes dispatched, three calls' worth of
+/// spend against a cap one call already exceeds.
 #[tokio::test]
 async fn a_fresh_budgeted_run_pauses_mid_drive_after_one_call() {
+    // 10x the original fixture (cap 100, 150/call): a cap under the clamp's floor never
+    // dispatches at all, so the property below would be unobservable. Every ratio is
+    // preserved — see [`run_started_with_budget`].
     let (gateway, calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
-        input_tokens: 100,
-        output_tokens: 50,
-        total_tokens: 150,
+        input_tokens: 1_000,
+        output_tokens: 500,
+        total_tokens: 1_500,
     }))
     .await;
     let journal = InMemoryJournal::new();
@@ -13414,7 +13515,9 @@ async fn a_fresh_budgeted_run_pauses_mid_drive_after_one_call() {
         .run_budgeted(
             run,
             &graph,
-            Some(orchestrator_core::TokenBudget { total_tokens: 100 }),
+            Some(orchestrator_core::TokenBudget {
+                total_tokens: 1_000,
+            }),
         )
         .await
         .expect("drives");
@@ -13435,7 +13538,7 @@ async fn a_fresh_budgeted_run_pauses_mid_drive_after_one_call() {
 
     let events = journal.load(run).await.unwrap();
     let (spent, budget) = crate::spend_of(&events);
-    assert_eq!((spent, budget), (150, Some(100)));
+    assert_eq!((spent, budget), (1_500, Some(1_000)));
     assert!(
         !events
             .iter()
@@ -13450,10 +13553,13 @@ async fn a_fresh_budgeted_run_pauses_mid_drive_after_one_call() {
 /// never reach the gateway.
 #[tokio::test]
 async fn a_budgeted_agent_stops_between_react_turns() {
+    // 10x the original fixture (cap 100, 150/turn): a cap under the clamp's floor never
+    // dispatches turn 0 either, which would make "turn 1 is gated" vacuous. See
+    // [`run_started_with_budget`].
     let usage = kernel::types::cost::TokenUsage {
-        input_tokens: 100,
-        output_tokens: 50,
-        total_tokens: 150,
+        input_tokens: 1_000,
+        output_tokens: 500,
+        total_tokens: 1_500,
     };
     // Turn 0 asks for a tool (so the loop would continue); turn 1 would be the final
     // answer. Both carry usage, so the metering path is exercised, not the unmetered
@@ -13492,7 +13598,9 @@ async fn a_budgeted_agent_stops_between_react_turns() {
         .run_budgeted(
             run,
             &graph,
-            Some(orchestrator_core::TokenBudget { total_tokens: 100 }),
+            Some(orchestrator_core::TokenBudget {
+                total_tokens: 1_000,
+            }),
         )
         .await
         .expect("drives");
@@ -13568,22 +13676,27 @@ async fn an_unbudgeted_run_is_never_gated_however_much_it_spends() {
 /// unmistakably distinguishable from 6 concurrent ones (1×) without being slow.
 const FANOUT_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
 
-/// A `Map` over 6 items, each of which would spend 150 tokens, under a 100-token cap
+/// A `Map` over 6 items, each of which would spend 1500 tokens, under a 1000-token cap
 /// and a fan-out wide enough to dispatch every child at once.
 ///
-/// Exactly ONE call may escape — the floor-trigger bound of §6.5. Before the fix this
-/// produced **6 calls, 900 tokens, `Completed`, zero pauses**: every child read the
-/// ledger while the others were still awaiting the provider.
+/// 10x the original fixture (150 against 100), because a cap under the clamp's floor
+/// dispatches NO child and the concurrency claim below becomes vacuous. See
+/// [`run_started_with_budget`].
 ///
-/// *Mutation:* drop the `budget.is_some()` serial gate from `dispatch_metered` and
-/// this fails with 6 calls and a completed run.
+/// Exactly ONE call may escape — the floor-trigger bound of §6.5. Before the fix every
+/// child read the ledger while the others were still awaiting the provider, so **all six
+/// dispatched, the run `Completed`, and it paused not once** — the full 6x spend against
+/// a cap one call exceeds.
+///
+/// *Mutation:* drop the `budget.is_some()` serial gate from `dispatch_metered` and this
+/// fails at `left: 6, right: 1`.
 #[tokio::test]
 async fn a_budgeted_map_fanout_dispatches_exactly_one_child_before_the_gate_fires() {
     let (gateway, calls) = metered_latency_gateway(
         Some(kernel::types::cost::TokenUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            total_tokens: 150,
+            input_tokens: 1_000,
+            output_tokens: 500,
+            total_tokens: 1_500,
         }),
         FANOUT_DELAY,
     )
@@ -13608,7 +13721,9 @@ async fn a_budgeted_map_fanout_dispatches_exactly_one_child_before_the_gate_fire
         .run_budgeted(
             run,
             &graph,
-            Some(orchestrator_core::TokenBudget { total_tokens: 100 }),
+            Some(orchestrator_core::TokenBudget {
+                total_tokens: 1_000,
+            }),
         )
         .await
         .expect("drives");
@@ -13616,7 +13731,7 @@ async fn a_budgeted_map_fanout_dispatches_exactly_one_child_before_the_gate_fire
     assert_eq!(
         calls.lock().unwrap().len(),
         1,
-        "a budgeted run serialises check→dispatch→charge, so the first child's 150 \
+        "a budgeted run serialises check→dispatch→charge, so the first child's 1500 \
          tokens are on the ledger before any sibling checks it"
     );
     let pause = out
@@ -13629,7 +13744,7 @@ async fn a_budgeted_map_fanout_dispatches_exactly_one_child_before_the_gate_fire
     let (spent, budget) = crate::spend_of(&events);
     assert_eq!(
         (spent, budget),
-        (150, Some(100)),
+        (1_500, Some(1_000)),
         "overshoot is bounded by ONE call even under fan-out"
     );
     assert!(
@@ -13870,18 +13985,22 @@ async fn compaction_preserves_the_map_children_spend_in_the_ledger() {
 /// erased, a budgeted run's SECOND drive folds a short base and blows through the cap
 /// with no operator action and nothing loud in the journal.
 ///
-/// Map(3) + Consolidate + 2 tail nodes at 150/call under a 700-token cap. Serialised
-/// (Critical 1's gate), the first drive spends 150·5 = 750 and pauses at the node
-/// after the cap is met. Compaction then removes 450 of it. Before the fix the resumed
-/// drive read a base of 300, dispatched the rest, and the run COMPLETED at 1050 real
-/// tokens against a 700 cap. After the fix the resume re-pauses at the same ledger.
+/// Map(3) + Consolidate + 2 tail nodes at 1500/call under a 7000-token cap. Serialised
+/// (Critical 1's gate), the first drive spends 1500·5 = 7500 and pauses at the node
+/// after the cap is met. Compaction then removes 4500 of it. Before the fix the resumed
+/// drive read a base of 3000, dispatched the rest, and the run COMPLETED at 10500 real
+/// tokens against a 7000 cap. After the fix the resume re-pauses at the same ledger.
+///
+/// 10x the original fixture (150/call under 700), because the clamp's floor refuses
+/// once the remaining budget drops under it: at the original scale only 3 of the 5
+/// calls went out. See [`run_started_with_budget`].
 #[tokio::test]
 async fn a_compacted_map_cannot_let_a_budgeted_run_overshoot_across_drives() {
     use orchestrator_store::InMemoryContentStore;
     let usage = kernel::types::cost::TokenUsage {
-        input_tokens: 100,
-        output_tokens: 50,
-        total_tokens: 150,
+        input_tokens: 1_000,
+        output_tokens: 500,
+        total_tokens: 1_500,
     };
     let content = Arc::new(InMemoryContentStore::new());
     let journal = InMemoryJournal::new();
@@ -13928,14 +14047,16 @@ async fn a_compacted_map_cannot_let_a_budgeted_run_overshoot_across_drives() {
         .run_budgeted(
             run,
             &graph,
-            Some(orchestrator_core::TokenBudget { total_tokens: 700 }),
+            Some(orchestrator_core::TokenBudget {
+                total_tokens: 7_000,
+            }),
         )
         .await
         .expect("drives");
     assert!(out1.paused.is_some(), "the cap must stop drive 1");
-    let spent_live = calls1.lock().unwrap().len() as u64 * 150;
+    let spent_live = calls1.lock().unwrap().len() as u64 * 1_500;
     assert_eq!(
-        spent_live, 750,
+        spent_live, 7_500,
         "5 serialised calls escape before the cap is met"
     );
     assert_eq!(
@@ -13968,7 +14089,1450 @@ async fn a_compacted_map_cannot_let_a_budgeted_run_overshoot_across_drives() {
             .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
         "a run that has blown its cap must never report RunCompleted"
     );
-    assert_eq!(crate::spend_of(&events).0, 750);
+    assert_eq!(crate::spend_of(&events).0, 7_500);
+}
+
+// ===================== SP-DATA-5 follow-on: the budget clamp ==================
+//
+// The gate above is a FLOOR-TRIGGER: it refuses once `spent` has already passed the
+// cap, so a run can overshoot by one call, and that call is bounded only by whatever
+// the provider's default output limit happens to be. These tests cover the clamp that
+// hands enforcement of that one call to the provider by setting `max_tokens`.
+//
+// They all run against `clamp_observing_gateway`, the only double that can SEE a
+// `max_tokens` — see `ClampObservingAdapter` for why it also honours it.
+//
+// What this section is careful NOT to claim: the overshoot is bounded by the
+// input-estimate error and biased toward refusing early. It is not eliminated.
+
+/// A budgeted `Chat` request reaches the provider with `max_tokens` set to what the
+/// remaining budget can afford.
+///
+/// This is the BUDGET half of the clamp, so the fixture is chosen to keep the budget the
+/// binding constraint throughout — a cap just under the fixture chain's own
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`], and a scripted reply small enough that the first call
+/// leaves room for a second. Let the model ceiling bind instead and every assertion
+/// below would read the same constant twice and prove nothing about the budget; that is
+/// `a_budgeted_call_is_never_clamped_above_the_models_output_limit`'s job, from the other
+/// side.
+#[tokio::test]
+async fn a_budgeted_call_reaches_the_provider_clamped() {
+    const CAP: u64 = 1_000;
+    let (gateway, seen) = clamp_observing_gateway(10, 300).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(!seen.is_empty(), "the provider was called");
+    assert!(
+        seen.iter().all(|m| m.is_some()),
+        "every budgeted call carries a clamp: {seen:?}"
+    );
+    assert!(
+        seen[0].unwrap() < u32::try_from(CAP).unwrap(),
+        "the clamp is below the cap — the prompt's own estimate is subtracted: {:?}",
+        seen[0]
+    );
+    assert!(
+        seen[0].unwrap() < FIXTURE_MAX_OUTPUT_TOKENS,
+        "and it is the BUDGET doing the work here, not the model's output limit — \
+         otherwise the assertions below compare a constant with itself: {seen:?}"
+    );
+    // The clamp TIGHTENS as the ledger fills. Without this the first assertion would
+    // also pass for a clamp pinned to the cap-minus-a-constant, which enforces nothing
+    // on the second call of a run that has already spent most of its budget.
+    assert!(
+        seen[1].unwrap() < seen[0].unwrap(),
+        "the second call's allowance is smaller — the first call's spend is already on \
+         the ledger: {seen:?}"
+    );
+}
+
+/// An UNBUDGETED run is byte-identical: no clamp reaches the provider. This is
+/// SP-DATA-5's standing additivity guarantee and the cheapest regression test in the
+/// slice.
+#[tokio::test]
+async fn an_unbudgeted_call_is_not_clamped() {
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(!seen.is_empty(), "the provider was called");
+    assert!(
+        seen.iter().all(|m| m.is_none()),
+        "no budget ⇒ max_tokens stays None: {seen:?}"
+    );
+}
+
+/// The clamp is bounded on BOTH sides: never above the model's own output limit.
+///
+/// `allowance = remaining − est` is a pure budget figure and knows nothing about the
+/// model. Any realistic whole-run cap — 100k, a million — exceeds every model's output
+/// limit, so an unbounded clamp sends a `max_tokens` no provider will accept: Anthropic
+/// answers a 400 `invalid_request_error`, and every adapter in this repo forwards the
+/// value verbatim. The failure mode is the worst kind of regression, because it is
+/// caused BY the budget: the identical run succeeds unbudgeted and hard-fails the moment
+/// an operator sets `--budget-tokens`.
+///
+/// Both assertions matter and neither subsumes the other. The first is the observable a
+/// real operator would see; the second is the invariant, and it holds even for a double
+/// that chose to honour an over-large value rather than refuse it.
+///
+/// The ceiling comes from `Gateway::min_max_output_tokens`, a `min` over the chain
+/// rather than the selected model — the clamp is applied before selection, and a request
+/// that fails over lands on a different entry.
+#[tokio::test]
+async fn a_budgeted_call_is_never_clamped_above_the_models_output_limit() {
+    // A cap ten times the fixture model's output limit, so the budget is nowhere near
+    // the binding constraint and only the model ceiling can hold the value down.
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(
+            run,
+            run_started_with_budget(u64::from(FIXTURE_MAX_OUTPUT_TOKENS) * 10),
+        )
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    assert!(
+        out.failed.is_none(),
+        "a budgeted run must not be failed by its own clamp: {:?}",
+        out.failed
+    );
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(!seen.is_empty(), "the provider was called");
+    assert!(
+        seen.iter()
+            .all(|m| m.is_some_and(|m| m <= FIXTURE_MAX_OUTPUT_TOKENS)),
+        "every clamp is at or below the model's own output limit \
+         ({FIXTURE_MAX_OUTPUT_TOKENS}): {seen:?}"
+    );
+}
+
+/// The clamp is bounded by the CONTEXT WINDOW too, not only by the output limit.
+///
+/// A provider enforces `prompt_tokens + max_tokens <= context_window`, and the
+/// unbudgeted path never trips it because `max_tokens: None` is omitted from the wire
+/// entirely (`openai_compat/convert.rs`'s `skip_serializing_if`). So bounding only by
+/// `max_output_tokens` reintroduces, through the window route, exactly the regression the
+/// ceiling term was added to prevent: **setting a budget hard-fails a call that succeeds
+/// without one.** Worse than the output-limit case, because it arrives as a `NodeFailed`
+/// rather than a budget pause — `torii run wake --budget-tokens N` cannot recover it, and
+/// the operator's only remedy is to drop the budget.
+///
+/// The fixture chain is `context_window: 4096`, `max_output_tokens: 1024`. A 10 500-char
+/// prompt estimates at `ceil(10500/3) = 3500`, so the window leaves `4096 - 3500 = 596` —
+/// BELOW the 1024 output limit, which is what makes the window the binding term here and
+/// the output limit a decoy. Before the fix the clamp emitted 1024 and asked for
+/// `3500 + 1024 = 4524` against a 4096 window.
+///
+/// The threshold is not exotic: the shipped presets are `8192 / 4096`
+/// (`gateway/src/catalog/presets.rs`), so any prompt over ~4096 tokens is in this
+/// territory, and SP-6 s4 bounds a single `## Context` section at 32 KiB — ~10.9k tokens
+/// on its own under `chars/3`.
+#[tokio::test]
+async fn a_budgeted_call_is_never_clamped_past_the_context_window() {
+    // 10_500 chars ⇒ est 3500 ⇒ the window allows 596, under the 1024 output limit.
+    let prompt = "x".repeat(10_500);
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // A cap far above both bounds, so neither the budget nor the output limit is what
+    // holds the value down — only the window can.
+    journal
+        .append(run, run_started_with_budget(100_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", &prompt),
+            deps: vec![],
+        }],
+    };
+    let out = exec.start(run, &graph).await.expect("drives");
+    assert!(
+        out.failed.is_none(),
+        "a budgeted run must not be failed by its own clamp: {:?}",
+        out.failed
+    );
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let emitted = seen
+        .first()
+        .copied()
+        .flatten()
+        .expect("the budgeted call was clamped");
+    // 4096 − 3500. Asserted as the arithmetic rather than a bare literal so a change to
+    // the fixture window or to the estimator moves the expectation with it.
+    let est = 10_500u32.div_ceil(3);
+    let window_allows = 4096 - est;
+    assert!(
+        emitted <= window_allows,
+        "the clamp must leave room for the prompt inside the context window: emitted \
+         {emitted} + est {est} exceeds the 4096 window (window allows {window_allows}, \
+         and the {FIXTURE_MAX_OUTPUT_TOKENS} output limit is NOT the binding term here)"
+    );
+}
+
+/// A budgeted **ReAct agent turn** reaches the provider clamped, and its estimate counts
+/// the system prompt and the tool schemas.
+///
+/// Two properties in one test because the second does not follow from the first, and the
+/// distinction is the whole point:
+///
+/// 1. **The clamp happens at all on this producer.** Every other clamp test drives a
+///    `ModelCall`, whose `support::build_request` hardcodes `system: None, tools: []`. So
+///    skipping the clamp for any request carrying a system prompt — `) if
+///    system.is_none() => {` on the match arm — reddened NOTHING before this test. The
+///    agent and the selector are the two producers that spend the most per call, and they
+///    were the two the clamp was never observed on.
+/// 2. **The estimate's `system` and `tools` terms are actually WIRED.** Passing
+///    `est_input_tokens(None, messages, &[])` at the call site also reddened nothing,
+///    because no test drove a payload where those terms were non-empty. That mutation is
+///    the direction §4 forbids: the estimate collapses to the user message, `allowance =
+///    remaining − est` comes out too high, and the clamp over-asks by the whole
+///    system-plus-schemas term — measured at ~98% of the estimate on this fixture.
+///
+/// The upper bound is what separates them: asserting merely `Some(_)` stays green under
+/// mutation 2. `cap − 1` is what a one-character user message alone would leave, so
+/// anything at or above it proves the other terms contributed nothing.
+#[tokio::test]
+async fn a_budgeted_agent_turn_is_clamped_and_counts_its_system_and_tools() {
+    const CAP: u64 = 1_000;
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: NodeKind::Agent {
+                agent: AgentRef("a".into()),
+                input: serde_json::json!("hi"),
+                phase: None,
+            },
+            deps: vec![],
+        }],
+    };
+    exec.start(run, &graph).await.expect("drives");
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let emitted =
+        seen.first().copied().flatten().expect(
+            "a budgeted ReAct turn reaches the provider CLAMPED, not with max_tokens: None",
+        );
+    // The user message is `"hi"` — 2 chars, so 1 token under `chars/3`. If the system
+    // prompt and the tool schemas were counted, the allowance is well below `cap - 1`.
+    let user_only = u32::try_from(CAP).unwrap() - 1;
+    assert!(
+        emitted < user_only,
+        "the estimate must count the agent's system prompt and tool schemas, not just \
+         the user message: emitted {emitted} is at or above the {user_only} that the \
+         2-char message alone would leave"
+    );
+}
+
+/// The floor refusal's guidance survives a sibling that spends AFTER the pause.
+///
+/// `drive` does not stop when a node pauses — `for node in ready` marks the refusing
+/// node terminal and keeps going — so an INDEPENDENT sibling can dispatch afterwards and
+/// push the ledger past any absolute cap figure computed at the refusing call. That made
+/// the named raise stale exactly when the graph had a second ready node, and an operator
+/// applying it verbatim re-paused on the `Spent` arm, which named no figure at all: two
+/// manual round trips (`BudgetRaised` + `force_wake` each, because this pause is
+/// `resume_after: None`) to get one number.
+///
+/// The property is what a headroom guarantees and an absolute cannot: raising to the
+/// FINAL ledger plus the stated headroom unblocks the run. Asserted against `spend_of`,
+/// the same fold the gate uses, rather than against a figure parsed out of prose — the
+/// message wording may change, the arithmetic may not.
+///
+/// Declaration order is the whole trap: put the cheap node first and the old figure was
+/// correct, so a single-node or well-ordered fixture could never see this.
+#[tokio::test]
+async fn the_floors_guidance_holds_when_a_sibling_spends_after_the_pause() {
+    const CAP: u64 = 400;
+    // A double reporting 500 total against a clamp that allowed far less. Not a cheat:
+    // `max_tokens` bounds OUTPUT, while `total_tokens` includes the input the provider
+    // actually counted — which is exactly the residual §4 admits, where our pessimistic
+    // estimate still undershoots the real prompt. The sibling therefore spends past any
+    // absolute figure the refusing call could have named.
+    let (gateway, _calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 400,
+            output_tokens: 100,
+            total_tokens: 500,
+        }),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    // Two INDEPENDENT nodes. `n1` is declared first and its 600-char prompt estimates at
+    // 200, leaving an allowance under the 256 floor; `n2` is cheap and dispatches after
+    // the pause, spending more.
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", &"x".repeat(600)),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("n2".into()),
+                kind: model_call("c", "hi"),
+                deps: vec![],
+            },
+        ],
+    };
+    let first = exec.start(run, &graph).await.expect("drives");
+    assert!(
+        first.paused.is_some(),
+        "n1 refuses below the floor: {first:?}"
+    );
+
+    let reason = first.paused.as_ref().map(|p| p.reason.clone()).unwrap();
+    let (final_spend, _) = crate::executor::spend_of(&journal.load(run).await.unwrap());
+    let est = 600u64.div_ceil(3);
+    let headroom = est + orchestrator_core::MIN_OUTPUT_TOKENS;
+
+    // 1. THE TRAP, executable. The absolute figure computable at the refusing call is
+    //    `spent_then + headroom`, and `spent_then` was 0 — the refusal happened before
+    //    anything dispatched. The sibling then spent, so that absolute is now BELOW the
+    //    ledger and applying it verbatim cannot possibly work. This is the assertion
+    //    that makes the staleness a fact rather than an argument.
+    let stale_absolute = headroom; // spent_then == 0
+    assert!(
+        stale_absolute < final_spend,
+        "the figure computable at refusal time ({stale_absolute}) must be demonstrably \
+         stale against the final ledger ({final_spend}) — otherwise this fixture is not \
+         exercising the defect at all"
+    );
+
+    // 2. The message must therefore state the requirement as HEADROOM ABOVE THE FINAL
+    //    SPEND, not as that absolute. This pins wording because the defect WAS wording:
+    //    the executor's arithmetic never changed, only what it tells an operator to do.
+    assert!(
+        reason.contains(&format!(
+            "exceed this run's final spend by at least {headroom}"
+        )),
+        "the floor refusal must state a headroom above the FINAL spend, which cannot go \
+         stale, rather than an absolute cap read mid-drive: {reason}"
+    );
+
+    // 3. And the guidance, applied, works.
+    journal
+        .append(
+            run,
+            JournalEvent::BudgetRaised {
+                new_total_tokens: final_spend + headroom,
+            },
+        )
+        .await
+        .unwrap();
+    let second = exec.start(run, &graph).await.expect("resumes");
+    assert!(
+        second.paused.is_none(),
+        "raising to the final spend plus the stated headroom must unblock the run, not \
+         re-pause it: {:?}",
+        second.paused
+    );
+}
+
+/// Below the floor the gate refuses, and **makes no gateway call**.
+///
+/// Asserted on the call log, not on the outcome: a test that only checked the pause
+/// would pass even if we spent the input tokens first and threw the reply away, which is
+/// the exact waste the floor exists to prevent. The floor is also the single most
+/// behaviour-changing line in the slice — it is what turns a run that used to complete
+/// into a run that pauses — and until this test existed nothing a local
+/// `cargo test --workspace` RUNS reached the arm at all: replacing its `return` with
+/// `unreachable!()` left that command at exit=0.
+///
+/// The narrow wording is the point. The DB-gated `crates/torii/tests/e2e_pg.rs` budget
+/// e2e did reach it — its pre-rescale `CAP = 100` left a first-call allowance of 87,
+/// under the floor, so the floor refused before dispatching, which is exactly why that
+/// fixture needed rescaling (b6b6a46). The `exit=0` above holds only because that test is
+/// `#[cfg_attr(not(have_database_url), ignore)]` and a dev box skips it. "Reachable by
+/// nothing in the workspace" is the reasoning that let that regression through to a
+/// required CI check, and it must not be re-taught at the site where it was made.
+#[tokio::test]
+async fn below_the_floor_the_gate_refuses_without_calling_the_provider() {
+    // A cap barely above the floor: the prompt's own estimate pushes the allowance
+    // under it, so the refusal is the FLOOR's and not the `spent >= cap` gate's —
+    // nothing has been spent at all.
+    let cap = orchestrator_core::MIN_OUTPUT_TOKENS + 5;
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(cap))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    // Exactly 30 characters, so the pessimistic `chars/3` estimate is exactly 10 and
+    // every number in the reason string below is arithmetic a reader can check:
+    // allowance = 261 − 10 = 251, five short of the 256 floor, so the cap must reach
+    // `spent + est + floor` = 0 + 10 + 256 = 266 before this call can go out. This is
+    // the NON-saturating case, where that figure and the discarded
+    // `budget + (floor − allowance)` = 261 + 5 agree — which is exactly why the
+    // saturating branch needs its own assertion in
+    // [`an_estimate_larger_than_the_budget_does_not_wrap`].
+    const PROMPT: &str = "an estimate of exactly ten tok";
+    assert_eq!(
+        PROMPT.chars().count(),
+        30,
+        "the expected reason below is computed from this length"
+    );
+    let (graph, ..) = two_node_graph(PROMPT, "p2");
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    let pause = out.paused.as_ref().expect("the run pauses on the budget");
+    assert_eq!(
+        pause.node.0, "n1",
+        "it pauses at the very first node: {out:?}"
+    );
+    assert!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and NO call was made — the point of the floor is not paying for a doomed reply"
+    );
+    assert_eq!(
+        crate::spend_of(&journal.load(run).await.unwrap()).0,
+        0,
+        "nothing was spent, which is what separates this refusal from an exhausted cap"
+    );
+    // The reason must SAY that, and say what to do about it. Reusing the exhausted
+    // wording here would report "0 of 261 tokens spent" beside a run that spent
+    // nothing, and tell an operator to raise a cap without saying by how much — two
+    // different situations with two different remedies, rendered identically.
+    assert_eq!(
+        pause.reason,
+        "budget: only 251 tokens left for output after the input estimate, below the \
+         256-token floor (0 of 261 spent); the cap must exceed this run's final spend \
+         by at least 266 (≥ 266 if nothing else in this drive spends — independent \
+         nodes may still run after this pause and push it higher); raise it with \
+         `torii run wake --budget-tokens N`",
+        "the floor's reason names the allowance, the floor and the headroom it needs"
+    );
+}
+
+/// An estimate larger than the whole remaining budget must not wrap — **and the raise
+/// the refusal names must actually unblock the call.**
+///
+/// With `saturating_sub` the allowance is 0, which is below the floor, so the run
+/// pauses. Without it the subtraction underflows: a debug build panics with "attempt to
+/// subtract with overflow" (which is what makes this test bite), and a RELEASE build —
+/// the workspace profile sets no `overflow-checks` — wraps to an allowance near
+/// `u64::MAX`, i.e. a clamp wider than the cap, which is worse than no clamp at all.
+///
+/// # Why this test also applies the raise
+///
+/// The saturating branch is the one place the refusal's arithmetic can be wrong without
+/// any other test noticing, because `allowance` has been floored to 0 and the part of
+/// `est` that exceeded `remaining` is no longer recoverable from it. Deriving the raise
+/// from the allowance — `budget + (floor − allowance)` — therefore understates it by
+/// exactly `est − remaining` here, while agreeing with the correct answer everywhere
+/// else, so [`below_the_floor_the_gate_refuses_without_calling_the_provider`] (the only
+/// other test that reads this string) cannot see it.
+///
+/// Two assertions carry it, and neither alone is enough. The first pins the exact
+/// number. The second APPLIES it — raise the cap to precisely what the message asked
+/// for and the call must go out — which is what makes the number a promise rather than
+/// a decoration. Under the allowance-derived arithmetic the message here reads "at least
+/// 257", and a run woken at 257 re-pauses on the same node having done nothing: each
+/// operator round trip buys only `MIN_OUTPUT_TOKENS`, and this pause is
+/// `resume_after: None`, so every round trip is a manual `BudgetRaised` + `force_wake`.
+#[tokio::test]
+async fn an_estimate_larger_than_the_budget_does_not_wrap() {
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // One token of budget against a prompt that estimates far above it.
+    journal
+        .append(run, run_started_with_budget(1))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    // Exactly 43 characters ⇒ a pessimistic estimate of 15, forty-three times the
+    // 1-token cap. The whole point of the fixture is `est > remaining`, and every
+    // number below is arithmetic a reader can check from these two.
+    const PROMPT: &str = "a prompt that costs far more than one token";
+    assert_eq!(
+        PROMPT.chars().count(),
+        43,
+        "the expected reason below is computed from this length"
+    );
+    const EST: u64 = 15;
+    // The smallest cap that unblocks this call: `spent + est + floor`. NOT
+    // `budget + (floor − allowance)`, which is 1 + 256 − 0 = 257 and leaves the run
+    // stuck in the same place.
+    const RAISE: u64 = EST + orchestrator_core::MIN_OUTPUT_TOKENS;
+    let (graph, ..) = two_node_graph(PROMPT, "p2");
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    let pause = out.paused.as_ref().expect("a 1-token budget pauses");
+    assert_eq!(pause.node.0, "n1", "it pauses at the first node: {out:?}");
+    assert!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "no call was made"
+    );
+    assert_eq!(
+        pause.reason,
+        format!(
+            "budget: only 0 tokens left for output after the input estimate, below the \
+             256-token floor (0 of 1 spent); the cap must exceed this run's final spend \
+             by at least {RAISE} (≥ {RAISE} if nothing else in this drive spends — \
+             independent nodes may still run after this pause and push it higher); \
+             raise it with `torii run wake --budget-tokens N`"
+        ),
+        "the saturated allowance must not swallow the part of the estimate that \
+         exceeded the budget: {pause:?}"
+    );
+
+    // Apply exactly the raise the message named — the operator's `torii run wake
+    // --budget-tokens N` — and the call must go out.
+    journal
+        .append(
+            run,
+            JournalEvent::BudgetRaised {
+                new_total_tokens: RAISE,
+            },
+        )
+        .await
+        .unwrap();
+    let second = exec.start(run, &graph).await.expect("resumes");
+
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec![Some(
+            u32::try_from(orchestrator_core::MIN_OUTPUT_TOKENS).unwrap()
+        )],
+        "n1 dispatched at the raise the refusal promised, with exactly the floor's \
+         worth of allowance left over"
+    );
+    assert_eq!(
+        second.paused.as_ref().map(|p| p.node.0.as_str()),
+        Some("n2"),
+        "and the run really moved: it is n2 that cannot afford the NEXT call now, not \
+         n1 refusing again at the cap it asked for: {second:?}"
+    );
+}
+
+/// A single budgeted `Chat` through the chokepoint carrying a CALLER-supplied
+/// `max_tokens`, returning what actually reached the provider.
+///
+/// Driven through `dispatch_metered` directly rather than through `start`, because no
+/// orchestrator producer sets `max_tokens` — every one of them passes `None`
+/// (`support.rs`'s two builders and `SelectorDispatch`'s hand-built request), so there
+/// is no graph that can exercise the caller half at all.
+///
+/// The dispatch RESULT is deliberately discarded. A `min` written backwards emits a
+/// `max_tokens` above the model's limit, which `ClampObservingAdapter` refuses exactly
+/// as a real provider would; the log records the offending value before the refusal, so
+/// asserting on the log — not on the outcome — is what makes both directions visible.
+async fn dispatch_once_with(caller_max: Option<u32>, cap: u64) -> Option<u32> {
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let gate = tokio::sync::Mutex::new(());
+    let meter = super::dispatch::Meter::new(0, Some(cap), &live, &gate);
+    let request = kernel::types::request::InferenceRequest {
+        capability: kernel::types::capability::Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some("c".to_string()),
+        payload: kernel::types::request::Payload::Chat {
+            messages: vec![kernel::types::request::Message::text(
+                kernel::types::request::MessageRole::User,
+                "p",
+            )],
+            system: None,
+            max_tokens: caller_max,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+    };
+    let _ = exec.dispatch_metered(&request, &meter).await;
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly one call reached the provider: {seen:?}"
+    );
+    seen[0]
+}
+
+/// A caller's own `max_tokens` is never WIDENED.
+///
+/// Both directions, because a `min` written the wrong way round passes a one-sided
+/// test: with `caller.max(want)` the low leg reads 1024 instead of 16 and the high leg
+/// reads the caller's own million back.
+///
+/// A clamp that could raise a caller's ceiling is the same defect as a tool that
+/// supplies argv and thereby widens its own sandbox policy, which SP-4 s4 spent a slice
+/// ruling out. Nothing in the orchestrator sets `max_tokens` today, so this guards a
+/// future caller rather than a present one — and an unexercised branch with no test is
+/// how the first such caller inherits the defect silently.
+#[tokio::test]
+async fn a_callers_max_tokens_is_never_widened() {
+    // Caller asks for LESS than the allowance ⇒ the caller's value survives untouched.
+    let seen = dispatch_once_with(Some(16), 100_000).await;
+    assert_eq!(seen, Some(16), "a lower caller value must win");
+
+    // Caller asks for MORE ⇒ it is clamped down, never honoured.
+    let seen = dispatch_once_with(Some(1_000_000), 100_000).await;
+    assert!(
+        seen.is_some_and(|m| m < 1_000_000),
+        "a higher caller value must be clamped down, not honoured: {seen:?}"
+    );
+}
+
+/// An `Embed` request on chain `"emb"` — the one payload kind the clamp skips.
+fn embed_request() -> kernel::types::request::InferenceRequest {
+    kernel::types::request::InferenceRequest {
+        capability: kernel::types::capability::Capability::TextEmbed,
+        model: None,
+        router: None,
+        chain: Some("emb".to_string()),
+        payload: kernel::types::request::Payload::Embed {
+            texts: vec!["x".to_string()],
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+    }
+}
+
+/// A non-`Chat` payload on a budgeted run is untouched by the clamp and still gated by
+/// the pre-existing `spent >= cap` rule — **including exactly ON the cap.**
+///
+/// # This test carries a boundary the clamp took away
+///
+/// `spending_exactly_the_cap_stops_the_run` used to be the only thing pinning
+/// `spent >= cap` against `spent > cap`, and it no longer is: for a `Chat` payload at
+/// `spent == cap` the clamp's floor computes `allowance == 0` and returns an identical
+/// `BudgetExhausted`, so the mutation leaves it green. `Embed` is the only payload the
+/// clamp SKIPS, which makes it the one place left where that gate is observably the
+/// only thing between a budgeted run and the provider. Hence the second half below, and
+/// hence the call counter: `>` instead of `>=` lets the third call out.
+#[tokio::test]
+async fn a_non_chat_payload_is_gated_but_not_clamped() {
+    const CAP: u64 = 400;
+    let (gateway, calls) = metered_embed_gateway(120).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let gate = tokio::sync::Mutex::new(());
+
+    // Under the cap: the clamp skips it (there is no `max_tokens` on an `Embed` to
+    // set) and it dispatches and is METERED like any other call.
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let under = exec
+        .dispatch_metered(
+            &embed_request(),
+            &super::dispatch::Meter::new(0, Some(CAP), &live, &gate),
+        )
+        .await
+        .expect("no gateway error");
+    assert!(
+        under.is_ok(),
+        "an Embed under the cap dispatches — the clamp must skip it, not refuse it"
+    );
+    assert_eq!(
+        *calls.lock().unwrap_or_else(|e| e.into_inner()),
+        1,
+        "and it really reached the provider"
+    );
+    assert_eq!(
+        live.load(std::sync::atomic::Ordering::Relaxed),
+        120,
+        "its spend is charged back to the ledger, exactly as a Chat call's is"
+    );
+
+    // EXACTLY on the cap: refused, before the provider. This is the `>=` boundary.
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let on_the_cap = exec
+        .dispatch_metered(
+            &embed_request(),
+            &super::dispatch::Meter::new(CAP, Some(CAP), &live, &gate),
+        )
+        .await
+        .expect("no gateway error");
+    assert!(
+        matches!(
+            on_the_cap,
+            Err(super::dispatch::Refusal::BudgetExhausted { .. })
+        ),
+        "spending exactly the cap is spending it — `>=`, not `>`"
+    );
+    assert_eq!(
+        *calls.lock().unwrap_or_else(|e| e.into_inner()),
+        1,
+        "and no second call went out"
+    );
+}
+
+/// The design's §4 claim, asserted as arithmetic rather than prose: a budgeted run's
+/// total spend does not exceed `cap + Σ(actual_input − est_input)`.
+///
+/// Its outcome depends on the fixture HONOURING `max_tokens` rather than merely
+/// recording it, which is what makes it a measurement instead of a reading-back of a
+/// number we just watched ourselves compute. A double that reported its scripted 5000
+/// regardless would put the spend at ~10_000 against a 2000 cap and this would fail —
+/// that is the sense in which the honouring half is load-bearing.
+///
+/// Not the ONLY such test, which an earlier version of this comment claimed: deleting the
+/// honouring leg reddens FIVE, this one among them, and `ClampObservingAdapter`'s own doc
+/// carries the measured list. Cross-checked rather than inferred, because a coverage claim
+/// stated on one side of the repo and contradicted on the other is the defect class this
+/// slice keeps finding — and that fixture's doc named two of the five in the same commit
+/// that wrote "the only test" here.
+///
+/// The overshoot is asserted from BOTH sides, deliberately. Upward, because the bound is
+/// the claim. Downward — `spent > cap` — because the claim this slice is NOT allowed to
+/// make is that the overshoot is eliminated: it is bounded by the input-estimate error
+/// and biased toward refusing early, and here the error is real and shows up in the
+/// ledger. A test that asserted `spent <= cap` would be asserting something false.
+#[tokio::test]
+async fn a_budgeted_run_does_not_overshoot_beyond_the_estimate_error() {
+    const CAP: u64 = 2_000;
+    // 10 real input tokens per call against a 1-token estimate for the 2-character
+    // prompt: the residual is 9 per call, and two calls go out.
+    const ACTUAL_INPUT: u64 = 10;
+    const ESTIMATED_INPUT: u64 = 1;
+    let (gateway, seen) = clamp_observing_gateway(ACTUAL_INPUT as u32, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    let spent = crate::spend_of(&journal.load(run).await.unwrap()).0;
+    let bound = CAP + calls * (ACTUAL_INPUT - ESTIMATED_INPUT);
+    assert!(
+        spent <= bound,
+        "spend {spent} must stay within cap {CAP} plus the input-estimate error over \
+         {calls} calls (bound {bound})"
+    );
+    assert!(
+        spent > CAP,
+        "and it DOES overshoot — bounded and biased safe, not eliminated. A spend at or \
+         under the cap here would mean this test is measuring something else: {spent}"
+    );
+    // The counterfactual, which is the whole point of clamping: unclamped, the fixture
+    // reports its scripted 5000 per call and two calls put the run five times past its
+    // cap.
+    assert!(
+        spent < 5_000,
+        "the clamp bit — unclamped this run spends ~10_000 against a 2_000 cap: {spent}"
+    );
+}
+
+/// A CLAMPED call still journals its REAL usage, and folds by effect id exactly as
+/// before.
+///
+/// The rest of the budget suite proves this for unclamped calls only, so without this
+/// the fold could silently mis-handle a clamped one — and the ledger is what every gate,
+/// every resume and every `run status` reads.
+#[tokio::test]
+async fn a_clamped_call_still_journals_its_real_usage() {
+    const INPUT: u32 = 10;
+    let (gateway, seen) = clamp_observing_gateway(INPUT, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(2_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    let allowance =
+        seen.lock().unwrap_or_else(|e| e.into_inner())[0].expect("the first call carried a clamp");
+    let recorded = journaled_usage_totals(&journal.load(run).await.unwrap(), |n| n == "n1");
+    assert_eq!(
+        recorded,
+        vec![Some(INPUT + allowance.min(5_000))],
+        "the journaled usage is the CLAMPED count the provider really returned, not the \
+         unclamped script and not the allowance we asked for"
+    );
+}
+
+/// A clamped call replays from its memo on resume even though the clamp VALUE has
+/// moved between drives.
+///
+/// # Why this is a precondition and not a nicety
+///
+/// Every determinism key in the executor covers the SEMANTIC inputs and none covers a
+/// transport parameter: `input_hash` hashes `{chain}|{payload}`, `agent_input_hash`
+/// hashes `{chain}|{system}|{messages}|{tools}`, and the selector hashes
+/// `{chain}|{system,user}`. `max_tokens` — and the remaining budget it is computed from
+/// — appear in none of the three, which is the only reason a run whose cap was raised
+/// between drives replays its completed prefix instead of halting on
+/// `DeterminismViolation`. Fold either quantity into any of those hashes and EVERY
+/// budgeted resume through that hash becomes a hard halt, because raising the cap is
+/// exactly what an operator does to un-stick a run that paused on its budget: the raise
+/// would then guarantee the violation.
+///
+/// **This test carries the `ModelCall` call site only** — its graph is two `ModelCall`
+/// nodes. There are FIVE call sites across two functions (see
+/// [`a_budgeted_agent_turn_replays_from_its_memo_when_the_budget_moved`]), and a budget
+/// term folded in at one leaves the other four hashing as before, so one fixture cannot
+/// pin more than the site it drives. The agent's is that test; the selector's is already
+/// reddened by [`a_re_driven_selector_replays_its_call_instead_of_respending`]. Claiming
+/// all of them here was wrong and measurably so: the agent site took the mutation green.
+///
+/// The clamp block's own comment leans on that argument. A comment cannot fail, so these
+/// tests carry it — and it was mutation-checked rather than assumed. Hashing the clamped
+/// `max_tokens` alongside the payload in `run_node`'s `ModelCall` arm reddens this one
+/// with `DeterminismViolation { node: NodeId("n1"), effect_id: ... }`.
+///
+/// # Why the fixture is shaped this way
+///
+/// A run that simply completes under one budget and is re-driven under another proves
+/// less than it looks: with nothing left to dispatch, "no new provider call" is also
+/// what a run that never resumed at all would show. So the first drive is made to stop
+/// HALF-WAY — `n1` completes, `n2` falls under the floor — and the second drive must
+/// then do both things at once: replay `n1` from its memo and dispatch `n2` live. The
+/// call log distinguishes the two, and the second entry proves the drive really did
+/// reach the provider rather than short-circuiting.
+///
+/// Every magnitude below is chosen to keep the BUDGET the binding term rather than
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`]; let the model ceiling bind and both drives would emit
+/// the same 1024 and the "clamp moved" assertion would be comparing a constant with
+/// itself.
+#[tokio::test]
+async fn a_clamped_call_replays_from_its_memo_when_the_budget_moved() {
+    // Drive 1 affords n1 and not n2: n1's allowance is 500 − 1 = 499, its reply costs
+    // 10 + min(300, 499) = 310, and that leaves n2 an allowance of 500 − 310 − 1 = 189,
+    // under the 256-token floor.
+    const CAP_1: u64 = 500;
+    // Drive 2 affords n2: 900 − 310 − 1 = 589, clear of the floor and still under the
+    // model's 1024, so the budget is what sets the number.
+    const CAP_2: u64 = 900;
+    let (gateway, seen) = clamp_observing_gateway(10, 300).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP_1))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+
+    let first = exec.start(run, &graph).await.expect("first drive");
+    assert_eq!(
+        first.paused.as_ref().map(|p| p.node.0.as_str()),
+        Some("n2"),
+        "the first drive completes n1 and pauses ON n2 — the node the floor refused: \
+         {first:?}"
+    );
+    let after_first = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(after_first.len(), 1, "exactly n1 was dispatched: {first:?}");
+
+    // The operator's remedy, as `torii run wake --budget-tokens N` journals it. It
+    // changes the clamp arithmetic for every call the run has left AND for every call
+    // it already made — which is the whole point of the test.
+    journal
+        .append(
+            run,
+            JournalEvent::BudgetRaised {
+                new_total_tokens: CAP_2,
+            },
+        )
+        .await
+        .unwrap();
+    let second = exec.start(run, &graph).await.expect("resumes");
+
+    assert!(
+        second.failed.is_none(),
+        "a moved clamp is not a determinism violation: {:?}",
+        second.failed
+    );
+    assert!(
+        second.paused.is_none(),
+        "and the raise really did un-stick the run: {second:?}"
+    );
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        seen.len(),
+        2,
+        "one new call, not two: n1 replayed from its memo and only n2 went to the \
+         provider — a re-spent n1 would show three: {seen:?}"
+    );
+    assert_eq!(
+        journaled_usage_totals(&journal.load(run).await.unwrap(), |n| n == "n1"),
+        vec![Some(310)],
+        "and n1 has exactly ONE ledger entry, so the replay charged nothing"
+    );
+    // The clamp really did move. Without this the test would still pass against a clamp
+    // pinned to a constant, which is the one case where "the budget moved" costs the
+    // fence nothing and the guard would be vacuous.
+    assert_eq!(
+        (after_first[0], seen[1]),
+        (Some(499), Some(589)),
+        "the second drive computes a DIFFERENT allowance from the first: {seen:?}"
+    );
+}
+
+/// The same fence, on the AGENT's determinism key: a budgeted ReAct turn that paused
+/// mid-loop replays turn 0 from its memo after the cap is raised.
+///
+/// # Why the `ModelCall` twin above does not cover this
+///
+/// There are TWO functions across FIVE call sites: `support::input_hash(chain, payload)`
+/// is called by `run_node`'s `ModelCall` arm (`mod.rs`), by the `Map` child producer and
+/// by the `Consolidate` synthesis (both `fanout.rs`), and — with a `{system, user}`
+/// payload — by `SelectorDispatch::complete`; `support::agent_input_hash` is called only
+/// by `agent_turn_output`. A guard attaches to a CALL SITE, not to a function — a budget
+/// term folded in at one leaves the other four hashing exactly as before, so each site
+/// needs a resume test of its own, and the agent's had none.
+///
+/// **This comment said THREE until the whole-slice review counted them**, folding the
+/// `Map` producer into the `ModelCall` entry one clause after ruling that a guard
+/// attaches to a site rather than a function, and omitting `Consolidate` outright. Both
+/// `fanout.rs` sites are covered only INCIDENTALLY: the Map gate test hand-computes its
+/// hash, so an author folding a term in would update that line and never see a failure,
+/// and the Consolidate site's only red is a compaction test named nowhere in this
+/// argument. Recorded because the count is what the next author will inherit.
+///
+/// Measured, both legs. Folding this run's remaining budget in at `agent_turn_output`
+/// (`agent.rs`) left the whole orchestrator lib suite green before this test existed; the
+/// same fold at `SelectorDispatch::complete` reddens
+/// [`a_re_driven_selector_replays_its_call_instead_of_respending`] and
+/// [`every_dispatch_a_selector_makes_is_its_own_ledger_entry`]. The asymmetry is a fact
+/// about the suite, not an inference from it.
+///
+/// The sequence is not hypothetical; it is the design's own recovery story. A budgeted
+/// agent pauses between turns, an operator raises the cap with `torii run wake
+/// --budget-tokens N`, the run resumes, and turn 0 must come back from its memo. Fold
+/// any budget-derived quantity into the hash and the RAISE ITSELF guarantees a
+/// `DeterminismViolation`: the one action that exists to un-stick the run is the one
+/// action that halts it for good.
+///
+/// # What the two drives distinguish
+///
+/// `scripted_gateway` pops one response per call, so a bare call COUNT cannot tell a
+/// memo replay from a re-dispatch: turn 0 re-run on drive 2 would pop the final answer,
+/// finish the agent in one turn, and leave the same total of two calls. The sharp
+/// assertion is therefore on the journal — an `EffectRecorded` under
+/// `effect_id("n1", 1, 0)` exists only if a SECOND turn really ran, and turn 0's
+/// `effect_id("n1", 0, 0)` appears exactly once.
+///
+/// The premise the fence needs is that the budget moved between the drives, and it moved
+/// twice over: the cap is raised from 1000 to 5000, and turn 0's own 1500 tokens are on
+/// the ledger by the time drive 2 recomputes the hash. What this does NOT assert is that
+/// the emitted `max_tokens` differed, because the two drives dispatch DIFFERENT turns and
+/// there is no single number to compare — the property here is that turn 0's RECORDED
+/// hash still matches the one recomputed under a moved budget.
+#[tokio::test]
+async fn a_budgeted_agent_turn_replays_from_its_memo_when_the_budget_moved() {
+    // Drive 1 affords turn 0 and not turn 1: turn 0's 1500 tokens put the ledger past
+    // the 1000-token cap, so turn 1 is refused by the `spent >= cap` gate.
+    const CAP_1: u64 = 1_000;
+    // Drive 2 affords turn 1: 5000 − 1500 leaves plenty above the clamp's floor.
+    const CAP_2: u64 = 5_000;
+    let usage = kernel::types::cost::TokenUsage {
+        input_tokens: 1_000,
+        output_tokens: 500,
+        total_tokens: 1_500,
+    };
+    let with_usage = |mut r: kernel::types::io::ChatResponse| {
+        r.usage = Some(usage.clone());
+        r
+    };
+    let (gateway, calls) = scripted_gateway(vec![
+        with_usage(tool_call_response(
+            "t0",
+            "calc",
+            "{\"op\":\"add\",\"a\":1,\"b\":1}",
+        )),
+        with_usage(final_response("done")),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP_1))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: NodeKind::Agent {
+                agent: AgentRef("a".into()),
+                input: serde_json::json!("hi"),
+                phase: None,
+            },
+            deps: vec![],
+        }],
+    };
+
+    let first = exec.start(run, &graph).await.expect("first drive");
+    assert_eq!(
+        first.paused.as_ref().map(|p| p.node.0.as_str()),
+        Some("n1"),
+        "the agent pauses mid-loop on the budget: {first:?}"
+    );
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "turn 0 dispatched and turn 1 was gated — the state this fence has to survive"
+    );
+
+    // The operator's remedy, exactly as `torii run wake --budget-tokens N` journals it.
+    journal
+        .append(
+            run,
+            JournalEvent::BudgetRaised {
+                new_total_tokens: CAP_2,
+            },
+        )
+        .await
+        .unwrap();
+    let second = exec.start(run, &graph).await.expect("resumes");
+
+    assert!(
+        second.failed.is_none(),
+        "a moved budget is not a determinism violation on the agent's hash either: {:?}",
+        second.failed
+    );
+    assert_eq!(
+        second.completed,
+        vec![NodeId("n1".into())],
+        "and the raise really did un-stick the agent: {second:?}"
+    );
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        2,
+        "one new call across both drives: turn 0 replayed, only turn 1 went to the \
+         provider"
+    );
+
+    let events = journal.load(run).await.unwrap();
+    let recorded = |eid: &EffectId| {
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, JournalEvent::EffectRecorded { effect_id, .. } if effect_id == eid))
+            .count()
+    };
+    assert_eq!(
+        recorded(&effect_id("n1", 0, 0)),
+        1,
+        "turn 0 has exactly ONE ledger entry, so the replay charged nothing"
+    );
+    assert_eq!(
+        recorded(&effect_id("n1", 1, 0)),
+        1,
+        "and turn 1 really ran — without this, a turn-0 re-dispatch that popped the \
+         final answer would show the same two calls and pass"
+    );
+}
+
+// --------------------- the clamp's two diagnostics (AC10, AC11) ---------------------
+//
+// The clamp's signals are `tracing` records and deliberately NOT journal events (design
+// §5.4): they describe our own ESTIMATOR, not run state. Nothing folds them, no resume
+// depends on them, and no operator decision keys on them, so making them durable would
+// cost a `FORMAT_VERSION` concern and a fold arm to carry what the ledger already
+// implies — `usage` is journaled, and the allowance is recomputable from the fold.
+//
+// That choice is what forces the little subscriber below. There is no journal to read
+// them back from, so the only way to assert a `tracing` record fired — or, just as
+// importantly, did NOT fire — is to install a subscriber and look. Without it these two
+// signals would be the one part of the slice with no test at all, which for a
+// diagnostic whose entire job is to be emitted is the same as not having it.
+
+/// One captured `tracing` event: its rendered message plus every integer field.
+///
+/// Integers only, because integers are all the clamp emits. A visitor that tried to be
+/// general would have to decide how to stringify every `Value` shape for no caller.
+#[derive(Debug, Clone, PartialEq)]
+struct CapturedEvent {
+    message: String,
+    fields: Vec<(String, u64)>,
+}
+
+impl CapturedEvent {
+    fn field(&self, name: &str) -> Option<u64> {
+        self.fields.iter().find(|(k, _)| k == name).map(|(_, v)| *v)
+    }
+}
+
+/// Pulls an event's message and its integer fields out of `tracing`'s visitor API.
+struct CapturingVisitor(CapturedEvent);
+
+impl tracing::field::Visit for CapturingVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.fields.push((field.name().to_string(), value));
+    }
+
+    /// The catch-all `tracing` routes the `message` field through. Every non-integer
+    /// field lands here too and is dropped on the floor — see [`CapturedEvent`].
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.message = format!("{value:?}");
+        }
+    }
+}
+
+/// A minimal `tracing::Subscriber` that records every event it is handed.
+///
+/// Hand-written rather than pulled from `tracing-subscriber`, which is not a dependency
+/// of this crate (only `torii` has it, for the CLI's `env-filter`). The seven required
+/// methods are six no-ops and one line of real work, which is less than the `Layer` +
+/// `Registry` wiring would be — and it keeps a test-only concern from adding a
+/// dependency edge to a crate that ships.
+///
+/// Spans are ignored outright: the clamp emits bare events, and a subscriber that
+/// tracks no span state can hand out a constant `Id` because nothing ever looks one up.
+#[derive(Clone, Default)]
+struct CapturingSubscriber(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+impl CapturingSubscriber {
+    /// Everything captured so far whose message names the clamp.
+    ///
+    /// Filtered rather than returned whole because a drive emits unrelated records (the
+    /// permission and jail denials in `agent.rs`, and anything a future change adds), and
+    /// a test that asserted on the total count would break for reasons that have nothing
+    /// to do with the clamp.
+    fn clamp_signals(&self) -> Vec<CapturedEvent> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|e| e.message.contains("budget clamp"))
+            .cloned()
+            .collect()
+    }
+}
+
+impl tracing::Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = CapturingVisitor(CapturedEvent {
+            message: String::new(),
+            fields: Vec::new(),
+        });
+        event.record(&mut visitor);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(visitor.0);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Both clamp diagnostics fire, on a call where both conditions really hold.
+///
+/// The fixture makes each one true for a DIFFERENT reason, so neither rides on the
+/// other. The scripted 5000-token reply is far larger than the 999-token allowance, so
+/// the provider stops at the clamp; and the fixture's 10 real input tokens are ten times
+/// the 1-token estimate of a two-character prompt, so the estimate is measurably low.
+///
+/// That second signal is the feedback loop the whole design rests on. The residual
+/// overshoot is `actual_input − est_input` (design §4) and the estimator is a
+/// `chars / 3` heuristic, so without a record of where it was wrong the bound is an
+/// article of faith. Here it is the difference between a run that spends 1009 against a
+/// 1000-token cap and one that does not: the 9-token overshoot is exactly what the warn
+/// reports.
+#[tokio::test]
+async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
+    const CAP: u64 = 1_000;
+    let capture = CapturingSubscriber::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    // One call: it returns 10 + 999 = 1009 tokens, which puts the ledger past the cap,
+    // so n2 is refused by the `spent >= cap` gate and emits nothing.
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec![Some(999)],
+        "one clamped call, the allowance being 1000 − 1 for the two-character prompt"
+    );
+
+    let signals = capture.clamp_signals();
+    let bit = signals
+        .iter()
+        .find(|e| e.message.contains("clamp bit"))
+        .unwrap_or_else(|| panic!("the clamp-bit signal fired: {signals:?}"));
+    assert_eq!(
+        (
+            bit.field("max_tokens"),
+            bit.field("allowance"),
+            bit.field("output_tokens")
+        ),
+        (Some(999), Some(999), Some(999)),
+        "it reports what was SENT, the budget term it came from, and what came back. \
+         The first two being equal is what says the BUDGET truncated this reply rather \
+         than the model's own limit: {bit:?}"
+    );
+
+    let low = signals
+        .iter()
+        .find(|e| e.message.contains("under-estimated"))
+        .unwrap_or_else(|| panic!("the estimate-wrong signal fired: {signals:?}"));
+    assert_eq!(
+        (low.field("estimated"), low.field("actual")),
+        (Some(1), Some(10)),
+        "and the estimate-wrong signal reports both sides, so the residual overshoot \
+         the design's §4 bounds is measurable rather than assumed: {low:?}"
+    );
+}
+
+/// The clamp-bit signal is keyed on the value SENT, not on the allowance — pinned on the
+/// one fixture where the two differ.
+///
+/// # Why this needs its own test
+///
+/// Every other signal test drives a run where `emitted == allowance`, so the two operands
+/// are indistinguishable and the comparison could name either. This one makes the MODEL's
+/// limit the binding term instead of the budget: a cap ten times
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`] leaves an allowance of 10239, the ceiling holds the
+/// emitted value at 1024, and the provider's 1024-token reply can never reach the
+/// allowance at all.
+///
+/// That is not an exotic shape — it is the COMMON one. Any cap large enough to run a
+/// whole graph exceeds every current model's output limit, which is the situation the
+/// ceiling term was added for in the first place. Key the comparison on `allowance` and
+/// the signal goes silent on precisely those runs: replies get truncated by the model's
+/// own limit, an operator sees nothing, and the only production feedback loop on
+/// truncation reports on the rare fixture instead of the common one. The design's §5.4
+/// records that as a correction made during implementation; before this test nothing
+/// could detect it being reversed — mutating `>= clamp.emitted` to `>= clamp.allowance`
+/// left the whole orchestrator lib suite green.
+///
+/// It pins the second half of §5.4's claim too — that "both numbers are logged so a
+/// reader can tell WHICH bound bit" — which until now was only ever exercised where they
+/// were equal, i.e. where the distinction carries no information.
+#[tokio::test]
+async fn the_clamp_bit_signal_fires_against_the_value_sent_not_the_allowance() {
+    // Ten times the model's own output limit, so the budget is nowhere near binding.
+    const CAP: u64 = FIXTURE_MAX_OUTPUT_TOKENS as u64 * 10;
+    let capture = CapturingSubscriber::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    // A scripted reply far larger than the ceiling, so the provider really does stop AT
+    // the emitted limit rather than finishing under it.
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+
+    assert_eq!(
+        seen.lock().unwrap_or_else(|e| e.into_inner())[0],
+        Some(FIXTURE_MAX_OUTPUT_TOKENS),
+        "the premise: the MODEL's limit set this call's max_tokens, not the budget"
+    );
+    let signals = capture.clamp_signals();
+    let bit = signals
+        .iter()
+        .find(|e| e.message.contains("clamp bit"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the clamp-bit signal fires when the reply stops at the value we SENT, \
+                 even though it never approaches the allowance: {signals:?}"
+            )
+        });
+    assert_eq!(
+        (
+            bit.field("max_tokens"),
+            bit.field("allowance"),
+            bit.field("output_tokens")
+        ),
+        (
+            Some(u64::from(FIXTURE_MAX_OUTPUT_TOKENS)),
+            Some(CAP - 1),
+            Some(u64::from(FIXTURE_MAX_OUTPUT_TOKENS))
+        ),
+        "and it reports both bounds. `max_tokens < allowance` is the reader's evidence \
+         that the MODEL's own limit truncated this reply and the budget merely did not \
+         prevent it — the distinction §5.4 logs both numbers for: {bit:?}"
+    );
+    assert!(
+        bit.field("max_tokens") < bit.field("allowance"),
+        "the fixture must actually separate the two operands, or this test would pass \
+         against either comparison: {bit:?}"
+    );
+}
+
+/// Neither signal fires when its condition does not hold — the half of AC10/AC11 that
+/// keeps them meaningful.
+///
+/// A diagnostic that fires on every call is not a diagnostic; it is noise that trains an
+/// operator to ignore the one that matters. So this drives two runs where each signal
+/// would be wrong, and the second is the sharper of the two.
+///
+/// **Phase 1, budgeted, neither condition met.** A 5-token reply against a 999-token
+/// allowance was not truncated, and 1 real input token against a 1-token estimate is not
+/// an under-estimate. `>=` and `>` respectively: an estimate that lands exactly right is
+/// not an error to report.
+///
+/// **Phase 2, UNBUDGETED, where the estimate-wrong condition WOULD hold.** 10 real input
+/// tokens against an estimate of… nothing, because on an unbudgeted run no estimate is
+/// made at all. Both signals live inside `if let Some(clamp)` for that reason, and this
+/// is what pins them there: hoist either check out and every unbudgeted call — every
+/// pre-SP-DATA-5 run in the system — starts warning that a clamp it never applied
+/// mis-estimated an input it never measured.
+///
+/// **Phase 3, the positive CONTROL, and it is not optional.** The two assertions above
+/// are `clamp_signals() == []`, which an empty capture satisfies for any reason at all —
+/// including the capture being dead. `tracing::subscriber::set_default` is thread-local,
+/// so a future `#[tokio::test(flavor = "multi_thread")]` here, or any executor change
+/// that moves a dispatch onto another thread, would empty it silently and leave this test
+/// green while proving nothing. The two premise guards above do not cover that: they
+/// check the CLAMP ("the calls WERE clamped", "no budget ⇒ no clamp"), not the listener.
+/// So a third drive on the SAME subscriber makes a signal that MUST fire, from inside
+/// `exec.start` rather than from the test body — the phrase the first two assertions need
+/// is "the listener was live and nothing fired", and only a record travelling the same
+/// path establishes the first half.
+#[tokio::test]
+async fn neither_clamp_signal_fires_when_its_condition_does_not_hold() {
+    let capture = CapturingSubscriber::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    // Phase 1: budgeted, clamped, and the clamp did not bite.
+    let (gateway, seen) = clamp_observing_gateway(1, 5).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(1_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+    exec.start(run, &graph).await.expect("drives");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|m| m.is_some()),
+        "the calls WERE clamped — otherwise this proves nothing about the signals"
+    );
+    assert_eq!(
+        capture.clamp_signals(),
+        Vec::new(),
+        "a reply well under its allowance, and an estimate that was not low, are the \
+         normal case and must be silent"
+    );
+
+    // Phase 2: unbudgeted, with input tokens that WOULD trip the estimate-wrong check
+    // if it were evaluated outside the clamp.
+    let (gateway, seen) = clamp_observing_gateway(10, 5).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    exec.run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("drives");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|m| m.is_none()),
+        "no budget ⇒ no clamp, which is the premise of the assertion below"
+    );
+    assert_eq!(
+        capture.clamp_signals(),
+        Vec::new(),
+        "and an unbudgeted run says nothing about an estimate it never made"
+    );
+
+    // Phase 3: the control. Same subscriber, same thread, a drive whose clamp DOES bite
+    // — a 5000-token script against a 999-token allowance. The estimate is deliberately
+    // exact (1 real input token against the 1-token estimate of a two-character prompt),
+    // so precisely ONE record is expected and the control cannot pass on the other
+    // signal.
+    let (gateway, _seen) = clamp_observing_gateway(1, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(1_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal), "v1");
+    exec.start(run, &graph).await.expect("drives");
+    let control = capture.clamp_signals();
+    assert!(
+        control.len() == 1 && control[0].message.contains("clamp bit"),
+        "the capture is LIVE for a record emitted from inside a drive — without this the \
+         two `== []` assertions above would hold just as well against a dead subscriber: \
+         {control:?}"
+    );
 }
 
 // ============================= SP-DATA-3 scheduler driver =====================

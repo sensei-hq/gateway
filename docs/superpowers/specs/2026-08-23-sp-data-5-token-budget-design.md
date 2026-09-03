@@ -48,7 +48,13 @@ So today a run can spend without limit, and nothing records what it spent.
 **Non-goals (deferred, §8)**
 - Money/cost denomination (needs durable per-model pricing; §8 records the path).
 - Fleet-wide or per-tenant budgets.
-- Pre-flight estimation to prevent overshoot (output tokens are unknowable before the call).
+- ~~Pre-flight estimation to prevent overshoot (output tokens are unknowable before the call).~~
+  **Superseded by the follow-on slice** (`2026-09-03-sp-data-5-budget-clamp-design.md`). The
+  reasoning was sound and the conclusion was wrong: predicting the output cost is indeed impossible,
+  but the slice did not have to predict it — it BOUNDS it, by setting `max_tokens` on a budgeted
+  request to what the remaining budget affords. Enforcement moves to the provider. The overshoot is
+  now bounded by the INPUT-estimate error and biased toward refusing early; it is **not eliminated**,
+  and that clamp spec's §2 and §4 say so in those words.
 - Budget-aware model selection (that is `gateway/budget.rs`'s existing concern, unchanged).
 
 ## 4. The four decisions, and why
@@ -199,6 +205,16 @@ one call — output tokens are unknowable before the call returns. `--budget-tok
 "stop once you have spent this much", not "never exceed this". Documented as such in the CLI help;
 calling it a hard cap would be a lie.
 
+> **Amended by the follow-on clamp slice** (`2026-09-03-sp-data-5-budget-clamp-design.md`). The
+> section above is still the shape of the gate, but "output tokens are unknowable before the call
+> returns" is no longer the operative constraint: a budgeted `Chat` request now carries
+> `max_tokens = min(remaining − est_input, the chain's smallest max_output_tokens, the caller's own)`,
+> so the provider enforces the bound. The one call's overshoot collapses to the INPUT-estimate error
+> — **bounded and biased toward refusing early, NOT eliminated**. And the gate is no longer the only
+> refusal: below a `MIN_OUTPUT_TOKENS` floor a budgeted run pauses with `spent < cap`, possibly at
+> `spent == 0`, through this same durable pause. Anyone debugging a budgeted run that paused having
+> spent nothing wants the clamp spec, not this section.
+
 #### 6.5a A budgeted run serialises its model calls — the price of the "one call" bound
 
 "At most one call" is only true if only one call can be *in flight*. The whole-slice review's
@@ -212,6 +228,18 @@ Three candidate fixes, and why only the third works:
    still check together against an unchanged ledger.
 2. **Reserve tokens before the call.** No: a reservation needs an output-token estimate, which §8
    deliberately does not have.
+
+   > **The follow-on clamp slice falsified this reason, and the decision survives on a different
+   > one.** §8's deferral is now marked ADDRESSED, so a bullet pointing at it for the estimate it
+   > lacks contradicts its own document. Every budgeted `Chat` carries an explicit `max_tokens`, so
+   > a reservation could hold `est_input + max_tokens` and be conservative without predicting
+   > anything. What rules it out now is STARVATION rather than ignorance: that reservation is
+   > essentially the whole remaining allowance, so the first child to claim it drops every sibling
+   > below `MIN_OUTPUT_TOKENS` and they are refused — a fan-out made safe without being made
+   > concurrent, and strictly worse than option 3, which at least runs the siblings. Written down
+   > rather than deleted, because "a reservation is impossible" is the wrong reason for the next
+   > person to inherit. The same correction is in `dispatch_metered`'s module doc and the
+   > overview's Critical-1 narrative.
 3. **Hold a 1-permit gate across check → dispatch → charge.** Yes. At most one model call per run is
    in flight, so the ledger is always current when the next call reads it.
 
@@ -351,36 +379,49 @@ SP-DATA-4 alone — so each of these names the mutation that must break it.
 - **Money denomination.** `Cost` and `ModelPricing` already exist; what is missing is durable,
   current per-model pricing. The token ledger is designed so a cost model can price it
   retrospectively — the journal records raw counts, which is the honest primitive.
-- **Budgeting `LlmPlannerSelector::select`** (§6.3). It needs a `PlannerSelector` trait signature
-  carrying run/fold context, and a decision about whether the selector's call should become a
-  journaled effect so it can be ledgered at all. Bounded exposure today: one call per
-  `PlannerRef::Select` node.
-- **⚠️ `Snapshot` carries no spend — a DORMANT third instance of the Critical-2 family.** Found while
-  auditing for more of the same after §6.5b. `Snapshot { seq, completed, skipped, outputs }` has no
-  `usage` and no `budget`, and its own doc comment states the design intent plainly: *"A resume seeds
-  from the latest snapshot and folds only the journal **tail** (events with `Seq >` seq)."* The moment
-  anyone wires that, every `EffectRecorded.usage` at or below `snapshot.seq` stops being folded and
-  the ledger silently loses the run's whole prefix — the exact failure compaction had, but **worse**:
-  `write_snapshot` runs at *every round boundary*, not only after a `Consolidate` over a `Map`.
-  **Not a live defect today** — `Executor::start` folds the FULL journal via `load()`, so the
-  snapshot-seeded resume is built but unwired. **Correction (2026-08-28):** the justification as
-  first written — "nothing in the workspace calls `load_since`/`latest_snapshot` outside the stores'
-  own tests" — was FALSE for `load_since`, and `e820d87`'s commit message repeats it. There is one
-  production caller: `Scheduler::earliest_resume_after` (`orchestrator/src/scheduler.rs`), on the
-  driver path. It does not affect the conclusion, and the reason is worth stating rather than
-  re-deriving: that call folds NO run state. It filters the tail for `RunPaused { resume_after }` and
-  takes the `min()`, so `Snapshot.spent`/`budget` are irrelevant to it — a scheduler asking "when is
-  this run due?" cannot lose a ledger it never reads. `latest_snapshot` has no non-test caller, which
-  is the narrower claim `docs/superpowers/orchestrator-overview.md` makes and which remains true.
-  The dormancy therefore stands, on the correct ground: it is `Executor::start`, and only
-  `Executor::start`, that would have to change. Recorded here rather than fixed because fixing it
-  means designing what a snapshot must carry (a folded `spent` scalar plus the effective `budget`,
-  and an argument for why re-folding the tail on top cannot double-count) — the same
-  keyed-by-effect-id reasoning §6.5b needed, but over a summary rather than a per-child manifest.
-  **Whoever wires snapshot-seeded resume owns this**; a tail-only fold that compiles will pass the
-  entire suite while quietly un-capping every budgeted run.
+- ~~**Budgeting `LlmPlannerSelector::select`** (§6.3)~~ — **CLOSED, in this same slice.** Stale until
+  2026-09-03. `SelectorDispatch` (`executor/dispatch.rs`) binds one `select()` to one run + Expand
+  node so every call it makes gates on the budget, charges the live meter, and journals its spend
+  under `RESERVED_SELECT_ID` (`"{node}/__select__"`), off the node's own effect ids. The selector
+  supplies prompts only: it cannot widen the capability, choose a provider, or skip the gate. Four
+  tests pin it — `budget_gate_stops_the_planner_selector_producer`,
+  `the_planner_selector_journals_its_spend_to_the_ledger`,
+  `a_re_driven_selector_replays_its_call_instead_of_respending`, and
+  `every_dispatch_a_selector_makes_is_its_own_ledger_entry` (the port permits more than one call per
+  `select()`; each is its own entry).
+
+- **`Snapshot` and a snapshot-seeded resume — the DATA half is closed; the CONSUMER is a
+  precondition on future work.** Rewritten 2026-09-03; the entry below said "`Snapshot` carries no
+  spend", which stopped being true at `e820d87` (2026-08-28) and was never updated.
+
+  **What is done:** `Snapshot` carries `#[serde(default)] spent: u64` and
+  `#[serde(default)] budget: Option<u64>` — "the ledger reduced to the two scalars a tail-only fold
+  cannot re-derive". `write_snapshot` populates them, and
+  `a_round_boundary_snapshot_carries_the_spend_ledger_and_the_cap` is a deliberate CONTRACT test
+  (it cannot be red-first through behaviour, because the consuming path does not exist; its point is
+  to make "a tail-only fold that compiles passes the entire suite" false). The `serde` defaults mean
+  pre-existing snapshots deserialize as `(0, None)` — the prior behaviour exactly.
+
+  **What is NOT done, and is the precondition:** nothing seeds a resume from a snapshot.
+  `Executor::start_inner` still folds the FULL journal via `load(run)`. `latest_snapshot` has no
+  non-test caller; `load_since`'s one production caller is `Scheduler::earliest_resume_after`, which
+  folds no run state (it filters the tail for `RunPaused { resume_after }` and takes the `min()`), so
+  it cannot lose a ledger it never reads.
+
+  **Whoever wires snapshot-seeded resume owns the remaining half:** an argument for why re-folding
+  the tail ON TOP of a seeded `spent` cannot double-count — the same keyed-by-effect-id reasoning
+  §6.5b needed, but over a summary rather than a per-child manifest. Carrying the scalars makes that
+  argument *possible*; it does not make it. Until then this is an unwired optimisation, not a latent
+  bug.
 - **Fleet-wide / per-tenant budgets**, and a precedence rule against the per-run cap.
-- **Pre-flight estimation** to eliminate the one-call overshoot.
+- ~~**Pre-flight estimation** to eliminate the one-call overshoot.~~ **ADDRESSED** by the follow-on
+  slice, `2026-09-03-sp-data-5-budget-clamp-design.md`. Not by estimating the output — that really
+  is unknowable — but by CLAMPING `max_tokens` to what the remaining budget affords, bounded by the
+  chain's own smallest `max_output_tokens`, with a refusal below a `MIN_OUTPUT_TOKENS` floor. The
+  overshoot is now **bounded by the input-estimate error and biased toward refusing early**, which is
+  not the same as eliminated and must not be written as if it were. Still deferred out of that slice:
+  a real tokenizer, a per-agent `min_output_tokens`, and self-calibration from observed
+  `actual_input / est_input`.
 - **Budget-aware scheduling** — e.g. refusing to wake a run whose remaining budget cannot plausibly
   finish it.
 - **Spend visibility beyond a single run** — an aggregate across runs is a reporting concern needing

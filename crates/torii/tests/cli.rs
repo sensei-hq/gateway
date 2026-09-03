@@ -550,6 +550,39 @@ fn gate_help_names_the_loop_gate_it_can_now_decide() {
     }
 }
 
+/// BOTH `--budget-tokens` flags name the floor their SHARED parser enforces.
+///
+/// `parse_budget_tokens` is the `value_parser` on `run submit` and on `run wake`, and it
+/// hard-rejects anything under `MIN_OUTPUT_TOKENS`. Only `submit`'s help was swept when
+/// that rejection widened, and `wake` is the worse of the two to miss: a budget refusal
+/// tells the operator, in its own text, to run `torii run wake --budget-tokens N`. That
+/// is the ONE command this whole feature exists to make them run, and its `--help`
+/// advertised that lowering the cap below current spend "is legitimate" while the parser
+/// refused anything under 256 with a clap error.
+///
+/// Both flags asserted, not just the one that was wrong, because the defect is a shared
+/// parser drifting from one of its two surfaces — pinning only the broken side leaves the
+/// same gap open in the other direction. Nothing in this file asserted `--budget-tokens`
+/// help at any level before this test.
+#[test]
+fn both_budget_token_flags_name_the_floor_their_parser_enforces() {
+    for args in [
+        vec!["run", "submit", "--help"],
+        vec!["run", "wake", "--help"],
+    ] {
+        let out = torii().args(&args).output().expect("runs");
+        assert!(out.status.success(), "exit: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("256"),
+            "`{}` must name the 256-token floor its shared `parse_budget_tokens` \
+             enforces — an operator sent here by a budget refusal reads this before \
+             typing a number, and a value under it is refused with a clap error:\n{text}",
+            args.join(" ")
+        );
+    }
+}
+
 /// The other side of the same sweep: `run agent --help` enumerated the waiting kinds as
 /// THREE ("The third waiting kind … Each of the three refuses the other two") in the very
 /// commit that added a fourth and a fourth refusal arm to this command.

@@ -285,6 +285,51 @@ pub fn est_tokens(s: &str) -> usize {
     s.chars().count() / 4
 }
 
+/// A deliberately pessimistic token estimate, for the BUDGET path only.
+///
+/// [`est_tokens`]'s `chars / 4` is the standard rough figure for English prose. The
+/// orchestrator's prompts are not mostly English prose: they carry JSON tool schemas and
+/// a `## Context` section rendered from upstream outputs, and JSON tokenizes nearer 3
+/// chars/token. So `chars / 4` UNDER-counts precisely where these prompts are heaviest.
+///
+/// The two estimates want OPPOSITE biases, which is why this is a second function and not
+/// a fix to the first. `est_tokens`'s callers — [`over_budget`] and the `est_prompt_tokens`
+/// diagnostic that reports its `est` — ask "will this prompt fit the window", and an
+/// over-count there halts a turn (`NodeFailed`) that would in fact have fitted. The budget
+/// asks "what is the worst this call can cost", and an under-count there is the expensive
+/// direction: the clamp computes `max_tokens = remaining − est`, so too low an estimate
+/// leaves too high an allowance and the cap is overshot by the difference.
+///
+/// So this one inverts the bias — it is wrong toward refusing early rather than toward
+/// overspending. It does not make the overshoot zero (the clamp design's §4 writes out the
+/// arithmetic); it bounds it by the remaining estimate error.
+///
+/// `chars / 3` rather than a multiplier on `est_tokens`, so the two are independent: a
+/// later change to the window-fit heuristic must not silently move the budget's floor.
+/// Neither is a real tokenizer — a real one needs a per-model vocabulary and a per-chain
+/// mapping, and would still need a heuristic like this as its fallback for an unknown
+/// model, so it is additional work on top of this rather than instead of it.
+///
+/// # The pessimism assumes a LATIN script
+///
+/// Three characters per token is an over-count only where a token is worth three or more
+/// characters, which is Latin-script text — the case both this and `est_tokens` were
+/// calibrated on. CJK, Cyrillic and emoji run nearer 1–3 tokens PER character, so on such
+/// a prompt this UNDER-counts by a multiple and the bias flips: the clamp's residual
+/// (`actual_input − est_input`, the clamp design's §4) stops being a small error and
+/// becomes a fraction of the prompt.
+///
+/// That is stated rather than fixed because the fix is the deferred real tokenizer, and a
+/// heuristic cannot be made script-agnostic by choosing a different divisor — a divisor
+/// pessimistic enough for CJK would refuse most Latin prompts outright. The AC11
+/// `budget clamp under-estimated the input` warning is the mitigation, and a non-Latin
+/// prompt is precisely the case it is expected to fire on.
+///
+/// Rounds UP, so any non-empty text costs at least one token, and `""` costs none.
+pub fn est_tokens_pessimistic(s: &str) -> usize {
+    s.chars().count().div_ceil(3)
+}
+
 /// True when the assembled prompt (system + messages + tool schemas) is estimated
 /// to exceed the chain's smallest context window. An unknown window (`None`) is
 /// never a hard fail — the caller logs and proceeds.
@@ -700,6 +745,87 @@ mod tests {
     #[test]
     fn est_tokens_is_chars_over_four() {
         assert_eq!(est_tokens("abcdefgh"), 2); // 8 chars / 4
+    }
+
+    /// The budget estimate is never below the window-fit one, on prose AND on the
+    /// JSON-heavy text that is the whole reason it exists.
+    ///
+    /// `est_tokens` is `chars / 4`. English prose is roughly that; JSON tool schemas
+    /// and materialized `## Context` outputs tokenize nearer 3 chars/token, so
+    /// `chars / 4` UNDER-counts exactly where the orchestrator's prompts are heaviest.
+    /// The clamp computes `allowance = remaining − est`, so clamping on an under-count
+    /// leaves too large an allowance and overshoots the cap by the error — the budget
+    /// path needs the bias inverted.
+    ///
+    /// `>=` on every input and STRICTLY `>` on the JSON one: `>=` alone would pass for
+    /// a function that just delegated to `est_tokens`, which is the obvious wrong
+    /// implementation and the one that silently reintroduces the under-count.
+    #[test]
+    fn the_pessimistic_estimate_is_never_below_the_window_fit_one() {
+        let prose = "The quick brown fox jumps over the lazy dog, repeatedly and at length.";
+        let json = r#"{"name":"fs_write","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string"}},"required":["path","contents"]}}"#;
+        for s in [prose, json, "", "a"] {
+            assert!(
+                est_tokens_pessimistic(s) >= est_tokens(s),
+                "pessimistic must not undercut the window-fit estimate for {s:?}: {} < {}",
+                est_tokens_pessimistic(s),
+                est_tokens(s)
+            );
+        }
+        assert!(
+            est_tokens_pessimistic(json) > est_tokens(json),
+            "and must be strictly higher on JSON, which is the case it exists for: {} vs {}",
+            est_tokens_pessimistic(json),
+            est_tokens(json)
+        );
+    }
+
+    /// The DIVISOR, pinned from both sides — the strict inequality above is not enough.
+    ///
+    /// `div_ceil(3)` → `div_ceil(4)` is a one-character edit that removes essentially
+    /// all of the margin this function exists for, and it still satisfies "strictly
+    /// greater than `est_tokens`" on any length not divisible by 4, because rounding up
+    /// beats flooring by a token. So the sign of the difference proves nothing about its
+    /// SIZE, and the size is the whole point: JSON tokenizes nearer 3 chars/token, and
+    /// clamping on a `chars / 4` under-count overshoots the cap by the error.
+    ///
+    /// Both bounds are needed. Without the first, the divisor can grow and the margin
+    /// silently evaporates. Without the second, it can shrink — `chars / 2` would pass
+    /// every other assertion here while charging a budgeted run double for its input and
+    /// refusing calls that would comfortably have fitted.
+    #[test]
+    fn the_pessimistic_estimate_is_chars_over_three_rounded_up() {
+        let json = r#"{"name":"fs_write","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string"}},"required":["path","contents"]}}"#;
+        for s in [
+            json,
+            "The quick brown fox jumps over the lazy dog.",
+            "",
+            "a",
+            "ab",
+        ] {
+            let n = s.chars().count();
+            let est = est_tokens_pessimistic(s);
+            assert!(
+                est * 3 >= n,
+                "the estimate must be at least chars/3 for {s:?}: {est} * 3 < {n}"
+            );
+            assert!(
+                est * 3 <= n + 2,
+                "and no more than chars/3 rounded up — an over-count is a tax on every \
+                 budgeted call, not free caution — for {s:?}: {est} * 3 > {n} + 2"
+            );
+        }
+    }
+
+    /// The empty string costs nothing under either estimate.
+    ///
+    /// The boundary is worth its own test because the clamp subtracts this value:
+    /// rounding UP is right for every non-empty input and wrong for the empty one, so
+    /// a `div_ceil` on a length that had been nudged (a `+1`, a `max(1)`) would charge
+    /// a token for a system prompt that is not there.
+    #[test]
+    fn the_pessimistic_estimate_of_nothing_is_zero() {
+        assert_eq!(est_tokens_pessimistic(""), 0);
     }
 
     #[test]

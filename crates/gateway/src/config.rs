@@ -51,6 +51,37 @@ pub(crate) fn collect_validation_errors(
         }
     }
 
+    // Rule 5: A model must be able to emit at least one output token.
+    //
+    // `max_output_tokens` is a plain required `u32` with no lower bound, and `0` was
+    // accepted — a value several fixtures in this repo already use as don't-care filler,
+    // so a hand-written config acquires it easily.
+    //
+    // Zero is broken for every reader of the field, which is why it is rejected here
+    // rather than defended against at each one:
+    //
+    // - `Gateway::min_max_output_tokens` is a `min` over the chain, so ONE such entry
+    //   makes the whole chain's ceiling `Some(0)`. The SP-DATA-5 budget clamp bounds
+    //   every budgeted `Chat` request by that ceiling and would emit
+    //   `max_tokens: Some(0)`, which providers reject — a run that succeeds unbudgeted
+    //   hard-failing the moment `--budget-tokens` is set, the exact regression shape the
+    //   ceiling term was added to prevent.
+    // - `budget.rs` prices a call as `max_output_tokens * output_per_1k / 1000`, so a
+    //   zero-output model costs nothing and wins any cheapest-first selection it enters.
+    //
+    // This is the CHECKED path only (`GatewayBuilder::build`, `Gateway::try_new`,
+    // `try_update_config`). `Gateway::new` and `update_config` stay unchecked by
+    // documented design, so this rule narrows where the value can enter rather than
+    // making it unrepresentable.
+    for (model_id, model) in models {
+        if model.max_output_tokens == 0 {
+            errors.push(format!(
+                "model '{model_id}' has max_output_tokens 0 — a model that can emit no \
+                 output cannot serve a chat call"
+            ));
+        }
+    }
+
     errors
 }
 
@@ -309,6 +340,48 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.contains("no corresponding router")));
+    }
+
+    /// A model that declares it can emit ZERO output tokens is not a model, and the
+    /// validator used to accept it.
+    ///
+    /// It is not a hypothetical value: this repo's own fixtures write
+    /// `max_output_tokens: 0` as a don't-care filler (`selection.rs`,
+    /// `gates/capability.rs`, `strategy.rs`), so it is a shape a hand-written config can
+    /// easily acquire, and nothing anywhere rejected it.
+    ///
+    /// The consequence is not merely cosmetic, which is why it is worth a rule of its
+    /// own. `Gateway::min_max_output_tokens` is a `min` over the chain, so ONE such entry
+    /// makes the whole chain's ceiling `Some(0)`, and the SP-DATA-5 budget clamp bounds
+    /// every budgeted `Chat` request by that ceiling — emitting `max_tokens: Some(0)`,
+    /// which providers reject outright. The failure shape is the one the clamp exists to
+    /// avoid: a run that succeeds unbudgeted hard-fails the moment an operator sets
+    /// `--budget-tokens`. The clamp's floor check cannot catch it either, because the
+    /// floor runs BEFORE the ceiling (deliberately — a model whose own limit is genuinely
+    /// small is not a budget problem) and so never sees this number.
+    ///
+    /// Rejected at config time rather than special-cased in the clamp because zero output
+    /// is broken for every reader of the field, not just that one: `budget.rs`'s cost
+    /// estimate is `max_output_tokens * output_per_1k / 1000`, which prices such a model
+    /// at zero and makes it win any cheapest-first selection it enters.
+    #[test]
+    fn fails_with_a_model_that_can_emit_no_output() {
+        let mut model = gemma_model();
+        model.max_output_tokens = 0;
+
+        let result = GatewayBuilder::new()
+            .add_router("ollama", ollama_router())
+            .add_model(model)
+            .add_chain(chat_chain())
+            .build();
+
+        let errors = result.expect_err("a zero output limit is not a usable model");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("gemma3:27b") && e.contains("max_output_tokens")),
+            "the error must name the model and the field: {errors:?}"
+        );
     }
 
     #[test]
