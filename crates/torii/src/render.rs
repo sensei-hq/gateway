@@ -838,14 +838,29 @@ mod tests {
         // .count()` to `label.chars().count() + 2`, and the `0 + 2` branch is taken by every
         // real loop gate (`HumanQuestion::compose` appends `TASK_MARKER` unconditionally)
         // and, until this assertion, by no test: every test that reached the marker arm
-        // passed `"agent: "`, measured with a probe. An over-counted head would push the
-        // cell past `QUESTION_MAX` and wreck the alignment of every other row in the block,
-        // silently, on the kind whose cell is already the widest.
+        // passed `"agent: "`, measured with a probe.
+        //
+        // **EXACT, not `<=`, and that is the whole guard.** The two errors the label term
+        // can make are not symmetric and the `<=` this block first shipped with caught only
+        // one of them — the one the `"agent: "` case above already catches, since it runs
+        // first and panics first. An UNDER-count overruns the cap (drop the `+ 2` and the
+        // agent assertion at the top of this test fires at 302 chars). An OVER-count does
+        // the opposite: reverting to the hardcoded `"agent: \"\"".chars().count()` charges
+        // this label 9 instead of 2 and renders 293 — seven characters of budget silently
+        // unspent, on the widest cell in the block, and `<=` passes. Measured: that exact
+        // revert left all 259 torii lib tests green. An earlier version of this comment
+        // named the over-count as the one that "would push the cell past `QUESTION_MAX`",
+        // which is backwards.
+        //
+        // The cell is exactly `QUESTION_MAX` because that is what the arithmetic means:
+        // `room` is whatever `QUESTION_MAX` has left after the overhead and the reserved
+        // ask, and a 5,000-char head always fills it.
         let cell = question_cell("", &composed);
-        assert!(
-            cell.chars().count() <= QUESTION_MAX,
-            "the empty label must be charged exactly its two quotes: {} chars",
-            cell.chars().count()
+        assert_eq!(
+            cell.chars().count(),
+            QUESTION_MAX,
+            "the empty label must be charged exactly its two quotes — no more (budget \
+             silently unspent) and no less (the cap overrun): {cell}"
         );
         assert!(
             cell.contains(TASK_SEP) && cell.contains("yyyy"),
