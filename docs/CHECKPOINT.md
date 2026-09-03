@@ -22,7 +22,7 @@
   `postgres:16`: A pays for `n1` + iteration 0 and pauses; a second pool's `list-paused` finds the
   SYNTHESIZED gate node, menu and question with no graph in hand; `gate decide` on a third; a
   fresh worker converges through `worker serve --once`, zero re-spend. Red step = 4 MUTATIONS.
-- **`2a1d079` VERIFIED by mutation** (`890ee18`) — 10 reverts in a throwaway worktree. All four
+- **`2a1d079` VERIFIED by mutation** (`890ee18`) — 12 reverts in a throwaway worktree. All four
   behaviour fixes and the redaction/bounds/help guards redden. TWO could not fail and are fixed:
   `question_cell`'s empty-label `<=` (the over-count revert renders 293/300 and stayed green;
   the comment had the direction backwards) and the help guard's bare-word `note` key (clap
