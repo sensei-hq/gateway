@@ -150,9 +150,39 @@ correct a decision before the run resumes). The `LoopGateAwaited` arm also write
 
 A third arm in `fanout.rs`'s gate match, beside `GateSpec::Pure` (`:546`) and `GateSpec::Agent`
 (`:552`), driving the gate at the same reserved `"{loop}/{i}/__gate__"` path. `RESERVED_GATE_ID`
-already exists (`orchestrator-core/src/plan.rs:22`) and `plan.rs` already rejects a planner-authored
-node that collides with it, so an untrusted `Expand` planner cannot forge a gate node. That
-reservation is a **precondition of this slice** and the plan re-verifies it rather than assuming it.
+already exists (`orchestrator-core/src/plan.rs:22`).
+
+**This section originally said `plan.rs` "already rejects a planner-authored node that collides with
+it, so an untrusted `Expand` planner cannot forge a gate node", and called that reservation a
+precondition the plan had re-verified. The claim was false, and the re-verification recorded
+"Confirmed."** `plan::feasible`'s reserved-id walk saw `plan.graph.nodes` and did not recurse, on
+the reasoning that "nested ids namespace deeper under their parent path and can't collide". That
+reasoning holds for `__plan__` and `__select__` — both sit under an `Expand`, which has no static
+body — and fails for `__gate__`, because a `Loop`'s `Subgraph` body is namespaced under
+`"{loop}/{i}"`. Measured by the whole-slice review:
+`feasible(Loop { body: Subgraph([Node{id:"__gate__"}]), gate: Human })` returned `Ok(())`.
+
+The same segment was authorable by hand: s1's `validate_dag` rule bans the `/` SEPARATOR, which
+makes the reserved path unwritable in one piece and says nothing about a bare segment. Whether that
+produced a loud failure or a silent one depended on the colliding node's KIND — a waiting kind
+writes the shared `deadlines` map and trips the gate's missing-menu refusal, while a kind that
+COMPLETES leaves the gate to ask normally at an id already carrying `NodeCompleted`, which
+`torii`'s `signal_states` folds as terminal. The run then pauses on a question `run list-paused`
+omits and `run gate decide` refuses as already completed: forever under the supported indefinite
+SLA, and until the whole `Loop` dies under a finite one.
+
+Both are closed now, and by rules that had to be ADDED:
+
+- `Graph::validate_dag` block **1c** rejects a bare `__plan__`/`__gate__`/`__select__` node id (and
+  a dep naming one) at every depth it recurses into. It covers an author and an untrusted planner
+  in one rule, because `feasible` validates through this same function.
+- `plan::feasible`'s reserved-id walk recurses into a `Subgraph` node's graph, a `Loop`'s
+  `Subgraph` body and a `Branch`'s arms and `default`, mirroring `check_agent_refs`, so the planner
+  still gets the typed `PlanError::ReservedNodeId(id)` rather than only a structural string.
+- `run_human_loop_gate`'s `NotYetAsking` arm refuses to publish an ask at a path already carrying
+  `NodeStarted`/`NodeCompleted`. This is the case no validator can reach: `GateSpec::Agent` drives
+  a real agent at this same path and journals both events there, so an operator editing
+  `scheduled_runs.graph` from `Agent` to `Human` between drives lands in it with each graph legal.
 
 ### 5.2 The order of operations
 

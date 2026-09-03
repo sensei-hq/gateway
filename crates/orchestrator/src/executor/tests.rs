@@ -19821,13 +19821,12 @@ mod human_loop_gate {
     ///
     /// The gate path is written by hand exactly as an operator would type it, because a
     /// loop gate has no `Node` in the graph to name it: the reachability HERE is a journal
-    /// the executor did not write, not a graph edit. The arm's other vector — an authored
-    /// `__gate__` segment inside the `Loop`'s own `Subgraph` body, which namespaces onto
-    /// the same path through a graph `validate_dag` accepts — is the sibling
-    /// `an_authored_gate_id_in_a_loop_body_collides_and_fails_loudly` below. The two are
-    /// kept apart because they answer different questions: this one that the arm is
-    /// fail-closed against a forged log, that one that the arm is reachable at all without
-    /// forging anything.
+    /// the executor did not write, not a graph edit — and since the s4 whole-slice review
+    /// closed the authored `__gate__` segment in `validate_dag` (block 1c), that is the
+    /// only vector this arm has left. The sibling
+    /// `an_authored_gate_id_in_a_loop_body_is_refused_before_the_run_starts` pins the
+    /// closure, and `a_loop_gate_refuses_to_ask_at_a_path_another_kind_already_completed`
+    /// pins the case where the occupant recorded no wait at all.
     #[tokio::test]
     async fn a_loop_gate_that_recorded_a_wait_without_a_menu_fails_loudly() {
         let journal = InMemoryJournal::new();
@@ -20291,46 +20290,46 @@ mod human_loop_gate {
         );
     }
 
-    /// The AUTHORED half of the kind-swap arm's reachability, and the reason the arm is
-    /// not merely defence in depth against a forged journal.
+    /// **The authored collision is closed at the FRONT DOOR, and the quiet half of it is
+    /// why.** SP-6 s4 whole-slice review, Important.
     ///
-    /// The sibling above reaches the arm through a journal `torii` did not write. This one
-    /// reaches it through a graph an author can write TODAY, with `validate_dag` green and
-    /// `torii run submit` accepting it: a `Loop` whose `Subgraph` body declares a node
-    /// literally named `__gate__`. `drive_nested` namespaces that body under
-    /// `"{loop}/{i}"`, so the inner node's path is `"lp/0/__gate__"` — byte-identical to
-    /// the path `run_loop` synthesizes for the gate.
+    /// A `Loop` whose `Subgraph` body declares a node literally named `__gate__`
+    /// namespaces that node to `"lp/0/__gate__"` — byte-identical to the path `run_loop`
+    /// synthesizes for the gate. s1's `/` ban makes the whole reserved PATH unauthorable
+    /// in one piece and says nothing about a bare SEGMENT, so until this slice's review
+    /// `validate_dag` accepted such a graph and `torii run submit` enqueued it.
     ///
-    /// **`validate_dag` does not stop it, and that is deliberate rather than an oversight
-    /// this test papers over.** Its SP-6 s1 rule bans the `/` SEPARATOR in an
-    /// author-supplied id, which makes the whole reserved PATH unauthorable in one piece
-    /// but says nothing about a bare `__gate__` SEGMENT that only becomes that path once
-    /// nesting has flattened it. `plan::feasible` does reserve the segment
-    /// (`PlanError::ReservedNodeId`, the SP-3 s5 review's fix) — so a PLANNER cannot emit
-    /// it — and `Executor::start`/`run` both call `validate_dag`, so the "unvalidated
-    /// caller parameter" escape an earlier version of the arm's comment claimed does not
-    /// exist. The author-supplied segment is the one door left open, and it is the door
-    /// this test walks through.
+    /// The slice's earlier version of this test used an `AwaitSignal` as the colliding
+    /// inner node and concluded the collision "fails loudly". That is true of a WAITING
+    /// inner kind only: it writes the shared `deadlines` map, so the gate arm takes its
+    /// missing-menu refusal. The fixture below uses the kind the review found instead — a
+    /// `ModelCall`, which COMPLETES. Nothing writes `deadlines`, the gate takes
+    /// `NotYetAsking`, asks normally and pauses, leaving `NodeCompleted` and
+    /// `LoopGateAwaited` at one node id. `torii`'s `signal_states` folds `NodeCompleted`
+    /// as terminal, so `run list-paused` omits the node and `run gate decide` refuses it
+    /// as already completed: a run paused on a human question no operator surface can
+    /// show or answer. Reproduced at both layers before the fix.
     ///
-    /// Reaching the arm this way costs the author's own signal delivery: the inner node
-    /// must COMPLETE before `run_loop` evaluates the gate at all, so the run pauses on
-    /// `lp/0/__gate__` as an `AwaitSignal`, is answered there, and only then does the gate
-    /// find a deadline it did not record. The refusal is what an operator should see;
-    /// making the collision unauthorable in `validate_dag` is a separate change, recorded
-    /// as a follow-up in the s4 plan.
+    /// So it is refused where the id is AUTHORED (`validate_dag` block 1c), not at the arm
+    /// that discovers it — which also covers an untrusted `Expand` planner, since
+    /// `plan::feasible` validates through the same function (and now walks reserved ids
+    /// recursively itself). The kind-swap arm keeps its own guard for the vector this
+    /// cannot reach: a journal the executor did not write, pinned by the sibling
+    /// `a_loop_gate_that_recorded_a_wait_without_a_menu_fails_loudly`.
     #[tokio::test]
-    async fn an_authored_gate_id_in_a_loop_body_collides_and_fails_loudly() {
+    async fn an_authored_gate_id_in_a_loop_body_is_refused_before_the_run_starts() {
         let journal = InMemoryJournal::new();
         let run = RunId(uuid::Uuid::new_v4());
-        let (ex, _clock, _calls) = exec_at(
+        let (ex, _clock, calls) = exec_at(
             &journal,
             human_registry(Some(Duration::hours(1))),
             at(1_000),
         )
         .await;
 
-        // A legal graph. The inner id carries no `/`, so s1's separator ban has nothing to
-        // catch; the collision exists only after `drive_nested` namespaces it.
+        // The inner id carries no `/`, so s1's separator ban has nothing to catch; the
+        // collision exists only after `drive_nested` namespaces it. And the inner kind
+        // COMPLETES, which is the sub-case that used to be silent.
         let graph = Graph {
             nodes: vec![Node {
                 id: lp(),
@@ -20338,7 +20337,10 @@ mod human_loop_gate {
                     body: LoopBody::Subgraph(Box::new(Graph {
                         nodes: vec![Node {
                             id: NodeId(orchestrator_core::plan::RESERVED_GATE_ID.into()),
-                            kind: NodeKind::AwaitSignal { timeout: None },
+                            kind: NodeKind::ModelCall {
+                                chain: "c".into(),
+                                payload: serde_json::json!({ "prompt": "draft it" }),
+                            },
                             deps: vec![],
                         }],
                     })),
@@ -20352,58 +20354,99 @@ mod human_loop_gate {
                 deps: vec![],
             }],
         };
-        graph
-            .validate_dag()
-            .expect("the graph is LEGAL — that is the whole point of this vector");
 
-        // Iteration 0's body parks on the inner `AwaitSignal`, at the path the gate will
-        // later want for itself.
-        let first = ex.start(run, &graph).await.expect("drives");
-        assert!(
-            first.paused.is_some() && first.failed.is_none(),
-            "the body's own node pauses first: {first:?}"
-        );
-        assert!(
-            journal.load(run).await.expect("loads").iter().any(
-                |(_, e)| matches!(e, JournalEvent::SignalAwaited { node, .. } if node == &gate(0))
+        match graph.validate_dag() {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("__gate__") && m.contains("reserve"),
+                "refused for the reserved segment, so the author knows what to rename: {m}"
             ),
-            "…and it is the SIGNAL kind that recorded the wait at the reserved path"
-        );
+            other => panic!("the collision must be unauthorable: {other:?}"),
+        }
 
-        // The author answers their own node. The body completes; the gate is now evaluated
-        // at an id that already carries another kind's wait.
-        journal
-            .append(
-                run,
-                JournalEvent::SignalReceived {
-                    node: gate(0),
-                    payload: serde_json::json!({ "ok": true }),
-                },
-            )
+        // And the executor refuses it at the front door rather than driving into the
+        // invisible-gate state: `start_inner` validates before anything is journaled.
+        let err = ex
+            .start(run, &graph)
             .await
-            .expect("the signal lands");
+            .expect_err("start must refuse the graph");
+        assert!(
+            matches!(&err, OrchestratorError::InvalidGraph(m) if m.contains("__gate__")),
+            "…for the same reason, not some later symptom: {err:?}"
+        );
+        assert!(
+            journal.load(run).await.expect("loads").is_empty(),
+            "nothing durable exists for a graph that never started"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "and no iteration was paid for on the way to the refusal"
+        );
+    }
 
-        let out = ex.start(run, &graph).await.expect("drives");
+    /// The belt-and-braces half of the same finding: the gate refuses to ASK at a path
+    /// another node kind has already terminated.
+    ///
+    /// `validate_dag` block 1c closes the AUTHORED door, and the kind-swap arm above
+    /// closes the case where the occupying kind recorded a WAIT. Neither reaches the case
+    /// where the occupant already COMPLETED, which is still reachable two ways that do not
+    /// go through graph validation at all:
+    ///
+    /// - a mid-run GATE-KIND edit. `GateSpec::Agent` drives a real agent at this same
+    ///   reserved path, and `drive_agent` journals `NodeStarted`/`NodeCompleted` there. An
+    ///   operator who edits `scheduled_runs.graph` from `Agent` to `Human` between drives
+    ///   leaves the human gate asking at an id that already carries both. Each graph is
+    ///   individually legal, so no validator can see it.
+    /// - a journal the executor did not write.
+    ///
+    /// Without the guard the gate publishes `LoopGateAwaited` there and the run pauses on
+    /// a question `signal_states` reports as already completed — `list-paused` omits it,
+    /// `gate decide` refuses it. Failing loudly instead is the same fail-closed answer the
+    /// missing-menu arm gives, for the same reason: an operator must never be waited on
+    /// silently.
+    #[tokio::test]
+    async fn a_loop_gate_refuses_to_ask_at_a_path_another_kind_already_completed() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, _calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+
+        // The residue a gate-AGENT leaves at the identical path — no `*Awaited`, so
+        // `Fold::deadlines` is empty and the arm would otherwise take `NotYetAsking`.
+        for e in [
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+                budget: None,
+            },
+            JournalEvent::NodeStarted { node: gate(0) },
+            JournalEvent::NodeCompleted { node: gate(0) },
+        ] {
+            journal.append(run, e).await.unwrap();
+        }
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
         let (node, message) = out.failed.clone().unwrap_or_else(|| {
-            panic!("the colliding wait must fail the gate, not be answered by it: {out:?}")
+            panic!("asking at an occupied path must fail, not publish silently: {out:?}")
         });
         assert_eq!(node, lp(), "a gate failure fails the LOOP: {out:?}");
         assert!(
-            message.contains(&gate(0).0) && message.contains("menu"),
-            "with the same refusal the forged-journal sibling gets: {message}"
+            message.contains(&gate(0).0),
+            "the failure names the colliding path: {message}"
         );
         assert!(
             out.paused.is_none(),
-            "and it does NOT pause — the gate cannot be answered here: {out:?}"
-        );
-        assert!(
-            !message.contains("revise") && !message.contains("ship"),
-            "…and it never recites the GRAPH's menu, which is the fallback this arm \
-             exists to refuse: {message}"
+            "and the run does not pause on a question nothing can show: {out:?}"
         );
         assert!(
             asks(&journal.load(run).await.expect("loads")).is_empty(),
-            "it never published a question of its own on top of the signal's record"
+            "no `LoopGateAwaited` is published at a terminal id — that row is what makes \
+             the gate invisible to `list-paused` and unanswerable by `gate decide`"
         );
     }
 
