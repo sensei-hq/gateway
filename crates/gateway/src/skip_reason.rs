@@ -28,8 +28,10 @@ pub enum SkipReason {
     /// Carries both numbers because the remedy depends on the gap: a request slightly
     /// over a small model's window is a ROUTING problem (widen or reorder the chain),
     /// and one over every window is a PROMPT problem (send less). A single "too big"
-    /// would not distinguish them, and `AllGated` renders these strings verbatim, so
-    /// whatever is not here is not recoverable by the operator reading it.
+    /// would not distinguish them. `AllGated` renders these strings verbatim — it did
+    /// NOT when this variant landed, which made the sentence you are reading false for
+    /// two commits; `GatewayError`'s `#[error]` dropped the whole `skipped` vector, and
+    /// widening it is what made the numbers reach an operator.
     ///
     /// `estimated` is the pessimistic figure from
     /// `engine::util::estimate_input_tokens_pessimistic`, NOT the cost estimate — see
@@ -96,8 +98,24 @@ impl SkipReason {
             SkipReason::OverBudget { .. } => GateStatus::Terminal(HumanAction::RaiseBudget),
             // Terminal, not Timed: no deadline passes that makes a model's window
             // bigger. And not Structural either — the candidate is well configured, it
-            // is this request that does not fit it, and a Structural skip would not make
-            // the run pausable at all.
+            // is this REQUEST that does not fit it. Structural skips contribute nothing
+            // to `all_gated_error`, so a selection skipped entirely on structural
+            // grounds is not "gated" at all and surfaces as a bare `NoCandidates`
+            // (`engine/execute.rs`), which names no cause and no remedy. Terminal
+            // carries a `HumanAction` that names the lever.
+            //
+            // What Terminal does NOT do — despite what an earlier version of this
+            // comment asserted — is make the run PAUSABLE. `all_gated_error` takes
+            // `resume_after` from the TIMED skips alone, so an all-over-window selection
+            // is `AllGated { resume_after: None }`, and `classify_gateway_error`
+            // (orchestrator `executor/support.rs`) pauses only on `Some(t)`; everything
+            // else fails the node. That is deliberate and predates this slice — risk M1
+            // in `docs/design/selection-policy-pipeline.md` resolved it as "terminal-only
+            // ⇒ fail-fast human-action, never pause", and `GatewayError::AllGated`'s own
+            // doc says the caller must not pause forever. So what this variant buys is a
+            // better-DIAGNOSED terminal failure, not a recoverable one: each candidate's
+            // own window and the estimate that exceeded it, in place of the
+            // orchestrator's single chain-minimum guess.
             SkipReason::OverContextWindow { .. } => {
                 GateStatus::Terminal(HumanAction::UseLargerContextWindow)
             }
@@ -125,11 +143,19 @@ mod tests {
     ///
     /// `Timed` would be wrong — no deadline passes that makes a model's window bigger —
     /// and `Structural` would be wrong too, because the candidate is perfectly well
-    /// configured; it is this REQUEST that does not fit it. Structural skips do not make
-    /// a run pausable at all, so classifying it there would turn an operator-fixable
-    /// situation back into the hard failure this slice exists to remove.
-    /// Terminal-with-a-remedy is the only classification that produces an actionable
-    /// `AllGated` pause.
+    /// configured; it is this REQUEST that does not fit it, and a structural skip
+    /// contributes nothing to `all_gated_error`, so the caller would see a bare
+    /// `NoCandidates` naming neither cause nor remedy. Terminal is the classification
+    /// that carries a `HumanAction`.
+    ///
+    /// It does not make the run pausable — see `gate_status`'s comment for why a
+    /// deadline-less `AllGated` is a terminal failure by design. What is bought here is
+    /// the DIAGNOSIS, which is why the message assertion below is exact rather than
+    /// substring-loose: `contains("20000") && contains("8192")` also passes when the two
+    /// placeholders are swapped, and "estimated 8192 tokens exceeds the model's
+    /// 20000-token window" tells an operator to shrink a prompt that is already small
+    /// and to leave alone the chain that is actually wrong. The numbers only help if
+    /// they are the right way round.
     #[test]
     fn over_context_window_is_terminal_and_names_the_window_remedy() {
         let r = SkipReason::OverContextWindow {
@@ -144,11 +170,11 @@ mod tests {
             "over-window must be terminal with the window remedy, got {:?}",
             r.gate_status()
         );
-        let shown = r.to_string();
-        assert!(
-            shown.contains("20000") && shown.contains("8192"),
-            "the message must name BOTH the estimate and the window it exceeded, so an \
-             operator can see how far over they are: {shown}"
+        assert_eq!(
+            r.to_string(),
+            "estimated 20000 input tokens exceeds the model's 8192-token context window",
+            "the message must name the estimate and the window, each labelled by which \
+             it is — this string is what reaches an operator through AllGated's Display"
         );
     }
 
