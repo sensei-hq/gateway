@@ -38,11 +38,18 @@ links **16**, the baseline. No database started; `$DATABASE_URL` never read.
 
 `gh pr merge 51 --merge`, then `git merge origin/main && git push origin develop`.
 
+## The sandbox flake is FIXED (`5ea6ebe`) — it was not a timing flake
+
+`spawn_capped` drained stdout and stderr with two SEQUENTIAL `recv_timeout(CAPTURE_GRACE)` calls, so
+the real bound was `2 × CAPTURE_GRACE` = 4s while the test asserted < 5s. Under a second of margin,
+which full-suite load ate; in isolation it held, which is why it read as noise. The two streams now
+share ONE deadline — measured 4.02s → 2.01s on the escaped-descendant path. Widening the test number
+would have left a 4s stall in production. `CAPTURE_GRACE` is module-scope and **all four** wall
+assertions derive from it; two of them had the same sub-second margin and had simply not failed yet.
+**Verified 6 consecutive full-suite runs, 0 failures**, at the rate that previously produced one.
+
 ## Known-broken / open
 
-Nothing broken. **One PRE-EXISTING flake, NOT a regression:**
-`a_backgrounded_straggler_is_reaped_on_clean_exit` (SP-4 sandbox) failed 1 of 6 runs on its 5s wall
-bound, 0 of 10 in isolation, 0 in CI; wants a wider bound or an injected clock, not a retry wrapper.
-Known gap written into the new code rather than hidden: when the WINDOW is the binding term, the
-refusal still reads as a budget problem and names a raise that cannot help. **The sensei daemon is
-not running, so this file is the only durable record.**
+Nothing broken; no known flakes. Known gap written into the clamp's code rather than hidden: when
+the WINDOW is the binding term, the refusal still reads as a budget problem and names a raise that
+cannot help. **The sensei daemon is not running, so this file is the only durable record.**
