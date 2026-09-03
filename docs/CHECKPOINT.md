@@ -17,16 +17,14 @@ down, so this file is the only durable record.
   three loud refusals; the review fixes (step 1's settled half vs a `config push`).
 - **Task 10** (`7969c1e`) — bounds + redaction, red-first by MUTATION since all three held.
 - **Task 11** (`33f7823`) — AC11 zero spend; AC12 as
-  `a_decided_loop_gate_replays_from_its_settlement_without_re_asking` (3 drives, third at
-  +45m INSIDE a 1h SLA).
+  `a_decided_loop_gate_replays_from_its_settlement…` (3 drives, third at +45m INSIDE a 1h SLA).
 - **Tasks 10–11 review round** (`e7ff7f3`, `6db5ab1`, `18a71a0`, `7ac6da0`) — 12 findings.
   The re-pause arm (`Waiting` + menu + NO decision, every wake before an answer) was reached
   by NO test: two new tests, four mutations. The MENU and the pause reason leaked plaintext
   while `prompt` was scrubbed on the same write: redacted at the append, and a menu whose
   names COLLIDE once redacted now fails loudly rather than inverting a decision. Four false
-  doc claims corrected against measurement (the CAS is NOT load-bearing — it is wired now
-  and asserted; the by-node effect list; two mutation blast radii; the phantom
-  `newly_journaled`).
+  doc claims corrected against measurement (the CAS is NOT load-bearing — wired + asserted
+  now; the by-node effect list; two mutation blast radii; the phantom `newly_journaled`).
 
 ## Remaining
 
