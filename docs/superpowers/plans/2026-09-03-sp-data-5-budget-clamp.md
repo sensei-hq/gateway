@@ -397,7 +397,11 @@ regression guard, not a red test.
 
 - [ ] **Step 3: Implement the clamp**
 
-In `dispatch_metered`, replace the line `let response = self.gateway.execute(request).await?;` with:
+In `dispatch_metered`, replace the line `let response = self.gateway.execute(request).await?;` with
+the block below. **The shipped version differs in two ways the whole-slice review forced** — it
+bounds the emitted value by `Gateway::min_max_output_tokens(chain)`, and `cap - spent` is a
+`checked_sub` behind a `debug_assert!` rather than a bare subtraction. See the round-1 section at
+the end of this plan; read the source, not this sketch.
 
 ```rust
         // SP-DATA-5 clamp. The gate above is a FLOOR-TRIGGER — it refuses once `spent`
