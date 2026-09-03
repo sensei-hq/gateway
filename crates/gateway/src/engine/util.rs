@@ -118,9 +118,10 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// **`Message::attachments` are not counted at all**, and that is a decision rather than
 /// an oversight. There is no honest token model for media here: the only quantity this
 /// crate can measure is the `MediaSource` string, and for a `Base64` source that
-/// over-counts by roughly two orders of magnitude (a 1 MB image is ~1.4 M base64 bytes
-/// against ~1.6 k tokens on Anthropic's published cost), while for a `Url` source its
-/// length has no relationship to the cost at all. Either would reproduce the failure the
+/// over-counts by two to three orders of magnitude (a 1 MB image is ~1.4 M base64 bytes,
+/// so ~466 k "tokens" at `/3`, against a per-image cost providers publish in the low
+/// thousands), while for a `Url` source its length has no relationship to the cost at
+/// all. Either would reproduce the failure the
 /// `Stt` arm below refuses — an estimate so large that every candidate is skipped and a
 /// perfectly serviceable request becomes a terminal `AllGated`.
 ///
@@ -413,8 +414,8 @@ mod tests {
     /// can carry this over an 8 k window is the schemas.
     #[test]
     fn tool_schemas_alone_push_a_request_over_a_small_candidates_window() {
-        // 80 tools at ~433 bytes of serialized schema each: ~35 KB of JSON, ~11.5 k
-        // tokens at /3 — over an 8 k window and well under a 128 k one.
+        // 80 tools at ~410 bytes of serialized schema each: ~35 KB of JSON in all,
+        // 11531 tokens at /3 — over an 8 k window and well under a 128 k one.
         let tools: Vec<ToolDefinition> = (0..80)
             .map(|i| ToolDefinition {
                 name: format!("tool_{i}"),

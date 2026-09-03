@@ -78,8 +78,9 @@ defect: it admits a candidate the prompt does not fit, and the provider answers 
 **What the pessimistic estimate does NOT count, stated so "pessimistic" is not read as
 "complete":** `Message::attachments`. There is no honest token model for media in this crate — the
 only measurable quantity is the `MediaSource` string, and for a `Base64` source that over-counts by
-roughly two orders of magnitude (a 1 MB image is ~1.4 M base64 bytes against ~1.6 k tokens), while
-a `Url` source's length has no relationship to its cost at all. Either would reproduce the failure
+two to three orders of magnitude (a 1 MB image is ~1.4 M base64 bytes — ~466 k "tokens" at `/3` —
+against a per-image cost providers publish in the low thousands), while a `Url` source's length has
+no relationship to its cost at all. Either would reproduce the failure
 the `Stt` arm avoids: an estimate so large that every candidate is skipped and a serviceable
 request becomes a terminal `AllGated`. So the estimate is an upper bound on a request's **text**,
 not on the request; a multimodal call can still be admitted to a model its images push over. That
