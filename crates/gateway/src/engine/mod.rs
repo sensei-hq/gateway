@@ -621,54 +621,8 @@ mod min_window_tests {
 
     #[tokio::test]
     async fn min_context_window_is_the_smallest_model_in_the_chain() {
-        let mut routers = HashMap::new();
-        routers.insert(
-            "r".into(),
-            RouterConfig {
-                url: "http://x".into(),
-                api_key_env: None,
-                api_key: None,
-                enabled: true,
-                timeout_ms: None,
-                headers: HashMap::new(),
-            },
-        );
-        let mut models = HashMap::new();
-        models.insert("big".into(), model("big", 200_000));
-        models.insert("small".into(), model("small", 8_000));
-        let mut chains = HashMap::new();
-        chains.insert(
-            "c".into(),
-            FallbackChainConfig {
-                id: "c".into(),
-                capability: Capability::TextChat,
-                models: vec![
-                    ChainEntry {
-                        model: "big".into(),
-                        router: Some("r".into()),
-                        api_model_id: None,
-                        priority: 1,
-                    },
-                    ChainEntry {
-                        model: "small".into(),
-                        router: Some("r".into()),
-                        api_model_id: None,
-                        priority: 2,
-                    },
-                ],
-                fallback_triggers: Vec::new(),
-            },
-        );
-        let config = GatewayConfig {
-            routers,
-            models,
-            chains,
-            constraints: Default::default(),
-            panels: Default::default(),
-            consensus: Default::default(),
-        };
         let gw = Gateway::new(
-            config,
+            two_model_chain(model("big", 200_000), model("small", 8_000)),
             AdapterRegistry::new(),
             CircuitBreakerManager::new(CircuitBreakerConfig::default()),
         );
