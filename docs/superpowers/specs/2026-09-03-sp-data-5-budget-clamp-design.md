@@ -375,5 +375,16 @@ which can never dispatch a call belongs on the precondition side; the floor wide
 - A per-agent `min_output_tokens`, for roles whose useful answer is much shorter or longer than the
   default.
 - Self-calibration: using observed `actual_input / est_input` per chain to tune the estimate.
+- **Restoring concurrent fan-out for a budgeted run via a reservation — considered and rejected,
+  and worth recording because this slice changed the reason.** SP-DATA-5 serialises a budgeted
+  run's model calls under a 1-permit gate, and rejected a reservation scheme on the ground that it
+  would need an output-token estimate nobody had. The clamp supplies precisely that bound: a
+  budgeted `Chat` now carries an explicit `max_tokens`, so a reservation could hold
+  `est_input + max_tokens` and be conservative without predicting anything. It still loses, for a
+  different reason — that reservation is essentially the whole remaining allowance, so the first
+  child to claim it drops every sibling below `MIN_OUTPUT_TOKENS` and they are refused rather than
+  queued. It would make a concurrent fan-out safe without making it concurrent, and would pause
+  runs that serialising completes. Anyone revisiting this should argue against the starvation, not
+  against the missing estimate.
 - The other SP-DATA-5 carry-forwards, untouched here: money denomination, fleet/per-tenant budgets,
   budget-aware scheduling, cross-run spend reporting, and the `RunPaused`-per-gated-child noise.
