@@ -67,11 +67,18 @@ enum RunAction {
         /// Stop this run once it has spent this many tokens, and pause it durably so
         /// you can raise the cap with `run wake --budget-tokens N`.
         ///
-        /// This is a floor trigger, not a hard ceiling: a call's output tokens are
-        /// unknowable until it returns, so the run can exceed the number by at most
-        /// one model call. Omit it and the run is unbudgeted, exactly as before.
-        /// A budgeted run runs its model calls one at a time, so a wide fan-out is
-        /// slower than an unbudgeted one. `0` is not a valid budget.
+        /// Not a hard ceiling. Each chat call is capped at what the remaining budget
+        /// affords, so the run can still exceed the number by however much its input
+        /// estimate was too low — bounded and biased toward refusing early, not zero.
+        ///
+        /// A run can also PAUSE BEFORE reaching the cap: when what is left cannot buy a
+        /// reply worth the input tokens, it stops rather than paying for a truncated
+        /// one, and says by how much the cap must rise. Small budgets are refused
+        /// outright for the same reason.
+        ///
+        /// Omit it and the run is unbudgeted, exactly as before. A budgeted run runs
+        /// its model calls one at a time, so a wide fan-out is slower than an
+        /// unbudgeted one.
         #[arg(long, value_parser = cmd::run::parse_budget_tokens)]
         budget_tokens: Option<u64>,
     },

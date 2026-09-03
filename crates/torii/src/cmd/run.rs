@@ -1302,24 +1302,36 @@ pub(crate) fn not_delivered(node: &str, state: &SignalState, residue: CompletedR
     }
 }
 
-/// Parse `--budget-tokens N` (on both `run submit` and `run wake`): a plain positive
-/// integer, rejecting 0 loudly and with the offending value echoed back —
-/// consistent with `--interval 0s` (`cmd::worker::parse_interval`) and
-/// `TORII_POOL_SIZE=0` (`boot::parse_pool_size`). A zero-token budget can never
-/// dispatch a single model call: the gate checks already-spent-vs-cap BEFORE every
-/// dispatch (§6.2 of the design), so `spent (0) >= cap (0)` is true from the very
-/// first check and the run would pause immediately, before doing any work at all —
-/// almost certainly not what an operator setting a budget intends, so it is
-/// refused as a precondition rather than accepted and silently useless.
+/// Parse `--budget-tokens N` (on both `run submit` and `run wake`): a whole number of
+/// at least [`orchestrator_core::MIN_OUTPUT_TOKENS`], rejecting anything smaller loudly
+/// and with the offending value echoed back — consistent with `--interval 0s`
+/// (`cmd::worker::parse_interval`) and `TORII_POOL_SIZE=0` (`boot::parse_pool_size`).
+///
+/// The floor, not `0`, because that is where "can never dispatch a single model call"
+/// actually sits. It used to be `0`, on the ground that `spent (0) >= cap (0)` refuses
+/// at the very first check; the SP-DATA-5 clamp widened the range that is useless in
+/// exactly that way. A budgeted `Chat` call is now also refused when
+/// `(cap − spent) − est_input < MIN_OUTPUT_TOKENS`, so ANY cap below the floor is
+/// refused before the provider whatever the prompt, and accepting it would hand the
+/// operator a run that pauses instantly having done nothing.
+///
+/// It is a precondition, not a guarantee, and the difference is worth stating: a cap AT
+/// the floor is accepted and can still be refused at dispatch, because the input
+/// estimate is subtracted first and depends on the prompt. What the parser can reject is
+/// the range that is provably useless for every prompt; the runtime refusal explains the
+/// rest, naming the raise it needs.
 pub fn parse_budget_tokens(s: &str) -> Result<u64, String> {
     let t = s.trim();
     let v: u64 = t
         .parse()
         .map_err(|_| format!("invalid --budget-tokens {t:?}: {t:?} is not a whole number"))?;
-    if v == 0 {
+    let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+    if v < floor {
         return Err(format!(
-            "invalid --budget-tokens {t:?}: a zero-token budget can never dispatch a single \
-             model call — the run would pause immediately, before doing any work"
+            "invalid --budget-tokens {t:?}: a budget under {floor} tokens can never dispatch a \
+             single model call — a reply needs at least {floor} output tokens, and the run's \
+             input estimate comes out of the cap before that, so the run would pause \
+             immediately, before doing any work"
         ));
     }
     Ok(v)
@@ -1727,7 +1739,34 @@ pub(crate) mod tests {
     #[test]
     fn parse_budget_tokens_accepts_a_positive_value() {
         assert_eq!(parse_budget_tokens("50000"), Ok(50_000));
-        assert_eq!(parse_budget_tokens(" 12 "), Ok(12), "whitespace is trimmed");
+        assert_eq!(
+            parse_budget_tokens(&orchestrator_core::MIN_OUTPUT_TOKENS.to_string()),
+            Ok(orchestrator_core::MIN_OUTPUT_TOKENS),
+            "the floor itself is accepted; it is only BELOW it that nothing can dispatch"
+        );
+    }
+
+    /// A cap below `MIN_OUTPUT_TOKENS` can never dispatch a single `Chat` call, for the
+    /// same reason `0` cannot: the clamp's floor refuses before the provider, whatever
+    /// the prompt. So it belongs with `0` on the precondition side of the CLI rather
+    /// than being accepted and paused-on-immediately.
+    ///
+    /// The message has to name the floor, because the whole complaint against the old
+    /// behaviour was an operator being told to raise a cap without being told to what.
+    #[test]
+    fn parse_budget_tokens_rejects_a_budget_below_the_output_floor() {
+        let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+        let e = parse_budget_tokens(&(floor - 1).to_string())
+            .expect_err("below the floor no Chat call can ever be dispatched");
+        assert!(e.contains("--budget-tokens"), "{e}");
+        assert!(
+            e.contains(&(floor - 1).to_string()),
+            "must echo the offending value: {e}"
+        );
+        assert!(
+            e.contains(&floor.to_string()),
+            "and must name the floor it fell under, so the operator knows the minimum: {e}"
+        );
     }
 
     #[test]
