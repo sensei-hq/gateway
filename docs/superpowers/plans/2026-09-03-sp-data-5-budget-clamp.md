@@ -994,6 +994,17 @@ All three must be `exit=0`. Record the counts.
 database was started and `$DATABASE_URL` was not read, so the `have_database_url` suites are among
 the 56 ignored — see the round-1 note above for the one budget test that hides there.
 
+**One PRE-EXISTING flake surfaced, and it is worth writing down because "run it again" is the wrong
+response.** `agent::sandbox::tests::a_backgrounded_straggler_is_reaped_on_clean_exit` (SP-4 s4,
+untouched since `fb4db2f`) failed **1 of 6** full-suite runs and **0 of 10** in isolation, on its
+`elapsed() < 5s` bound. It is not a regression — this task's only source edit is a doc comment, and
+comment-only changes cannot move runtime behaviour — but the gate should not be reported green
+without it. The likely mechanism is not the reap failing: `spawn_capped`'s bounded capture falls
+back to a 2s `recv_timeout` per stream, so a stdout+stderr pair that both hit the fallback burns 4s
+of the 5s budget before scheduling delay is counted. The remedy is a wider bound or an injected
+clock, NOT a retry wrapper, which would hide the 30s hang the test exists to catch. Left for whoever
+owns the sandbox, since fixing it here would put an untested timing change in a docs commit.
+
 - [x] **Step 2: Doc-link baseline**
 
 ```bash

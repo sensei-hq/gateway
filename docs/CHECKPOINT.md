@@ -12,16 +12,14 @@ run refuses through the existing durable pause and makes **no call at all**, nam
 unblocks it (`spent + est_input + floor`). Two `tracing` records measure the estimator. Unbudgeted
 runs are byte-identical. **The claim this slice does NOT make:** the overshoot is **bounded by the
 input-estimate error, biased toward refusing early — NOT eliminated** (spec §4 has the arithmetic).
-Task 9's sweep also corrected one stale WHY this slice itself falsified — the budgeted fan-out
-serialises because a reservation would STARVE its siblings, not because the output estimate is
-unknowable (the clamp supplies it) — in `dispatch.rs`, the overview and the clamp spec §8.
+Task 9 also fixed a stale WHY: fan-out serialises to avoid STARVING siblings (see `ef44318`).
 
 ## Verified at the tip — real exit codes, re-run after the doc edits
 
-`cargo test --workspace` **1682 passed / 0 failed / 56 ignored, exit 0** (35 suites) · `cargo clippy
---workspace --all-targets -- -D warnings` **exit 0** · `cargo fmt --all --check` **exit 0** ·
-`cargo doc --workspace --no-deps --document-private-items` unresolved links **16**, the baseline
-exactly. No database touched.
+`cargo test --workspace` **1682 passed / 0 failed / 56 ignored, exit 0** (35 suites), reproduced in
+**5 of 6** runs — see the flake below · `clippy --workspace --all-targets -- -D warnings` **exit 0**
+· `fmt --all --check` **exit 0** · `cargo doc` unresolved links **16**, the baseline exactly. No
+database touched.
 
 ## Next command
 
@@ -32,7 +30,10 @@ git push origin develop && gh pr create --base main --head develop
 
 ## Known-broken / open
 
-Nothing broken, no open questions. `$DATABASE_URL` is **REMOTE Supabase — never run a suite against
-it**. The Postgres AC6 budget e2e is `ignore`d locally without `have_database_url`; it was rescaled
-×10 above the clamp's floor and verified in-process. The **sensei daemon is not running**, so this
-file is the only durable record.
+Nothing broken in this slice. **One PRE-EXISTING flake the gate surfaced, NOT a regression:**
+`a_backgrounded_straggler_is_reaped_on_clean_exit` (SP-4 sandbox, untouched since) failed 1 of 6
+full-suite runs on its 5s wall bound and 0 of 10 in isolation; this slice's diff is comment-only.
+Suspect its two sequential 2s `recv_timeout` fallbacks under load; wants a wider bound, not a retry.
+`$DATABASE_URL` is **REMOTE Supabase — never run a suite against it**; the Postgres AC6 budget e2e
+is `ignore`d locally, rescaled ×10 above the clamp's floor and verified in-process. The **sensei
+daemon is not running**, so this file is the only durable record.
