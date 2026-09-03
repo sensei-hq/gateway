@@ -304,23 +304,37 @@ pub(super) fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
             tools,
             ..
         } => {
-            let msg: usize = messages.iter().map(|m| m.content.as_text().len()).sum();
+            let msg: usize = messages.iter().map(|m| m.as_text().len()).sum();
             let sys: usize = system.as_ref().map(|s| s.len()).unwrap_or(0);
             let tls: usize = tools
                 .iter()
-                .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+                .map(|t| {
+                    t.name.len()
+                        + t.description.as_ref().map(|d| d.len()).unwrap_or(0)
+                        + t.input_schema.to_string().len()
+                })
                 .sum();
             msg + sys + tls
         }
         Payload::Embed { texts } => texts.iter().map(|t| t.len()).sum(),
-        _ => 0,
+        Payload::Stt { .. } => 0,
+        Payload::Tts { text, .. } => text.len(),
+        Payload::ImageGenerate { prompt, .. } | Payload::VideoGenerate { prompt, .. } => {
+            prompt.len()
+        }
     };
     u32::try_from(chars.div_ceil(3)).unwrap_or(u32::MAX)
 }
 ```
 
-Match `estimate_input_tokens`'s own arms for the non-Chat payload kinds — read it first and mirror
-its handling rather than inventing different behaviour for `Stt`.
+**Corrected against the real types while implementing** (the draft above now matches what shipped):
+`ToolDefinition` is `{ name: String, description: Option<String>, input_schema: Value }`, not
+`{ description: String, parameters: Value }`; `Message` exposes `as_text()` directly. And the
+draft's `_ => 0` catch-all was **wrong** — it contradicted the instruction below it and would have
+made the pessimistic estimate *under*-count a `Tts` / `ImageGenerate` / `VideoGenerate` payload
+(0 against the cost estimate's `chars/4`), inverting AC7, the one ordering the gate's safety rests
+on. Every non-chat arm mirrors `estimate_input_tokens` at `/3`; `Stt` alone stays 0 in both,
+because audio bytes are not characters.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -586,6 +600,13 @@ Expected: COMPILE ERROR — `SelectionCriteria` has no `input_tokens_pessimistic
 ```
 
 and the `SelectionCriteria` literal gains `input_tokens_pessimistic: Some(input_tokens_pessimistic),`.
+
+5. **Delete the `#[allow(dead_code)]` above `estimate_input_tokens_pessimistic` in
+   `engine/util.rs`.** Task 3 added it because nothing in a non-test build called the function
+   between Task 3 and this one, and the pre-commit gate is `clippy --workspace --all-targets
+   -D warnings`. This step is what makes it unnecessary; leaving it would silence a real signal
+   for the next person who breaks the plumbing. If clippy then reports the function as dead,
+   step 4 above did not actually land.
 
 - [ ] **Step 4: Fix every other `SelectionCriteria` construction**
 
