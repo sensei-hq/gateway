@@ -151,12 +151,59 @@ fn check_agent_refs(graph: &Graph, registry: &Registry, errs: &mut Vec<PlanError
     }
 }
 
+/// Recursively reject a node id that IS one of the executor's reserved path segments —
+/// `__plan__` (planner sub-run), `__gate__` (a `Loop`'s gate) or `__select__` (a planner
+/// selector's spend).
+///
+/// **It recurses, and until the SP-6 s4 whole-slice review it did not.** The walk saw
+/// `plan.graph.nodes` alone, on the recorded reasoning that "nested ids namespace deeper
+/// under their parent path and can't collide". That is true of `__plan__` and
+/// `__select__`, which live under an `Expand` (no static body for a plan node to sit in),
+/// and FALSE of `__gate__`: a `Loop`'s `Subgraph` body is namespaced under
+/// `"{loop}/{i}"`, so a plan node named `__gate__` in that body lands on exactly the
+/// path that `Loop`'s own gate uses. Four places in s4 asserted the opposite — that a
+/// planner therefore could not emit the segment — and `feasible` measured `Ok(())` on
+/// `Loop { body: Subgraph([__gate__]), gate: Human }`.
+///
+/// The nesting set mirrors [`check_agent_refs`] exactly, and for the same reason: those
+/// are the graphs this function can see statically. An `Expand` body's plan is produced
+/// at runtime and is checked by its own `feasible` call at splice time.
+///
+/// `Graph::validate_dag`'s block 1c refuses the same shape structurally, so this walk is
+/// not the only guard. It is still owed: `validate_dag` returns one `InvalidGraph` string,
+/// while `ValidatePlan` hands a planner the typed `ReservedNodeId(id)` it can act on.
+fn check_reserved_ids(graph: &Graph, errs: &mut Vec<PlanError>) {
+    for n in &graph.nodes {
+        if n.id.0 == RESERVED_PLAN_ID
+            || n.id.0 == RESERVED_GATE_ID
+            || n.id.0 == crate::planner::RESERVED_SELECT_ID
+        {
+            errs.push(PlanError::ReservedNodeId(n.id.0.clone()));
+        }
+        match &n.kind {
+            NodeKind::Subgraph { graph } => check_reserved_ids(graph, errs),
+            NodeKind::Loop {
+                body: LoopBody::Subgraph(g),
+                ..
+            } => check_reserved_ids(g, errs),
+            NodeKind::Branch { arms, default, .. } => {
+                for (_, g) in arms {
+                    check_reserved_ids(g, errs);
+                }
+                check_reserved_ids(default, errs);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Pure feasibility: structure (validate_dag) + registry-resolvable agent refs
 /// (top-level `Agent` nodes, the `Map`/`Consolidate` `MapBody::Agent` bodies, a
 /// `Loop`'s `LoopBody::Agent` body and its `GateSpec::Agent`/`GateSpec::Human` gate,
 /// and recursively through nested `Subgraph`/`Branch` graphs plus a
 /// `LoopBody::Subgraph` body) + each `NodePlan.needs` (agents/skills/tools) +
-/// reserved-id + node-count. Returns ALL errors.
+/// reserved-id (recursively — see [`check_reserved_ids`]) + node-count. Returns ALL
+/// errors.
 pub fn feasible(
     plan: &PlannedGraph,
     registry: &Registry,
@@ -173,18 +220,8 @@ pub fn feasible(
             limit: max_nodes,
         });
     }
-    // Reserved-id is a top-level-only pre-check: nested ids namespace deeper under
-    // their parent path and can't collide with the top-level `__plan__` (planner
-    // sub-run), `__gate__` (Loop gate-agent) or `__select__` (planner-selector spend)
-    // segments.
-    for n in &plan.graph.nodes {
-        if n.id.0 == RESERVED_PLAN_ID
-            || n.id.0 == RESERVED_GATE_ID
-            || n.id.0 == crate::planner::RESERVED_SELECT_ID
-        {
-            errs.push(PlanError::ReservedNodeId(n.id.0.clone()));
-        }
-    }
+    // Reserved ids, at EVERY depth this function can see — see `check_reserved_ids`.
+    check_reserved_ids(&plan.graph, &mut errs);
     // Agent refs, recursing into nested Subgraph/Branch graphs.
     check_agent_refs(&plan.graph, registry, &mut errs);
     for np in plan.node_plans.values() {
@@ -370,6 +407,137 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| matches!(e, PlanError::ReservedNodeId(id) if id == "__select__"))
+        );
+    }
+
+    /// **SP-6 s4 whole-slice review, Minor.** The reserved-id walk used to see
+    /// `plan.graph.nodes` and nothing else, on the reasoning that "nested ids namespace
+    /// deeper under their parent path and can't collide". That reasoning holds for
+    /// `__plan__` and `__select__` and is FALSE for `__gate__`: a `Loop`'s `Subgraph`
+    /// body namespaces under `"{loop}/{i}"`, so a plan node named `__gate__` in that body
+    /// lands on exactly the gate's own path.
+    ///
+    /// Four places in the s4 slice asserted the opposite — that `feasible` reserves the
+    /// segment, so a planner cannot emit it. Measured before the fix:
+    /// `feasible(Loop { body: Subgraph([__gate__]), gate: Human }) == Ok(())`.
+    ///
+    /// Both errors are expected and both are asserted: `validate_dag`'s block 1c refuses
+    /// the graph structurally at every depth, and this walk names the id in the typed
+    /// `ReservedNodeId` variant the `ValidatePlan` tool reports back to the planner. The
+    /// structural one alone would leave a planner reading "invalid graph" with no id.
+    #[test]
+    fn feasible_reports_a_reserved_gate_id_nested_in_a_loop_body() {
+        let inner = Graph {
+            nodes: vec![Node {
+                id: NodeId(RESERVED_GATE_ID.into()),
+                kind: mc("z", None).kind,
+                deps: vec![],
+            }],
+        };
+        let plan = PlannedGraph {
+            graph: Graph {
+                nodes: vec![Node {
+                    id: NodeId("lp".into()),
+                    kind: NodeKind::Loop {
+                        body: LoopBody::Subgraph(Box::new(inner)),
+                        input: serde_json::json!({}),
+                        gate: GateSpec::Human {
+                            agent: AgentRef("researcher".into()),
+                            menu: vec![LoopGateOption {
+                                name: "ship".into(),
+                                stops: true,
+                            }],
+                        },
+                        max_iters: 3,
+                    },
+                    deps: vec![],
+                }],
+            },
+            node_plans: HashMap::new(),
+        };
+        let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::ReservedNodeId(id) if id == RESERVED_GATE_ID)),
+            "the nested reserved id must be named, not merely refused: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, PlanError::Structural(m) if m.contains(RESERVED_GATE_ID))),
+            "…and `validate_dag`'s own block 1c refuses it too: {errs:?}"
+        );
+    }
+
+    /// The same walk through the other two nestings it now recurses into — a `Subgraph`
+    /// node's graph and a `Branch`'s arm — so the recursion is pinned at every site
+    /// `check_agent_refs` reaches rather than only at the one that motivated it.
+    #[test]
+    fn feasible_reports_a_reserved_id_nested_in_a_subgraph_or_a_branch_arm() {
+        let offender = || Graph {
+            nodes: vec![Node {
+                id: NodeId(RESERVED_GATE_ID.into()),
+                kind: mc("z", None).kind,
+                deps: vec![],
+            }],
+        };
+        let named = |graph: Graph, what: &str| {
+            let plan = PlannedGraph {
+                graph,
+                node_plans: HashMap::new(),
+            };
+            let errs = feasible(&plan, &agent_reg(), 512).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, PlanError::ReservedNodeId(id) if id == RESERVED_GATE_ID)),
+                "{what}: {errs:?}"
+            );
+        };
+
+        named(
+            Graph {
+                nodes: vec![Node {
+                    id: NodeId("sg".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(offender()),
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Subgraph",
+        );
+        named(
+            Graph {
+                nodes: vec![
+                    mc("on", None),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("on".into()),
+                            arms: vec![(BranchCond::FieldTrue("go".into()), offender())],
+                            default: Graph { nodes: vec![] },
+                        },
+                        deps: vec![Dep::hard("on")],
+                    },
+                ],
+            },
+            "nested in a Branch arm",
+        );
+        named(
+            Graph {
+                nodes: vec![
+                    mc("on", None),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("on".into()),
+                            arms: vec![],
+                            default: offender(),
+                        },
+                        deps: vec![Dep::hard("on")],
+                    },
+                ],
+            },
+            "nested in a Branch default",
         );
     }
 

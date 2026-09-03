@@ -537,6 +537,66 @@ impl Graph {
             }
         }
 
+        // 1c. SP-6 s4 (whole-slice review): the executor's own reserved path SEGMENTS,
+        // banned for the same reason 1b bans the separator and closing the vector 1b does
+        // NOT reach.
+        //
+        // 1b makes `"lp/0/__gate__"` unauthorable in one piece, and until this block that
+        // was mistaken for the whole rule. A `Loop`'s `Subgraph` body is namespaced under
+        // `"{loop}/{i}"` (`executor::subgraph::namespace_graph`), so an inner node the
+        // author simply named `__gate__` lands on exactly the path that `Loop`'s own gate
+        // uses — no separator required. Both ids are legal at their own level, and the
+        // collision exists only once nesting has flattened them.
+        //
+        // What it produced depended on the colliding node's KIND, and the quiet case was
+        // the bad one. A WAITING inner kind writes the shared `deadlines` map, so
+        // `run_human_loop_gate` takes its loud missing-menu refusal. A kind that COMPLETES
+        // (`ModelCall`/`Agent`) writes nothing there: the gate sees no recorded wait, asks
+        // normally, and publishes `LoopGateAwaited` at an id that already carries
+        // `NodeCompleted` — so `torii`'s `signal_states` folds the node terminal,
+        // `run list-paused` omits it and `run gate decide` refuses it as already
+        // completed. The run pauses on a question no operator surface can show or answer;
+        // with the supported indefinite SLA (`backed_by: human { timeout: None }`) it
+        // waits there forever, and with a finite one the whole `Loop` dies at the deadline
+        // taking every earlier iteration's spend with it.
+        //
+        // Equality on the WHOLE id, never `contains`: `my__gate__` namespaces to a path
+        // the executor never generates, and a substring rule would refuse a legal graph.
+        //
+        // `__plan__` and `__select__` are refused by the same rule as uniformity and
+        // defence in depth, NOT because either is reachable the way `__gate__` is: both
+        // sit under an `Expand`, which has no static body an author can put a node in.
+        // Checked here rather than only in `plan::feasible` because this function is what
+        // BOTH intakes run — `Executor::start`/`run` for an authored graph, and `feasible`
+        // for a planner's — so one rule covers an author and an untrusted planner at every
+        // depth `validate_dag` recurses into.
+        const RESERVED_SEGMENTS: [&str; 3] = [
+            crate::plan::RESERVED_PLAN_ID,
+            crate::plan::RESERVED_GATE_ID,
+            crate::planner::RESERVED_SELECT_ID,
+        ];
+        for node in &self.nodes {
+            if RESERVED_SEGMENTS.contains(&node.id.0.as_str()) {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "node id {:?} is a path segment the executor reserves for its own \
+                     synthesized nodes (a Loop's gate at \"{{loop}}/{{i}}/__gate__\", a \
+                     planner sub-run at \"{{expand}}/__plan__\", a selector's spend at \
+                     \"{{expand}}/__select__\"); nested under a Loop body it would collide \
+                     with one of them once the path is namespaced",
+                    node.id
+                )));
+            }
+            for dep in &node.deps {
+                if RESERVED_SEGMENTS.contains(&dep.on.0.as_str()) {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "node {:?} depends on {:?}, which is a path segment the executor \
+                         reserves for its own synthesized nodes",
+                        node.id, dep.on
+                    )));
+                }
+            }
+        }
+
         // 2. Every dependency references a declared node.
         for node in &self.nodes {
             for dep in &node.deps {
@@ -1015,6 +1075,139 @@ mod tests {
             "gate:2",
             "gate-c3a9f0e4-1b2d-4c5e-8a7b-9d0e1f2a3b4c",
         ] {
+            let g = Graph {
+                nodes: vec![node(id, vec![])],
+            };
+            assert!(g.validate_dag().is_ok(), "{id:?} must still validate");
+        }
+    }
+
+    /// **SP-6 s4 whole-slice review, Important.** The sibling of the `/` ban above, and
+    /// the vector it does NOT cover: a bare `__gate__` SEGMENT.
+    ///
+    /// s1's rule bans the separator, which makes `"lp/0/__gate__"` unauthorable in one
+    /// piece — but a `Loop`'s `Subgraph` body is namespaced under `"{loop}/{i}"`, so an
+    /// inner node the author simply named `__gate__` lands on exactly the path the Loop's
+    /// own gate uses. Both ids are legal at their own level, and the collision only
+    /// exists once nesting has flattened them, so nothing downstream can catch it.
+    ///
+    /// The consequence measured by review was the WORST available one, and it depended on
+    /// the colliding node's kind. A WAITING inner kind writes into the shared `deadlines`
+    /// map, so the gate arm takes its loud missing-menu refusal. A kind that COMPLETES
+    /// (`ModelCall`/`Agent`) writes nothing there: the gate arm sees no recorded wait,
+    /// asks normally, and publishes `LoopGateAwaited` at an id that already carries
+    /// `NodeCompleted` — whereupon `torii`'s `signal_states` folds the node as terminal,
+    /// `run list-paused` omits it, and `run gate decide` refuses it as already completed.
+    /// With `backed_by: human { timeout: None }` the run then waits forever on a question
+    /// no operator surface can show or answer.
+    ///
+    /// So it is refused HERE, where the id is authored, rather than at the arm that
+    /// discovers it — the same reasoning the `/` ban used: a pure syntactic rule needing
+    /// no cross-level analysis, holding for planner-produced graphs too (`plan::feasible`
+    /// validates through this function), and costing nothing, since no graph in this
+    /// workspace uses a reserved segment as an author-supplied id.
+    #[test]
+    fn validate_dag_rejects_a_reserved_gate_segment_in_an_author_supplied_node_id() {
+        let offender = || Graph {
+            nodes: vec![node(crate::plan::RESERVED_GATE_ID, vec![])],
+        };
+        let assert_rejects = |g: &Graph, what: &str| match g.validate_dag() {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("__gate__") && m.contains("reserve"),
+                "{what}: rejected, but not for the reserved segment: {m}"
+            ),
+            other => panic!("{what}: expected InvalidGraph, got {other:?}"),
+        };
+
+        assert_rejects(&offender(), "top level");
+        assert_rejects(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("s".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(offender()),
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Subgraph",
+        );
+        // The live vector: this is the nesting that actually produces the collision.
+        assert_rejects(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("L".into()),
+                    kind: NodeKind::Loop {
+                        body: LoopBody::Subgraph(Box::new(offender())),
+                        input: serde_json::json!({}),
+                        gate: GateSpec::Pure(LoopGate::TextContains("x".into())),
+                        max_iters: 3,
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Loop body",
+        );
+        assert_rejects(
+            &Graph {
+                nodes: vec![
+                    node("on", vec![]),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("on".into()),
+                            arms: vec![(BranchCond::FieldTrue("go".into()), offender())],
+                            default: Graph { nodes: vec![] },
+                        },
+                        deps: vec![Dep::hard("on")],
+                    },
+                ],
+            },
+            "nested in a Branch arm",
+        );
+
+        // The two SIBLING reserved segments are refused by the same rule. Neither is
+        // reachable as a collision the way `__gate__` is — `"{expand}/__plan__"` and
+        // `"{expand}/__select__"` sit under an `Expand`, which has no static body for an
+        // author to put a node in — so this half is defence in depth and uniformity, not
+        // a fix. Stated that way rather than claimed as a live vector.
+        for reserved in [
+            crate::plan::RESERVED_PLAN_ID,
+            crate::planner::RESERVED_SELECT_ID,
+        ] {
+            assert_rejects(
+                &Graph {
+                    nodes: vec![node(reserved, vec![])],
+                },
+                reserved,
+            );
+        }
+
+        // And a DEP naming one, for the same reason the separator ban checks deps: the
+        // author meant some node, and "undeclared node" would send them hunting a typo.
+        match (Graph {
+            nodes: vec![
+                node("a", vec![]),
+                node("b", vec![Dep::hard(crate::plan::RESERVED_GATE_ID)]),
+            ],
+        })
+        .validate_dag()
+        {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("__gate__") && m.contains("reserve"),
+                "a dep on a reserved segment is refused as reserved, not as a typo: {m}"
+            ),
+            other => panic!("expected InvalidGraph, got {other:?}"),
+        }
+    }
+
+    /// The other half, mirroring the separator ban's: an id that merely CONTAINS a
+    /// reserved segment as a substring is not the reserved segment, and must still
+    /// validate. The rule is equality on the whole id, not a `contains` — an author's
+    /// `__gate__like` or `my__gate__` namespaces to a path the executor never generates.
+    #[test]
+    fn validate_dag_accepts_ids_that_merely_resemble_a_reserved_segment() {
+        for id in ["__gate__like", "my__gate__", "gate", "_gate_", "__plan__2"] {
             let g = Graph {
                 nodes: vec![node(id, vec![])],
             };

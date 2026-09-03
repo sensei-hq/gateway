@@ -949,6 +949,39 @@ impl Executor {
             // also SCRUBBED here and nowhere else: what this arm journals is the redacted
             // copy, and every later drive reads that one back out of the fold.
             Ok(WaitState::NotYetAsking(fresh)) => {
+                // **Before anything: is this reserved path already occupied by a node
+                // that COMPLETED here?**
+                //
+                // The `Waiting` arm below catches an occupant that recorded a WAIT,
+                // because `Fold::deadlines` is shared. A node kind that simply ran and
+                // finished writes nothing there, so without this check the gate would
+                // reach the ask and publish `LoopGateAwaited` at an id that already
+                // carries `NodeStarted`/`NodeCompleted`. `torii`'s `signal_states` folds
+                // `NodeCompleted` as terminal, so the row is INVISIBLE: `run list-paused`
+                // omits the node and `run gate decide` refuses it as already completed,
+                // while the executor sits paused waiting for a decision — forever under an
+                // indefinite SLA, and until the whole `Loop` dies under a finite one.
+                //
+                // `validate_dag` block 1c closes the door an AUTHOR could walk through (a
+                // bare `__gate__` segment in the `Loop`'s own `Subgraph` body, which
+                // namespaces onto this path). Two doors it cannot close remain, and this
+                // is the guard for them: a mid-run edit of the gate KIND — `GateSpec::
+                // Agent` drives a real agent HERE, and `drive_agent` journals
+                // `NodeStarted`/`NodeCompleted` at the gate path, so an
+                // `Agent`→`Human` edit of `scheduled_runs.graph` between drives lands
+                // exactly in this state with both graphs individually legal — and a
+                // journal the executor did not write.
+                //
+                // Fail-closed, the same answer the missing-menu arm gives, and for the
+                // same reason: the alternative is a person being waited on with no surface
+                // that can tell them so. Guarded by
+                // `a_loop_gate_refuses_to_ask_at_a_path_another_kind_already_completed`.
+                if fold.started.contains(node_id) || fold.completed.contains(node_id) {
+                    return self
+                        .fail_loop_gate(run, node_id, occupied_path_message(node_id))
+                        .await;
+                }
+
                 // The question, through the seam shared with `drive_agent`'s human branch
                 // — so a person is shown a question built by the MODEL path's own prompt
                 // assembly and the two cannot drift. Composed HERE rather than at step 2
@@ -1130,28 +1163,37 @@ impl Executor {
             // this id. Its siblings get there by an edit to a live run's graph; a gate path
             // is SYNTHESIZED, so the two vectors here are different ones.
             //
-            // **(a) An authored `__gate__` SEGMENT, inside the gated `Loop`'s own
-            // `Subgraph` body.** `drive_nested` namespaces that body under `"{loop}/{i}"`,
-            // so an inner node the author simply named `__gate__` lands at exactly this
-            // path. `validate_dag` does not stop it: SP-6 s1's rule bans the `/` SEPARATOR
-            // in an author-supplied id, which makes the reserved path unauthorable in one
-            // piece but says nothing about a bare segment that only becomes that path once
-            // nesting has flattened it. `plan::feasible` DOES reserve the segment
-            // (`PlanError::ReservedNodeId`, the SP-3 s5 review's fix), so a planner cannot
-            // emit it, and an `Expand` body is covered by that; the author-supplied segment
-            // is the door left open. Guarded by
-            // `an_authored_gate_id_in_a_loop_body_collides_and_fails_loudly`.
+            // **(a) A journal `torii` did not write**, which is a first-class case for a
+            // durable log an embedder may append to directly. It is now the ONLY vector
+            // this arm has, and the sentences that used to stand here were wrong about
+            // both of the others.
             //
-            // An earlier version of this comment described (a) as a `/`-containing id
+            // The vector this arm shipped for was an authored `__gate__` SEGMENT inside
+            // the gated `Loop`'s own `Subgraph` body: `drive_nested` namespaces that body
+            // under `"{loop}/{i}"`, so an inner node named `__gate__` lands at exactly this
+            // path, and s1's `/` ban — which reserves the SEPARATOR — never saw it.
+            // `validate_dag` block 1c now rejects the bare segment at every depth it
+            // recurses into, so that door is shut before anything is journaled
+            // (`an_authored_gate_id_in_a_loop_body_is_refused_before_the_run_starts`).
+            //
+            // The claim that `plan::feasible` already reserved the segment "so a planner
+            // cannot emit it" was FALSE when it was written: that walk saw
+            // `plan.graph.nodes` alone and did not recurse, and `feasible` measured
+            // `Ok(())` on `Loop { body: Subgraph([__gate__]), gate: Human }`. It recurses
+            // now, and `feasible` runs `validate_dag` in any case, so a planner really is
+            // covered — by two rules that had to be added, not by one that was there.
+            //
+            // An earlier version also described the authored case as a `/`-containing id
             // reaching the executor because "`Executor::start` takes the graph as an
             // unvalidated caller parameter". Both halves are false: `start_inner` and
             // `run_inner` each call `graph.validate_dag()?` before anything is journaled,
             // and validation recurses into `Subgraph`, `Loop` and `Branch` bodies — so no
-            // caller, embedder included, gets an unvalidated graph past the front door. The
-            // real vector needed no separator at all.
+            // caller, embedder included, gets an unvalidated graph past the front door.
             //
-            // **(b) A journal `torii` did not write**, which is a first-class case for a
-            // durable log an embedder may append to directly.
+            // **(b) The occupant that COMPLETED rather than waited** does not arrive here
+            // at all — it writes nothing into the shared `deadlines` map, so the arm above
+            // sees `NotYetAsking`. Its guard is there; see the comment at the top of that
+            // arm for the mid-run gate-KIND edit that reaches it.
             //
             // What is NOT a vector, though an earlier version of this comment claimed it:
             // a `Loop` whose gate was `Agent` over a human-backed role. That role never
@@ -1518,6 +1560,30 @@ fn missing_menu_message(node_id: &NodeId) -> String {
         "loop_gate: node {} recorded that it began waiting but published no menu, so there \
          is nothing a decision could be validated against. A waiting node's kind cannot be \
          changed mid-run; fail the run and start a new one.",
+        node_id.0
+    )
+}
+
+/// The other kind-swap refusal: the reserved gate path is already occupied by a node that
+/// STARTED or COMPLETED there.
+///
+/// Its sibling [`missing_menu_message`] covers an occupant that recorded a WAIT (the
+/// shared `Fold::deadlines` map makes that one visible to `wait_or_expire_by_id`); this
+/// one covers an occupant that simply ran, which writes nothing that map can see. The two
+/// are separate messages because the remedies differ: a waiting occupant means a kind swap
+/// on a live wait, while a completed one means the gate's own path was consumed by
+/// something else — most plausibly a `GateSpec::Agent`→`GateSpec::Human` edit between
+/// drives, which no validator can refuse because both graphs are legal.
+///
+/// It does not recite the menu, for [`missing_menu_message`]'s reason: nothing here is
+/// answerable, and naming options would suggest otherwise.
+fn occupied_path_message(node_id: &NodeId) -> String {
+    format!(
+        "loop_gate: node {} already has a completed node's record at its reserved gate \
+         path, so a question published here would be folded as already answered and no \
+         operator surface could show it. The usual cause is a gate whose kind was changed \
+         mid-run (a `GateSpec::Agent` drives a real agent at this same path); a gate's \
+         kind cannot be changed mid-run — fail the run and start a new one.",
         node_id.0
     )
 }
