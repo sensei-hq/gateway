@@ -14209,9 +14209,17 @@ async fn below_the_floor_the_gate_refuses_without_calling_the_provider() {
         .await
         .unwrap();
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
-    // A prompt long enough that `chars/3` alone clears the 5 tokens of headroom — the
-    // property is "allowance below the floor", not "an empty prompt costs something".
-    let (graph, ..) = two_node_graph("a prompt whose estimate eats the headroom", "p2");
+    // Exactly 30 characters, so the pessimistic `chars/3` estimate is exactly 10 and
+    // every number in the reason string below is arithmetic a reader can check:
+    // allowance = 261 − 10 = 251, five short of the 256 floor, so the cap must reach
+    // 261 + 5 = 266 before this call can go out.
+    const PROMPT: &str = "an estimate of exactly ten tok";
+    assert_eq!(
+        PROMPT.chars().count(),
+        30,
+        "the expected reason below is computed from this length"
+    );
+    let (graph, ..) = two_node_graph(PROMPT, "p2");
     let out = exec.start(run, &graph).await.expect("drives");
 
     let pause = out.paused.as_ref().expect("the run pauses on the budget");
@@ -14227,6 +14235,17 @@ async fn below_the_floor_the_gate_refuses_without_calling_the_provider() {
         crate::spend_of(&journal.load(run).await.unwrap()).0,
         0,
         "nothing was spent, which is what separates this refusal from an exhausted cap"
+    );
+    // The reason must SAY that, and say what to do about it. Reusing the exhausted
+    // wording here would report "0 of 261 tokens spent" beside a run that spent
+    // nothing, and tell an operator to raise a cap without saying by how much — two
+    // different situations with two different remedies, rendered identically.
+    assert_eq!(
+        pause.reason,
+        "budget: only 251 tokens left for output after the input estimate, below the \
+         256-token floor (0 of 261 spent); raise the cap to at least 266 with \
+         `torii run wake --budget-tokens N`",
+        "the floor's reason names the allowance, the floor and the raise it needs"
     );
 }
 

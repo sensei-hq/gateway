@@ -167,15 +167,46 @@ fn est_input_tokens(system: Option<&str>, messages: &[Message], tools: &[ToolDef
 /// [`Executor::dispatch_metered`] and consumed ONLY by
 /// [`Executor::record_refusal`] — a producer never invents or interprets one.
 pub(super) enum Refusal {
-    /// The run has already spent its budget. Carries `(spent, budget)` for the
-    /// operator-facing message.
-    BudgetExhausted { spent: u64, budget: u64 },
+    /// A budgeted run may not make this call. Carries `(spent, budget)` for the
+    /// operator-facing message and `cause` for WHICH of the two budget checks said so
+    /// — see [`BudgetRefusal`], which is the whole reason this is not just a pair of
+    /// numbers.
+    BudgetExhausted {
+        spent: u64,
+        budget: u64,
+        cause: BudgetRefusal,
+    },
     /// A budget is set but the provider reported no usage, so this call's spend would
     /// be invisible to the ledger. Fail closed: a budget you cannot measure is not a
     /// budget. (SP-DATA-5 Task 4 owns capturing usage and the tests for this arm;
     /// today it is unreachable in practice because nothing sets a budget until
     /// Task 5 wires `--budget-tokens`.)
     Unmetered { model: String },
+}
+
+/// Which of the two budget checks refused, and therefore what the operator is being
+/// told.
+///
+/// ONE refusal kind with a cause, not two kinds: the clamp design's §2 requires the
+/// floor to travel the EXISTING `BudgetExhausted` durable-pause path — same
+/// `RunPaused`, same `resume_after: None` HOTL class, same recovery verb — and a second
+/// variant would invite a second pause class to grow next to it. What §2 does not ask
+/// for is a single message for two different situations, and reusing one was a real
+/// defect: a fresh run with a cap of 300 paused reporting "budget: 0 of 300 tokens
+/// spent", which is not true (nothing was spent), and told the operator to raise the cap
+/// without saying by how much.
+///
+/// The two situations have different remedies. `Spent` means the run is out of budget
+/// and any raise buys more work. `BelowFloor` means the cap must clear
+/// `MIN_OUTPUT_TOKENS` plus this call's input estimate before the run can move AT ALL —
+/// a raise smaller than that leaves it stuck in exactly the same place.
+pub(super) enum BudgetRefusal {
+    /// `spent >= cap`: the ledger has already reached the cap.
+    Spent,
+    /// The output allowance left after the pessimistic input estimate is below
+    /// [`orchestrator_core::MIN_OUTPUT_TOKENS`]. Carries that allowance, which is what
+    /// makes the required raise computable in the message.
+    BelowFloor { allowance: u64 },
 }
 
 /// What a journaled refusal means for the producer that hit it: a durable pause the
@@ -228,7 +259,11 @@ impl Executor {
         if let Some(cap) = meter.budget()
             && spent >= cap
         {
-            return Ok(Err(Refusal::BudgetExhausted { spent, budget: cap }));
+            return Ok(Err(Refusal::BudgetExhausted {
+                spent,
+                budget: cap,
+                cause: BudgetRefusal::Spent,
+            }));
         }
         // The SP-DATA-5 clamp. The gate immediately above is a FLOOR-TRIGGER — it
         // refuses only once `spent` has ALREADY passed the cap — so without this a
@@ -294,7 +329,11 @@ impl Executor {
                     // is the EXISTING durable pause, not a new refusal kind: the
                     // operator's recovery (`torii run wake --budget-tokens N`) is
                     // already built and already documented.
-                    return Ok(Err(Refusal::BudgetExhausted { spent, budget: cap }));
+                    return Ok(Err(Refusal::BudgetExhausted {
+                        spent,
+                        budget: cap,
+                        cause: BudgetRefusal::BelowFloor { allowance },
+                    }));
                 }
                 // The MODEL's own output limit, which the allowance knows nothing
                 // about. `allowance` is a pure budget figure: for any realistic
@@ -373,10 +412,35 @@ impl Executor {
         refusal: Refusal,
     ) -> Result<RefusalKind, OrchestratorError> {
         match refusal {
-            Refusal::BudgetExhausted { spent, budget } => {
-                let reason = format!(
-                    "budget: {spent} of {budget} tokens spent; raise it with `torii run wake --budget-tokens N`"
-                );
+            Refusal::BudgetExhausted {
+                spent,
+                budget,
+                cause,
+            } => {
+                // Both messages start `budget: ` — that prefix is the operator- and
+                // test-visible marker for "this pause is about the cap", and torii's
+                // status/list-paused surfaces match on it.
+                let reason = match cause {
+                    BudgetRefusal::Spent => format!(
+                        "budget: {spent} of {budget} tokens spent; raise it with `torii run wake --budget-tokens N`"
+                    ),
+                    // The floor. Reusing the wording above here would report a spend
+                    // that did not happen ("0 of 300 tokens spent" on a fresh run) and
+                    // give no hint of how far the cap must move. The raise it names is
+                    // the SMALLEST one that unblocks THIS call — a later, longer prompt
+                    // can still land under the floor at that cap, which is why it says
+                    // "at least".
+                    BudgetRefusal::BelowFloor { allowance } => {
+                        let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+                        let needed = budget.saturating_add(floor.saturating_sub(allowance));
+                        format!(
+                            "budget: only {allowance} tokens left for output after the input \
+                             estimate, below the {floor}-token floor ({spent} of {budget} \
+                             spent); raise the cap to at least {needed} with \
+                             `torii run wake --budget-tokens N`"
+                        )
+                    }
+                };
                 // `resume_after: None` is the HOTL pause class (SP-DATA-3): the
                 // scheduler records a NULL `next_wake` and never auto-wakes the run.
                 // Correct here — no amount of waiting refills a budget, only an
