@@ -159,7 +159,11 @@ source: crates/orchestrator*
 >   **fails** it. `HumanGate` (s2, landed) and **human-as-Agent (s3, landed —
 >   `AgentBacking::Human` on an `AgentDefinition`, so a `NodeKind::Agent` whose `AgentRef`
 >   resolves to a human-backed role waits instead of calling a model; legal ONLY as a
->   top-level `Agent` node)** are the typed wrappers over it. A
+>   top-level `Agent` node)** are the typed wrappers over it. That position rule is about
+>   the NODE KIND, not about the role: since SP-6 s4 a human-backed role has a second legal
+>   use site, as the `agent` of a `GateSpec::Human` (above), where it supplies the loop
+>   gate's question and its SLA — and where a MODEL-backed role is refused loudly, the
+>   mirror of the same rule. A
 >   three-way fold read over two node-keyed journal events (`SignalAwaited{node,deadline}`
 >   · `SignalReceived{node,payload}`, both new variants ⇒ `FORMAT_VERSION` stays 1),
 >   **preceded by a terminal check**: a folded `NodeFailed` for this node returns `Failed`
