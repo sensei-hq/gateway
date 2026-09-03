@@ -369,7 +369,12 @@ at `now >= deadline`, so on a shipped `worker serve` the scheduler's wake IS the
 an SLA from this section therefore has to budget for "will a person answer AND will a drive occur
 before the deadline", not just the first half.
 
-**The mitigation belongs at the CLI boundary, and Task 12 owes it.** `torii run gate decide` must
+**The mitigation belongs at the CLI boundary, and Task 12 owes it — SHIPPED, and inherited rather
+than written:** once `signal_states` folds `LoopGateAwaited`, a loop gate reads as
+`SignalState::Awaiting { deadline }` and s2's existing arm refuses it, with
+`a_loop_gate_decision_exactly_at_the_deadline_is_refused` /
+`…_before_the_deadline_is_delivered` pinning both sides on this kind too.
+`torii run gate decide` must
 refuse to append a `LoopGateDecided` when the journaled `LoopGateAwaited.deadline` has already
 passed, so the operator gets a visible refusal instead of a success message followed by a durable row
 that kills their run. That is exactly what s2's `cmd::gate::decide` already does for `HumanGate`
@@ -460,11 +465,26 @@ and this slice's answer is yes.
     executor sink at all — the
     arm reads only `option` off `LoopGateDecided` — so it is owed by the writer that appends the
     event, i.e. **Task 12's `torii run gate decide`**, and is acceptance-tested there. §6 records
-    why it cannot be inherited from `cmd::gate::decide`'s existing actor handling.
+    why it cannot be inherited from `cmd::gate::decide`'s existing actor handling. **SHIPPED**
+    (`a_secret_shaped_actor_is_redacted_before_a_loop_gate_decision_is_journaled`), redact-then-cap
+    as `cmd::human::answer` does, with `Measured::AfterRedaction` so the growth explanation names a
+    transform the value really went through
+    (`a_loop_gate_actor_that_only_exceeds_the_cap_after_redaction_is_rejected`). The `HumanGate`
+    arm beside it keeps `AsGiven` and no scrub, which is the asymmetry §6 predicted.
 17. `torii run gate decide --node "{loop}/{i}/__gate__" --option <name>` decides a loop gate; a bad
     name recites the journaled menu; `run signal` and `run agent answer` refuse it, each naming the
-    verb that would work.
-18. `run list-paused` renders the loop gate's question and menu.
+    verb that would work. **SHIPPED.** `gate_menu` returns a `PublishedMenu::{Human,Loop}` and
+    everything up to the append is factored over the option NAMES; only the append itself branches,
+    because the two events are not interchangeable. Two additions the criterion does not state:
+    `--note` is REFUSED on a loop gate rather than dropped (the event has no note field), and the
+    verb refuses a decision at or after the journaled deadline, the guard §7 says Task 12 owes —
+    boundary pinned on both sides.
+18. `run list-paused` renders the loop gate's question and menu. **SHIPPED**, as the FOURTH
+    `AwaitingNode` shape: `options` and `question` both present, which is what tells a loop gate
+    from the other three. Additive for a `--json` consumer, because `options`-present ⇒
+    `gate decide` is evaluated first everywhere. A gate whose decision has been HONOURED
+    (`LoopGateSettled`) leaves the listing — without that, `run_loop` re-deriving every iteration's
+    gate leaves each decided one advertised for the life of the run.
 19. **Cross-process**: a loop gate awaited in one process, decided through `torii`, resumes and
     converges in another against a real Postgres.
 20. `FORMAT_VERSION` is still 1.

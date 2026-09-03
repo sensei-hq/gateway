@@ -1226,7 +1226,7 @@ Run: `cargo test -p sensei-orchestrator the_human_question_seam_composes_the_sam
 
 Expected: **all s3 human-agent tests still pass**, plus the new one. If any s3 test reddens, the extraction changed behaviour — fix the extraction, not the test.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
@@ -2712,7 +2712,7 @@ where the flag went.
 > are now the same type, so the shared path needs no `.map(Some)` and no per-kind branch for
 > attribution at all.
 
-- [ ] **Step 1: Write the failing tests (AC17, AC18)**
+- [x] **Step 1: Write the failing tests (AC17, AC18)**
 
 ```rust
 /// AC17 — `run gate decide` decides a LOOP gate at its synthetic path. The node does
@@ -2770,13 +2770,24 @@ async fn list_paused_renders_a_loop_gates_question_and_menu() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p sensei-torii -- loop_gate`
 
 Expected: **4 failures** — `decide` reports the node has not asked, because `gate_menu` reads only `GateAwaited`.
 
-- [ ] **Step 3: Implement**
+**AS BUILT: 13 failures, 237 passing.** The sketch's four grew to fourteen tests (see the
+deviation list at Step 3) and every one of them was red first, for one of four reasons:
+`not delivered: lp/0/__gate__ is not awaiting a decision` (`gate decide`), `not awaiting a
+signal` (`run signal`), `not awaiting a human answer` (`run agent answer`), and `no AWAITING
+block at all` (`list-paused`). One test — the settled-gate refusal — passed on its exit code
+alone before the implementation and was therefore NOT a test: it was re-keyed on the word
+`already completed`, which reddened it.
+
+The `--as` redaction and the blank-actor guard were red without a mutation, because both
+append sites were reached through a branch that did not exist yet.
+
+- [x] **Step 3: Implement**
 
 1. `gate_menu` returns an enum rather than `Option<Vec<GateOption>>`:
 
@@ -2816,11 +2827,59 @@ pub(crate) enum PublishedMenu {
    string, then assert the journaled `LoopGateDecided.actor` contains no plaintext. (Semgrep
    CWE-798 blocks a literal fixture — assemble it at runtime, as `cmd::human`'s tests do.)
 
-- [ ] **Step 4: Run to verify passing**
+**AS BUILT — five things this task did that the sketch above does not say, each because
+leaving it out would have shipped a defect the five items were silent about.**
+
+1. **`signal_states` folds `LoopGateSettled` as the node's terminal marker, not only
+   `LoopGateAwaited` as the precondition blockquote says.** The blockquote asserts "a settled
+   gate is one nobody is waiting on"; adding only the *Awaited* arm would have made that
+   sentence FALSE in the code. A loop gate journals no `NodeCompleted` and — unlike an
+   `AwaitSignal` — publishes nothing to the blackboard under its own id, so neither generic
+   completion marker fires for it, and `run_loop` re-derives iteration 0's gate on every
+   drive. Without this arm a ten-iteration loop advertises ten decided gates in
+   `list-paused` beside the one real ask, and `gate decide` accepts a second decision on each
+   of them that `run_human_loop_gate`'s step 1 will never read (it replays the SETTLEMENT and
+   does not re-read `LoopGateDecided`) while reporting it delivered. `LoopGateSettled` and not
+   `LoopGateDecided` is the marker for exactly that reason: a decision folds last-wins so an
+   operator can correct it *before the run resumes*, and the settlement is the line after
+   which "before" has passed. Guarded by `list_paused_does_not_name_a_settled_loop_gate` and
+   `a_decision_on_a_settled_loop_gate_is_refused`.
+2. **`--note` on a loop gate is REFUSED, not dropped.** `LoopGateDecided` is
+   `{node, option, actor}` — there is nowhere to put one — and silently discarding text an
+   operator believes was recorded is the defect class this slice keeps finding. Consequence
+   worth knowing: `gate reject --reason X` therefore cannot decide a loop gate even if its
+   menu happens to carry an option named `reject`, because `--reason` IS the note; the
+   refusal names `gate decide --option "reject"`, which works.
+3. **`actor_or_user` is applied inside `decide`** as well as at `dispatch`. The blockquote
+   says the loop branch "inherits this by staying inside that signature", which is true and
+   is not testable: nothing in the library could observe the resolver being skipped. Applying
+   it at the one point both append sites pass through makes the blank audit row unreachable
+   from the `pub` entry point too, and it is idempotent so an ordinary `--as alice` is
+   untouched. Pinned on BOTH kinds by `no_decision_can_journal_a_blank_actor`.
+4. **`list-paused` renders a loop gate as `(options, question)` BOTH present**, which is the
+   fourth `AwaitingNode` shape and the new discriminator. Three supporting changes:
+   `question_cell` took a `label` parameter so the tail-reserve logic is not duplicated;
+   `awaiting_nodes` now fills the two fields from ONE source per node in menu-first order (so
+   `(Some, Some)` means a loop gate BY CONSTRUCTION, not by convention, even for a
+   hand-written journal that published two asks at one id); and the agent header line is
+   keyed on `question.is_some() && options.is_none()`, because keying it on the question
+   alone advertised `run agent answer` — the one verb a loop gate refuses — to a fleet whose
+   only waiting node was one. Both of the latter two were correct-but-unguarded when written
+   and were mutation-proved: reverting each reddens
+   `list_paused_renders_a_loop_gates_question_and_menu` and
+   `list_paused_reads_a_node_with_two_asks_as_the_gate_the_refusals_do` respectively.
+5. **The `--json` shape is additive and the `options`-first rule is what makes it so.** A
+   loop gate serializes both keys; a script written against s2/s3 that tests `options` first
+   still builds the right command for one. A script that tested `question` first would now
+   reach for `agent answer`, so the precedence is stated on `AwaitingNode::options` rather
+   than left implicit.
+
+- [x] **Step 4: Run to verify passing**
 
 Run: `cargo test -p sensei-torii`
 
-Expected: **0 failed.**
+AS BUILT: 251 lib + 24 cli, **0 failed**; `cargo test --workspace` 1636 passing (1622 + 14),
+0 failed; `clippy --workspace --all-targets -D warnings` and `fmt --check` clean.
 
 - [ ] **Step 5: Commit**
 
