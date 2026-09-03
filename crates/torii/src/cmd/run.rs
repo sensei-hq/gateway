@@ -374,11 +374,17 @@ pub struct SignalStateAt {
 /// production boot always wires a `ContextStore`, so the first marker is always present
 /// in a real deployment.
 ///
-/// Deliberately conservative in ONE direction: if neither marker is present the node
-/// reads as still `Awaiting`. That errs toward delivering a signal that is redundant
-/// (harmless — last-wins) rather than toward reporting `already completed` for a node
-/// that is genuinely still waiting, which would strand a run on a human who was told
-/// their decision had already landed.
+/// **A LOOP gate is the exception to that paragraph and needs a marker of its own.** It
+/// journals no `NodeCompleted` either, and — unlike an `AwaitSignal` — it publishes
+/// nothing to the blackboard under its own id, so the `ContextWrite` marker never fires
+/// for it. `LoopGateSettled` is its completion event; see that arm for why the DECISION is
+/// deliberately not used in its place.
+///
+/// Deliberately conservative in ONE direction: if no marker is present the node reads as
+/// still `Awaiting`. That errs toward delivering a signal that is redundant (harmless —
+/// last-wins) rather than toward reporting `already completed` for a node that is
+/// genuinely still waiting, which would strand a run on a human who was told their
+/// decision had already landed.
 fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalStateAt> {
     let mut awaited: HashMap<NodeId, Option<DateTime<Utc>>> = HashMap::new();
     let mut terminal: HashMap<NodeId, (Seq, SignalState)> = HashMap::new();
@@ -420,6 +426,21 @@ fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalStateA
             JournalEvent::AgentAwaited { node, deadline, .. } => {
                 awaited.entry(node.clone()).or_insert(*deadline);
             }
+            // SP-6 s4: the FOURTH waiting kind, a `Loop` gate decided by a person. Same
+            // arm, same first-wins rule, same stakes as the three above — and here the
+            // stakes are at their highest, because the node's path is SYNTHESIZED
+            // (`"{loop}/{i}/__gate__"`) and appears in no graph, so this fold is the only
+            // thing in the system that can say a human is being waited on there.
+            //
+            // Without it the window the s4 plan's Task 12 precondition names is open: the
+            // executor arm is live, the run pauses, `list-paused` shows nothing, and the
+            // gate waits out its SLA and terminally fails the whole `Loop` with no
+            // operator recourse at all. It also gives `cmd::gate::decide` the DEADLINE it
+            // refuses a late decision against — `SignalState::Awaiting { deadline }` is
+            // where that guard reads it from, for this kind as for a `HumanGate`.
+            JournalEvent::LoopGateAwaited { node, deadline, .. } => {
+                awaited.entry(node.clone()).or_insert(*deadline);
+            }
             JournalEvent::NodeCompleted { node } => {
                 terminal.insert(node.clone(), (*seq, SignalState::Completed));
             }
@@ -428,6 +449,34 @@ fn signal_states(events: &[(Seq, JournalEvent)]) -> HashMap<NodeId, SignalStateA
             }
             JournalEvent::NodeSkipped { node } => {
                 terminal.insert(node.clone(), (*seq, SignalState::Skipped));
+            }
+            // A loop gate's completion marker, and it needs its own arm because neither of
+            // the two generic ones can see it: the kind journals no `NodeCompleted` (like
+            // `Branch`/`Subgraph`), and it publishes nothing to the blackboard under its
+            // own id, so the `ContextWrite` backstop below never fires for it either.
+            //
+            // `LoopGateSettled` is the right marker and `LoopGateDecided` is NOT, which is
+            // the whole subtlety. A decision folds LAST-wins precisely so an operator can
+            // correct it while the run is still paused; the SETTLEMENT is the line after
+            // which "before the run resumes" has passed — the drive read the answer,
+            // honoured it and spent an iteration on the strength of it, and
+            // `run_human_loop_gate`'s step 1 replays that option forever without
+            // re-reading the decision. So a settled gate is one nobody is waiting on: it
+            // must leave `list-paused`, and `cmd::gate::decide` must refuse a second
+            // decision that nothing will ever read rather than reporting it delivered.
+            //
+            // Without this arm iteration 0's gate stays `Awaiting` for the life of the
+            // run, because `run_loop` re-enters `for i in 0..max_iters` from zero on every
+            // drive and the `LoopGateAwaited` above is folded first-wins forever — so a
+            // ten-iteration loop would advertise ten decided gates beside the one real ask.
+            //
+            // `or_insert`, matching the inferred `ContextWrite` marker below rather than
+            // the three real terminal events above: a `NodeFailed` at this path (an
+            // expired gate, or a cascade skip) is the stronger statement and must win.
+            JournalEvent::LoopGateSettled { node, .. } => {
+                terminal
+                    .entry(node.clone())
+                    .or_insert((*seq, SignalState::Completed));
             }
             // The completion marker for the node kinds that journal no `NodeCompleted`.
             // `or_insert`, not `insert`: a real terminal event above is the stronger
@@ -498,15 +547,20 @@ pub(crate) fn signal_state_at(events: &[(Seq, JournalEvent)], node: &NodeId) -> 
 /// Every node in this run that is currently awaiting a human, in node-id order so the
 /// rendering is deterministic run to run.
 ///
-/// Covers ALL THREE waiting kinds, because [`signal_states`] folds all three `*Awaited`
-/// events: an `AwaitSignal`, a `HumanGate` and — since SP-6 s3 — a human-backed `Agent`.
+/// Covers ALL FOUR waiting kinds, because [`signal_states`] folds all four `*Awaited`
+/// events: an `AwaitSignal`, a `HumanGate`, a human-backed `Agent` (SP-6 s3) and a `Loop`'s
+/// human gate (SP-6 s4).
 ///
-/// **And it tells all three apart**, which is the point of carrying a menu and a question
-/// rather than only a node id: each kind takes a different verb and REFUSES the other two,
-/// so a listing that rendered them identically would send an operator to a refusal for a
-/// node they had correctly identified. `options` comes from `GateAwaited`, `question` from
-/// `AgentAwaited`, and an `AwaitSignal` has neither — the discriminator
-/// [`render::AwaitingNode::options`] documents for the `--json` path.
+/// **And it tells all four apart**, which is the point of carrying a menu and a question
+/// rather than only a node id: a listing that rendered them identically would send an
+/// operator to a refusal for a node they had correctly identified. `options` alone is a
+/// `HumanGate`, `question` alone a human-backed `Agent`, BOTH a loop gate, and neither an
+/// `AwaitSignal` — the discriminator [`render::AwaitingNode::options`] documents for the
+/// `--json` path.
+///
+/// Three kinds, three verbs, four rows: a loop gate takes the SAME `run gate decide` a
+/// `HumanGate` does, which is why the pair is a safe discriminator to add — an existing
+/// script that keyed on `options` first still builds the right command for it.
 ///
 /// The question is REDACTED here, once, so that every sink is covered by construction. See
 /// [`render::AwaitingNode::question`] for why that scrub belongs on this side and why the
@@ -547,12 +601,56 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
             acc
         });
 
+    // SP-6 s4's kind is the only one that publishes BOTH — a menu to pick from and the
+    // question the pick answers — and that pairing is what tells it apart downstream, so
+    // it is folded as one entry rather than into the two maps above. FIRST wins for the
+    // same reason both of those do.
+    //
+    // The question takes the SAME `redact_question` scrub an agent's does. The executor
+    // already scrubbed it before the `LoopGateAwaited` append, so this is a second pass and
+    // not the first — see [`render::AwaitingNode::question`] for why the second is still
+    // owed. The menu does NOT need one: `run_human_loop_gate` redacts the option names
+    // before publishing them (and refuses a menu redaction would make ambiguous), so the
+    // journaled names are the scrubbed ones and re-scrubbing here could only produce a
+    // vocabulary that differs from the one `gate decide` matches against.
+    let loop_gates: HashMap<NodeId, (Vec<String>, String)> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::LoopGateAwaited {
+                node, prompt, menu, ..
+            } => Some((node.clone(), (menu, prompt))),
+            _ => None,
+        })
+        .fold(HashMap::new(), |mut acc, (n, (menu, prompt))| {
+            acc.entry(n).or_insert_with(|| {
+                (
+                    menu.iter().map(|o| o.name.clone()).collect(),
+                    render::redact_question(prompt),
+                )
+            });
+            acc
+        });
+
     let mut out: Vec<render::AwaitingNode> = signal_states(events)
         .into_iter()
         .filter_map(|(node, st)| match st.state {
             SignalState::Awaiting { deadline } => {
-                let options = menus.get(&node).cloned();
-                let question = questions.get(&node).cloned();
+                // **Exactly one source per node, in the order every refusal path uses.**
+                // The three maps were consulted independently until s4, which was harmless
+                // while `options` and `question` came from mutually exclusive events — but
+                // s4 makes the PAIR the discriminator for a loop gate, so a node carrying
+                // both a `GateAwaited` and an `AgentAwaited` (impossible from the executor,
+                // reachable in a hand-written journal) would render as a third kind it is
+                // not. Falling through in menu-first order keeps such a node reading as the
+                // `HumanGate` the refusals already treat it as, and makes `(Some, Some)`
+                // mean a loop gate BY CONSTRUCTION rather than by convention.
+                let (options, question) = if let Some((menu, prompt)) = loop_gates.get(&node) {
+                    (Some(menu.clone()), Some(prompt.clone()))
+                } else if let Some(menu) = menus.get(&node) {
+                    (Some(menu.clone()), None)
+                } else {
+                    (None, questions.get(&node).cloned())
+                };
                 Some(render::AwaitingNode {
                     node,
                     deadline,
@@ -587,6 +685,11 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 /// durable row, it was capped by nothing while its neighbour was capped at 4096, and it
 /// is not display-only — the executor interpolates it into the rejection `NodeFailed`
 /// that `torii run status` renders and every later drive re-emits from the fold.
+///
+/// SP-6 s4 adds a third row to that list and no third number: `LoopGateDecided.actor`,
+/// written by the same `decide` through the same helper. It differs only in WHEN it is
+/// measured — after redaction, because unlike `GateDecided.actor` this one is scrubbed
+/// before the write, and the bytes bounded must be the bytes written.
 ///
 /// 4 KiB is the same boundary the executor already applies to a model call's inline
 /// output, so a journal row torii writes can never be larger than one the
@@ -854,13 +957,35 @@ pub async fn signal(
     // `GateAwaited`) — reaching the generic arm would refuse it as "not awaiting a
     // signal", which is true and useless: it sends an operator to check the node id when
     // the id was right and the COMMAND was wrong.
-    if crate::cmd::gate::gate_menu(&events, &node).is_some() {
-        return Ok(Outcome::precondition(format!(
-            "not delivered: {shown} is a HumanGate, not an AwaitSignal — it accepts a \
-             named option, not arbitrary JSON. Use: torii run gate decide {} --node \
-             {shown} --option <name>",
-            run.0
-        )));
+    //
+    // SP-6 s4 splits this arm in two. `gate_menu` now answers for BOTH menu-bearing kinds
+    // and says which published, because the refusal has to name what the node actually is:
+    // "a HumanGate" for a loop gate would be a confident lie about a node kind, on the one
+    // surface an operator uses to work out what they are looking at. The VERB is the same
+    // either way — the operator's vocabulary stays three commands, not four — so both arms
+    // point at `run gate decide`.
+    match crate::cmd::gate::gate_menu(&events, &node) {
+        Some(crate::cmd::gate::PublishedMenu::Human(_)) => {
+            return Ok(Outcome::precondition(format!(
+                "not delivered: {shown} is a HumanGate, not an AwaitSignal — it accepts a \
+                 named option, not arbitrary JSON. Use: torii run gate decide {} --node \
+                 {shown} --option <name>",
+                run.0
+            )));
+        }
+        // The same bypass, on the kind that cannot even be looked up in a graph. A loop
+        // gate's path is synthesized per iteration, so `SignalReceived` here would be
+        // journaled at a node whose only reader — `run_human_loop_gate` — reads
+        // `LoopGateDecided` and nothing else: never read, and reported as `signalled`.
+        Some(crate::cmd::gate::PublishedMenu::Loop(_)) => {
+            return Ok(Outcome::precondition(format!(
+                "not delivered: {shown} is a Loop's human gate, not an AwaitSignal — it \
+                 accepts one of the options it published, not arbitrary JSON. Use: torii \
+                 run gate decide {} --node {shown} --option <name>",
+                run.0
+            )));
+        }
+        None => {}
     }
 
     // SP-6 s3 AC7, the third arm of the same matrix. A human-backed `Agent` is answerable
@@ -1343,7 +1468,9 @@ pub(crate) mod tests {
     use super::*;
     // The `GateAwaited` fixtures live beside `cmd::gate`'s own tests — see that module's
     // doc comment for why the reuse runs in both directions.
-    use crate::cmd::gate::tests::{gate_journal, release};
+    use crate::cmd::gate::tests::{
+        LOOP_GATE_QUESTION, gate_journal, loop_gate, loop_gate_journal, release,
+    };
     // Likewise `cmd::human`'s `AgentAwaited` fixture: the listing tests must fold the SAME
     // shape the command that answers it folds, or the two drift silently.
     use crate::cmd::human::tests::{THE_QUESTION, agent_journal, agent_journal_asking, reviewer};
@@ -4919,5 +5046,180 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("--json emitted non-JSON {:?}: {e}", out.text));
         assert_eq!(v[0]["awaiting"][0]["node"], "gate");
         assert_eq!(v[0]["awaiting"][0]["deadline"], "1970-02-04T18:20:00Z");
+    }
+
+    // ---- SP-6 s4: the FOURTH waiting kind, a human-decided LOOP gate ------------------
+
+    /// AC17, the `run signal` corner of what is now a FOUR-way cross-refusal. A loop gate
+    /// is answerable only by `LoopGateDecided`, so a raw payload here would be journaled,
+    /// never read (`run_human_loop_gate` reads nothing else), and reported as delivered.
+    ///
+    /// Checked before `signal_state`, like both siblings: since this slice folds
+    /// `LoopGateAwaited`, a loop gate DOES read as `Awaiting`, so without its own arm the
+    /// generic path would not refuse this at all.
+    #[tokio::test]
+    async fn signal_on_a_loop_gate_is_refused_and_points_at_run_gate_decide() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+
+        let out = signal(&s, &j, run, loop_gate(), approved(), now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("run gate decide"),
+            "must name the verb that WOULD work: {}",
+            out.text
+        );
+        assert!(
+            journaled_signals(&j, run, &loop_gate()).await.is_empty(),
+            "a raw payload must never become a durable answer to a loop gate"
+        );
+        assert_eq!(
+            s.status(run).await.unwrap().unwrap().next_wake,
+            None,
+            "and must not queue a wake"
+        );
+    }
+
+    /// AC18 — the listing renders a loop gate's QUESTION and its MENU, so an operator sees
+    /// both what is being asked and what they may answer without reading a graph. There is
+    /// no graph to read: the node's path is synthesized per iteration, so the journal is
+    /// the only place either value exists.
+    ///
+    /// `signal_states`' `LoopGateAwaited` arm is the only thing that puts this kind in the
+    /// awaited set at all — without it the node never appears here, an operator cannot
+    /// decide what they cannot see, and the gate waits out its SLA and destroys the run.
+    #[tokio::test]
+    async fn list_paused_renders_a_loop_gates_question_and_menu() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        assert_eq!(out.code, EXIT_OK);
+        let row = awaiting_row(&out.text, run, "lp/0/__gate__");
+        assert!(
+            row.contains("revise") && row.contains("ship"),
+            "the menu must be shown so an operator knows the choices: {row}"
+        );
+        assert!(
+            row.contains(LOOP_GATE_QUESTION),
+            "…and the question, which is the whole of what is being decided: {row}"
+        );
+        assert!(
+            row.contains("loop gate:"),
+            "the row must name the KIND: a loop gate takes `gate decide`, and a row \
+             labelled `agent:` would send an operator to the one verb it refuses: {row}"
+        );
+        assert!(
+            out.text.contains("run gate decide"),
+            "the block must name the verb that works:\n{}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("run agent answer"),
+            "…and must NOT advertise the verb it refuses. A loop gate publishes a question, \
+             so keying the agent header on `question.is_some()` alone prints `an agent: row \
+             takes free text` for a fleet whose only waiting node takes no free text at \
+             all:\n{}",
+            out.text
+        );
+    }
+
+    /// One node, two asks — a `GateAwaited` and an `AgentAwaited` at the same id. The
+    /// executor cannot write that (they are different node kinds, each arm writes one
+    /// event), but a hand-written journal can, and SP-6 s4 gives the listing a reason to
+    /// care: `(options, question)` both `Some` is now what MEANS a loop gate, so a node
+    /// that set both by accident would render as a third kind it is not.
+    ///
+    /// It reads as the `HumanGate` every refusal path already treats it as, because
+    /// `awaiting_nodes` fills the two fields from ONE source per node in menu-first order —
+    /// the same order `cmd::run::signal` and `cmd::human::answer` check their refusals in.
+    /// A listing that disagreed with the refusals about a node's kind sends an operator to
+    /// a command that rejects them.
+    #[tokio::test]
+    async fn list_paused_reads_a_node_with_two_asks_as_the_gate_the_refusals_do() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship", "hold"]).await;
+        j.append(
+            run,
+            JournalEvent::AgentAwaited {
+                node: release(),
+                deadline: None,
+                prompt: THE_QUESTION.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let row = awaiting_row(&out.text, run, "release");
+        assert!(
+            row.contains("gate: ship|hold") && !row.contains("loop gate:"),
+            "menu-first: the same kind `cmd::run::signal` refuses it as: {row}"
+        );
+        assert!(
+            !row.contains(THE_QUESTION),
+            "…and it must not also carry the question, which is what would make the PAIR \
+             stop meaning `a loop gate`: {row}"
+        );
+    }
+
+    /// A SETTLED loop gate is one nobody is waiting on, and it must leave the listing.
+    ///
+    /// A `Loop` re-derives every iteration's gate on every drive and a loop gate journals
+    /// no `NodeCompleted` and writes no blackboard entry — so without `LoopGateSettled`
+    /// folding as this node's terminal marker, iteration 0's gate stays `Awaiting`
+    /// forever, and a ten-iteration loop ends up advertising ten decided gates beside the
+    /// one real ask. `LoopGateDecided` is deliberately NOT the marker: it folds last-wins
+    /// so an operator can correct a decision before the run resumes, and the settlement is
+    /// exactly the line after which "before" has passed.
+    #[tokio::test]
+    async fn list_paused_does_not_name_a_settled_loop_gate() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+        j.append(
+            run,
+            JournalEvent::LoopGateSettled {
+                node: loop_gate(),
+                option: "revise".into(),
+            },
+        )
+        .await
+        .unwrap();
+        // The NEXT iteration's gate — a different synthetic path — is the one genuinely
+        // waiting, and it must still be listed. Without it this test would also pass on a
+        // listing that had simply stopped rendering loop gates altogether.
+        let live = NodeId("lp/1/__gate__".into());
+        j.append(
+            run,
+            JournalEvent::LoopGateAwaited {
+                node: live.clone(),
+                deadline: None,
+                prompt: LOOP_GATE_QUESTION.to_string(),
+                menu: vec![orchestrator_core::LoopGateOption {
+                    name: "ship".into(),
+                    stops: true,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = list_paused(&s, &j, false).await.expect("lists");
+        let (_, block) = out.text.split_once("AWAITING").expect("an awaiting block");
+        assert!(
+            !block.contains("lp/0/__gate__"),
+            "a gate whose decision has been honoured is not awaiting anything:\n{block}"
+        );
+        assert!(
+            block.contains("lp/1/__gate__"),
+            "…while the iteration that IS asking must still be listed:\n{block}"
+        );
     }
 }
