@@ -185,6 +185,57 @@ impl Gateway {
             .min()
     }
 
+    /// The smallest `max_output_tokens` among a chain's models (read-only; the output
+    /// twin of [`Self::min_context_window`], folded the same way). `None` if the chain
+    /// is unknown or has no resolvable models.
+    ///
+    /// Added for the SP-DATA-5 budget clamp, which sets `max_tokens` on a budgeted
+    /// request from what the remaining budget affords. That number is a BUDGET figure
+    /// and knows nothing about the model: with a whole-run cap of 100k it can easily
+    /// exceed a model's own output limit, and the providers do not treat that kindly —
+    /// Anthropic rejects a `max_tokens` above the model's maximum with a 400, and the
+    /// adapters in this repo forward the value verbatim
+    /// (`cloud-providers/src/anthropic/mod.rs`, `gemini.rs`, `bedrock/mod.rs`,
+    /// `openai_compat/mod.rs`). So the clamp bounds itself by this before emitting.
+    ///
+    /// `min` over the chain rather than the selected model's own figure, for exactly the
+    /// reason `min_context_window` takes a `min`: the caller sets `max_tokens` before
+    /// selection, a request that fails over lands on a DIFFERENT entry, and a value the
+    /// fallback model would reject turns a survivable failover into a hard 400. The
+    /// smallest limit in the chain is the only one safe for every entry in it.
+    ///
+    /// **The cost of that `min` on a HETEROGENEOUS chain, stated plainly.** A budgeted
+    /// run on `[gpt-4o 16384, small-fallback 4096]` has its replies capped at 4096 on the
+    /// PRIMARY, from the very first call and however much budget remains — while the same
+    /// run unbudgeted sends `max_tokens: None` and, on an `openai_compat` router, gets the
+    /// selected model's own 16384. So this is a narrowing that is independent of how near
+    /// the cap the run is, which is a different effect from the clamp's "replies get
+    /// shorter as the budget runs down". Visible rather than silent (the clamp emits a
+    /// `tracing::info!` naming both bounds), and recorded in the clamp design's §6. The
+    /// alternative — bounding by the SELECTED model after selection — needs the clamp to
+    /// move downstream of the selector and is §8 work.
+    ///
+    /// **`Some(0)` is possible and is a config bug, not a limit.** One entry with
+    /// `max_output_tokens: 0` makes the whole chain's ceiling zero, and the budget clamp
+    /// would then emit `max_tokens: Some(0)` — "generate nothing" — on every budgeted
+    /// `Chat` call. `collect_validation_errors` rejects such a model, so it cannot arrive
+    /// through `GatewayBuilder::build`, `Gateway::try_new` or `try_update_config`; the
+    /// unchecked `Gateway::new` / `update_config` pair validate nothing by their own
+    /// documented design, so this is narrowed rather than made unrepresentable.
+    ///
+    /// Selection, gates and `execute` are untouched — this is a read of the same config
+    /// table they read.
+    pub async fn min_max_output_tokens(&self, chain: &str) -> Option<u32> {
+        let cfg = self.config.read().await;
+        let chain = cfg.chains.get(chain)?;
+        chain
+            .models
+            .iter()
+            .filter_map(|entry| cfg.models.get(&entry.model))
+            .map(|m| m.max_output_tokens)
+            .min()
+    }
+
     /// Attach a readiness probe (the local engine's provisioning supervisor).
     /// Builder-style, mirroring [`Self::with_store`]. When set, chain exhaustion
     /// consults the probe and degrades a still-provisioning candidate to a
@@ -492,6 +543,10 @@ mod min_window_tests {
     use std::collections::HashMap;
 
     fn model(id: &str, window: u32) -> ModelConfig {
+        model_with_output(id, window, 1024)
+    }
+
+    fn model_with_output(id: &str, window: u32, max_output_tokens: u32) -> ModelConfig {
         ModelConfig {
             id: id.into(),
             api_model_id: None,
@@ -499,14 +554,16 @@ mod min_window_tests {
             family: None,
             capabilities: vec![Capability::TextChat],
             context_window: window,
-            max_output_tokens: 1024,
+            max_output_tokens,
             pricing: None,
             catalog: None,
         }
     }
 
-    #[tokio::test]
-    async fn min_context_window_is_the_smallest_model_in_the_chain() {
+    /// Build a two-model chain `"c"` from a pair of `ModelConfig`s, for the two
+    /// chain-wide `min` accessors below. Factored out so they cannot drift apart on
+    /// topology and disagree for a reason that has nothing to do with what they read.
+    fn two_model_chain(a: ModelConfig, b: ModelConfig) -> GatewayConfig {
         let mut routers = HashMap::new();
         routers.insert(
             "r".into(),
@@ -519,42 +576,72 @@ mod min_window_tests {
                 headers: HashMap::new(),
             },
         );
+        let entries = vec![
+            ChainEntry {
+                model: a.id.clone(),
+                router: Some("r".into()),
+                api_model_id: None,
+                priority: 1,
+            },
+            ChainEntry {
+                model: b.id.clone(),
+                router: Some("r".into()),
+                api_model_id: None,
+                priority: 2,
+            },
+        ];
         let mut models = HashMap::new();
-        models.insert("big".into(), model("big", 200_000));
-        models.insert("small".into(), model("small", 8_000));
+        models.insert(a.id.clone(), a);
+        models.insert(b.id.clone(), b);
         let mut chains = HashMap::new();
         chains.insert(
             "c".into(),
             FallbackChainConfig {
                 id: "c".into(),
                 capability: Capability::TextChat,
-                models: vec![
-                    ChainEntry {
-                        model: "big".into(),
-                        router: Some("r".into()),
-                        api_model_id: None,
-                        priority: 1,
-                    },
-                    ChainEntry {
-                        model: "small".into(),
-                        router: Some("r".into()),
-                        api_model_id: None,
-                        priority: 2,
-                    },
-                ],
+                models: entries,
                 fallback_triggers: Vec::new(),
             },
         );
-        let config = GatewayConfig {
+        GatewayConfig {
             routers,
             models,
             chains,
             constraints: Default::default(),
             panels: Default::default(),
             consensus: Default::default(),
-        };
+        }
+    }
+
+    /// The output twin of `min_context_window`, and the SP-DATA-5 clamp's ceiling.
+    ///
+    /// `min` over the chain rather than the selected model's own figure, for the same
+    /// reason the window accessor takes a `min`: the caller does not know which entry
+    /// the request will land on, and a fallback to the smaller model must not carry a
+    /// `max_tokens` that model would reject.
+    ///
+    /// The unknown-chain leg is asserted too, because it is the leg the clamp treats as
+    /// "no ceiling from here" — a `Some(0)` or a panic there would silently refuse or
+    /// truncate every budgeted call on an unregistered chain.
+    #[tokio::test]
+    async fn min_max_output_tokens_is_the_smallest_output_limit_in_the_chain() {
         let gw = Gateway::new(
-            config,
+            two_model_chain(
+                model_with_output("big", 200_000, 8_192),
+                model_with_output("small", 8_000, 4_096),
+            ),
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+
+        assert_eq!(gw.min_max_output_tokens("c").await, Some(4_096));
+        assert_eq!(gw.min_max_output_tokens("nope").await, None);
+    }
+
+    #[tokio::test]
+    async fn min_context_window_is_the_smallest_model_in_the_chain() {
+        let gw = Gateway::new(
+            two_model_chain(model("big", 200_000), model("small", 8_000)),
             AdapterRegistry::new(),
             CircuitBreakerManager::new(CircuitBreakerConfig::default()),
         );

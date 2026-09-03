@@ -20,7 +20,7 @@ pub mod redact;
 pub mod registry;
 pub mod scheduler;
 
-pub use budget::{TokenBudget, TokenUsage};
+pub use budget::{MIN_OUTPUT_TOKENS, TokenBudget, TokenUsage};
 pub use clock::{Clock, SystemClock};
 pub use content::{ContentRef, ContentStore, Digest, EffectOutput, digest_of};
 pub use context::{ContextKey, ContextRef, ContextStore, Scope};

@@ -85,7 +85,8 @@ let config = GatewayBuilder::new()
 ```
 
 `build()` (and `Gateway::try_new`) reject: no routers, empty router URLs, a chain
-referencing an unknown model, and a model whose `provider` has no router.
+referencing an unknown model, a model whose `provider` has no router, and a model whose
+`max_output_tokens` is 0.
 
 ## Load from JSON instead
 

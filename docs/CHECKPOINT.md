@@ -1,39 +1,48 @@
 # Checkpoint
 
-**Slice: SP-6 s4 — the human loop gate. COMPLETE.** All 14 tasks, the whole-slice review's 24
-findings, and the release gate are closed. Everything through SP-6 s3 is on `main` (PR #49,
-`78c5138`); `develop` is ahead by this slice and is **unpushed — the coordinator pushes**.
-The sensei daemon is NOT running, so this file is the only durable record of this gate.
+**Slice: SP-DATA-5 follow-on — the budget clamp. COMPLETE, reviewed, pushed.** PR #51 is open
+against `main` and awaiting the mandatory human review. Next action: merge it.
 
-## Shipped — `GateSpec::Human { agent, menu }`, the FOURTH waiting kind
+## Done
 
-A `Loop` whose stop decision a person makes, from a graph-level menu, once per iteration, at the
-reserved `"{loop}/{i}/__gate__"` path. Three new journal variants (`LoopGateAwaited` FIRST-wins,
-`LoopGateDecided` LAST-wins, `LoopGateSettled` FIRST-wins) ⇒ `FORMAT_VERSION` stays 1.
-`validate_dag` rejects a menu that can never converge and now bans a bare
-`__plan__`/`__gate__`/`__select__` node id at every depth. Operator surface: `torii run gate
-decide --node "{loop}/{i}/__gate__" --option <name>`; `run signal`/`run agent answer` refuse it.
+A budgeted `Chat` carries `max_tokens = min(remaining − est_input, the chain's smallest
+max_output_tokens, the chain's context window − est_input, the caller's own)`, set at the single
+`dispatch_metered` chokepoint, so the PROVIDER enforces the cap rather than our arithmetic. Below a
+`MIN_OUTPUT_TOKENS` (256) allowance the run refuses through the existing durable pause and makes
+**no call at all**. Unbudgeted runs byte-identical. **The claim this slice does NOT make:** the
+overshoot is **bounded by the input-estimate error, biased toward refusing early — NOT eliminated**.
 
-## Release gate — measured, real exit codes
+## The whole-slice review (`/sensei:review`) — 4 HIGH, 6 MEDIUM, all fixed
 
-- DB-free `cargo test --workspace`: **1658 passed / 0 failed / 56 ignored**, exit 0.
-  `clippy --workspace --all-targets -D warnings` exit 0; `fmt --all --check` exit 0.
-- Against a throwaway `postgres:16` on **55432** (schema from `database/_apply_all.sql`;
-  container removed, port free): workspace **1707/0/7** (the 7 are live-provider tests, no DB
-  test among them) · `orchestrator --features postgres-tests` **406/0/0** · `orchestrator-store
-  --features postgres` **69/0/0** · `torii --test e2e_pg` **8/0/0**. **0 ignored in every DB
-  suite.**
-- `cargo doc --workspace --no-deps --document-private-items`: **16** unresolved links on a
-  forced full re-document of all 11 crates — exactly the baseline, no new broken links.
+Five parallel adversarial lenses. Security returned NO FINDINGS; the sensei daemon was down so every
+MCP check was NOT RUN and fell back to git/grep.
 
-## Docs swept
+- `b22cce2` **A** — the ceiling bounded OUTPUT but not the CONTEXT WINDOW, so a long-prompt call that
+  succeeds unbudgeted hard-FAILED once a budget was set, as `NodeFailed` (unrecoverable by `wake`).
+  Plus two coverage holes: the clamp was unobserved on the AGENT and SELECTOR paths, and the
+  estimate's `system`/`tools` terms were unwired at the call site — both mutations reddened nothing.
+- `210d098` **B** — the floor's recommended raise went stale (a sibling spends after the pause, since
+  `drive` does not stop at one), and the follow-up `Spent` message named no figure at all. Now stated
+  as headroom above FINAL spend.
+- `d19f2bf` **C** — six doc surfaces still describing the pre-clamp contract, incl. a config
+  reference claiming to list "all" validation rules while listing 4 of 5, and the fence census
+  saying 3 `input_hash` call sites where there are 5.
 
-The overview s4 entry gained the menu-redaction leak, the §5.8 shared-path changes and the
-missing "human at the other four refused positions" carry-forward; `agents-skills-tools.md`
-gained s4's second use site for a human-backed role (and `run_agent` → `drive_agent`, a
-function that does not exist); `execution-graph.md` scopes "top-level only" to the NODE KIND;
-`durable-executor.md` no longer lists SP-6 or the SP-DATA-3 scheduler as unbuilt.
+## Verified at `d19f2bf` — real exit codes
 
-**Remaining: none. Known-broken: none.** Next: the coordinator pushes `develop`, then opens the
-develop→main PR — `main`'s ruleset is strict, so merge `origin/main` into `develop` first or
-the PR sits BEHIND and cannot land.
+`cargo test --workspace` **1686 passed / 0 failed / 56 ignored, exit 0** · `clippy --workspace
+--all-targets -- -D warnings` **exit 0** · `fmt --all --check` **exit 0** · `cargo doc` unresolved
+links **16**, the baseline. No database started; `$DATABASE_URL` never read.
+
+## Next command
+
+`gh pr merge 51 --merge`, then `git merge origin/main && git push origin develop`.
+
+## Known-broken / open
+
+Nothing broken. **One PRE-EXISTING flake, NOT a regression:**
+`a_backgrounded_straggler_is_reaped_on_clean_exit` (SP-4 sandbox) failed 1 of 6 runs on its 5s wall
+bound, 0 of 10 in isolation, 0 in CI; wants a wider bound or an injected clock, not a retry wrapper.
+Known gap written into the new code rather than hidden: when the WINDOW is the binding term, the
+refusal still reads as a budget problem and names a raise that cannot help. **The sensei daemon is
+not running, so this file is the only durable record.**
