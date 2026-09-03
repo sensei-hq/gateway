@@ -32,7 +32,9 @@
 //! Map child's `MapChildPaused`).
 
 use gateway::GatewayError;
-use kernel::types::request::{InferenceRequest, InferenceResponse};
+use kernel::types::request::{
+    InferenceRequest, InferenceResponse, Message, Payload, ToolDefinition,
+};
 use orchestrator_core::{JournalEvent, NodeId, OrchestratorError, RunId};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -133,6 +135,34 @@ impl<'a> Meter<'a> {
     }
 }
 
+/// The pessimistic input estimate over everything the provider will be sent: the system
+/// prompt, every message body, and the tool schemas.
+///
+/// Tool schemas are counted rather than waved off as small for two reasons. They are pure
+/// JSON, which is the worst case for a chars-per-token heuristic and the reason
+/// [`est_tokens_pessimistic`](crate::agent::prompt::est_tokens_pessimistic) exists at all;
+/// and an agent's activated schemas routinely outweigh its prompt. `over_budget` already
+/// counts them, for the same reason, and is the reference this mirrors — including its
+/// treatment of `description` as optional.
+///
+/// Deliberately NOT shared with `over_budget`/`est_prompt_tokens`: those answer "will this
+/// fit the context window", which wants to avoid false alarms and so wants the opposite
+/// bias. One function cannot serve both, and merging them would silently change a
+/// window-fit behaviour this slice has no business touching.
+fn est_input_tokens(system: Option<&str>, messages: &[Message], tools: &[ToolDefinition]) -> u64 {
+    let est = |s: &str| crate::agent::prompt::est_tokens_pessimistic(s) as u64;
+    let mut total = system.map_or(0, est);
+    for m in messages {
+        total += est(m.content.as_text());
+    }
+    for t in tools {
+        total += est(&t.name)
+            + t.description.as_deref().map_or(0, est)
+            + est(&t.input_schema.to_string());
+    }
+    total
+}
+
 /// Why a metered dispatch refused to run. Constructed ONLY by
 /// [`Executor::dispatch_metered`] and consumed ONLY by
 /// [`Executor::record_refusal`] — a producer never invents or interprets one.
@@ -200,6 +230,89 @@ impl Executor {
         {
             return Ok(Err(Refusal::BudgetExhausted { spent, budget: cap }));
         }
+        // The SP-DATA-5 clamp. The gate immediately above is a FLOOR-TRIGGER — it
+        // refuses only once `spent` has ALREADY passed the cap — so without this a
+        // single call can overshoot, and it is bounded by nothing but whatever the
+        // provider's default output limit happens to be. Setting `max_tokens` moves
+        // enforcement of that last call from our arithmetic to the provider's: it
+        // CANNOT return more output than the remaining budget affords.
+        //
+        // What this does NOT do is eliminate the overshoot, and the distinction is the
+        // whole reason the design argues for a pessimistic estimate. With
+        // `max_tokens = remaining − est_input`, the real total is
+        // `actual_input + output ≤ actual_input + (remaining − est_input)`, which
+        // exceeds `remaining` by exactly `actual_input − est_input`. So the residual is
+        // the ESTIMATE's error, biased toward refusing early because
+        // `est_tokens_pessimistic` over-counts on the JSON-heavy prompts this
+        // orchestrator actually sends. Bounded and biased safe, not zero.
+        //
+        // Only for a budgeted run, and only for `Chat`: `Embed`/`Stt` have no
+        // `max_tokens` to set, so they fall through to the pre-existing floor-trigger
+        // behaviour unchanged. `budget: None` never even computes the estimate — the
+        // additivity guarantee the whole pre-SP-DATA-5 suite rests on.
+        //
+        // The request is CLONED and the clone modified: `dispatch_metered` takes a
+        // `&InferenceRequest` and the caller's copy must not change under it. That is
+        // safe for the memo fence because `input_hash` covers the SEMANTIC inputs
+        // (`{chain, system, user}` — see `support::input_hash` and its callers), not
+        // `max_tokens`, so a call whose clamp differs between drives still hashes
+        // identically and replays from its memo rather than raising
+        // `DeterminismViolation`.
+        let clamped;
+        let request = match (meter.budget(), &request.payload) {
+            (
+                Some(cap),
+                Payload::Chat {
+                    system,
+                    messages,
+                    tools,
+                    ..
+                },
+            ) => {
+                let est = est_input_tokens(system.as_deref(), messages, tools);
+                // `cap - spent` cannot underflow: the gate three lines up returned when
+                // `spent >= cap`, reading the same two values. It is left as a plain
+                // subtraction deliberately — that gate is the ONLY thing keeping it
+                // safe, and a `saturating_sub` here would silently absorb the bug if
+                // the gate were ever removed or reordered instead of panicking on it
+                // (`a_fresh_budgeted_run_pauses_mid_drive_after_one_call` is what
+                // catches that, with "attempt to subtract with overflow").
+                //
+                // `saturating_sub` on the ESTIMATE is a different matter and is
+                // load-bearing: `est` genuinely can exceed what is left, and a plain
+                // subtraction there would wrap to an enormous allowance — a clamp WIDER
+                // than the cap, which is worse than no clamp at all.
+                let allowance = (cap - spent).saturating_sub(est);
+                if allowance < orchestrator_core::MIN_OUTPUT_TOKENS {
+                    // Below the floor, refuse rather than clamp — and refuse BEFORE the
+                    // call, so no input tokens are spent on a reply that would arrive
+                    // truncated mid-sentence and flow downstream as work product. This
+                    // is the EXISTING durable pause, not a new refusal kind: the
+                    // operator's recovery (`torii run wake --budget-tokens N`) is
+                    // already built and already documented.
+                    return Ok(Err(Refusal::BudgetExhausted { spent, budget: cap }));
+                }
+                let mut r = request.clone();
+                if let Payload::Chat { max_tokens, .. } = &mut r.payload {
+                    // NEVER widen: a caller's own limit wins whenever it is lower. A
+                    // clamp that could RAISE a caller's ceiling is the same defect as a
+                    // tool that supplies argv and thereby widens its own sandbox policy,
+                    // which SP-4 s4 spent a slice ruling out. Every orchestrator
+                    // producer passes `None` today, so this guards a future caller
+                    // rather than a present one.
+                    //
+                    // `u32::MAX` on an allowance too large for the `u32` field is the
+                    // safe saturation: it is a ceiling of "no lower than the provider's
+                    // own default", and a budget with more than 4 billion tokens left is
+                    // not the case this exists to constrain.
+                    let want = u32::try_from(allowance).unwrap_or(u32::MAX);
+                    *max_tokens = Some(max_tokens.map_or(want, |caller| caller.min(want)));
+                }
+                clamped = r;
+                &clamped
+            }
+            _ => request,
+        };
         let response = self.gateway.execute(request).await?;
         let Some(usage) = &response.usage else {
             if meter.budget().is_some() {
