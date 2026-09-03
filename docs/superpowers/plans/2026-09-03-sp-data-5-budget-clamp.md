@@ -61,7 +61,7 @@
 - Modify: `crates/orchestrator-core/src/budget.rs`
 - Modify: `crates/orchestrator-core/src/lib.rs` (re-export)
 
-- [ ] **Step 1: Add the constant**
+- [x] **Step 1: Add the constant**
 
 Append to `budget.rs`, after `TokenUsage`:
 
@@ -81,17 +81,17 @@ Append to `budget.rs`, after `TokenUsage`:
 pub const MIN_OUTPUT_TOKENS: u64 = 256;
 ```
 
-- [ ] **Step 2: Re-export**
+- [x] **Step 2: Re-export**
 
 In `crates/orchestrator-core/src/lib.rs`, find the `pub use budget::{...}` list and add
 `MIN_OUTPUT_TOKENS`, keeping the existing ordering.
 
-- [ ] **Step 3: Verify it compiles**
+- [x] **Step 3: Verify it compiles**
 
 Run: `cargo build -p sensei-orchestrator-core > /tmp/t1.log 2>&1; echo "exit=$?"`
 Expected: `exit=0`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
@@ -113,7 +113,7 @@ flows downstream as work product with no signal it was cut short."
 Every later task's assertions need this. `LatencyMeteredAdapter` logs only `(model, prompt)`, so
 today no test can see the clamp.
 
-- [ ] **Step 1: Add the adapter**
+- [x] **Step 1: Add the adapter**
 
 Add to `test_support.rs`, beside `LatencyMeteredAdapter`:
 
@@ -191,12 +191,12 @@ pub async fn clamp_observing_gateway(
 Check the imports already in `test_support.rs` (`Arc`, `Mutex`, `TokenUsage`, `ChatRequest`,
 `ChatResponse`, `RouterConfig`, `Model`, `ChatModel`, `async_trait`) and add only what is missing.
 
-- [ ] **Step 2: Verify it compiles**
+- [x] **Step 2: Verify it compiles**
 
 Run: `cargo build -p sensei-orchestrator --all-targets > /tmp/t2.log 2>&1; echo "exit=$?"`
 Expected: `exit=0`. If `clippy` later flags the struct as unused, that resolves in Task 4.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 cargo fmt --all
@@ -218,7 +218,7 @@ about a number we made up."
 - Modify: `crates/orchestrator/src/agent/prompt.rs`
 - Test: `crates/orchestrator/src/agent/prompt.rs` (its existing inline test module)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// AC8 — the budget estimate is never below the window-fit one, on prose AND on the
@@ -254,12 +254,12 @@ fn the_pessimistic_estimate_of_nothing_is_zero() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p sensei-orchestrator est_tokens_pessimistic > /tmp/t3.log 2>&1; echo "exit=$?"; tail -20 /tmp/t3.log`
 Expected: a COMPILE ERROR — `cannot find function est_tokens_pessimistic`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to `prompt.rs`, immediately after `est_tokens`:
 
@@ -293,18 +293,18 @@ harmless for `est_tokens`'s caller, "a window-fit check that logs and proceeds".
 makes the stronger and true argument instead: the two estimates want OPPOSITE biases, since an
 over-count halts a turn that would have fitted while an under-count overspends.
 
-- [ ] **Step 4: Run to verify passing**
+- [x] **Step 4: Run to verify passing**
 
 Run: `cargo test -p sensei-orchestrator est_tokens_pessimistic > /tmp/t3b.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t3b.log`
 Expected: `exit=0`, 2 passed.
 
-- [ ] **Step 5: Confirm the window-fit path is untouched (AC9)**
+- [x] **Step 5: Confirm the window-fit path is untouched (AC9)**
 
 Run: `cargo test -p sensei-orchestrator over_budget > /tmp/t3c.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t3c.log`
 Expected: `exit=0`, the existing tests pass **unmodified**. If you changed `est_tokens` or
 `over_budget`, revert — this task adds a function, it does not alter one.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
@@ -331,7 +331,7 @@ cannot silently move the budget's floor."
 - Modify: `crates/orchestrator/src/executor/dispatch.rs:186-217` (`dispatch_metered`)
 - Test: `crates/orchestrator/src/executor/tests.rs`
 
-- [ ] **Step 1: Write the failing tests (AC1, AC2)**
+- [x] **Step 1: Write the failing tests (AC1, AC2)**
 
 Add a `mod budget_clamp` to `tests.rs`, next to the existing budget tests:
 
@@ -388,14 +388,14 @@ async fn an_unbudgeted_call_is_not_clamped() {
 Check the real names of `run_started_with_budget` and `two_node_graph` in `tests.rs` and use what
 is actually there — these are the helpers the existing budget tests use.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p sensei-orchestrator budget_clamp > /tmp/t4.log 2>&1; echo "exit=$?"; tail -25 /tmp/t4.log`
 Expected: `a_budgeted_call_reaches_the_provider_clamped` FAILS — `every budgeted call carries a
 clamp: [None, None]`. `an_unbudgeted_call_is_not_clamped` passes already; that is correct, it is a
 regression guard, not a red test.
 
-- [ ] **Step 3: Implement the clamp**
+- [x] **Step 3: Implement the clamp**
 
 In `dispatch_metered`, replace the line `let response = self.gateway.execute(request).await?;` with
 the block below. **The shipped version differs in two ways the whole-slice review forced** — it
@@ -474,12 +474,12 @@ fn est_input_tokens(
 Check `ToolDefinition`'s real field names in `crates/kernel/src/types/request.rs` and match them —
 `over_budget` in `prompt.rs` already does this and is the reference.
 
-- [ ] **Step 4: Run to verify passing**
+- [x] **Step 4: Run to verify passing**
 
 Run: `cargo test -p sensei-orchestrator budget_clamp > /tmp/t4b.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t4b.log`
 Expected: `exit=0`, 2 passed.
 
-- [ ] **Step 5: Run the whole suite — the existing budget tests are the real gate**
+- [x] **Step 5: Run the whole suite — the existing budget tests are the real gate**
 
 Run: `cargo test --workspace > /tmp/t4c.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t4c.log | tail -3`
 
@@ -517,7 +517,7 @@ The only payload the clamp skips is a non-`Chat` one, so **Task 6's
 `a_non_chat_payload_is_gated_but_not_clamped` should carry that guard**: land an `Embed` dispatch
 exactly on the cap and mutation-check `>=` → `>` there.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
@@ -546,7 +546,7 @@ site passes None today, so that guards a future caller."
 The refusal shipped in Task 4's code. This task proves it, including the part most likely to be
 silently wrong.
 
-- [ ] **Step 1: Write the failing tests (AC4, AC5)**
+- [x] **Step 1: Write the failing tests (AC4, AC5)**
 
 ```rust
 /// AC4 — below the floor the gate refuses, and **makes no gateway call**. Asserted on
@@ -601,13 +601,13 @@ async fn an_estimate_larger_than_the_budget_does_not_wrap() {
 }
 ```
 
-- [ ] **Step 2: Run**
+- [x] **Step 2: Run**
 
 Run: `cargo test -p sensei-orchestrator -- below_the_floor an_estimate_larger > /tmp/t5.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t5.log`
 Expected: `exit=0`, 2 passed — Task 4 implemented both behaviours. **A green first run is
 acceptable here only because Step 3 proves the tests are not vacuous.**
 
-- [ ] **Step 3: Mutation-prove both**
+- [x] **Step 3: Mutation-prove both**
 
 Each mutation applied to `dispatch.rs`, run, then **reverted**. Confirm the tree is clean with
 `git status -s` afterwards.
@@ -621,7 +621,7 @@ Run each as: `cargo test -p sensei-orchestrator -- below_the_floor an_estimate_l
 Expected under each mutation: `exit=101`. Quote the failure. If a mutation leaves the suite green,
 the test is not guarding what it claims — fix it before continuing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
@@ -645,7 +645,7 @@ than the cap, worse than no clamp at all. Both proven by mutation."
 **Files:**
 - Test: `crates/orchestrator/src/executor/tests.rs`
 
-- [ ] **Step 1: Write the tests (AC3, AC6)**
+- [x] **Step 1: Write the tests (AC3, AC6)**
 
 AC3 needs a caller-supplied `max_tokens`, which no orchestrator site sets — so test
 `dispatch_metered` directly rather than through `start`. Find how the existing budget tests
@@ -697,17 +697,17 @@ the natural home for that boundary: dispatch an `Embed` with the meter sitting e
 assert it is refused, and mutation-check `spent >= cap` → `spent > cap` reddens it. Without that,
 the `>=` boundary ships unguarded for the first time since it was pinned.
 
-- [ ] **Step 2: Run to verify failure, then implement if needed**
+- [x] **Step 2: Run to verify failure, then implement if needed**
 
 Run: `cargo test -p sensei-orchestrator -- never_widened non_chat_payload > /tmp/t6.log 2>&1; echo "exit=$?"; tail -20 /tmp/t6.log`
 Task 4's code should satisfy both. If either fails, fix `dispatch.rs`.
 
-- [ ] **Step 3: Mutation-prove the `min`**
+- [x] **Step 3: Mutation-prove the `min`**
 
 Mutate `caller.min(want)` → `caller.max(want)`, run, confirm
 `a_callers_max_tokens_is_never_widened` reddens, revert. Quote the failure.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
@@ -731,7 +731,7 @@ floor-trigger gate still applies."
 The precondition Task 4's comment leans on. If it is ever false, every budgeted resume becomes a
 hard halt — so it gets a test rather than a comment.
 
-- [ ] **Step 1: Write the test (AC13)**
+- [x] **Step 1: Write the test (AC13)**
 
 ```rust
 /// AC13 — a clamped call replays from its memo on resume even though the clamp VALUE
@@ -776,19 +776,49 @@ async fn a_clamped_call_replays_from_its_memo_when_the_budget_moved() {
 
 Check the real name of the `BudgetRaised` helper in `tests.rs` and use it.
 
-- [ ] **Step 2: Run**
+**Three corrections applied when this task shipped. Read the source, not the sketch above.**
+
+1. *There is no `BudgetRaised` helper and the shipped test does not add one* —
+   `JournalEvent::BudgetRaised { new_total_tokens }` is appended inline. A one-line helper with a
+   single caller is noise beside `run_started_with_budget`, which has thirty.
+2. *The sketch's fixture cannot observe the property it claims to test.* `50_000` raised to
+   `500_000` puts BOTH drives far above the fixture chain's `FIXTURE_MAX_OUTPUT_TOKENS` of 1024, so
+   the model ceiling — not the budget — binds the clamp on both, the emitted `max_tokens` is 1024
+   either way, and "the clamp VALUE differs between drives" is simply false of that run. The
+   shipped fixture keeps the budget binding on both drives (cap 500 raised to 900, allowances 499
+   and 589) and ASSERTS both values, so the premise is checked rather than assumed.
+3. *A run that merely completes and is re-driven proves less than it looks.* With nothing left to
+   dispatch, "no new provider call" is also what a run that never resumed at all would show. The
+   shipped fixture stops the first drive HALF-WAY — `n1` completes, `n2` falls under the floor —
+   so the second drive must replay `n1` from its memo AND dispatch `n2` live, and the call log
+   tells the two apart.
+
+- [x] **Step 2: Run**
 
 Run: `cargo test -p sensei-orchestrator a_clamped_call_replays > /tmp/t7.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t7.log`
 Expected: `exit=0`, 1 passed.
 
-- [ ] **Step 3: Prove it is a real guard**
+- [x] **Step 3: Prove it is a real guard**
 
 In `support::input_hash`'s caller, temporarily add `max_tokens` to the hashed JSON. Re-run:
 the test must FAIL with `DeterminismViolation`. Revert; confirm `git status -s` is clean.
 
 If it does NOT fail, the test is not exercising resume — fix it before continuing.
 
-- [ ] **Step 4: Commit**
+**This step as written is a FALSE-NEGATIVE trap, and the mutation shipped differently.** At the
+`ModelCall` site the memo check runs strictly UPSTREAM of the clamp, and `build_request` sets
+`max_tokens: None` there — the clamp is applied later, inside `dispatch_metered`, on a clone. So
+"add `max_tokens` to the hashed JSON" would hash `None` on both drives, the test would stay GREEN,
+and the natural reading of that is "the guard is fine" when nothing was actually tested. Worth
+recording as a structural fact: no change confined to `input_hash` or its callers can fold the
+clamp into the fence, because the clamp does not exist yet at that point in the call.
+
+The mutation that does bite recomputes the clamp at the hash site — in `run_node`'s `ModelCall`
+arm, `input_hash(chain, &json!({"payload": payload, "max_tokens": <the clamp>}))` with the clamp
+as `min(fold.budget() − fold.spent() − est_tokens_pessimistic(prompt), 1024)`. Under it the test
+fails with `resumes: DeterminismViolation { node: NodeId("n1"), effect_id: ... }`.
+
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
@@ -809,7 +839,7 @@ a hard halt. Proven by doing exactly that and watching this redden."
 - Modify: `crates/orchestrator/src/executor/dispatch.rs`
 - Test: `crates/orchestrator/src/executor/tests.rs`
 
-- [ ] **Step 1: Write the test (AC7)**
+- [x] **Step 1: Write the test (AC7)**
 
 ```rust
 /// AC7 — the spec's §4 claim, asserted as arithmetic rather than prose: a budgeted run's
@@ -845,7 +875,7 @@ async fn a_budgeted_run_does_not_overshoot_beyond_the_estimate_error() {
 Write `total_spend_from_journal` as a local helper summing `EffectRecorded.usage.total_tokens`,
 or reuse whatever the existing budget tests already use for this — check first.
 
-- [ ] **Step 2: Add the two signals (AC10, AC11)**
+- [x] **Step 2: Add the two signals (AC10, AC11)**
 
 In `dispatch_metered`, after `let Some(usage) = &response.usage else { … };` and before
 `meter.record(...)`:
@@ -883,12 +913,41 @@ In `dispatch_metered`, after `let Some(usage) = &response.usage else { … };` a
 This needs `clamp_applied: Option<u64>` and `est_used: u64` bound in the clamp block from Task 4 —
 extend that block to set them (`None`/`0` on the unbudgeted and non-`Chat` paths).
 
-- [ ] **Step 3: Run**
+**Three corrections applied when this task shipped. Read the source, not the sketch above.**
+
+1. *One `Option<ClampRecord>`, not two loose locals.* The three numbers are only ever meaningful
+   together — `emitted` alone cannot say whether the budget or the model's limit produced it, and
+   `est_input` alone cannot say whether an estimate was made at all — and a single `Option` makes
+   "all three or none" a type-level fact rather than a convention. `est_used: u64` defaulting to
+   `0` on the unbudgeted path is the specific hazard: it reads as a real estimate of zero, which is
+   what makes hoisting the check out of the guard look harmless.
+2. *The condition is `output_tokens >= emitted`, not `>= allowance`.* See the spec §5.4 correction:
+   keying on `allowance` makes the signal silent on every chain whose model limit sits below it.
+3. *The sketch's wording — "the reply was truncated by the run's token budget" — is not always
+   true.* When the model ceiling or a caller's own `max_tokens` was the binding term, the budget
+   did not truncate anything. The shipped record says "the reply stopped at the clamped output
+   limit" and logs `max_tokens` beside `allowance` so the reader can tell which bound bit.
+
+**And Step 1 above covers only AC7. AC10 and AC11 had no test in this plan at all** — which for two
+signals whose entire job is to be emitted is the same as not shipping them. Two were added:
+
+- `both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` (the fire half, with each
+  condition true for a different reason so neither rides on the other), and
+- `neither_clamp_signal_fires_when_its_condition_does_not_hold` (the "and not otherwise" half, in
+  two phases: budgeted-but-neither-condition-met, and UNBUDGETED where the estimate-wrong condition
+  *would* hold if it were evaluated outside the clamp's `if let`).
+
+Asserting on a `tracing` record needs a subscriber, because §5.4's decision means there is no
+journal to read it back from. `tracing-subscriber` is not a dependency of this crate (only `torii`
+has it), so `tests.rs` carries a ~40-line `CapturingSubscriber` — six no-op trait methods and one
+line of real work — rather than adding a dependency edge to a crate that ships.
+
+- [x] **Step 3: Run**
 
 Run: `cargo test --workspace > /tmp/t8.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t8.log | tail -3`
 Expected: `exit=0`, 0 failed.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
@@ -1008,8 +1067,31 @@ It is the only DB-gated test in the workspace that sets a `TokenBudget`; the oth
 
 **Tasks 5, 6 and most of 8 landed in this round**, because the findings that named them were
 "UNTESTED" findings and the remedy is the test. All the mutations the plan asks for were run and
-their failures are quoted in the commit messages. What is NOT yet landed from Task 8: the two
-`tracing` signals (AC10/AC11). No finding touched them and they need no behaviour change.
+their failures are quoted in the commit messages. What did NOT land in this round: Task 7's memo
+fence and Task 8's two `tracing` signals (AC10/AC11). Both shipped afterwards — see the mutation
+ledger below.
+
+## The mutation ledger
+
+Every property the clamp rests on was already correct before its test existed, so none of these
+tests could be written red. Each was therefore proven by mutating the source, watching the named
+test redden, and reverting — re-run in full after Tasks 7 and 8 landed, not carried over from
+whichever round first ran them.
+
+| Mutation applied to | Change | Reddens | Failure |
+|---|---|---|---|
+| `dispatch.rs` | delete the `if allowance < MIN_OUTPUT_TOKENS { … }` block | `below_the_floor_the_gate_refuses_without_calling_the_provider` | `the run pauses on the budget` (and `an_estimate_larger_than_the_budget_does_not_wrap` on `no call was made`) |
+| `dispatch.rs` | `remaining.saturating_sub(est)` → `remaining - est` | `an_estimate_larger_than_the_budget_does_not_wrap` | `attempt to subtract with overflow` at the clamp |
+| `dispatch.rs` | `caller.min(want)` → `caller.max(want)` | `a_callers_max_tokens_is_never_widened` | `a lower caller value must win — left: Some(1024), right: Some(16)` |
+| `mod.rs` | fold the clamped `max_tokens` into `run_node`'s `input_hash` | `a_clamped_call_replays_from_its_memo_when_the_budget_moved` | `DeterminismViolation { node: NodeId("n1"), … }` |
+| `dispatch.rs` | `spent >= cap` → `spent > cap` | `a_non_chat_payload_is_gated_but_not_clamped` **and** `spending_exactly_the_cap_stops_the_run` | ``spending exactly the cap is spending it — `>=`, not `>` `` |
+| `dispatch.rs` | `output_tokens >= clamp.emitted` → `>` | `both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` | `the clamp-bit signal fired: [ … only the under-estimate record … ]` |
+| `dispatch.rs` | hoist the estimate check out of `if let Some(clamp)` | `neither_clamp_signal_fires_when_its_condition_does_not_hold` | `an unbudgeted run says nothing about an estimate it never made — left: [ … estimated: 0, actual: 10 … ]` |
+
+The fourth is the sharpest and the reason it is worth a row of its own: `input_hash` covers
+`{chain, payload}` and not `max_tokens`, which is the only reason a budgeted resume is not a hard
+halt. If that ever became false, raising a cap — the operator's remedy for a run that paused on its
+budget — would GUARANTEE the violation it is meant to clear.
 
 **Three plan/spec claims corrected in place:**
 
@@ -1085,12 +1167,16 @@ async fn a_clamped_call_still_journals_its_real_usage() {
 ```
 
 **Placeholder scan:** one sketch remained — `a_non_chat_payload_is_gated_but_not_clamped` in
-Task 6 — and Step 1 now explicitly instructs filling it in rather than leaving the stub.
+Task 6 — and Step 1 now explicitly instructs filling it in rather than leaving the stub. It is
+filled in and shipped: an `Embed` under the cap dispatches, is metered, and carries no clamp, and a
+second `Embed` sitting exactly ON the cap is refused, which is where the `>=` boundary now lives.
 
 **Type consistency:** `MIN_OUTPUT_TOKENS: u64`, `est_tokens_pessimistic(&str) -> usize`,
 `est_input_tokens(Option<&str>, &[Message], &[ToolDefinition]) -> u64`,
 `clamp_observing_gateway(u32, u32) -> (Gateway, Arc<Mutex<Vec<Option<u32>>>>)`,
-`clamp_applied: Option<u64>`, `est_used: u64`. Each defined once and used consistently. Note the
+`clamp: Option<ClampRecord>` with `{allowance, emitted, est_input}: u64` (the sketch's
+`clamp_applied: Option<u64>` + `est_used: u64` — see Task 8's corrections for why the two loose
+locals became one struct). Each defined once and used consistently. Note the
 `usize`→`u64` conversion in `est_input_tokens` and the `u64`→`u32` conversion at the `max_tokens`
 boundary (`u32::try_from(...).unwrap_or(u32::MAX)`) — both deliberate and both in Task 4.
 

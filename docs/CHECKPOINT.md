@@ -1,42 +1,36 @@
 # Checkpoint
 
 **Slice: SP-DATA-5 follow-on — the budget clamp.** On `develop`, unpushed. Tasks 1–8 done;
-Task 9 (docs + release gate) is what remains.
+Task 9 (docs + release gate) is all that remains.
 
 ## Done
 
-Tasks 1–4 (floor constant, clamp fixture, pessimistic estimate, the clamp) shipped at `c301901`.
-A three-reviewer whole-slice review then raised 20 findings at Minor or above; all are fixed in
-nine commits on top, and Tasks 5, 6 and most of 8 landed as part of that — their findings were
-"this property is untested", and the remedy is the test.
+Tasks 1–4 shipped at `c301901`; a three-reviewer whole-slice review raised 20 findings at Minor or
+above, all fixed in nine commits, and Tasks 5, 6 and most of 8 landed with them. Two Criticals were
+real: the clamp had no upper bound (a cap of 10240 sent `Some(10239)` and the provider answered a
+400 — a budgeted run hard-failing where the unbudgeted one succeeds; fixed with
+`min(allowance, Gateway::min_max_output_tokens(chain))`), and the Postgres AC6 e2e was left under
+the floor at `CAP = 100`, invisible to the local suite and red in CI.
 
-Both Criticals were real. (1) The clamp had no upper bound, so at a cap of 10240 it sent
-`Some(10239)` and the provider answered a 400 — a budgeted run hard-failing where the unbudgeted
-one succeeds. Fixed with `Gateway::min_max_output_tokens(chain)` and `min(allowance, ceiling)`.
-(2) The Postgres AC6 e2e was left at `CAP = 100`, under the floor; the local suite skips it and
-CI would have gone red. Rescaled ×10 and verified with an in-process replica.
-
-Also: the floor has its own reason text (it reported "0 of 300 tokens spent" on a run that spent
-nothing); `est_input_tokens` counts an assistant turn's `tool_calls`; `cap - spent` is a
-`checked_sub` behind a `debug_assert!`, because the overflow panic it relied on was debug-only.
+Since then — **Task 7** (`cd992df`): AC13, a clamped call replays from its memo when the budget
+moved between drives. The first drive is made to stop half-way so the second must replay `n1` AND
+dispatch `n2`; the plan's own fixture sketch could not have shown the clamp differing at all.
+**Task 8** (`f4f97b0`): the two `tracing` signals, plus the two tests the plan never asked for. The
+clamp-bit condition is `output_tokens >= the max_tokens SENT`, not `== allowance` as the spec said
+— keying on the allowance is silent on every chain whose model limit sits below it.
 
 ## Verified at the gate — real exit codes
 
-`cargo test --workspace` **1676 passed / 0 failed / 56 ignored, exit 0** ·
+`cargo test --workspace` **1679 passed / 0 failed / 56 ignored, exit 0** ·
 `cargo clippy --workspace --all-targets -- -D warnings` exit 0 · `cargo fmt --all --check` exit 0.
-Every mutation quoted in this round's commit messages was run against a clean tree and reverted.
+All seven mutations are tabulated with their failures in the plan's "mutation ledger"; each was run
+against a clean tree and reverted.
 
-## Remaining
+## Remaining, and the next command
 
-- **Task 9**: the overview entry, the SP-DATA-5 spec's §8/§2, the doc-link baseline (expect 16),
-  the release gate. The four prose surfaces Step 4 used to own are already swept.
-- **Task 8's two `tracing` signals (AC10/AC11)** — the only ACs with no code. No finding touched
-  them; they need no behaviour change.
-- **Task 7** (AC13, the memo fence under a moving clamp) still has no test.
-
-## Next command
-
-`cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`, then Task 9.
+**Task 9** only: the overview entry, the older SP-DATA-5 spec's §8/§2, the doc-link baseline
+(expect 16), the release gate. The four prose surfaces Step 4 used to own are already swept.
+Run `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`, then Task 9.
 
 ## Known-broken
 

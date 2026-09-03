@@ -155,12 +155,30 @@ would silently change the window-fit behaviour this slice has no business touchi
 
 Two distinct signals, and they mean different things:
 
-- **The clamp bit** — `usage.output_tokens == allowance`, i.e. the reply was cut short by our
-  budget rather than by the model finishing. `InferenceResponse` carries **no `finish_reason`**
-  (only a streaming chunk does), so this inference is the available signal; the plan must not
-  claim a provider stop-reason it cannot read.
+- **The clamp bit** — `usage.output_tokens >= emitted_max_tokens`, i.e. the reply stopped at the
+  limit we imposed and so was almost certainly cut short rather than finished.
+  `InferenceResponse` carries **no `finish_reason`** (only a streaming chunk does), so this
+  inference is the available signal; the plan must not claim a provider stop-reason it cannot read.
 - **The estimate was wrong** — `usage.input_tokens > est_input`, the residual-overshoot case §4
   bounds.
+
+> **Correction, from implementing Task 8.** This section and AC10 both first said the clamp-bit
+> condition was `output_tokens == allowance`. That is wrong in two ways and would have shipped a
+> signal that is silent on the cases it exists for.
+>
+> First, `allowance` is not what the provider was told. §5.2 emits
+> `min(allowance, ceiling, caller's)`, so on any chain whose model limit sits below the allowance
+> — the common case for a large cap, and the exact situation the ceiling term was added for — a
+> reply can never reach `allowance` at all and the signal would never fire. It is compared against
+> the value actually SENT. Both numbers are logged, so a reader can still tell WHICH bound bit:
+> equal means the budget truncated the reply, `emitted < allowance` means the model's own limit (or
+> a caller's own `max_tokens`) did and the budget merely did not prevent it. That distinction is
+> also why the emitted record does not claim "truncated by the run's token budget" — on three of
+> the five provider families that sentence would often be false.
+>
+> Second, `==` rather than `>=` fails silent: a provider that returned one token more than it was
+> allowed is precisely the thing worth knowing about, and `==` would drop it between the two
+> comparisons.
 
 Both are emitted at the chokepoint, and **both are `tracing` records, not journal events.**
 
@@ -239,8 +257,12 @@ which can never dispatch a call belongs on the precondition side; the floor wide
    bodies, an assistant turn's `tool_calls` (name AND arguments), and each tool's name, description
    and JSON schema — each term proven by deleting it alone.
 9. `est_tokens`'s existing window-fit behaviour is unchanged (its own tests still pass untouched).
-10. The clamp-bit signal fires when `output_tokens == allowance` and not otherwise.
-11. The estimate-wrong signal fires when `input_tokens > est_input` and not otherwise.
+10. The clamp-bit signal fires when `output_tokens >= emitted_max_tokens` and not otherwise —
+    against the value SENT, not against `allowance`; see §5.4's correction for why the original
+    wording would have been silent on the cases the signal exists for.
+11. The estimate-wrong signal fires when `input_tokens > est_input` and not otherwise. "Not
+    otherwise" includes an UNBUDGETED call, where no estimate is made at all: both signals sit
+    inside the clamp's own `if let`, and a test pins them there.
 12. A clamped call still journals its real `usage` and folds by effect id exactly as before.
 13. **A clamped call replays from its memo on resume rather than raising `DeterminismViolation`** —
     §5.1's fence argument, asserted by resuming a run whose remaining budget (and therefore whose
