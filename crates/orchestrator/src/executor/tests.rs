@@ -17996,8 +17996,15 @@ mod human_agent {
     /// hand-written second copy of that graph would let the two drift, and, worse, would
     /// keep passing if the row here were deleted. Design §5.4 turns on the row standing:
     /// s4 adds no new path into `drive_agent`, so making `GateSpec::Agent` polymorphic over
-    /// the backing is exactly the `Subgraph`-wrapper bypass the s3 review closed. Deleting
-    /// the row now fails two tests in two modules instead of silently opening it.
+    /// the backing is exactly the `Subgraph`-wrapper bypass the s3 review closed.
+    ///
+    /// **Deleting a row fails two tests in two modules, and it takes an explicit assertion
+    /// to make that true.** The AC13 lookup catches the `GateSpec::Agent` row alone, and
+    /// `a_human_backed_agent_is_rejected_outside_a_top_level_agent_node` — the table's own
+    /// consumer — used to iterate whatever rows existed, so a deletion made it iterate one
+    /// fewer time and stay green. Review measured it: deleting the row reddened ONE test,
+    /// not two. That test now pins the site list by value before it loops, so every row
+    /// here is guarded, not just the one s4 names.
     pub(super) fn non_top_level_sites() -> Vec<(&'static str, Graph, NodeId)> {
         let reviewer = || AgentRef("reviewer".into());
         vec![
@@ -18195,9 +18202,42 @@ mod human_agent {
     /// exactly the defect `a_fired_expiry_is_terminal_even_if_an_answer_arrives_later` pins
     /// for the sibling arm. The fix is the same `gate_precheck_by_id` read-back the rest of
     /// the human path already uses.
+    ///
+    /// **The site list is asserted BY VALUE before the loop, and that assertion is the
+    /// guard, not a formality.** A bare `for … in non_top_level_sites()` cannot see a
+    /// DELETED row: it simply iterates one fewer time and stays green, so the site that was
+    /// removed silently stops being covered here. Review measured exactly that — deleting
+    /// the `GateSpec::Agent` row reddened only s4's AC13 test, while
+    /// [`non_top_level_sites`]' own doc claimed two tests in two modules would catch it.
+    /// With the list pinned, deleting ANY row reddens this test as well, including the
+    /// `Subgraph`, `LoopBody::Subgraph` and `Branch arm` rows the whole-slice review added
+    /// to close the wrapper bypass and which no other test looks up by name.
+    ///
+    /// Pinning the ORDER too costs nothing and buys the same thing: a row added in the
+    /// middle is a deliberate act that should be recorded here, since this list is the
+    /// enumeration of which `drive_agent` callers are known to be covered.
     #[tokio::test]
     async fn a_human_backed_agent_is_rejected_outside_a_top_level_agent_node() {
-        for (site, graph, failing) in non_top_level_sites() {
+        let sites = non_top_level_sites();
+        assert_eq!(
+            sites.iter().map(|(site, ..)| *site).collect::<Vec<_>>(),
+            vec![
+                "MapBody::Agent",
+                "LoopBody::Agent",
+                "GateSpec::Agent",
+                "PlannerRef::Agent",
+                "Consolidate MapBody::Agent",
+                "Subgraph",
+                "LoopBody::Subgraph",
+                "Branch arm",
+            ],
+            "every non-top-level site `drive_agent` is reachable from must still be in the \
+             table. A row that DISAPPEARS is a site that silently stopped being tested — \
+             which is how a human-backed role becomes legal somewhere nobody is looking. \
+             Adding a site is welcome; add it here in the same commit."
+        );
+
+        for (site, graph, failing) in sites {
             let journal = InMemoryJournal::new();
             let run = RunId(uuid::Uuid::new_v4());
             let (ex, _clock, _calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
@@ -20566,8 +20606,9 @@ mod human_loop_gate {
             "and it does NOT pause — re-offering the same menu to the same operator \
              changes nothing about the row already in the journal: {out:?}"
         );
+        let events = journal.load(run).await.expect("loads");
         assert_eq!(
-            asks(&journal.load(run).await.expect("loads")).len(),
+            asks(&events).len(),
             1,
             "iteration 1 was never entered, so nobody was asked a second question"
         );
@@ -20576,6 +20617,26 @@ mod human_loop_gate {
             1,
             "…and no second iteration was SPENT — a silent fallback to the menu's head \
              would have bought one on a decision nobody made"
+        );
+
+        // The ORDERING inside the arm, and the only assertion that can see it. The
+        // `Waiting` arm resolves the option against the published menu FIRST and appends
+        // `LoopGateSettled` SECOND, deliberately (human.rs step 3's `Waiting` arm): a
+        // settlement row for a decision that was never honoured is a durable LIE about the
+        // one record the whole slice's argument rests on — "a verdict is settled by the
+        // drive that produces it and read back afterwards".
+        //
+        // The run outcome cannot see the swap. Step 0's `gate_failure_by_id` read-back
+        // fences the node either way, so hoisting the append above the `find` leaves every
+        // outcome assertion above green and changes only what the journal CLAIMS happened.
+        // That is precisely why it needs its own assertion rather than being inferred from
+        // the failure.
+        assert!(
+            !rows(&events).contains(&format!("LoopGateSettled({})", gate(0).0)),
+            "a decision naming an option nobody was offered leaves NO settlement behind — \
+             the gate failed, and a `LoopGateSettled` row would record that it was \
+             honoured with an option that was never published: {:?}",
+            rows(&events)
         );
     }
 
@@ -20671,7 +20732,11 @@ mod human_loop_gate {
     /// person had picked, which is precisely the "the run quietly decides for itself" state
     /// §5.5 exists to prevent. Contrast step 1: a gate already SETTLED replays above the
     /// SLA read, so the same edit cannot retroactively kill a loop nobody is waiting on.
-    /// The two arms differ deliberately and this test pins the live half.
+    /// The two arms differ deliberately; this test pins the live half and
+    /// `a_settled_gate_replays_when_a_config_push_breaks_its_role`, directly below, pins
+    /// the settled half. Both halves are needed and neither implies the other: the
+    /// mutation that reddens one (deleting step 2 / moving step 1 below it) leaves the
+    /// other green.
     #[tokio::test]
     async fn a_role_edited_to_model_backed_mid_wait_fails_a_drive_that_does_not_ask() {
         let journal = InMemoryJournal::new();
@@ -20736,6 +20801,132 @@ mod human_loop_gate {
         );
     }
 
+    /// The SETTLED half of the same asymmetry, which the sibling above pins only the live
+    /// half of — and which shipped as prose in three places while nothing guarded it.
+    ///
+    /// Design §5.5 and step 1's own comment both claim that a gate ALREADY SETTLED replays
+    /// ABOVE the SLA read, "so the same config edit cannot retroactively kill a loop nobody
+    /// is waiting on". Review mutation-proved the claim unguarded: moving step 1's
+    /// `loop_gate_settled_with` block BELOW the `human_sla_for` match left the entire
+    /// workspace green, because no test in this module had a settlement in its journal AND
+    /// a registry edit at the same time. The live-half sibling has the edit and no
+    /// settlement; `a_converged_loop_is_not_re_killed_by_its_own_gates_stale_deadline` has
+    /// the settlement and never touches the registry.
+    ///
+    /// **The consequence is the Critical this slice already shipped once, reached by a
+    /// different door.** There the trigger was the CLOCK — a settled gate re-derived
+    /// against a deadline that had since passed. Here it is `torii config push`: same
+    /// converged loop, same downstream `AwaitSignal` keeping the run resumable, and the
+    /// edit destroys a `Loop` that succeeded hours ago and cascade-skips the very node the
+    /// signal was delivered for. A wholly natural refactor — hoisting the SLA read to the
+    /// top of the function, since two of the arms below want it — reopens it silently.
+    ///
+    /// **Both `human_sla_for` failures, because they are one seam and not two.** A role
+    /// EDITED to `backed_by: model` and a role DELETED outright by the same replace-all
+    /// push reach step 2 through the identical `Err` path, and a fix that special-cased one
+    /// backing would leave the other open. Each row gets its own journal and run: the first
+    /// re-drive COMPLETES the run, so a second registry driven over the same journal would
+    /// take the terminal path, return the folded outcome without re-driving, and pass
+    /// without executing the gate arm at all.
+    ///
+    /// The failing direction is asserted as much as the passing one — `skipped` empty and
+    /// `after` completed, not merely `failed.is_none()` — because under the mutation the
+    /// `Loop` fails and `after` is cascade-SKIPPED, and a run whose signal was delivered
+    /// into a skipped node is the operator-visible damage.
+    #[tokio::test]
+    async fn a_settled_gate_replays_when_a_config_push_breaks_its_role() {
+        let after = NodeId("after".into());
+        let pushes: Vec<(&str, Arc<Registry>)> = vec![
+            (
+                // The SAME `reviewer` every other test in this module uses, differing in
+                // exactly the field under test.
+                "the role was edited to `backed_by: model`",
+                Arc::new(Registry::default().with_agent(AgentDefinition {
+                    backed_by: AgentBacking::Model,
+                    ..reviewer(Some(Duration::hours(1)), vec![])
+                })),
+            ),
+            (
+                // `torii config push` is replace-all: a push that simply omits the role
+                // deletes it, and step 2 raises `UnknownAgent` rather than a backing error.
+                "the role was deleted by a replace-all push",
+                Arc::new(Registry::default()),
+            ),
+        ];
+
+        for (push, edited_registry) in pushes {
+            let journal = InMemoryJournal::new();
+            let run = RunId(uuid::Uuid::new_v4());
+            let t0 = at(1_000);
+            let (ex, clock, _calls) =
+                exec_at(&journal, human_registry(Some(Duration::hours(1))), t0).await;
+            let graph = human_gated_loop_then_signal_graph(3);
+
+            // An ordinary human-backed ask, answered inside its SLA. The loop converges and
+            // the run parks on the downstream signal, so it carries no `RunCompleted` and
+            // every later wake re-drives the whole graph — gate 0 included.
+            ex.start(run, &graph).await.expect("pauses on the gate");
+            journal
+                .append(run, decided(&gate(0), "ship", "jerry"))
+                .await
+                .expect("the decision lands");
+            clock.set(t0 + Duration::minutes(30));
+            let converged = ex.start(run, &graph).await.expect("drives");
+            assert!(
+                converged.completed.contains(&lp()) && converged.failed.is_none(),
+                "{push}: the Loop converges inside the SLA, before any push: {converged:?}"
+            );
+            assert!(
+                converged.paused.is_some(),
+                "{push}: …and parks on the downstream signal, which is what keeps the \
+                 settled gate re-derivable at all: {converged:?}"
+            );
+
+            // The push lands, and the signal the run was parked for arrives after it. A
+            // worker in another process picks up the new registry — modelled as a second
+            // executor over the SAME journal, which is exactly what that worker has.
+            journal
+                .append(
+                    run,
+                    JournalEvent::SignalReceived {
+                        node: after.clone(),
+                        payload: serde_json::json!({ "ok": true }),
+                    },
+                )
+                .await
+                .expect("the signal lands");
+            let (worker, _clock, calls) =
+                exec_at(&journal, edited_registry, t0 + Duration::minutes(45)).await;
+
+            let out = worker.start(run, &graph).await.expect("re-drives");
+            assert!(
+                out.failed.is_none(),
+                "{push}: a gate that was SETTLED needs no role, no question and no \
+                 deadline — its answer is already durable, so a config edit cannot \
+                 retroactively kill a loop nobody is waiting on: {out:?}"
+            );
+            assert!(
+                out.completed.contains(&after),
+                "{push}: …and the node the signal was delivered for runs: {out:?}"
+            );
+            assert!(
+                out.skipped.is_empty(),
+                "{push}: …rather than being cascade-skipped by a gate re-derived against \
+                 config that arrived after it was answered: {out:?}"
+            );
+            assert_eq!(
+                asks(&journal.load(run).await.expect("loads")).len(),
+                1,
+                "{push}: and the replay published no second question — the settled arm \
+                 composes nothing"
+            );
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "{push}: …and spent nothing: both iterations replayed from their memos"
+            );
+        }
+    }
+
     /// AC13 — a HUMAN-backed role in a `GateSpec::Agent` STILL refuses, and the refusal now
     /// names `GateSpec::Human` as the variant that would work.
     ///
@@ -20748,8 +20939,11 @@ mod human_loop_gate {
     /// rather than a second hand-written graph. Design §5.4: s4 adds no new path into
     /// `drive_agent` at all, so making `GateSpec::Agent` polymorphic over the backing would
     /// reopen exactly what the s3 review closed — legality decided by position, not by
-    /// caller — and the row standing is the guarantee. Deleting it now reddens this test
-    /// too, in a different module, with a message that says a bypass was opened.
+    /// caller — and the row standing is the guarantee. Deleting it reddens this test, with a
+    /// message that says a bypass was opened, AND the table's own consumer over in `mod
+    /// human_agent` — two tests in two modules. The second half of that only became true
+    /// when review measured it: a bare `for … in non_top_level_sites()` cannot see a
+    /// deleted row, so that test now pins the site list by value before it loops.
     ///
     /// The assertion reads the JOURNALED row at the gate path rather than
     /// `RunOutcome.failed`, because the `Loop`'s own wrapper is what an operator sees in
