@@ -718,8 +718,21 @@ impl Executor {
                 // test-visible marker for "this pause is about the cap", and torii's
                 // status/list-paused surfaces match on it.
                 let reason = match cause {
+                    // Names a concrete lower bound, not just the arithmetic. It used to
+                    // end at "raise it", which is a dead end precisely where an operator
+                    // most needs a number: this is the arm a run lands on after applying
+                    // a stale figure from the floor arm below, so it is the SECOND round
+                    // trip of a sequence that is manual at every step. "More than
+                    // {spent}" is the honest bound — it is what unblocks the gate — and
+                    // the caveat is stated rather than implied, because clearing the gate
+                    // only to refuse on the floor one line later is the same round trip
+                    // wasted again.
                     BudgetRefusal::Spent => format!(
-                        "budget: {spent} of {budget} tokens spent; raise it with `torii run wake --budget-tokens N`"
+                        "budget: {spent} of {budget} tokens spent; raise the cap above \
+                         {spent} — and far enough above it that the next call's input \
+                         estimate still leaves {} tokens, or it will refuse on the floor \
+                         instead; raise it with `torii run wake --budget-tokens N`",
+                        orchestrator_core::MIN_OUTPUT_TOKENS
                     ),
                     // The floor. Reusing the wording above here would report a spend
                     // that did not happen ("0 of 300 tokens spent" on a fresh run) and
@@ -742,17 +755,38 @@ impl Executor {
                     // `saturating_add` for the u64 sum: it cannot realistically overflow
                     // (a cap near `u64::MAX` is not a budget), and a wrap would name a
                     // raise SMALLER than the current cap.
+                    //
+                    // **And it is stated as HEADROOM ABOVE THE FINAL SPEND, not as an
+                    // absolute cap.** `spent` here is the ledger as it stood at THIS
+                    // call, and the drive does not stop when a node pauses: `drive`'s
+                    // `for node in ready` loop marks the refusing node terminal and keeps
+                    // going, so an independent sibling can dispatch afterwards and push
+                    // the ledger past any absolute figure computed here. An operator who
+                    // applied that figure verbatim would re-pause — on the `Spent` arm,
+                    // whose message named no figure at all, so the second round trip had
+                    // nothing to work from. Every round trip is manual: this pause is
+                    // `resume_after: None`, so it is a `BudgetRaised` plus a `force_wake`
+                    // by a human each time.
+                    //
+                    // A headroom cannot go stale, because it is relative to whatever the
+                    // ledger ends at rather than to what it read mid-drive. The absolute
+                    // is still shown — it is the right answer when nothing else spends,
+                    // which is the common single-node case — but it is labelled as a
+                    // floor under the real requirement rather than as the answer.
                     BudgetRefusal::BelowFloor {
                         allowance,
                         est_input,
                     } => {
                         let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
-                        let needed = spent.saturating_add(est_input).saturating_add(floor);
+                        let headroom = est_input.saturating_add(floor);
+                        let needed = spent.saturating_add(headroom);
                         format!(
                             "budget: only {allowance} tokens left for output after the input \
                              estimate, below the {floor}-token floor ({spent} of {budget} \
-                             spent); raise the cap to at least {needed} with \
-                             `torii run wake --budget-tokens N`"
+                             spent); the cap must exceed this run's final spend by at least \
+                             {headroom} (≥ {needed} if nothing else in this drive spends — \
+                             independent nodes may still run after this pause and push it \
+                             higher); raise it with `torii run wake --budget-tokens N`"
                         )
                     }
                 };
