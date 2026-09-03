@@ -21396,13 +21396,17 @@ mod human_loop_gate {
     /// not survive measurement**, and the correction is worth keeping because the shape of
     /// it recurs: it said "a count cannot distinguish 'the gate journaled an effect' from
     /// 'the body ran twice'". Both of those give a length other than 1, so `len() == 1`
-    /// catches both — it just cannot say WHICH, and having to re-read the journal to find
-    /// out is the real (smaller) cost. The one shape a count structurally cannot see is
-    /// ONE effect at the WRONG node: `["lp/0/__gate__"]` passes `len() == 1` and is
-    /// precisely what this AC forbids. This single drive cannot produce it (the body runs
-    /// live, so its effect is always there), but a resume drive can — the body replays
-    /// from its memo and journals nothing, leaving room for exactly one effect that should
-    /// not exist.
+    /// catches both.
+    ///
+    /// The honest reason for the by-node form is smaller and is about the FAILURE, not the
+    /// detection: `["lp/0","lp/1","lp/2"]` and `["lp/0","lp/0/__gate__"]` are two different
+    /// bugs with two different fixes, and the assertion prints which one happened instead
+    /// of leaving the next reader to go and re-scrape the journal. `effect_nodes` is a
+    /// whole-run scrape, so there is no effect list a count would let through: the
+    /// only shape that could — exactly one effect, at the gate path and not the body's —
+    /// needs a scrape scoped to a single drive, which no fixture in this module has.
+    /// (Nor does a resume drive give it: the body replays from its memo and journals
+    /// nothing, but drive 1's `lp/0` is still in the journal being scraped.)
     ///
     /// **The "no folded `usage`" half of AC11 needs no separate assertion and gets none.**
     /// `Fold::usage` is written from exactly two places (`fold_journal`): an
