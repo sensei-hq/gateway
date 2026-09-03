@@ -299,10 +299,18 @@ impl Executor {
         }
         // The SP-DATA-5 clamp. The gate immediately above is a FLOOR-TRIGGER — it
         // refuses only once `spent` has ALREADY passed the cap — so without this a
-        // single call can overshoot, and it is bounded by nothing but whatever the
-        // provider's default output limit happens to be. Setting `max_tokens` moves
-        // enforcement of that last call from our arithmetic to the provider's: it
+        // single call can overshoot by however much output the adapter allows when
+        // `max_tokens` is `None`, which is not one number: `openai_compat` and the local
+        // engine pass the `Option` through (so the model's own maximum applies), while
+        // `anthropic`, `gemini` and `bedrock` each substitute their own 1024. Setting
+        // `max_tokens` replaces all of that with one rule under our control: the call
         // CANNOT return more output than the remaining budget affords.
+        //
+        // On the three that default to 1024, that is a WIDENING as well as an
+        // enforcement — a budgeted call may now return more than the same unbudgeted one
+        // — and the design's §6 records it as an accepted cost with the alternative that
+        // was rejected. The run's TOTAL is bounded either way, which is the property this
+        // exists for; only the per-call shape moves.
         //
         // What this does NOT do is eliminate the overshoot, and the distinction is the
         // whole reason the design argues for a pessimistic estimate. With
