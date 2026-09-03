@@ -135,8 +135,10 @@ impl<'a> Meter<'a> {
     }
 }
 
-/// The pessimistic input estimate over everything the provider will be sent: the system
-/// prompt, every message body, and the tool schemas.
+/// The pessimistic input estimate for the budget clamp: the system prompt, every
+/// message body, every assistant turn's tool CALLS, and the tool schemas.
+///
+/// # What is counted, and what is not
 ///
 /// Tool schemas are counted rather than waved off as small for two reasons. They are pure
 /// JSON, which is the worst case for a chars-per-token heuristic and the reason
@@ -145,15 +147,35 @@ impl<'a> Meter<'a> {
 /// counts them, for the same reason, and is the reference this mirrors — including its
 /// treatment of `description` as optional.
 ///
+/// A message's `tool_calls` are counted for a plainer reason: they are SENT. The ReAct
+/// loop appends an assistant turn carrying them on every turn (`agent.rs`) and re-sends
+/// the whole transcript on every turn after that; `anthropic/convert.rs` renders each as
+/// a `ToolUse` block and `openai_compat/convert.rs` as a `tool_calls` array. Those turns
+/// have an EMPTY `content`, so counting only `as_text()` priced a serialized plan or an
+/// `fs_write` body — the largest payloads the loop produces — at zero, which under-counts
+/// in the one direction this function must not: `allowance = remaining − est`, so an
+/// estimate that is too low leaves an allowance that is too high.
+///
+/// `attachments` are NOT counted, and this is not an oversight to be silent about: the
+/// orchestrator never populates them (`agent.rs:469` and this module's own builder both
+/// pass `Vec::new()`), so counting them would be dead arithmetic. A producer that starts
+/// attaching media owes this function a term, and there is no way for it to find out
+/// except by reading this paragraph.
+///
 /// Deliberately NOT shared with `over_budget`/`est_prompt_tokens`: those answer "will this
 /// fit the context window", which wants to avoid false alarms and so wants the opposite
 /// bias. One function cannot serve both, and merging them would silently change a
-/// window-fit behaviour this slice has no business touching.
+/// window-fit behaviour this slice has no business touching. `over_budget` has the same
+/// `tool_calls` gap and keeps it: an under-count there is the SAFE direction (it lets a
+/// turn through that might not fit) where here it is the expensive one.
 fn est_input_tokens(system: Option<&str>, messages: &[Message], tools: &[ToolDefinition]) -> u64 {
     let est = |s: &str| crate::agent::prompt::est_tokens_pessimistic(s) as u64;
     let mut total = system.map_or(0, est);
     for m in messages {
         total += est(m.content.as_text());
+        for call in &m.tool_calls {
+            total += est(&call.name) + est(&call.arguments);
+        }
     }
     for t in tools {
         total += est(&t.name)
@@ -704,5 +726,127 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             )
             .await?;
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel::types::request::{MessageContent, MessageRole, ToolCall};
+
+    fn user(text: &str) -> Message {
+        Message::text(MessageRole::User, text)
+    }
+
+    fn tool(name: &str, description: Option<&str>, schema: serde_json::Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            input_schema: schema,
+        }
+    }
+
+    /// Every term of the estimate is COUNTED, proven one term at a time.
+    ///
+    /// The estimate is the whole clamp: `allowance = remaining − est`, so a term that
+    /// silently contributes nothing leaves the allowance too high and the cap is
+    /// overshot by exactly that much. Before this test, deleting the tool loop or
+    /// replacing the system term with `0` left `cargo test --workspace` green, and the
+    /// only guarded term was messages — guarded by one token of margin, because every
+    /// clamp test used a two-character prompt.
+    ///
+    /// Strict `>` on each step, against the same call with that one term absent. A
+    /// weaker `>=` would pass for a function that ignored the term entirely.
+    #[test]
+    fn every_part_of_the_input_is_counted_in_the_estimate() {
+        let msgs = vec![user("the user's question, which is not short")];
+        let bare = est_input_tokens(None, &msgs, &[]);
+        assert!(bare > 0, "the message body itself costs something");
+
+        assert!(
+            est_input_tokens(Some("a system prompt the agent was given"), &msgs, &[]) > bare,
+            "the system prompt is counted"
+        );
+
+        let named = tool("fs_write", None, serde_json::json!({}));
+        let with_name = est_input_tokens(None, &msgs, std::slice::from_ref(&named));
+        assert!(with_name > bare, "a tool's NAME is counted");
+
+        let described = tool(
+            "fs_write",
+            Some("write a file, creating parent directories"),
+            serde_json::json!({}),
+        );
+        assert!(
+            est_input_tokens(None, &msgs, &[described]) > with_name,
+            "a tool's DESCRIPTION is counted — it is optional, not free"
+        );
+
+        let schemad = tool(
+            "fs_write",
+            None,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "contents": { "type": "string" }
+                },
+                "required": ["path", "contents"]
+            }),
+        );
+        assert!(
+            est_input_tokens(None, &msgs, &[schemad]) > with_name,
+            "a tool's JSON SCHEMA is counted — the term the estimate exists for"
+        );
+    }
+
+    /// An assistant turn's `tool_calls` are counted, because the provider is sent them.
+    ///
+    /// The ReAct loop appends exactly such a message every turn (`agent.rs`), and every
+    /// subsequent turn re-sends it: `anthropic/convert.rs` emits a `ToolUse` block per
+    /// entry, `openai_compat/convert.rs` emits `tool_calls`. `Message::content` is empty
+    /// on those turns, so counting only `as_text()` made a serialized plan or an
+    /// `fs_write` body — the biggest payloads the loop produces — cost zero.
+    ///
+    /// That under-counts in the one direction the design forbids: `allowance =
+    /// remaining − est` comes out too high, so the residual overshoot exceeds the
+    /// design's §4 bound and "biased toward refusing early" stops being true for the
+    /// agent path, which is the path that generates the large arguments.
+    #[test]
+    fn an_assistant_turns_tool_call_arguments_are_counted() {
+        let plain = Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text {
+                text: String::new(),
+            },
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let calling = Message {
+            tool_calls: vec![ToolCall {
+                id: "t0".into(),
+                name: "fs_write".into(),
+                arguments: serde_json::json!({
+                    "path": "notes.md",
+                    "contents": "a body long enough to matter to a token budget"
+                })
+                .to_string(),
+            }],
+            ..plain.clone()
+        };
+
+        let without = est_input_tokens(None, std::slice::from_ref(&plain), &[]);
+        let with = est_input_tokens(None, std::slice::from_ref(&calling), &[]);
+        assert!(
+            with > without,
+            "a tool call's arguments are sent to the provider, so they are estimated: \
+             {with} vs {without}"
+        );
+        // And by roughly what they cost: the arguments alone are ~90 characters, so a
+        // token or two of difference would mean only the NAME was counted.
+        assert!(
+            with - without >= 20,
+            "the ARGUMENTS are counted, not just the call's name: {with} vs {without}"
+        );
     }
 }
