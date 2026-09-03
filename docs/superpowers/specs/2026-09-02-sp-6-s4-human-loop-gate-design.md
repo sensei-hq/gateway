@@ -321,13 +321,22 @@ nor `completed`. Pre-existing, not new.
   redaction). A loop-gate branch bolted onto `decide` inherits that gap silently — which is exactly
   how the s3 leak this bullet cites happened. Recorded on `JournalEvent::LoopGateDecided`'s own doc
   as well, since that is where the next writer of the event looks.
-- **Menu option names are author free text.** They are recited back on a bad `--option`, so torii's
-  existing `cap_chars` collapse-and-cap applies unchanged.
+- **Menu option names are author free text**, out of the GRAPH — `torii run submit --graph <file>`,
+  which deserializes the file and scrubs nothing. Not `torii config push`: §4 above puts the menu on
+  the graph so `validate_dag` can see it and rejects the registry as its home, so a pushed config
+  carries no option name at all. They are recited back on a bad `--option`, so torii's existing
+  `cap_chars` collapse-and-cap applies unchanged.
 - **And they are therefore redacted at the `LoopGateAwaited` append, alongside the prompt.** The
   first shipped site scrubbed only the prompt, which quotes the same names through `gate_ask` — so
   one author string was clean in `prompt` and plaintext in `menu` and in the `RunPaused.reason`
-  built from it, on one write. `torii config push` scrubs nothing, so the append is the last line of
-  defence. `pause_gate` is handed the scrubbed copy on both its arms and runs the finished reason
+  built from it, on one write. The append is the last line of defence **for the journal**, which is
+  the precise claim: it is not the first durable copy of an option name, because `Scheduler::submit`
+  calls `store.enqueue` before it drives and that writes the whole submitted graph into
+  `scheduled_runs.graph` as jsonb, in the clear. The journal is the copy that is read BACK — folded
+  by every later drive, printed by `run status` and `run list-paused`, shown to the person by
+  `gate_ask`, and resolved against by a decision — while `scheduled_runs.graph` is the operator's own
+  input, read by `claim_due` alone (`ScheduledRun`, what both observe commands return, has no graph
+  field). `pause_gate` is handed the scrubbed copy on both its arms and runs the finished reason
   through the redactor as the write chokepoint — forward-looking only, since the menu now arrives
   clean and the other interpolation (the node id) is a structural key already plaintext in
   `NodeStarted` and `EffectRecorded`.

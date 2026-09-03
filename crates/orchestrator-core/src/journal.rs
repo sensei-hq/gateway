@@ -360,10 +360,13 @@ pub enum JournalEvent {
     ///
     /// A writer must also REDACT it before appending (design §6), and `run_human_agent`
     /// does: it runs the executor's own redactor over the WHOLE composed question and
-    /// appends that value. s3 originally shipped `prompt: prompt.to_string()`, which made
-    /// this row the one place a credential in a `system_prompt` or a skill body reached
-    /// durable storage in the clear — nothing upstream scrubs it (`torii config push`
-    /// redacts nothing). The residue worth knowing: `Executor::with_redactor` is opt-in and
+    /// appends that value. s3 originally shipped `prompt: prompt.to_string()`, which let a
+    /// credential in a `system_prompt` or a skill body into the JOURNAL in the clear —
+    /// nothing between the authored config and this append scrubs it (`torii config push`
+    /// redacts nothing). s3's own note called this row "the one place" such a credential
+    /// reached durable storage; it is not, since the agent's markdown and the
+    /// `config_agents` jsonb hold it verbatim already. It is the last door into the copy
+    /// that is read BACK. The residue worth knowing: `Executor::with_redactor` is opt-in and
     /// defaults to `None`, so a library embedder that wires no redactor still writes the
     /// question as composed.
     ///
@@ -457,16 +460,24 @@ pub enum JournalEvent {
     ///   says "trim the gate role's system prompt, its skills, or the menu option names".
     /// - **REDACT it before appending** (design §6), through the executor's own
     ///   `Redactor`, then clamp — `[REDACTED]` is longer than the shortest span it
-    ///   replaces. This is the one place a credential in a `system_prompt`, a skill body
-    ///   or an iteration output reaches durable storage in the clear; nothing upstream
-    ///   scrubs it (`torii config push` redacts nothing). s3 shipped the unredacted form
-    ///   first and its review caught it.
+    ///   replaces. Nothing upstream scrubs the authored halves: `torii config push` writes
+    ///   an agent's `system_prompt` and a skill's body to `config_agents`/`config_skills`
+    ///   as jsonb, verbatim. So this is the last unscrubbed door into the JOURNAL for a
+    ///   credential in one of them — not the one place it reaches durable storage at all,
+    ///   which is what an earlier version of this bullet claimed and the config tables
+    ///   already disprove. The journal's copy is the one read BACK: folded on every drive,
+    ///   printed by the operator surfaces, and shown to the person. s3 shipped the
+    ///   unredacted form first and its review caught it.
     /// - **Redact the `menu` too, and refuse a menu that redaction makes AMBIGUOUS.** This
     ///   obligation is s4's own — `AgentAwaited` has no menu — and it is the one the first
     ///   shipped append site missed: `prompt` quotes the option names (through `gate_ask`)
     ///   and was scrubbed, while `menu` was appended straight from the graph, so one author
     ///   string was clean in one durable field and plaintext in another on the same write.
-    ///   Option names come through the same `torii config push` that redacts nothing.
+    ///   Option names arrive by a DIFFERENT unscrubbed intake from the prompt's: the graph
+    ///   file `torii run submit --graph` deserializes. `torii config push` never carries
+    ///   one — the menu lives on the graph so `validate_dag` can see it — and
+    ///   `Scheduler::submit` has already put that graph in `scheduled_runs.graph`, in the
+    ///   clear, before the executor drives. This append governs the journal's copy.
     ///
     ///   The refusal is the non-obvious half. `menu` is not display text: it is the
     ///   vocabulary a decision is resolved against, and redacting it is only safe while the

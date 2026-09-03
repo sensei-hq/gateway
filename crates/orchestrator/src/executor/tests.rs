@@ -21285,10 +21285,13 @@ mod human_loop_gate {
     /// AC16 — the journaled question is REDACTED before the durable write, not only at
     /// display time.
     ///
-    /// This is the one place a credential sitting in a gate role's `system_prompt`, an
-    /// activated skill body, or an iteration output reaches durable storage in the clear:
-    /// `torii config push` scrubs nothing, and `LoopGateAwaited.prompt` goes straight into
-    /// `journal_events`.
+    /// This is the last unscrubbed door into the JOURNAL for a credential sitting in a
+    /// gate role's `system_prompt`, an activated skill body, or an iteration output:
+    /// nothing between the authored config and here scrubs the first two, and
+    /// `LoopGateAwaited.prompt` goes straight into `journal_events`. Not "the one place
+    /// they reach durable storage in the clear", which this doc used to say — a
+    /// `system_prompt` is authored in a markdown file and `torii config push` copies it
+    /// into `config_agents` as jsonb, both verbatim. The journal is the copy read BACK.
     ///
     /// **The two authored sources are the discriminating half.** The iteration-output
     /// secret is already scrubbed upstream by the shared `model_output` chokepoint (SP-4
@@ -21645,8 +21648,17 @@ mod human_loop_gate {
     /// question, which is redacted; `LoopGateAwaited.menu` was appended straight from the
     /// graph; and `pause_gate` built `RunPaused.reason` from those same names. Review
     /// measured all three on one drive — prompt clean, menu leaking, reason leaking — and
-    /// this is the defect class s2 and s3 each shipped and each had to fix. `torii config
-    /// push` scrubs nothing, so the journal row is the last line of defence.
+    /// this is the defect class s2 and s3 each shipped and each had to fix.
+    ///
+    /// The append is the last line of defence **for the journal**, which is narrower than
+    /// what this doc used to say. An option name comes off the GRAPH — `torii run submit
+    /// --graph <file>` deserializes the file and scrubs nothing, and it is not `torii
+    /// config push`, which never carries a menu at all (design §4 keeps the menu on the
+    /// graph so `validate_dag` can see it) — and `Scheduler::submit` writes that whole
+    /// graph into `scheduled_runs.graph` as jsonb BEFORE it drives. So a plaintext copy
+    /// already exists when this append runs. What the append governs is the copy read
+    /// BACK: folded by every later drive, printed by `run status` and `run list-paused`,
+    /// shown to the person, and resolved against by a decision.
     ///
     /// **The second half of the test is the point of the first.** A menu is not display
     /// text: it is the VOCABULARY every later decision is resolved against
@@ -21694,8 +21706,9 @@ mod human_loop_gate {
         assert!(
             !published.iter().any(|o| o.name.contains(&in_option)),
             "…and so is the MENU beside it. An option name is author free text out of the \
-             same `torii config push` that redacts nothing, and this row is durable — read \
-             back by every later drive and rendered by `run list-paused`: {published:?}"
+             graph file `torii run submit` reads verbatim, and this row is the copy that is \
+             read BACK — folded by every later drive, rendered by `run list-paused`, and \
+             resolved against by a decision: {published:?}"
         );
         assert!(
             !pause_reasons(&events)
