@@ -380,6 +380,13 @@ pub struct AwaitingNode {
     /// must not do is test `question` first and conclude `agent answer`, which is the one
     /// verb a loop gate refuses.
     ///
+    /// "Everywhere" is measured, not assumed — this sentence shipped once while it was
+    /// false. `cmd::human::answer` gated its whole refusal block on `agent_question(..)`,
+    /// i.e. it read the QUESTION first, and answered a menu-bearing node with exit 0;
+    /// `cmd::run::awaiting_nodes` derived the kind from a parallel rule that disagreed with
+    /// `gate_menu` on a `GateAwaited` + `LoopGateAwaited` journal. Both are fixed, and the
+    /// listing now resolves the kind by CALLING `gate_menu` rather than by re-deriving it.
+    ///
     /// Read from the journaled `GateAwaited`, so `list-paused` needs no graph load —
     /// which matters because `list-paused` folds one journal per paused run and has no
     /// graph in hand.
@@ -691,19 +698,24 @@ pub fn awaiting_section(rows: &[(orchestrator_core::RunId, Awaiting)]) -> String
                     // and cap a node id does: a raw newline would forge an extra row, and
                     // an ESC could rewrite what is already on screen.
                     //
-                    // The MENU is checked first, matching the order `cmd::run::signal`
-                    // checks its refusals in (`gate_menu`, then `agent_question`), so a
-                    // node the listing and the refusals could disagree about is never sent
-                    // to a command that refuses it.
+                    // The MENU is checked first, matching the order every refusal path
+                    // checks in (`gate_menu`, then `agent_question` — `cmd::run::signal`
+                    // and `cmd::human::answer` both, the latter only since the review that
+                    // measured it reading the question first), so a node the listing and
+                    // the refusals could disagree about is never sent to a command that
+                    // refuses it.
                     //
                     // BOTH ⇒ a loop gate, and that is a construction rather than a
-                    // convention: `cmd::run::awaiting_nodes` fills the two fields from ONE
-                    // source per node, in this same menu-first order, precisely so this arm
-                    // cannot be reached by a hand-written journal that published a
-                    // `GateAwaited` and an `AgentAwaited` at one id. (Before s4 those two
-                    // maps were consulted independently, so such a node did set both and
-                    // fell into the `gate:` arm below — which is where menu-first order
-                    // still puts it.)
+                    // convention: `cmd::run::awaiting_nodes` resolves a node's kind through
+                    // `cmd::gate::gate_menu` — the SAME function the refusals call — and
+                    // fills `question` beside a menu only for the `Loop` variant. So this
+                    // arm cannot be reached by a hand-written journal that published a
+                    // `GateAwaited` and an `AgentAwaited` at one id (that node has no
+                    // `question` at all here), nor by one that published a `GateAwaited`
+                    // and a `LoopGateAwaited` (the resolver's first-wins-in-journal-order
+                    // decides which, and the refusals get the same answer by construction).
+                    // Both journals were rendered as a kind the refusals disagreed with
+                    // before those two fixes.
                     let cell = match (&a.options, &a.question) {
                         (Some(opts), Some(q)) => loop_gate_cell(opts, q),
                         (Some(opts), None) => cap_chars(
@@ -819,6 +831,29 @@ mod tests {
         assert!(
             cell.starts_with("agent: \"standing"),
             "and the head still leads the cell: {cell}"
+        );
+
+        // **The EMPTY label — the loop gate's, and the case the reserve arithmetic was
+        // generalised for.** `overhead` went from a hardcoded `"agent: \"\"".chars()
+        // .count()` to `label.chars().count() + 2`, and the `0 + 2` branch is taken by every
+        // real loop gate (`HumanQuestion::compose` appends `TASK_MARKER` unconditionally)
+        // and, until this assertion, by no test: every test that reached the marker arm
+        // passed `"agent: "`, measured with a probe. An over-counted head would push the
+        // cell past `QUESTION_MAX` and wreck the alignment of every other row in the block,
+        // silently, on the kind whose cell is already the widest.
+        let cell = question_cell("", &composed);
+        assert!(
+            cell.chars().count() <= QUESTION_MAX,
+            "the empty label must be charged exactly its two quotes: {} chars",
+            cell.chars().count()
+        );
+        assert!(
+            cell.contains(TASK_SEP) && cell.contains("yyyy"),
+            "…and the ask's share is reserved for it too: {cell}"
+        );
+        assert!(
+            cell.starts_with("\"standing"),
+            "…with no label, so the cell opens on the quote: {cell}"
         );
 
         // No marker ⇒ the pre-reserve rendering, unchanged.

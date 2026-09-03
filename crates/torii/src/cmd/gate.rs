@@ -687,6 +687,36 @@ pub async fn decide(
     // means the drive that terminated the node folded a journal that already contained the
     // decision; a marker AHEAD of it means the node was already dead when the row landed.
     let SignalStateAt { state, at } = signal_state_at(&after_events, &node);
+
+    // **What the durable orphan below will DO — and the two kinds do opposite things.**
+    // Split because the `HumanGate` sentence was inherited whole by the loop branch and is
+    // false there, which is the defect class this slice keeps shipping: a message that
+    // asserts something untrue is worse than one that says less.
+    //
+    // A `HumanGate` re-executes. It journals no `NodeCompleted`, `NodeFailed` is not folded
+    // as a barrier, and `run_human_gate` re-reads `GateDecided` on every drive — so a
+    // re-`start` really does fold this late row as the node's answer, and an operator has a
+    // reason to care about it.
+    //
+    // A loop gate does NOT. `run_human_loop_gate` reads a terminal verdict BACK rather than
+    // re-deriving one: step 0 returns a folded `NodeFailed` forever, and step 1 replays
+    // `LoopGateSettled` without ever consulting `LoopGateDecided` again (that ordering is
+    // deliberate and separately tested there). Whichever marker beat this write therefore
+    // wins permanently and the row is inert. Telling an operator it will be folded sends
+    // them to clean up a decision nothing will ever read.
+    let orphan_residue = match menu {
+        PublishedMenu::Human(_) => {
+            "The decision stays on the journal as a last-wins value that a re-`start` of \
+             this run would fold as the node's answer"
+        }
+        PublishedMenu::Loop(_) => {
+            "The decision stays on the journal as inert residue: `run_human_loop_gate` \
+             replays whichever terminal verdict beat it — a folded `NodeFailed`, or the \
+             `LoopGateSettled` of the option that was honoured — instead of re-reading a \
+             decision, so nothing will ever fold this row"
+        }
+    };
+
     if let Some(at) = at {
         return Ok(match (&state, at > appended) {
             // Terminated AFTER our row, by completing: the decision was on the journal for
@@ -745,14 +775,13 @@ pub async fn decide(
             )),
             // Terminated BEFORE our row landed: a true orphan. The pre-check refuses this
             // shape, so reaching it means the node died inside the write window — worth
-            // saying plainly, because the residue is durable: a `HumanGate` journals no
-            // `NodeCompleted` and `NodeFailed` is not folded as a barrier, so a re-`start`
-            // would re-execute the gate and fold this late decision as its answer.
+            // saying plainly, because the residue is durable and what it will DO differs by
+            // kind. See `orphan_residue`: this sentence was inherited whole from the s2
+            // path and is FALSE for a loop gate.
             (other, false) => Outcome::precondition(format!(
                 "not read: {shown}'s decision is journaled durably, but {shown} was already \
-                 {} before the write landed, so nothing read it. The decision stays on the \
-                 journal as a last-wins value that a re-`start` of this run would fold as \
-                 the node's answer — do not treat this gate as decided.",
+                 {} before the write landed, so nothing read it. {orphan_residue} — do not \
+                 treat this gate as decided.",
                 other.as_str()
             )),
         });
@@ -2019,6 +2048,115 @@ pub(crate) mod tests {
             "must say the row is a durable orphan, not a delivery: {}",
             out.text
         );
+        // The RESIDUE claim, which is kind-specific and true only here: a `HumanGate`
+        // journals no `NodeCompleted` and `NodeFailed` is not folded as a barrier, so a
+        // re-`start` really would re-execute the gate and fold this late row. Asserted so
+        // that the loop-gate twin's opposite assertion is a pair rather than a lone claim.
+        assert!(
+            out.text.contains("re-`start`"),
+            "…and must say what the durable residue will DO, which for this kind is be \
+             folded as the node's answer on a re-`start`: {}",
+            out.text
+        );
+    }
+
+    /// **The same arm, on the kind whose residue behaves the OPPOSITE way.**
+    ///
+    /// No test reached any post-append reporting arm with a loop gate, and the inherited
+    /// `(other, false)` sentence — "a last-wins value that a re-`start` of this run would
+    /// fold as the node's answer" — is FALSE for one. `run_human_loop_gate` reads a
+    /// terminal verdict BACK rather than re-deriving it: step 0 replays a folded
+    /// `NodeFailed` forever, and step 1 replays `LoopGateSettled` without ever consulting
+    /// `LoopGateDecided` again. So the decision is inert, and an operator told the durable
+    /// residue will be folded may act to remove a row that will never be read.
+    ///
+    /// `LoopGateSettled` is the marker, because it is the one this kind actually writes on
+    /// the honoured path (a loop gate journals no `NodeCompleted`) and because the pre-check
+    /// refuses a gate that was already settled when the command STARTED — reaching this arm
+    /// requires the settlement to land INSIDE the write window, which is what the local
+    /// `SettlesInsideTheWindow` journal produces. It is the loop-kind twin of
+    /// `a_decision_the_node_died_before_is_reported_as_an_orphan_not_as_decided`'s
+    /// `DiesInsideTheWindow`, and for the same reason that one exists: the store hook fires
+    /// on `force_wake`, which is post-append by construction, so no `SchedulerStore` fixture
+    /// can produce this ordering.
+    #[tokio::test]
+    async fn a_loop_gate_decision_the_settlement_beat_is_reported_as_inert_not_as_foldable() {
+        struct SettlesInsideTheWindow {
+            inner: std::sync::Arc<InMemoryJournal>,
+        }
+        #[async_trait::async_trait]
+        impl ExecutionJournal for SettlesInsideTheWindow {
+            async fn append(
+                &self,
+                run: RunId,
+                event: JournalEvent,
+            ) -> Result<Seq, orchestrator_core::JournalError> {
+                if matches!(event, JournalEvent::LoopGateDecided { .. }) {
+                    self.inner
+                        .append(
+                            run,
+                            JournalEvent::LoopGateSettled {
+                                node: loop_gate(),
+                                option: "revise".into(),
+                            },
+                        )
+                        .await?;
+                }
+                self.inner.append(run, event).await
+            }
+            async fn load(
+                &self,
+                run: RunId,
+            ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+                self.inner.load(run).await
+            }
+        }
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let inner = std::sync::Arc::new(
+            loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await,
+        );
+        let j = SettlesInsideTheWindow {
+            inner: inner.clone(),
+        };
+
+        let out = decide(&s, &j, run, loop_gate(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        let events = inner.load(run).await.unwrap();
+        let seq_of = |p: fn(&JournalEvent) -> bool| {
+            events
+                .iter()
+                .find(|(_, e)| p(e))
+                .map(|(s, _)| *s)
+                .expect("the event is on the journal")
+        };
+        assert!(
+            seq_of(|e| matches!(e, JournalEvent::LoopGateSettled { .. }))
+                < seq_of(|e| matches!(e, JournalEvent::LoopGateDecided { .. })),
+            "precondition: the gate had settled before the row landed"
+        );
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("was already") && out.text.contains("nothing read it"),
+            "must say the row is a durable orphan, not a delivery: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("re-`start`"),
+            "a loop gate's decision is NOT folded on a re-`start`: step 1 of \
+             `run_human_loop_gate` replays the SETTLEMENT and never re-reads a decision, \
+             so this sentence sends an operator to clean up a row nothing will read: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("nothing will ever fold"),
+            "…and must say what is actually true — the row is inert: {}",
+            out.text
+        );
     }
 
     /// The other half of the post-append window: the run went TERMINAL while the node
@@ -2371,6 +2509,18 @@ pub(crate) mod tests {
             "must name the flag the operator actually typed: {}",
             e.message
         );
+        // **The other half of the asymmetry `decide` argues for.** A `HumanGate`'s actor is
+        // journaled AS GIVEN — the executor scrubs it on the way back out — so this message
+        // must NOT offer redaction as the explanation for a size it never grew by. The two
+        // arms are one `match` on one line, so without this the discriminant could be set
+        // on both and nothing would notice: the loop-gate test asserts only that the
+        // explanation is PRESENT.
+        assert!(
+            !e.message.contains("once redacted"),
+            "a `HumanGate`'s actor is written as typed, so the growth explanation would \
+             name a transform this value never went through: {}",
+            e.message
+        );
         assert!(
             journaled_decisions(&j, run, &release()).await.is_empty(),
             "an over-limit actor must never reach the journal"
@@ -2578,13 +2728,33 @@ pub(crate) mod tests {
         deadline: Option<chrono::DateTime<chrono::Utc>>,
         options: &[&str],
     ) -> InMemoryJournal {
+        loop_gate_journal_asking(run, node, deadline, options, LOOP_GATE_QUESTION).await
+    }
+
+    /// [`loop_gate_journal`] with the question spelled out, for the tests whose subject IS
+    /// the question rather than the menu.
+    ///
+    /// The loop gate is the kind most exposed there, which is why it needs its own: its
+    /// prompt is composed by `HumanQuestion::compose` from the gate role's system prompt,
+    /// its activated skill bodies AND the ITERATION OUTPUT — model text about the run —
+    /// so it is the longest, the most `## Task`-shaped and the most likely of the four to
+    /// carry a credential. `cmd::run`'s listing tests need an overlong compose-shaped one
+    /// and a secret-shaped one, both through the SAME `LoopGateAwaited` shape the executor
+    /// writes rather than a hand-rolled event, for the reason [`loop_gate`] records.
+    pub(crate) async fn loop_gate_journal_asking(
+        run: RunId,
+        node: &NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        options: &[&str],
+        prompt: &str,
+    ) -> InMemoryJournal {
         let j = InMemoryJournal::new();
         j.append(
             run,
             JournalEvent::LoopGateAwaited {
                 node: node.clone(),
                 deadline,
-                prompt: LOOP_GATE_QUESTION.to_string(),
+                prompt: prompt.to_string(),
                 menu: options
                     .iter()
                     .map(|o| orchestrator_core::LoopGateOption {
@@ -2866,6 +3036,19 @@ pub(crate) mod tests {
             e.message.contains(&journaled.to_string()),
             "must name the size that would actually be JOURNALED ({journaled}), not the \
              one the operator typed: {}",
+            e.message
+        );
+        // **The WORDING, not only the number** — and it is a separate assertion because
+        // the byte count cannot see the discriminant. `Measured::AfterRedaction`'s only job
+        // is this explanation, and the size assertion above passes for BOTH values: with
+        // this arm switched to `AsGiven` the whole torii suite stayed green (measured),
+        // leaving an operator who typed 4,030 bytes told "5,580 bytes" with no reason —
+        // exactly the confusion `check_payload_size`'s own comment says the discriminant
+        // exists to prevent.
+        assert!(
+            e.message.contains("once redacted"),
+            "must explain WHY the row is bigger than what was typed, naming a transform \
+             this value really went through: {}",
             e.message
         );
         assert!(

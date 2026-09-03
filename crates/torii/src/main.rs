@@ -147,13 +147,21 @@ enum RunAction {
         #[arg(long, group = "payload_src", value_name = "PATH")]
         payload_file: Option<std::path::PathBuf>,
     },
-    /// Decide a `HumanGate` — approve, reject, or pick a named option
+    /// Decide a gate — a `HumanGate` or a `Loop`'s human gate
     ///
-    /// The typed counterpart to `run signal`. A `HumanGate` declares a menu, and this
-    /// picks one of it; `run signal` delivers arbitrary JSON to an `AwaitSignal` and is
-    /// refused on a gate. The menu is read from the journal — what the human was actually
+    /// The typed counterpart to `run signal`. A gate declares a menu, and this picks one
+    /// of it; `run signal` delivers arbitrary JSON to an `AwaitSignal` and is refused on
+    /// either gate kind. The menu is read from the journal — what the human was actually
     /// shown — not from the graph, so an undeclared option is refused here rather than
     /// terminally failing the node.
+    ///
+    /// TWO KINDS, ONE VERB. `list-paused` labels them `gate:` and `loop gate:`, and both
+    /// take this command. A `HumanGate` is an authored node whose options each carry an
+    /// outcome — complete the node, or fail it and cascade. A `Loop`'s human gate is asked
+    /// at a SYNTHESIZED path (`<loop>/<iteration>/__gate__`) that exists in no graph, and
+    /// its options instead decide whether the loop runs another iteration — so `list-paused`
+    /// is the only place to discover one, and its row carries the question as well as the
+    /// menu.
     ///
     /// `--as` records WHO decided. It is ATTRIBUTION, NOT AUTHENTICATION: it is whatever
     /// string you supply (defaulting to $USER), so it answers "who claimed to decide".
@@ -163,6 +171,21 @@ enum RunAction {
     /// and any CI job's command echo. Secret-shaped text is redacted before it is
     /// journaled, but that is a best-effort scrub by shape — a decision note is not a
     /// credential channel.
+    ///
+    /// A LOOP GATE RECORDS NO NOTE. Its journal row has no note field, so `--note` is
+    /// REFUSED rather than silently dropped — and `reject`, which always carries one as
+    /// `--reason`, is refused with it. Use `decide --option <name>` on that kind, and put
+    /// the reasoning wherever the loop's own output goes.
+    //
+    // The loop-gate paragraphs are not decoration: `list-paused` prints `loop gate:` rows
+    // and this help is the only place a row label maps to a verb. Left unswept, an operator
+    // reading this group's one-liner ("Decide a `HumanGate`") beside `run agent`'s ("a role
+    // the registry says a person fills") guesses the agent verb — which is the one command
+    // a loop gate refuses. Guarded by `cli.rs::gate_help_names_the_loop_gate_it_can_now_
+    // decide`, on BOTH this group help and `decide --help` (the two surfaces an operator
+    // may arrive at), in the shape `agent_help_names_the_question_list_paused_now_shows`
+    // established for exactly this recurring drift. That guard reads the BUILT binary's
+    // stdout — the sweep was missed by reading source, and found by running `--help`.
     Gate {
         // The enum and its verb→option mapping live in the LIBRARY (`cmd::gate`), not
         // here: this binary has no test module, and while the mapping sat in `dispatch`
@@ -173,10 +196,20 @@ enum RunAction {
     },
     /// Answer a human-backed `Agent` — a role the registry says a person fills
     ///
-    /// The third waiting kind. `run signal` delivers arbitrary JSON to an `AwaitSignal`,
-    /// `run gate` picks one of a `HumanGate`'s published options, and this delivers FREE
-    /// TEXT to an `Agent` node whose role is answered by a person instead of a model. Each
-    /// of the three refuses the other two and names the verb that would work.
+    /// FOUR WAITING KINDS, THREE VERBS. `run signal` delivers arbitrary JSON to an
+    /// `AwaitSignal`; `run gate` picks a named option, and serves BOTH gate kinds (an
+    /// authored `HumanGate` and a `Loop`'s human gate, which `list-paused` labels
+    /// `loop gate:`); and this delivers FREE TEXT to an `Agent` node whose role is answered
+    /// by a person instead of a model. Every verb refuses the kinds it does not serve and
+    /// names the one that would work, so a wrong guess costs a retype and never a durable
+    /// row nothing will read.
+    //
+    // The count is spelled out because it went stale silently: this paragraph said "the
+    // third waiting kind … each of the three" through the commit that added the fourth and
+    // gave THIS command a fourth refusal arm. An operator who counts three concludes the
+    // matrix is closed and that a `loop gate:` row must be one of the three they know.
+    // `cli.rs::agent_help_does_not_enumerate_the_waiting_kinds_as_three` keys on the stale
+    // enumeration itself, because that is the thing that rots.
     ///
     /// The answer becomes the node's OUTPUT under the same `text` key a model-backed agent
     /// produces — so it flows into downstream nodes and model prompts exactly as a model's

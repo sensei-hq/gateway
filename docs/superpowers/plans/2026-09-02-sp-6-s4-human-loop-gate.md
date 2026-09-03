@@ -2655,7 +2655,19 @@ where the flag went.
 **Files:**
 - Modify: `crates/torii/src/cmd/gate.rs` — `gate_menu` and `decide` learn the second event pair
 - Modify: `crates/torii/src/cmd/run.rs` — cross-refusals and `list-paused` rendering
-- Test: `crates/torii/src/cmd/gate.rs` and `crates/torii/src/cmd/run.rs` inline tests
+- Modify: `crates/torii/src/cmd/human.rs` — `answer`'s fourth cross-refusal arm
+- Modify: `crates/torii/src/render.rs` — the `loop gate:` cell, the labelled `question_cell`,
+  the conditional header
+- Modify: `crates/torii/src/main.rs` — the `Gate`/`Agent` group help (review round; see the
+  AS BUILT block at Step 3)
+- Test: `crates/torii/src/cmd/gate.rs`, `crates/torii/src/cmd/run.rs` and
+  `crates/torii/src/cmd/human.rs` inline tests; `crates/torii/tests/cli.rs` help guards
+
+> **The first two bullets were the whole list until the review round, and following it
+> literally stages 2 of the 4 files 8f09e25 actually changed** — the `loop gate:` cell lives
+> in `render.rs` and the fourth refusal arm in `human.rs`, so the resulting commit compiles
+> while `list_paused_renders_a_loop_gates_question_and_menu` is red. `git show --stat
+> 8f09e25` is the record: gate.rs +693, human.rs +65, run.rs +348, render.rs +133.
 
 `gate_menu` (`gate.rs:716`) already reads the menu from the **journal**, which is why this extends rather than rewrites.
 
@@ -2777,12 +2789,23 @@ Run: `cargo test -p sensei-torii -- loop_gate`
 Expected: **4 failures** — `decide` reports the node has not asked, because `gate_menu` reads only `GateAwaited`.
 
 **AS BUILT: 13 failures, 237 passing.** The sketch's four grew to fourteen tests (see the
-deviation list at Step 3) and every one of them was red first, for one of four reasons:
-`not delivered: lp/0/__gate__ is not awaiting a decision` (`gate decide`), `not awaiting a
-signal` (`run signal`), `not awaiting a human answer` (`run agent answer`), and `no AWAITING
-block at all` (`list-paused`). One test — the settled-gate refusal — passed on its exit code
-alone before the implementation and was therefore NOT a test: it was re-keyed on the word
-`already completed`, which reddened it.
+deviation list at Step 3). **The THIRTEEN that existed at this point were red first**, for
+one of four reasons: `not delivered: lp/0/__gate__ is not awaiting a decision`
+(`gate decide`), `not awaiting a signal` (`run signal`), `not awaiting a human answer`
+(`run agent answer`), and `no AWAITING block at all` (`list-paused`). One of the thirteen —
+the settled-gate refusal — passed on its exit code alone before the implementation and was
+therefore NOT a test: it was re-keyed on the word `already completed`, which reddened it.
+
+> **CORRECTION (review round).** This paragraph read "every one of them was red first" for
+> all fourteen, and that is not what happened — the arithmetic above says so on its own
+> face: 237 + 13 = 250, one short of the 251 the task ended at. The fourteenth,
+> `list_paused_reads_a_node_with_two_asks_as_the_gate_the_refusals_do`, did not exist yet at
+> Step 2; it was written during Step 3 against a property that was already correct, and it
+> is a MUTATION-proof rather than a red-first test — which is what Step 3's item 4 says, and
+> the two paragraphs could not both be true. Measured: ported verbatim into a worktree at
+> the parent commit 374542a it passes (`test result: ok. 1 passed; 0 failed`), because
+> pre-s4 `awaiting_section`'s `(Some(opts), _)` arm already rendered `gate: ship|hold` and
+> dropped the question.
 
 The `--as` redaction and the blank-actor guard were red without a mutation, because both
 append sites were reached through a branch that did not exist yet.
@@ -2859,20 +2882,97 @@ leaving it out would have shipped a defect the five items were silent about.**
 4. **`list-paused` renders a loop gate as `(options, question)` BOTH present**, which is the
    fourth `AwaitingNode` shape and the new discriminator. Three supporting changes:
    `question_cell` took a `label` parameter so the tail-reserve logic is not duplicated;
-   `awaiting_nodes` now fills the two fields from ONE source per node in menu-first order (so
-   `(Some, Some)` means a loop gate BY CONSTRUCTION, not by convention, even for a
-   hand-written journal that published two asks at one id); and the agent header line is
-   keyed on `question.is_some() && options.is_none()`, because keying it on the question
-   alone advertised `run agent answer` — the one verb a loop gate refuses — to a fleet whose
-   only waiting node was one. Both of the latter two were correct-but-unguarded when written
-   and were mutation-proved: reverting each reddens
-   `list_paused_renders_a_loop_gates_question_and_menu` and
-   `list_paused_reads_a_node_with_two_asks_as_the_gate_the_refusals_do` respectively.
+   `awaiting_nodes` now fills the two fields from ONE source per node (so `(Some, Some)`
+   means a loop gate BY CONSTRUCTION, not by convention, even for a hand-written journal
+   that published two asks at one id); and the agent header line is keyed on
+   `question.is_some() && options.is_none()`, because keying it on the question alone
+   advertised `run agent answer` — the one verb a loop gate refuses — to a fleet whose only
+   waiting node was one. Both of the latter two were correct-but-unguarded when written and
+   were mutation-proved: reverting the `awaiting_nodes` one-source fill reddens
+   `list_paused_reads_a_node_with_two_asks_as_the_gate_the_refusals_do`, and reverting the
+   agent-header pair key reddens `list_paused_renders_a_loop_gates_question_and_menu`.
+
+   > **CORRECTION (review round), twice over.** (a) The two test names were paired the WRONG
+   > way round — the sentence said "respectively" against the opposite order. Re-measured by
+   > mutating each site in the main tree: the independent-map fill reddens ONLY
+   > `list_paused_reads_a_node_with_two_asks…` (250 passed, 1 failed) and
+   > `let any_agent = …question.is_some()` reddens ONLY
+   > `list_paused_renders_a_loop_gates_question_and_menu` (250 passed, 1 failed). This is the
+   > exact defect class the slice keeps shipping: a doc naming a guard for a property that
+   > guard does not hold. (b) "in menu-first order" is gone from the sentence because the
+   > order itself was the bug — see the review-round block below.
 5. **The `--json` shape is additive and the `options`-first rule is what makes it so.** A
    loop gate serializes both keys; a script written against s2/s3 that tests `options` first
    still builds the right command for one. A script that tested `question` first would now
    reach for `agent answer`, so the precedence is stated on `AwaitingNode::options` rather
    than left implicit.
+
+**AS BUILT, REVIEW ROUND — four behaviour fixes and ten guards the task shipped without.**
+Three reviewers raised 19 findings at Minor or above against 66f7916; the ones that changed
+code or the record:
+
+6. **`cmd::human::answer` read the QUESTION first, so it did not screen a menu-bearing node
+   at all** — while `run signal`, `awaiting_section`'s cell match and `awaiting_nodes` all
+   read the MENU first, and three comments this task added claimed the rule held "in every
+   cross-refusal". Measured against a journal carrying a `LoopGateAwaited` and an
+   `AgentAwaited` at one id: exit 0, `answered: lp/0/__gate__`, an `AgentAnswered` journaled
+   at a path whose only reader is `run_human_loop_gate` (which reads `LoopGateDecided` and
+   nothing else) — never read, reported as delivered, i.e. exactly what the cross-refusals
+   exist to close. The reachable journal is that arm's case (b), one an embedder appended to
+   directly; the executor does not write the shape itself (it fails the gate loudly rather
+   than publishing a second ask, and `drive_agent`'s `!top_level` arm keeps a human-backed
+   role from producing an `AgentAwaited` inside a `Loop` body at all), and the fix's comment
+   says so rather than overclaiming a vector. Fixed by moving the `gate_menu` match ahead of
+   the `agent_question` check; guarded by
+   `an_answer_aimed_at_a_node_that_also_published_a_menu_is_refused_as_the_gate`.
+7. **The listing and `gate decide` disagreed on the OTHER two-ask journal.** `gate_menu` is
+   one `find_map` across both variants, so it is first-wins in JOURNAL order; item 4's
+   `awaiting_nodes` tried its loop-gate map FIRST and unconditionally. A `GateAwaited` then
+   `LoopGateAwaited` at one id listed as `loop gate: revise` while `decide` validated against
+   `ship|hold` and refused `revise` — a listing reciting a vocabulary the command rejects.
+   Fixed by deleting the parallel rule: `awaiting_nodes` now CALLS `gate_menu`, so there is
+   one resolver and no second order to drift. Guarded by
+   `the_listing_resolves_a_two_menu_journal_exactly_as_gate_decide_does`, which asserts
+   against `gate_menu`'s own answer in both journal orders rather than against a literal.
+8. **The post-append orphan message was false for a loop gate.** `(other, false)` said the
+   row "stays on the journal as a last-wins value that a re-`start` of this run would fold as
+   the node's answer" — true for `GateDecided`, false for `LoopGateDecided`, whose reader
+   replays a terminal verdict (step 0 a folded `NodeFailed`, step 1 `LoopGateSettled`) and
+   never re-reads a decision. Split per `PublishedMenu`; the loop wording says the row is
+   inert. Guarded in both directions by the s2 test (which now asserts the re-`start`
+   sentence IS present) and the new
+   `a_loop_gate_decision_the_settlement_beat_is_reported_as_inert_not_as_foldable`, the first
+   test to reach any post-append arm with a loop gate.
+9. **The operator-facing help was never swept.** `run gate --help` still read "Decide a
+   `HumanGate`" and `run agent --help` still enumerated "the third waiting kind … each of the
+   three" — in the commit that added the fourth kind and a fourth refusal arm to that very
+   command. An operator reading a `loop gate:` row had no surface mapping it to a verb, and
+   the natural guess (`agent`, since a loop gate IS backed by an agent role) is the one
+   command that refuses it. Both group helps and `AgentAction::Answer`'s own help now name
+   both gate kinds and the `--note` refusal; guarded by
+   `cli.rs::gate_help_names_the_loop_gate_it_can_now_decide` and
+   `agent_help_does_not_enumerate_the_waiting_kinds_as_three`, in the shape
+   `agent_help_names_the_question_list_paused_now_shows` established for this recurring drift.
+
+**And the guards for properties that were correct and held by nothing** — each added, then
+proved by mutating the source, watching the new test redden, and reverting:
+`a_secret_shaped_loop_gate_question_is_redacted_in_the_listing` (the SECOND
+`redact_question` call site; `prompt.clone()` left the whole package green, on the kind whose
+`## Context` half is the ITERATION OUTPUT);
+`a_hostile_loop_gate_option_name_cannot_forge_an_awaiting_row_or_move_the_cursor` and
+`an_overlong_loop_gate_menu_is_capped_so_it_cannot_wreck_the_block` (the new cell inherited
+`one_line` + `cap_chars` from the `gate:` arm and neither of its two named guards; proved
+independently, one mutation each);
+`an_overlong_loop_gate_question_is_capped_but_still_shows_the_ask` plus an empty-label
+assertion in `a_reserved_question_cell_is_still_bounded_and_falls_back_cleanly` (the `## Task`
+reserve's `0 + 2` branch is taken by every REAL loop gate and by no test — a probe showed
+every test reaching that arm passed `"agent: "`); the exact widened header line plus
+`a_gate_only_fleets_header_keeps_the_s2_wording` (forcing `any_loop_gate` either way left the
+suite green); the `--json` assertions on the fourth `AwaitingNode` shape; `contains("Loop's
+human gate")` on both cross-refusals (rewriting both arms to "a HumanGate" left the suite
+green — the per-kind split existed for the message and the message was unasserted); and
+`contains("once redacted")` / `!contains(…)` on the two actor-cap tests (swapping the two
+`Measured` discriminants left the suite green).
 
 - [x] **Step 4: Run to verify passing**
 
@@ -2881,11 +2981,17 @@ Run: `cargo test -p sensei-torii`
 AS BUILT: 251 lib + 24 cli, **0 failed**; `cargo test --workspace` 1636 passing (1622 + 14),
 0 failed; `clippy --workspace --all-targets -D warnings` and `fmt --check` clean.
 
-- [ ] **Step 5: Commit**
+REVIEW ROUND: 259 lib + 26 cli, 0 failed.
+
+- [x] **Step 5: Commit**
+
+Shipped as `8f09e25`, which staged FOUR files, not the two below. The command is corrected
+here so a re-run of this plan does not reproduce the omission.
 
 ```bash
 cargo fmt --all
-git add crates/torii/src/cmd/gate.rs crates/torii/src/cmd/run.rs
+git add crates/torii/src/cmd/gate.rs crates/torii/src/cmd/run.rs \
+        crates/torii/src/cmd/human.rs crates/torii/src/render.rs
 git commit -m "feat(torii): decide a loop gate
 
 gate_menu already read the menu from the JOURNAL rather than the graph,
