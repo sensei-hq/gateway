@@ -388,9 +388,10 @@ pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 /// Records the `max_tokens` each call carried, and HONOURS it in the usage it reports
 /// — `output_tokens = min(scripted_output, max_tokens)`.
 ///
-/// Both halves are load-bearing, and neither existing double has either. Every other
-/// adapter in this module logs `(model, prompt)` at most, so before this one **no test
-/// in the suite could see a clamp at all**.
+/// Both halves are load-bearing, and no other double in this module has either. The
+/// existing adapters record some slice of the prompt — the user text, the system text,
+/// or both — and `max_tokens` is read by none of them, so before this one **no test in
+/// the suite could see a clamp at all**.
 ///
 /// Recording is what lets a test assert the clamp was applied. Honouring is what makes
 /// "a budgeted run does not exceed its cap" a real end-to-end claim rather than an

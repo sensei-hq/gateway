@@ -292,13 +292,17 @@ pub fn est_tokens(s: &str) -> usize {
 /// a `## Context` section rendered from upstream outputs, and JSON tokenizes nearer 3
 /// chars/token. So `chars / 4` UNDER-counts precisely where these prompts are heaviest.
 ///
-/// Under-counting is harmless for `est_tokens`'s own caller — [`over_budget`], a
-/// window-fit check that logs and proceeds — and harmful for the budget clamp, which
-/// computes `max_tokens = remaining − est`: an estimate that is too low leaves an
-/// allowance that is too high, and the cap is overshot by the error. This function
-/// inverts the bias, so it is wrong in the direction of refusing early rather than
-/// overspending. It does not make the overshoot zero (the clamp design's §4 writes out
-/// the arithmetic); it bounds it by the remaining estimate error.
+/// The two estimates want OPPOSITE biases, which is why this is a second function and not
+/// a fix to the first. `est_tokens`'s callers — [`over_budget`] and the `est_prompt_tokens`
+/// diagnostic that reports its `est` — ask "will this prompt fit the window", and an
+/// over-count there halts a turn (`NodeFailed`) that would in fact have fitted. The budget
+/// asks "what is the worst this call can cost", and an under-count there is the expensive
+/// direction: the clamp computes `max_tokens = remaining − est`, so too low an estimate
+/// leaves too high an allowance and the cap is overshot by the difference.
+///
+/// So this one inverts the bias — it is wrong toward refusing early rather than toward
+/// overspending. It does not make the overshoot zero (the clamp design's §4 writes out the
+/// arithmetic); it bounds it by the remaining estimate error.
 ///
 /// `chars / 3` rather than a multiplier on `est_tokens`, so the two are independent: a
 /// later change to the window-fit heuristic must not silently move the budget's floor.

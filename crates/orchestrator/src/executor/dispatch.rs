@@ -253,11 +253,13 @@ impl Executor {
         //
         // The request is CLONED and the clone modified: `dispatch_metered` takes a
         // `&InferenceRequest` and the caller's copy must not change under it. That is
-        // safe for the memo fence because `input_hash` covers the SEMANTIC inputs
-        // (`{chain, system, user}` — see `support::input_hash` and its callers), not
-        // `max_tokens`, so a call whose clamp differs between drives still hashes
-        // identically and replays from its memo rather than raising
-        // `DeterminismViolation`.
+        // safe for the memo fence because every determinism key covers the SEMANTIC
+        // inputs and none of them covers a transport parameter: `support::input_hash`
+        // hashes `{chain}|{payload}`, `agent_input_hash` hashes
+        // `{chain}|{system}|{messages}|{tools}`, and the selector hashes
+        // `{chain}|{system,user}`. `max_tokens` appears in none of the three, so a call
+        // whose clamp differs between drives still hashes identically and replays from
+        // its memo rather than raising `DeterminismViolation`.
         let clamped;
         let request = match (meter.budget(), &request.payload) {
             (
@@ -270,8 +272,10 @@ impl Executor {
                 },
             ) => {
                 let est = est_input_tokens(system.as_deref(), messages, tools);
-                // `cap - spent` cannot underflow: the gate three lines up returned when
-                // `spent >= cap`, reading the same two values. It is left as a plain
+                // `cap - spent` cannot underflow: the gate at the top of this function
+                // returned when `spent >= cap`, reading the same two values (`cap` from
+                // `meter.budget()`, which is a plain field read, and this same `spent`
+                // local). It is left as a plain
                 // subtraction deliberately — that gate is the ONLY thing keeping it
                 // safe, and a `saturating_sub` here would silently absorb the bug if
                 // the gate were ever removed or reordered instead of panicking on it
