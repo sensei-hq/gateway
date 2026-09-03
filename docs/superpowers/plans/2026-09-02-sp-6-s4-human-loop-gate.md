@@ -2334,10 +2334,24 @@ async fn the_journaled_loop_gate_question_is_redacted() {
 > needed a fixture the module did not have: `exec_at`'s `recording_gateway` always answers
 > `"canned-response"`, and a gate's `## Context` **is** the iteration output — so a test that
 > cannot choose the body's answer can exercise neither bound. `exec_with_body_output` (a scripted
-> gateway, no `ContentStore`) is that fixture. The missing CAS is load-bearing, not laziness: with
-> one wired, the 37 KiB output exceeds the default 4096-byte `cas_threshold`, is journaled as a
-> `ContentRef`, and `run_loop` hands the gate a ref instead of the text — so the truncation would
-> never happen and the test would pass for the wrong reason.
+> gateway) is that fixture.
+>
+> **CORRECTED after review.** This note originally read: "The missing CAS is load-bearing, not
+> laziness: with one wired, the 37 KiB output exceeds the default 4096-byte `cas_threshold`, is
+> journaled as a `ContentRef`, and `run_loop` hands the gate a ref instead of the text — so the
+> truncation would never happen and the test would pass for the wrong reason." Three reviewers
+> independently disproved it by wiring an `InMemoryContentStore` and watching the module stay
+> green. The split is on the JOURNALED copy only: `run_map_child_modelcall` computes
+> `let recorded = self.split_output(&output)`, journals `recorded` and returns `output`, so the
+> drive that PRODUCES an iteration's output always hands `run_loop` the inline text however large
+> it was; only the memo arm materializes, back to the same text. The CAS is now WIRED into the
+> fixture and the truncation test asserts the journal really carried an `EffectOutput::Ref`, which
+> turns a false claim into a guarded true one — a CAS changes what is durable and nothing about
+> what the human is shown. (Dropping the store back out reddens that assertion on an `Inline` row,
+> so the probe is not decorative.) The same paragraph's "the two bounds tests below" was also
+> wrong: `exec_with_body_output` has ONE caller — the other bounds test uses `exec_at` and the
+> redaction test builds its own executor for `with_redactor`. Its unused `CallLog` return is
+> dropped.
 
 - [ ] **Step 2: Run, implement if needed, run again**
 
@@ -2493,9 +2507,17 @@ async fn a_decided_loop_gate_replays_from_the_journal_without_re_asking() {
 
 > **What actually shipped, and why the second test is not the sketch above.** The AC11 test
 > landed as written in spirit, with the effect assertion strengthened from a COUNT to the effect
-> list BY NODE (`effect_nodes(&events) == ["lp/0"]`): a count cannot distinguish "the gate
-> journaled an effect" from "the body ran twice", which are different defects with different
-> fixes. AC11's third clause — "no folded `usage`" — deliberately gets **no** assertion:
+> list BY NODE (`effect_nodes(&events) == ["lp/0"]`).
+>
+> **CORRECTED after review**: the reason given here and on the test was "a count cannot
+> distinguish 'the gate journaled an effect' from 'the body ran twice'". Both of those give a
+> length other than 1, so `len() == 1` catches both — it just cannot say WHICH. The shape a count
+> structurally cannot see is ONE effect at the WRONG node (`["lp/0/__gate__"]` passes
+> `len() == 1`), which this single drive cannot produce but a resume drive can, the body having
+> replayed from its memo. The by-node form is still the right assertion; the argument for it was
+> not.
+>
+> AC11's third clause — "no folded `usage`" — deliberately gets **no** assertion:
 > `Fold::usage` is written only from an `EffectRecorded`'s `usage` field and a `MapCompacted`
 > child's, so zero effects at the gate path IS zero folded usage there, and a separate assertion
 > would restate it.
@@ -2515,8 +2537,23 @@ async fn a_decided_loop_gate_replays_from_the_journal_without_re_asking() {
 >
 > | Mutation | Effect |
 > | --- | --- |
-> | force step 1's `fold.loop_gate_settled_with(node_id)` to `None` (the Critical's own mutation) | reddens **7** tests. The other six fail LOUDLY (a killed loop, a resurrected failure) because each re-derives with the deadline already blown; this one fails only on the settlement COUNT, with the converge, the pause and the call count all still green — the silent case none of them can reach |
+> | force step 1's `fold.loop_gate_settled_with(node_id)` to `None` (the Critical's own mutation) | reddens **7** tests. This one fails only on the settlement COUNT, with the converge, the pause and the call count all still green — the silent case none of the other six can reach |
 > | append a `LoopGateSettled` inside `decide_from_published_menu` (the plausible "keep the settlement fresh" edit, step 1 left intact) | reddens **this test and nothing else in the crate** — 389 passed, 1 failed |
+>
+> **CORRECTED after review.** The first row originally continued: "The other six fail LOUDLY (a
+> killed loop, a resurrected failure) because each re-derives with the deadline already blown."
+> Re-measured, the six break in three different ways and only three of them that way. THREE blow
+> the deadline (`a_converged_loop_is_not_re_killed_by_its_own_gates_stale_deadline` at +1 day,
+> `a_decision_honoured_inside_its_sla_survives_a_later_iterations_clock`,
+> `a_settled_gate_replays_while_a_later_iterations_gate_still_expires`). ONE never reaches the
+> clock — `a_settled_gate_replays_when_a_config_push_breaks_its_role` dies at step 2 on the edited
+> role, which is that test's whole subject. And TWO do not fail loudly at all:
+> `a_settled_loop_gate_with_no_published_menu_fails_loudly` and
+> `a_settled_loop_gate_naming_an_option_outside_its_menu_fails_loudly` carry a settlement but no
+> `LoopGateAwaited`, so with step 1 gone the gate takes `NotYetAsking` and ASKS — the run pauses on
+> a fresh question rather than refusing. The conclusion the row draws is unchanged and now rests on
+> the right fact: none of the six re-derives a settled gate INSIDE its SLA, so none can see a drive
+> whose visible behaviour is unchanged and whose journal is not.
 >
 > The second mutation is the one that earns the test its keep. Folding is first-wins, so a
 > duplicate settlement changes no decision and no outcome; it only contradicts
@@ -2535,6 +2572,13 @@ Both passed on the shipped arm, so each went in red-first by mutation. AC11's, i
 assertion at a time (the earlier ones were disabled in turn to reach the later ones): `paused:
 None` with `iterations: 3`, then `asks: 3 != 1`, then `effect_nodes: ["lp/0", "lp/1", "lp/2"] !=
 ["lp/0"]` — three iterations' tokens spent while the person was still being asked.
+
+**What that mutation is worth, re-measured after review.** It reddens **20 of this module's 29
+tests**, and against the shipped assertions it reddens `a_human_loop_gate_spends_no_tokens` on the
+FIRST one (the run completes with `converged: false` instead of pausing) and never reaches the
+effect list — the walk down the assertions above only happened because the earlier ones were
+disabled in turn. It is a real red-first for "a gate pause stops the loop"; it is not evidence for
+the by-node form, and neither the plan nor the test's doc should have paired the two.
 
 - [ ] **Step 3: Commit**
 
@@ -2556,6 +2600,50 @@ the pre-Critical wording and it is wrong: a decided gate replays from **`LoopGat
 and the difference is the whole of §4's fix — a replay re-derived from the decision has to pass the
 clock on the way, and the clock does not know the answer was already honoured. The shipped commit
 message says settlement.
+
+#### Review follow-up on Tasks 10 and 11 — twelve findings, and the two that mattered
+
+Three adversarial reviewers read the two commits above. Most findings were false claims in
+comments, corrected in place and marked as corrections rather than silently rewritten (see the
+CORRECTED blocks in this task and Task 10, and the `newly_journaled` note below). Two were
+substantive.
+
+**1. The re-pause arm was reached by NO test.** `Waiting(deadline)` + a published menu + NO
+decision is the state a run woken by the SP-DATA-3 scheduler is in on every wake between the ask
+and the answer — for an SLA measured in hours, nearly all of them — and every test in the module
+either answered the gate or let its deadline blow. Review proved it by replacing the arm's body
+with a bare failure and watching 390 tests stay green. Two properties the arm's own comments
+assert were therefore guarded by nothing: that it re-pauses on the RECORDED deadline (recomputing
+is the never-expires bug s1 shipped; dropping it is SP-DATA-3's never-auto-woken class), and that
+it re-pauses rather than re-asking. Closed by
+`an_undecided_loop_gate_re_pauses_without_re_asking` and
+`a_re_pause_carries_the_deadline_the_gate_recorded_not_a_fresh_one`, red-first against four
+mutations — bare-failure, `None` deadline, `now + timeout`, and republishing the ask (that last
+one reddens these two tests and nothing else in the crate). Source unchanged; the arm was right.
+
+**2. A secret leaked into two durable fields while being scrubbed in a third on the same write.**
+`LoopGateAwaited.menu` was appended straight from the graph and `pause_gate` built
+`RunPaused.reason` from the same names, while `prompt` — which quotes them through `gate_ask` —
+was redacted. Fixed at the append: the menu is scrubbed there and the scrubbed copy is what
+`pause_gate` is handed on both arms, so there is ONE vocabulary and resolution keeps matching
+journal against journal. A menu whose option names COLLIDE once redacted now fails the gate loudly
+rather than offering two options under one name — `find` would take the first, silently inverting
+a decision, which is what §5.3 journals the menu to prevent; it cannot be checked in
+`validate_dag`, which is pure over the graph and has no `Redactor`. `pause_gate` also runs the
+finished reason through the redactor as the write chokepoint, and its doc says plainly that this
+is forward-looking only: handing it the graph's menu again is green, so the scrub is not a second
+necessary defence today. Guarded by
+`a_credential_in_a_menu_option_name_never_reaches_the_journal` (which also proves the gate still
+WORKS — the decision is made with the name read back off the journal) and
+`a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly`. Design §6 and AC16 and
+`LoopGateAwaited`'s writer-obligation block all carry the new rule.
+
+**The `newly_journaled` phantom.** `fail_loop_gate`'s doc and
+`a_dead_loop_gate_stops_appending_node_failed_rows_on_every_wake`'s both described the flag in the
+present tense. It does not exist — deviation 1 above is recorded as REVERSED, and
+`LoopGateStep::Failed(String)`'s own doc explains why. Both sites now name
+`Executor::fail_loop`'s idempotent append, which is what actually holds the property, and say
+where the flag went.
 
 ---
 

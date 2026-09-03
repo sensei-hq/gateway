@@ -19618,16 +19618,24 @@ mod human_loop_gate {
     /// A gate that is DEAD stops writing to the journal: re-driving the run appends no
     /// further `NodeFailed`, for the gate node OR for the `Loop`.
     ///
-    /// **This guards the `LoopGateStep::Failed { newly_journaled }` flag, which is not in
-    /// the s4 plan's sketch and was added after measuring the defect.** A human gate's
-    /// failure is terminal — `run_human_loop_gate`'s step 0 reads the verdict back rather
-    /// than re-deriving it — but the run it kills journals no `RunCompleted`, so it stays
+    /// **This guards [`Executor::fail_loop`]'s idempotence, which is not in the s4 plan's
+    /// sketch and was added after measuring the defect.** A human gate's failure is
+    /// terminal — `run_human_loop_gate`'s step 0 reads the verdict back rather than
+    /// re-deriving it — but the run it kills journals no `RunCompleted`, so it stays
     /// resumable and every later wake (`torii run wake`, a scheduler retry, any re-`start`)
     /// re-drives the iteration and re-reaches the gate. Reading the GATE's verdict back was
     /// only half the fix: `run_loop` still wrapped it and called `fail_loop`, so the LOOP's
-    /// own row was appended per drive. Measured before the flag: 2 rows after the failing
+    /// own row was appended per drive. Measured before the guard: 2 rows after the failing
     /// drive, **3** after one more wake, growing without bound for a run that can never
     /// progress. That is the defect `gate_precheck` exists to prevent, one level out.
+    ///
+    /// (An earlier version of this sentence named a `LoopGateStep::Failed
+    /// { newly_journaled }` flag. That was the FIRST shipped shape and it is gone —
+    /// `Failed` carries a bare `String`, as its own doc says. The flag was a second claim
+    /// about the journal that could disagree with the first, and
+    /// `a_loop_whose_gate_died_without_the_loops_own_row_journals_it_on_the_next_drive`
+    /// exists because it did; the guard now lives on the append, where it is self-healing.
+    /// A doc naming a field the type does not have sends the next reader looking for it.)
     ///
     /// The gate is killed by expiry because that is the canonical way a loop gate dies; the
     /// ORDERING that expiry implies (AC8) and terminality against a late decision (AC9) are
@@ -21003,35 +21011,46 @@ mod human_loop_gate {
     }
 
     /// An executor whose loop BODY answers `body_text`, so a test can choose what the
-    /// human is asked to judge.
+    /// human is asked to judge — over a wired `ContentStore`, so the iteration output it
+    /// chooses is journaled the way a deployment with a CAS journals a model answer that
+    /// size.
     ///
     /// [`exec_at`]'s `recording_gateway` always answers `"canned-response"`, which suits
-    /// every test above — none of them cares what the iteration produced. The two bounds
-    /// tests below care about nothing else: a gate's `## Context` section IS the iteration
-    /// output, so a fixture that cannot choose it can exercise neither the truncation rule
-    /// nor the redaction one. One scripted response is enough because both fixtures pause
-    /// on iteration 0's gate and never reach iteration 1's body.
+    /// every test above — none of them cares what the iteration produced. Its ONE caller,
+    /// the truncation test below, cares about nothing else: a gate's `## Context` section
+    /// IS the iteration output, so a fixture that cannot choose it cannot exercise the
+    /// truncation rule at all. One scripted response is enough because that fixture pauses
+    /// on iteration 0's gate and never reaches iteration 1's body, and the clock is fixed
+    /// at `at(1_000)` and not handed back because it never crosses a deadline — a gate
+    /// that asks is a single-drive story.
     ///
-    /// No `ContentStore`/`ContextStore` is wired, and that is load-bearing rather than
-    /// lazy: with a CAS, the 37 KiB output below would exceed the default 4096-byte
-    /// `cas_threshold` and be journaled as a `ContentRef`, so `run_loop` would hand the
-    /// gate a ref instead of the text and the truncation this test is named for would
-    /// never happen. Inline is also what `exec_at` does, so the two fixtures differ in
-    /// exactly the gateway.
+    /// **The `ContentStore` is wired, and an earlier version of this doc argued at length
+    /// that leaving it out was load-bearing:** "with a CAS, the 37 KiB output below would
+    /// exceed the default 4096-byte `cas_threshold` and be journaled as a `ContentRef`, so
+    /// `run_loop` would hand the gate a ref instead of the text and the truncation this
+    /// test is named for would never happen." Three reviewers independently disproved it
+    /// by wiring one, and it is wired now with the caller asserting the split really
+    /// happened, so the sentence cannot come back.
     ///
-    /// The clock is fixed at `at(1_000)` like `exec_at`'s and is not handed back: neither
-    /// caller crosses a deadline — a gate that fails its bound and a gate that asks are
-    /// both single-drive stories.
+    /// It is false because the split is on the JOURNALED copy only.
+    /// `run_map_child_modelcall` computes `let recorded = self.split_output(&output)`,
+    /// journals `recorded`, and returns `output` — the inline value — so the drive that
+    /// PRODUCES an iteration's output always hands `run_loop` the text however large it
+    /// was. Only the memo arm materializes, and it materializes back to the same text. A
+    /// CAS therefore changes what is durable and nothing about what the gate is asked to
+    /// show a human, which is a property worth having under test rather than a hazard
+    /// worth avoiding: it is what makes the truncation rule mean the same thing on a
+    /// 4 KiB output and a 37 KiB one.
     async fn exec_with_body_output(
         journal: &InMemoryJournal,
         registry: Arc<Registry>,
         body_text: &str,
-    ) -> (Executor, CallLog) {
-        let (gw, calls) = scripted_gateway(vec![final_response(body_text)]).await;
-        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+    ) -> Executor {
+        let (gw, _calls) = scripted_gateway(vec![final_response(body_text)]).await;
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
             .with_registry(registry)
-            .with_clock(crate::test_support::FakeClock::new(at(1_000)));
-        (ex, calls)
+            .with_clock(crate::test_support::FakeClock::new(at(1_000)))
+            .with_content_store(Arc::new(orchestrator_store::InMemoryContentStore::new()))
     }
 
     /// AC15, the LOUD half — an oversized AUTHORED question fails the gate, and the `Loop`
@@ -21154,7 +21173,7 @@ mod human_loop_gate {
         // Past `MAX_HUMAN_CONTEXT_BYTES`, and so far past `MAX_HUMAN_TEXT_BYTES` that a
         // one-cap implementation cannot survive it: both bounds are exercised.
         let verbose = "L".repeat(orchestrator_core::MAX_HUMAN_CONTEXT_BYTES + 5_000);
-        let (ex, _calls) =
+        let ex =
             exec_with_body_output(&journal, human_registry(Some(Duration::hours(1))), &verbose)
                 .await;
 
@@ -21173,6 +21192,34 @@ mod human_loop_gate {
         );
 
         let events = journal.load(run).await.expect("loads");
+
+        // The body's output really was CAS-split, so what follows is asserted over the
+        // production shape and not over a fixture that dodged it. Named `Ref` rather
+        // than counted: an inline row would mean the threshold moved or the store was
+        // dropped, and either makes the paragraph on `exec_with_body_output` a claim
+        // about nothing.
+        let recorded: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::EffectRecorded { node, output, .. } => Some((node.clone(), output)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "one effect, iteration 0's body: {recorded:?}"
+        );
+        assert!(
+            matches!(recorded[0].1, orchestrator_core::EffectOutput::Ref(_)),
+            "a 37 KiB model answer is journaled as a ContentRef past the 4096-byte \
+             threshold — and the gate is STILL handed the text, because \
+             `run_map_child_modelcall` splits only the copy it journals and returns the \
+             inline one. That is the opposite of what this fixture's doc used to claim: \
+             {:?}",
+            recorded[0].1
+        );
+
         let asked = asks(&events);
         assert_eq!(asked.len(), 1, "exactly one question: {asked:?}");
         let prompt = &asked[0].1;
@@ -21340,11 +21387,22 @@ mod human_loop_gate {
     /// whether to spend more — a gate that itself cost tokens would be self-undermining,
     /// and one that cost tokens per WAKE would bill a run for a person's lunch break.
     ///
-    /// The assertion is the effect list BY NODE, not a count. A count cannot distinguish
-    /// "the gate journaled an effect" from "the body ran twice", and those are different
-    /// defects with different fixes. `["lp/0"]` says both things at once: the only effect
-    /// in the whole run is iteration 0's body, so the gate at `lp/0/__gate__` recorded
-    /// none, and nothing past iteration 0 ran while a person is still deciding.
+    /// The assertion is the effect list BY NODE, not a count. `["lp/0"]` says two things
+    /// at once: the only effect in the whole run is iteration 0's body, so the gate at
+    /// `lp/0/__gate__` recorded none, and nothing past iteration 0 ran while a person is
+    /// still deciding.
+    ///
+    /// **An earlier version of this paragraph justified that with an argument that does
+    /// not survive measurement**, and the correction is worth keeping because the shape of
+    /// it recurs: it said "a count cannot distinguish 'the gate journaled an effect' from
+    /// 'the body ran twice'". Both of those give a length other than 1, so `len() == 1`
+    /// catches both — it just cannot say WHICH, and having to re-read the journal to find
+    /// out is the real (smaller) cost. The one shape a count structurally cannot see is
+    /// ONE effect at the WRONG node: `["lp/0/__gate__"]` passes `len() == 1` and is
+    /// precisely what this AC forbids. This single drive cannot produce it (the body runs
+    /// live, so its effect is always there), but a resume drive can — the body replays
+    /// from its memo and journals nothing, leaving room for exactly one effect that should
+    /// not exist.
     ///
     /// **The "no folded `usage`" half of AC11 needs no separate assertion and gets none.**
     /// `Fold::usage` is written from exactly two places (`fold_journal`): an
@@ -21354,10 +21412,15 @@ mod human_loop_gate {
     /// enough to make it non-vacuous (`metered_gateway`) would still be measuring the
     /// BODY's usage.
     ///
-    /// Mutation-proven: turn `fanout.rs`'s `LoopGateStep::Paused(reason) => return
-    /// Ok(NodeExec::Paused { reason })` into `LoopGateStep::Paused(_) => false` — a pause
-    /// that does not stop the loop — and iterations 1 and 2 run while the person is still
-    /// being asked, giving three body effects and three gateway calls.
+    /// **The recorded mutation, and what it is honestly worth.** Turning `fanout.rs`'s
+    /// `LoopGateStep::Paused(reason) => return Ok(NodeExec::Paused { reason })` into
+    /// `LoopGateStep::Paused(_) => false` — a pause that does not stop the loop — does run
+    /// iterations 1 and 2 while the person is still being asked. But re-measured, it
+    /// reddens 20 of this module's 29 tests, and it reddens THIS one on the first
+    /// assertion (the run completes with `converged: false` instead of pausing), never
+    /// reaching the effect list at all. So it proves the pause propagates; it proves
+    /// nothing about the by-node form, and an earlier version of this paragraph implied
+    /// otherwise by pairing the two.
     #[tokio::test]
     async fn a_human_loop_gate_spends_no_tokens() {
         let journal = InMemoryJournal::new();
@@ -21428,14 +21491,29 @@ mod human_loop_gate {
     /// and the pair is the point:
     ///
     /// * Forcing step 1's `fold.loop_gate_settled_with(node_id)` to `None` — the Critical's
-    ///   own mutation — reddens six other tests in this module as well, all of them
-    ///   loudly (a killed loop, a resurrected failure). It also reddens this one, but only
-    ///   on the settlement count: at +45m the SLA has NOT been passed, so the arm re-reads
-    ///   the decision, the loop converges exactly as before and `after` pauses exactly as
-    ///   before. Every other assertion here stays green. That is the case the existing
-    ///   tests structurally cannot show, because each of them reaches its re-derivation
-    ///   with the deadline already blown (`a_converged_loop_is_not_re_killed_by_its_own_gates_stale_deadline`
-    ///   drives at +1 day) and so sees a loud failure instead.
+    ///   own mutation — reddens six other tests in this module as well. It also reddens
+    ///   this one, but only on the settlement count: at +45m the SLA has NOT been passed,
+    ///   so the arm re-reads the decision, the loop converges exactly as before and
+    ///   `after` pauses exactly as before. Every other assertion here stays green.
+    ///
+    ///   **The six break in three different ways, not one.** An earlier version of this
+    ///   bullet said "all of them loudly (a killed loop, a resurrected failure) … each of
+    ///   them reaches its re-derivation with the deadline already blown", and re-measuring
+    ///   contradicts it on both halves. THREE do blow the deadline
+    ///   (`a_converged_loop_is_not_re_killed_by_its_own_gates_stale_deadline` at +1 day,
+    ///   `a_decision_honoured_inside_its_sla_survives_a_later_iterations_clock`,
+    ///   `a_settled_gate_replays_while_a_later_iterations_gate_still_expires`). ONE never
+    ///   reaches the clock: `a_settled_gate_replays_when_a_config_push_breaks_its_role`
+    ///   dies at step 2 on the edited role, which is the whole point of that test. And TWO
+    ///   do not fail LOUDLY at all — `a_settled_loop_gate_with_no_published_menu_fails_
+    ///   loudly` and `a_settled_loop_gate_naming_an_option_outside_its_menu_fails_loudly`
+    ///   carry a settlement but no `LoopGateAwaited`, so without step 1 the gate takes the
+    ///   `NotYetAsking` arm and ASKS: the run pauses on a fresh question instead of
+    ///   refusing, which is a quieter failure than the one they are named for.
+    ///
+    ///   Either way the case below is the one they structurally cannot show: none of them
+    ///   re-derives a settled gate INSIDE its SLA, so none can see a drive whose visible
+    ///   behaviour is unchanged and whose journal is not.
     /// * Appending a `LoopGateSettled` inside `decide_from_published_menu` — the plausible
     ///   "keep the settlement fresh" edit, which leaves step 1 intact — reddens **this test
     ///   and nothing else in the crate**. Folding is first-wins, so a duplicate settlement
