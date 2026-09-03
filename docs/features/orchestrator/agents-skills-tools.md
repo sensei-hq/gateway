@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-2, SP-4, SP-6-3
+spec: SP-1, SP-2, SP-4, SP-6-3, SP-6-4
 source: crates/orchestrator*
 ---
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete) + SP-4 s1/s3/s4 + credential broker + SP-6-3).** Design §6/§9;
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete) + SP-4 s1/s3/s4 + credential broker + SP-6-3 + SP-6-4).** Design §6/§9;
 > config-source design
 > [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
 > **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
@@ -183,12 +183,33 @@ source: crates/orchestrator*
 > the human nothing), and a **non-positive or over-`MAX_AWAIT_SIGNAL_TIMEOUT` timeout**
 > (`None` is the way to wait indefinitely) — the same bound `Graph::validate_dag` applies to
 > the sibling waiting kinds, applied here because that pass is pure over the graph and never
-> sees the registry. At runtime the branch sits in `run_agent` **after** prompt assembly and
+> sees the registry. At runtime the branch sits in `drive_agent` **after** prompt assembly and
 > **before** `resolve_chain`, so the human's question reuses the model path's own
-> `assemble_prompt` rather than a second implementation that could drift, and zero token spend
-> is STRUCTURAL rather than measured. **Deferred:** tool use by a human-backed role,
+> `assemble_prompt_parts` rather than a second implementation that could drift, and zero token
+> spend is STRUCTURAL rather than measured. **Deferred:** tool use by a human-backed role,
 > multi-turn (one ask, one answer), human-as-fallback when a model declines, and per-use-site
 > SLA overrides.
+>
+> **SP-6 s4 — a human-backed role now has a SECOND use site, and the seam is shared.** The
+> registry side is unchanged (no new field, no new rule, no `config_agents` migration), but
+> `GateSpec::Human { agent, menu }` resolves an `AgentRef` the same way `NodeKind::Agent` does:
+> the role's `system_prompt` and activated skills compose the loop gate's question, and its
+> `backed_by: human { timeout }` is that gate's SLA. So the "one SLA per role, not per use
+> site" cost above is now paid at two sites rather than one, and the three human-backing rules
+> `Registry::validate` added at s3 (no declared `tools`/`grants`, a non-empty `system_prompt`, a
+> bounded `timeout`) govern a gate role exactly as they govern an agent-node one — they are
+> load-time facts about the ROLE, so no use site can opt out of them. Both callers
+> go through **one seam, `Executor::human_question_for`** (`executor/human.rs`), which resolves
+> the role, asserts the backing and returns `(question, timeout)` — s3's branch and s4's gate
+> arm cannot drift on what "the agent's prompt" means. Its SLA half, `human_sla_for`, is split
+> out deliberately: a loop gate is re-entered for every iteration on every wake of the run, so
+> composing eagerly there would cost N `assemble_prompt_parts` runs and N redaction passes over
+> up to `MAX_HUMAN_CONTEXT_BYTES` of iteration output, all discarded by an arm that then pauses.
+> **A MODEL-backed role named in a `GateSpec::Human` fails LOUDLY** — the mirror of the refusal
+> `drive_agent` gives a human-backed role at an illegal position, and for the same reason:
+> silence would let an author believe a person is in the loop while the run quietly decides for
+> itself. The seam returns `Err` rather than journaling, because its two callers differ on what
+> a failure means (s3 `?`-propagates; s4 turns it into a `NodeFailed` that fails the `Loop`).
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
