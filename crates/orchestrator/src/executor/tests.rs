@@ -11973,14 +11973,20 @@ async fn shell_stdout_is_redacted() {
 /// first call, so no call goes out at all and a test asserting anything about the
 /// `spent >= cap` gate never reaches it.
 ///
-/// So each of those fixtures had its token magnitudes multiplied by a common factor
-/// (10, or 800/150 where an exact boundary had to be preserved). Every ratio, call
+/// So each of those fixtures had its token magnitudes multiplied by a common factor —
+/// ten, except for `spending_exactly_the_cap_stops_the_run`, which needs its two calls
+/// to land exactly on the cap and so uses 16/3 (75→400 against 150→800). Every ratio, call
 /// count, pause site and reason string they assert is unchanged; only the absolute
 /// numbers moved, into the regime where the floor-trigger really is the binding
 /// constraint. This is the clamp design's §6 accepted cost — "a run can now pause
 /// where it previously completed" — meeting a suite written before a floor existed.
-/// The gate was not weakened to accommodate it; `the_budget_gate_still_stops_a_run_at_
-/// its_cap_after_the_clamp` re-proves it by mutation.
+///
+/// The gate itself was NOT weakened to accommodate any of this, and that was checked by
+/// mutation rather than asserted: delete the `spent >= cap` block from
+/// `dispatch_metered` and `a_fresh_budgeted_run_pauses_mid_drive_after_one_call` fails
+/// with "attempt to subtract with overflow" on the clamp's `cap - spent`. One thing the
+/// clamp DID cost is recorded on `spending_exactly_the_cap_stops_the_run`, whose
+/// `>=`-versus-`>` mutation no longer bites.
 fn run_started_with_budget(cap: u64) -> JournalEvent {
     JournalEvent::RunStarted {
         version: "v1".into(),
