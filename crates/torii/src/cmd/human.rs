@@ -514,7 +514,13 @@ pub async fn answer(
     // to report success.
     match signal_state(&events, &node) {
         SignalState::Awaiting { .. } => {}
-        other => return Ok(Outcome::precondition(not_delivered(&shown, &other))),
+        other => {
+            return Ok(Outcome::precondition(not_delivered(
+                &shown,
+                &other,
+                crate::cmd::run::CompletedResidue::LastWins,
+            )));
+        }
     }
 
     if before.status != RunStatus::Paused {

@@ -592,10 +592,26 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
     // The question takes the SAME `redact_question` scrub an agent's does. The executor
     // already scrubbed it before the `LoopGateAwaited` append, so this is a second pass and
     // not the first — see [`render::AwaitingNode::question`] for why the second is still
-    // owed. The menu does NOT need one: `run_human_loop_gate` redacts the option names
-    // before publishing them (and refuses a menu redaction would make ambiguous), so the
-    // journaled names are the scrubbed ones and re-scrubbing here could only produce a
-    // vocabulary that differs from the one `gate decide` matches against.
+    // owed: `Executor::with_redactor` is opt-in and defaults to `None`, so an embedder that
+    // wired none writes the question as composed.
+    //
+    // **The MENU deliberately gets no second pass, and that is a bounded gap rather than a
+    // guarantee.** The reason not to re-scrub is right: the menu is not display text, it is
+    // the VOCABULARY `gate decide` matches an operator's `--option` against
+    // (`published.iter().find(|o| o.name == decision.option)`), so a display-only scrub
+    // would offer names the decide path refuses. The scrub is therefore owed ENTIRELY by
+    // the executor at the `LoopGateAwaited` append, where `run_human_loop_gate` redacts the
+    // option names and refuses a menu redaction would make ambiguous.
+    //
+    // What this comment used to say — "so the journaled names are the scrubbed ones" — is
+    // true only when a redactor was wired, and it asserted the opposite precondition to the
+    // one its neighbour on the same struct states. Against a journal written by a library
+    // embedder with no redactor, `list-paused` renders the menu as stored while scrubbing
+    // the question beside it: the same author string clean in one cell and plaintext in the
+    // next, in the table and in `--json`, and recited again by `gate decide`'s bad-option
+    // refusal. Not reachable through torii's own boot, which wires `PatternRedactor`
+    // unconditionally (`boot.rs`), which is what keeps this a known limit rather than a
+    // live leak.
     let loop_prompts: HashMap<NodeId, String> = events
         .iter()
         .filter_map(|(_, e)| match e {
@@ -1019,7 +1035,13 @@ pub async fn signal(
     match signal_state(&events, &node) {
         SignalState::Awaiting { .. } => {}
         // Everything else is a no-op at the node, so say so instead of writing.
-        other => return Ok(Outcome::precondition(not_delivered(&shown, &other))),
+        other => {
+            return Ok(Outcome::precondition(not_delivered(
+                &shown,
+                &other,
+                CompletedResidue::LastWins,
+            )));
+        }
     }
     if before.status != RunStatus::Paused {
         // A `waking` row means a worker holds the lease and is folding this journal right
@@ -1200,6 +1222,43 @@ pub async fn signal(
     }
 }
 
+/// What a row delivered to an ALREADY-COMPLETED node will do, which is the one thing
+/// [`not_delivered`]'s terminal wording cannot state for every kind at once.
+///
+/// SP-6 s4's whole-slice review: `cmd::gate::decide`'s POST-append `orphan_residue` was
+/// deliberately split per kind because the `HumanGate` sentence is FALSE for a loop gate.
+/// The PRE-check refusal was not split, and went on asserting the same claim.
+#[derive(Clone, Copy)]
+pub(crate) enum CompletedResidue {
+    /// The node re-executes and re-reads its answer on every drive, so a later row really
+    /// would be folded: `AwaitSignal` (`run_await_signal` completes on any folded
+    /// payload), `HumanGate` (`run_human_gate` re-reads `GateDecided`) and a human-backed
+    /// `Agent` (`run_human_agent` re-reads `AgentAnswered`).
+    LastWins,
+    /// SP-6 s4: a loop gate does NOT. `run_human_loop_gate` reads a terminal verdict BACK
+    /// rather than re-deriving one — step 0 returns a folded `NodeFailed` forever, and
+    /// step 1 replays `LoopGateSettled` without ever consulting `LoopGateDecided` again —
+    /// so whichever marker made the node terminal wins permanently and a later row is
+    /// inert.
+    InertLoopGate,
+}
+
+impl CompletedResidue {
+    fn clause(self) -> &'static str {
+        match self {
+            CompletedResidue::LastWins => {
+                "the node has read its answer and a later signal would only sit in the \
+                 journal as a new last-wins value"
+            }
+            CompletedResidue::InertLoopGate => {
+                "the gate's decision has been honoured and replays from its settlement, so \
+                 a later decision would sit in the journal as inert residue that nothing \
+                 will ever fold"
+            }
+        }
+    }
+}
+
 /// The pre-check refusal text for a node that is not awaiting. Split out so the exact
 /// wording cannot drift between the state variants.
 /// `node` is the DISPLAY form (control characters already collapsed) — see `signal`.
@@ -1210,11 +1269,18 @@ pub async fn signal(
 /// text says "signal" where a gate would say "decision"; that is the price of one source
 /// of truth, and it is the cheaper half of the trade — the sentence that matters ("a
 /// terminal node never re-executes") is exactly the same fact in both commands.
-pub(crate) fn not_delivered(node: &str, state: &SignalState) -> String {
+///
+/// **The `Completed` arm is the one place that price was too high.** Its clause described
+/// what a late row DOES, and "a new last-wins value" is false for a loop gate — the same
+/// falsehood `decide`'s post-append `orphan_residue` was split to remove, left standing on
+/// the earlier path. So the caller supplies the clause as a [`CompletedResidue`] rather
+/// than the function guessing from a state that cannot tell the kinds apart. Everything
+/// else stays shared, because everything else really is the same fact.
+pub(crate) fn not_delivered(node: &str, state: &SignalState, residue: CompletedResidue) -> String {
     match state {
         SignalState::Completed => format!(
-            "not delivered: {node} already completed — the node has read its answer and a \
-             later signal would only sit in the journal as a new last-wins value."
+            "not delivered: {node} already completed — {}.",
+            residue.clause()
         ),
         SignalState::NotAwaiting => format!(
             "not delivered: {node} is not awaiting a signal — check the node id against \

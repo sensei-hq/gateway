@@ -114,6 +114,14 @@ pub(crate) fn fold_journal(
             // the one the run actually stopped on.
             JournalEvent::NodeFailed { node, error } => {
                 fold.failed.entry(node.clone()).or_insert(error.clone());
+                // SP-6 s4 review: the SET beside the first-wins verdict. `failed` answers
+                // "what did this run stop on"; this answers "is this exact row already
+                // written", which is the only question an idempotent append may ask. See
+                // `Fold::failure_messages`.
+                fold.failure_messages
+                    .entry(node.clone())
+                    .or_default()
+                    .insert(error.clone());
             }
             // The cascade-skip record, folded so `cascade_skip_from` appends each node's
             // `NodeSkipped` at most once ACROSS drives. It was a `_` catch-all until the

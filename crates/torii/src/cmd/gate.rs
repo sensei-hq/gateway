@@ -345,7 +345,21 @@ pub async fn decide(
             )));
         }
         SignalState::Awaiting { .. } => {}
-        other => return Ok(Outcome::precondition(not_delivered(&shown, &other))),
+        // The `Completed` clause is per-KIND, for the same reason the post-append
+        // `orphan_residue` below is: what a late row DOES differs between them, and the
+        // shared "a new last-wins value" sentence is FALSE for a loop gate. That split was
+        // made downstream and not here, so this path went on telling an operator that a
+        // row nothing will ever fold might be — the exact misdirection the other split
+        // exists to remove. Both wordings are asserted, so neither can drift back.
+        other => {
+            let residue = match menu {
+                PublishedMenu::Human(_) => crate::cmd::run::CompletedResidue::LastWins,
+                PublishedMenu::Loop(_) => crate::cmd::run::CompletedResidue::InertLoopGate,
+            };
+            return Ok(Outcome::precondition(not_delivered(
+                &shown, &other, residue,
+            )));
+        }
     }
 
     // Resolved over the option NAMES, which is the one thing the two menu kinds share —
@@ -3143,11 +3157,57 @@ pub(crate) mod tests {
              right: {}",
             out.text
         );
+        // …and it must say WHAT a late row would do, per KIND. The shared clause claimed
+        // "a new last-wins value", which is exactly what `run_human_loop_gate` does NOT
+        // do: step 1 replays `LoopGateSettled` and never re-reads `LoopGateDecided`. The
+        // POST-append `orphan_residue` was split for this reason and the PRE-check was
+        // not, so this path told an operator that a row nothing will ever fold might be —
+        // sending them to clean up after a decision with no reader.
+        assert!(
+            !out.text.contains("last-wins"),
+            "a settled loop gate's residue is INERT, not last-wins: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("inert residue"),
+            "…and the refusal says so, rather than merely omitting the false clause: {}",
+            out.text
+        );
         assert!(
             journaled_loop_decisions(&j, run, &loop_gate())
                 .await
                 .is_empty(),
             "a decision the executor will never re-read must not be written: {}",
+            out.text
+        );
+    }
+
+    /// The other side of the same split: a `HumanGate` DOES re-read `GateDecided` on every
+    /// drive, so its `Completed` refusal keeps the last-wins clause. Asserted as the
+    /// NEGATIVE of its sibling above, so a future edit cannot collapse the two back into
+    /// one sentence in either direction.
+    #[tokio::test]
+    async fn a_decision_on_a_completed_human_gate_keeps_the_last_wins_wording() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship", "reject"]).await;
+        j.append(run, JournalEvent::NodeCompleted { node: release() })
+            .await
+            .unwrap();
+
+        let out = decide(&s, &j, run, release(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("already completed") && out.text.contains("last-wins"),
+            "a `HumanGate` re-reads `GateDecided`, so a late row really would be folded: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("inert"),
+            "…which is the opposite of the loop gate's residue: {}",
             out.text
         );
     }

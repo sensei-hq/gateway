@@ -391,8 +391,8 @@ impl Executor {
         }
     }
 
-    /// Fail a `Loop` node: journal its `NodeFailed` — unless one is already recorded —
-    /// and return the matching [`NodeExec::Failed`]`{ output: None }`.
+    /// Fail a `Loop` node: journal its `NodeFailed` — unless this exact failure is already
+    /// recorded — and return the matching [`NodeExec::Failed`]`{ output: None }`.
     ///
     /// Colocating the append-then-return pairing keeps the invariant in ONE place, and
     /// the invariant is: **when `run_loop` returns `Failed`, this `Loop` has a
@@ -418,12 +418,34 @@ impl Executor {
     /// anything folding `NodeFailed`, and the `on_node_failed` hook never heard of it.
     /// Reading the fold is self-healing instead: the next drive writes the missing row.
     ///
-    /// This makes `run_loop` a SECOND reader of [`Fold::failed`], whose doc reserves it
-    /// for `gate_precheck`'s family. The fence that doc sets is about TERMINALITY — "may a
-    /// node kind treat a recorded failure as final?" — and this read does not ask that
-    /// question: the `Loop` still fails, on this drive's own verdict, whatever the map
-    /// says. It asks only "is that row already durable?", and the answer changes nothing
-    /// but an append.
+    /// **It asks whether THIS MESSAGE is already on the journal, not whether the node has
+    /// SOME failure row, and the difference is an SP-6 s4 review finding.** The guard
+    /// covers all three paths, but only the human-gate one is TERMINAL; the other two are
+    /// explicitly not (a `ModelCall` or `Agent` whose provider died re-attempts on resume).
+    /// `DriveState` is per-drive and `ready_nodes` consults no failure map, so a `Loop`
+    /// that failed once is re-driven, can succeed, and can later fail for a wholly
+    /// DIFFERENT reason. Presence-keyed, the guard suppressed that new row, leaving the
+    /// durable record attributing the run's death to a transient gateway error it had
+    /// recovered from — the real cause surviving only in the gate's own row and in the
+    /// in-process `RunOutcome`. "Self-healing: the next drive writes the missing row"
+    /// covers a MISSING row, not a CHANGED one.
+    ///
+    /// **And it reads [`Fold::failure_messages`], not [`Fold::failed`], which is the second
+    /// half of the same finding — found by breaking it.** The obvious repair was equality
+    /// against `failure_for`, and that trades the defect for its mirror: `failed` is
+    /// FIRST-wins by design, so once a stale cause sits there the new message never matches
+    /// and the append fires on EVERY wake, unbounded. Measured, not reasoned about. The set
+    /// answers the only question an idempotent append may ask.
+    ///
+    /// Guarded from both sides by
+    /// `a_loop_that_dies_of_a_new_cause_does_not_keep_reporting_the_old_one` (the new cause
+    /// lands, AND two further wakes append nothing) beside
+    /// `a_dead_loop_gate_stops_appending_node_failed_rows_on_every_wake`.
+    ///
+    /// Neither read makes a terminality claim: the `Loop` fails on this drive's own verdict
+    /// whatever either map says, and they decide only whether a row is written. That is why
+    /// this is not a loosening of [`Fold::failed`]'s fence, which is about which kinds may
+    /// treat a recorded failure as FINAL.
     pub(super) async fn fail_loop(
         &self,
         run: RunId,
@@ -431,7 +453,7 @@ impl Executor {
         message: String,
         fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        if fold.failure_for(node).is_none() {
+        if !fold.has_failure_message(node, &message) {
             self.append(
                 run,
                 JournalEvent::NodeFailed {
@@ -468,7 +490,18 @@ impl Executor {
     /// fails the Loop; a body pause pauses the Loop. Resume replays completed
     /// iterations (memo-hit, no re-spend) and recomputes the gate — a pure gate from
     /// the memoized output, a gate-agent from its memoized turns, a human gate from its
-    /// journaled `LoopGateDecided` — so it stops at the same iteration. The Loop's own
+    /// journaled **`LoopGateSettled`** — so it stops at the same iteration.
+    ///
+    /// **From the SETTLEMENT, never from `LoopGateDecided`**, and this clause named the
+    /// wrong event until the s4 whole-slice review. A decision folds LAST-wins so an
+    /// operator can correct it *before the run resumes*; a settlement is the line after
+    /// which "before" has passed, because the loop has already spent an iteration on the
+    /// strength of the answer. Re-deriving the gate from the decision is not a rewording —
+    /// it has to pass the CLOCK on the way, which is precisely how an already-honoured gate
+    /// came to re-expire and retroactively kill converged runs (the Critical §4 records).
+    /// See `run_human_loop_gate`'s step 1.
+    ///
+    /// The Loop's own
     /// `NodeStarted`/`NodeCompleted` are
     /// fold-guarded (like `run_map`) so a replayed completed Loop does not re-journal
     /// them.
