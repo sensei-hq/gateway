@@ -14356,6 +14356,118 @@ async fn a_budgeted_agent_turn_is_clamped_and_counts_its_system_and_tools() {
     );
 }
 
+/// The floor refusal's guidance survives a sibling that spends AFTER the pause.
+///
+/// `drive` does not stop when a node pauses — `for node in ready` marks the refusing
+/// node terminal and keeps going — so an INDEPENDENT sibling can dispatch afterwards and
+/// push the ledger past any absolute cap figure computed at the refusing call. That made
+/// the named raise stale exactly when the graph had a second ready node, and an operator
+/// applying it verbatim re-paused on the `Spent` arm, which named no figure at all: two
+/// manual round trips (`BudgetRaised` + `force_wake` each, because this pause is
+/// `resume_after: None`) to get one number.
+///
+/// The property is what a headroom guarantees and an absolute cannot: raising to the
+/// FINAL ledger plus the stated headroom unblocks the run. Asserted against `spend_of`,
+/// the same fold the gate uses, rather than against a figure parsed out of prose — the
+/// message wording may change, the arithmetic may not.
+///
+/// Declaration order is the whole trap: put the cheap node first and the old figure was
+/// correct, so a single-node or well-ordered fixture could never see this.
+#[tokio::test]
+async fn the_floors_guidance_holds_when_a_sibling_spends_after_the_pause() {
+    const CAP: u64 = 400;
+    // A double reporting 500 total against a clamp that allowed far less. Not a cheat:
+    // `max_tokens` bounds OUTPUT, while `total_tokens` includes the input the provider
+    // actually counted — which is exactly the residual §4 admits, where our pessimistic
+    // estimate still undershoots the real prompt. The sibling therefore spends past any
+    // absolute figure the refusing call could have named.
+    let (gateway, _calls) = metered_latency_gateway(
+        Some(kernel::types::cost::TokenUsage {
+            input_tokens: 400,
+            output_tokens: 100,
+            total_tokens: 500,
+        }),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    // Two INDEPENDENT nodes. `n1` is declared first and its 600-char prompt estimates at
+    // 200, leaving an allowance under the 256 floor; `n2` is cheap and dispatches after
+    // the pause, spending more.
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", &"x".repeat(600)),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("n2".into()),
+                kind: model_call("c", "hi"),
+                deps: vec![],
+            },
+        ],
+    };
+    let first = exec.start(run, &graph).await.expect("drives");
+    assert!(
+        first.paused.is_some(),
+        "n1 refuses below the floor: {first:?}"
+    );
+
+    let reason = first.paused.as_ref().map(|p| p.reason.clone()).unwrap();
+    let (final_spend, _) = crate::executor::spend_of(&journal.load(run).await.unwrap());
+    let est = 600u64.div_ceil(3);
+    let headroom = est + orchestrator_core::MIN_OUTPUT_TOKENS;
+
+    // 1. THE TRAP, executable. The absolute figure computable at the refusing call is
+    //    `spent_then + headroom`, and `spent_then` was 0 — the refusal happened before
+    //    anything dispatched. The sibling then spent, so that absolute is now BELOW the
+    //    ledger and applying it verbatim cannot possibly work. This is the assertion
+    //    that makes the staleness a fact rather than an argument.
+    let stale_absolute = headroom; // spent_then == 0
+    assert!(
+        stale_absolute < final_spend,
+        "the figure computable at refusal time ({stale_absolute}) must be demonstrably \
+         stale against the final ledger ({final_spend}) — otherwise this fixture is not \
+         exercising the defect at all"
+    );
+
+    // 2. The message must therefore state the requirement as HEADROOM ABOVE THE FINAL
+    //    SPEND, not as that absolute. This pins wording because the defect WAS wording:
+    //    the executor's arithmetic never changed, only what it tells an operator to do.
+    assert!(
+        reason.contains(&format!(
+            "exceed this run's final spend by at least {headroom}"
+        )),
+        "the floor refusal must state a headroom above the FINAL spend, which cannot go \
+         stale, rather than an absolute cap read mid-drive: {reason}"
+    );
+
+    // 3. And the guidance, applied, works.
+    journal
+        .append(
+            run,
+            JournalEvent::BudgetRaised {
+                new_total_tokens: final_spend + headroom,
+            },
+        )
+        .await
+        .unwrap();
+    let second = exec.start(run, &graph).await.expect("resumes");
+    assert!(
+        second.paused.is_none(),
+        "raising to the final spend plus the stated headroom must unblock the run, not \
+         re-pause it: {:?}",
+        second.paused
+    );
+}
+
 /// Below the floor the gate refuses, and **makes no gateway call**.
 ///
 /// Asserted on the call log, not on the outcome: a test that only checked the pause
@@ -14425,9 +14537,11 @@ async fn below_the_floor_the_gate_refuses_without_calling_the_provider() {
     assert_eq!(
         pause.reason,
         "budget: only 251 tokens left for output after the input estimate, below the \
-         256-token floor (0 of 261 spent); raise the cap to at least 266 with \
+         256-token floor (0 of 261 spent); the cap must exceed this run's final spend \
+         by at least 266 (≥ 266 if nothing else in this drive spends — independent \
+         nodes may still run after this pause and push it higher); raise it with \
          `torii run wake --budget-tokens N`",
-        "the floor's reason names the allowance, the floor and the raise it needs"
+        "the floor's reason names the allowance, the floor and the headroom it needs"
     );
 }
 
@@ -14495,8 +14609,10 @@ async fn an_estimate_larger_than_the_budget_does_not_wrap() {
         pause.reason,
         format!(
             "budget: only 0 tokens left for output after the input estimate, below the \
-             256-token floor (0 of 1 spent); raise the cap to at least {RAISE} with \
-             `torii run wake --budget-tokens N`"
+             256-token floor (0 of 1 spent); the cap must exceed this run's final spend \
+             by at least {RAISE} (≥ {RAISE} if nothing else in this drive spends — \
+             independent nodes may still run after this pause and push it higher); \
+             raise it with `torii run wake --budget-tokens N`"
         ),
         "the saturated allowance must not swallow the part of the estimate that \
          exceeded the budget: {pause:?}"
