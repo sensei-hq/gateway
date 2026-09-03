@@ -313,6 +313,21 @@ multi-iteration loop with a finite SLA. It also bounds `LoopGateDecided`'s LAST-
 correction reaches a gate right up to the drive that acts on it, and not after, so a loop cannot
 have its convergence point moved retroactively under work it has already done.
 
+**That bound was UNGUARDED until the whole-slice review, from both directions.** Two one-line
+mutations each left all 394 orchestrator lib tests green, `mod human_loop_gate` included, because
+every s4 journal in the suite held exactly one decision and one settlement — so both readings
+agreed: (a) re-reading `Fold::loop_gate_decision_for` inside `decide_from_published_menu`, the
+"use the live decision, it's the same thing" simplification its own doc forbids; and (b) flipping
+`fold_journal`'s `LoopGateSettled` arm to `insert` (LAST-wins), matching the `LoopGateDecided` arm
+two lines up. Both are now red:
+`a_correction_appended_after_the_settlement_cannot_move_a_converged_loop` appends a later
+`LoopGateDecided` **and** a later `LoopGateSettled` naming the opposite option to a loop that has
+already converged, and reddens on either mutation; the in-flight mirror
+`a_correction_to_an_earlier_gate_cannot_converge_a_loop_already_past_it` reddens on (a) with the
+shape this paragraph actually describes — iteration 1 already spent, a late `ship` for gate 0.
+Reachable because `cmd::gate::decide`'s settled-gate refusal is advisory and non-atomic, the
+library entry point bypasses it, and an embedder may append to the journal directly.
+
 Like every other waiting kind this node journals no `NodeStarted`/`NodeCompleted`, and so carries
 the family's known asymmetry: re-`start`ing an already-terminal run reports it in neither `outputs`
 nor `completed`. Pre-existing, not new.
@@ -515,6 +530,16 @@ and this slice's answer is yes.
     named a guard that did not hold its property. It now asserts the WORDING (`once redacted`), and
     its `HumanGate` sibling `an_oversized_actor_is_rejected_before_anything_is_journaled` asserts
     the NEGATIVE, so the asymmetry is pinned from both ends.
+    **Whole-slice review, a fourth sink and the one this criterion never named:** the FAILURE
+    MESSAGES. `fail_loop_gate`'s doc calls itself the point where "every one of them is redacted
+    at this single chokepoint" and named no guard, and deleting its `redact_text` line left all
+    394 orchestrator lib tests green — while the identical deletion in the s3 twin
+    `fail_human_agent` reddens its own test. `a_menu_whose_option_names_collide_once_redacted_
+    fails_the_gate_loudly` could not stand in, because `ambiguous_menu_message` interpolates the
+    already-redacted placeholder. Now
+    `a_credential_in_a_loop_gate_failure_message_never_reaches_the_journal`, through the
+    unmatched-option arm, whose message quotes the operator's own `--option` verbatim into a row
+    `gate_precheck` re-emits on every later drive.
 17. `torii run gate decide --node "{loop}/{i}/__gate__" --option <name>` decides a loop gate; a bad
     name recites the journaled menu; `run signal` and `run agent answer` refuse it, each naming the
     verb that would work. **SHIPPED.** `gate_menu` returns a `PublishedMenu::{Human,Loop}` and

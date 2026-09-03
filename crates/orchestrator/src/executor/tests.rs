@@ -21642,6 +21642,343 @@ mod human_loop_gate {
         );
     }
 
+    /// **The SETTLEMENT FENCE, from the direction nothing guarded: a row appended AFTER
+    /// the honouring drive must not move a convergence point already spent against.**
+    /// SP-6 s4 whole-slice review, Important.
+    ///
+    /// §5.7 states the rule — "a correction reaches a gate right up to the drive that acts
+    /// on it, and not after, so a loop cannot have its convergence point moved
+    /// retroactively under work it has already done" — and it is the SUCCESS mirror of the
+    /// Critical this slice already shipped once. Review mutation-proved it unguarded from
+    /// BOTH sides, each a one-liner and each a plausible "simplification":
+    ///
+    /// * **(a) re-reading the decision.** Inserting
+    ///   `let option = fold.loop_gate_decision_for(node_id).map(|d| d.option.as_str()).unwrap_or(option);`
+    ///   at the head of `decide_from_published_menu` — the exact re-read that function's
+    ///   own doc calls deliberate — left all 394 orchestrator lib tests green, `mod
+    ///   human_loop_gate` included. "Use the live decision, it is the same thing."
+    /// * **(b) LAST-wins settlement.** Flipping `fold_journal`'s `LoopGateSettled` arm from
+    ///   `.entry(node).or_insert_with(..)` to `.insert(node, option)` — matching the
+    ///   `LoopGateDecided` arm two lines up — also left everything green.
+    ///
+    /// `a_decided_loop_gate_replays_from_its_settlement_without_re_asking` cannot see
+    /// either: its journal holds exactly ONE decision and ONE settlement, so both readings
+    /// agree. This one appends both a later `LoopGateDecided` and a later
+    /// `LoopGateSettled` naming the OPPOSITE option, so the two readings disagree and the
+    /// disagreement is visible in the outcome.
+    ///
+    /// Reachable: `cmd::gate::decide`'s settled-gate refusal is explicitly advisory and
+    /// non-atomic, the library entry point bypasses it, and an embedder may append to the
+    /// journal directly. Under either mutation the finished loop silently un-converges and
+    /// pays for another iteration.
+    #[tokio::test]
+    async fn a_correction_appended_after_the_settlement_cannot_move_a_converged_loop() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let (ex, clock, calls) =
+            exec_at(&journal, human_registry(Some(Duration::hours(1))), t0).await;
+        // Loop-then-signal, so the converged run stays resumable and IS re-driven; a
+        // converged run with no downstream node finalizes from the fold and never
+        // re-enters the arm at all.
+        let graph = human_gated_loop_then_signal_graph(3);
+
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        journal
+            .append(run, decided(&gate(0), "ship", "jerry"))
+            .await
+            .expect("the decision lands");
+
+        clock.set(t0 + Duration::minutes(15));
+        let converged = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            converged.completed.contains(&lp()) && converged.failed.is_none(),
+            "precondition: the loop converged on `ship`: {converged:?}"
+        );
+        let calls_at_convergence = calls.lock().unwrap().len();
+
+        // The correction, in BOTH shapes, naming the CONTINUING option — after the drive
+        // that honoured `ship` and spent an iteration on the strength of it.
+        journal
+            .append(run, decided(&gate(0), "revise", "mallory"))
+            .await
+            .expect("a late decision lands");
+        journal
+            .append(
+                run,
+                JournalEvent::LoopGateSettled {
+                    node: gate(0),
+                    option: "revise".into(),
+                },
+            )
+            .await
+            .expect("and a late settlement with it");
+
+        clock.set(t0 + Duration::minutes(30));
+        let out = ex.start(run, &graph).await.expect("re-drives");
+
+        let o = out
+            .outputs
+            .get(&lp())
+            .unwrap_or_else(|| panic!("the Loop still produces its converged output: {out:?}"));
+        assert_eq!(
+            o["converged"],
+            serde_json::json!(true),
+            "the loop stays converged — the settlement is the line after which a \
+             correction has no say: {o}"
+        );
+        assert_eq!(
+            o["iterations"],
+            serde_json::json!(1),
+            "…and at the SAME iteration. A moved convergence point discards work already \
+             paid for: {o}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            calls_at_convergence,
+            "and nothing was spent re-opening it: a late `revise` that reached the arm \
+             would run iteration 1 through the gateway"
+        );
+        let events = journal.load(run).await.expect("loads");
+        assert_eq!(
+            asks(&events).len(),
+            1,
+            "and no second person was asked anything: {:?}",
+            rows(&events)
+        );
+    }
+
+    /// The same fence in flight rather than after the fact: a correction to gate 0 landing
+    /// while gate 1 is the pending ask must not converge the loop at gate 0.
+    ///
+    /// The sibling above catches both mutations on a loop that has already finished. This
+    /// one catches mutation (a) — re-reading `LoopGateDecided` in the replay — on the
+    /// shape §5.7's sentence actually describes: iteration 0 was answered `revise`, the
+    /// loop SPENT iteration 1 on that answer, and a later `ship` for gate 0 arrives. Under
+    /// the mutation the next drive replays gate 0 as `stop = true`, the `Loop` completes
+    /// reporting `iterations: 1`, and iteration 1's tokens are simply discarded — with the
+    /// person who is looking at gate 1's question never told it was withdrawn.
+    #[tokio::test]
+    async fn a_correction_to_an_earlier_gate_cannot_converge_a_loop_already_past_it() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let (ex, clock, _calls) =
+            exec_at(&journal, human_registry(Some(Duration::hours(1))), t0).await;
+        let graph = human_gated_loop_graph(3);
+
+        ex.start(run, &graph).await.expect("pauses on gate 0");
+        journal
+            .append(run, decided(&gate(0), "revise", "jerry"))
+            .await
+            .expect("the decision lands");
+
+        clock.set(t0 + Duration::minutes(20));
+        let second = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            second.paused.is_some() && second.failed.is_none(),
+            "precondition: iteration 1 ran and gate 1 is the pending ask: {second:?}"
+        );
+        let events = journal.load(run).await.expect("loads");
+        assert_eq!(
+            asks(&events)
+                .into_iter()
+                .map(|(n, ..)| n)
+                .collect::<Vec<_>>(),
+            vec![gate(0), gate(1)],
+            "precondition: gate 1 asked its own question"
+        );
+
+        // The late correction: gate 0's decision, changed to the STOPPING option, after
+        // the loop has already spent iteration 1 on the original answer.
+        journal
+            .append(run, decided(&gate(0), "ship", "mallory"))
+            .await
+            .expect("a late correction lands");
+
+        clock.set(t0 + Duration::minutes(40));
+        let out = ex.start(run, &graph).await.expect("re-drives");
+        assert!(
+            !out.completed.contains(&lp()),
+            "the loop must NOT converge at a gate it is already past: {out:?}"
+        );
+        assert!(
+            out.failed.is_none(),
+            "…and nothing fails — gate 0 is settled, gate 1 is inside its SLA: {out:?}"
+        );
+        assert!(
+            out.paused.is_some(),
+            "…the run is still waiting on gate 1's own question: {out:?}"
+        );
+        let events = journal.load(run).await.expect("loads");
+        assert_eq!(
+            asks(&events)
+                .into_iter()
+                .map(|(n, ..)| n)
+                .collect::<Vec<_>>(),
+            vec![gate(0), gate(1)],
+            "and gate 1 is still the ask an operator sees: {:?}",
+            rows(&events)
+        );
+    }
+
+    /// AC16's third sink, and the one `fail_loop_gate`'s own doc claims without naming a
+    /// guard: **every failure message this gate journals is redacted at that one
+    /// chokepoint.** SP-6 s4 whole-slice review, Important.
+    ///
+    /// Deleting `let message = self.redact_text(message);` from `fail_loop_gate` left all
+    /// 394 orchestrator lib tests green. Its s3 twin 42 lines below IS guarded — deleting
+    /// the identical line from `fail_human_agent` reddens
+    /// `human_agent::a_failure_message_is_redacted_before_it_reaches_the_journal`.
+    /// `a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly` cannot
+    /// stand in: `ambiguous_menu_message` interpolates the ALREADY-redacted placeholder,
+    /// so it passes with the scrub deleted.
+    ///
+    /// The arm used here is the unmatched-option refusal, whose message quotes the
+    /// operator's own `--option` verbatim — arbitrary by definition, since it matched
+    /// nothing in the menu. The resulting `NodeFailed` is durable, is read BACK by
+    /// `gate_precheck` on every later drive, and surfaces in `RunOutcome.failed` and
+    /// `torii run status`, so a credential landing there is the same class of leak s3's
+    /// `AgentAwaited.prompt` and this slice's own `LoopGateAwaited.menu` already shipped.
+    ///
+    /// The secret is assembled at RUNTIME: the Semgrep CWE-798 hook blocks a literal
+    /// credential-shaped fixture.
+    #[tokio::test]
+    async fn a_credential_in_a_loop_gate_failure_message_never_reaches_the_journal() {
+        let in_option = format!("sk-{}", "e".repeat(40));
+
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, graph) = exec_redacting(&journal, menu()).await;
+
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        journal
+            .append(run, decided(&gate(0), &in_option, "jerry"))
+            .await
+            .expect("a decision naming no published option lands");
+
+        let out = ex.start(run, &graph).await.expect("re-drives");
+        let (_node, message) = out
+            .failed
+            .clone()
+            .unwrap_or_else(|| panic!("an unmatched option fails the gate loudly: {out:?}"));
+        assert!(
+            !message.contains(&in_option),
+            "the returned failure carries the operator's raw `--option` in the clear: \
+             {message}"
+        );
+        assert!(
+            message.contains("[REDACTED]"),
+            "…and it says so, rather than silently dropping the value: {message}"
+        );
+
+        let journaled: Vec<String> = journal
+            .load(run)
+            .await
+            .expect("loads")
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::NodeFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !journaled.is_empty(),
+            "precondition: the refusal is durable, which is what makes it a leak"
+        );
+        assert!(
+            !journaled.iter().any(|e| e.contains(&in_option)),
+            "every durable `NodeFailed` on this path goes through the one chokepoint — \
+             `gate_precheck` re-emits this row on every later drive and `torii run status` \
+             prints it: {journaled:?}"
+        );
+    }
+
+    /// The one configuration of this node kind no test drove: an INDEFINITE SLA.
+    /// SP-6 s4 whole-slice review, Minor.
+    ///
+    /// Every `human_registry(..)` call in this module passed `Some(Duration::hours(1))`.
+    /// Review proved the gap by asserting `deadline.is_some()` at the top of `pause_gate`
+    /// and watching 394/394 stay green — so `RunPaused { resume_after: None }` (SP-DATA-3's
+    /// never-auto-woken class), `pause_gate`'s empty deadline suffix and the
+    /// `WaitState::Waiting(None)` re-pause were all unexercised here. Each of the three
+    /// sibling waiting kinds has such a test; `support.rs`'s
+    /// `a_deadline_less_loop_gate_records_that_it_began_asking` covers only the FOLD.
+    ///
+    /// It is not an exotic configuration. Design §7 argues an indefinite SLA is the
+    /// rational choice for THIS kind — under a finite one an ANSWERED gate still destroys
+    /// the run if no drive happens before the deadline, and neither named bound helps — so
+    /// an author following the spec's own reasoning lands exactly here.
+    #[tokio::test]
+    async fn an_indefinite_human_loop_gate_pauses_forever_and_still_converges() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, clock, calls) = exec_at(&journal, human_registry(None), at(1_000)).await;
+        let graph = human_gated_loop_graph(3);
+
+        let first = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            first.paused.is_some() && first.failed.is_none(),
+            "the gate asks and the run pauses: {first:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        let asked = asks(&events);
+        assert_eq!(asked.len(), 1, "one question: {asked:?}");
+        assert_eq!(
+            asked[0].3, None,
+            "journaled with NO deadline — the role's `backed_by: human` carries no timeout"
+        );
+        assert_eq!(
+            super::human_gate::paused_resume_afters(&events),
+            vec![None],
+            "…so the pause carries no `resume_after` either: this is SP-DATA-3's \
+             never-auto-woken class, and `force_wake` is the only thing that moves it"
+        );
+        let reason = pause_reasons(&events).pop().expect("a reason");
+        assert!(
+            reason.contains("revise") && reason.contains("ship"),
+            "the reason still recites the menu, so `run status` alone can be answered \
+             from: {reason}"
+        );
+        assert!(
+            !reason.contains("deadline"),
+            "…and it promises no deadline it does not have: {reason}"
+        );
+
+        // A second drive, arbitrarily later. Nothing expires, and nothing is re-asked.
+        clock.set(at(1_000) + Duration::days(30));
+        let second = ex.start(run, &graph).await.expect("re-drives");
+        assert!(
+            second.paused.is_some() && second.failed.is_none(),
+            "an indefinite gate cannot time out, however long the run lives: {second:?}"
+        );
+        assert_eq!(
+            asks(&journal.load(run).await.expect("loads")).len(),
+            1,
+            "and it re-pauses WITHOUT re-asking"
+        );
+
+        // And it is still answerable a month on.
+        journal
+            .append(run, decided(&gate(0), "ship", "jerry"))
+            .await
+            .expect("the decision lands");
+        let out = ex.start(run, &graph).await.expect("resumes");
+        assert!(out.completed.contains(&lp()), "the loop converges: {out:?}");
+        assert_eq!(
+            out.outputs[&lp()]["converged"],
+            serde_json::json!(true),
+            "on the option the person picked: {:?}",
+            out.outputs[&lp()]
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "one body call across all three drives — the gate itself spends nothing"
+        );
+    }
+
     /// Every `RunPaused.reason` this run journaled, in order.
     ///
     /// The DEADLINE half of the same event already has a shared scraper —

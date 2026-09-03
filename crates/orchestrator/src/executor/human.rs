@@ -1281,6 +1281,17 @@ impl Executor {
     /// after which "before" has passed — the loop has already spent an iteration on the
     /// strength of the answer, so a later correction must not move where it converged.
     ///
+    /// **That is a TEST, not only this paragraph**, and it was not until the whole-slice
+    /// review: inserting the re-read here left all 394 orchestrator lib tests green,
+    /// `mod human_loop_gate` included, because every s4 journal in the suite held exactly
+    /// one decision and both readings agreed. It reddens
+    /// `a_correction_appended_after_the_settlement_cannot_move_a_converged_loop` (a
+    /// converged loop un-converging under a late `LoopGateDecided`) and
+    /// `a_correction_to_an_earlier_gate_cannot_converge_a_loop_already_past_it` (the same
+    /// rule in flight, discarding an iteration already paid for). The FOLD's half of the
+    /// same fence — `LoopGateSettled` is first-wins, so a late settlement cannot do what a
+    /// late decision cannot — is pinned by the first of those two as well.
+    ///
     /// Both failures here are reachable only from a journal the executor did not write (a
     /// settlement with no ask, or with an option absent from the ask's menu), which is why
     /// they must fail rather than guess — the same argument the live arm makes.
@@ -1420,6 +1431,16 @@ impl Executor {
     /// reached the journal in plaintext, and because `fold.failed` is read back by
     /// `gate_precheck`, it was re-emitted on every later drive. Scrubbing once, where the
     /// journal write happens, is what makes a future arm safe by construction.
+    ///
+    /// **Guarded by `a_credential_in_a_loop_gate_failure_message_never_reaches_the_journal`,
+    /// and it was not until the whole-slice review.** Deleting the `redact_text` line below
+    /// left all 394 orchestrator lib tests green, while the identical deletion in the s3
+    /// twin `fail_human_agent` reddens
+    /// `human_agent::a_failure_message_is_redacted_before_it_reaches_the_journal`.
+    /// `a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly` cannot serve
+    /// as the guard: `ambiguous_menu_message` interpolates the ALREADY-redacted placeholder,
+    /// so it passes with the scrub gone. The guard uses the unmatched-option arm instead,
+    /// whose message quotes the operator's own `--option` verbatim.
     async fn fail_loop_gate(
         &self,
         run: RunId,
@@ -1504,6 +1525,11 @@ impl Executor {
 /// Each option is annotated with what picking it does to the LOOP. `stops` is the only
 /// thing a `LoopGateOption` carries beyond its name, and a menu of bare names would make a
 /// person guess which of `revise`/`ship` ends the run — a guess the type exists to remove.
+/// That annotation is pinned by `gate_ask_says_which_option_ends_the_loop`, on the EXACT
+/// rendered string: until the whole-slice review it was pinned by nothing in either lib
+/// crate — swapping the two arms left 394 orchestrator and 259 torii tests green, because
+/// the executor tests assert only that both NAMES appear and the one real assertion lived
+/// in a `DATABASE_URL`-gated e2e that returns early when the variable is unset.
 ///
 /// **One consequence, accepted deliberately:** the seam evaluates every skill's and tool's
 /// `activation.is_active` against this same string, so a gate role's `OnKeywords` skills
@@ -1835,6 +1861,46 @@ mod tests {
              redactor's whole-match never fired and key material reached the durable \
              `AgentAwaited.prompt`: {}",
             &out[..out.len().min(400)]
+        );
+    }
+
+    /// **The sentence that tells a person which option ENDS the run.** SP-6 s4 whole-slice
+    /// review, Minor.
+    ///
+    /// [`gate_ask`]'s per-option annotation had no unit or executor test. Swapping the two
+    /// arms — so `stops: true` renders "run another iteration" and `stops: false` renders
+    /// "stop the loop" — left all 394 orchestrator lib tests and all 259 torii lib tests
+    /// green. The only assertion in the repo was in `torii/tests/e2e_pg.rs`, which returns
+    /// early printing SKIP whenever `DATABASE_URL` is unset, so the house workflow
+    /// `cargo test --workspace` was green over the inversion on any DB-free box.
+    ///
+    /// The annotation is the whole justification for `LoopGateOption.stops` existing on the
+    /// human-facing side: a menu of bare names "would make a person guess which of
+    /// `revise`/`ship` ends the run". Inverted, every operator is told the opposite of what
+    /// their pick does, in a slice whose only purpose is that a person decides. The lib
+    /// tests that touch the prompt assert only that both names appear, which holds either
+    /// way.
+    ///
+    /// Asserted as the EXACT string, not by `contains`: `gate_ask` is pure, its output is
+    /// durable in `LoopGateAwaited.prompt`, and the annotation is the part a `contains`
+    /// check on the names cannot see. `gate_ask`'s own doc advertises it as "pure and
+    /// unit-testable without an executor"; this is that claim cashed in.
+    #[test]
+    fn gate_ask_says_which_option_ends_the_loop() {
+        let menu = vec![
+            LoopGateOption {
+                name: "revise".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "ship".into(),
+                stops: true,
+            },
+        ];
+        assert_eq!(
+            gate_ask(&menu),
+            "Review the iteration output above and choose one: `revise` (run another \
+             iteration), `ship` (stop the loop).",
         );
     }
 
