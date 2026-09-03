@@ -21513,4 +21513,182 @@ mod human_loop_gate {
              reaches no gateway at all"
         );
     }
+
+    /// Every `RunPaused.reason` this run journaled, in order.
+    ///
+    /// The DEADLINE half of the same event already has a shared scraper —
+    /// [`super::human_gate::paused_resume_afters`], `pub(super)` precisely so that all
+    /// four waiting kinds assert on one filter — and this module uses it rather than
+    /// copying it. Nothing scrapes the REASON, which is the other half: the sentence
+    /// `torii run status` prints, and the only place a paused run says WHAT it is waiting
+    /// for and what the answers are.
+    fn pause_reasons(events: &[(Seq, JournalEvent)]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::RunPaused { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The single most-travelled drive in the slice: a wake while the person has NOT
+    /// answered yet. The gate RE-PAUSES — it does not re-ask, does not fail, and does not
+    /// spend.
+    ///
+    /// **Every other test in this module either answers the gate or lets its deadline
+    /// blow.** `a_decision_after_the_deadline_does_not_continue_the_loop` re-drives past
+    /// the SLA and takes the `Expired` arm;
+    /// `a_role_edited_to_model_backed_mid_wait_fails_a_drive_that_does_not_ask` re-drives
+    /// inside it but dies two steps earlier, at the SLA read. So the `Waiting` +
+    /// published-menu + NO-decision arm — the state a run woken by the SP-DATA-3
+    /// scheduler is in on every wake between the ask and the answer, which for a human
+    /// SLA measured in hours is nearly all of them — was reached by nothing. Review
+    /// proved it: replacing the arm's `pause_gate` call with a bare
+    /// `Ok(LoopGateStep::Failed(..))` left the whole lib suite green.
+    ///
+    /// The two things it pins are the two the arm's own comment claims:
+    ///
+    /// * **It re-pauses rather than re-asking.** Journaling a second `LoopGateAwaited` is
+    ///   the plausible edit ("republish the question so `list-paused` is fresh"), and it
+    ///   is the one the arm's comment rejects: `Fold::deadlines` folds FIRST-wins, so the
+    ///   republished row's deadline is silently ignored while the durable log grows a
+    ///   contradictory claim per wake, for the life of the wait.
+    /// * **It re-offers the PUBLISHED menu**, so what `run status` invites an operator to
+    ///   pick from is what their answer will be validated against (§5.3). Asserted on the
+    ///   reason string because that is the only operator-visible carrier of it on a
+    ///   re-pause — no second `LoopGateAwaited` is written, by the rule above.
+    ///
+    /// The deadline the re-pause carries is the sibling test's subject, not this one's.
+    #[tokio::test]
+    async fn an_undecided_loop_gate_re_pauses_without_re_asking() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let (ex, clock, calls) =
+            exec_at(&journal, human_registry(Some(Duration::hours(1))), t0).await;
+        let graph = human_gated_loop_graph(3);
+
+        // Drive 1 — iteration 0's body runs and the gate asks.
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        let calls_after_asking = calls.lock().unwrap().len();
+
+        // Drive 2, at +15m and with NOTHING appended in between: the person has not
+        // answered, and the SLA has not run out.
+        clock.set(t0 + Duration::minutes(15));
+        let out = ex.start(run, &graph).await.expect("re-drives");
+        assert!(
+            out.failed.is_none(),
+            "a wake with no answer yet is the ORDINARY case, not a failure — the SLA has \
+             not run out and nothing is wrong: {out:?}"
+        );
+        assert!(
+            out.paused.is_some(),
+            "…the run is still waiting on the person: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        assert_eq!(
+            asks(&events).len(),
+            1,
+            "the question was published ONCE. A re-ask would fold first-wins against the \
+             deadline the FIRST row recorded, so the second row's would be silently \
+             ignored — a durable claim the executor does not act on, appended on every \
+             wake of a wait that may last days: {:?}",
+            rows(&events)
+        );
+        let reasons = pause_reasons(&events);
+        assert_eq!(
+            reasons.len(),
+            2,
+            "one `RunPaused` per drive, so `torii run status` is answering about THIS \
+             wake: {reasons:?}"
+        );
+        assert!(
+            reasons[1].contains("revise") && reasons[1].contains("ship"),
+            "the re-pause re-offers the menu it PUBLISHED, so an operator can answer from \
+             `run status` alone rather than going to the graph for the option names — and \
+             what they are invited to pick is what the decision will be validated \
+             against: {}",
+            reasons[1]
+        );
+        assert_eq!(
+            reasons[0], reasons[1],
+            "…in the SAME sentence the asking drive used. `pause_gate` exists so the two \
+             arms cannot drift, and an operator polling a wait must not see the wording \
+             change under them with nothing having happened"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            calls_after_asking,
+            "and the wake cost nothing: iteration 0's body replays from its memo and the \
+             gate reaches no gateway at all. A gate billed per WAKE would charge the run \
+             for the person's lunch break"
+        );
+    }
+
+    /// A re-pause re-arms the scheduler on the deadline this gate RECORDED — never on
+    /// `now + timeout`.
+    ///
+    /// **This is the never-expires bug s1 shipped, at s4's site.** `RunPaused.resume_after`
+    /// is what `Scheduler::record` writes to `scheduled_runs.next_wake`, so it decides when
+    /// the run is woken next, and there are two ways to get it wrong here — both of which
+    /// review found unguarded, and both of which leave every other assertion in this module
+    /// green:
+    ///
+    /// * **Recomputed** (`now + timeout`): every early wake pushes the wake instant
+    ///   forward by the whole SLA, so a run polled more often than its timeout is never
+    ///   woken AT its deadline. The two later drives below are at +15m and +30m against a
+    ///   1h SLA, so a recomputing arm writes three DIFFERENT instants and this assertion
+    ///   reads them off in order.
+    /// * **Dropped** (`None`): SP-DATA-3's never-auto-woken class. `scheduled_runs` gets a
+    ///   NULL `next_wake`, `Scheduler::tick` never claims the run again, and the SLA that
+    ///   exists to bound how long a loop waits on a person fires only if an operator
+    ///   happens to `force_wake` it.
+    ///
+    /// Note what this does NOT claim: the gate's own EXPIRY is unaffected by either
+    /// mutation, because `wait_or_expire_by_id` reads `Fold::deadline_for` — the
+    /// first-wins `LoopGateAwaited.deadline`, asserted below — and not this field. The
+    /// damage is entirely to WHEN the run is next driven, which is why it takes a
+    /// journal-level assertion to see it at all.
+    #[tokio::test]
+    async fn a_re_pause_carries_the_deadline_the_gate_recorded_not_a_fresh_one() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let sla = Duration::hours(1);
+        let (ex, clock, _calls) = exec_at(&journal, human_registry(Some(sla)), t0).await;
+        let graph = human_gated_loop_graph(3);
+
+        // Three drives, none of them answering and none of them past the SLA — the shape
+        // of a run woken early, twice.
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        clock.set(t0 + Duration::minutes(15));
+        ex.start(run, &graph).await.expect("re-drives");
+        clock.set(t0 + Duration::minutes(30));
+        let out = ex.start(run, &graph).await.expect("re-drives");
+        assert!(
+            out.paused.is_some() && out.failed.is_none(),
+            "all three drives are inside the SLA and none of them has an answer: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        let recorded = t0 + sla;
+        assert_eq!(
+            asks(&events).iter().map(|a| a.3).collect::<Vec<_>>(),
+            vec![Some(recorded)],
+            "the gate recorded ONE deadline, at the instant it first asked"
+        );
+        assert_eq!(
+            super::human_gate::paused_resume_afters(&events),
+            vec![Some(recorded); 3],
+            "…and every pause re-arms the scheduler on THAT instant. A recomputed \
+             `now + timeout` would read {:?} and {:?} on the two later drives — each early \
+             wake pushing the SLA out by another hour — and a dropped deadline would read \
+             `None`, which is SP-DATA-3's never-auto-woken class: the run would sit \
+             waiting until somebody force-woke it",
+            Some(t0 + Duration::minutes(15) + sla),
+            Some(t0 + Duration::minutes(30) + sla),
+        );
+    }
 }
