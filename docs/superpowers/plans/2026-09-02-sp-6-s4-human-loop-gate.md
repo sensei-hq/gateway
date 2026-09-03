@@ -2328,11 +2328,37 @@ async fn the_journaled_loop_gate_question_is_redacted() {
 
 > **Note:** the Semgrep CWE-798 pre-commit hook blocks literal credential-shaped fixtures. Assemble the secret at runtime as shown — never inline the full string.
 
+> **What actually shipped.** The three tests landed under the names above except the truncation
+> one, which is `a_verbose_iteration_output_truncates_the_question_instead_of_killing_the_gate`
+> (the sketch's name lost the "instead of killing" half, which is the whole claim). They also
+> needed a fixture the module did not have: `exec_at`'s `recording_gateway` always answers
+> `"canned-response"`, and a gate's `## Context` **is** the iteration output — so a test that
+> cannot choose the body's answer can exercise neither bound. `exec_with_body_output` (a scripted
+> gateway, no `ContentStore`) is that fixture. The missing CAS is load-bearing, not laziness: with
+> one wired, the 37 KiB output exceeds the default 4096-byte `cas_threshold`, is journaled as a
+> `ContentRef`, and `run_loop` hands the gate a ref instead of the text — so the truncation would
+> never happen and the test would pass for the wrong reason.
+
 - [ ] **Step 2: Run, implement if needed, run again**
 
 Run: `cargo test -p sensei-orchestrator -- oversized_authored_prompt_fails_the_loop_gate verbose_iteration_output_truncates journaled_loop_gate_question_is_redacted`
 
 Expected: **all pass** if Task 6 used `question.authored_bytes` and `redact_and_clamp` as specified. If the redaction test fails, the arm is appending `question.text()` directly — route it through `redact_and_clamp`.
+
+**All three passed on the shipped arm, so each went in red-first by MUTATION** — a test that has
+never failed is not yet a test. The three mutations, each run and reverted:
+
+| Test | Mutation in `executor/human.rs` | Observed red |
+| --- | --- | --- |
+| `an_oversized_authored_prompt_fails_the_loop_gate` | `authored_bytes > MAX_HUMAN_TEXT_BYTES` → `> usize::MAX` | the gate journaled the 4 KiB-plus question and **paused** instead of failing |
+| `a_verbose_iteration_output_truncates_…` | pass `iteration_output` as the seam's `input` instead of as a `context` entry — the reversal the plan's own Task 6 sketch had | `"authored prompt is 37861 bytes, over the 4096-byte limit"` **on an ordinary body output** |
+| `the_journaled_loop_gate_question_is_redacted` | `redact_and_clamp(\|t\| self.redact_text(t), …)` → `redact_and_clamp(\|t\| t, …)` | `sk-…` from the role's `system_prompt` and from a skill body in the journal in plaintext |
+
+The third mutation also **proved the test's own doc claim**: under it the ITERATION-OUTPUT secret
+was still `[REDACTED]` (the shared `model_output` chokepoint had already scrubbed it) while the two
+AUTHORED secrets leaked. So the discriminating half of that test is the `system_prompt` and the
+skill body, which pass through no other scrub — and the output secret is the guard that composing
+the question does not RE-introduce plaintext the chokepoint removed.
 
 - [ ] **Step 3: Reconcile the journal-variant docs with what actually shipped**
 
@@ -2348,6 +2374,30 @@ behaviour and correct whichever is wrong. A doc that promises a bound the code d
 is worse than no doc — that is the Task 1 finding pattern this slice keeps hitting. In
 particular, confirm that `actor` really is redacted (nothing in Task 10's three tests above
 asserts it — add a fourth if the shared seam does not make it structural).
+
+**What the reconciliation found — and the one finding that leaves the slice.**
+
+`LoopGateAwaited.prompt`'s doc was accurate; it now also names the three guards and the mutation
+each one is proof against, and drops the "ahead of any code that honours them" framing, which was
+true when Task 3 wrote it and is not now.
+
+`LoopGateDecided.actor`'s doc was accurate as an OBLIGATION and misleading about who owes it, and
+**no fourth test was added, because there is nothing in this crate to assert.** The seam does not
+make actor-redaction structural; the executor never touches the field. `run_human_loop_gate` reads
+only `option` off `LoopGateDecided` — verified by grep across `crates/` — and interpolates the
+actor into no failure message and no node output. That is the opposite of both siblings, which is
+why the assumption is easy to make: `GateDecided.actor` IS interpolated by `run_human_gate` into
+its rejection `NodeFailed` (so it crosses `fail_gate`'s redacting chokepoint), and
+`AgentAnswered.actor` becomes half the node's output and is redacted there. A loop gate's actor is
+written once and read only by an operator surface.
+
+**So AC16's actor half is Task 12's, and it must be ADDED there rather than inherited.**
+`cmd::human::answer` redacts `--as` (`redact_answer`); `cmd::gate::decide` — the verb Task 12
+extends to write `LoopGateDecided` — deliberately does **not**, and says so at `gate.rs`'s
+`Measured::AsGiven` comment, on the ground that `GateDecided.actor` goes through no redaction.
+Bolting the loop-gate branch onto that path therefore inherits an unredacted actor silently, which
+is precisely how the s3 leak happened. Task 12's Step 3 now carries this as a numbered
+requirement; design §6 and AC16 carry the reasoning.
 
 - [ ] **Step 4: Commit**
 
@@ -2609,6 +2659,26 @@ pub(crate) enum PublishedMenu {
 3. `run.rs`'s `signal` and `agent answer` gain a `LoopGateAwaited` arm in their state check, refusing with `run gate decide`.
 
 4. `render::awaiting_section` gains a loop-gate arm showing the question and menu.
+
+5. **The loop-gate branch REDACTS `actor` before appending, and is tested for it (AC16's second
+   half).** Carried here by Task 10 Step 3, which found the property unownable in the executor:
+   `run_human_loop_gate` reads only `option` off `LoopGateDecided` and puts the actor in no message
+   and no output, so unlike `GateDecided.actor` (interpolated into `run_human_gate`'s rejection
+   `NodeFailed`, and so scrubbed on the way out by `fail_gate`) and unlike `AgentAnswered.actor`
+   (redacted as half the node's output), nothing downstream is a second line of defence. Whatever
+   is appended here is what an audit reads forever.
+   **It cannot be inherited from the existing `decide` path**, which is the trap: `decide` measures
+   the actor `Measured::AsGiven` precisely because it does not redact it, while `cmd::human::answer`
+   *does* (`redact_answer`, added by s3's whole-slice review after an unredacted `--as` turned out
+   to be a real plaintext leak on this exact field). Follow `answer`'s order, which s3 also had to
+   fix: **redact first, then size-check**, because `[REDACTED]` is longer than the shortest span it
+   replaces and a value that fitted before can exceed the cap after — and switch the loop-gate
+   branch's `Measured` to `AfterRedaction` so the growth explanation names a transform the value
+   really went through.
+   The guard is a torii test in the shape of `an_answer_that_only_exceeds_the_cap_after_redaction_
+   is_rejected`'s sibling: append a decision whose `--as` is a runtime-assembled secret-shaped
+   string, then assert the journaled `LoopGateDecided.actor` contains no plaintext. (Semgrep
+   CWE-798 blocks a literal fixture — assemble it at runtime, as `cmd::human`'s tests do.)
 
 - [ ] **Step 4: Run to verify passing**
 

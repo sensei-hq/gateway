@@ -308,6 +308,19 @@ nor `completed`. Pre-existing, not new.
 - **Redaction before the durable write**, through the same chokepoint: the prompt, the failure
   messages, and `actor` (the leak s3's review caught on that exact field). Then clamp, because
   `[REDACTED]` is longer than the shortest span it replaces.
+- **The `actor` half of that rule has a different OWNER from the other two, and Task 10 does not
+  discharge it.** The prompt and the failure messages are the executor's: `run_human_loop_gate`
+  redacts the question before appending `LoopGateAwaited`, and `fail_loop_gate` is the single
+  chokepoint every failure arm routes through. `actor` never passes through the executor at all —
+  the arm reads only `option` off `LoopGateDecided`, interpolates the actor into no message and
+  puts it in no output, so there is no executor-side sink to scrub and no executor test that can
+  assert the property. It is owed entirely by the APPENDING writer, which is Task 12's
+  `torii run gate decide`, and it must be **added** there rather than inherited: `cmd::human::answer`
+  redacts `--as` through `redact_answer`, while `cmd::gate::decide` deliberately does not (it
+  measures the actor `Measured::AsGiven`, on the ground that `GateDecided.actor` goes through no
+  redaction). A loop-gate branch bolted onto `decide` inherits that gap silently — which is exactly
+  how the s3 leak this bullet cites happened. Recorded on `JournalEvent::LoopGateDecided`'s own doc
+  as well, since that is where the next writer of the event looks.
 - **Menu option names are author free text.** They are recited back on a bad `--option`, so torii's
   existing `cap_chars` collapse-and-cap applies unchanged.
 - **This node kind must never panic.** A panic unwinds through `Scheduler::tick`, which has already
@@ -419,7 +432,13 @@ and this slice's answer is yes.
     it neither continues nor stops the loop.
 15. An oversized **authored** prompt fails the node; a verbose **iteration output** truncates the
     question instead of killing it.
-16. The journaled prompt and `actor` are redacted.
+16. The journaled prompt and `actor` are redacted. **Two halves with two owners, and only the
+    first is an executor property.** The prompt is redacted by `run_human_loop_gate` before the
+    `LoopGateAwaited` append (`the_journaled_loop_gate_question_is_redacted`, mutation-proven
+    against swapping the redactor for the identity). `actor` reaches no executor sink at all — the
+    arm reads only `option` off `LoopGateDecided` — so it is owed by the writer that appends the
+    event, i.e. **Task 12's `torii run gate decide`**, and is acceptance-tested there. §6 records
+    why it cannot be inherited from `cmd::gate::decide`'s existing actor handling.
 17. `torii run gate decide --node "{loop}/{i}/__gate__" --option <name>` decides a loop gate; a bad
     name recites the journaled menu; `run signal` and `run agent answer` refuse it, each naming the
     verb that would work.
