@@ -61,13 +61,22 @@ use super::Executor;
 /// tokens and completed. That is a deterministic check-then-act, not a memory-ordering
 /// race, so no atomic ordering fixes it. Re-checking inside the fan-out semaphore does
 /// not either — those permits ARE the concurrency, so N holders still check together
-/// against an unchanged ledger. A reservation would need an output-token estimate that
-/// is unknowable before the call (§8).
+/// against an unchanged ledger. A reservation was rejected because it would need an
+/// output-token estimate unknowable before the call — and that reason no longer holds:
+/// the SP-DATA-5 clamp below gives every budgeted `Chat` an explicit `max_tokens`, so a
+/// reservation could simply hold `est_input + max_tokens` and be conservative without
+/// predicting anything. What rules it out now is starvation rather than ignorance. That
+/// reservation is essentially the WHOLE remaining allowance, so the first child to claim
+/// it leaves every sibling under `MIN_OUTPUT_TOKENS` and refused — i.e. it would make a
+/// concurrent fan-out safe without making it concurrent, and pause siblings that
+/// serialising would have run. Recorded rather than deleted because "a reservation is
+/// impossible" is the wrong reason to carry forward if anyone revisits this.
 ///
 /// So a run WITH a budget takes [`gate`](Meter::gate) — a 1-permit `tokio::sync::Mutex`
 /// held across the whole check → dispatch → charge sequence — and therefore has at most
 /// one model call in flight at a time. That is what makes §6.5's "overshoot bounded by
-/// at most one call" true under fan-out, with no estimation.
+/// at most one call" true under fan-out, and it does so with no estimation of its own —
+/// the clamp's estimate bounds the size of that one call, not the number in flight.
 ///
 /// **The trade, stated plainly: a budgeted run gives up fan-out throughput for an exact
 /// cap.** A 6-wide `Map` under a budget dispatches its children one after another. That
