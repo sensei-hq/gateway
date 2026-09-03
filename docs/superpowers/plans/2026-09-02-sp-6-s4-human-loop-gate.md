@@ -3013,7 +3013,7 @@ run gate decide. signal and agent answer refuse, each naming it."
 **Files:**
 - Modify: `crates/torii/tests/e2e_pg.rs`
 
-- [ ] **Step 1: Start a throwaway Postgres**
+- [x] **Step 1: Start a throwaway Postgres**
 
 **Never** use `$DATABASE_URL` — it points at a remote Supabase.
 
@@ -3023,7 +3023,17 @@ docker run -d --rm --name s4-pg -e POSTGRES_PASSWORD=pg -p 55432:5432 postgres:1
 until docker exec s4-pg pg_isready -U postgres; do sleep 1; done
 ```
 
-- [ ] **Step 2: Write the failing test (AC19)**
+**The recipe was missing its second half, and the test cannot connect without it.** A bare
+`postgres:16` has no `orchestrator.*` schema, so `connect()` fails on the first query. The
+schema is dbd-managed and applied exactly as `README.md`'s *Postgres-backed tests* section
+does it — there is no in-test bootstrap, and the sketch's `fresh_schema(&url)` in Step 2 does
+not exist and was never the mechanism:
+
+```bash
+docker exec -i s4-pg psql -U postgres -v ON_ERROR_STOP=1 < database/_apply_all.sql
+```
+
+- [x] **Step 2: Write the failing test (AC19)**
 
 ```rust
 /// AC19 — a loop gate awaited in one process, decided through `torii`, resumes and
@@ -3057,7 +3067,34 @@ async fn a_loop_gate_decided_in_another_process_resumes_and_converges() {
 }
 ```
 
-- [ ] **Step 3: Run**
+**What was built instead, and why it is bigger than the sketch.** The sketch's three helpers
+(`fresh_schema`, `pg_executor_with_human_reviewer`, `pg_torii_ctx`) exist in no crate; its
+`decide` signature is not `cmd::gate::decide`'s; and its `human_gated_loop_graph` is the
+EXECUTOR suite's private fixture, which this integration test (a separate crate) cannot see.
+More importantly its shape would not have proved the acceptance criterion:
+
+- **Bare node ids.** `context_refs`' primary key is `(scope_kind, scope_id, ctx_key)` and a
+  `Scope::Run` write carries an EMPTY scope id, so a literal `lp` collides LOUDLY on the
+  suite's second run against a persistent database. Every id is marker-qualified —
+  `human_loop_gate_node_ids` — exactly as the three e2es above do it, and the gate path is
+  DERIVED from the loop's id there rather than hand-written, so it cannot drift from what the
+  executor synthesizes.
+- **A one-node graph.** With no prefix and no successor there is nothing to say about
+  re-spend. The fixture is `n1 → lp → n2`, so `n1` and the `Loop`'s iteration 0 are both
+  spend process A paid for and B must replay, and `n2` is the node the decision unblocks.
+- **`exec.start` twice.** Process B drives through the real `worker serve --once`, like every
+  other test in this file, and completion is asserted at the scheduler row, in the journal's
+  `RunCompleted` and on the durable blackboard — not through a re-`start`'s `RunOutcome`.
+- **`out.completed.contains(lp)` as the convergence check.** It cannot distinguish a honoured
+  `ship` from a `Loop` that ignored the human and completed best-effort at its `max_iters`
+  cap. The blackboard's `converged: true, iterations: 1` can, and that is what is asserted.
+- **`Some("jerry")` in the fourth position.** `decide`'s fourth argument is `note`, and a
+  loop gate REFUSES `--note` (Task 12) rather than dropping it: passing it would have tested
+  the refusal and got exit 2. The actor is a separate, required argument.
+- **A bare `run wake` was missing entirely.** `gate decide` queues a wake too, so without the
+  discrimination step a gate that converged on ANY resume would pass the whole test.
+
+- [x] **Step 3: Run**
 
 ```bash
 DATABASE_URL=postgres://postgres:pg@localhost:55432/postgres \
@@ -3067,17 +3104,41 @@ echo "exit=$?"
 
 Expected: FAIL first, then **1 passed, exit 0**.
 
-- [ ] **Step 4: Confirm the test is not silently skipped**
+**It passed first time, and that is reported rather than dressed up as a red step.** Tasks
+1–12 built the property; nothing in Task 13 is production code. The red step is therefore by
+MUTATION — four, each reverted, each quoted in the commit message:
+
+| Mutation | Result |
+|---|---|
+| the live `Waiting` arm's `let stop = chosen.stops` → `chosen.stops && false` | RED: `never moved … off 'paused' in 16 ticks` |
+| `cmd::gate::decide`'s `PublishedMenu::Loop` arm appends `GateDecided` | RED: same stranding — the cross-kind bug, over a process boundary |
+| `render::loop_gate_cell` drops the question half | RED on the discovery assertion |
+| the `LoopGateSettled` append suppressed | RED: `left: [] right: ["ship"]` |
+
+A **fifth** stayed green and is worth recording rather than hiding: `decide_from_published_
+menu`'s `stop: chosen.stops` (the step-1 REPLAY) can be mutated freely without this test
+noticing. That path is not reachable from this fixture — a converged run journals
+`RunCompleted`, so no later drive re-derives the settled gate — and it is covered by the
+executor suite (`a_settled_gate_replays_when_a_config_push_breaks_its_role` and the +45m
+replay of Task 11). Reaching it here would need a downstream indefinite `AwaitSignal`, which
+is the executor fixture `human_gated_loop_then_signal_graph`'s job, not this one's.
+
+- [x] **Step 4: Confirm the test is not silently skipped**
 
 Run the same command with `-- --nocapture` and confirm the test **ran** rather than early-returning. `171ccf5` made an unconfigured DB test `ignored` rather than passed — confirm you see `1 passed`, not `1 ignored`.
 
-- [ ] **Step 5: Tear down**
+Observed `1 passed; 0 failed; 0 ignored` with the variable exported at BUILD time (the
+`have_database_url` cfg comes from `crates/torii/build.rs`, so a variable exported after the
+last build has no effect until the target is rebuilt). Whole file: **8 passed, 0 failed, 0
+ignored**. DB-free, the same binary reports **0 passed, 8 ignored** — honest either way.
+
+- [x] **Step 5: Tear down**
 
 ```bash
 docker stop s4-pg
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
@@ -3089,6 +3150,9 @@ in a fresh process B on the same database. Verified against a throwaway
 postgres:16 on a free port, removed afterwards — never against
 \$DATABASE_URL, which is remote Supabase."
 ```
+
+Committed as `788930a` (test) — the message above was expanded to carry the four mutations
+and the one that stayed green, since that is this task's whole red step.
 
 ---
 
