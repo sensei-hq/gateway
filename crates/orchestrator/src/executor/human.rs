@@ -770,7 +770,8 @@ impl Executor {
     /// | the role is model-backed / unknown | `Failed` — a config error, named |
     /// | asking, deadline passed | `Failed` — **before any decision is read** |
     /// | no wait recorded yet | journal `LoopGateAwaited`, pause |
-    /// | a wait recorded by ANOTHER kind, so no menu | `Failed` — the kind swap |
+    /// | no wait, but the path already COMPLETED | `Failed` — the kind swap, silent half |
+    /// | a wait recorded by ANOTHER kind, so no menu | `Failed` — the kind swap, loud half |
     /// | decided, option in the JOURNALED menu | journal `LoopGateSettled`, `Decided { stop }` |
     /// | decided, option NOT in that menu | `Failed`, loudly — never a default |
     /// | not decided, deadline not passed | re-pause on the SAME absolute instant |
@@ -1161,12 +1162,12 @@ impl Executor {
             // `LoopGateAwaited` writes `Fold::loop_gate_asks`, so this arm is reachable the
             // same way its three siblings' are: some OTHER kind's awaited record sits at
             // this id. Its siblings get there by an edit to a live run's graph; a gate path
-            // is SYNTHESIZED, so the two vectors here are different ones.
+            // is SYNTHESIZED, so its vector is a different one.
             //
-            // **(a) A journal `torii` did not write**, which is a first-class case for a
+            // **A journal `torii` did not write**, which is a first-class case for a
             // durable log an embedder may append to directly. It is now the ONLY vector
-            // this arm has, and the sentences that used to stand here were wrong about
-            // both of the others.
+            // this arm has, and the two sentences that used to stand here were wrong about
+            // the others.
             //
             // The vector this arm shipped for was an authored `__gate__` SEGMENT inside
             // the gated `Loop`'s own `Subgraph` body: `drive_nested` namespaces that body
@@ -1190,8 +1191,8 @@ impl Executor {
             // and validation recurses into `Subgraph`, `Loop` and `Branch` bodies — so no
             // caller, embedder included, gets an unvalidated graph past the front door.
             //
-            // **(b) The occupant that COMPLETED rather than waited** does not arrive here
-            // at all — it writes nothing into the shared `deadlines` map, so the arm above
+            // **An occupant that COMPLETED rather than waited** does not arrive here at
+            // all — it writes nothing into the shared `deadlines` map, so the arm above
             // sees `NotYetAsking`. Its guard is there; see the comment at the top of that
             // arm for the mid-run gate-KIND edit that reaches it.
             //
