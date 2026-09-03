@@ -21316,4 +21316,201 @@ mod human_loop_gate {
             "everything that is not credential-shaped survives: {prompt}"
         );
     }
+
+    /// Every node that recorded an EFFECT in this run, in order — the durable record of
+    /// what actually cost something.
+    ///
+    /// Node-keyed rather than counted, because "how many" cannot say WHICH: a gate that
+    /// journaled an effect and a body that ran twice both read as two.
+    fn effect_nodes(events: &[(Seq, JournalEvent)]) -> Vec<NodeId> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::EffectRecorded { node, .. } => Some(node.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC11 — the gate itself spends NOTHING.
+    ///
+    /// Structural rather than measured: `run_human_loop_gate` resolves no chain and never
+    /// reaches the gateway, so there is no path from this arm to a token. It matters more
+    /// here than at any other human site in SP-6, because the decision being made IS
+    /// whether to spend more — a gate that itself cost tokens would be self-undermining,
+    /// and one that cost tokens per WAKE would bill a run for a person's lunch break.
+    ///
+    /// The assertion is the effect list BY NODE, not a count. A count cannot distinguish
+    /// "the gate journaled an effect" from "the body ran twice", and those are different
+    /// defects with different fixes. `["lp/0"]` says both things at once: the only effect
+    /// in the whole run is iteration 0's body, so the gate at `lp/0/__gate__` recorded
+    /// none, and nothing past iteration 0 ran while a person is still deciding.
+    ///
+    /// **The "no folded `usage`" half of AC11 needs no separate assertion and gets none.**
+    /// `Fold::usage` is written from exactly two places (`fold_journal`): an
+    /// `EffectRecorded`'s own `usage` field, and a `MapCompacted` child's. A loop gate
+    /// journals neither event, so zero effects at the gate path IS zero folded usage
+    /// there. Asserting it separately would be a restatement, and a fixture metered well
+    /// enough to make it non-vacuous (`metered_gateway`) would still be measuring the
+    /// BODY's usage.
+    ///
+    /// Mutation-proven: turn `fanout.rs`'s `LoopGateStep::Paused(reason) => return
+    /// Ok(NodeExec::Paused { reason })` into `LoopGateStep::Paused(_) => false` — a pause
+    /// that does not stop the loop — and iterations 1 and 2 run while the person is still
+    /// being asked, giving three body effects and three gateway calls.
+    #[tokio::test]
+    async fn a_human_loop_gate_spends_no_tokens() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, _clock, calls) = exec_at(
+            &journal,
+            human_registry(Some(Duration::hours(1))),
+            at(1_000),
+        )
+        .await;
+
+        let out = ex
+            .start(run, &human_gated_loop_graph(3))
+            .await
+            .expect("drives");
+        assert!(
+            out.paused.is_some() && out.failed.is_none(),
+            "the gate really did ask and is waiting — a run that failed or completed \
+             instead would spend nothing for the wrong reason: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        assert_eq!(
+            asks(&events).len(),
+            1,
+            "…and it asked exactly once, so the zero below is 'the gate is free', not \
+             'the gate never ran'"
+        );
+        assert_eq!(
+            effect_nodes(&events),
+            vec![NodeId("lp/0".into())],
+            "the ONLY effect in the run is iteration 0's BODY. The gate at {} journals \
+             none — no `EffectRecorded`, and therefore no folded usage either — and \
+             nothing past iteration 0 has run, because a gate waiting on a person must \
+             not authorize the next iteration's spend",
+            gate(0).0
+        );
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one gateway call in total: {recorded:?}");
+        assert!(
+            recorded[0].1.contains("draft it"),
+            "…and it is the BODY's prompt: {:?}",
+            recorded[0].1
+        );
+        assert!(
+            !recorded[0].1.contains("choose one"),
+            "…never the GATE's question, which is addressed to a person and would be \
+             both a leak of the decision to the model and the spend this AC forbids: \
+             {:?}",
+            recorded[0].1
+        );
+    }
+
+    /// AC12 — a decided gate REPLAYS: no re-ask, no gateway call, no second settlement,
+    /// and the identical decision.
+    ///
+    /// **Deliberately NOT a third assertion on the two-drive story.** That is
+    /// `a_stopping_decision_converges_the_loop`, which already pins the decision itself
+    /// (`converged`, `iterations`) and the zero re-spend across the drive that HONOURS it
+    /// (`calls == 1`). What nothing pinned is the drive AFTER that one — the drive on
+    /// which `run_loop` re-enters `for i in 0..max_iters` from zero and re-derives a gate
+    /// that is already answered. §5.7 says such a drive replays from the SETTLEMENT rather
+    /// than from the decision, and the whole of §4's Critical fix is that distinction.
+    ///
+    /// **The discriminating assertion is the settlement COUNT, and what it guards is the
+    /// DURABLE RECORD of a drive whose behaviour is unchanged.** Two mutations were run,
+    /// and the pair is the point:
+    ///
+    /// * Forcing step 1's `fold.loop_gate_settled_with(node_id)` to `None` — the Critical's
+    ///   own mutation — reddens six other tests in this module as well, all of them
+    ///   loudly (a killed loop, a resurrected failure). It also reddens this one, but only
+    ///   on the settlement count: at +45m the SLA has NOT been passed, so the arm re-reads
+    ///   the decision, the loop converges exactly as before and `after` pauses exactly as
+    ///   before. Every other assertion here stays green. That is the case the existing
+    ///   tests structurally cannot show, because each of them reaches its re-derivation
+    ///   with the deadline already blown (`a_converged_loop_is_not_re_killed_by_its_own_gates_stale_deadline`
+    ///   drives at +1 day) and so sees a loud failure instead.
+    /// * Appending a `LoopGateSettled` inside `decide_from_published_menu` — the plausible
+    ///   "keep the settlement fresh" edit, which leaves step 1 intact — reddens **this test
+    ///   and nothing else in the crate**. Folding is first-wins, so a duplicate settlement
+    ///   changes no decision and no outcome; it just contradicts the variant's own claim
+    ///   that the executor writes at most one, and grows the journal by a row per wake for
+    ///   the life of the run.
+    ///
+    /// The fixture is the loop-then-`AwaitSignal` graph for the reason its own doc gives:
+    /// a converged run with no downstream node finalizes, and `start` returns the folded
+    /// outcome WITHOUT re-driving — which is precisely the case that cannot see any of
+    /// this.
+    #[tokio::test]
+    async fn a_decided_loop_gate_replays_from_its_settlement_without_re_asking() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let t0 = at(1_000);
+        let (ex, clock, calls) =
+            exec_at(&journal, human_registry(Some(Duration::hours(1))), t0).await;
+        let graph = human_gated_loop_then_signal_graph(3);
+
+        // Drive 1 — iteration 0's body runs and the gate asks.
+        ex.start(run, &graph).await.expect("pauses on the gate");
+        journal
+            .append(run, decided(&gate(0), "ship", "jerry"))
+            .await
+            .expect("the decision lands");
+
+        // Drive 2, at +15m — the decision is honoured and SETTLED, and the loop converges.
+        clock.set(t0 + Duration::minutes(15));
+        let converged = ex.start(run, &graph).await.expect("drives");
+        assert!(
+            converged.completed.contains(&lp()) && converged.failed.is_none(),
+            "the loop converges on `ship`: {converged:?}"
+        );
+        let calls_after_deciding = calls.lock().unwrap().len();
+
+        // Drive 3, at +45m — still INSIDE the gate's SLA, so nothing about the clock
+        // rescues this assertion; the run is re-driven because it parks on `after`.
+        clock.set(t0 + Duration::minutes(45));
+        let out = ex.start(run, &graph).await.expect("re-drives");
+        assert!(
+            out.failed.is_none(),
+            "re-deriving a settled gate must not fail anything: {out:?}"
+        );
+        assert!(
+            out.paused.is_some(),
+            "…and the run is still parked on the downstream signal: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        let asked = asks(&events);
+        assert_eq!(
+            asked.len(),
+            1,
+            "the question was published ONCE across all three drives — a settled gate \
+             asks nobody anything: {asked:?}"
+        );
+        assert_eq!(asked[0].0, gate(0), "at its own path: {asked:?}");
+        assert_eq!(
+            rows(&events)
+                .iter()
+                .filter(|r| r.starts_with("LoopGateSettled"))
+                .count(),
+            1,
+            "and settled ONCE. Drive 3 READ the settlement back; it did not re-resolve \
+             the decision and write a second row, which is what `LoopGateSettled`'s doc \
+             claims and what §5.7 means by replaying from the settlement rather than from \
+             the decision: {:?}",
+            rows(&events)
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            calls_after_deciding,
+            "and it cost nothing: iteration 0's body replays from its memo and the gate \
+             reaches no gateway at all"
+        );
+    }
 }

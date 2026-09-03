@@ -2491,11 +2491,50 @@ async fn a_decided_loop_gate_replays_from_the_journal_without_re_asking() {
 }
 ```
 
+> **What actually shipped, and why the second test is not the sketch above.** The AC11 test
+> landed as written in spirit, with the effect assertion strengthened from a COUNT to the effect
+> list BY NODE (`effect_nodes(&events) == ["lp/0"]`): a count cannot distinguish "the gate
+> journaled an effect" from "the body ran twice", which are different defects with different
+> fixes. AC11's third clause — "no folded `usage`" — deliberately gets **no** assertion:
+> `Fold::usage` is written only from an `EffectRecorded`'s `usage` field and a `MapCompacted`
+> child's, so zero effects at the gate path IS zero folded usage there, and a separate assertion
+> would restate it.
+>
+> The AC12 sketch, however, **was already covered** — by `a_stopping_decision_converges_the_loop`,
+> which shipped in Task 6 and asserts the converge, the `iterations`, the option that was honoured
+> and `calls == 1` across BOTH drives. Writing the sketch verbatim would have been a duplicate
+> under a new name. What was NOT covered is the drive AFTER the one that honours the decision —
+> the drive on which `run_loop` re-enters `for i in 0..max_iters` from zero and re-derives a gate
+> that is already answered. §5.7 says that drive replays from the **settlement**, and §4's Critical
+> fix is exactly that distinction. So the test that landed is
+> `a_decided_loop_gate_replays_from_its_settlement_without_re_asking`: three drives over the
+> loop-then-`AwaitSignal` graph, with the third at **+45m under a 1h SLA** — inside the deadline,
+> which is the whole point.
+>
+> Two mutations were run against it, and the pair is what makes it load-bearing:
+>
+> | Mutation | Effect |
+> | --- | --- |
+> | force step 1's `fold.loop_gate_settled_with(node_id)` to `None` (the Critical's own mutation) | reddens **7** tests. The other six fail LOUDLY (a killed loop, a resurrected failure) because each re-derives with the deadline already blown; this one fails only on the settlement COUNT, with the converge, the pause and the call count all still green — the silent case none of them can reach |
+> | append a `LoopGateSettled` inside `decide_from_published_menu` (the plausible "keep the settlement fresh" edit, step 1 left intact) | reddens **this test and nothing else in the crate** — 389 passed, 1 failed |
+>
+> The second mutation is the one that earns the test its keep. Folding is first-wins, so a
+> duplicate settlement changes no decision and no outcome; it only contradicts
+> `LoopGateSettled`'s own claim that the executor writes at most one, and grows the journal by a
+> row per wake for the life of the run.
+
 - [ ] **Step 2: Run**
 
-Run: `cargo test -p sensei-orchestrator -- spends_no_tokens replays_from_the_journal_without_re_asking`
+Run: `cargo test -p sensei-orchestrator -- spends_no_tokens replays_from_its_settlement_without_re_asking`
 
 Expected: **2 passed.**
+
+Both passed on the shipped arm, so each went in red-first by mutation. AC11's, in
+`executor/fanout.rs`: `LoopGateStep::Paused(reason) => return Ok(NodeExec::Paused { reason })` →
+`LoopGateStep::Paused(_) => false`, a pause that does not stop the loop. Observed red, one
+assertion at a time (the earlier ones were disabled in turn to reach the later ones): `paused:
+None` with `iterations: 3`, then `asks: 3 != 1`, then `effect_nodes: ["lp/0", "lp/1", "lp/2"] !=
+["lp/0"]` — three iterations' tokens spent while the person was still being asked.
 
 - [ ] **Step 3: Commit**
 
@@ -2511,6 +2550,12 @@ being made IS whether to spend more.
 A decided gate replays from LoopGateDecided with no re-ask and no gateway
 call; the pure part is recomputed from the journaled option name."
 ```
+
+**Correction to that message, applied in the shipped commit.** "Replays from `LoopGateDecided`" is
+the pre-Critical wording and it is wrong: a decided gate replays from **`LoopGateSettled`** (§5.7),
+and the difference is the whole of §4's fix — a replay re-derived from the decision has to pass the
+clock on the way, and the clock does not know the answer was already honoured. The shipped commit
+message says settlement.
 
 ---
 
