@@ -14554,6 +14554,115 @@ async fn a_clamped_call_still_journals_its_real_usage() {
     );
 }
 
+/// A clamped call replays from its memo on resume even though the clamp VALUE has
+/// moved between drives.
+///
+/// # Why this is a precondition and not a nicety
+///
+/// Every determinism key in the executor covers the SEMANTIC inputs and none covers a
+/// transport parameter: `input_hash` hashes `{chain}|{payload}`, `agent_input_hash`
+/// hashes `{chain}|{system}|{messages}|{tools}`, and the selector hashes
+/// `{chain}|{system,user}`. `max_tokens` — and the remaining budget it is computed from
+/// — appear in none of the three, which is the only reason a run whose cap was raised
+/// between drives replays its completed prefix instead of halting on
+/// `DeterminismViolation`. Fold either quantity into any of those hashes and EVERY
+/// budgeted resume becomes a hard halt, because raising the cap is exactly what an
+/// operator does to un-stick a run that paused on its budget: the raise would then
+/// guarantee the violation.
+///
+/// The clamp block's own comment leans on that argument. A comment cannot fail, so this
+/// test carries it — and it was mutation-checked rather than assumed. Hashing the
+/// clamped `max_tokens` alongside the payload in `run_node`'s `ModelCall` arm reddens it
+/// with `DeterminismViolation { node: NodeId("n1"), effect_id: ... }`.
+///
+/// # Why the fixture is shaped this way
+///
+/// A run that simply completes under one budget and is re-driven under another proves
+/// less than it looks: with nothing left to dispatch, "no new provider call" is also
+/// what a run that never resumed at all would show. So the first drive is made to stop
+/// HALF-WAY — `n1` completes, `n2` falls under the floor — and the second drive must
+/// then do both things at once: replay `n1` from its memo and dispatch `n2` live. The
+/// call log distinguishes the two, and the second entry proves the drive really did
+/// reach the provider rather than short-circuiting.
+///
+/// Every magnitude below is chosen to keep the BUDGET the binding term rather than
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`]; let the model ceiling bind and both drives would emit
+/// the same 1024 and the "clamp moved" assertion would be comparing a constant with
+/// itself.
+#[tokio::test]
+async fn a_clamped_call_replays_from_its_memo_when_the_budget_moved() {
+    // Drive 1 affords n1 and not n2: n1's allowance is 500 − 1 = 499, its reply costs
+    // 10 + min(300, 499) = 310, and that leaves n2 an allowance of 500 − 310 − 1 = 189,
+    // under the 256-token floor.
+    const CAP_1: u64 = 500;
+    // Drive 2 affords n2: 900 − 310 − 1 = 589, clear of the floor and still under the
+    // model's 1024, so the budget is what sets the number.
+    const CAP_2: u64 = 900;
+    let (gateway, seen) = clamp_observing_gateway(10, 300).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP_1))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let (graph, ..) = two_node_graph("p1", "p2");
+
+    let first = exec.start(run, &graph).await.expect("first drive");
+    assert_eq!(
+        first.paused.as_ref().map(|p| p.node.0.as_str()),
+        Some("n2"),
+        "the first drive completes n1 and pauses ON n2 — the node the floor refused: \
+         {first:?}"
+    );
+    let after_first = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(after_first.len(), 1, "exactly n1 was dispatched: {first:?}");
+
+    // The operator's remedy, as `torii run wake --budget-tokens N` journals it. It
+    // changes the clamp arithmetic for every call the run has left AND for every call
+    // it already made — which is the whole point of the test.
+    journal
+        .append(
+            run,
+            JournalEvent::BudgetRaised {
+                new_total_tokens: CAP_2,
+            },
+        )
+        .await
+        .unwrap();
+    let second = exec.start(run, &graph).await.expect("resumes");
+
+    assert!(
+        second.failed.is_none(),
+        "a moved clamp is not a determinism violation: {:?}",
+        second.failed
+    );
+    assert!(
+        second.paused.is_none(),
+        "and the raise really did un-stick the run: {second:?}"
+    );
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        seen.len(),
+        2,
+        "one new call, not two: n1 replayed from its memo and only n2 went to the \
+         provider — a re-spent n1 would show three: {seen:?}"
+    );
+    assert_eq!(
+        journaled_usage_totals(&journal.load(run).await.unwrap(), |n| n == "n1"),
+        vec![Some(310)],
+        "and n1 has exactly ONE ledger entry, so the replay charged nothing"
+    );
+    // The clamp really did move. Without this the test would still pass against a clamp
+    // pinned to a constant, which is the one case where "the budget moved" costs the
+    // fence nothing and the guard would be vacuous.
+    assert_eq!(
+        (after_first[0], seen[1]),
+        (Some(499), Some(589)),
+        "the second drive computes a DIFFERENT allowance from the first: {seen:?}"
+    );
+}
+
 // ============================= SP-DATA-3 scheduler driver =====================
 
 /// The `Scheduler` driver (in-memory store + a fake clock): a run pauses on a timed gate, is recorded
