@@ -207,6 +207,25 @@ fn single_chain_config() -> GatewayConfig {
         },
     );
 
+    // The embedding twin of `"m"`, on the same router. Present so a test can dispatch
+    // the ONE payload kind the SP-DATA-5 clamp deliberately skips — `Payload::Embed`
+    // has no `max_tokens` to set — and show it is still metered and still gated.
+    // Inert for every other fixture: nothing else resolves chain `"emb"`.
+    models.insert(
+        "me".to_string(),
+        ModelConfig {
+            id: "me".to_string(),
+            api_model_id: None,
+            provider: "r".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextEmbed],
+            context_window: 4096,
+            max_output_tokens: FIXTURE_MAX_OUTPUT_TOKENS,
+            pricing: None,
+            catalog: None,
+        },
+    );
+
     let mut chains = HashMap::new();
     chains.insert(
         "c".to_string(),
@@ -215,6 +234,20 @@ fn single_chain_config() -> GatewayConfig {
             capability: Capability::TextChat,
             models: vec![ChainEntry {
                 model: "m".to_string(),
+                router: Some("r".to_string()),
+                api_model_id: None,
+                priority: 1,
+            }],
+            fallback_triggers: Vec::new(),
+        },
+    );
+    chains.insert(
+        "emb".to_string(),
+        FallbackChainConfig {
+            id: "emb".to_string(),
+            capability: Capability::TextEmbed,
+            models: vec![ChainEntry {
+                model: "me".to_string(),
                 router: Some("r".to_string()),
                 api_model_id: None,
                 priority: 1,
@@ -504,6 +537,60 @@ pub async fn clamp_observing_gateway(
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     (Gateway::new(single_chain_config(), adapters, cb), seen)
+}
+
+/// A metered EMBEDDING double for chain `"emb"`, counting the calls that reach it.
+///
+/// `Payload::Embed` is the one payload kind the SP-DATA-5 clamp skips — there is no
+/// `max_tokens` on it to set — which makes it the only place left where the plain
+/// `spent >= cap` gate is observably the ONLY thing between a budgeted run and the
+/// provider. That is why this exists: it is the home for the `>=`-versus-`>` boundary
+/// guard the clamp took away from `spending_exactly_the_cap_stops_the_run`.
+pub struct MeteredEmbedAdapter {
+    calls: Arc<Mutex<usize>>,
+    total_tokens: u32,
+}
+
+impl Model for MeteredEmbedAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait]
+impl gateway::adapters::capability::EmbedModel for MeteredEmbedAdapter {
+    async fn embed(
+        &self,
+        _cfg: &RouterConfig,
+        req: &kernel::types::io::EmbedRequest,
+    ) -> Result<kernel::types::io::EmbedResponse, GatewayError> {
+        *self.calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Ok(kernel::types::io::EmbedResponse {
+            embeddings: req.texts.iter().map(|_| vec![0.0_f32; 3]).collect(),
+            usage: Some(TokenUsage {
+                input_tokens: self.total_tokens,
+                output_tokens: 0,
+                total_tokens: self.total_tokens,
+            }),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway whose chain `"emb"` resolves `TextEmbedding` to [`MeteredEmbedAdapter`].
+/// Returns the shared call counter, so a test can tell "refused before the provider"
+/// from "dispatched" — the distinction the whole non-`Chat` arm rests on.
+pub async fn metered_embed_gateway(total_tokens: u32) -> (Gateway, Arc<Mutex<usize>>) {
+    let calls = Arc::new(Mutex::new(0usize));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_embed(Arc::new(MeteredEmbedAdapter {
+            calls: calls.clone(),
+            total_tokens,
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(single_chain_config(), adapters, cb), calls)
 }
 
 /// Chat adapter that replays a scripted queue of responses (one per turn), so a

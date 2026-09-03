@@ -2,8 +2,9 @@ use super::*;
 use crate::test_support::{
     CallLog, FIXTURE_MAX_OUTPUT_TOKENS, clamp_observing_gateway, content_gated_gateway,
     demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
-    failing_after_gateway, final_response, metered_gateway, metered_latency_gateway,
-    prompt_recording_gateway, recording_gateway, scripted_gateway, tool_call_response,
+    failing_after_gateway, final_response, metered_embed_gateway, metered_gateway,
+    metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
+    tool_call_response,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -13330,26 +13331,30 @@ async fn the_consolidate_producer_journals_its_reported_usage() {
 /// cap: two calls at 400 tokens against a cap of 800 means node 3 sees `spent == cap`
 /// and must be stopped.
 ///
-/// # The SP-DATA-5 clamp took this test's mutation away, and did not give it back
+/// # The SP-DATA-5 clamp took this test's mutation away
 ///
 /// The claim this comment used to make — "`spent >= cap` → `spent > cap` and this
 /// fails with three calls and a completed run" — is **no longer true**, and it was
-/// re-run to confirm that rather than reasoned about. Under the clamp, node 3 sees
-/// `allowance = (cap − spent) − est = 0`, which is below `MIN_OUTPUT_TOKENS`, so the
-/// clamp's floor refuses with the *same* `BudgetExhausted { spent: 800, budget: 800 }`
-/// the gate would have produced. The two arms are observationally identical for a
-/// `Chat` payload, so the mutation leaves this green.
+/// re-run to confirm that rather than reasoned about. UNDER THAT MUTATION node 3 falls
+/// through to the clamp, sees `allowance = (cap − spent) − est = 0`, which is below
+/// `MIN_OUTPUT_TOKENS`, and is refused with the *same*
+/// `BudgetExhausted { spent: 800, budget: 800 }` the gate would have produced. (In the
+/// UNMUTATED build the gate returns first and the clamp's floor is never reached here
+/// at all.) The two arms are observationally identical for a `Chat` payload, so the
+/// mutation leaves this green.
 ///
-/// That is defence in depth rather than lost safety — the boundary is now covered
-/// twice — but it does mean this test no longer distinguishes `>` from `>=`. What it
-/// still guards is the gate's REMOVAL: delete the `spent >= cap` block entirely and
-/// `a_fresh_budgeted_run_pauses_mid_drive_after_one_call` panics with "attempt to
-/// subtract with overflow" on the clamp's `cap - spent`, which is why that subtraction
-/// is deliberately not saturating.
+/// That is defence in depth rather than lost safety — the boundary is refused either
+/// way — but it does mean this test no longer distinguishes `>` from `>=`, and deleting
+/// the `spent >= cap` block entirely does not redden it either: nine other tests panic
+/// with "attempt to subtract with overflow" on the clamp's `cap - spent` (which is why
+/// that subtraction is deliberately not saturating), and this one is not among them.
 ///
 /// A test that can still tell `>` from `>=` needs a payload the clamp SKIPS — a
 /// non-`Chat` one, where the gate is the only thing standing between the run and the
-/// provider. That belongs with the `Embed` coverage.
+/// provider. That is now
+/// [`a_non_chat_payload_is_gated_but_not_clamped`], which lands an `Embed` exactly on
+/// the cap and is mutation-proven against `>`. This test keeps the `Chat` half of the
+/// boundary: on the cap, a budgeted run stops.
 #[tokio::test]
 async fn spending_exactly_the_cap_stops_the_run() {
     // 400/call against a cap of 800, scaled up from 75 against 150. The RATIO is what
@@ -14250,6 +14255,168 @@ async fn an_estimate_larger_than_the_budget_does_not_wrap() {
     assert!(
         seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "no call was made"
+    );
+}
+
+/// A single budgeted `Chat` through the chokepoint carrying a CALLER-supplied
+/// `max_tokens`, returning what actually reached the provider.
+///
+/// Driven through `dispatch_metered` directly rather than through `start`, because no
+/// orchestrator producer sets `max_tokens` — every one of them passes `None`
+/// (`support.rs`'s two builders and `SelectorDispatch`'s hand-built request), so there
+/// is no graph that can exercise the caller half at all.
+///
+/// The dispatch RESULT is deliberately discarded. A `min` written backwards emits a
+/// `max_tokens` above the model's limit, which `ClampObservingAdapter` refuses exactly
+/// as a real provider would; the log records the offending value before the refusal, so
+/// asserting on the log — not on the outcome — is what makes both directions visible.
+async fn dispatch_once_with(caller_max: Option<u32>, cap: u64) -> Option<u32> {
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let gate = tokio::sync::Mutex::new(());
+    let meter = super::dispatch::Meter::new(0, Some(cap), &live, &gate);
+    let request = kernel::types::request::InferenceRequest {
+        capability: kernel::types::capability::Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some("c".to_string()),
+        payload: kernel::types::request::Payload::Chat {
+            messages: vec![kernel::types::request::Message::text(
+                kernel::types::request::MessageRole::User,
+                "p",
+            )],
+            system: None,
+            max_tokens: caller_max,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+    };
+    let _ = exec.dispatch_metered(&request, &meter).await;
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly one call reached the provider: {seen:?}"
+    );
+    seen[0]
+}
+
+/// A caller's own `max_tokens` is never WIDENED.
+///
+/// Both directions, because a `min` written the wrong way round passes a one-sided
+/// test: with `caller.max(want)` the low leg reads 1024 instead of 16 and the high leg
+/// reads the caller's own million back.
+///
+/// A clamp that could raise a caller's ceiling is the same defect as a tool that
+/// supplies argv and thereby widens its own sandbox policy, which SP-4 s4 spent a slice
+/// ruling out. Nothing in the orchestrator sets `max_tokens` today, so this guards a
+/// future caller rather than a present one — and an unexercised branch with no test is
+/// how the first such caller inherits the defect silently.
+#[tokio::test]
+async fn a_callers_max_tokens_is_never_widened() {
+    // Caller asks for LESS than the allowance ⇒ the caller's value survives untouched.
+    let seen = dispatch_once_with(Some(16), 100_000).await;
+    assert_eq!(seen, Some(16), "a lower caller value must win");
+
+    // Caller asks for MORE ⇒ it is clamped down, never honoured.
+    let seen = dispatch_once_with(Some(1_000_000), 100_000).await;
+    assert!(
+        seen.is_some_and(|m| m < 1_000_000),
+        "a higher caller value must be clamped down, not honoured: {seen:?}"
+    );
+}
+
+/// An `Embed` request on chain `"emb"` — the one payload kind the clamp skips.
+fn embed_request() -> kernel::types::request::InferenceRequest {
+    kernel::types::request::InferenceRequest {
+        capability: kernel::types::capability::Capability::TextEmbed,
+        model: None,
+        router: None,
+        chain: Some("emb".to_string()),
+        payload: kernel::types::request::Payload::Embed {
+            texts: vec!["x".to_string()],
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+    }
+}
+
+/// A non-`Chat` payload on a budgeted run is untouched by the clamp and still gated by
+/// the pre-existing `spent >= cap` rule — **including exactly ON the cap.**
+///
+/// # This test carries a boundary the clamp took away
+///
+/// `spending_exactly_the_cap_stops_the_run` used to be the only thing pinning
+/// `spent >= cap` against `spent > cap`, and it no longer is: for a `Chat` payload at
+/// `spent == cap` the clamp's floor computes `allowance == 0` and returns an identical
+/// `BudgetExhausted`, so the mutation leaves it green. `Embed` is the only payload the
+/// clamp SKIPS, which makes it the one place left where that gate is observably the
+/// only thing between a budgeted run and the provider. Hence the second half below, and
+/// hence the call counter: `>` instead of `>=` lets the third call out.
+#[tokio::test]
+async fn a_non_chat_payload_is_gated_but_not_clamped() {
+    const CAP: u64 = 400;
+    let (gateway, calls) = metered_embed_gateway(120).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let gate = tokio::sync::Mutex::new(());
+
+    // Under the cap: the clamp skips it (there is no `max_tokens` on an `Embed` to
+    // set) and it dispatches and is METERED like any other call.
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let under = exec
+        .dispatch_metered(
+            &embed_request(),
+            &super::dispatch::Meter::new(0, Some(CAP), &live, &gate),
+        )
+        .await
+        .expect("no gateway error");
+    assert!(
+        under.is_ok(),
+        "an Embed under the cap dispatches — the clamp must skip it, not refuse it"
+    );
+    assert_eq!(
+        *calls.lock().unwrap_or_else(|e| e.into_inner()),
+        1,
+        "and it really reached the provider"
+    );
+    assert_eq!(
+        live.load(std::sync::atomic::Ordering::Relaxed),
+        120,
+        "its spend is charged back to the ledger, exactly as a Chat call's is"
+    );
+
+    // EXACTLY on the cap: refused, before the provider. This is the `>=` boundary.
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let on_the_cap = exec
+        .dispatch_metered(
+            &embed_request(),
+            &super::dispatch::Meter::new(CAP, Some(CAP), &live, &gate),
+        )
+        .await
+        .expect("no gateway error");
+    assert!(
+        matches!(
+            on_the_cap,
+            Err(super::dispatch::Refusal::BudgetExhausted { .. })
+        ),
+        "spending exactly the cap is spending it — `>=`, not `>`"
+    );
+    assert_eq!(
+        *calls.lock().unwrap_or_else(|e| e.into_inner()),
+        1,
+        "and no second call went out"
     );
 }
 
