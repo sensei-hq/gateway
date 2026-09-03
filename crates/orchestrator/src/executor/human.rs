@@ -1332,13 +1332,20 @@ impl Executor {
     /// cannot drift, and every one of them is redacted at this single chokepoint.
     ///
     /// **It returns the whole [`LoopGateStep`], not just the message**, where
-    /// [`Executor::fail_human_agent`] returns a [`NodeExec`]. That is what makes
-    /// `newly_journaled: true` unforgeable: the flag says "this drive wrote the row", and
-    /// the only place it is set is the function that writes it. A helper returning a bare
-    /// `String` would leave every call site free to pair a real write with the wrong flag.
-    /// It also makes `fail_human_agent`'s "`output: None` on every one of them" property
-    /// STRUCTURAL rather than merely upheld: `LoopGateStep::Failed` has no output field at
-    /// all, so an expired or unmatched gate cannot produce a defaulted result by mistake.
+    /// [`Executor::fail_human_agent`] returns a [`NodeExec`]. What that buys is that every
+    /// arm's "I failed" and the row recording it are produced by ONE expression: a helper
+    /// returning a bare `String` leaves each call site free to append here and then build
+    /// some other step. It also makes `fail_human_agent`'s "`output: None` on every one of
+    /// them" property STRUCTURAL rather than merely upheld: [`LoopGateStep::Failed`] has no
+    /// output field at all, so an expired or unmatched gate cannot produce a defaulted
+    /// result by mistake.
+    ///
+    /// An earlier version of this paragraph justified the return type by a
+    /// `newly_journaled: true` flag it made "unforgeable". There is no such field —
+    /// `Failed(String)`, and the variant's own doc explains that the flag was the FIRST
+    /// shipped shape and was removed because it was a second claim about the journal that
+    /// disagreed with the first. The guard it was reaching for lives on
+    /// [`Executor::fail_loop`]'s append, where reading the fold makes it self-healing.
     ///
     /// **What the redaction protects, precisely:** these arms interpolate a NODE ID (the
     /// author's loop id plus the reserved suffix), an OPTION NAME (arbitrary by
