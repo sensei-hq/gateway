@@ -323,6 +323,22 @@ nor `completed`. Pre-existing, not new.
   as well, since that is where the next writer of the event looks.
 - **Menu option names are author free text.** They are recited back on a bad `--option`, so torii's
   existing `cap_chars` collapse-and-cap applies unchanged.
+- **And they are therefore redacted at the `LoopGateAwaited` append, alongside the prompt.** The
+  first shipped site scrubbed only the prompt, which quotes the same names through `gate_ask` — so
+  one author string was clean in `prompt` and plaintext in `menu` and in the `RunPaused.reason`
+  built from it, on one write. `torii config push` scrubs nothing, so the append is the last line of
+  defence. `pause_gate` is handed the scrubbed copy on both its arms and runs the finished reason
+  through the redactor as the write chokepoint — forward-looking only, since the menu now arrives
+  clean and the other interpolation (the node id) is a structural key already plaintext in
+  `NodeStarted` and `EffectRecorded`.
+- **A menu that redaction makes ambiguous fails the gate, loudly, before the append.** `menu` is the
+  vocabulary a decision is resolved against, not display text. `validate_dag` rejects duplicate
+  option names but runs on the authored graph and has no `Redactor` — the redactor is an executor
+  injection, so the same graph is legal under one executor and not another — and redaction can
+  RE-CREATE the duplicate: two credential-shaped names collapse to one placeholder, `find` takes the
+  first, and an operator picking the only name they were offered gets whichever `stops` came first.
+  A silently inverted decision is exactly what §5.3 journals the menu to prevent, so it is refused
+  on the authored-cap's reasoning: author-controlled config, actionable by the person who wrote it.
 - **This node kind must never panic.** A panic unwinds through `Scheduler::tick`, which has already
   claimed a batch of runs and taken their leases; the claimed rows stay `waking` and the next worker
   reclaims the stale lease and dies identically. Every failure path is a `NodeFailed`.
@@ -432,10 +448,16 @@ and this slice's answer is yes.
     it neither continues nor stops the loop.
 15. An oversized **authored** prompt fails the node; a verbose **iteration output** truncates the
     question instead of killing it.
-16. The journaled prompt and `actor` are redacted. **Two halves with two owners, and only the
-    first is an executor property.** The prompt is redacted by `run_human_loop_gate` before the
-    `LoopGateAwaited` append (`the_journaled_loop_gate_question_is_redacted`, mutation-proven
-    against swapping the redactor for the identity). `actor` reaches no executor sink at all — the
+16. The journaled prompt, **the journaled `menu`** and `actor` are redacted. **Three halves with
+    two owners, and only the first two are executor properties.** The prompt is redacted by
+    `run_human_loop_gate` before the `LoopGateAwaited` append
+    (`the_journaled_loop_gate_question_is_redacted`, mutation-proven against swapping the redactor
+    for the identity). The MENU is redacted on the same append, and the pause `reason` built from
+    it with it (`a_credential_in_a_menu_option_name_never_reaches_the_journal`, mutation-proven
+    against appending `menu.to_vec()`); a menu whose option names COLLIDE once redacted fails the
+    gate loudly rather than offering two options under one name
+    (`a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly`). `actor` reaches no
+    executor sink at all — the
     arm reads only `option` off `LoopGateDecided` — so it is owed by the writer that appends the
     event, i.e. **Task 12's `torii run gate decide`**, and is acceptance-tested there. §6 records
     why it cannot be inherited from `cmd::gate::decide`'s existing actor handling.

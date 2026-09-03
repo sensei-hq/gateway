@@ -945,7 +945,9 @@ impl Executor {
             }
 
             // The first — and only — ask this gate ever makes. `menu` (the GRAPH's copy)
-            // is read here and nowhere else, which is what makes the menu durable.
+            // is read here and nowhere else, which is what makes the menu durable. It is
+            // also SCRUBBED here and nowhere else: what this arm journals is the redacted
+            // copy, and every later drive reads that one back out of the fold.
             Ok(WaitState::NotYetAsking(fresh)) => {
                 // The question, through the seam shared with `drive_agent`'s human branch
                 // — so a person is shown a question built by the MODEL path's own prompt
@@ -1019,13 +1021,63 @@ impl Executor {
                     |t| self.redact_text(t),
                     MAX_HUMAN_TEXT_BYTES + MAX_HUMAN_CONTEXT_BYTES,
                 );
+
+                // **The MENU is redacted too, and it is a deliberate answer rather than a
+                // reflex.** Option names are author free text arriving through the same
+                // `torii config push` that scrubs nothing, and this append is where they
+                // become durable — so leaving them alone made the SAME string scrubbed in
+                // `prompt` (which quotes them, via `gate_ask`) and plaintext in `menu` and
+                // in the pause reason built from it, on one drive. That is the exact defect
+                // class s2 and s3 each shipped and each had to fix, and review measured it
+                // here.
+                //
+                // The reflex answer would have been to leave it: a menu is not display
+                // text, it is the VOCABULARY every later decision is resolved against
+                // (`find(|o| o.name == decision.option)`), so scrubbing it changes what an
+                // operator must type. That is exactly why it is redacted HERE, at the one
+                // append, rather than at each reader: the published copy is the only copy
+                // anybody can see — `torii run gate decide` recites it and refuses anything
+                // else — so redacting it keeps ONE vocabulary, matching the question, and
+                // resolution keeps matching journal against journal.
+                //
+                // What it must not do is make two options indistinguishable.
+                // `check_menu_option_names` already rejects a duplicate name at
+                // `validate_dag` time ("`--option x` would be ambiguous"), but redaction
+                // runs long afterwards and can RE-CREATE the duplicate: two different
+                // credential-shaped names both collapse to `[REDACTED]`, `find` takes the
+                // first, and an operator picking the only name they were offered gets
+                // whichever `stops` happened to come first — a decision inverted silently,
+                // which is precisely what §5.3 journals the menu to prevent. So the gate
+                // refuses, on the authored-bytes cap's reasoning: this is author-controlled
+                // config, a loud failure is actionable by the person who wrote it, and both
+                // alternatives are worse (keeping the plaintext re-opens the leak;
+                // inventing disambiguating suffixes offers a human an option their config
+                // does not contain).
+                //
+                // It cannot move to `validate_dag`, where the duplicate rule lives: that
+                // function is pure over the graph and has no `Redactor`. The redactor is an
+                // executor injection (`with_redactor`, default none), so the same graph is
+                // legal under one executor and not another — a redactor-dependent rule in a
+                // pure graph validator would be a lie about the graph. The check runs
+                // unconditionally rather than only when a redactor is wired, which costs
+                // nothing and also catches a duplicate that reached the executor without
+                // passing `validate_dag` at all.
+                //
+                // BEFORE the append, so a menu nobody could answer unambiguously leaves no
+                // durable row behind — the same ordering the authored-bytes cap uses.
+                let published = self.redact_menu(menu);
+                if let Some(name) = collided_option_name(&published) {
+                    return self
+                        .fail_loop_gate(run, node_id, ambiguous_menu_message(node_id, &name))
+                        .await;
+                }
                 self.append(
                     run,
                     JournalEvent::LoopGateAwaited {
                         node: node_id.clone(),
                         deadline: fresh,
                         prompt,
-                        menu: menu.to_vec(),
+                        menu: published.clone(),
                     },
                 )
                 .await?;
@@ -1040,7 +1092,11 @@ impl Executor {
                 // the ask is durable, and the very next drive honours the decision against
                 // it. Pausing is also the behaviour AC3 states: the gate asks, and the run
                 // pauses.
-                self.pause_gate(run, node_id, menu, fresh).await
+                //
+                // On the PUBLISHED menu, not the graph's: the reason recites the options,
+                // and an operator must be offered the same names on this drive as on every
+                // later one.
+                self.pause_gate(run, node_id, &published, fresh).await
             }
 
             // Already asking by the SHARED map's reckoning — but did THIS kind begin
@@ -1192,10 +1248,40 @@ impl Executor {
     /// ONE definition — an operator reading `torii run status` on the drive that asked and
     /// on a drive that re-paused must not see two different sentences about the same wait.
     ///
-    /// `menu` is whichever copy that arm is entitled to read: the GRAPH's on the first ask
-    /// (it is being journaled in the same breath), the PUBLISHED one on every later drive.
-    /// Listing it here is what lets an operator answer from `run status` alone, and it is
-    /// the same courtesy `run_human_gate`'s pause reason extends.
+    /// `menu` is the PUBLISHED menu on every drive — the copy the asking arm scrubbed and
+    /// journaled, read back out of the fold on every later one. Listing it here is what
+    /// lets an operator answer from `run status` alone, and it is the same courtesy
+    /// `run_human_gate`'s pause reason extends. (It was the GRAPH's copy on the first ask
+    /// until review found that the same option name was scrubbed in `prompt` and plaintext
+    /// here; the asking arm now hands over the redacted copy, which also keeps the two
+    /// drives' sentences identical rather than merely similar.)
+    ///
+    /// **The reason is then run through the redactor, as the write chokepoint** — the same
+    /// argument [`Executor::fail_loop_gate`] makes for the messages it journals, and made
+    /// at the write rather than per arm for the same reason: s2 shipped a per-arm scrub
+    /// that missed an arm.
+    ///
+    /// Its value here is entirely FORWARD-LOOKING, and saying otherwise would overstate it.
+    /// Today it scrubs nothing the caller has not already scrubbed: the menu arrives
+    /// redacted from the asking arm, and the only other interpolation is the NODE ID, which
+    /// this cannot meaningfully protect — a node id is a structural key, plaintext in
+    /// `NodeStarted`, `EffectRecorded` and `LoopGateAwaited.node` in the same journal, so a
+    /// credential in one leaks whatever this line does. What it buys is that a future arm
+    /// which interpolates something new — or an edit that hands this function the GRAPH's
+    /// menu again, which is what review caught — cannot re-open the leak from here.
+    ///
+    /// One difference from [`Executor::redact_menu`] worth knowing: that pass sees each
+    /// name alone, this one sees them JOINED by ` | `, so a pattern spanning the separator
+    /// would scrub more here than there. Strictly more, never less — and the `menu` field
+    /// is the one that must not drift, since it is the vocabulary a decision is resolved
+    /// against, while this string is read by people only.
+    ///
+    /// This is an asymmetry with the other three waiting kinds, stated plainly rather than
+    /// papered over: `run_await_signal`, `run_human_gate` and `run_human_agent` call
+    /// `pause_awaiting` directly with an unredacted reason. Widening the scrub to all four
+    /// is a change to three shipped slices' behaviour and is not this one's to make; s4's
+    /// site is the one that interpolates a whole author-authored MENU, which is what forced
+    /// the question here first.
     async fn pause_gate(
         &self,
         run: RunId,
@@ -1203,19 +1289,41 @@ impl Executor {
         menu: &[LoopGateOption],
         deadline: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<LoopGateStep, OrchestratorError> {
-        let reason = format!(
+        let reason = self.redact_text(format!(
             "loop_gate: waiting for a decision on node {} ({}){}",
             node_id.0,
             menu_names(menu, " | "),
             deadline
                 .map(|d| format!(" (deadline {d})"))
                 .unwrap_or_default()
-        );
+        ));
         // `pause_awaiting` journals the `RunPaused` and echoes the reason into a
         // `NodeExec::Paused` this kind has no use for; the SAME string is returned as the
         // step, so the two cannot disagree.
         self.pause_awaiting(run, reason.clone(), deadline).await?;
         Ok(LoopGateStep::Paused(reason))
+    }
+
+    /// Scrub a loop gate's menu into the copy that becomes durable.
+    ///
+    /// Only the NAMES: `stops` is a `bool` and carries nothing to leak, and it is also the
+    /// half a redaction must never touch — it is what the loop's convergence is decided
+    /// from, and the human is shown it in the question (`gate_ask` annotates each option
+    /// with what picking it does). So the scrubbed menu says the same thing about the LOOP
+    /// as the authored one and differs only in what an operator types.
+    ///
+    /// Through [`Executor::redact_text`], the same wrapper `fail_loop_gate` uses, so the
+    /// option name reaching the journal is byte-identical to the one `gate_ask` put in the
+    /// already-redacted question. Two passes over the same string with the same pure
+    /// redactor, not two different scrubs — which is what keeps the `menu` field and the
+    /// `prompt` field one vocabulary.
+    fn redact_menu(&self, menu: &[LoopGateOption]) -> Vec<LoopGateOption> {
+        menu.iter()
+            .map(|o| LoopGateOption {
+                name: self.redact_text(o.name.clone()),
+                stops: o.stops,
+            })
+            .collect()
     }
 
     /// Journal a `NodeFailed` for a loop gate and return the step that reports it. Every
@@ -1381,6 +1489,42 @@ fn missing_menu_message(node_id: &NodeId) -> String {
         "loop_gate: node {} recorded that it began waiting but published no menu, so there \
          is nothing a decision could be validated against. A waiting node's kind cannot be \
          changed mid-run; fail the run and start a new one.",
+        node_id.0
+    )
+}
+
+/// The first option name that appears twice in a menu, if any.
+///
+/// Run over the REDACTED menu at the one append site, where it catches the duplicate that
+/// `check_menu_option_names` structurally cannot: two distinct credential-shaped names
+/// that collapse to the same placeholder. `validate_dag`'s copy of this rule runs on the
+/// authored graph, before any redactor exists — see the append site for why the rule
+/// cannot move there.
+///
+/// It returns the NAME rather than a `bool` so the failure can say which one, and the name
+/// it returns is post-redaction by construction: the collision is only observable in the
+/// scrubbed vocabulary, and the plaintext must not be recited back in any case.
+fn collided_option_name(menu: &[LoopGateOption]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    menu.iter()
+        .find(|o| !seen.insert(o.name.as_str()))
+        .map(|o| o.name.clone())
+}
+
+/// The refusal for a menu that cannot be offered unambiguously.
+///
+/// It quotes the COLLIDED name — which is the placeholder, not the config — and says what
+/// to do about it, because the operator reading this cannot see the authored names from
+/// here and the message must not show them. `fail_loop_gate` redacts everything it
+/// journals, so a future edit that interpolated the authored names would be scrubbed
+/// anyway; not interpolating them is the first line, not the only one.
+fn ambiguous_menu_message(node_id: &NodeId, name: &str) -> String {
+    format!(
+        "loop_gate: node {}'s menu offers the option name {name:?} more than once after \
+         redaction, so a decision naming it could not be resolved to one option — it would \
+         silently take whichever came first, and the two may disagree about whether the \
+         loop stops. Two option names of credential SHAPE both scrub to the same \
+         placeholder; rename them to something that is not credential-shaped.",
         node_id.0
     )
 }
