@@ -185,6 +185,25 @@ fn est_input_tokens(system: Option<&str>, messages: &[Message], tools: &[ToolDef
     total
 }
 
+/// What the clamp did on one call, kept so the two post-response diagnostics can be
+/// emitted against it (design §5.4). `None` on an unbudgeted run and on a non-`Chat`
+/// payload — the two paths the clamp does not touch — which is what keeps both signals
+/// silent there.
+///
+/// One struct rather than three loose `Option`s because the three numbers are only ever
+/// meaningful together: a reader of `emitted` alone cannot tell whether the budget or
+/// the model's limit produced it, and a reader of `est_input` alone cannot tell whether
+/// an estimate was made at all.
+struct ClampRecord {
+    /// `remaining − est_input`, the BUDGET's own term before any other bound.
+    allowance: u64,
+    /// The `max_tokens` actually sent, i.e. `min(allowance, model ceiling, caller's)`.
+    /// Equal to `allowance` exactly when the budget was the binding term.
+    emitted: u64,
+    /// The pessimistic input estimate the allowance was computed from.
+    est_input: u64,
+}
+
 /// Why a metered dispatch refused to run. Constructed ONLY by
 /// [`Executor::dispatch_metered`] and consumed ONLY by
 /// [`Executor::record_refusal`] — a producer never invents or interprets one.
@@ -336,6 +355,7 @@ impl Executor {
         // whose clamp differs between drives still hashes identically and replays from
         // its memo rather than raising `DeterminismViolation`.
         let clamped;
+        let mut clamp: Option<ClampRecord> = None;
         let request = match (meter.budget(), &request.payload) {
             (
                 Some(cap),
@@ -431,7 +451,17 @@ impl Executor {
                     // budget half exists to constrain anyway.
                     let want = u32::try_from(allowance).unwrap_or(u32::MAX);
                     let want = ceiling.map_or(want, |limit| want.min(limit));
-                    *max_tokens = Some(max_tokens.map_or(want, |caller| caller.min(want)));
+                    // Bound before it is stored, rather than read back out of
+                    // `max_tokens` afterwards: the signals below need this number and
+                    // reading it back would need an `expect` on an `Option` this line
+                    // just filled.
+                    let emitted = max_tokens.map_or(want, |caller| caller.min(want));
+                    *max_tokens = Some(emitted);
+                    clamp = Some(ClampRecord {
+                        allowance,
+                        emitted: u64::from(emitted),
+                        est_input: est,
+                    });
                 }
                 clamped = r;
                 &clamped
@@ -451,6 +481,64 @@ impl Executor {
             // Unbudgeted and unmetered: nothing to charge, nothing to gate.
             return Ok(Ok(response));
         };
+        // The clamp's two diagnostics, and they say DIFFERENT things: the first that our
+        // budget cut a reply short, the second that our estimate of the input was low.
+        //
+        // Both are `tracing` records and neither is a journal event — a decision, not a
+        // deferral (design §5.4). They describe our own ESTIMATOR, not run state:
+        // nothing folds them, no resume depends on them, and no operator decision keys
+        // on them. A journal event would make them durable FORMAT — a `FORMAT_VERSION`
+        // concern, a fold arm, and a row on every clamped call of every budgeted run —
+        // to carry what the ledger already implies, since `usage` is journaled and the
+        // allowance is recomputable from the fold. They earn their place by being cheap.
+        //
+        // Both live inside this `if let` because both are statements ABOUT the clamp.
+        // Hoisting either out would make every unbudgeted call — every pre-SP-DATA-5
+        // run in the system — report against an estimate that was never made, which is
+        // the additivity guarantee broken in the log rather than in the request.
+        if let Some(clamp) = &clamp {
+            if u64::from(usage.output_tokens) >= clamp.emitted {
+                // The reply stopped AT the limit we imposed, so it was almost certainly
+                // cut short rather than finished. Inferred from the token count because
+                // `InferenceResponse` carries no finish reason — only a streaming chunk
+                // does — so this is the available signal, not the ideal one.
+                //
+                // Compared against `emitted` and not `allowance`: `emitted` is what the
+                // provider was actually told, and on any chain whose model limit is
+                // below the allowance (the common case for a large cap) a reply can
+                // never reach `allowance` at all, so keying on that would report nothing
+                // on exactly the runs where replies get truncated. Both numbers are
+                // logged so the reader can tell WHICH bound bit: equal means the budget
+                // truncated this reply, `emitted < allowance` means the model's own
+                // limit (or a caller's own `max_tokens`) did and the budget merely did
+                // not prevent it.
+                //
+                // `>=` rather than `==` is fail-loud: a provider that reported one token
+                // more than it was allowed should still surface here, not fall silently
+                // between the two comparisons.
+                tracing::info!(
+                    max_tokens = clamp.emitted,
+                    allowance = clamp.allowance,
+                    output_tokens = u64::from(usage.output_tokens),
+                    "budget clamp bit: the reply stopped at the clamped output limit"
+                );
+            }
+            if u64::from(usage.input_tokens) > clamp.est_input {
+                // The residual overshoot the design's §4 bounds, and the reason the
+                // claim is "bounded and biased safe" rather than "eliminated": the total
+                // exceeds the remaining budget by exactly `actual_input − est_input`.
+                // Emitted so that term is MEASURABLE in production instead of assumed —
+                // the provider reports the real input count at the same chokepoint that
+                // made the estimate, which is the only feedback loop a `chars / 3`
+                // heuristic can have.
+                tracing::warn!(
+                    estimated = clamp.est_input,
+                    actual = u64::from(usage.input_tokens),
+                    "budget clamp under-estimated the input; the cap may be exceeded by \
+                     the difference"
+                );
+            }
+        }
         meter.record(u64::from(usage.total_tokens));
         Ok(Ok(response))
     }
