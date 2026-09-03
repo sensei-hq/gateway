@@ -4,25 +4,46 @@ use crate::skip_reason::SkipReason;
 /// Gate: the candidate's `context_window` must be able to hold this request's estimated
 /// input.
 ///
-/// The sixth gate, and the one that makes the orchestrator's pre-dispatch check
-/// unnecessary. That check tested the prompt against `min_context_window(chain)` — the
-/// SMALLEST window in the chain — and failed the node terminally, so a chain of
-/// `[gpt-4o 128k, fallback 8k]` refused a 20k prompt the primary would have served. Here
-/// the question is asked per CANDIDATE, which is the only place it has a correct answer.
+/// The sixth gate — registered by SP-7a Task 5, beside the five in
+/// `ModelSelectionService::new`; until that lands this type is built and tested but
+/// changes no selection outcome. It is the one that makes the orchestrator's
+/// pre-dispatch check unnecessary. That check tested the prompt against
+/// `min_context_window(chain)` — the SMALLEST window in the chain — and failed the node
+/// terminally, so a chain of `[gpt-4o 128k, fallback 8k]` refused a 20k prompt the
+/// primary would have served. Here the question is asked per CANDIDATE, which is the
+/// only place it has a correct answer.
 ///
 /// The estimate read is `input_tokens_pessimistic`, NOT the cost gate's `input_tokens`:
 /// the cost figure omits tool schemas and divides by 4, so judging on it would admit
 /// exactly the requests this gate exists to catch. See
-/// `engine::util::estimate_input_tokens_pessimistic`.
+/// `engine::util::estimate_input_tokens_pessimistic` — including its statement of what
+/// it does NOT count, since the gate is exactly as complete as its input.
 ///
 /// `None` admits, matching `BudgetGate`'s treatment of a model with no pricing: an absent
 /// estimate is not evidence of a problem, and a gate that skipped on missing data would
 /// refuse every request that did not carry one.
 ///
-/// Strictly `>`: a request that exactly fills the window is admitted. It leaves no room
-/// for output, but bounding output is the SP-DATA-5 clamp's job (it caps `max_tokens` by
-/// the window), and duplicating that judgement here would skip candidates the clamp can
-/// still serve. Please do not "fix" this to `>=`.
+/// # The boundary is `>`, so a request that exactly fills the window is admitted
+///
+/// This gate answers ONE question — can this candidate hold the INPUT — and a request
+/// of exactly `window` tokens can be held. Whether there is room for OUTPUT beside it is
+/// a different question, and answering it here would need a floor for "enough output"
+/// that the gateway does not have: `max_tokens` may be set by the caller, defaulted by
+/// the adapter (`anthropic` sends 1024 when the request carries `None`), or omitted from
+/// the wire entirely (`openai_compat` skips the field). Any floor picked here would
+/// refuse candidates that would have served a short reply.
+///
+/// What this comment used to say, and what is NOT true: that bounding output is the
+/// SP-DATA-5 clamp's job, so the boundary is safe. The clamp bounds `max_tokens` by a
+/// window only on a BUDGETED run with a `Chat` payload (`executor/dispatch.rs`;
+/// `budget: None` — every unbudgeted run, which is the default — never clamps), and when
+/// it does run it bounds by `min_context_window(chain)`, the chain MINIMUM this gate
+/// exists to stop trusting. So on the default path nothing downstream bounds output by
+/// the window at all. The `>` stands on the narrow-question argument above, not on a
+/// downstream guard.
+///
+/// Changing this to `>=` is therefore a design change needing that floor figure and an
+/// argument for it — not a bug fix.
 pub struct ContextWindowGate;
 
 impl AdmissionGate for ContextWindowGate {
@@ -138,24 +159,42 @@ mod tests {
     /// not evidence of a problem, and skipping on it would refuse every request that did
     /// not carry one — which is every caller that reaches selection by a path other than
     /// `engine::execute`.
+    ///
+    /// Asserted against a ZERO window, deliberately. With the 8192 fixture this test
+    /// could not tell "admitted because the estimate is absent" from "admitted because a
+    /// substituted default happened to fit": `.or(Some(8_000))` in the gate passes an
+    /// 8192-window test while skipping every candidate under 8000 tokens. Nothing fits a
+    /// zero window, so admitting here is possible ONLY because the estimate is absent,
+    /// and every `unwrap_or(k)` mutant reddens rather than just the extreme ones.
     #[test]
     fn no_estimate_admits() {
-        let mc = model_with_window(8_192);
+        let mc = model_with_window(0);
         let rc = test_router_config();
         let cfg = GatewayConfig::default();
         let health = NeverOpen;
-        assert!(matches!(
-            ContextWindowGate.evaluate(&cand(&mc, &rc), &ctx(&cfg, &health, None, None)),
-            GateVerdict::Admit
-        ));
+        assert!(
+            matches!(
+                ContextWindowGate.evaluate(&cand(&mc, &rc), &ctx(&cfg, &health, None, None)),
+                GateVerdict::Admit
+            ),
+            "a request carrying no pessimistic estimate must admit EVERY candidate, \
+             including one whose window could hold nothing"
+        );
     }
 
-    /// A request inside the window admits; one over it is skipped with BOTH numbers.
+    /// A request inside the window admits; one over it is skipped with BOTH numbers; and
+    /// the SAME request gets DIFFERENT answers from two candidates.
+    ///
+    /// The third clause is the slice's whole reason to exist and was the one thing no
+    /// test pinned: replacing `c.model_config.context_window` with the literal 8_192 —
+    /// deleting every read of the candidate — left the entire gateway suite green. So
+    /// one estimate is now evaluated against a 128k candidate and an 8k one, which is
+    /// AC1's chain at unit scale and dies on any regression to a single chain-wide
+    /// number.
     ///
     /// `8_192` admitting and `8_193` skipping pins the boundary as `est > window`, not
-    /// `est >= window`. A request that exactly fills the window leaves no room for
-    /// output — but bounding output is the SP-DATA-5 clamp's job, and skipping here for
-    /// that reason would refuse candidates the clamp can still serve.
+    /// `est >= window` — see the type's doc for why that is the narrow question and what
+    /// does NOT bound the output half.
     #[test]
     fn over_window_skips_and_under_window_admits() {
         let mc = model_with_window(8_192);
@@ -176,6 +215,34 @@ mod tests {
             }
             GateVerdict::Skip(other) => panic!("expected an OverContextWindow skip, got {other}"),
             GateVerdict::Admit => panic!("8193 tokens must not be admitted to an 8192 window"),
+        }
+
+        // AC1 at unit scale: ONE request, two candidates, two answers.
+        let big = model_with_window(128_000);
+        let small = model_with_window(8_192);
+        let twenty_k = ctx(&cfg, &health, None, Some(20_000));
+        assert!(
+            matches!(
+                ContextWindowGate.evaluate(&cand(&big, &rc), &twenty_k),
+                GateVerdict::Admit
+            ),
+            "the 128k candidate holds 20k and must be admitted"
+        );
+        match ContextWindowGate.evaluate(&cand(&small, &rc), &twenty_k) {
+            GateVerdict::Skip(SkipReason::OverContextWindow { estimated, window }) => {
+                assert_eq!(estimated, 20_000);
+                assert_eq!(
+                    window, 8_192,
+                    "the skip must record THIS candidate's window, not a chain-wide \
+                     figure — recording the wrong one sends the operator after the \
+                     wrong model"
+                );
+            }
+            GateVerdict::Skip(other) => panic!("expected an OverContextWindow skip, got {other}"),
+            GateVerdict::Admit => panic!(
+                "the 8192 candidate cannot hold 20k — a gate that admits it is reading \
+                 something other than this candidate's window"
+            ),
         }
     }
 
