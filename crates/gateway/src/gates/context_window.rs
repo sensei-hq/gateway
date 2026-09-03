@@ -4,10 +4,9 @@ use crate::skip_reason::SkipReason;
 /// Gate: the candidate's `context_window` must be able to hold this request's estimated
 /// input.
 ///
-/// The sixth gate — registered by SP-7a Task 5, beside the five in
-/// `ModelSelectionService::new`; until that lands this type is built and tested but
-/// changes no selection outcome. It is the one that makes the orchestrator's
-/// pre-dispatch check unnecessary. That check tested the prompt against
+/// The sixth gate, registered LAST in `ModelSelectionService::new` (see the comment
+/// there for why that position, not merely "at the end"). It is the one that made the
+/// orchestrator's pre-dispatch check unnecessary — that check tested the prompt against
 /// `min_context_window(chain)` — the SMALLEST window in the chain — and failed the node
 /// terminally, so a chain of `[gpt-4o 128k, fallback 8k]` refused a 20k prompt the
 /// primary would have served. Here the question is asked per CANDIDATE, which is the
