@@ -14225,6 +14225,137 @@ async fn a_budgeted_call_is_never_clamped_above_the_models_output_limit() {
     );
 }
 
+/// The clamp is bounded by the CONTEXT WINDOW too, not only by the output limit.
+///
+/// A provider enforces `prompt_tokens + max_tokens <= context_window`, and the
+/// unbudgeted path never trips it because `max_tokens: None` is omitted from the wire
+/// entirely (`openai_compat/convert.rs`'s `skip_serializing_if`). So bounding only by
+/// `max_output_tokens` reintroduces, through the window route, exactly the regression the
+/// ceiling term was added to prevent: **setting a budget hard-fails a call that succeeds
+/// without one.** Worse than the output-limit case, because it arrives as a `NodeFailed`
+/// rather than a budget pause — `torii run wake --budget-tokens N` cannot recover it, and
+/// the operator's only remedy is to drop the budget.
+///
+/// The fixture chain is `context_window: 4096`, `max_output_tokens: 1024`. A 10 500-char
+/// prompt estimates at `ceil(10500/3) = 3500`, so the window leaves `4096 - 3500 = 596` —
+/// BELOW the 1024 output limit, which is what makes the window the binding term here and
+/// the output limit a decoy. Before the fix the clamp emitted 1024 and asked for
+/// `3500 + 1024 = 4524` against a 4096 window.
+///
+/// The threshold is not exotic: the shipped presets are `8192 / 4096`
+/// (`gateway/src/catalog/presets.rs`), so any prompt over ~4096 tokens is in this
+/// territory, and SP-6 s4 bounds a single `## Context` section at 32 KiB — ~10.9k tokens
+/// on its own under `chars/3`.
+#[tokio::test]
+async fn a_budgeted_call_is_never_clamped_past_the_context_window() {
+    // 10_500 chars ⇒ est 3500 ⇒ the window allows 596, under the 1024 output limit.
+    let prompt = "x".repeat(10_500);
+    let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // A cap far above both bounds, so neither the budget nor the output limit is what
+    // holds the value down — only the window can.
+    journal
+        .append(run, run_started_with_budget(100_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", &prompt),
+            deps: vec![],
+        }],
+    };
+    let out = exec.start(run, &graph).await.expect("drives");
+    assert!(
+        out.failed.is_none(),
+        "a budgeted run must not be failed by its own clamp: {:?}",
+        out.failed
+    );
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let emitted = seen
+        .first()
+        .copied()
+        .flatten()
+        .expect("the budgeted call was clamped");
+    // 4096 − 3500. Asserted as the arithmetic rather than a bare literal so a change to
+    // the fixture window or to the estimator moves the expectation with it.
+    let est = 10_500u32.div_ceil(3);
+    let window_allows = 4096 - est;
+    assert!(
+        emitted <= window_allows,
+        "the clamp must leave room for the prompt inside the context window: emitted \
+         {emitted} + est {est} exceeds the 4096 window (window allows {window_allows}, \
+         and the {FIXTURE_MAX_OUTPUT_TOKENS} output limit is NOT the binding term here)"
+    );
+}
+
+/// A budgeted **ReAct agent turn** reaches the provider clamped, and its estimate counts
+/// the system prompt and the tool schemas.
+///
+/// Two properties in one test because the second does not follow from the first, and the
+/// distinction is the whole point:
+///
+/// 1. **The clamp happens at all on this producer.** Every other clamp test drives a
+///    `ModelCall`, whose `support::build_request` hardcodes `system: None, tools: []`. So
+///    skipping the clamp for any request carrying a system prompt — `) if
+///    system.is_none() => {` on the match arm — reddened NOTHING before this test. The
+///    agent and the selector are the two producers that spend the most per call, and they
+///    were the two the clamp was never observed on.
+/// 2. **The estimate's `system` and `tools` terms are actually WIRED.** Passing
+///    `est_input_tokens(None, messages, &[])` at the call site also reddened nothing,
+///    because no test drove a payload where those terms were non-empty. That mutation is
+///    the direction §4 forbids: the estimate collapses to the user message, `allowance =
+///    remaining − est` comes out too high, and the clamp over-asks by the whole
+///    system-plus-schemas term — measured at ~98% of the estimate on this fixture.
+///
+/// The upper bound is what separates them: asserting merely `Some(_)` stays green under
+/// mutation 2. `cap − 1` is what a one-character user message alone would leave, so
+/// anything at or above it proves the other terms contributed nothing.
+#[tokio::test]
+async fn a_budgeted_agent_turn_is_clamped_and_counts_its_system_and_tools() {
+    const CAP: u64 = 1_000;
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools());
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: NodeKind::Agent {
+                agent: AgentRef("a".into()),
+                input: serde_json::json!("hi"),
+                phase: None,
+            },
+            deps: vec![],
+        }],
+    };
+    exec.start(run, &graph).await.expect("drives");
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let emitted =
+        seen.first().copied().flatten().expect(
+            "a budgeted ReAct turn reaches the provider CLAMPED, not with max_tokens: None",
+        );
+    // The user message is `"hi"` — 2 chars, so 1 token under `chars/3`. If the system
+    // prompt and the tool schemas were counted, the allowance is well below `cap - 1`.
+    let user_only = u32::try_from(CAP).unwrap() - 1;
+    assert!(
+        emitted < user_only,
+        "the estimate must count the agent's system prompt and tool schemas, not just \
+         the user message: emitted {emitted} is at or above the {user_only} that the \
+         2-char message alone would leave"
+    );
+}
+
 /// Below the floor the gate refuses, and **makes no gateway call**.
 ///
 /// Asserted on the call log, not on the outcome: a test that only checked the pause
