@@ -4317,7 +4317,9 @@ pub(crate) mod tests {
     /// rather than a comment. It is inverted rather than deleted so the closure is proven
     /// on the same fixture that pinned the gap.
     ///
-    /// **All THREE waiting kinds sit in ONE run**, and that is what makes the negative
+    /// **Three waiting kinds sit in ONE run** — every kind that existed when this was
+    /// written; SP-6 s4's loop gate is the fourth, and it has its own listing tests. That
+    /// is what makes the negative
     /// assertions mean anything: [`list_paused`] folds one journal PER RUN, so a question
     /// could not leak between runs however `awaiting_nodes` was written. In one fold, only
     /// the per-node keying stops it — the same lesson
