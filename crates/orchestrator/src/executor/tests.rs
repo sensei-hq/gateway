@@ -14918,13 +14918,12 @@ async fn a_clamped_call_still_journals_its_real_usage() {
 /// would then guarantee the violation.
 ///
 /// **This test carries the `ModelCall` call site only** — its graph is two `ModelCall`
-/// nodes. The three keys are two functions across three call sites (see
+/// nodes. There are FIVE call sites across two functions (see
 /// [`a_budgeted_agent_turn_replays_from_its_memo_when_the_budget_moved`]), and a budget
-/// term folded in at one site leaves the other two hashing as before, so one fixture
-/// cannot pin more than the site it drives. The agent's is that test; the selector's is
-/// already reddened by [`a_re_driven_selector_replays_its_call_instead_of_respending`].
-/// Claiming all three here was wrong and measurably so: the agent site took the mutation
-/// green.
+/// term folded in at one leaves the other four hashing as before, so one fixture cannot
+/// pin more than the site it drives. The agent's is that test; the selector's is already
+/// reddened by [`a_re_driven_selector_replays_its_call_instead_of_respending`]. Claiming
+/// all of them here was wrong and measurably so: the agent site took the mutation green.
 ///
 /// The clamp block's own comment leans on that argument. A comment cannot fail, so these
 /// tests carry it — and it was mutation-checked rather than assumed. Hashing the clamped
@@ -15024,13 +15023,21 @@ async fn a_clamped_call_replays_from_its_memo_when_the_budget_moved() {
 ///
 /// # Why the `ModelCall` twin above does not cover this
 ///
-/// There are three determinism keys, and they are TWO functions across THREE call sites:
-/// `support::input_hash(chain, payload)` is called both by `run_node`'s `ModelCall` arm
-/// (and the `Map` producer) and, with a `{system, user}` payload, by
-/// `SelectorDispatch::complete`; `support::agent_input_hash` is called only by
-/// `agent_turn_output`. A guard therefore attaches to a CALL SITE, not to a function — a
-/// budget term folded in at one site leaves the other two hashing exactly as before, so
-/// each site needs a resume test of its own, and the agent's had none.
+/// There are TWO functions across FIVE call sites: `support::input_hash(chain, payload)`
+/// is called by `run_node`'s `ModelCall` arm (`mod.rs`), by the `Map` child producer and
+/// by the `Consolidate` synthesis (both `fanout.rs`), and — with a `{system, user}`
+/// payload — by `SelectorDispatch::complete`; `support::agent_input_hash` is called only
+/// by `agent_turn_output`. A guard attaches to a CALL SITE, not to a function — a budget
+/// term folded in at one leaves the other four hashing exactly as before, so each site
+/// needs a resume test of its own, and the agent's had none.
+///
+/// **This comment said THREE until the whole-slice review counted them**, folding the
+/// `Map` producer into the `ModelCall` entry one clause after ruling that a guard
+/// attaches to a site rather than a function, and omitting `Consolidate` outright. Both
+/// `fanout.rs` sites are covered only INCIDENTALLY: the Map gate test hand-computes its
+/// hash, so an author folding a term in would update that line and never see a failure,
+/// and the Consolidate site's only red is a compaction test named nowhere in this
+/// argument. Recorded because the count is what the next author will inherit.
 ///
 /// Measured, both legs. Folding this run's remaining budget in at `agent_turn_output`
 /// (`agent.rs`) left the whole orchestrator lib suite green before this test existed; the
