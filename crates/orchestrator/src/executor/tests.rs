@@ -21532,6 +21532,213 @@ mod human_loop_gate {
             .collect()
     }
 
+    /// An executor over a caller-owned journal with a REDACTOR wired, and a menu the
+    /// caller chooses.
+    ///
+    /// [`exec_at`] cannot serve the two tests below: it has no `with_redactor`, and the
+    /// module's shared `human_gated_loop_graph` hard-codes [`menu`]. The gateway is the
+    /// same `recording_gateway` `exec_at` builds, so the fixtures differ in exactly the
+    /// redactor and the menu.
+    async fn exec_redacting(
+        journal: &InMemoryJournal,
+        menu: Vec<LoopGateOption>,
+    ) -> (Executor, Graph) {
+        let (gw, _calls) = recording_gateway().await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(human_registry(Some(Duration::hours(1))))
+            .with_clock(crate::test_support::FakeClock::new(at(1_000)))
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+        let graph = Graph {
+            nodes: vec![human_gated_loop_node(3, menu)],
+        };
+        (ex, graph)
+    }
+
+    /// AC16, the half `the_journaled_loop_gate_question_is_redacted` does not reach: a
+    /// credential in an OPTION NAME reaches the journal in the `menu` field and in the
+    /// pause `reason`, not only in the `prompt`.
+    ///
+    /// **The same author-config string was scrubbed in one durable field and plaintext in
+    /// two others on the same drive.** `gate_ask` interpolates the option names into the
+    /// question, which is redacted; `LoopGateAwaited.menu` was appended straight from the
+    /// graph; and `pause_gate` built `RunPaused.reason` from those same names. Review
+    /// measured all three on one drive — prompt clean, menu leaking, reason leaking — and
+    /// this is the defect class s2 and s3 each shipped and each had to fix. `torii config
+    /// push` scrubs nothing, so the journal row is the last line of defence.
+    ///
+    /// **The second half of the test is the point of the first.** A menu is not display
+    /// text: it is the VOCABULARY every later decision is resolved against
+    /// (`published.iter().find(|o| o.name == decision.option)`, §5.3). Redacting it is
+    /// only correct if the gate still WORKS afterwards — so the decision below is made
+    /// with the name read back off the journal, exactly as `torii run gate decide` would
+    /// have to, and the loop must go on to run another iteration. A fix that closed the
+    /// leak by scrubbing the menu and left the resolution matching against the graph's
+    /// plaintext copy would pass the leak assertions and strand every operator.
+    ///
+    /// Every secret is assembled at RUNTIME: the Semgrep CWE-798 pre-commit hook blocks a
+    /// literal credential-shaped fixture.
+    #[tokio::test]
+    async fn a_credential_in_a_menu_option_name_never_reaches_the_journal() {
+        let in_option = format!("sk-{}", "d".repeat(40));
+
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, graph) = exec_redacting(
+            &journal,
+            vec![
+                LoopGateOption {
+                    name: in_option.clone(),
+                    stops: false,
+                },
+                LoopGateOption {
+                    name: "ship".into(),
+                    stops: true,
+                },
+            ],
+        )
+        .await;
+
+        let out = ex.start(run, &graph).await.expect("drives");
+        assert!(out.paused.is_some(), "the gate still asks: {out:?}");
+
+        let events = journal.load(run).await.expect("loads");
+        let asked = asks(&events);
+        assert_eq!(asked.len(), 1, "exactly one question: {asked:?}");
+        let (_, prompt, published, _) = &asked[0];
+        assert!(
+            !prompt.contains(in_option.as_str()),
+            "the question is redacted, as it already was: {prompt}"
+        );
+        assert!(
+            !published.iter().any(|o| o.name.contains(&in_option)),
+            "…and so is the MENU beside it. An option name is author free text out of the \
+             same `torii config push` that redacts nothing, and this row is durable — read \
+             back by every later drive and rendered by `run list-paused`: {published:?}"
+        );
+        assert!(
+            !pause_reasons(&events)
+                .iter()
+                .any(|r| r.contains(&in_option)),
+            "…and so is the pause reason built from it, which is the sentence `torii run \
+             status` prints: {:?}",
+            pause_reasons(&events)
+        );
+
+        // The menu still WORKS. The name comes off the journal because that is the only
+        // copy an operator can see — `run gate decide` recites the published menu and
+        // refuses anything else.
+        let offered = published[0].name.clone();
+        assert_eq!(
+            offered, "[REDACTED]",
+            "the option is offered under its scrubbed name, which is also what the \
+             question shows — one vocabulary, not two"
+        );
+        journal
+            .append(run, decided(&gate(0), &offered, "jerry"))
+            .await
+            .expect("the decision lands");
+        let out = ex.start(run, &graph).await.expect("re-drives");
+        assert!(
+            out.failed.is_none(),
+            "a decision naming the PUBLISHED option resolves — redacting the menu must \
+             not strand the operator it protects: {out:?}"
+        );
+        let events = journal.load(run).await.expect("loads");
+        assert_eq!(
+            asks(&events).len(),
+            2,
+            "…and it resolved to `stops: false`, so iteration 1 ran and asked again. The \
+             `stops` flag travels with the name and is not itself redactable: {:?}",
+            rows(&events)
+        );
+    }
+
+    /// The one case redacting the menu could make WORSE, refused loudly rather than
+    /// guessed.
+    ///
+    /// `check_menu_option_names` rejects a duplicate option name at `validate_dag` time —
+    /// "`--option x` would be ambiguous". Redaction happens long after that, and it can
+    /// RE-CREATE the duplicate: two distinct credential-shaped names both collapse to
+    /// `[REDACTED]`. Resolution is `published.iter().find(..)`, so the first match wins
+    /// and an operator picking the only name they were offered would get whichever
+    /// `stops` came first — a decision inverted silently, which is precisely the hazard
+    /// §5.3 journals the menu to prevent.
+    ///
+    /// So the gate fails, on the same reasoning as the authored-bytes cap: the input is
+    /// author-controlled config, a loud terminal failure is actionable by the person who
+    /// wrote it, and the alternatives are worse — keeping the plaintext re-opens the leak,
+    /// and inventing disambiguating suffixes would offer a human an option name their
+    /// config does not contain.
+    ///
+    /// It is NOT checkable at `validate_dag` time, which is where the duplicate rule
+    /// lives: that function is pure over the graph and has no `Redactor`. The redactor is
+    /// an executor injection (`with_redactor`, default none), so the same graph is legal
+    /// under one executor and not under another — a redactor-dependent rule in a pure
+    /// graph validator would be a lie about the graph.
+    #[tokio::test]
+    async fn a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly() {
+        let first = format!("sk-{}", "e".repeat(40));
+        let second = format!("sk-{}", "f".repeat(40));
+
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let (ex, graph) = exec_redacting(
+            &journal,
+            vec![
+                LoopGateOption {
+                    name: first.clone(),
+                    stops: false,
+                },
+                LoopGateOption {
+                    name: second.clone(),
+                    stops: true,
+                },
+            ],
+        )
+        .await;
+
+        let out = ex.start(run, &graph).await.expect("drives");
+        let (node, message) = out.failed.clone().unwrap_or_else(|| {
+            panic!("two options that redact to one name cannot be offered: {out:?}")
+        });
+        assert_eq!(
+            node,
+            lp(),
+            "the gate's refusal fails the LOOP (AC10): {out:?}"
+        );
+        assert!(
+            message.contains(&gate(0).0) && message.contains("[REDACTED]"),
+            "the message names the gate and the name the collision happened UNDER, which \
+             is the only form of it an operator may be shown: {message}"
+        );
+        for secret in [&first, &second] {
+            assert!(
+                !message.contains(secret.as_str()),
+                "…and never the plaintext it is refusing to publish — `fail_loop_gate` \
+                 scrubs every message it journals: {message}"
+            );
+        }
+        assert!(
+            out.paused.is_none(),
+            "it does not also pause: a menu nobody can answer unambiguously is not a \
+             wait: {out:?}"
+        );
+
+        let events = journal.load(run).await.expect("loads");
+        assert!(
+            asks(&events).is_empty(),
+            "and NOTHING was published — the refusal happens BEFORE the append, so no \
+             durable row carries either the ambiguous menu or the plaintext it came \
+             from: {:?}",
+            rows(&events)
+        );
+        assert!(
+            pause_reasons(&events).is_empty(),
+            "…including the pause reason, which recites the menu: {:?}",
+            pause_reasons(&events)
+        );
+    }
+
     /// The single most-travelled drive in the slice: a wake while the person has NOT
     /// answered yet. The gate RE-PAUSES — it does not re-ask, does not fail, and does not
     /// spend.

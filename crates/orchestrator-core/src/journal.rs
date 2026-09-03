@@ -439,33 +439,63 @@ pub enum JournalEvent {
     /// because a writer who adds a second append site reads THIS doc:
     ///
     /// - **Bound it by two rules, not one.** The AUTHORED bytes (the role's
-    ///   `system_prompt` + activated skill bodies + the iteration input) fail LOUDLY over
-    ///   [`MAX_HUMAN_TEXT_BYTES`]; the `## Context` bytes are TRUNCATED with a visible
-    ///   marker against [`MAX_HUMAN_CONTEXT_BYTES`]. Charging one cap against both is not
-    ///   a smaller version of the rule but a different behaviour, and it was the s3
+    ///   `system_prompt` + activated skill bodies + the menu-derived `## Task` ask) fail
+    ///   LOUDLY over [`MAX_HUMAN_TEXT_BYTES`]; the `## Context` bytes are TRUNCATED with a
+    ///   visible marker against [`MAX_HUMAN_CONTEXT_BYTES`]. Charging one cap against both
+    ///   is not a smaller version of the rule but a different behaviour, and it was the s3
     ///   whole-slice review's worst finding — an ordinary verbose upstream killed the node
     ///   terminally after its tokens were already spent. It bites harder here than at s3's
     ///   site: a loop gate's `## Context` is a model iteration's output essentially
     ///   always.
+    ///
+    ///   The third authored term is where this restatement is NOT verbatim, and getting it
+    ///   verbatim was a bug in an earlier version of this bullet. At `AgentAwaited`'s site
+    ///   the third term is the node INPUT; at a loop gate's it is `gate_ask(menu)`, the ask
+    ///   synthesized from the option names, and the iteration output is the whole of the
+    ///   `## Context` half. Naming the iteration data as the loudly-capped term inverts the
+    ///   rule the bullet exists to state — which is why the executor's own failure message
+    ///   says "trim the gate role's system prompt, its skills, or the menu option names".
     /// - **REDACT it before appending** (design §6), through the executor's own
     ///   `Redactor`, then clamp — `[REDACTED]` is longer than the shortest span it
     ///   replaces. This is the one place a credential in a `system_prompt`, a skill body
     ///   or an iteration output reaches durable storage in the clear; nothing upstream
     ///   scrubs it (`torii config push` redacts nothing). s3 shipped the unredacted form
     ///   first and its review caught it.
+    /// - **Redact the `menu` too, and refuse a menu that redaction makes AMBIGUOUS.** This
+    ///   obligation is s4's own — `AgentAwaited` has no menu — and it is the one the first
+    ///   shipped append site missed: `prompt` quotes the option names (through `gate_ask`)
+    ///   and was scrubbed, while `menu` was appended straight from the graph, so one author
+    ///   string was clean in one durable field and plaintext in another on the same write.
+    ///   Option names come through the same `torii config push` that redacts nothing.
     ///
-    /// Neither is optional (design §6, AC15/AC16). They were recorded on the TYPE ahead of
-    /// any code that honoured them, because the s4 plan builds the append site (Task 6)
-    /// four tasks before the enforcement (Task 10) — the contract had to be legible to the
-    /// writer who arrived first. Both are now honoured by `Executor::run_human_loop_gate`
-    /// and each is guarded by the test named for the mutation that undoes it:
+    ///   The refusal is the non-obvious half. `menu` is not display text: it is the
+    ///   vocabulary a decision is resolved against, and redacting it is only safe while the
+    ///   names stay DISTINCT. `Graph::validate_dag` rejects a duplicate name, but it runs on
+    ///   the authored graph and cannot see a redactor at all (the redactor is an executor
+    ///   injection, so the same graph is legal under one executor and not another), and
+    ///   redaction can re-create the duplicate: two credential-shaped names both collapse to
+    ///   the placeholder, the resolver takes the first match, and an operator picking the
+    ///   only name they were offered gets whichever `stops` came first. A silently inverted
+    ///   decision is worse than either the leak or a loud failure, so the writer must check
+    ///   the redacted names for collision and fail the gate BEFORE appending.
+    ///
+    /// None of the three is optional (design §6, AC15/AC16). The first two were recorded on
+    /// the TYPE ahead of any code that honoured them, because the s4 plan builds the append
+    /// site (Task 6) four tasks before the enforcement (Task 10) — the contract had to be
+    /// legible to the writer who arrived first; the third was added after review found the
+    /// shipped site honouring the prompt rule and not the menu one. All three are now
+    /// honoured by `Executor::run_human_loop_gate`, and each is guarded by the test named
+    /// for the mutation that undoes it:
     /// `an_oversized_authored_prompt_fails_the_loop_gate` (delete the authored-bytes
     /// check), `a_verbose_iteration_output_truncates_the_question_instead_of_killing_the_gate`
     /// (pass the iteration output as the seam's `input` instead of as a `context` entry —
     /// the reversal the plan's own Task 6 sketch had, which fails the gate on a perfectly
-    /// ordinary 37 KiB model answer) and `the_journaled_loop_gate_question_is_redacted`
-    /// (swap the redactor for the identity). A SECOND append site owes all three, and
-    /// inherits none of them.
+    /// ordinary 37 KiB model answer), `the_journaled_loop_gate_question_is_redacted`
+    /// (swap the redactor for the identity),
+    /// `a_credential_in_a_menu_option_name_never_reaches_the_journal` (append the graph's
+    /// menu instead of the scrubbed one) and
+    /// `a_menu_whose_option_names_collide_once_redacted_fails_the_gate_loudly` (delete the
+    /// collision refusal). A SECOND append site owes all of them, and inherits none.
     ///
     /// FIRST record wins when folded, exactly as `SignalAwaited`/`GateAwaited`/
     /// `AgentAwaited` do — overwriting the deadline is the never-expires bug.
