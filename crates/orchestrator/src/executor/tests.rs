@@ -11993,8 +11993,8 @@ async fn shell_stdout_is_redacted() {
 ///
 /// The gate itself was NOT weakened to accommodate any of this, and that was checked by
 /// mutation rather than asserted: delete the `spent >= cap` block from
-/// `dispatch_metered` and eleven tests redden — nine with "attempt to subtract with
-/// overflow" on the clamp's `cap - spent`, plus
+/// `dispatch_metered` and eleven tests redden — nine on the clamp's own
+/// `debug_assert!` ("the `spent >= cap` gate was bypassed or reordered"), plus
 /// `a_non_chat_payload_is_gated_but_not_clamped` (a payload the clamp skips, so the gate
 /// is the only thing left) and `spending_exactly_the_cap_stops_the_run` (whose reason
 /// assertion now tells the gate's message from the floor's). The `>=`-versus-`>`
@@ -13375,8 +13375,9 @@ async fn the_consolidate_producer_journals_its_reported_usage() {
 ///
 /// So the `Chat` boundary is pinned again, by the wording rather than by the call count.
 /// Deleting the `spent >= cap` block entirely reddens this test for the same reason, and
-/// ten others besides — nine with "attempt to subtract with overflow" on the clamp's
-/// `cap - spent`, which is why that subtraction is deliberately not saturating.
+/// ten others besides — nine on the clamp's own `debug_assert!`, "the `spent >= cap`
+/// gate was bypassed or reordered: spent 1500 > cap 1000", which is why that subtraction
+/// is a `checked_sub` behind a debug tripwire and not a `saturating_sub`.
 ///
 /// [`a_non_chat_payload_is_gated_but_not_clamped`] pins the same boundary from the other
 /// side, on an `Embed` — the one payload the clamp SKIPS, where the gate is the only

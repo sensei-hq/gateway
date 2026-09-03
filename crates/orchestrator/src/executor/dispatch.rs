@@ -247,10 +247,20 @@ impl Executor {
     /// in-drive tally is updated HERE, at the same single chokepoint that reads it — so
     /// a producer can neither bypass the gate nor forget to account for what it spent.
     ///
-    /// The check is `spent >= cap` BEFORE the call, which makes the budget a
-    /// FLOOR-TRIGGER rather than a ceiling: output tokens are unknowable until the
-    /// call returns, so a cap can be overshot by at most one call. `budget: None`
-    /// (every pre-SP-DATA-5 run) never gates — the additivity guarantee.
+    /// There are TWO budget checks here, not one, and a reader who knows only the first
+    /// has the wrong model of when a budgeted run stops.
+    ///
+    /// The first is `spent >= cap` BEFORE the call — a floor-trigger, which on its own
+    /// permits an overshoot of one whole call. The second is the SP-DATA-5 clamp below
+    /// it, which bounds that call's OUTPUT half by setting `max_tokens` to what the
+    /// remaining budget affords, and REFUSES when what is left cannot buy a reply worth
+    /// paying input tokens for. So a budgeted run can pause with `spent < cap`, and the
+    /// residual overshoot is the input estimate's error rather than a model's whole
+    /// output limit. Bounded and biased safe, not eliminated — the clamp block's own
+    /// comment writes out the arithmetic.
+    ///
+    /// `budget: None` (every pre-SP-DATA-5 run) never gates and never clamps — the
+    /// additivity guarantee.
     ///
     /// Tokens are charged on a successful RESPONSE rather than after the caller
     /// journals its `EffectRecorded`: the provider has been paid either way, so a
@@ -329,21 +339,43 @@ impl Executor {
                 },
             ) => {
                 let est = est_input_tokens(system.as_deref(), messages, tools);
-                // `cap - spent` cannot underflow: the gate at the top of this function
-                // returned when `spent >= cap`, reading the same two values (`cap` from
-                // `meter.budget()`, which is a plain field read, and this same `spent`
-                // local). It is left as a plain
-                // subtraction deliberately — that gate is the ONLY thing keeping it
-                // safe, and a `saturating_sub` here would silently absorb the bug if
-                // the gate were ever removed or reordered instead of panicking on it
-                // (`a_fresh_budgeted_run_pauses_mid_drive_after_one_call` is what
-                // catches that, with "attempt to subtract with overflow").
+                // `cap - spent` cannot underflow while the gate at the top of this
+                // function stands: it returned when `spent >= cap`, reading the same two
+                // values (`cap` from `meter.budget()`, a plain field read, and this same
+                // `spent` local). The gate is the ONLY thing keeping that true, so this
+                // subtraction is written to do two different jobs depending on the
+                // build, and both are deliberate.
                 //
+                // In a DEBUG build the `debug_assert!` panics with a message naming the
+                // cause, which is what makes removing or reordering the gate loud rather
+                // than silently absorbed: delete the gate and eleven tests redden.
+                //
+                // In a RELEASE build there is no tripwire to rely on — the workspace
+                // profile sets no `overflow-checks`, so a plain `cap - spent` would WRAP
+                // to something near `u64::MAX` and sail past the floor into a dispatch
+                // that should have been refused. `checked_sub` fails CLOSED instead: the
+                // impossible case refuses the call, which is the same answer the gate
+                // would have given. That is the whole point of not writing
+                // `saturating_sub` here — a saturating subtraction would produce 0 and
+                // refuse too, but SILENTLY, in debug as well, and the gate's removal
+                // would then be invisible to the suite.
+                debug_assert!(
+                    spent <= cap,
+                    "the `spent >= cap` gate was bypassed or reordered: spent {spent} > cap {cap}"
+                );
+                let Some(remaining) = cap.checked_sub(spent) else {
+                    return Ok(Err(Refusal::BudgetExhausted {
+                        spent,
+                        budget: cap,
+                        cause: BudgetRefusal::Spent,
+                    }));
+                };
                 // `saturating_sub` on the ESTIMATE is a different matter and is
-                // load-bearing: `est` genuinely can exceed what is left, and a plain
-                // subtraction there would wrap to an enormous allowance — a clamp WIDER
-                // than the cap, which is worse than no clamp at all.
-                let allowance = (cap - spent).saturating_sub(est);
+                // load-bearing: `est` genuinely can exceed what is left, for a long
+                // prompt against a nearly spent budget, and a plain subtraction there
+                // would wrap to an enormous allowance — a clamp WIDER than the cap,
+                // which is worse than no clamp at all.
+                let allowance = remaining.saturating_sub(est);
                 if allowance < orchestrator_core::MIN_OUTPUT_TOKENS {
                     // Below the floor, refuse rather than clamp — and refuse BEFORE the
                     // call, so no input tokens are spent on a reply that would arrive

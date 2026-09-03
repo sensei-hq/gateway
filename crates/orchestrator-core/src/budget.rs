@@ -10,9 +10,20 @@ use serde::{Deserialize, Serialize};
 /// models. Money denomination is deferred (spec §8) because it needs durable,
 /// current per-model pricing, and a stale price would silently make the cap wrong.
 ///
-/// It is a FLOOR-TRIGGER, not a ceiling. The gate tests already-accumulated spend
-/// before each call, and output tokens are unknowable before the call returns, so a
-/// budget can be overshot by at most one call.
+/// It is not a hard ceiling, and the shape of the slack has TWO parts.
+///
+/// The gate tests already-accumulated spend before each call — a floor-trigger — so on
+/// its own it permits an overshoot of one whole call. The SP-DATA-5 clamp then bounds
+/// that call's OUTPUT half by setting `max_tokens` to what the remaining budget affords,
+/// which leaves only the INPUT half unbounded: the residual is
+/// `actual_input − est_input`, biased toward refusing early by a pessimistic estimate.
+/// Bounded and biased safe, not eliminated.
+///
+/// The same clamp means a budgeted run can PAUSE WITH `spent < cap`, which is the wrong
+/// mental model to be missing when debugging one. Once the allowance left after the
+/// input estimate falls under [`MIN_OUTPUT_TOKENS`], the run refuses rather than paying
+/// for a reply too short to be useful, and says by how much the cap must rise. So
+/// `spent >= cap` is not the only refusal.
 ///
 /// `Copy`: a single immutable `u64` cap value, not a handle to shared mutable state
 /// — the one-source-of-truth concern that `Copy` would threaten belongs to the
