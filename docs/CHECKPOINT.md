@@ -1,37 +1,38 @@
 # Checkpoint
 
-**Slice: SP-DATA-5 follow-on — the budget clamp.** On `develop`, unpushed. Tasks 1–8 done; Task 9
-is down to Steps 1–2 and 5–6 (its doc steps 3–4 landed in review round 2).
+**Slice: SP-DATA-5 follow-on — the budget clamp. COMPLETE on `develop`, unpushed.** Tasks 1–9 all
+done, nothing outstanding. Next action is the batched `develop` → `main` PR.
 
 ## Done
 
-Tasks 1–4 at `c301901`; round-1 raised 20 findings and Tasks 5, 6 and most of 8 landed with the
-fixes. Then Task 7 (`cd992df`), Task 8 (`f4f97b0`), the ledger (`bc902c4`).
+A budgeted `Chat` request now carries `max_tokens = min(remaining − est_input, the chain's smallest
+max_output_tokens, the caller's own)`, set at the single `dispatch_metered` chokepoint, so the
+PROVIDER enforces the cap instead of our arithmetic. Below a `MIN_OUTPUT_TOKENS` (256) allowance the
+run refuses through the existing durable pause and makes **no call at all**, naming the cap that
+unblocks it (`spent + est_input + floor`). Two `tracing` records measure the estimator. Unbudgeted
+runs are byte-identical. **The claim this slice does NOT make:** the overshoot is **bounded by the
+input-estimate error, biased toward refusing early — NOT eliminated** (spec §4 has the arithmetic).
+Task 9's sweep also corrected one stale WHY this slice itself falsified — the budgeted fan-out
+serialises because a reservation would STARVE its siblings, not because the output estimate is
+unknowable (the clamp supplies it) — in `dispatch.rs`, the overview and the clamp spec §8.
 
-**Review round 2 — 18 findings, all fixed.** One real bug: `BelowFloor`'s recommended raise was
-derived from the SATURATED allowance, so on the `est ≥ remaining` branch it understated the answer
-("at least 257" where 271 was needed) and each `BudgetRaised` + `force_wake` bought only another
-256 tokens. Now `spent + est_input + floor`, with the wrap test re-driving at the cap it names.
-Three UNTESTED properties got red-first guards: the AGENT determinism call site (a budgeted agent
-paused mid-loop, raised, replaying turn 0 — folding the remaining budget in there was green across
-the whole suite), AC10's clamp-bit signal keyed on `emitted` not `allowance`, and the
-`--budget-tokens` whitespace trim the floor rescale deleted. `max_output_tokens: 0` is now a
-config-validation error (`ceiling = Some(0)` ⇒ `max_tokens: Some(0)`), and "neither signal fires"
-gained a positive control so a dead thread-local capture cannot pass it. The rest were false doc
-claims: the five-family adapter survey was wrong for gemini and the local engine in four places,
-three stale mutation counts are now properties, and the pre-clamp contract still read as current
-in the overview and the older SP-DATA-5 spec.
+## Verified at the tip — real exit codes, re-run after the doc edits
 
-## Verified at the gate — real exit codes
+`cargo test --workspace` **1682 passed / 0 failed / 56 ignored, exit 0** (35 suites) · `cargo clippy
+--workspace --all-targets -- -D warnings` **exit 0** · `cargo fmt --all --check` **exit 0** ·
+`cargo doc --workspace --no-deps --document-private-items` unresolved links **16**, the baseline
+exactly. No database touched.
 
-`cargo test --workspace` **1682 passed / 0 failed / 56 ignored, exit 0** · `clippy --workspace
---all-targets -- -D warnings` exit 0 · `fmt --all --check` exit 0 · `cargo doc` unresolved links
-**16**, the baseline. Every round-2 mutation is tabulated with its failure in the plan's ledger.
+## Next command
 
-## Remaining, the next command, and known-broken
+```
+git fetch origin && git merge origin/main   # main's ruleset is STRICT: merge FIRST or the PR sits BEHIND
+git push origin develop && gh pr create --base main --head develop
+```
 
-Task 9 Steps 5–6, re-running Steps 1–2 at the tip; `develop` → `main` is still the batched PR. Run
-`cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`. Broken:
-nothing. `$DATABASE_URL` is REMOTE Supabase — never run the DB suite against it. The Postgres AC6
-budget e2e is `ignore`d without `have_database_url`, so a local `--workspace` run misses it, and
-the **sensei daemon is not running**, so this file is the only durable record.
+## Known-broken / open
+
+Nothing broken, no open questions. `$DATABASE_URL` is **REMOTE Supabase — never run a suite against
+it**. The Postgres AC6 budget e2e is `ignore`d locally without `have_database_url`; it was rescaled
+×10 above the clamp's floor and verified in-process. The **sensei daemon is not running**, so this
+file is the only durable record.
