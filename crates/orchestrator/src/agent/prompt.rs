@@ -765,6 +765,43 @@ mod tests {
         );
     }
 
+    /// The DIVISOR, pinned from both sides — the strict inequality above is not enough.
+    ///
+    /// `div_ceil(3)` → `div_ceil(4)` is a one-character edit that removes essentially
+    /// all of the margin this function exists for, and it still satisfies "strictly
+    /// greater than `est_tokens`" on any length not divisible by 4, because rounding up
+    /// beats flooring by a token. So the sign of the difference proves nothing about its
+    /// SIZE, and the size is the whole point: JSON tokenizes nearer 3 chars/token, and
+    /// clamping on a `chars / 4` under-count overshoots the cap by the error.
+    ///
+    /// Both bounds are needed. Without the first, the divisor can grow and the margin
+    /// silently evaporates. Without the second, it can shrink — `chars / 2` would pass
+    /// every other assertion here while charging a budgeted run double for its input and
+    /// refusing calls that would comfortably have fitted.
+    #[test]
+    fn the_pessimistic_estimate_is_chars_over_three_rounded_up() {
+        let json = r#"{"name":"fs_write","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string"}},"required":["path","contents"]}}"#;
+        for s in [
+            json,
+            "The quick brown fox jumps over the lazy dog.",
+            "",
+            "a",
+            "ab",
+        ] {
+            let n = s.chars().count();
+            let est = est_tokens_pessimistic(s);
+            assert!(
+                est * 3 >= n,
+                "the estimate must be at least chars/3 for {s:?}: {est} * 3 < {n}"
+            );
+            assert!(
+                est * 3 <= n + 2,
+                "and no more than chars/3 rounded up — an over-count is a tax on every \
+                 budgeted call, not free caution — for {s:?}: {est} * 3 > {n} + 2"
+            );
+        }
+    }
+
     /// The empty string costs nothing under either estimate.
     ///
     /// The boundary is worth its own test because the clamp subtracts this value:
