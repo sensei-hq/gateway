@@ -1,10 +1,26 @@
-//! `torii run gate` — the typed operator surface for a `HumanGate` (SP-6 s2).
+//! `torii run gate` — the typed operator surface for the two MENU-bearing waiting kinds: a
+//! `HumanGate` (SP-6 s2) and a `Loop`'s human gate (SP-6 s4).
 //!
 //! [`crate::cmd::run::signal`] delivers arbitrary JSON to an `AwaitSignal`. This delivers
-//! a NAMED CHOICE to a gate that published a menu, so the answer carries an outcome
-//! (`Complete` or `Fail`) instead of being a value the graph author must remember to test
-//! for. The two commands refuse each other's node kinds, in both directions — see
-//! [`decide`]'s `AwaitSignal` arm and `signal`'s `HumanGate` arm.
+//! a NAMED CHOICE to a gate that published a menu, so the answer is validated against what
+//! the human was actually shown instead of being a value the graph author must remember to
+//! test for. Every command refuses the other kinds and names the verb that would work —
+//! see [`decide`]'s `AwaitSignal` and `Agent` arms, `signal`'s two gate arms and
+//! `cmd::human::answer`'s.
+//!
+//! **One verb, two kinds, two journal events.** The operator's vocabulary stays three
+//! commands — both gates are `run gate decide` — but the events they write are NOT
+//! interchangeable, because each executor arm reads only its own and the two menus are
+//! different vocabularies: a `HumanGate`'s option carries a `GateOutcome`, a loop gate's
+//! carries `stops`. [`PublishedMenu`] is what keeps those two facts from being one fact,
+//! and everything up to the append itself is factored over the option NAMES, which both
+//! kinds have. Appending the wrong event would record a decision the executor cannot
+//! interpret: durable, unread, and reported here as delivered.
+//!
+//! The loop gate is also the reason the "menu comes from the JOURNAL" rule is not merely
+//! prudent but structural. Its node id is SYNTHESIZED per iteration
+//! (`"{loop}/{i}/__gate__"`) and exists in no graph, so there is no graph copy of the menu
+//! to prefer even if one wanted it.
 //!
 //! Everything that was hard-won in `signal` is reproduced here rather than re-derived:
 //! append THEN `force_wake`; a post-append fault reported as a durable-but-unqueued answer
@@ -21,8 +37,8 @@ use crate::errors::CliError;
 use crate::render;
 use chrono::{DateTime, Utc};
 use orchestrator_core::{
-    ExecutionJournal, GateOption, GateOutcome, JournalEvent, NodeId, OrchestratorError, RunId,
-    RunStatus, SchedulerStore, Seq,
+    ExecutionJournal, GateOption, GateOutcome, JournalEvent, LoopGateOption, NodeId,
+    OrchestratorError, RunId, RunStatus, SchedulerStore, Seq,
 };
 
 /// The three verbs of `run gate`. `approve` and `reject` are sugar for `decide --option
@@ -94,6 +110,7 @@ pub enum GateAction {
         /// output, so it flows into downstream nodes and model prompts. Max 4096 bytes
         /// as stored — redaction replaces secret-shaped text with the longer literal
         /// `[REDACTED]`, so a note can cross the limit on the way to the journal.
+        /// A LOOP gate records no note and REFUSES this flag rather than dropping it.
         #[arg(long)]
         note: Option<String>,
     },
@@ -181,14 +198,22 @@ pub fn decision_of(action: GateAction) -> Decision {
     }
 }
 
-/// Deliver a typed decision to a `HumanGate` (SP-6 s2).
+/// Deliver a typed decision to a gate of either kind — a `HumanGate` (SP-6 s2) or a
+/// `Loop`'s human gate (SP-6 s4).
 ///
-/// **The menu comes from the JOURNAL, not the graph.** `GateAwaited` records what the
-/// human was actually shown; validating against a graph that may since have been edited
-/// would defeat the durability §4 requires — and nothing binds the graph in hand to the
-/// one the human saw (there is no graph fence, and `Executor::start` takes the graph as a
-/// caller parameter). This is the same rule the executor's `run_human_gate` follows on
-/// its side, deliberately: two enforcements of one rule, which must not drift.
+/// **The menu comes from the JOURNAL, not the graph.** `GateAwaited`/`LoopGateAwaited`
+/// record what the human was actually shown; validating against a graph that may since
+/// have been edited would defeat the durability §4 requires — and nothing binds the graph
+/// in hand to the one the human saw (there is no graph fence, and `Executor::start` takes
+/// the graph as a caller parameter). This is the same rule the executor's
+/// `run_human_gate`/`run_human_loop_gate` follow on their side, deliberately: two
+/// enforcements of one rule, which must not drift.
+///
+/// For a loop gate that rule is not a preference but the only thing available: its node id
+/// is synthesized per iteration and exists in NO graph, so the journal is the only record
+/// that anything is waiting there or of what it may be answered with. Reading the menu
+/// from the journal is why this command works on that kind at all — it needed a
+/// [`PublishedMenu`] variant, not a new command.
 ///
 /// **This check is advisory and the executor re-checks.** It is non-atomic — it reads the
 /// menu, then appends — and the library entry point bypasses it entirely. It exists to
@@ -323,7 +348,23 @@ pub async fn decide(
         other => return Ok(Outcome::precondition(not_delivered(&shown, &other))),
     }
 
-    let Some(chosen) = menu.iter().find(|o| o.name == option) else {
+    // Resolved over the option NAMES, which is the one thing the two menu kinds share —
+    // and the only thing an operator types. The per-kind half is what comes BACK: a
+    // `HumanGate`'s option carries a `GateOutcome`, a loop gate's does not, and that
+    // `Option<GateOutcome>` is what the required-reason rule below branches on. Doing the
+    // `find` once, inside the kind match, is what keeps a second lookup (and a second
+    // chance to disagree with this one) from existing.
+    let chosen: Option<(&str, Option<GateOutcome>)> = match &menu {
+        PublishedMenu::Human(opts) => opts
+            .iter()
+            .find(|o| o.name == option)
+            .map(|o| (o.name.as_str(), Some(o.outcome))),
+        PublishedMenu::Loop(opts) => opts
+            .iter()
+            .find(|o| o.name == option)
+            .map(|o| (o.name.as_str(), None)),
+    };
+    let Some((chosen_name, outcome)) = chosen else {
         // The recited menu gets the SAME collapse and cap `render::awaiting_section`
         // gives these very values, and for the same reasons: an option name is AUTHOR
         // free text (a `run submit` file, a `scheduled_runs.graph` row, or a runtime
@@ -333,12 +374,19 @@ pub async fn decide(
         // own awaiting row, an ESC could rewrite what is already on screen, and one
         // 5,000-character name would flood the refusal an operator has to read.
         //
+        // For a LOOP gate the recital matters more than for a `HumanGate`, not less: the
+        // node exists in no graph, so this refusal is the ONLY place an operator can
+        // discover the vocabulary other than `run list-paused`. And the executor's own
+        // arm fails a loop gate LOUDLY on an unmatched option — terminally, for the whole
+        // `Loop` — so this pre-check is what stands between a typo and a dead run.
+        //
         // `{option:?}` is left as Debug on purpose: it is the operator's OWN input and
         // Debug already escapes it. The menu is Display and was not guarded at all.
         let menu_shown = render::cap_chars(
             &menu
+                .option_names()
                 .iter()
-                .map(|o| render::one_line(&o.name))
+                .map(|n| render::one_line(n))
                 .collect::<Vec<_>>()
                 .join(", "),
             render::MENU_MAX,
@@ -353,7 +401,7 @@ pub async fn decide(
     // The option is echoed back on every SUCCESS line below, and by this point it is a
     // journaled option name (it was matched against the menu), i.e. the same author free
     // text the refusal above collapses — so it gets the same collapse AND the same cap.
-    // Display-only: the value journaled on `GateDecided.option` is the one the operator
+    // Display-only: the value journaled on the decision's `option` is the one the operator
     // supplied, because that is what the executor re-matches against the menu.
     //
     // `MENU_MAX`, never a second number: it is `pub(crate)` precisely so this crate has
@@ -361,7 +409,7 @@ pub async fn decide(
     // capping left the refusal path at 324 chars with a visible ellipsis and the SUCCESS
     // path — the one an operator always reaches — at 5065 with none, for the same
     // journaled name.
-    let chosen_shown = render::cap_chars(&render::one_line(&chosen.name), render::MENU_MAX);
+    let chosen_shown = render::cap_chars(&render::one_line(chosen_name), render::MENU_MAX);
 
     // A Fail option must record WHY. CLI-layer only, deliberately: `GateDecided.note`
     // stays `Option` because a `Complete` decision legitimately has none, and an absent
@@ -371,10 +419,30 @@ pub async fn decide(
     //
     // Trimmed, not merely present: clap's `required` cannot see that `--reason ''` is the
     // same omission with quotes around it, so this is the check that actually holds.
-    if chosen.outcome == GateOutcome::Fail && note.map(str::trim).unwrap_or("").is_empty() {
+    if outcome == Some(GateOutcome::Fail) && note.map(str::trim).unwrap_or("").is_empty() {
         return Ok(Outcome::precondition(format!(
             "not delivered: {option:?} stops the run, so it needs a reason. \
              Use: torii run gate reject {} --node {shown} --reason '<why>'",
+            run.0
+        )));
+    }
+
+    // The mirror image on the other kind: a loop gate's row has NO note field
+    // (`LoopGateDecided` is `{node, option, actor}`), so a `--note` here can only be
+    // DROPPED — and dropping it silently is worse than refusing. An operator who typed an
+    // explanation has every reason to believe it was recorded, and this is the one place
+    // that belief can still be corrected; afterwards the only evidence is a journal row
+    // they would have to read to discover the absence.
+    //
+    // Not fixed by widening the event either: `run_human_loop_gate` reads only `option`,
+    // so a note would be a durable field nothing renders, and adding it is a journal-shape
+    // change this task has no mandate for. Refusing costs the operator one retype.
+    if matches!(menu, PublishedMenu::Loop(_)) && note.is_some() {
+        return Ok(Outcome::precondition(format!(
+            "not delivered: {shown} is a loop gate, and a loop gate's decision records no \
+             note — there is nowhere durable to put --note, so it would be silently \
+             dropped. Re-run without it: torii run gate decide {} --node {shown} --option \
+             {option:?}",
             run.0
         )));
     }
@@ -463,12 +531,57 @@ pub async fn decide(
         .map_err(CliError::error)?;
     }
 
+    // Resolved HERE as well as at `dispatch`, and that is deliberate rather than
+    // redundant. Both events' `actor` is a required `String`, so "nobody said who" has no
+    // legible encoding: a caller that skipped the resolver journals clap's empty default
+    // as a silent `""`, indistinguishable at a glance from a real name in the row an
+    // audit reads forever. Applying it at the one place BOTH append sites pass through
+    // makes that unreachable from the library entry point too — `decide` is `pub`, and
+    // `main.rs` is not the only caller (the e2e drives it directly).
+    //
+    // Idempotent, so the dispatch call is not defeated and an ordinary `--as alice` is
+    // untouched: [`actor_or`] returns a non-blank supplied value verbatim, and only an
+    // empty one falls through to `$USER` and then to `unknown`.
+    let actor = actor_or_user(actor);
+
     // Collapsed on the way IN, not just on the way out — unlike the node id, which is
     // journaled as given. `actor` is interpolated by the executor into a `NodeFailed`
     // message that `torii run status` renders and that a later drive re-emits from the
     // fold, so an escape sequence smuggled through `--as` would be replayed at every
     // operator who reads the run.
-    let actor = render::one_line(actor);
+    let actor = render::one_line(&actor);
+
+    // **On a LOOP gate the actor is REDACTED, and on a `HumanGate` it is not.** The
+    // asymmetry looks like an inconsistency and is the opposite of one — it is the reason
+    // this branch could not simply inherit the path beside it, and inheriting it silently
+    // is how the s3 `--as` leak happened on `AgentAnswered.actor`.
+    //
+    // `GateDecided.actor` has a second line of defence: `run_human_gate` interpolates it
+    // into the rejection `NodeFailed`, so it passes the executor's own redacting chokepoint
+    // on the way back out. `LoopGateDecided.actor` has NONE — `run_human_loop_gate` reads
+    // only `option`, puts the actor in no message and no node output — so whatever is
+    // appended here is what an audit reads forever, and the journal row is the one place a
+    // credential-shaped `--as "$CI_TOKEN_OWNER"` would land in the clear. The variant's own
+    // doc states the obligation as the appending writer's alone; this is the writer.
+    //
+    // **Redact, THEN size-check** — the order `cmd::human::answer` had to be fixed to, for
+    // the reason `Measured` records: `[REDACTED]` is longer than the shortest span it
+    // replaces, so a value that fitted as typed can exceed the cap once scrubbed, and a
+    // check placed first bounds a value nobody stores. `Measured::AfterRedaction` travels
+    // with it so the growth explanation names a transform this value really went through —
+    // which is exactly why the `HumanGate` arm keeps `AsGiven`.
+    //
+    // The non-string arm is fail-CLOSED, like the note's above and for the same reason.
+    let (actor, measured) = match menu {
+        PublishedMenu::Human(_) => (actor, crate::cmd::run::Measured::AsGiven),
+        PublishedMenu::Loop(_) => (
+            render::redact_payload(&serde_json::json!(actor))
+                .as_str()
+                .unwrap_or("[REDACTED]")
+                .to_string(),
+            crate::cmd::run::Measured::AfterRedaction,
+        ),
+    };
 
     // The SIBLING field on the same durable row, held to the same bound. `--as` was
     // capped by nothing while `--note` was capped at 4096, so `ARG_MAX` permitted a
@@ -477,29 +590,43 @@ pub async fn decide(
     // executor interpolates it into the rejection `NodeFailed` above, so an unbounded one
     // is reloaded on every drive and re-rendered by every `torii run status`.
     //
-    // Measured on the COLLAPSED value, for the same reason the note is measured after
-    // redaction: these are the bytes actually written. `Measured::AsGiven` because,
-    // unlike the note, an actor is not redacted — labelling it `AfterRedaction` would
-    // print a growth explanation naming a transform this value never went through.
+    // Measured on the value about to be WRITTEN — collapsed, and scrubbed on the kind that
+    // scrubs — for the same reason the note is measured after redaction: these are the
+    // bytes actually written.
     crate::cmd::run::check_payload_size(
         &serde_json::json!(actor),
-        crate::cmd::run::Measured::AsGiven,
+        measured,
         "the decision actor (--as)",
     )
     .map_err(CliError::error)?;
 
+    // **The one place the two kinds stop sharing.** Everything above is factored over the
+    // option NAMES precisely so this stays a single `match` on a single line of divergence:
+    // the two events are not interchangeable, because each executor arm reads only its own
+    // and each menu is a different vocabulary, so appending the wrong one records a
+    // decision that is durable, unreadable and reported as delivered.
+    //
+    // `note` is `None` on the loop arm by construction — the refusal above rejects a
+    // `--note` on this kind rather than dropping it — so the field's absence here loses
+    // nothing an operator supplied.
+    let event = match menu {
+        PublishedMenu::Human(_) => JournalEvent::GateDecided {
+            node: node.clone(),
+            option: option.to_string(),
+            actor,
+            note,
+        },
+        PublishedMenu::Loop(_) => JournalEvent::LoopGateDecided {
+            node: node.clone(),
+            option: option.to_string(),
+            actor,
+        },
+    };
+
     // The appended seq is KEPT, not discarded: it is what names the durable row in the
     // post-append fault report below, so an operator can find the write that succeeded.
     let appended = journal
-        .append(
-            run,
-            JournalEvent::GateDecided {
-                node: node.clone(),
-                option: option.to_string(),
-                actor,
-                note,
-            },
-        )
+        .append(run, event)
         .await
         .map_err(OrchestratorError::Journal)?;
 
@@ -707,33 +834,88 @@ fn rejected_at(events: &[(Seq, JournalEvent)], at: Seq, node: &NodeId) -> bool {
     })
 }
 
-/// The menu a `HumanGate` published, folded from `GateAwaited`. FIRST wins, matching the
-/// executor's fold — two copies of one rule, so they must not drift.
+/// Which waiting kind published a menu at this node, and what it published.
 ///
-/// `None` = this node never asked, which is what distinguishes a gate from an
-/// `AwaitSignal` without loading the graph. `cmd::run::signal` reads it for exactly that:
-/// a `Some` here is a `HumanGate`, and a raw payload must be refused.
-pub(crate) fn gate_menu(events: &[(Seq, JournalEvent)], node: &NodeId) -> Option<Vec<GateOption>> {
+/// **Two kinds carry menus and they are NOT interchangeable.** A `HumanGate`'s
+/// [`GateOption`] carries a [`GateOutcome`] of `{Complete, Fail}`; a loop gate's
+/// [`LoopGateOption`] carries `stops`, and "continue" has no representation in the former
+/// at all. Each is answered by its OWN journal event — `GateDecided` and
+/// `LoopGateDecided` — and each executor arm reads only its own: appending the wrong one
+/// records a decision the executor structurally cannot interpret, which is journaled,
+/// never read, and reported here as delivered.
+///
+/// So the KIND is returned rather than just the options. An `Option<Vec<GateOption>>`
+/// could not carry it, and the alternative — a second `loop_gate_menu` lookup beside this
+/// one — would leave every caller free to consult only the first and silently mis-handle
+/// the other kind, which is exactly the state `cmd::run::signal` and `cmd::human::answer`
+/// were in before this slice: both refused a loop gate as "not awaiting", true and
+/// useless.
+///
+/// What the two DO share is the option NAMES, which is the whole of what an operator
+/// types and the whole of what a refusal recites — hence [`PublishedMenu::option_names`],
+/// over which [`decide`] factors everything up to the append itself.
+pub(crate) enum PublishedMenu {
+    Human(Vec<GateOption>),
+    Loop(Vec<LoopGateOption>),
+}
+
+impl PublishedMenu {
+    /// The option names, in published order — the shared vocabulary. Borrowed rather than
+    /// cloned: every consumer either compares or renders.
+    pub(crate) fn option_names(&self) -> Vec<&str> {
+        match self {
+            PublishedMenu::Human(o) => o.iter().map(|o| o.name.as_str()).collect(),
+            PublishedMenu::Loop(o) => o.iter().map(|o| o.name.as_str()).collect(),
+        }
+    }
+}
+
+/// The menu a gate of EITHER kind published, folded from `GateAwaited` or
+/// `LoopGateAwaited`. FIRST wins, matching the executor's fold — two copies of one rule,
+/// so they must not drift.
+///
+/// `None` = this node never asked, which is what distinguishes a gate from the two
+/// menu-less waiting kinds without loading the graph. `cmd::run::signal` and
+/// `cmd::human::answer` read it for exactly that: a `Some` here means a raw payload or
+/// free text must be refused, and the variant says which verb to name.
+///
+/// **Reading the journal is not a shortcut here, it is the only design available for a
+/// LOOP gate.** A `HumanGate` is at least an authored node one could look up in a graph;
+/// a loop gate's path is SYNTHESIZED per iteration (`"{loop}/{i}/__gate__"`) and exists in
+/// no graph at all, so the journaled `LoopGateAwaited` is the only record of both the menu
+/// and the fact that anything is waiting there. That is what makes `torii run gate decide`
+/// work on it at all.
+///
+/// First-wins across BOTH variants, not within each: one node cannot legitimately publish
+/// two kinds of ask (they are different node kinds, and each executor arm writes exactly
+/// one event), so a journal that contains both is corrupt and the earlier row is the one
+/// that describes what a human was actually shown.
+pub(crate) fn gate_menu(events: &[(Seq, JournalEvent)], node: &NodeId) -> Option<PublishedMenu> {
     events.iter().find_map(|(_, e)| match e {
         JournalEvent::GateAwaited {
             node: n, options, ..
-        } if n == node => Some(options.clone()),
+        } if n == node => Some(PublishedMenu::Human(options.clone())),
+        JournalEvent::LoopGateAwaited { node: n, menu, .. } if n == node => {
+            Some(PublishedMenu::Loop(menu.clone()))
+        }
         _ => None,
     })
 }
 
 /// Whether this node is awaiting a RAW signal — used only to give the right cross-refusal.
 ///
-/// `pub(crate)` since SP-6 s3 made the refusal matrix three-way: `cmd::human::answer` has to
-/// distinguish an `AwaitSignal` from a `HumanGate` exactly as this module does, and a second
-/// `SignalAwaited` scan would be a second place for that rule to drift.
+/// `pub(crate)` since SP-6 s3 made the refusal matrix three-way — four-way as of s4, whose
+/// loop gate is a fourth waiting KIND answered by an existing verb: `cmd::human::answer`
+/// has to distinguish an `AwaitSignal` from the gates exactly as this module does, and a
+/// second `SignalAwaited` scan would be a second place for that rule to drift.
 pub(crate) fn awaiting_signal(events: &[(Seq, JournalEvent)], node: &NodeId) -> bool {
     events
         .iter()
         .any(|(_, e)| matches!(e, JournalEvent::SignalAwaited { node: n, .. } if n == node))
 }
 
-/// Resolve `--as` to the actor string journaled on `GateDecided`.
+/// Resolve `--as` to the actor string journaled on `GateDecided`, `LoopGateDecided` or
+/// `AgentAnswered`.
 ///
 /// **ATTRIBUTION, NOT AUTHENTICATION.** It is whatever string the caller supplied, so it
 /// answers "who claimed to decide", never "who decided" — anyone who can reach the
@@ -743,6 +925,15 @@ pub(crate) fn awaiting_signal(events: &[(Seq, JournalEvent)], node: &NodeId) -> 
 ///
 /// Lives in the library, not in `main.rs`, so the fallback chain is testable: the binary
 /// is deliberately thin (clap plus `dispatch`) and has no test module.
+///
+/// **Called at BOTH edges since s4: `dispatch` resolves it, and [`decide`] resolves it
+/// again** at the one point both of its append sites pass through. That is defence, not
+/// duplication: every one of these `actor` fields is a required `String`, so a caller that
+/// skipped this resolver would journal clap's empty default as a silent `""` — a blank
+/// audit row, indistinguishable at a glance from a real name, on a row nothing downstream
+/// rewrites. `decide` is `pub` and `main.rs` is not its only caller. Idempotent, so the
+/// second application changes nothing an operator supplied: a non-blank value comes back
+/// trimmed and otherwise verbatim.
 pub fn actor_or_user(supplied: &str) -> String {
     actor_or(supplied, std::env::var("USER").ok().as_deref())
 }
@@ -2364,5 +2555,417 @@ pub(crate) mod tests {
     fn an_actor_with_nothing_to_fall_back_on_is_named_unknown() {
         assert_eq!(actor_or("", None), "unknown");
         assert_eq!(actor_or("", Some("  ")), "unknown");
+    }
+
+    // ---- SP-6 s4: the SECOND menu-bearing kind, a human-decided LOOP gate -------------
+
+    /// The synthetic path a `Loop` gate is asked at. It exists in NO graph —
+    /// `run_loop` composes it per iteration from the loop's own id — which is exactly
+    /// why every check in this command reads the JOURNAL: there is nothing else to read.
+    pub(crate) fn loop_gate() -> NodeId {
+        NodeId("lp/0/__gate__".into())
+    }
+
+    /// A journal in which a LOOP gate has already asked, with the given menu.
+    ///
+    /// `stops` is `true` for an option literally named `ship` and `false` otherwise —
+    /// the same one-name convention [`gate_journal`] uses for `reject`, and enough to
+    /// build a converging menu without a second helper. Nothing in `torii` reads `stops`
+    /// (the executor resolves it), so the flag is fixture realism rather than a subject.
+    pub(crate) async fn loop_gate_journal(
+        run: RunId,
+        node: &NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        options: &[&str],
+    ) -> InMemoryJournal {
+        let j = InMemoryJournal::new();
+        j.append(
+            run,
+            JournalEvent::LoopGateAwaited {
+                node: node.clone(),
+                deadline,
+                prompt: LOOP_GATE_QUESTION.to_string(),
+                menu: options
+                    .iter()
+                    .map(|o| orchestrator_core::LoopGateOption {
+                        name: o.to_string(),
+                        stops: *o == "ship",
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap();
+        j
+    }
+
+    /// The question [`loop_gate_journal`] publishes. Named rather than inlined because
+    /// `cmd::run`'s listing tests assert on this exact text, for the reason
+    /// `cmd::human::tests::THE_QUESTION` records.
+    pub(crate) const LOOP_GATE_QUESTION: &str = "Is this draft good enough to ship?";
+
+    /// Every `LoopGateDecided` journaled for `node`, as `(option, actor)`.
+    ///
+    /// A SECOND reader beside [`journaled_decisions`] rather than one generic over both,
+    /// deliberately: the whole point of this task is that the two events are not
+    /// interchangeable, and a helper that flattened them would let a test asserting "a
+    /// loop gate was decided" pass on a `GateDecided` — the exact confusion the split
+    /// exists to prevent.
+    async fn journaled_loop_decisions(
+        j: &InMemoryJournal,
+        run: RunId,
+        node: &NodeId,
+    ) -> Vec<(String, String)> {
+        j.load(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::LoopGateDecided {
+                    node: n,
+                    option,
+                    actor,
+                } if &n == node => Some((option, actor)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC17 — `run gate decide` decides a LOOP gate at its synthetic path, and the row it
+    /// writes is a `LoopGateDecided`.
+    ///
+    /// It works at all only because [`gate_menu`] reads the menu from the JOURNAL: the
+    /// node exists in no graph, so there is no other place a menu could come from.
+    ///
+    /// The negative assertion is the load-bearing half. `GateDecided` also carries an
+    /// `option: String`, so appending it here would compile and would look right in the
+    /// journal — and the executor's `run_human_loop_gate` reads only `LoopGateDecided`,
+    /// so the decision would be journaled, never read, and reported as delivered.
+    #[tokio::test]
+    async fn a_loop_gate_is_decided_at_its_synthetic_path() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+
+        let out = decide(&s, &j, run, loop_gate(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+        assert!(
+            out.text.contains("ship"),
+            "confirms the choice: {}",
+            out.text
+        );
+        assert_eq!(
+            journaled_loop_decisions(&j, run, &loop_gate()).await,
+            vec![("ship".to_string(), "alice".to_string())],
+            "a LoopGateDecided is appended — never a GateDecided, which is resolved \
+             against a menu whose options carry a GateOutcome this kind cannot interpret"
+        );
+        assert!(
+            journaled_decisions(&j, run, &loop_gate()).await.is_empty(),
+            "and no GateDecided beside it"
+        );
+        assert!(
+            s.status(run).await.unwrap().unwrap().next_wake.is_some(),
+            "a delivered decision queues the wake, exactly as a HumanGate's does"
+        );
+    }
+
+    /// AC17 — a bad option recites the JOURNALED menu, so the operator can retry without
+    /// reading a graph that does not contain this node.
+    #[tokio::test]
+    async fn a_bad_option_recites_a_loop_gates_journaled_menu() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+
+        let out = decide(&s, &j, run, loop_gate(), "sideways", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("revise") && out.text.contains("ship"),
+            "recites the menu: {}",
+            out.text
+        );
+        assert!(
+            journaled_loop_decisions(&j, run, &loop_gate())
+                .await
+                .is_empty(),
+            "and nothing is journaled — the executor fails a loop gate LOUDLY on an \
+             option its menu does not carry, which is terminal for the whole Loop"
+        );
+    }
+
+    /// A loop gate's decision carries no note, so a `--note` must be REFUSED rather than
+    /// dropped. `LoopGateDecided` is `{node, option, actor}` — there is no field to put it
+    /// in — and an operator who typed an explanation has every reason to believe it was
+    /// recorded. Silently discarding operator input is the defect class this slice keeps
+    /// finding; this is the same judgement `gate reject --reason ''` makes in reverse.
+    #[tokio::test]
+    async fn a_note_on_a_loop_gate_is_refused_rather_than_dropped() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+
+        let out = decide(
+            &s,
+            &j,
+            run,
+            loop_gate(),
+            "ship",
+            "alice",
+            Some("the canary suite is green"),
+            now(),
+        )
+        .await
+        .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("--note"),
+            "must name the flag the operator typed: {}",
+            out.text
+        );
+        assert!(
+            journaled_loop_decisions(&j, run, &loop_gate())
+                .await
+                .is_empty(),
+            "nothing is journaled: a decision recorded without the note beside it is the \
+             silent drop this refusal exists to prevent"
+        );
+    }
+
+    /// The deadline guard, inherited by construction from the `SignalState::Awaiting`
+    /// arm — but only once `signal_states` folds `LoopGateAwaited`, so it is asserted on
+    /// this kind too rather than assumed.
+    ///
+    /// `now == deadline` is EXPIRED for the executor (`wait_or_expire`'s `now >= d`), and
+    /// `run_human_loop_gate` reads expiry BEFORE any decision, so a CLI that accepted this
+    /// would report success and then watch the next wake terminally fail the whole `Loop`.
+    /// The sibling boundary test is `a_decision_exactly_at_the_gates_deadline_is_refused`.
+    #[tokio::test]
+    async fn a_loop_gate_decision_exactly_at_the_deadline_is_refused() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let j = loop_gate_journal(run, &loop_gate(), Some(now()), &["revise", "ship"]).await;
+
+        let out = decide(&s, &j, run, loop_gate(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("deadline"),
+            "must name the deadline that closed the gate: {}",
+            out.text
+        );
+        assert!(
+            journaled_loop_decisions(&j, run, &loop_gate())
+                .await
+                .is_empty(),
+            "an expired gate must not be given a decision to read"
+        );
+    }
+
+    /// The other side of that boundary: one microsecond before the deadline is DELIVERED.
+    /// Without it the refusal above is satisfied by a guard that refuses everything.
+    #[tokio::test]
+    async fn a_loop_gate_decision_before_the_deadline_is_delivered() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let deadline = now() + chrono::Duration::microseconds(1);
+        let s = paused_store(run, Some(deadline)).await;
+        let j = loop_gate_journal(run, &loop_gate(), Some(deadline), &["revise", "ship"]).await;
+
+        let out = decide(&s, &j, run, loop_gate(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_OK, "{}", out.text);
+        assert_eq!(
+            journaled_loop_decisions(&j, run, &loop_gate()).await.len(),
+            1,
+            "a decision inside the SLA is delivered"
+        );
+    }
+
+    /// AC16, second half: the loop branch REDACTS `--as` before the durable write.
+    ///
+    /// This cannot be inherited and that is the trap. The `GateDecided` path deliberately
+    /// does NOT redact its actor (it measures `Measured::AsGiven`) because the executor
+    /// interpolates that field into a `NodeFailed` and scrubs it on the way out.
+    /// `run_human_loop_gate` reads only `option` off `LoopGateDecided`: the actor is put in
+    /// no message and no output, so nothing downstream is a second line of defence and
+    /// whatever is appended here is what an audit reads forever. s3's whole-slice review
+    /// found exactly this leak on `AgentAnswered.actor`.
+    ///
+    /// The credential is assembled at runtime — the repo's Semgrep CWE-798 hook blocks a
+    /// literal one in a fixture.
+    #[tokio::test]
+    async fn a_secret_shaped_actor_is_redacted_before_a_loop_gate_decision_is_journaled() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+        let secret = format!("sk-{}", "A".repeat(24));
+
+        decide(&s, &j, run, loop_gate(), "ship", &secret, None, now())
+            .await
+            .expect("delivers");
+
+        let durable = format!("{:?}", j.load(run).await.unwrap());
+        assert!(
+            !durable.contains(&secret),
+            "the actor reached durable storage in plaintext: {durable}"
+        );
+        assert!(durable.contains("[REDACTED]"), "{durable}");
+    }
+
+    /// …and the redaction runs BEFORE the size check, so the bytes bounded are the bytes
+    /// written. `[REDACTED]` is longer than the shortest span it replaces, so an actor
+    /// that fitted as typed can exceed the cap once scrubbed — the ordering `signal`
+    /// shipped wrong once, `cmd::human::answer` had to fix, and `Measured` records.
+    ///
+    /// The pair is assembled at runtime for the Semgrep reason above.
+    #[tokio::test]
+    async fn a_loop_gate_actor_that_only_exceeds_the_cap_after_redaction_is_rejected() {
+        use crate::cmd::run::MAX_PAYLOAD_BYTES;
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["ship"]).await;
+
+        // The trailing space is load-bearing: without a separator the value class runs to
+        // the end of the string and the whole run collapses into ONE placeholder, which
+        // shrinks rather than grows.
+        let unit = format!("{}:{} ", "token", "abcdef");
+        let raw = unit.repeat(310);
+        let as_given = serde_json::to_vec(&serde_json::json!(raw)).unwrap().len();
+        // `.trim()` because `actor_or` trims a supplied actor before anything else touches
+        // it, and this expectation has to be the size of the row that is actually written
+        // — the very property the test is asserting the CHECK gets right.
+        let journaled = serde_json::to_vec(&render::redact_payload(&serde_json::json!(raw.trim())))
+            .unwrap()
+            .len();
+        assert!(
+            as_given <= MAX_PAYLOAD_BYTES,
+            "precondition: this actor is under the cap as typed ({as_given} bytes)"
+        );
+        assert!(
+            journaled > MAX_PAYLOAD_BYTES,
+            "precondition: redaction GROWS it past the cap ({as_given} -> {journaled} bytes)"
+        );
+
+        let e = decide(&s, &j, run, loop_gate(), "ship", &raw, None, now())
+            .await
+            .expect_err("an actor that would exceed the cap once redacted is refused");
+
+        assert_eq!(e.code, crate::errors::EXIT_ERROR, "{}", e.message);
+        assert!(
+            e.message.contains(&journaled.to_string()),
+            "must name the size that would actually be JOURNALED ({journaled}), not the \
+             one the operator typed: {}",
+            e.message
+        );
+        assert!(
+            journaled_loop_decisions(&j, run, &loop_gate())
+                .await
+                .is_empty(),
+            "an over-limit row must never reach the journal"
+        );
+    }
+
+    /// **The blank-audit-row guard.** `LoopGateDecided.actor` is a required `String`, so
+    /// "nobody said who" has no legible encoding: a path that skipped the resolver would
+    /// journal clap's empty default as a silent `""`, indistinguishable at a glance from a
+    /// real name. [`actor_or_user`] is what stands between an operator and that row, and
+    /// this pins that BOTH append sites in [`decide`] route through it — the failure mode
+    /// the plan names is a second append site added beside the first, and a second site is
+    /// exactly what this task adds.
+    ///
+    /// Asserted on both kinds because the resolution is one shared line: a fix applied to
+    /// only the new branch would leave `GateDecided` — whose `actor_or` doc already
+    /// promises "never an empty actor" — able to journal one through the library entry
+    /// point.
+    #[tokio::test]
+    async fn no_decision_can_journal_a_blank_actor() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["ship"]).await;
+        decide(&s, &j, run, loop_gate(), "ship", "", None, now())
+            .await
+            .expect("delivers");
+        let (_, actor) = journaled_loop_decisions(&j, run, &loop_gate())
+            .await
+            .pop()
+            .expect("a decision was journaled");
+        assert!(
+            !actor.is_empty(),
+            "a blank actor is indistinguishable from a bug in an audit; \
+             `actor_or_user` names an unresolvable one `unknown`"
+        );
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = gate_journal(run, &release(), None, &["ship"]).await;
+        decide(&s, &j, run, release(), "ship", "", None, now())
+            .await
+            .expect("delivers");
+        let (_, actor, _) = journaled_decisions(&j, run, &release())
+            .await
+            .pop()
+            .expect("a decision was journaled");
+        assert!(!actor.is_empty(), "the same rule on the s2 row");
+    }
+
+    /// A SETTLED loop gate is one nobody is waiting on: the drive that read the decision
+    /// journaled `LoopGateSettled`, spent the iteration on the strength of it, and
+    /// `run_human_loop_gate`'s step 1 replays that answer forever WITHOUT re-reading
+    /// `LoopGateDecided`. A second decision would therefore be journaled, never read, and
+    /// reported as delivered — so it is refused instead.
+    ///
+    /// This is the operator-facing half of the fold arm `list_paused` needs: without
+    /// `LoopGateSettled` folding as the node's terminal marker, iteration 0's gate stays
+    /// `Awaiting` for the life of the run, because a loop gate journals no
+    /// `NodeCompleted` and writes no blackboard entry of its own.
+    #[tokio::test]
+    async fn a_decision_on_a_settled_loop_gate_is_refused() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+        j.append(
+            run,
+            JournalEvent::LoopGateSettled {
+                node: loop_gate(),
+                option: "revise".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = decide(&s, &j, run, loop_gate(), "ship", "alice", None, now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        // Keyed on the SETTLED wording, not merely on the exit code. Before the fold arm
+        // existed this command refused a loop gate for a different reason entirely — "not
+        // awaiting a decision", because `gate_menu` read only `GateAwaited` — so an
+        // exit-code-only assertion passed while nothing about settlement was implemented.
+        assert!(
+            out.text.contains("already completed"),
+            "the refusal must say the gate is DONE, not that the node is unknown — an \
+             operator told 'not awaiting a decision' checks their node id, which was \
+             right: {}",
+            out.text
+        );
+        assert!(
+            journaled_loop_decisions(&j, run, &loop_gate())
+                .await
+                .is_empty(),
+            "a decision the executor will never re-read must not be written: {}",
+            out.text
+        );
     }
 }
