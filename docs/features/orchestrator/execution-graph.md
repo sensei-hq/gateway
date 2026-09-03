@@ -10,9 +10,9 @@ source: crates/orchestrator*
 
 # Execution Graph
 
-> **Status: Partial (Phase 3 · SP-1/3 · SP-6-3).** Design §10. Implemented node kinds:
+> **Status: Partial (Phase 3 · SP-1/3 · SP-6-4).** Design §10. Implemented node kinds:
 > `ModelCall`, `Agent`, `Map`, `Consolidate`, **`Loop`** (leaf + graph bodies +
-> gate-agent), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
+> gate-agent + **human gate**), **`Subgraph`**, **`Branch`**, **`Expand`** (runtime
 > PlanDelta / planner-driven), **`AwaitSignal`** (SP-6 s1 — the HITL primitive) and
 > **`HumanGate`** (SP-6 s2 — the typed menu over it).
 > Typed `hard`/`soft` edges + `validate_dag` + the round-based ready-node
@@ -26,7 +26,16 @@ source: crates/orchestrator*
 > `SignalReceived` completed both). The rule is purely syntactic, checks only what the
 > author wrote — the executor's own `{map}/{i}`, `{loop}/{i}/__gate__`,
 > `{expand}/__plan__` paths are generated after validation — and holds for runtime plans
-> too, since `plan::feasible` validates through the same function. **`Loop`** (SP-1 loop-node
+> too, since `plan::feasible` validates through the same function.
+> **And (SP-6 s4) an author-supplied node id may not BE one of the reserved segments
+> `__plan__` / `__gate__` / `__select__`** (equality on the whole id, so `my__gate__` is
+> fine). The separator ban alone was not enough: a `Loop`'s `Subgraph` body is namespaced
+> under `"{loop}/{i}"`, so an inner node named `__gate__` lands on exactly that `Loop`'s
+> own gate path with no separator written anywhere. Where the colliding node COMPLETES
+> rather than waits, the gate went on to ask at an id already carrying `NodeCompleted` —
+> which `torii` folds as terminal, so `run list-paused` omitted the node and
+> `run gate decide` refused it, leaving the run paused on a question no operator surface
+> could show or answer. **`Loop`** (SP-1 loop-node
 > [`../../superpowers/specs/2026-08-10-sp1-loop-node-design.md`](../../superpowers/specs/2026-08-10-sp1-loop-node-design.md)
 > + SP-3 slice 5 loops-of-graphs
 > [`../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md`](../../superpowers/specs/2026-08-14-sp3-coordinator-loops-of-graphs-design.md)):
@@ -76,16 +85,27 @@ source: crates/orchestrator*
 > defaulting either way. And the **deadline is read BEFORE the decision** — s2's
 > ordering, inverting s3's — because "continue" authorizes another iteration of SPEND,
 > which is an approval, so a late one must not sanction tokens the SLA said to stop
-> waiting for; an expired undecided gate FAILS the Loop rather than converging (silence
-> is not consent, and "silence means stop" would report SUCCESS with nobody asked).
+> waiting for. An **expired** gate FAILS the Loop rather than converging, **whether or
+> not a decision was journaled**: the arm has not read the fold at that point and
+> structurally cannot know, so its message names the DEADLINE and never "no decision".
+> (This sentence said "expired UNDECIDED gate", which is the s3 ordering the whole rule
+> exists to refuse — the one-line "fix" that makes the code match it is exactly what
+> `a_decision_after_the_deadline_does_not_continue_the_loop` reddens on.) Converging
+> instead is refused for its own reason: silence is not consent, and "silence means stop"
+> would report SUCCESS with nobody asked.
 > `validate_dag` rejects an empty menu, duplicate or empty option names, and a menu with
 > no `stops: true` option — a loop that provably cannot converge however the human
 > answers — at every depth it recurses into. The gate resolves no chain and never
 > reaches the gateway, so it spends NOTHING, which matters more here than at any other
-> human site: the decision being made *is* whether to spend more. (Operator surface —
-> `torii run gate decide` on a `"{loop}/{i}/__gate__"` node and `run list-paused`
-> rendering its question — lands later in SP-6 s4; until then the arm is reachable from
-> a library caller and from the durable journal only.)
+> human site: the decision being made *is* whether to spend more.
+> **Operator surface (SP-6 s4, shipped):** `torii run gate decide <run> --node
+> "{loop}/{i}/__gate__" --option <name>` — the same verb a `HumanGate` takes, validating
+> the option and the deadline against the JOURNAL before appending anything and refusing
+> `--note` (a loop gate's decision records none, so it could only be dropped); `run
+> signal` and `run agent answer` each refuse the node naming the verb and the kind that
+> would work; and `run list-paused` renders it as the FOURTH row shape — `options` and
+> `question` both present, which is what tells a loop gate from the other three — leaving
+> the listing once its decision has been HONOURED.
 > Cap-without-Stop completes best-effort (`converged: false`) — never a bare fail
 > (§10.3); a body/gate failure fails the Loop (naming the iteration), a body/gate pause
 > pauses it. Resume replays completed iterations + gate decisions from the memo (zero
