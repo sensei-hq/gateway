@@ -46,7 +46,8 @@ pub enum NodeKind {
     /// a bare fail (§10.3); a body failure fails the Loop. Output:
     /// `{ iterations, converged, output }`. The body drives a leaf effect
     /// (`ModelCall`/`Agent`) or a whole graph (`Subgraph`/`Expand`, SP-3 s5) per
-    /// iteration; the gate is a pure predicate or a journaled gate-agent.
+    /// iteration; the gate is a pure predicate, a journaled gate-agent, or — since
+    /// SP-6 s4 — a PERSON picking from an enumerated menu ([`GateSpec`]).
     Loop {
         body: LoopBody,
         input: serde_json::Value,
@@ -142,9 +143,13 @@ pub const MAX_AWAIT_SIGNAL_TIMEOUT: chrono::Duration = chrono::Duration::days(36
 
 /// One choice a [`NodeKind::HumanGate`] offers, and what picking it does to the run.
 ///
-/// Not to be confused with [`GateSpec`]/[`LoopGate`] — those name a `Loop`'s stop
-/// predicate (continue vs. halt the iteration); this `Gate` is the unrelated HITL
-/// sense, a human picking one of a named menu.
+/// Not to be confused with [`LoopGateOption`] (SP-6 s4) — both now put a NAMED MENU in
+/// front of a human, so the two are easy to reach for interchangeably, but they answer
+/// to different node kinds: this one belongs to the `HumanGate` node and its
+/// [`GateOutcome`] decides that NODE's outcome (and a `Fail` option fails the run);
+/// `LoopGateOption` belongs to a `Loop`'s `GateSpec::Human` and its `stops` decides
+/// whether the LOOP keeps iterating — asked once per iteration, not once per run.
+/// The tell is which field is on the option — `outcome` here, `stops` there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateOption {
     /// What the operator types: `torii run gate decide … --option <name>`.
@@ -210,9 +215,10 @@ pub enum LoopBody {
     Expand { planner: PlannerRef },
 }
 
-/// A `Loop`'s stop decision (SP-3 s5). `Pure` = the SP-1 pure predicate (no journaling);
-/// `Agent` = a gate-agent over the iteration output, then a pure `stop_when` over the
-/// agent's answer (the agent turn is journaled ⇒ resume replays it).
+/// A `Loop`'s stop decision (SP-3 s5, extended SP-6 s4). `Pure` = the SP-1 pure predicate
+/// (no journaling); `Agent` = a gate-agent over the iteration output, then a pure
+/// `stop_when` over the agent's answer (the agent turn is journaled ⇒ resume replays it);
+/// `Human` = a PERSON picks from an enumerated menu, once per iteration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GateSpec {
     Pure(LoopGate),
@@ -220,6 +226,34 @@ pub enum GateSpec {
         agent: crate::registry::AgentRef,
         stop_when: LoopGate,
     },
+    /// SP-6 s4. The `AgentRef` supplies the QUESTION (its `system_prompt` and activated
+    /// skills) and the SLA (its `backed_by: human { timeout }`); the `menu` supplies the
+    /// DECISION and lives on the graph, not the registry, so `validate_dag` can reject a
+    /// menu that cannot converge. See the `GateSpec::Human` block in
+    /// [`Graph::validate_dag`].
+    ///
+    /// There is deliberately no `stop_when` here. Under a human backing a pure predicate
+    /// would be either inert or applied to a magic option-name vocabulary, where
+    /// `TextContains("halt")` against a menu emitting `"stop"` silently yields a loop that
+    /// runs to `max_iters`. `LoopGateOption::stops` says the thing directly.
+    Human {
+        agent: crate::registry::AgentRef,
+        menu: Vec<LoopGateOption>,
+    },
+}
+
+/// One choice a [`GateSpec::Human`] offers, and what picking it does to the LOOP.
+///
+/// Deliberately NOT [`GateOption`]/[`GateOutcome`], whose `{Complete, Fail}` cannot
+/// express "continue" — the one decision this variant exists for. Reinterpreting
+/// `Complete` as "stop the loop" would put two meanings in a two-variant enum depending
+/// on which node read it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopGateOption {
+    /// What the operator types: `torii run gate decide … --option <name>`.
+    pub name: String,
+    /// `true` converges the loop; `false` runs another iteration (subject to `max_iters`).
+    pub stops: bool,
 }
 
 /// A deterministic Stop condition for a [`NodeKind::Loop`], evaluated as a pure
@@ -341,6 +375,72 @@ pub struct Graph {
     pub nodes: Vec<Node>,
 }
 
+/// The hygiene rules EVERY enumerated human menu obeys, whatever offers it: the menu is
+/// non-empty, no option name is empty, and no name repeats. `owner` names the kind of
+/// thing that owns the menu (`"human_gate node"`, `"the human gate on loop node"`) and is
+/// interpolated with `node` to open each message.
+///
+/// Shared, not copied, and that is the point. When SP-6 s4 added a second menu
+/// ([`GateSpec::Human`]'s) beside s2's [`NodeKind::HumanGate`], the second block was a
+/// verbatim copy of the first with the nouns changed — 45 lines whose only real difference
+/// is the at-least-one predicate. This slice's own s2 review recorded the rule for exactly
+/// that shape: *"s1's node was SPLIT, not copied … a second copy is a second place for
+/// [defects] to come back."* Option names are author- and planner-supplied free text, so
+/// any future guard on them (a length cap, whitespace-only, a leading `-` that would be
+/// eaten by a CLI parser) has to reach both menus; with one copy it does so by
+/// construction.
+///
+/// **The at-least-one rule stays with the caller**, because it is the one rule that is
+/// genuinely per-kind: a `HumanGate` needs an option whose `outcome` is `Complete` (a way
+/// FORWARD), a human loop gate needs one whose `stops` is true (a way to CONVERGE), and
+/// the two messages explain different failures. Folding them together behind a predicate
+/// argument would buy nothing and cost the explanation.
+///
+/// **Call this BEFORE that rule.** An empty menu satisfies neither, and "no Complete
+/// option" / "no stopping option" sends the author hunting for a missing flag on options
+/// that do not exist. The corollary is that a menu with two defects is reported by
+/// whichever check runs first — `validate_dag` returns the first `Err` it finds, not a
+/// list — and a menu with a duplicate name AND no stopping option now reports the
+/// duplicate. Either way the graph is refused; nothing downstream branches on which.
+///
+/// The `HashSet` is used for MEMBERSHIP ONLY and is never iterated, so nothing here varies
+/// with its hash order. That matters more than it looks: `feasible` wraps this text as
+/// `PlanError::Structural`, the Pure `ValidatePlan` tool memoizes it, and `drive_expand`
+/// journals it in a `NodeFailed`, so a per-process message is a resume
+/// `DeterminismViolation` — the full argument is in block 2b-quater.
+fn check_menu_option_names<'a>(
+    owner: &str,
+    node: &NodeId,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), OrchestratorError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name.is_empty() {
+            return Err(OrchestratorError::InvalidGraph(format!(
+                "{owner} {node:?} has an option with an empty name; an operator could not \
+                 type it"
+            )));
+        }
+        if !seen.insert(name) {
+            // The name twice, deliberately: `{:?}` quotes and escapes it so the value is
+            // unambiguous even if it is whitespace or punctuation, while the second,
+            // unquoted copy is the flag an operator can paste as-is. A single `{:?}` in
+            // the flag would print `--option "approve"`, which is not what they type.
+            return Err(OrchestratorError::InvalidGraph(format!(
+                "{owner} {node:?} has a duplicate option name {name:?}; `--option {name}` \
+                 would be ambiguous"
+            )));
+        }
+    }
+    // Last, not first: an early return above means `seen` is empty only when the menu was.
+    if seen.is_empty() {
+        return Err(OrchestratorError::InvalidGraph(format!(
+            "{owner} {node:?} declares no options; it must offer at least one option"
+        )));
+    }
+    Ok(())
+}
+
 impl Graph {
     /// Validate that the graph is strictly linear: node ids are distinct, the
     /// first node has no dependencies, and every subsequent node depends on
@@ -437,6 +537,66 @@ impl Graph {
             }
         }
 
+        // 1c. SP-6 s4 (whole-slice review): the executor's own reserved path SEGMENTS,
+        // banned for the same reason 1b bans the separator and closing the vector 1b does
+        // NOT reach.
+        //
+        // 1b makes `"lp/0/__gate__"` unauthorable in one piece, and until this block that
+        // was mistaken for the whole rule. A `Loop`'s `Subgraph` body is namespaced under
+        // `"{loop}/{i}"` (`executor::subgraph::namespace_graph`), so an inner node the
+        // author simply named `__gate__` lands on exactly the path that `Loop`'s own gate
+        // uses — no separator required. Both ids are legal at their own level, and the
+        // collision exists only once nesting has flattened them.
+        //
+        // What it produced depended on the colliding node's KIND, and the quiet case was
+        // the bad one. A WAITING inner kind writes the shared `deadlines` map, so
+        // `run_human_loop_gate` takes its loud missing-menu refusal. A kind that COMPLETES
+        // (`ModelCall`/`Agent`) writes nothing there: the gate sees no recorded wait, asks
+        // normally, and publishes `LoopGateAwaited` at an id that already carries
+        // `NodeCompleted` — so `torii`'s `signal_states` folds the node terminal,
+        // `run list-paused` omits it and `run gate decide` refuses it as already
+        // completed. The run pauses on a question no operator surface can show or answer;
+        // with the supported indefinite SLA (`backed_by: human { timeout: None }`) it
+        // waits there forever, and with a finite one the whole `Loop` dies at the deadline
+        // taking every earlier iteration's spend with it.
+        //
+        // Equality on the WHOLE id, never `contains`: `my__gate__` namespaces to a path
+        // the executor never generates, and a substring rule would refuse a legal graph.
+        //
+        // `__plan__` and `__select__` are refused by the same rule as uniformity and
+        // defence in depth, NOT because either is reachable the way `__gate__` is: both
+        // sit under an `Expand`, which has no static body an author can put a node in.
+        // Checked here rather than only in `plan::feasible` because this function is what
+        // BOTH intakes run — `Executor::start`/`run` for an authored graph, and `feasible`
+        // for a planner's — so one rule covers an author and an untrusted planner at every
+        // depth `validate_dag` recurses into.
+        const RESERVED_SEGMENTS: [&str; 3] = [
+            crate::plan::RESERVED_PLAN_ID,
+            crate::plan::RESERVED_GATE_ID,
+            crate::planner::RESERVED_SELECT_ID,
+        ];
+        for node in &self.nodes {
+            if RESERVED_SEGMENTS.contains(&node.id.0.as_str()) {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "node id {:?} is a path segment the executor reserves for its own \
+                     synthesized nodes (a Loop's gate at \"{{loop}}/{{i}}/__gate__\", a \
+                     planner sub-run at \"{{expand}}/__plan__\", a selector's spend at \
+                     \"{{expand}}/__select__\"); nested under a Loop body it would collide \
+                     with one of them once the path is namespaced",
+                    node.id
+                )));
+            }
+            for dep in &node.deps {
+                if RESERVED_SEGMENTS.contains(&dep.on.0.as_str()) {
+                    return Err(OrchestratorError::InvalidGraph(format!(
+                        "node {:?} depends on {:?}, which is a path segment the executor \
+                         reserves for its own synthesized nodes",
+                        node.id, dep.on
+                    )));
+                }
+            }
+        }
+
         // 2. Every dependency references a declared node.
         for node in &self.nodes {
             for dep in &node.deps {
@@ -527,12 +687,14 @@ impl Graph {
             let NodeKind::HumanGate { options, timeout } = &node.kind else {
                 continue;
             };
-            if options.is_empty() {
-                return Err(OrchestratorError::InvalidGraph(format!(
-                    "human_gate node {:?} declares no options; it must offer at least one option",
-                    node.id
-                )));
-            }
+            // Empty / empty-name / duplicate — the rules every enumerated menu obeys,
+            // shared with the human LOOP gate below (2b-ter-bis). Before the
+            // `Complete`-option rule, so an empty menu is reported as an empty menu.
+            check_menu_option_names(
+                "human_gate node",
+                &node.id,
+                options.iter().map(|o| o.name.as_str()),
+            )?;
             if !options.iter().any(|o| o.outcome == GateOutcome::Complete) {
                 return Err(OrchestratorError::InvalidGraph(format!(
                     "human_gate node {:?} has no Complete option, so the run can never \
@@ -540,23 +702,6 @@ impl Graph {
                      option is required",
                     node.id
                 )));
-            }
-            let mut seen = HashSet::new();
-            for o in options {
-                if o.name.is_empty() {
-                    return Err(OrchestratorError::InvalidGraph(format!(
-                        "human_gate node {:?} has an option with an empty name; an \
-                         operator could not type it",
-                        node.id
-                    )));
-                }
-                if !seen.insert(o.name.as_str()) {
-                    return Err(OrchestratorError::InvalidGraph(format!(
-                        "human_gate node {:?} has a duplicate option name {:?}; \
-                         `--option {}` would be ambiguous",
-                        node.id, o.name, o.name
-                    )));
-                }
             }
             if let Some(t) = timeout {
                 if *t <= chrono::Duration::zero() {
@@ -573,6 +718,81 @@ impl Graph {
                         node.id
                     )));
                 }
+            }
+        }
+
+        // 2b-ter-bis. SP-6 s4: a `GateSpec::Human`'s menu must be usable, and must offer
+        // a way to STOP. Same principle as `max_iters == 0` and 2b-ter above: reject the
+        // degenerate node loudly here rather than let it produce a baffling runtime state.
+        //
+        // The stopping-option rule is the sharper of the two. A menu with no `stops: true`
+        // option is a loop that provably cannot converge however the human answers — it
+        // runs to `max_iters` and reports a non-converged result, having asked a person
+        // `max_iters` times to no purpose. That is a malformed graph, and catching it is
+        // the entire reason s4 puts the menu on the GRAPH rather than on the
+        // `AgentDefinition`: a registry menu is invisible here, exactly as s3's §5.5
+        // records for the human backing itself.
+        //
+        // The converse is NOT checked. A menu whose every option stops is degenerate
+        // ("approve once, then stop") but legitimate, and rejecting it would be policy
+        // rather than structure. Contrast 2b-ter, which DOES require a `Complete` option:
+        // there, every-option-Fails is a guaranteed dead end; here, every-option-stops
+        // still completes the loop normally.
+        //
+        // Like 2b/2b-bis/2b-ter, this block walks `self.nodes` at ONE level and does not
+        // itself recurse. Every nesting level is covered because block 2c's (`Subgraph`
+        // node, `Loop`'s `Subgraph` body) and block 2d's (`Branch` arms, `default`)
+        // recursive `validate_dag()` calls run this block again down there — the same
+        // wording 2b-quater uses, and worth repeating because 2c alone does NOT reach a
+        // `Branch`. All four sites are pinned by
+        // `validate_dag_recurses_into_a_nested_bad_human_loop_gate`.
+        //
+        // No timeout bounds are checked here — unlike 2b-ter — because a `GateSpec::Human`
+        // carries no timeout. Its SLA is the ROLE's `backed_by: human { timeout }`, a
+        // registry fact this function cannot see at all (`validate_dag` is pure over the
+        // graph and takes no `Registry`).
+        //
+        // That does NOT mean the deadline arrives here pre-bounded, and the next reader
+        // must not assume it does. The registry's layer-1 bound is `Registry::validate`,
+        // which applies the SAME `MAX_AWAIT_SIGNAL_TIMEOUT` this block's siblings use. It
+        // deliberately does NOT live in the frontmatter parser: `parse_fm_duration` is
+        // purely syntactic (it bounds only against `chrono::TimeDelta`'s ~292-million-year
+        // range, via its `try_*` constructors — far past the year-262143 `DateTime<Utc>`
+        // ceiling 2b-bis/2b-ter argue about), and an `AgentDefinition` can arrive as a
+        // jsonb row from Postgres without passing through that parser at all, so
+        // `Registry::validate` is the one place that catches BOTH sources. Duplicating the
+        // bound into the parser would just let the two copies drift.
+        //
+        // Layer 2 is unchanged and still required: the shared wait path computes the
+        // deadline with `checked_add_signed`, not `+`, so a role that reached the executor
+        // unvalidated fails its node instead of panicking a worker. Whichever task reuses
+        // that path for this gate inherits layer 2 by construction — and must not "simplify"
+        // it away on the strength of a validation that runs in different code.
+        for node in &self.nodes {
+            let NodeKind::Loop {
+                gate: GateSpec::Human { menu, .. },
+                ..
+            } = &node.kind
+            else {
+                continue;
+            };
+            // The same three menu rules 2b-ter applies, from the same function — the
+            // nouns differ, the rules do not. Before the stopping-option rule, so an
+            // empty menu is reported as an empty menu rather than as one that cannot
+            // converge.
+            check_menu_option_names(
+                "the human gate on loop node",
+                &node.id,
+                menu.iter().map(|o| o.name.as_str()),
+            )?;
+            if !menu.iter().any(|o| o.stops) {
+                return Err(OrchestratorError::InvalidGraph(format!(
+                    "loop node {:?} has a human gate with no stopping option, so the loop \
+                     can never converge however the human answers — it would run to \
+                     max_iters and ask a person that many times to no purpose; at least \
+                     one option with `stops: true` is required",
+                    node.id
+                )));
             }
         }
 
@@ -855,6 +1075,139 @@ mod tests {
             "gate:2",
             "gate-c3a9f0e4-1b2d-4c5e-8a7b-9d0e1f2a3b4c",
         ] {
+            let g = Graph {
+                nodes: vec![node(id, vec![])],
+            };
+            assert!(g.validate_dag().is_ok(), "{id:?} must still validate");
+        }
+    }
+
+    /// **SP-6 s4 whole-slice review, Important.** The sibling of the `/` ban above, and
+    /// the vector it does NOT cover: a bare `__gate__` SEGMENT.
+    ///
+    /// s1's rule bans the separator, which makes `"lp/0/__gate__"` unauthorable in one
+    /// piece — but a `Loop`'s `Subgraph` body is namespaced under `"{loop}/{i}"`, so an
+    /// inner node the author simply named `__gate__` lands on exactly the path the Loop's
+    /// own gate uses. Both ids are legal at their own level, and the collision only
+    /// exists once nesting has flattened them, so nothing downstream can catch it.
+    ///
+    /// The consequence measured by review was the WORST available one, and it depended on
+    /// the colliding node's kind. A WAITING inner kind writes into the shared `deadlines`
+    /// map, so the gate arm takes its loud missing-menu refusal. A kind that COMPLETES
+    /// (`ModelCall`/`Agent`) writes nothing there: the gate arm sees no recorded wait,
+    /// asks normally, and publishes `LoopGateAwaited` at an id that already carries
+    /// `NodeCompleted` — whereupon `torii`'s `signal_states` folds the node as terminal,
+    /// `run list-paused` omits it, and `run gate decide` refuses it as already completed.
+    /// With `backed_by: human { timeout: None }` the run then waits forever on a question
+    /// no operator surface can show or answer.
+    ///
+    /// So it is refused HERE, where the id is authored, rather than at the arm that
+    /// discovers it — the same reasoning the `/` ban used: a pure syntactic rule needing
+    /// no cross-level analysis, holding for planner-produced graphs too (`plan::feasible`
+    /// validates through this function), and costing nothing, since no graph in this
+    /// workspace uses a reserved segment as an author-supplied id.
+    #[test]
+    fn validate_dag_rejects_a_reserved_gate_segment_in_an_author_supplied_node_id() {
+        let offender = || Graph {
+            nodes: vec![node(crate::plan::RESERVED_GATE_ID, vec![])],
+        };
+        let assert_rejects = |g: &Graph, what: &str| match g.validate_dag() {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("__gate__") && m.contains("reserve"),
+                "{what}: rejected, but not for the reserved segment: {m}"
+            ),
+            other => panic!("{what}: expected InvalidGraph, got {other:?}"),
+        };
+
+        assert_rejects(&offender(), "top level");
+        assert_rejects(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("s".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(offender()),
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Subgraph",
+        );
+        // The live vector: this is the nesting that actually produces the collision.
+        assert_rejects(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("L".into()),
+                    kind: NodeKind::Loop {
+                        body: LoopBody::Subgraph(Box::new(offender())),
+                        input: serde_json::json!({}),
+                        gate: GateSpec::Pure(LoopGate::TextContains("x".into())),
+                        max_iters: 3,
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Loop body",
+        );
+        assert_rejects(
+            &Graph {
+                nodes: vec![
+                    node("on", vec![]),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("on".into()),
+                            arms: vec![(BranchCond::FieldTrue("go".into()), offender())],
+                            default: Graph { nodes: vec![] },
+                        },
+                        deps: vec![Dep::hard("on")],
+                    },
+                ],
+            },
+            "nested in a Branch arm",
+        );
+
+        // The two SIBLING reserved segments are refused by the same rule. Neither is
+        // reachable as a collision the way `__gate__` is — `"{expand}/__plan__"` and
+        // `"{expand}/__select__"` sit under an `Expand`, which has no static body for an
+        // author to put a node in — so this half is defence in depth and uniformity, not
+        // a fix. Stated that way rather than claimed as a live vector.
+        for reserved in [
+            crate::plan::RESERVED_PLAN_ID,
+            crate::planner::RESERVED_SELECT_ID,
+        ] {
+            assert_rejects(
+                &Graph {
+                    nodes: vec![node(reserved, vec![])],
+                },
+                reserved,
+            );
+        }
+
+        // And a DEP naming one, for the same reason the separator ban checks deps: the
+        // author meant some node, and "undeclared node" would send them hunting a typo.
+        match (Graph {
+            nodes: vec![
+                node("a", vec![]),
+                node("b", vec![Dep::hard(crate::plan::RESERVED_GATE_ID)]),
+            ],
+        })
+        .validate_dag()
+        {
+            Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                m.contains("__gate__") && m.contains("reserve"),
+                "a dep on a reserved segment is refused as reserved, not as a typo: {m}"
+            ),
+            other => panic!("expected InvalidGraph, got {other:?}"),
+        }
+    }
+
+    /// The other half, mirroring the separator ban's: an id that merely CONTAINS a
+    /// reserved segment as a substring is not the reserved segment, and must still
+    /// validate. The rule is equality on the whole id, not a `contains` — an author's
+    /// `__gate__like` or `my__gate__` namespaces to a path the executor never generates.
+    #[test]
+    fn validate_dag_accepts_ids_that_merely_resemble_a_reserved_segment() {
+        for id in ["__gate__like", "my__gate__", "gate", "_gate_", "__plan__2"] {
             let g = Graph {
                 nodes: vec![node(id, vec![])],
             };
@@ -1366,6 +1719,303 @@ mod tests {
         assert!(!field.should_stop(&serde_json::json!({})));
     }
 
+    /// AC1 — the new variant round-trips through serde.
+    #[test]
+    fn a_human_gate_spec_round_trips_through_serde() {
+        let gate = GateSpec::Human {
+            agent: crate::registry::AgentRef("reviewer".into()),
+            menu: vec![
+                LoopGateOption {
+                    name: "keep-going".into(),
+                    stops: false,
+                },
+                LoopGateOption {
+                    name: "good-enough".into(),
+                    stops: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&gate).expect("serialises");
+        // Pin the wire bytes, not just the round-trip: a round-trip alone is invariant
+        // under `#[serde(rename = "halts")] pub stops: bool` (renames both directions
+        // together). The mutation with teeth is that rename PLUS `#[serde(default)]` —
+        // a missing `stops`/`halts` field then silently reads as `false`, flipping every
+        // stopping option in an already-persisted `scheduled_runs.graph` row to
+        // non-stopping, which is the exact failure this variant exists to prevent. This
+        // assertion is what would catch it; it is not redundant with the round-trip above.
+        assert_eq!(
+            json,
+            r#"{"Human":{"agent":"reviewer","menu":[{"name":"keep-going","stops":false},{"name":"good-enough","stops":true}]}}"#
+        );
+        let back: GateSpec = serde_json::from_str(&json).expect("deserialises");
+        match back {
+            GateSpec::Human { agent, menu } => {
+                assert_eq!(agent.0, "reviewer");
+                assert_eq!(menu.len(), 2);
+                assert!(!menu[0].stops, "keep-going must not stop the loop");
+                assert!(menu[1].stops, "good-enough must stop the loop");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// AC1 — additivity: a graph using no `Human` gate serialises exactly as it does
+    /// today. Guards against a change to the TAGGING REPRESENTATION — `#[serde(tag =
+    /// …)]`, `untagged`, a rename — silently rewriting every existing
+    /// `scheduled_runs.graph` row.
+    ///
+    /// It does NOT catch variant REORDERING, and that is not a gap here: externally
+    /// tagged serde (today's default, unchanged by this variant) keys JSON by variant
+    /// NAME, so order cannot affect the output or name-matched deserialisation. Order
+    /// would only matter under `untagged` or an index-based binary format, and this
+    /// workspace persists `Graph` as JSON/jsonb everywhere (no `bincode`/`postcard`/
+    /// `rmp_serde`/`ciborium`/`serde_cbor` in any crate). If one is ever added, this
+    /// test stops being sufficient and a round-trip through THAT format is what closes
+    /// the gap.
+    #[test]
+    fn an_existing_pure_gate_serialises_unchanged_by_the_new_variant() {
+        let gate = GateSpec::Pure(LoopGate::TextContains("DONE".into()));
+        assert_eq!(
+            serde_json::to_string(&gate).expect("serialises"),
+            r#"{"Pure":{"TextContains":"DONE"}}"#
+        );
+    }
+
+    /// A single-node `Loop` gated by `GateSpec::Human`, valid in every respect EXCEPT
+    /// whatever the caller puts in `menu` — the menu is the variable under test here, so
+    /// it is deliberately not required to be well-formed. Everything else is fixed so a
+    /// rejection can only be the menu's doing.
+    fn human_gated_loop(menu: Vec<LoopGateOption>) -> Graph {
+        Graph {
+            nodes: vec![Node {
+                id: NodeId("lp".into()),
+                kind: NodeKind::Loop {
+                    body: LoopBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({ "prompt": "start" }),
+                    gate: GateSpec::Human {
+                        agent: crate::registry::AgentRef("reviewer".into()),
+                        menu,
+                    },
+                    max_iters: 3,
+                },
+                deps: vec![],
+            }],
+        }
+    }
+
+    /// AC2 — a menu with no stopping option is a loop that provably cannot converge; it
+    /// runs to `max_iters` however the human answers. That is a malformed graph, not a
+    /// policy, and it is the whole reason the menu lives on the graph rather than the
+    /// registry: only here can it be caught statically.
+    #[test]
+    fn validate_dag_rejects_a_human_loop_gate_with_no_stopping_option() {
+        let g = human_gated_loop(vec![
+            LoopGateOption {
+                name: "again".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "more".into(),
+                stops: false,
+            },
+        ]);
+        let err = g.validate_dag().expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no stopping option"),
+            "must name the defect: {msg}"
+        );
+        assert!(msg.contains("lp"), "must name the node: {msg}");
+    }
+
+    /// AC2 — an empty menu leaves the human nothing to pick.
+    ///
+    /// This rule and the two below come from `check_menu_option_names`, shared with the s2
+    /// `HumanGate` block, so each also asserts the error NAMES THE NODE (`"lp"`): the
+    /// shared function is told which node it is validating, and a message that lost the id
+    /// would leave an author with no way to find the offending menu. Same property
+    /// `a_degenerate_gate_is_rejected` pins on the other caller.
+    #[test]
+    fn validate_dag_rejects_a_human_loop_gate_with_an_empty_menu() {
+        let err = human_gated_loop(vec![])
+            .validate_dag()
+            .expect_err("must reject");
+        assert!(format!("{err}").contains("no options"), "{err}");
+        assert!(format!("{err}").contains("lp"), "must name the node: {err}");
+    }
+
+    /// AC2 — `--option x` would be ambiguous.
+    #[test]
+    fn validate_dag_rejects_a_duplicate_option_name_in_a_human_loop_gate() {
+        let g = human_gated_loop(vec![
+            LoopGateOption {
+                name: "x".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "x".into(),
+                stops: true,
+            },
+        ]);
+        let err = g.validate_dag().expect_err("must reject");
+        assert!(format!("{err}").contains("duplicate"), "{err}");
+        assert!(format!("{err}").contains("lp"), "must name the node: {err}");
+    }
+
+    /// AC2 — an operator could not type it.
+    #[test]
+    fn validate_dag_rejects_an_empty_option_name_in_a_human_loop_gate() {
+        let g = human_gated_loop(vec![LoopGateOption {
+            name: String::new(),
+            stops: true,
+        }]);
+        let err = g.validate_dag().expect_err("must reject");
+        assert!(format!("{err}").contains("empty name"), "{err}");
+        assert!(format!("{err}").contains("lp"), "must name the node: {err}");
+    }
+
+    /// AC2 — the valid shape is accepted. A menu with ONLY stopping options is legal:
+    /// "approve once, then stop" is degenerate but legitimate, and rejecting it would be
+    /// policy rather than structure.
+    #[test]
+    fn validate_dag_accepts_a_well_formed_human_loop_gate() {
+        human_gated_loop(vec![
+            LoopGateOption {
+                name: "again".into(),
+                stops: false,
+            },
+            LoopGateOption {
+                name: "done".into(),
+                stops: true,
+            },
+        ])
+        .validate_dag()
+        .expect("a menu with a stopping option is valid");
+
+        human_gated_loop(vec![LoopGateOption {
+            name: "done".into(),
+            stops: true,
+        }])
+        .validate_dag()
+        .expect("an all-stopping menu is degenerate but legal");
+    }
+
+    /// AC2 — the rule fires at DEPTH, at every site `validate_dag` descends into.
+    ///
+    /// What this does NOT test is that the 2b-ter-bis block itself walks the tree: it does
+    /// not, and is not meant to. Like 2b/2b-bis/2b-ter it iterates `self.nodes` at ONE
+    /// level. Depth is delivered by the recursive `validate_dag()` calls in block **2c**
+    /// (a `Subgraph` node's graph, and a `Loop`'s `Subgraph` body) and block **2d** (a
+    /// `Branch`'s arm graphs and its `default`) — the same wording 2b-quater's comment
+    /// uses, and the reason a `Branch` reader must be sent to 2d rather than to 2c.
+    ///
+    /// So what this test guards is the COMPOSITION of the two: the rule sits inside the
+    /// body those calls re-enter, AND every descent site still re-enters it. That is not
+    /// free, because each site is its own line of code that a later edit can drop — and
+    /// dropping one is invisible to the five top-level s4 tests, none of which nest.
+    ///
+    /// Each case is separately load-bearing, mutation-checked one recursion at a time:
+    /// dropping 2c's `NodeKind::Subgraph` recursion reddens this test at case 1 (alongside
+    /// four pre-existing depth tests, and no other s4 test); dropping 2c's
+    /// `LoopBody::Subgraph` recursion, case 2; dropping 2d's `arms` recursion, case 3;
+    /// dropping 2d's `default` recursion, case 4 — and that last mutation reddens NOTHING
+    /// else in the crate, so case 4 is currently the only guard on it. Note what does NOT
+    /// discriminate: disabling the 2b-ter-bis loop wholesale reddens all five s4 rejection
+    /// tests together, which proves the block runs at all and says nothing about depth.
+    ///
+    /// The `Loop`-body and `Branch`-arm shapes are the ones AC2 and the file's precedents
+    /// name: `validate_dag_recurses_into_a_nested_human_gate` covers `Subgraph` +
+    /// `Loop`-body for the s2 gate, and
+    /// `validate_dag_rejects_a_path_separator_in_an_author_supplied_node_id` covers all of
+    /// them for the s1 id rule.
+    #[test]
+    fn validate_dag_recurses_into_a_nested_bad_human_loop_gate() {
+        // Rejected, and rejected FOR THE NESTED GATE — a nested case that merely errors
+        // (say, because the wrapper is malformed) would prove nothing about the recursion.
+        // Hence both halves: the inner node's id AND the menu's actual defect.
+        fn assert_rejects_the_gate(graph: &Graph, what: &str) {
+            match graph.validate_dag() {
+                Err(OrchestratorError::InvalidGraph(m)) => assert!(
+                    m.contains("lp") && m.contains("no stopping option"),
+                    "{what}: rejected, but not for the nested gate's missing stopping \
+                     option: {m}"
+                ),
+                other => panic!("{what}: expected InvalidGraph, got {other:?}"),
+            }
+        }
+
+        let offender = || {
+            human_gated_loop(vec![LoopGateOption {
+                name: "again".into(),
+                stops: false,
+            }])
+        };
+
+        assert_rejects_the_gate(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("sub".into()),
+                    kind: NodeKind::Subgraph {
+                        graph: Box::new(offender()),
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Subgraph",
+        );
+        assert_rejects_the_gate(
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("outer".into()),
+                    kind: NodeKind::Loop {
+                        body: LoopBody::Subgraph(Box::new(offender())),
+                        input: serde_json::json!({}),
+                        // The OUTER loop's own gate is pure and well-formed, so the only
+                        // thing 2b-ter-bis can complain about is the inner one.
+                        gate: GateSpec::Pure(LoopGate::TextContains("x".into())),
+                        max_iters: 3,
+                    },
+                    deps: vec![],
+                }],
+            },
+            "nested in a Loop body",
+        );
+        assert_rejects_the_gate(
+            &Graph {
+                nodes: vec![
+                    node("on", vec![]),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("on".into()),
+                            arms: vec![(BranchCond::FieldTrue("go".into()), offender())],
+                            default: Graph { nodes: vec![] },
+                        },
+                        deps: vec![Dep::hard("on")],
+                    },
+                ],
+            },
+            "nested in a Branch arm",
+        );
+        assert_rejects_the_gate(
+            &Graph {
+                nodes: vec![
+                    node("on", vec![]),
+                    Node {
+                        id: NodeId("b".into()),
+                        kind: NodeKind::Branch {
+                            on: NodeId("on".into()),
+                            arms: vec![],
+                            default: offender(),
+                        },
+                        deps: vec![Dep::hard("on")],
+                    },
+                ],
+            },
+            "nested in a Branch default",
+        );
+    }
+
     /// A minimal node carrying a throwaway `ModelCall` kind — `validate_dag`
     /// inspects only ids + deps, never the kind.
     fn node(id: &str, deps: Vec<Dep>) -> Node {
@@ -1777,6 +2427,105 @@ mod tests {
              execution-graph.md: {undocumented:?} — each needs its own \
              `> - **`Name {{ … }}`** — …` bullet (a mention in someone else's prose is not \
              documentation; see this test's doc comment)"
+        );
+    }
+
+    /// Every `GateSpec` variant must be named where the feature doc ENUMERATES them.
+    ///
+    /// The sibling of `every_node_kind_is_documented_in_the_execution_graph_feature_doc`,
+    /// and it exists because that test cannot see this: a `Loop`'s gate is not a
+    /// `NodeKind`, so SP-6 s4 could add a third way for a loop to stop with the whole
+    /// workspace green while the page still read "**`GateSpec`** is **`Pure(LoopGate)`**
+    /// … or **`Agent { … }`**". That sentence is a CLOSED enumeration — it says what
+    /// `GateSpec` *is* — so a variant it omits is a variant the page states does not
+    /// exist, which is the same failure the node-kind guard was written for, one type
+    /// away. It cost s1 a reader who concluded HITL was unavailable.
+    ///
+    /// Bounded to the enumeration itself rather than to the whole file, for that test's
+    /// reason: `Human` occurs in this page's prose in several unrelated senses
+    /// (`AwaitSignal`'s "a human answers", `HumanGate`'s bullet), and a bare
+    /// `doc.contains` would have been GREEN before this slice wrote a word.
+    ///
+    /// **The bound is an explicit MARKER PAIR in the markdown, not a heuristic.** It was
+    /// first written as "up to the next blank blockquote line", which the doc's own growth
+    /// then stretched to a 3.8 KB span covering three further paragraphs about human loop
+    /// gates — re-creating the `doc.contains` weakness the paragraph above rejects, since
+    /// any one of those sentences mentioning `` `Human` `` would keep the guard green with
+    /// the enumeration sentence silently emptied. A comment pair cannot drift that way, and
+    /// it tells the next author writing in this blockquote which side of the line to write
+    /// on.
+    ///
+    /// Only rule 1 (the enumeration) applies. There is no per-gate-kind bullet convention
+    /// to hold a variant to — the gate kinds are documented inside the `Loop` paragraph,
+    /// which is where an author reading about loops will be.
+    #[test]
+    fn every_gate_spec_variant_is_documented_in_the_execution_graph_feature_doc() {
+        let src = include_str!("graph.rs");
+        let body = src
+            .split_once("pub enum GateSpec {")
+            .expect("the enum is declared here")
+            .1
+            .split_once("\n}\n")
+            .expect("the enum ends")
+            .0;
+        let variants: Vec<&str> = body
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                // A variant line is four-space-indented and starts a `Name {` or `Name(`.
+                if l.starts_with("    ") && !l.starts_with("     ") && !t.starts_with("//") {
+                    t.split(|c: char| !c.is_alphanumeric())
+                        .next()
+                        .filter(|n| n.chars().next().is_some_and(char::is_uppercase))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            variants,
+            vec!["Pure", "Agent", "Human"],
+            "the variant scrape broke, or a gate kind was added/renamed — update this \
+             expectation together with the feature doc"
+        );
+
+        let doc = include_str!("../../../docs/features/orchestrator/execution-graph.md");
+        // The enumeration, bounded by the marker pair the page carries for exactly this
+        // purpose. Everything outside it in the same blockquote is about what a gate DOES,
+        // not about which kinds exist — and only the markers keep that distinction from
+        // eroding as the page grows.
+        let enumeration = doc
+            .split_once("<!-- gate-spec-enumeration -->")
+            .expect("the feature doc still marks where the gate-kind enumeration starts")
+            .1
+            .split_once("<!-- /gate-spec-enumeration -->")
+            .expect("…and where it ends")
+            .0;
+        assert!(
+            enumeration.contains("**`GateSpec`** is"),
+            "the markers must bracket the enumeration SENTENCE, not some other prose: \
+             {enumeration}"
+        );
+
+        // A backticked name whose next character is non-alphanumeric, so `` `Pure(LoopGate)` ``
+        // documents `Pure` while `` `HumanGate` `` — a DIFFERENT node kind this page also
+        // discusses — does not document `Human`.
+        let named = |v: &str| {
+            let needle = format!("`{v}");
+            enumeration.match_indices(&needle).any(|(i, m)| {
+                enumeration[i + m.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_alphanumeric() && c != '_')
+            })
+        };
+        let unlisted: Vec<&str> = variants.iter().copied().filter(|v| !named(v)).collect();
+        assert!(
+            unlisted.is_empty(),
+            "gate kinds implemented but MISSING FROM THE ENUMERATION in \
+             docs/features/orchestrator/execution-graph.md: {unlisted:?} — the \
+             \"**`GateSpec`** is …\" sentence says what a gate CAN be, so a kind it omits \
+             is a kind the page states does not exist"
         );
     }
 }

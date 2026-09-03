@@ -50,9 +50,14 @@ pub(super) enum WaitState {
 }
 
 impl Executor {
-    /// Arm 0 of §6.2, shared by BOTH waiting node kinds: a folded `NodeFailed` for this
-    /// node is TERMINAL, read back rather than re-derived, and — this is the load-bearing
-    /// part — checked BEFORE the caller reads its answer.
+    /// Arm 0 of §6.2: a folded `NodeFailed` for this node is TERMINAL, read back rather
+    /// than re-derived, and — this is the load-bearing part — checked BEFORE the caller
+    /// reads its answer.
+    ///
+    /// Shared by ALL FOUR waiting node kinds: `AwaitSignal` (s1) and `HumanGate` (s2)
+    /// through this `&Node` form, the human-backed `Agent` (s3) and the human LOOP GATE
+    /// (s4) through the `_by_id` and `gate_failure_by_id` forms below, which are the same
+    /// read of the same map.
     ///
     /// **Whole-slice review, Important.** `fold_journal` originally had no `NodeFailed`
     /// arm, so an expired gate was not terminal on resume, with two consequences, the
@@ -91,10 +96,13 @@ impl Executor {
         self.gate_precheck_by_id(&node.id, fold)
     }
 
-    /// [`Executor::gate_precheck`] over a bare [`NodeId`], and the ONE implementation of
-    /// it — the `&Node` form above is a two-line delegation.
+    /// [`Executor::gate_precheck`] over a bare [`NodeId`] — a WRAPPER, since SP-6 s4, over
+    /// [`Executor::gate_failure_by_id`] below, which is the family's one implementation.
+    /// (It was itself that implementation until s4 needed the verdict as a bare message;
+    /// the `&Node` form above has always been a two-line delegation to this one.)
     ///
-    /// The split exists because SP-6 s3's human-backed `Agent` node is reached through
+    /// The `&NodeId`-vs-`&Node` split is the part that still lives here, and it exists
+    /// because SP-6 s3's human-backed `Agent` node is reached through
     /// `drive_agent`, which holds only a `&NodeId`: a `Map`/`Loop` child runs at the
     /// synthesized path `"{map}/{i}"`, which is a node id with no `Node` anywhere in the
     /// graph to correspond to it. Every word of the doc comment above applies here
@@ -104,10 +112,32 @@ impl Executor {
     /// arrangement exists to prevent: s1's whole-slice review found real defects in exactly
     /// these arms, and a second copy is a second place for them to return.
     pub(super) fn gate_precheck_by_id(&self, node: &NodeId, fold: &Fold) -> Option<NodeExec> {
-        fold.failure_for(node).map(|error| NodeExec::Failed {
-            message: error.to_string(),
-            output: None,
-        })
+        self.gate_failure_by_id(node, fold)
+            .map(|message| NodeExec::Failed {
+                message,
+                output: None,
+            })
+    }
+
+    /// [`Executor::gate_precheck_by_id`] as a bare MESSAGE, and — since SP-6 s4 — the ONE
+    /// implementation of the whole family: the two forms above are wrappers that dress this
+    /// verdict up as the [`NodeExec`] their callers return.
+    ///
+    /// It exists because s4's human LOOP GATE does not return a `NodeExec` at all. Its arm
+    /// reports a [`LoopGateStep`](super::human::LoopGateStep), whose `Failed` carries a
+    /// `String` and whose `Decided { stop }` has no `NodeExec` shape to be — so the gate
+    /// arm would otherwise have to `match` a `NodeExec` it knows can only be `Failed`,
+    /// leaving either an `unreachable!` (forbidden: a panic in a node kind unwinds through
+    /// `Scheduler::tick`, stranding a claimed lease) or an `if let` whose non-matching path
+    /// falls THROUGH and silently ignores a recorded failure — fail-OPEN, in the one guard
+    /// whose entire purpose is fail-closed.
+    ///
+    /// **Every word of `gate_precheck`'s contract applies here, and one in particular: call
+    /// it FIRST, before reading the node's answer.** This is not a second, laxer entry
+    /// point — it is the same read of the same `fold.failed`, and it journals nothing, so
+    /// a dead node does not append a fresh `NodeFailed` on every drive.
+    pub(super) fn gate_failure_by_id(&self, node: &NodeId, fold: &Fold) -> Option<String> {
+        fold.failure_for(node).map(str::to_string)
     }
 
     /// Arms 2–4 of §6.2, shared: read the recorded deadline or compute a fresh one, and
@@ -207,7 +237,10 @@ impl Executor {
         }
     }
 
-    /// The durable pause both waiting kinds end on.
+    /// The durable pause ALL FOUR waiting kinds end on — `run_await_signal` (s1),
+    /// `run_human_gate` (s2) and `run_human_agent` (s3) directly, and s4's
+    /// `run_human_loop_gate` through its own `pause_gate` wrapper, which adds the menu to
+    /// the reason and echoes the same string back as a `LoopGateStep`.
     ///
     /// `resume_after` carries the ORIGINAL absolute deadline (not `now + timeout`), so the
     /// durable scheduler re-arms on the same instant however many times the run is woken
@@ -375,9 +408,10 @@ impl Executor {
             // Already waiting by the SHARED map's reckoning — but did THIS kind begin
             // waiting here?
             //
-            // `Fold::deadlines` is written by all three waiting kinds while only
-            // `SignalAwaited` records membership in `signal_asks`, so this arm is reachable
-            // exactly the way `run_human_gate`'s missing-menu arm and `run_human_agent`'s
+            // `Fold::deadlines` is written by all four waiting kinds (SP-6 s4's
+            // `LoopGateAwaited` is the fourth) while only `SignalAwaited` records
+            // membership in `signal_asks`, so this arm is reachable exactly the way
+            // `run_human_gate`'s missing-menu arm and `run_human_agent`'s
             // missing-question arm are: by editing a live run's graph to change a waiting
             // node's KIND (`Executor::start` takes the graph as an unfenced caller
             // parameter, and `scheduled_runs.graph` is an editable row). s2 and s3 each

@@ -138,6 +138,21 @@ struct Fold {
     memo: HashMap<EffectId, (String, EffectOutput)>,
     started: std::collections::HashSet<NodeId>,
     completed: std::collections::HashSet<NodeId>,
+    /// The nodes whose `NodeSkipped` is already journaled, so
+    /// [`cascade_skip_from`](Executor::cascade_skip_from) appends each at most once across
+    /// resumes.
+    ///
+    /// The counterpart of `started`/`completed`, and it exists for the same bounded-growth
+    /// reason the SP-6 s4 review found at the `Loop`: a run whose node FAILED terminally
+    /// journals no `RunCompleted`, so it stays resumable and every later wake re-drives it,
+    /// re-fails it and re-cascades. `DriveState.terminal` bounds the cascade WITHIN one
+    /// drive — that is the "each node is skipped at most once" its doc means — and nothing
+    /// bounded it ACROSS drives, so a dead run appended one `NodeSkipped` per hard
+    /// dependent per wake, forever (measured 1 / 2 / 3 rows over three drives).
+    ///
+    /// `RunOutcome.skipped` is unaffected: the in-process outcome still reports every
+    /// cascade-skipped node on every drive. Only the durable append is guarded.
+    skipped: std::collections::HashSet<NodeId>,
     /// Effect ids that journaled an `EffectIntent` → the journaled idempotency key
     /// (§7.3, SP-4 s5). An id here with no matching `EffectRecorded` is in-doubt on
     /// resume; reconcile queries the provider by THIS key.
@@ -164,16 +179,18 @@ struct Fold {
     /// one for the same node.
     signals: HashMap<NodeId, serde_json::Value>,
     /// SP-6 s1: what each WAITING node recorded when it began waiting, folded from
-    /// `SignalAwaited` and — since SP-6 s2 and s3 — from `GateAwaited` and `AgentAwaited`
-    /// too, so that "has this node begun asking?" has ONE answer for all THREE waiting
-    /// kinds. Keep this list of writers current: every one of them is an
-    /// `entry().or_insert` in `fold_journal`, and
+    /// `SignalAwaited` and — since SP-6 s2, s3 and s4 — from `GateAwaited`,
+    /// `AgentAwaited` and `LoopGateAwaited` too, so that "has this node begun asking?"
+    /// has ONE answer for all FOUR waiting kinds. Keep this list of writers current:
+    /// every one of them is an `entry().or_insert` in `fold_journal`, and
     /// [`wait_or_expire`](Executor::wait_or_expire) reads the map without knowing which
     /// kind wrote it — so a reader that reasons about which kinds can be present is
-    /// reasoning off THIS sentence. All three now do: `run_await_signal`'s missing-ask arm,
-    /// `run_human_gate`'s missing-menu arm and `run_human_agent`'s missing-question arm,
-    /// each pairing this shared map with its own kind-specific record
-    /// ([`Fold::signal_asks`], [`Fold::menus`], [`Fold::agent_prompts`]).
+    /// reasoning off THIS sentence. All four do: `run_await_signal`'s missing-ask arm,
+    /// `run_human_gate`'s missing-menu arm, `run_human_agent`'s missing-question arm and
+    /// `run_human_loop_gate`'s missing-menu arm, each pairing this shared map with its own
+    /// kind-specific record ([`Fold::signal_asks`], [`Fold::menus`],
+    /// [`Fold::agent_prompts`], [`Fold::loop_gate_asks`]). All four writers and all four
+    /// readers now exist.
     ///
     /// FIRST record wins — the opposite of `signals`, and deliberately
     /// so: if a later `SignalAwaited` could overwrite it, every resume would push the
@@ -182,23 +199,26 @@ struct Fold {
     ///
     /// The VALUE is itself an `Option`, so the two layers mean different things:
     /// *key absent* = this node has never begun waiting; `Some(None)` = it began waiting
-    /// with **no deadline** — the indefinite HITL gate, and since s3 also the indefinite
-    /// human agent (`AgentBacking::Human { timeout: None }`). Folding that `None` as a
+    /// with **no deadline** — the indefinite HITL gate, since s3 also the indefinite
+    /// human agent (`AgentBacking::Human { timeout: None }`) and since s4 the indefinite
+    /// human LOOP gate, whose agent is backed the same way. Folding that `None` as a
     /// real value — rather than dropping it — is what makes the deadline-less arm of
     /// [`run_await_signal`](Executor::run_await_signal) node-keyed idempotent: without it
     /// the node re-journals `SignalAwaited` on every drive, and a re-drive is NOT
     /// human-bounded (a dep-free sibling that pauses with a deadline in the same round
-    /// keeps the whole run auto-wakeable). The same holds for the s2 and s3 kinds, which
-    /// re-journal `GateAwaited`/`AgentAwaited` respectively — see
-    /// `a_deadline_less_gate_records_that_it_began_asking` and
-    /// `a_deadline_less_human_agent_records_that_it_began_asking`.
+    /// keeps the whole run auto-wakeable). The same holds for the s2, s3 and s4 kinds,
+    /// which re-journal `GateAwaited`/`AgentAwaited`/`LoopGateAwaited` respectively — see
+    /// `a_deadline_less_gate_records_that_it_began_asking`,
+    /// `a_deadline_less_human_agent_records_that_it_began_asking` and
+    /// `a_deadline_less_loop_gate_records_that_it_began_asking`.
     deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>,
     /// SP-6 s1: the nodes that began waiting **as an `AwaitSignal`**, from `SignalAwaited`
     /// alone.
     ///
-    /// The exact counterpart of [`Fold::menus`] and [`Fold::agent_prompts`], which answer
-    /// the same per-kind question for the other two waiting kinds by carrying a payload only
-    /// that kind writes. `SignalAwaited` carries no payload beyond the deadline — which goes
+    /// The exact counterpart of [`Fold::menus`], [`Fold::agent_prompts`] and
+    /// [`Fold::loop_gate_asks`], which answer the same per-kind question for the other
+    /// three waiting kinds by carrying a payload only that kind writes.
+    /// `SignalAwaited` carries no payload beyond the deadline — which goes
     /// into the SHARED `deadlines` map — so the per-kind record has to be its own set;
     /// without it `run_await_signal` had no way to tell "I began waiting" from "some other
     /// kind began waiting at my id", and paused forever on the latter.
@@ -212,7 +232,7 @@ struct Fold {
     /// not retroactively change what their answer meant.
     ///
     /// `deadlines` is folded from `GateAwaited` too, so the "has this node begun asking?"
-    /// question stays in one place — as of s3 for all three waiting kinds, not two.
+    /// question stays in one place — as of s4 for all four waiting kinds, not two.
     menus: HashMap<NodeId, Vec<orchestrator_core::GateOption>>,
     /// SP-6 s3: each human-backed agent node's answer, from `AgentAnswered`. LAST wins,
     /// like `signals`/`gate_decisions` and for the same reason: an operator must be able
@@ -226,18 +246,62 @@ struct Fold {
     /// from `GateAwaited`: "has this node begun asking?" stays one question, and
     /// `wait_or_expire` reads only `deadline_for`.
     agent_prompts: HashMap<NodeId, String>,
+    /// SP-6 s4: each loop gate's decision, from `LoopGateDecided`. LAST wins, like
+    /// `signals`/`gate_decisions`/`agent_answers` and for the same reason: an operator
+    /// must be able to correct a mistaken decision before the run resumes.
+    loop_gate_decisions: HashMap<NodeId, LoopGateDecision>,
+    /// SP-6 s4: the MENU and QUESTION each loop gate published when it began asking, from
+    /// `LoopGateAwaited`. FIRST wins — the human was shown THIS menu and asked THIS
+    /// question, and a later ask must not retroactively change what their answer meant.
+    ///
+    /// Carried as one map rather than two because both come from the same event and are
+    /// read together by the same arm; splitting them would allow a state where one is
+    /// present and the other is not, which no writer can produce.
+    loop_gate_asks: HashMap<NodeId, LoopGateAsk>,
+    /// SP-6 s4: the option each loop gate was HONOURED with, from `LoopGateSettled`.
+    /// FIRST wins — the executor writes at most one, and the first is the one that
+    /// happened.
+    ///
+    /// The success mirror of [`Fold::failed`], and read for the same reason: a loop gate's
+    /// verdict must be settled by the drive that produced it and READ BACK afterwards,
+    /// never re-derived. `run_loop` recomputes every iteration's gate on every drive, so
+    /// without this map a decision honoured inside its SLA was re-checked against a clock
+    /// that had since passed the deadline — and the whole `Loop` died. See the event's own
+    /// doc for the two reproductions.
+    ///
+    /// It carries the option NAME rather than the resolved `bool`, so the replay resolves
+    /// it against the journaled menu exactly as the live path did (§5.7: the pure part is
+    /// recomputed, never carried). What it deliberately does NOT do is re-read
+    /// [`Fold::loop_gate_decisions`], whose LAST-wins rule lets an operator correct a
+    /// decision *before the run resumes*: this row is the line after which "before" has
+    /// passed.
+    loop_gate_settlements: HashMap<NodeId, String>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
-    /// the shared arm 0 of the two WAITING node kinds, for which a failure is TERMINAL (an
+    /// the shared arm 0 of the WAITING node kinds, for which a failure is TERMINAL (an
     /// expired gate stays expired). SP-6 s2 moved that read out of `run_await_signal` and
-    /// into the shared helper, so it now has two CALLERS —
+    /// into the shared helper, and the CALLER count has grown with the waiting kinds
+    /// while the reader count has not. Four call it today:
     /// [`run_await_signal`](Executor::run_await_signal) and
-    /// [`run_human_gate`](Executor::run_human_gate) — but still one reader.
+    /// [`run_human_gate`](Executor::run_human_gate) through `gate_precheck`;
+    /// [`run_human_agent`](Executor::run_human_agent) (s3) and `drive_agent`'s
+    /// human-backed-in-a-nested-position refusal (`agent.rs`, also s3) through
+    /// `gate_precheck_by_id`, which is the same body over a bare `NodeId`. s4's
+    /// `run_human_loop_gate` is the fifth, through `gate_failure_by_id` (design §5.2
+    /// step 0) — which is that same body again, one wrapper further in, because a loop
+    /// gate's step type is not a `NodeExec`. Five callers, still ONE reader.
     ///
-    /// It is deliberately not consulted anywhere else, and the fence is on the READER, not
-    /// on the caller count: a third node kind may read this map only by being a waiting
-    /// kind that calls `gate_precheck` first. A `NodeFailed` does not make a node terminal
-    /// in general: a `ModelCall` or `Agent` node whose provider died journals one and
+    /// **There is now a second reader, and it is a different question.**
+    /// ([`fail_loop`](Executor::fail_loop) once read THIS map for its idempotence guard.
+    /// It reads [`Fold::failure_messages`] instead — see that field for why FIRST-wins is
+    /// the wrong question to ask about "is this row already written".)
+    ///
+    /// The fence is on the READER, not on the caller count — which is why the count growing
+    /// is not a loosening: a further
+    /// node kind may read this map AS A VERDICT only by being a waiting kind that calls
+    /// `gate_precheck`
+    /// first. A `NodeFailed` does not make a node terminal in general: a `ModelCall` or
+    /// `Agent` node whose provider died journals one and
     /// RE-ATTEMPTS on the next drive, which is the documented resume contract (see
     /// `a_paused_gated_run_reattempts_and_completes_on_resume`, and `resolve_context`'s note
     /// that a failed node "carries no memo and re-runs on resume"). Making this map
@@ -245,6 +309,24 @@ struct Fold {
     /// generalization is refused: only a node kind whose failure is by definition
     /// irreversible — a deadline that has passed — may read it.
     failed: HashMap<NodeId, String>,
+    /// SP-6 s4 (whole-slice review): every DISTINCT `NodeFailed.error` already journaled
+    /// for a node, so an append can ask "is THIS row already durable?".
+    ///
+    /// [`Fold::failed`] cannot answer that question and must not be changed to: it is
+    /// FIRST-wins on purpose, so the verdict a resume reads back is the one the run
+    /// actually stopped on, and every waiting kind's `gate_precheck` depends on that. But a
+    /// node may legitimately fail more than once with DIFFERENT causes — a `ModelCall` or
+    /// `Agent` whose provider died re-attempts on resume, and `ready_nodes` works off the
+    /// per-drive `DriveState`, which never consults `failed`. Keying an idempotence guard
+    /// on the first message therefore did one of two wrong things depending on how it was
+    /// written: suppress the new cause forever (presence), or append it on every wake
+    /// (equality against the first). Both were measured while fixing the other.
+    ///
+    /// Read by [`fail_loop`](Executor::fail_loop) alone, and it makes NO terminality claim:
+    /// the `Loop` fails on this drive's own verdict either way, and this set decides only
+    /// whether a row is written. That is why it is not a loosening of [`Fold::failed`]'s
+    /// fence, which is about which kinds may treat a recorded failure as FINAL.
+    failure_messages: HashMap<NodeId, std::collections::HashSet<String>>,
     /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
     /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
     /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
@@ -291,6 +373,30 @@ struct GateDecision {
     /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::GateDecided`.
     actor: String,
     note: Option<String>,
+}
+
+/// SP-6 s4: a folded `LoopGateDecided`.
+#[derive(Debug, Clone, PartialEq)]
+struct LoopGateDecision {
+    option: String,
+    /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::LoopGateDecided`.
+    ///
+    /// A required `String`, the SAME shape as [`GateDecision::actor`] and
+    /// [`AgentAnswer::actor`], because a loop gate's decision is an approval on exactly
+    /// their terms — answering `continue` authorizes another iteration of spend — and an
+    /// approval always records who claimed to give it. The fold cannot widen or narrow
+    /// this: the event's own field is required, so there is no "nobody said who" state
+    /// left for the side-map to represent. Whatever string was appended is what an
+    /// operator sees, `""` included; see the event's doc for why an empty one is a writer
+    /// bug rather than an anonymous decision.
+    actor: String,
+}
+
+/// SP-6 s4: a folded `LoopGateAwaited` — what the human was shown.
+#[derive(Debug, Clone, PartialEq)]
+struct LoopGateAsk {
+    prompt: String,
+    menu: Vec<orchestrator_core::LoopGateOption>,
 }
 
 impl Fold {
@@ -346,27 +452,39 @@ impl Fold {
     ///
     /// Two layers, and they are not the same question:
     /// - `None` — this node has NEVER begun waiting (no `SignalAwaited`/`GateAwaited`/
-    ///   `AgentAwaited` — the three writers of [`Fold::deadlines`], all of them).
-    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate, or
-    ///   since s3 the indefinite human agent).
+    ///   `AgentAwaited`/`LoopGateAwaited` — the four writers of [`Fold::deadlines`], all
+    ///   of them).
+    /// - `Some(None)` — it began waiting with **no deadline** (the indefinite gate, since
+    ///   s3 the indefinite human agent, and since s4 the indefinite human loop gate).
     /// - `Some(Some(t))` — it began waiting with the absolute deadline `t`.
     ///
     /// Read through [`wait_or_expire`](Executor::wait_or_expire) — SP-6 s2's shared arm,
-    /// called on EVERY execution by BOTH `run_await_signal` and `run_human_gate`. (s3's
-    /// `AgentAwaited` is already a WRITER as of this task; its reader, `run_human_agent`,
-    /// lands in the next one — the fold deliberately goes in first so the durable record
-    /// exists before anything reads it.) It is the durable half of the never-recompute
-    /// rule; the caller must not fall back to `now + timeout` when this returns `Some`, in
-    /// EITHER of its two inner shapes.
+    /// called on EVERY execution by `run_await_signal`, `run_human_gate` and (through
+    /// `wait_or_expire_by_id`) `run_human_agent` and s4's `run_human_loop_gate`. It is the
+    /// durable half of the never-recompute rule; the caller must not fall back to
+    /// `now + timeout` when this returns `Some`, in EITHER of its two inner shapes.
     fn deadline_for(&self, node: &NodeId) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
         self.deadlines.get(node).copied()
     }
 
     /// SP-6 s1: the failure this node already journaled, if any — see [`Fold::failed`] for
-    /// why only [`gate_precheck`](Executor::gate_precheck), on behalf of the two waiting
-    /// node kinds, may act on it.
+    /// why only [`gate_precheck`](Executor::gate_precheck) and its `_by_id` forms, on
+    /// behalf of the four waiting node kinds, may ACT on it.
+    ///
+    /// [`fail_loop`](Executor::fail_loop) reads it too, since SP-6 s4, and does not act on
+    /// it: it asks only whether the `Loop`'s own `NodeFailed` is already durable, so that
+    /// the append is idempotent. The fence on `Fold::failed` is about TERMINALITY, and that
+    /// read makes no terminality claim — see `fail_loop`'s own doc.
     fn failure_for(&self, node: &NodeId) -> Option<&str> {
         self.failed.get(node).map(String::as_str)
+    }
+
+    /// Has this exact `NodeFailed` row already been journaled for `node`? See
+    /// [`Fold::failure_messages`] — the idempotence question, never the terminality one.
+    fn has_failure_message(&self, node: &NodeId, message: &str) -> bool {
+        self.failure_messages
+            .get(node)
+            .is_some_and(|seen| seen.contains(message))
     }
 
     /// SP-6 s2: the decision folded for this `HumanGate`, if a human has answered.
@@ -409,10 +527,12 @@ impl Fold {
     /// SP-6 s3: the question THIS node published when it began asking.
     ///
     /// The node-keyed counterpart to [`Fold::deadline_for`], and the distinction is the
-    /// whole point: `deadline_for` answers "has SOME waiting kind begun here?" — all three
-    /// of `SignalAwaited`/`GateAwaited`/`AgentAwaited` write that map — whereas this
-    /// answers "did the HUMAN-BACKED AGENT kind begin here?", because only `AgentAwaited`
-    /// carries a prompt.
+    /// whole point: `deadline_for` answers "has SOME waiting kind begun here?" — all four
+    /// of `SignalAwaited`/`GateAwaited`/`AgentAwaited`/`LoopGateAwaited` write that map —
+    /// whereas this answers "did the HUMAN-BACKED AGENT kind begin here?", because only
+    /// `AgentAwaited` carries a prompt. (`LoopGateAwaited` carries one too, but into its
+    /// own [`Fold::loop_gate_asks`]: a loop gate is not answerable by `AgentAnswered`, so
+    /// the two questions must not share a slot.)
     ///
     /// `run_human_agent` reads it on the already-waiting path for exactly that reason. The
     /// whole-slice review found the accessor unused in non-test builds and carrying an
@@ -426,20 +546,102 @@ impl Fold {
 
     /// SP-6 s1: did the `AwaitSignal` kind itself begin waiting at this node?
     ///
-    /// The third member of the [`Fold::menu_for`]/[`Fold::prompt_for`] family, and it exists
-    /// for the same reason both of those do: [`Fold::deadline_for`] answers "has SOME
-    /// waiting kind begun here?" — all three of `SignalAwaited`/`GateAwaited`/`AgentAwaited`
-    /// write that map — and a node kind that acts on that shared answer alone acts on
-    /// another kind's record.
+    /// The third member of the [`Fold::menu_for`]/[`Fold::prompt_for`] family — s4's
+    /// [`Fold::loop_gate_menu_for`] is the fourth — and it exists for the same reason
+    /// all of them do: [`Fold::deadline_for`] answers "has SOME waiting kind begun here?"
+    /// — all four of `SignalAwaited`/`GateAwaited`/`AgentAwaited`/`LoopGateAwaited` write
+    /// that map — and a node kind that acts on that shared answer alone acts on another
+    /// kind's record.
     ///
-    /// `run_await_signal` reads it on the already-waiting path, exactly where its two
-    /// siblings read theirs. It was the LAST of the three to exist, and the gap was a real
+    /// `run_await_signal` reads it on the already-waiting path, exactly where its siblings
+    /// read theirs. It was the LAST of the first three to exist, and the gap was a real
     /// defect: a node bearing another kind's awaited record re-paused with
     /// `resume_after: None` on every drive — the never-auto-woken class — while `torii run
     /// signal` refused it (s3 added that refusal) and `torii run agent answer` accepted an
     /// answer nothing would ever read.
     fn has_signal_ask(&self, node: &NodeId) -> bool {
         self.signal_asks.contains(node)
+    }
+
+    /// SP-6 s4: the menu a loop gate published, or `None` if it never began asking.
+    ///
+    /// **It answers BOTH of this family's questions at once, which is why it is the one
+    /// the arm reads.** `None` means "the LOOP GATE kind never began asking here" — the
+    /// [`Fold::menu_for`]/[`Fold::prompt_for`]/[`Fold::has_signal_ask`] question, narrower
+    /// than [`Fold::deadline_for`], which all FOUR waiting kinds write — and `Some` is the
+    /// menu the decision must then be validated against. `run_human_loop_gate` needs the
+    /// second thing anyway, so a separate "did this kind ask?" probe would be a second
+    /// read of the same record for no extra information (`LoopGateAsk` holds the prompt
+    /// and the menu together precisely so "one present, the other absent" is
+    /// unrepresentable).
+    ///
+    /// Task 4 carried an `expect(dead_code)` here because the fold landed one task ahead
+    /// of its only non-test consumer. Task 6 shipped that consumer — `run_human_loop_gate`
+    /// (`executor/human.rs`) reads this on the already-asking path — so the attribute is
+    /// gone, exactly as its own doc said it would be: an `expect` that is no longer needed
+    /// is itself a `-D warnings` failure, which is what made it delete itself rather than
+    /// silently outlive its reason the way a stale `allow` would.
+    fn loop_gate_menu_for(&self, node: &NodeId) -> Option<&[orchestrator_core::LoopGateOption]> {
+        self.loop_gate_asks.get(node).map(|a| a.menu.as_slice())
+    }
+
+    /// SP-6 s4: the question a loop gate published.
+    ///
+    /// `#[cfg(test)]`, and — unlike its three siblings — it has no production consumer at
+    /// all. Task 4 predicted one and was wrong about which accessor the arm would use:
+    /// `run_human_loop_gate` reads [`Fold::loop_gate_menu_for`], which answers the same
+    /// "did the LOOP GATE kind begin here?" question AND hands back the thing the arm
+    /// actually needs, so a prompt read alongside it would be a second read of the same
+    /// `LoopGateAsk` for nothing. `torii` does not want it either: every operator surface
+    /// folds the raw journal itself (`cmd::gate`'s own `GateAwaited` scrape) rather than
+    /// borrowing the executor's `Fold`.
+    ///
+    /// So it is gated rather than carrying a permanent `expect(dead_code)`, on the
+    /// precedent Task 5 set for `HumanQuestion::text`: an `expect` whose stated occasion
+    /// never arrives is the stale `allow` in disguise, while `#[cfg(test)]` says plainly
+    /// what it is. What it earns its place for is real — `LoopGateAsk.prompt` is folded
+    /// FIRST-wins, and
+    /// `the_loop_gate_fold_is_first_wins_for_the_menu_and_last_wins_for_the_decision`
+    /// asserts that a second ask does not overwrite the question a person was shown. Drop
+    /// the attribute, do not re-add an `expect`, if a production reader ever appears.
+    #[cfg(test)]
+    fn loop_gate_prompt_for(&self, node: &NodeId) -> Option<&str> {
+        self.loop_gate_asks.get(node).map(|a| a.prompt.as_str())
+    }
+
+    /// SP-6 s4: the decision recorded for a loop gate, if any.
+    ///
+    /// Read only AFTER the ask has been journaled and only AFTER `gate_precheck`/
+    /// `wait_or_expire` have had their say — s4 mirrors s2's ordering rather than s3's
+    /// (design §5.2), so an EXPIRED gate fails even if a decision landed late, and an
+    /// answer counts only while the node was still asking.
+    ///
+    /// Task 6's `run_human_loop_gate` is that reader, so Task 4's `expect(dead_code)` is
+    /// gone — see [`Fold::loop_gate_menu_for`].
+    ///
+    /// It is read on the LIVE path only. Once a drive has honoured the answer the replay
+    /// reads [`Fold::loop_gate_settled_with`] instead, which is what bounds this map's
+    /// LAST-wins rule: a correction wins up to the drive that acts on it, and not after.
+    fn loop_gate_decision_for(&self, node: &NodeId) -> Option<&LoopGateDecision> {
+        self.loop_gate_decisions.get(node)
+    }
+
+    /// SP-6 s4: the option a loop gate was HONOURED with, or `None` if no drive has
+    /// honoured it yet.
+    ///
+    /// Read FIRST by `run_human_loop_gate` — ahead of the clock, and for the same reason
+    /// [`gate_precheck`](Executor::gate_precheck) is read ahead of the answer: a verdict
+    /// that has already been reached is READ BACK, never re-derived. `Some` means a drive
+    /// resolved this gate while it was still live, so its recorded deadline has no further
+    /// say; `None` means the gate is still live, and the deadline decides.
+    ///
+    /// That split is what lets AC8 and §5.7 both hold. Reading the DECISION first instead
+    /// would satisfy §5.7 and break AC8 (a "continue" arriving after the SLA would
+    /// authorize another iteration of spend); reading the CLOCK first alone satisfies AC8
+    /// and breaks §5.7 (a settled gate dies of its own stale deadline). Only "settled, then
+    /// clock, then decision" satisfies both.
+    fn loop_gate_settled_with(&self, node: &NodeId) -> Option<&str> {
+        self.loop_gate_settlements.get(node).map(String::as_str)
     }
 }
 
@@ -1008,6 +1210,7 @@ impl Executor {
                     run,
                     graph,
                     &node.id,
+                    fold,
                     &mut state.terminal,
                     &mut state.outcome,
                 )
@@ -1034,13 +1237,26 @@ impl Executor {
     /// terminal set and to `RunOutcome.skipped` — and recurse into ITS
     /// hard-dependents (§3.3). `Soft` edges never cascade, so a soft-dependent
     /// of a failed/skipped node is left runnable. Deterministic in graph
-    /// declaration order; each node is skipped at most once (guarded by the
-    /// terminal set).
+    /// declaration order; each node is skipped at most once per drive (guarded by
+    /// the terminal set) and its `NodeSkipped` is appended at most once EVER
+    /// (guarded by [`Fold::skipped`]).
+    ///
+    /// **The fold guard is the across-drives half, and it was missing.** The terminal
+    /// set is per-drive, so a run whose node failed TERMINALLY — a fired human deadline,
+    /// which `gate_precheck` reads back forever — re-failed and re-cascaded on every
+    /// wake, appending a fresh `NodeSkipped` per hard dependent each time. Such a run
+    /// journals no `RunCompleted`, so it stays resumable and the growth is unbounded:
+    /// measured at 1 / 2 / 3 rows over three drives by the SP-6 s4 review, which found
+    /// the `Loop`'s own `NodeFailed` had just been bounded one edge in while this was
+    /// left growing. `RunOutcome.skipped` is deliberately NOT guarded — the in-process
+    /// outcome still reports what this drive skipped, which is what a caller asked for;
+    /// only the durable append is idempotent.
     async fn cascade_skip_from(
         &self,
         run: RunId,
         graph: &Graph,
         origin: &NodeId,
+        fold: &Fold,
         terminal: &mut std::collections::HashSet<NodeId>,
         outcome: &mut RunOutcome,
     ) -> Result<(), OrchestratorError> {
@@ -1055,13 +1271,15 @@ impl Executor {
                     .iter()
                     .any(|dep| dep.kind == orchestrator_core::EdgeKind::Hard && dep.on == current);
                 if hard_on_current {
-                    self.append(
-                        run,
-                        JournalEvent::NodeSkipped {
-                            node: node.id.clone(),
-                        },
-                    )
-                    .await?;
+                    if !fold.skipped.contains(&node.id) {
+                        self.append(
+                            run,
+                            JournalEvent::NodeSkipped {
+                                node: node.id.clone(),
+                            },
+                        )
+                        .await?;
+                    }
                     terminal.insert(node.id.clone());
                     outcome.skipped.push(node.id.clone());
                     frontier.push(node.id.clone());

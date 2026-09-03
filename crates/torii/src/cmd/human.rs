@@ -1,10 +1,12 @@
 //! `torii run agent answer` — the operator surface for a human-backed `Agent` (SP-6 s3).
 //!
-//! The third and last of the waiting verbs. [`crate::cmd::run::signal`] delivers arbitrary
-//! JSON to an `AwaitSignal`; [`crate::cmd::gate::decide`] delivers a named option to a
-//! `HumanGate`; this delivers FREE TEXT, with an actor, to a role the registry says is
-//! answered by a person. All three refuse each other's node kinds — the matrix is proven
-//! in one place, this module's `mod tests`.
+//! The third and last of the waiting verbs — three verbs over FOUR kinds since SP-6 s4.
+//! [`crate::cmd::run::signal`] delivers arbitrary JSON to an `AwaitSignal`;
+//! [`crate::cmd::gate::decide`] delivers a named option to EITHER gate kind (an authored
+//! `HumanGate` or a `Loop`'s human gate, told apart by `gate_menu`'s `PublishedMenu`); this
+//! delivers FREE TEXT, with an actor, to a role the registry says is answered by a person.
+//! Each verb refuses every kind it does not serve, naming the one that would work — the
+//! matrix is proven in one place, this module's `mod tests`.
 //!
 //! **A new file rather than more of `gate.rs`**, matching how the executor put
 //! `run_human_agent` in its own `human.rs`: `gate.rs` is the menu path and stays that.
@@ -41,6 +43,13 @@ use orchestrator_core::{
 #[derive(clap::Subcommand)]
 pub enum AgentAction {
     /// Answer a human-backed `Agent` node on behalf of a person
+    ///
+    /// FREE TEXT, and only for an `agent:` row. The other three waiting kinds are refused
+    /// here, each naming the verb that works: an `AwaitSignal` takes `run signal`, and BOTH
+    /// gate kinds — an authored `HumanGate` and a `Loop`'s human gate, which `list-paused`
+    /// labels `loop gate:` — take `run gate decide --option`. A loop gate publishes a
+    /// QUESTION as well as a menu, so its row looks the most like this command's; it is
+    /// still decided by option name, and free text carries none.
     #[command(group(
         clap::ArgGroup::new("answer_src").required(true).multiple(false)
     ))]
@@ -176,8 +185,9 @@ pub fn answer_args(action: AgentAction) -> Result<AnswerArgs, CliError> {
 /// `{loop}/2/__gate__`) has no `NodeKind` in the graph in the first place. Folding the
 /// journal needs none of that and handles path-qualified ids for free.
 ///
-/// `pub(crate)` because both siblings read it for their half of the three-way cross-refusal:
-/// a `Some` here means a raw payload or a named option must be refused.
+/// `pub(crate)` because both siblings read it for their half of the cross-refusal matrix
+/// (three-way at s3, FOUR-way once s4's loop gate joined the menu-bearing side): a `Some`
+/// here means a raw payload or a named option must be refused.
 pub(crate) fn agent_question(events: &[(Seq, JournalEvent)], node: &NodeId) -> Option<String> {
     events.iter().find_map(|(_, e)| match e {
         JournalEvent::AgentAwaited {
@@ -423,33 +433,72 @@ pub async fn answer(
         .await
         .map_err(OrchestratorError::Journal)?;
 
+    // **The MENU is read FIRST — before the question — and that ordering is the rule, not
+    // a detail of this function.** `cmd::run::signal` matches `gate_menu` before
+    // `agent_question`, `cmd::run::awaiting_nodes` resolves a node's kind through
+    // `gate_menu` and only then falls back to a question, and `render::awaiting_section`'s
+    // cell match tests `options` before `question`. A node carrying BOTH is therefore a
+    // gate to every one of those surfaces, and this command has to agree with them: a
+    // listing, a refusal and a delivery that disagree about a node's kind send an operator
+    // to a command that rejects them — or, worse, to one that accepts.
+    //
+    // It read the QUESTION first until this fix, and against a journal carrying both it
+    // answered the node: exit 0, an `AgentAnswered` durable, reported as delivered.
+    //
+    // **Where such a journal comes from, stated no more strongly than it is true.** Not
+    // from the executor: `run_human_loop_gate`'s `Waiting` arm refuses to publish a second
+    // ask on top of another kind's record — it fails the gate LOUDLY rather than journaling
+    // a `LoopGateAwaited` beside an `AgentAwaited` — and a human-backed role cannot produce
+    // an `AgentAwaited` inside a `Loop` body at all, because `drive_agent`'s `!top_level`
+    // arm refuses it before the seam (that same doc's "What is NOT a vector" paragraph).
+    // The live vector is its case (b): **a journal `torii` did not write**, which it calls
+    // "a first-class case for a durable log an embedder may append to directly". torii is
+    // not the layer that gets to assume otherwise — every other surface here already reads
+    // such a journal menu-first, and this one disagreeing is what makes the disagreement
+    // reachable.
+    //
+    // The cost of being wrong is worst at a `{loop}/{i}/__gate__` path, which is where the
+    // reachable case lands: the only reader there is `run_human_loop_gate`, which reads
+    // `LoopGateDecided` and nothing else, so an `AgentAnswered` is durable, never read, and
+    // reported as delivered — the exact failure the cross-refusals exist to close. Guarded
+    // by `an_answer_aimed_at_a_node_that_also_published_a_menu_is_refused_as_the_gate`.
+    //
+    // SP-6 s4 makes this matrix FOUR-way. Both menu-bearing kinds refuse free text for the
+    // same reason and point at the same verb, so they share an arm and differ only in what
+    // they NAME the node — a refusal that called a loop gate "a HumanGate" would be a
+    // confident lie about a node kind on the one surface an operator uses to work out what
+    // they are looking at.
+    if let Some(menu) = gate_menu(&events, &node) {
+        let kind = match menu {
+            crate::cmd::gate::PublishedMenu::Human(_) => "a HumanGate",
+            crate::cmd::gate::PublishedMenu::Loop(_) => "a Loop's human gate",
+        };
+        return Ok(Outcome::precondition(format!(
+            "not delivered: {shown} is {kind}, not a human-backed Agent — it takes one of \
+             the options it published, not free text. Use: torii run gate decide {} --node \
+             {shown} --option <name>",
+            run.0
+        )));
+    }
+
     // The question comes from the JOURNAL. Absent ⇒ this node has not asked yet, or is one
     // of the other two waiting kinds — and each of those gets its own refusal naming the
     // verb that WOULD work, because a refusal that only says "wrong kind" sends an operator
     // to check a node id that was right when the COMMAND was wrong.
     if agent_question(&events, &node).is_none() {
-        return Ok(Outcome::precondition(
-            if gate_menu(&events, &node).is_some() {
-                format!(
-                    "not delivered: {shown} is a HumanGate, not a human-backed Agent — it takes \
-                 one of the options it published, not free text. Use: torii run gate decide \
-                 {} --node {shown} --option <name>",
-                    run.0
-                )
-            } else if awaiting_signal(&events, &node) {
-                format!(
-                    "not delivered: {shown} is an AwaitSignal, not a human-backed Agent — it \
+        return Ok(Outcome::precondition(if awaiting_signal(&events, &node) {
+            format!(
+                "not delivered: {shown} is an AwaitSignal, not a human-backed Agent — it \
                  takes arbitrary JSON, and it records no actor. Use: torii run signal {} \
                  --node {shown} --payload '<json>'",
-                    run.0
-                )
-            } else {
-                format!(
-                    "not delivered: {shown} is not awaiting a human answer. \
+                run.0
+            )
+        } else {
+            format!(
+                "not delivered: {shown} is not awaiting a human answer. \
                  `torii run list-paused` names the nodes that are."
-                )
-            },
-        ));
+            )
+        }));
     }
 
     // The NODE's own state, folded from the journal. The fold is `cmd::run`'s, not a second
@@ -465,7 +514,13 @@ pub async fn answer(
     // to report success.
     match signal_state(&events, &node) {
         SignalState::Awaiting { .. } => {}
-        other => return Ok(Outcome::precondition(not_delivered(&shown, &other))),
+        other => {
+            return Ok(Outcome::precondition(not_delivered(
+                &shown,
+                &other,
+                crate::cmd::run::CompletedResidue::LastWins,
+            )));
+        }
     }
 
     if before.status != RunStatus::Paused {
@@ -665,14 +720,15 @@ pub async fn answer(
     })
 }
 
-/// `pub(crate)` for the same reason `cmd::gate::tests` is: the three-way cross-refusal
-/// matrix is proven here, in one place, rather than split across three modules that could
-/// each drift.
+/// `pub(crate)` for the same reason `cmd::gate::tests` is: the cross-refusal matrix is
+/// proven here, in one place, rather than split across the modules that could each drift.
+/// SP-6 s4 made it four KINDS over three verbs — a `Loop`'s human gate is refused by this
+/// command and by `run signal`, and decided by the same `run gate decide` a `HumanGate` is.
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    use crate::cmd::gate::tests::gate_journal;
+    use crate::cmd::gate::tests::{gate_journal, loop_gate, loop_gate_journal};
     use crate::cmd::run::tests::{FailingForceWakeStore, awaiting_journal, now, paused_store};
     use crate::errors::{EXIT_OK, EXIT_PRECONDITION};
     use orchestrator_core::{
@@ -1330,12 +1386,14 @@ pub(crate) mod tests {
         );
     }
 
-    // ---- AC7: the three-way cross-refusal, proven in one place ------------------------
+    // ---- AC7/AC17: the cross-refusal matrix, proven in one place ----------------------
     //
-    // `run signal` answers an `AwaitSignal`, `run gate decide` a `HumanGate`, and this
-    // command a human-backed `Agent`. Each must refuse the other two AND name the verb that
-    // would work — a refusal that only says "wrong kind" sends an operator to check a node
-    // id that was right when the COMMAND was wrong.
+    // `run signal` answers an `AwaitSignal`, `run gate decide` BOTH gate kinds (a
+    // `HumanGate` and — since SP-6 s4 — a `Loop`'s human gate), and this command a
+    // human-backed `Agent`. Four kinds, three verbs: each command must refuse every kind it
+    // does not answer AND name the verb that would work, because a refusal that only says
+    // "wrong kind" sends an operator to check a node id that was right when the COMMAND was
+    // wrong.
 
     /// AC7, arm one: `run agent answer` aimed at an `AwaitSignal`.
     #[tokio::test]
@@ -1385,6 +1443,106 @@ pub(crate) mod tests {
             out.text
         );
         assert!(journaled_answers(&j, run, &reviewer()).await.is_empty());
+    }
+
+    /// AC17, the fourth arm of what SP-6 s4 makes a FOUR-way matrix: `run agent answer`
+    /// aimed at a human-decided LOOP gate.
+    ///
+    /// It refuses for the gate's reason, not the agent's: a loop gate takes one of the
+    /// options it published, and free text carries no option name at all. Its own row is
+    /// `LoopGateDecided`, which `run_human_loop_gate` is the only reader of — so an
+    /// `AgentAnswered` here would be journaled, never read, and reported as delivered.
+    #[tokio::test]
+    async fn an_answer_aimed_at_a_loop_gate_points_at_run_gate_decide() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+
+        let out = answer(&s, &j, run, loop_gate(), "ship it", "alice", now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(out.code, EXIT_PRECONDITION, "{}", out.text);
+        assert!(
+            out.text.contains("run gate decide"),
+            "must name the command that would work: {}",
+            out.text
+        );
+        // The KIND, not only the verb — and it is a separate assertion because the verb
+        // alone cannot tell the two menu-bearing arms apart. Both emit `run gate decide`,
+        // so `contains("run gate decide")` is satisfied by the `HumanGate` wording too:
+        // with this arm's string replaced by "a HumanGate" the whole torii suite stayed
+        // green (measured), leaving the per-kind split inert on the one surface it exists
+        // for. Naming the kind is the stated reason `gate_menu` returns a `PublishedMenu`
+        // here at all: an operator staring at an `lp/0/__gate__` row told it is a
+        // `HumanGate` goes looking for an authored node in a graph that contains none.
+        assert!(
+            out.text.contains("Loop's human gate"),
+            "must name the node's actual KIND, not the sibling menu-bearing one: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("is a HumanGate"),
+            "…and must not call a synthesized loop-gate path an authored `HumanGate`: {}",
+            out.text
+        );
+        assert!(journaled_answers(&j, run, &loop_gate()).await.is_empty());
+    }
+
+    /// **One node, two asks — and this command did not screen for it.**
+    ///
+    /// `answer` gated its whole refusal block on `agent_question(..).is_none()`, i.e. it
+    /// read the QUESTION first, while `cmd::run::signal`, `awaiting_section`'s cell match
+    /// and `cmd::run::awaiting_nodes` all read the MENU first. Three comments this slice
+    /// added claimed the menu-first rule was "evaluated FIRST everywhere … in every
+    /// cross-refusal"; measured against a journal carrying a menu and a question at one id,
+    /// this command returned exit 0 and journaled an `AgentAnswered`.
+    ///
+    /// The reachable journal is `run_human_loop_gate`'s `Waiting`-arm case (b) — one an
+    /// embedder appended to directly, which that doc calls "a first-class case for a
+    /// durable log". The executor does not write this shape itself and the comment on the
+    /// fix says so rather than overclaiming. What makes it worth a refusal anyway is where
+    /// it lands: at a `{loop}/{i}/__gate__` path the only reader is `run_human_loop_gate`,
+    /// which reads `LoopGateDecided` and nothing else, so the answer is durable, never
+    /// read, and reported as delivered — the exact failure the cross-refusals exist to
+    /// close — and every other torii surface already reads such a journal menu-first.
+    #[tokio::test]
+    async fn an_answer_aimed_at_a_node_that_also_published_a_menu_is_refused_as_the_gate() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, None).await;
+        let j = loop_gate_journal(run, &loop_gate(), None, &["revise", "ship"]).await;
+        j.append(
+            run,
+            JournalEvent::AgentAwaited {
+                node: loop_gate(),
+                deadline: None,
+                prompt: THE_QUESTION.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = answer(&s, &j, run, loop_gate(), "ship it", "alice", now())
+            .await
+            .expect("no hard error");
+
+        assert_eq!(
+            out.code, EXIT_PRECONDITION,
+            "a node that published a menu is a gate to every other surface, and this one \
+             must agree with them: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Loop's human gate") && out.text.contains("run gate decide"),
+            "…refused as the kind `gate_menu` resolves it to, pointing at the verb that \
+             works: {}",
+            out.text
+        );
+        assert!(
+            journaled_answers(&j, run, &loop_gate()).await.is_empty(),
+            "an answer at a path whose only reader is `run_human_loop_gate` would be \
+             durable, never read, and reported as delivered"
+        );
     }
 
     /// AC7, arm three: `run signal` aimed at a human-backed `Agent`.

@@ -11,6 +11,7 @@ use orchestrator_core::{
     OrchestratorError, RunId, effect_id,
 };
 
+use super::human::LoopGateStep;
 use super::support::{build_request, input_hash};
 use super::{AgentStep, Executor, Fold, NodeExec};
 
@@ -390,27 +391,78 @@ impl Executor {
         }
     }
 
-    /// Fail a `Loop` node: journal its `NodeFailed` and return the matching
-    /// [`NodeExec::Failed`]`{ output: None }`. Colocating the append-then-return
-    /// pairing keeps the invariant in ONE place — a `Failed` return from `run_loop`
-    /// must always be preceded by the `NodeFailed` append (skipping it would corrupt
-    /// replay). Both `run_loop` failure paths (a body-iteration failure and a
-    /// gate-agent failure) go through here. (A `Map` aggregation failure carries its
-    /// manifest out via `output: Some(..)`, so it does NOT use this helper.)
+    /// Fail a `Loop` node: journal its `NodeFailed` — unless this exact failure is already
+    /// recorded — and return the matching [`NodeExec::Failed`]`{ output: None }`.
+    ///
+    /// Colocating the append-then-return pairing keeps the invariant in ONE place, and
+    /// the invariant is: **when `run_loop` returns `Failed`, this `Loop` has a
+    /// `NodeFailed` in the journal, written exactly once.** All THREE of `run_loop`'s
+    /// failure paths go through here — a body-iteration failure, a gate-AGENT failure and
+    /// (SP-6 s4) a human-gate failure. (A `Map` aggregation failure carries its manifest
+    /// out via `output: Some(..)`, so it does NOT use this helper.)
+    ///
+    /// **The guard is what makes "exactly once" true, and it is not cosmetic.** A human
+    /// loop gate's verdict is TERMINAL — `run_human_loop_gate`'s step 0 reads it back
+    /// forever — while the run it kills journals no `RunCompleted` and so stays resumable,
+    /// so every later wake re-drives the iteration and re-reaches this helper. Appending
+    /// unconditionally grew the journal by a row per wake for a run that can never
+    /// progress: exactly the defect `gate_precheck` exists to prevent, one level further
+    /// out (measured: three drives, three `NodeFailed(lp)` rows).
+    ///
+    /// It is guarded HERE, on the `Loop`'s own recorded failure, rather than by a flag
+    /// carried out of the gate. The first shipped shape did the latter and the two claims
+    /// came apart: the flag meant "this drive wrote the GATE's row" while the caller
+    /// needed "the LOOP's row is missing", so a transient journal error between the two
+    /// appends left the durable record showing the gate dead and the Loop untouched
+    /// FOREVER — in-process `RunOutcome.failed` named the `Loop` while `torii run status`,
+    /// anything folding `NodeFailed`, and the `on_node_failed` hook never heard of it.
+    /// Reading the fold is self-healing instead: the next drive writes the missing row.
+    ///
+    /// **It asks whether THIS MESSAGE is already on the journal, not whether the node has
+    /// SOME failure row, and the difference is an SP-6 s4 review finding.** The guard
+    /// covers all three paths, but only the human-gate one is TERMINAL; the other two are
+    /// explicitly not (a `ModelCall` or `Agent` whose provider died re-attempts on resume).
+    /// `DriveState` is per-drive and `ready_nodes` consults no failure map, so a `Loop`
+    /// that failed once is re-driven, can succeed, and can later fail for a wholly
+    /// DIFFERENT reason. Presence-keyed, the guard suppressed that new row, leaving the
+    /// durable record attributing the run's death to a transient gateway error it had
+    /// recovered from — the real cause surviving only in the gate's own row and in the
+    /// in-process `RunOutcome`. "Self-healing: the next drive writes the missing row"
+    /// covers a MISSING row, not a CHANGED one.
+    ///
+    /// **And it reads [`Fold::failure_messages`], not [`Fold::failed`], which is the second
+    /// half of the same finding — found by breaking it.** The obvious repair was equality
+    /// against `failure_for`, and that trades the defect for its mirror: `failed` is
+    /// FIRST-wins by design, so once a stale cause sits there the new message never matches
+    /// and the append fires on EVERY wake, unbounded. Measured, not reasoned about. The set
+    /// answers the only question an idempotent append may ask.
+    ///
+    /// Guarded from both sides by
+    /// `a_loop_that_dies_of_a_new_cause_does_not_keep_reporting_the_old_one` (the new cause
+    /// lands, AND two further wakes append nothing) beside
+    /// `a_dead_loop_gate_stops_appending_node_failed_rows_on_every_wake`.
+    ///
+    /// Neither read makes a terminality claim: the `Loop` fails on this drive's own verdict
+    /// whatever either map says, and they decide only whether a row is written. That is why
+    /// this is not a loosening of [`Fold::failed`]'s fence, which is about which kinds may
+    /// treat a recorded failure as FINAL.
     pub(super) async fn fail_loop(
         &self,
         run: RunId,
         node: &NodeId,
         message: String,
+        fold: &Fold,
     ) -> Result<NodeExec, OrchestratorError> {
-        self.append(
-            run,
-            JournalEvent::NodeFailed {
-                node: node.clone(),
-                error: message.clone(),
-            },
-        )
-        .await?;
+        if !fold.has_failure_message(node, &message) {
+            self.append(
+                run,
+                JournalEvent::NodeFailed {
+                    node: node.clone(),
+                    error: message.clone(),
+                },
+            )
+            .await?;
+        }
         Ok(NodeExec::Failed {
             message,
             output: None,
@@ -425,15 +477,32 @@ impl Executor {
     /// per iteration and threads its whole output (the sink map) as the next planner
     /// input. A graph-body
     /// Failed/Paused fails/pauses the Loop exactly like a leaf body. The `gate` is
-    /// either `Pure` (an SP-1 pure predicate over the iteration output, no journaling)
-    /// or `Agent` — a gate-agent driven over the output at `"{loop}/{i}/__gate__"`,
+    /// `Pure` (an SP-1 pure predicate over the iteration output, no journaling),
+    /// `Agent` — a gate-agent driven over the output at `"{loop}/{i}/__gate__"`,
     /// whose journaled answer feeds the pure `stop_when` (a gate-agent Failed fails the
-    /// Loop, a gate-agent Paused pauses it). Cap-without-Stop
+    /// Loop, a gate-agent Paused pauses it) — or `Human` — a PERSON picks from an
+    /// enumerated menu at that same reserved path, once per iteration, and the chosen
+    /// option's `stops` is the decision (SP-6 s4, [`Executor::run_human_loop_gate`]: a
+    /// gate failure fails the Loop and a pending decision pauses it, exactly as the
+    /// gate-agent's do; no chain is resolved, so the gate itself spends nothing).
+    /// Cap-without-Stop
     /// completes best-effort (`converged: false`), never a bare fail; a body failure
     /// fails the Loop; a body pause pauses the Loop. Resume replays completed
     /// iterations (memo-hit, no re-spend) and recomputes the gate — a pure gate from
-    /// the memoized output, a gate-agent from its memoized turns — so it stops at the
-    /// same iteration. The Loop's own `NodeStarted`/`NodeCompleted` are
+    /// the memoized output, a gate-agent from its memoized turns, a human gate from its
+    /// journaled **`LoopGateSettled`** — so it stops at the same iteration.
+    ///
+    /// **From the SETTLEMENT, never from `LoopGateDecided`**, and this clause named the
+    /// wrong event until the s4 whole-slice review. A decision folds LAST-wins so an
+    /// operator can correct it *before the run resumes*; a settlement is the line after
+    /// which "before" has passed, because the loop has already spent an iteration on the
+    /// strength of the answer. Re-deriving the gate from the decision is not a rewording —
+    /// it has to pass the CLOCK on the way, which is precisely how an already-honoured gate
+    /// came to re-expire and retroactively kill converged runs (the Critical §4 records).
+    /// See `run_human_loop_gate`'s step 1.
+    ///
+    /// The Loop's own
+    /// `NodeStarted`/`NodeCompleted` are
     /// fold-guarded (like `run_map`) so a replayed completed Loop does not re-journal
     /// them.
     pub(super) async fn run_loop(
@@ -537,7 +606,7 @@ impl Executor {
                 Ok(o) => o,
                 Err(message) => {
                     let msg = format!("loop {:?} failed at iteration {i}: {message}", loop_node.id);
-                    return self.fail_loop(run, &loop_node.id, msg).await;
+                    return self.fail_loop(run, &loop_node.id, msg, fold).await;
                 }
             };
             ran = i + 1;
@@ -562,10 +631,57 @@ impl Executor {
                                 "loop {:?} gate agent failed at iteration {i}: {m}",
                                 loop_node.id
                             );
-                            return self.fail_loop(run, &loop_node.id, msg).await;
+                            return self.fail_loop(run, &loop_node.id, msg, fold).await;
                         }
                         // A gate-agent pause (in-doubt Mutation / quota) pauses the Loop.
                         AgentStep::Paused(reason) => return Ok(NodeExec::Paused { reason }),
+                    }
+                }
+                // SP-6 s4: a PERSON decides. Same reserved `"{loop}/{i}/__gate__"` path as
+                // the gate-agent above, but no agent is driven at all —
+                // `run_human_loop_gate` resolves no chain and never reaches the gateway, so
+                // zero token spend is STRUCTURAL. That matters more here than anywhere else
+                // in SP-6: the decision being made IS whether to spend more, so a gate that
+                // itself cost tokens would be self-undermining.
+                //
+                // The iteration `output` is passed as the thing being JUDGED (it becomes
+                // the question's `## Context`); the graph's `menu` is passed for the first
+                // ask only — every later drive resolves the decision against the JOURNALED
+                // copy. See `run_human_loop_gate`.
+                GateSpec::Human { agent, menu } => {
+                    let gate_path = NodeId(format!("{path}/__gate__"));
+                    match self
+                        .run_human_loop_gate(run, &gate_path, agent, menu, &output, fold)
+                        .await?
+                    {
+                        LoopGateStep::Decided { stop } => stop,
+                        // A gate failure fails the Loop, exactly as the gate-AGENT arm
+                        // above does — no new outcome shape (AC10). An expired gate lands
+                        // here, and so does a decision naming an option the published menu
+                        // does not contain.
+                        //
+                        // A human gate's failure is TERMINAL, unlike the gate-agent's
+                        // above: `run_human_loop_gate`'s step 0 reads it back forever,
+                        // while the run it kills journals no `RunCompleted` and so stays
+                        // resumable, so every later wake re-drives this iteration and
+                        // re-reaches this arm. `fail_loop` is idempotent for exactly that
+                        // reason — see its doc; this arm needs no special case, and the
+                        // flag it used to carry to get one was a second claim that could
+                        // (and did) come apart from the first.
+                        LoopGateStep::Failed(message) => {
+                            let msg = format!(
+                                "loop {:?} human gate failed at iteration {i}: {message}",
+                                loop_node.id
+                            );
+                            return self.fail_loop(run, &loop_node.id, msg, fold).await;
+                        }
+                        // Waiting on a person pauses the whole Loop, like every other body
+                        // or gate pause. The `RunPaused` is already journaled, on the
+                        // deadline the GATE recorded, so the SP-DATA-3 scheduler wakes this
+                        // run at the SLA rather than immediately.
+                        LoopGateStep::Paused(reason) => {
+                            return Ok(NodeExec::Paused { reason });
+                        }
                     }
                 }
             };
