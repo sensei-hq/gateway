@@ -67,7 +67,7 @@
 **Files:**
 - Modify: `crates/kernel/src/types/error.rs:9-16`
 
-- [ ] **Step 1: Add the variant**
+- [x] **Step 1: Add the variant**
 
 ```rust
     /// Every candidate's context window is smaller than the request — no waiting helps,
@@ -80,19 +80,19 @@
     UseLargerContextWindow,
 ```
 
-- [ ] **Step 2: Verify it compiles**
+- [x] **Step 2: Verify it compiles**
 
 Run: `cargo build -p sensei-kernel > /tmp/t1.log 2>&1; echo "exit=$?"`
 Expected: `exit=0`. If any `match` over `HumanAction` is exhaustive elsewhere, the workspace build in Step 3 will name it.
 
-- [ ] **Step 3: Find every exhaustive match**
+- [x] **Step 3: Find every exhaustive match**
 
 Run: `cargo build --workspace > /tmp/t1b.log 2>&1; echo "exit=$?"; grep -A6 'non-exhaustive\|E0004' /tmp/t1b.log | head -20`
 
 Any site that renders `HumanAction` for an operator needs an arm. Add one that says: use a model
 with a larger context window, or send less. Do **not** collapse it into the `RaiseBudget` arm.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt --all
@@ -112,7 +112,7 @@ them at the wrong lever."
 **Files:**
 - Modify: `crates/gateway/src/skip_reason.rs` — the enum (`:17`), its `Display` (`:45` area), `gate_status` (`:74` area), and the inline tests
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `skip_reason.rs`'s `mod tests`:
 
@@ -146,12 +146,12 @@ Add to `skip_reason.rs`'s `mod tests`:
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p sensei-gateway over_context_window_is_terminal > /tmp/t2.log 2>&1; echo "exit=$?"; tail -20 /tmp/t2.log`
 Expected: a COMPILE ERROR — `no variant named OverContextWindow`.
 
-- [ ] **Step 3: Add the variant**
+- [x] **Step 3: Add the variant**
 
 In the `SkipReason` enum, after `OverBudget`:
 
@@ -187,12 +187,12 @@ In `gate_status`, beside the `OverBudget` arm:
             }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p sensei-gateway skip_reason > /tmp/t2b.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t2b.log`
 Expected: `exit=0`, all pass. The pre-existing `gate_status_classifies_each_reason` must still pass **unmodified** — if it reddens, you changed an existing classification.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
@@ -213,7 +213,7 @@ window is a prompt problem, and 'too big' cannot tell them apart."
 **Files:**
 - Modify: `crates/gateway/src/engine/util.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `util.rs`'s test module:
 
@@ -270,12 +270,12 @@ In `util.rs`'s test module:
 Check `ToolDefinition`'s real field names in `crates/kernel/src/types/request.rs` and `Message`'s
 real constructor in the same file before writing — adapt to what is there rather than assuming.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p sensei-gateway the_pessimistic_estimate_counts_tools > /tmp/t3.log 2>&1; echo "exit=$?"; tail -20 /tmp/t3.log`
 Expected: COMPILE ERROR — `cannot find function estimate_input_tokens_pessimistic`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to `util.rs`, beside `estimate_input_tokens`:
 
@@ -336,12 +336,12 @@ made the pessimistic estimate *under*-count a `Tts` / `ImageGenerate` / `VideoGe
 on. Every non-chat arm mirrors `estimate_input_tokens` at `/3`; `Stt` alone stays 0 in both,
 because audio bytes are not characters.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p sensei-gateway estimate_input_tokens > /tmp/t3b.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t3b.log`
 Expected: `exit=0`. The existing `estimate_input_tokens` tests must pass **unmodified**.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
@@ -367,7 +367,7 @@ silently make every BudgetGate decision more conservative."
 - Create: `crates/gateway/src/gates/context_window.rs`
 - Modify: `crates/gateway/src/gates/mod.rs` — `pub mod context_window;` and the new `SelectionCtx` field
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In the new file's `mod tests`, modelled on `budget.rs`'s test module — read that first for the
 `CandidateView` / `SelectionCtx` fixture shape and reuse it:
@@ -410,12 +410,12 @@ exactly filling the window leaves no room for output, but that is the **clamp's*
 (SP-DATA-5 bounds `max_tokens` by the window), not this gate's. Say so in a comment so the next
 reader does not "fix" it.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test -p sensei-gateway context_window > /tmp/t4.log 2>&1; echo "exit=$?"; tail -20 /tmp/t4.log`
 Expected: COMPILE ERROR — the module does not exist.
 
-- [ ] **Step 3: Add the field to `SelectionCtx`**
+- [x] **Step 3: Add the field to `SelectionCtx`**
 
 In `gates/mod.rs`, after `input_tokens`:
 
@@ -431,7 +431,7 @@ In `gates/mod.rs`, after `input_tokens`:
 
 Add `pub mod context_window;` to the module list.
 
-- [ ] **Step 4: Write the gate**
+- [x] **Step 4: Write the gate**
 
 ```rust
 use super::{AdmissionGate, CandidateView, GateVerdict, SelectionCtx};
@@ -474,7 +474,7 @@ impl AdmissionGate for ContextWindowGate {
 }
 ```
 
-- [ ] **Step 5: Run — expect every OTHER `SelectionCtx` construction to break**
+- [x] **Step 5: Run — expect every OTHER `SelectionCtx` construction to break**
 
 Run: `cargo build --workspace --all-targets > /tmp/t4b.log 2>&1; echo "exit=$?"; grep -c 'missing field' /tmp/t4b.log`
 
@@ -484,7 +484,7 @@ through; in test fixtures `None` is correct unless the test is about this gate. 
 Run: `cargo test -p sensei-gateway context_window > /tmp/t4c.log 2>&1; echo "exit=$?"; grep -E '^test result' /tmp/t4c.log`
 Expected: `exit=0`, 2 passed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cargo fmt --all
