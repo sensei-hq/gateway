@@ -48,7 +48,13 @@ So today a run can spend without limit, and nothing records what it spent.
 **Non-goals (deferred, §8)**
 - Money/cost denomination (needs durable per-model pricing; §8 records the path).
 - Fleet-wide or per-tenant budgets.
-- Pre-flight estimation to prevent overshoot (output tokens are unknowable before the call).
+- ~~Pre-flight estimation to prevent overshoot (output tokens are unknowable before the call).~~
+  **Superseded by the follow-on slice** (`2026-09-03-sp-data-5-budget-clamp-design.md`). The
+  reasoning was sound and the conclusion was wrong: predicting the output cost is indeed impossible,
+  but the slice did not have to predict it — it BOUNDS it, by setting `max_tokens` on a budgeted
+  request to what the remaining budget affords. Enforcement moves to the provider. The overshoot is
+  now bounded by the INPUT-estimate error and biased toward refusing early; it is **not eliminated**,
+  and that clamp spec's §2 and §4 say so in those words.
 - Budget-aware model selection (that is `gateway/budget.rs`'s existing concern, unchanged).
 
 ## 4. The four decisions, and why
@@ -198,6 +204,16 @@ The gate tests already-accumulated spend **before** each call, so a budget can b
 one call — output tokens are unknowable before the call returns. `--budget-tokens` therefore means
 "stop once you have spent this much", not "never exceed this". Documented as such in the CLI help;
 calling it a hard cap would be a lie.
+
+> **Amended by the follow-on clamp slice** (`2026-09-03-sp-data-5-budget-clamp-design.md`). The
+> section above is still the shape of the gate, but "output tokens are unknowable before the call
+> returns" is no longer the operative constraint: a budgeted `Chat` request now carries
+> `max_tokens = min(remaining − est_input, the chain's smallest max_output_tokens, the caller's own)`,
+> so the provider enforces the bound. The one call's overshoot collapses to the INPUT-estimate error
+> — **bounded and biased toward refusing early, NOT eliminated**. And the gate is no longer the only
+> refusal: below a `MIN_OUTPUT_TOKENS` floor a budgeted run pauses with `spent < cap`, possibly at
+> `spent == 0`, through this same durable pause. Anyone debugging a budgeted run that paused having
+> spent nothing wants the clamp spec, not this section.
 
 #### 6.5a A budgeted run serialises its model calls — the price of the "one call" bound
 
@@ -386,7 +402,14 @@ SP-DATA-4 alone — so each of these names the mutation that must break it.
   argument *possible*; it does not make it. Until then this is an unwired optimisation, not a latent
   bug.
 - **Fleet-wide / per-tenant budgets**, and a precedence rule against the per-run cap.
-- **Pre-flight estimation** to eliminate the one-call overshoot.
+- ~~**Pre-flight estimation** to eliminate the one-call overshoot.~~ **ADDRESSED** by the follow-on
+  slice, `2026-09-03-sp-data-5-budget-clamp-design.md`. Not by estimating the output — that really
+  is unknowable — but by CLAMPING `max_tokens` to what the remaining budget affords, bounded by the
+  chain's own smallest `max_output_tokens`, with a refusal below a `MIN_OUTPUT_TOKENS` floor. The
+  overshoot is now **bounded by the input-estimate error and biased toward refusing early**, which is
+  not the same as eliminated and must not be written as if it were. Still deferred out of that slice:
+  a real tokenizer, a per-agent `min_output_tokens`, and self-calibration from observed
+  `actual_input / est_input`.
 - **Budget-aware scheduling** — e.g. refusing to wake a run whose remaining budget cannot plausibly
   finish it.
 - **Spend visibility beyond a single run** — an aggregate across runs is a reporting concern needing

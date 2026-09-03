@@ -310,6 +310,21 @@ pub fn est_tokens(s: &str) -> usize {
 /// mapping, and would still need a heuristic like this as its fallback for an unknown
 /// model, so it is additional work on top of this rather than instead of it.
 ///
+/// # The pessimism assumes a LATIN script
+///
+/// Three characters per token is an over-count only where a token is worth three or more
+/// characters, which is Latin-script text — the case both this and `est_tokens` were
+/// calibrated on. CJK, Cyrillic and emoji run nearer 1–3 tokens PER character, so on such
+/// a prompt this UNDER-counts by a multiple and the bias flips: the clamp's residual
+/// (`actual_input − est_input`, the clamp design's §4) stops being a small error and
+/// becomes a fraction of the prompt.
+///
+/// That is stated rather than fixed because the fix is the deferred real tokenizer, and a
+/// heuristic cannot be made script-agnostic by choosing a different divisor — a divisor
+/// pessimistic enough for CJK would refuse most Latin prompts outright. The AC11
+/// `budget clamp under-estimated the input` warning is the mitigation, and a non-Latin
+/// prompt is precisely the case it is expected to fire on.
+///
 /// Rounds UP, so any non-empty text costs at least one token, and `""` costs none.
 pub fn est_tokens_pessimistic(s: &str) -> usize {
     s.chars().count().div_ceil(3)

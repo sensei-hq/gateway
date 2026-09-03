@@ -245,9 +245,17 @@ pub(super) enum BudgetRefusal {
     /// `spent >= cap`: the ledger has already reached the cap.
     Spent,
     /// The output allowance left after the pessimistic input estimate is below
-    /// [`orchestrator_core::MIN_OUTPUT_TOKENS`]. Carries that allowance, which is what
-    /// makes the required raise computable in the message.
-    BelowFloor { allowance: u64 },
+    /// [`orchestrator_core::MIN_OUTPUT_TOKENS`].
+    ///
+    /// Carries BOTH terms the message needs, and the second is not redundant. The
+    /// allowance is what the operator is told is left; the ESTIMATE is what the required
+    /// raise must be computed from, because the allowance is
+    /// `remaining.saturating_sub(est)` and that saturation is reachable — a long prompt
+    /// against a nearly spent budget floors it at 0 and destroys `est − remaining`.
+    /// Deriving the raise from the allowance instead (`budget + floor − allowance`)
+    /// agrees everywhere else and understates it by exactly that difference here, which
+    /// is the arm nothing else can observe.
+    BelowFloor { allowance: u64, est_input: u64 },
 }
 
 /// What a journaled refusal means for the producer that hit it: a durable pause the
@@ -319,17 +327,39 @@ impl Executor {
         // The SP-DATA-5 clamp. The gate immediately above is a FLOOR-TRIGGER — it
         // refuses only once `spent` has ALREADY passed the cap — so without this a
         // single call can overshoot by however much output the adapter allows when
-        // `max_tokens` is `None`, which is not one number: `openai_compat` and the local
-        // engine pass the `Option` through (so the model's own maximum applies), while
-        // `anthropic`, `gemini` and `bedrock` each substitute their own 1024. Setting
-        // `max_tokens` replaces all of that with one rule under our control: the call
-        // CANNOT return more output than the remaining budget affords.
+        // `max_tokens` is `None`. That is not one number; it is five different ones, and
+        // the survey below was re-read against the adapters rather than assumed, because
+        // an earlier version of this comment got two of the five wrong:
         //
-        // On the three that default to 1024, that is a WIDENING as well as an
-        // enforcement — a budgeted call may now return more than the same unbudgeted one
-        // — and the design's §6 records it as an accepted cost with the alternative that
-        // was rejected. The run's TOTAL is bounded either way, which is the property this
-        // exists for; only the per-call shape moves.
+        // - `openai_compat` (`openai_compat/mod.rs:73`, `:128`) is the only true
+        //   pass-through: the wire field is `skip_serializing_if = "Option::is_none"`, so
+        //   `None` OMITS it and the model's own maximum applies.
+        // - `anthropic` (`anthropic/mod.rs:155`, `:218`) and `bedrock`
+        //   (`bedrock/mod.rs:205`, `:271`) substitute their own `DEFAULT_MAX_TOKENS` of
+        //   1024 unconditionally.
+        // - `gemini` (`gemini.rs:636`, `:685`) builds `generationConfig` only when
+        //   `max_tokens.is_some() || temperature.is_some()`, and every producer here
+        //   sends `temperature: None` (`support.rs:500`, `support.rs:539`, and this
+        //   module's own selector request). So with `max_tokens: None` NO
+        //   `generationConfig` is sent at all and gemini's 1024 is never reached —
+        //   Gemini's own server-side default applies.
+        // - the local engine (`llama_cpp/mod.rs:398`, `:597`) does
+        //   `max_tokens.unwrap_or(default_max_tokens)`, which the chat builder sets to
+        //   512 (`:142`). `None` there means 512, not the model's maximum.
+        //
+        // Setting `max_tokens` replaces all five with one rule under our control: the
+        // call CANNOT return more output than the remaining budget affords.
+        //
+        // The DIRECTION of the change therefore differs by family, and it is not the
+        // split the design first recorded. Against a large cap the emitted value is the
+        // chain's own `max_output_tokens` (2048 to 8192 across the shipped example
+        // catalog and presets), so the
+        // clamp WIDENS on `anthropic`, `bedrock` and the local engine — all three of
+        // which substitute a small constant for `None` — and NARROWS on `openai_compat`
+        // and `gemini`, where `None` meant the model's or the provider's own maximum. The
+        // design's §6 records both directions as accepted costs, with the alternative
+        // that was rejected. The run's TOTAL is bounded either way, which is the property
+        // this exists for; only the per-call shape moves.
         //
         // What this does NOT do is eliminate the overshoot, and the distinction is the
         // whole reason the design argues for a pessimistic estimate. With
@@ -339,6 +369,17 @@ impl Executor {
         // the ESTIMATE's error, biased toward refusing early because
         // `est_tokens_pessimistic` over-counts on the JSON-heavy prompts this
         // orchestrator actually sends. Bounded and biased safe, not zero.
+        //
+        // "Biased toward refusing early" carries a SCRIPT assumption, and it is worth
+        // naming because nothing else in the code does. `chars / 3` over-counts only
+        // where a token is worth three or more characters, which is Latin-script text.
+        // CJK, Cyrillic and emoji run nearer 1–3 tokens PER character, so on such a
+        // prompt the estimate under-counts by a multiple and the §4 residual
+        // (`actual_input − est_input`) stops being a small error and becomes a fraction
+        // of the prompt. The bias flips sign; the bound does not vanish, but it widens by
+        // a factor a reader could not otherwise anticipate. The AC11 `tracing::warn!`
+        // below is the mitigation — a non-Latin prompt is exactly the case it is expected
+        // to fire on — and a real tokenizer (design §8) is the fix.
         //
         // Only for a budgeted run, and only for `Chat`: `Embed`/`Stt` have no
         // `max_tokens` to set, so they fall through to the pre-existing floor-trigger
@@ -376,7 +417,15 @@ impl Executor {
                 //
                 // In a DEBUG build the `debug_assert!` panics with a message naming the
                 // cause, which is what makes removing or reordering the gate loud rather
-                // than silently absorbed: delete the gate and eleven tests redden.
+                // than silently absorbed: delete the gate and every budget-producer test
+                // that drives past the cap reddens on this `debug_assert!`'s own message,
+                // plus two that do not touch it —
+                // `a_non_chat_payload_is_gated_but_not_clamped` (the one payload the
+                // clamp skips, so the gate is all that is left) and
+                // `spending_exactly_the_cap_stops_the_run` (whose reason assertion tells
+                // the gate's message from the floor's). Stated as a property rather than
+                // a count: the count moved the last two times a budget test was added,
+                // and a stale number in a load-bearing comment is worse than no number.
                 //
                 // In a RELEASE build there is no tripwire to rely on — the workspace
                 // profile sets no `overflow-checks`, so a plain `cap - spent` would WRAP
@@ -414,7 +463,10 @@ impl Executor {
                     return Ok(Err(Refusal::BudgetExhausted {
                         spent,
                         budget: cap,
-                        cause: BudgetRefusal::BelowFloor { allowance },
+                        cause: BudgetRefusal::BelowFloor {
+                            allowance,
+                            est_input: est,
+                        },
                     }));
                 }
                 // The MODEL's own output limit, which the allowance knows nothing
@@ -430,6 +482,27 @@ impl Executor {
                 // ceiling from here", matching how `over_budget` treats an unknown
                 // context window — a missing catalog entry must not silently truncate
                 // every reply, and the budget allowance still bounds the call.
+                //
+                // It is a `min` over the CHAIN, which has a cost §6 records: on a
+                // HETEROGENEOUS fallback chain the weakest entry's limit binds from the
+                // very first call, however much budget remains. A budgeted run on
+                // [gpt-4o 16384, small-fallback 4096] gets 4096-token replies on the
+                // primary throughout, where the same run unbudgeted would get 16384.
+                // That is the price of setting `max_tokens` before selection, and it is
+                // paid deliberately: a request that fails over lands on a different
+                // entry, and a value the fallback would reject turns a survivable
+                // failover into a hard 400.
+                //
+                // A ceiling of `Some(0)` would emit `max_tokens: Some(0)` — "generate
+                // nothing" — and is NOT special-cased here. It is rejected one layer
+                // down instead: `collect_validation_errors` refuses a model with
+                // `max_output_tokens == 0`, because zero output is broken for every
+                // reader of that field and not just this one. Deliberately not widened
+                // to "ignore any ceiling below MIN_OUTPUT_TOKENS" — that would send an
+                // over-large `max_tokens` to a model whose limit is genuinely small,
+                // which is the case the floor-before-ceiling ordering exists to serve.
+                // The residual is the documented unchecked `Gateway::new` /
+                // `update_config` path, which validates nothing at all.
                 let ceiling = match request.chain.as_deref() {
                     Some(chain) => self.gateway.min_max_output_tokens(chain).await,
                     None => None,
@@ -580,9 +653,27 @@ impl Executor {
                     // the SMALLEST one that unblocks THIS call — a later, longer prompt
                     // can still land under the floor at that cap, which is why it says
                     // "at least".
-                    BudgetRefusal::BelowFloor { allowance } => {
+                    //
+                    // Computed from the same three terms the refusal itself used, and
+                    // deliberately NOT from the allowance. A dispatch needs
+                    // `(cap − spent) − est >= floor`, so the smallest cap that clears it
+                    // is `spent + est + floor`. The tempting one-liner
+                    // `budget + (floor − allowance)` is algebraically identical WHENEVER
+                    // `est <= remaining` — and silently wrong when it is not, because
+                    // `allowance` is `remaining.saturating_sub(est)` and the saturation
+                    // has already thrown away `est − remaining`. That is the arm AC5
+                    // exists for, so it is exactly where the operator would be handed a
+                    // number that re-pauses the run on the same node.
+                    //
+                    // `saturating_add` for the u64 sum: it cannot realistically overflow
+                    // (a cap near `u64::MAX` is not a budget), and a wrap would name a
+                    // raise SMALLER than the current cap.
+                    BudgetRefusal::BelowFloor {
+                        allowance,
+                        est_input,
+                    } => {
                         let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
-                        let needed = budget.saturating_add(floor.saturating_sub(allowance));
+                        let needed = spent.saturating_add(est_input).saturating_add(floor);
                         format!(
                             "budget: only {allowance} tokens left for output after the input \
                              estimate, below the {floor}-token floor ({spent} of {budget} \

@@ -1019,10 +1019,10 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
 /// each wake would let the run spend its whole cap again. Here process A's spend is read
 /// back out of Postgres by a process that shares nothing with it.
 ///
-/// 1. **Process A** submits a two-node graph with `--budget-tokens 1000` against a
-///    gateway that reports 1500 tokens per call. `n1` dispatches (nothing spent yet),
-///    `n2` is refused — inside that same drive, so the cap is overshot by exactly ONE
-///    call, never by "everything the drive can reach".
+/// 1. **Process A** submits a two-node graph with `--budget-tokens {CAP}` against a
+///    gateway that reports `{PER_CALL}` tokens per call. `n1` dispatches (nothing spent
+///    yet), `n2` is refused — inside that same drive, so the cap is overshot by exactly
+///    ONE call, never by "everything the drive can reach".
 ///
 ///    The magnitudes are 10x the fixture this test shipped with, for the reason
 ///    `run_started_with_budget` records for the in-process suite: under the SP-DATA-5
@@ -1033,13 +1033,22 @@ async fn a_stale_config_generation_fails_a_wake_at_the_fence_before_spending_any
 ///    budget, so the scheduler must never auto-wake this run; only an operator can.
 /// 3. **The operator, light tier** (`run status`) reads spend and cap out of the durable
 ///    journal — on its own pool, with no model credentials and no gateway at all.
-/// 4. **`run wake --budget-tokens 1000`** appends `BudgetRaised` and queues the run.
+/// 4. **`run wake --budget-tokens {RAISED}`** appends `BudgetRaised` and queues the run.
 /// 5. **Process B** — a fresh store/journal/content-store/gateway — drives it through
 ///    torii's real `worker serve --once` to `Completed`, folding the RAISED cap.
 /// 6. **Zero re-spend**, asserted per node: B's gateway saw `n2` exactly once and `n1`
 ///    NEVER — A's already-paid-for prefix was replayed from the durable journal + CAS.
-///    And the final ledger reads 300, not 150: spend ACCUMULATED across the boundary
-///    rather than restarting, which is the whole point of journaling it.
+///    And the final ledger reads `{PER_CALL} * 2`, not `{PER_CALL}`: spend ACCUMULATED
+///    across the boundary rather than restarting, which is the whole point of journaling
+///    it.
+///
+/// The numbers in steps 1, 4 and 6 are written as the constant NAMES rather than as
+/// literals. The rescale that moved this fixture above the clamp's floor updated step 1
+/// and left steps 4 and 6 quoting the old magnitudes — "wake --budget-tokens 1000" when
+/// 1000 had become the CAP, and "300, not 150" against an assertion of 3000. This file is
+/// `#[cfg_attr(not(have_database_url), ignore)]`, so a dev box's `cargo test --workspace`
+/// structurally cannot surface that drift; naming the constants is what stops the next
+/// rescale separating them again.
 #[cfg_attr(
     not(have_database_url),
     ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
