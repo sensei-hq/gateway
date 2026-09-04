@@ -1507,11 +1507,43 @@ mod tests {
     }
 
     /// `join_bounded` cuts the context, drops the planned schemas, and never touches `authored`.
+    ///
+    /// `authored` is deliberately LONGER than `context_budget_bytes`, and that sizing is what makes
+    /// the last clause a claim about the code rather than about the fixture. The version of this
+    /// test that shipped first used an 8-byte `authored` against the same 200-byte budget, so the
+    /// bound was never in play and the assertion could not tell "never cut" from "shorter than the
+    /// budget anyway": I ran both `system.truncate(plan.context_budget_bytes)` after the push and
+    /// `truncate_prompt_to_bound(self.authored, plan.context_budget_bytes)` before it, and each left
+    /// the whole `sensei-orchestrator` lib suite green (442 tests, as it stood). That suite is also
+    /// the only one that could have caught them: `join_bounded` has no production caller until the
+    /// executor is wired, so until then this test is the only thing behind the "`authored` is never
+    /// cut" claim on [`PromptParts::join_bounded`].
+    ///
+    /// It has to be pinned HERE rather than left to a downstream check, because cutting `authored`
+    /// makes the prompt SMALLER. The floor check ([`retained_meets_floor`]) is decided on
+    /// [`ContextCut`], which counts context BODIES and knows nothing of `authored`, and the
+    /// gateway's window gate only ever refuses a prompt for being too BIG. Neither can see bytes
+    /// that went missing under the bound.
+    ///
+    /// The length assertion is not a restatement of the `starts_with`: it names the distinction the
+    /// first mutation gets wrong — the budget bounds the `## Context` SECTION, not the joined
+    /// prompt — and it says so with one legible number rather than a 700-byte string diff. Under
+    /// that mutation its own claim is false (the join comes back at exactly 200 bytes, which I
+    /// confirmed by evaluating it first), though in the order below the `starts_with` fires before
+    /// it. Under the second mutation it PASSES: only `authored` is clamped there, so the joined
+    /// prompt still runs past the budget and the `starts_with` is the assertion that fires.
+    ///
+    /// The remainder equality holds the rest of the composition — what follows `authored` is
+    /// EXACTLY the measured section — so a dropped `push_str`, a swapped order or an added
+    /// separator cannot pass either. It slices at `authored.len()`, which is safe because the
+    /// `starts_with` above has already established that prefix.
     #[test]
     fn join_bounded_cuts_context_and_drops_schemas_but_never_authored() {
+        let authored = format!("AUTHORED{}", "A".repeat(500));
+        let context = vec![("A".to_string(), "a".repeat(1000))];
         let parts = PromptParts {
-            authored: "AUTHORED".to_string(),
-            context: vec![("A".to_string(), "a".repeat(1000))],
+            authored: authored.clone(),
+            context: context.clone(),
             tools: vec![tool_def("alpha", 100), tool_def("beta", 100)],
         };
         let plan = BudgetPlan {
@@ -1520,8 +1552,20 @@ mod tests {
         };
         let (system, tools, cut) = parts.join_bounded(&plan);
         assert!(
-            system.starts_with("AUTHORED"),
-            "authored bytes are never cut: {system}"
+            system.starts_with(&authored),
+            "all {} authored bytes survive a {}-byte context budget: {system:?}",
+            authored.len(),
+            plan.context_budget_bytes
+        );
+        assert!(
+            system.len() > plan.context_budget_bytes,
+            "the budget bounds the SECTION, not the joined prompt, which is {} bytes",
+            system.len()
+        );
+        assert_eq!(
+            &system[authored.len()..],
+            render_context_section_measured(&context, plan.context_budget_bytes).0,
+            "and what follows the authored bytes is exactly the measured section"
         );
         assert_eq!(
             tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
