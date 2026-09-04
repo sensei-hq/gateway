@@ -15501,10 +15501,44 @@ async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
          than the model's own limit: {bit:?}"
     );
 
+    // The failure message dumps EVERY captured record, not just the clamp-filtered ones.
+    //
+    // This test failed once, on one full-suite run out of many, with the clamp-bit record
+    // present and this one absent — and the arithmetic says that should be impossible.
+    // Both records are emitted back-to-back in the same `if let Some(clamp)` block on the
+    // same thread (`dispatch.rs`, the two signals). The captured bit reported
+    // `allowance: 999` against a 1000 cap and zero spend, which forces `est_input == 1`,
+    // and `clamp_observing_gateway(10, …)` hardcodes `input_tokens: 10`. So `10 > 1` held
+    // and the `warn!` ran.
+    //
+    // **The diagnosis first recorded for this — that `set_default` is thread-local while
+    // tracing's callsite `Interest` cache is global, so a subscriber-less thread can cache
+    // `Interest::never()` — is DISPROVEN.** Three probes, all green where the theory
+    // predicts red: a subscriber-less drive on the same thread first; the same from a
+    // separate `std::thread`; and a synthetic unique callsite emitted under
+    // `Dispatch::none()` before installing the capture, which was still captured
+    // (`poisoned_capture=1`). `rebuild_interest_cache()` was therefore NOT applied — it
+    // would have been a fix for a mechanism that does not occur here.
+    //
+    // What is left is the difference between "the record was never emitted" and "the
+    // capture did not see it", and the filtered view could not tell them apart. This dump
+    // can: an unfiltered record present here but missing from `signals` is a filter or
+    // capture problem, and its absence from both means the predicate did not hold and the
+    // arithmetic above is wrong somewhere. Recorded rather than guessed at, so the next
+    // occurrence produces evidence instead of another theory.
     let low = signals
         .iter()
         .find(|e| e.message.contains("under-estimated"))
-        .unwrap_or_else(|| panic!("the estimate-wrong signal fired: {signals:?}"));
+        .unwrap_or_else(|| {
+            let all = capture.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            panic!(
+                "the estimate-wrong signal did NOT fire.\n  clamp-filtered: {signals:?}\n  \
+                 ALL captured records: {all:?}\n  (est_input is forced to 1 by the \
+                 allowance of 999, and the fixture's input_tokens is 10, so the `10 > 1` \
+                 predicate held and this record should exist — see the comment above for \
+                 the disproven diagnosis and what this dump distinguishes)"
+            )
+        });
     assert_eq!(
         (low.field("estimated"), low.field("actual")),
         (Some(1), Some(10)),
