@@ -543,6 +543,13 @@ drop-order test.
     /// `join_bounded` cuts the context, drops the planned schemas, and never touches `authored`.
     #[test]
     fn join_bounded_cuts_context_and_drops_schemas_but_never_authored() {
+        // NOTE (amended after review): 8 bytes of `authored` against a 200-byte context budget
+        // leaves the bound NEVER IN PLAY, so `starts_with` cannot tell "never cut" from "shorter
+        // than the budget anyway" — AC8 was unpinned and two mutations of `join_bounded` left all
+        // 442 orchestrator tests green. Use authored bytes LARGER than the budget (508 against
+        // 200, as shipped in 2e844d6), take `starts_with` against a saved copy, and assert both
+        // that the joined prompt EXCEEDS the budget and that what follows `authored` is exactly
+        // the measured section.
         let parts = PromptParts {
             authored: "AUTHORED".to_string(),
             context: vec![("A".to_string(), "a".repeat(1000))],
@@ -764,7 +771,7 @@ In `crates/orchestrator/src/executor/support.rs`'s `mod tests`:
 - [ ] **Step 2: Run and watch them fail**
 
 ```
-cargo test -p orchestrator-core --lib -- the_context_budgeted_event_round_trips > /tmp/t4.log 2>&1; echo "exit=$?"
+cargo test -p sensei-orchestrator-core --lib -- the_context_budgeted_event_round_trips > /tmp/t4.log 2>&1; echo "exit=$?"
 cargo test -p sensei-orchestrator --lib -- the_first_context_budget_wins > /tmp/t4b.log 2>&1; echo "exit=$?"
 ```
 Expected: **compile errors** — no `ContextBudgeted` variant, no `fold.context_budgets`.
@@ -856,7 +863,7 @@ exhaustive match and WILL. Add:
 - [ ] **Step 6: Run and watch them pass, then build all targets**
 
 ```
-cargo test -p orchestrator-core --lib -- the_context_budgeted_event_round_trips > /tmp/t4.log 2>&1; echo "exit=$?"
+cargo test -p sensei-orchestrator-core --lib -- the_context_budgeted_event_round_trips > /tmp/t4.log 2>&1; echo "exit=$?"
 cargo test -p sensei-orchestrator --lib -- the_first_context_budget_wins > /tmp/t4b.log 2>&1; echo "exit=$?"
 cargo build --workspace --all-targets > /tmp/t4c.log 2>&1; echo "exit=$?"
 ```

@@ -1,40 +1,40 @@
 # Checkpoint
 
-**SP-7b context budgeting: SPEC APPROVED and committed (`cef53ba`), awaiting Jerry's review of the
-spec file before any plan or code.** SP-7a serving-window bound is DONE — all 6 review findings
-closed and pushed (`864a8dd`), nothing open from it.
+**SP-7b context budgeting: IN BUILD, subagent-driven. Tasks 1-4 landed and REVIEWED (both
+rechecks PASS); task 5 next.** Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12 ACs), plan
+`2026-09-04-sp-7b-context-budgeting.md` (8 tasks). SP-7a is DONE and pushed (`864a8dd`).
 
 ## Done
 
-SP-7a review (`cbb8854..b91403b`, five lenses): the refusal remedy was false the same way twice —
-"put a model with a larger window in this chain" cannot clear a `min { w : w >= est }` bound, proven
-by byte-identical refusals down `{4096}` and `{4096, 200 000}`. A TIE now names `max_output_tokens`;
-cap-independence is pinned. **M1 REVERSED** (`64325f1`): an `AllGated` carrying a `human_action` is
-the indefinite HOTL pause, not a `NodeFailed`, because nothing revives a terminal run. Recorded on
-ten doc surfaces (`dfe33d0`).
+`fedb8ac` T1 `Gateway::max_context_window` — the budget target, the only window accessor folding
+`max` rather than `min`. `7c7d286` T2 `CONTEXT_FLOOR_FRACTION = 0.25` + the pure planner.
+`6ada19d` T2 fix: `plan_budget` compared a SECTION-byte budget against a BODY-byte floor, so a plan
+approved AT the floor rendered BELOW it and the schema-drop loop stopped early — **turning
+degradable turns into refusals**. `ee13ddd` closed three FALSE CLAIMS, one introduced by that fix.
+`0f618e1`+`2e844d6` T3 measured renderer; the fix put the bound IN PLAY — AC8 was unpinned and two
+mutations of `join_bounded` left all 442 tests green. `42446e3`+`daeee45` T4 `ContextBudgeted`,
+folded FIRST-wins via `entry().or_insert`, `label` arm added (`cargo build --workspace` cannot see
+it), `FORMAT_VERSION` still 1.
 
-SP-7b spec: 12 ACs in `docs/superpowers/specs/2026-09-04-sp-7b-context-budgeting-design.md`, built on
-a 12-agent research workflow (89 findings, **3 of 5 central claims refuted**). Jerry's decisions:
-availability · a fixed floor · all four disclosure channels · scope = system + tools. **The one idea:
-journal the BUDGET, not the cut** — the truncator is already pure and every other input replay-stable,
-so the window-derived integer was the only unfenced one (`GatewayConfig` has NO version field, so the
-`#cfg{gen}` fence has no catalog term). Mandatory, not defensive: every past turn's hash is recomputed
-on every partial resume forever, and a `DeterminismViolation` leaves the run unrevivable.
+**The design's one idea: journal the BUDGET, not the cut.** The truncator is pure and every other
+input is replay-stable, so the window-derived integer was the only unfenced one (`GatewayConfig` has
+NO version field). Mandatory, not defensive: every past turn's hash is recomputed on every partial
+resume forever, and a `DeterminismViolation` leaves the run unrevivable.
 
 ## Verified
 
-`cargo test --workspace` **1721 passed / 0 failed / 56 ignored, exit 0** · `clippy -D warnings` 0 ·
-`fmt --check` 0 · `cargo doc` private-item links **16 = baseline**. Spec facts spot-checked at HEAD
-myself: `eid` (agent.rs:383) is one line before `ih` (:384); `join` (:271) runs BEFORE `resolve_chain`
-(:273), so §5.1 needs a reorder; no `max_context_window` accessor exists yet.
+`cargo test --workspace` **1739 passed / 0 failed / 56 ignored, exit 0** · `--all-targets` 0 · `clippy -D warnings` 0 ·
+`fmt --check` 0. Every new arithmetic term mutation-pinned, including the zero-floor saturation the
+fix had left unguarded while claiming otherwise.
 
 ## Next
 
-Jerry reviews the spec → writing-plans → subagent-driven execution. No SP-7b code exists yet.
+T5 ALONE next (the `drive_agent` wiring — the risky integration: the `resolve_chain` reorder, the
+stale-fold trap, the floor's pause path), then T6-8. Passes are split so review lands inside one.
 
 ## Open
 
-`both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` failed ONCE; its
-`Interest`-cache diagnosis is **DISPROVEN by three probes**, so no fix shipped. Spec §7 flags the real
-cost: the guard test asserting "half a document never becomes work product" inverts under SP-7b and
-gets SPLIT, not relaxed. **Sensei daemon NOT running — this file is the only record.**
+**Do NOT "fix" `min_context_window`'s doc.** A T1 agent called its "its own test" claim false; both
+reviewers refuted that (the test is at `engine/mod.rs:835`; the grep was read at file granularity).
+Plan amended: `plan_budget` takes entries, not a byte total; T5 passes `&parts.context`.
+**Sensei daemon NOT running — this file is the only record.**
