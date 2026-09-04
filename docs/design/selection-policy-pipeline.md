@@ -51,7 +51,7 @@ Each finding and its resolution:
 | H5 | Only `execute` wired; `execute_stream` diverges. | Both dispatch paths route through `recorders.on_outcome` (§5, step 2/5). |
 | H6 | Config-swap/key-rotation never clears terminal lockouts → dead until restart. | `try_update_config`/`refresh_router_keys` clear/evict affected health state (§5b). |
 | H7 | Escalation never resets on success; concurrent fan-out lost-update jumps to max. | Reset/decay on success (mirror breaker); increment **once per lock→release→relock cycle** via a generation guard (§3.2). |
-| M1 | Overloading `AllAttemptsFailed`; terminal-only exhaustion could pause forever. | New `GatewayError::AllGated { resume_after: Option<DateTime<Utc>>, skipped, human_action: Option<HumanAction> }`. Terminal-only ⇒ **fail-fast human-action, never pause** (§3.3). |
+| M1 | Overloading `AllAttemptsFailed`; terminal-only exhaustion could pause forever. | New `GatewayError::AllGated { resume_after: Option<DateTime<Utc>>, skipped, human_action: Option<HumanAction> }`. Terminal-only ⇒ ~~**fail-fast human-action, never pause**~~ → **REVERSED 2026-09-04, see below** (§3.3). |
 | M2 | `CircuitOpen` carries no `until` → excluded from `resume_after`. | `CircuitOpen { until }` (breaker exposes `next_retry`); breaker adopts the injected clock (§2, §8). |
 | M3 | Can't distinguish exact reset from estimate on re-eval. | `Until::{ Exact(t), Backoff(t) }` — clamp only `Backoff` (§3.2). |
 | M4 | Per-tier strategy needs a tier tag; hardcoded `sort_by_key(priority)` fights a strategy. | `RoutingStrategy` is the **one** ordering seam; SP-0 ships `PriorityStrategy` replacing the hardcoded sort; `SelectedModel`/`ChainEntry` gain an optional `tier`/`segment` marker (populated by SP-CAT); `ctx` is an extensible struct (§2). |
@@ -62,6 +62,40 @@ Each finding and its resolution:
 | S3 | SP-0 scope drift (expiration stateful, retry-budget). | Moved out (non-goals); §16 + governance README reconciled. |
 | S4 | Is metering an OutcomeSink? | No — metering stays a **separate** write path (`GatewayStore`); predicted-lockout (SP-DATA) *reads* metering and *writes* a lockout via `HealthRecorder` (§9). |
 | S5 | Multi-instance `resume_after` authority. | Documented: authoritative only when one instance owns the subject's traffic; fleet-wide correctness deferred to persisted state (SP-DATA) (§9). |
+
+### M1 REVERSED — 2026-09-04
+
+**"Terminal-only ⇒ fail-fast human-action, never pause" no longer holds.** A terminal-only
+`AllGated` that carries a `human_action` is now a durable, indefinite pause — SP-DATA-3's
+HOTL class — and only an `AllGated` carrying *neither* a `resume_after` nor a
+`human_action` fails.
+
+M1 feared a run pausing forever on something nothing would ever clear. That fear was
+right, and `human_action` turns out to be the exact discriminator for it: a `Some(_)` IS
+the statement that a named party can end the pause. The `None` arm still fails, so the
+fear is answered rather than ignored.
+
+What forced the reversal is that "fail fast" was not, in this system, a recoverable
+outcome. SP-7a moved window-fit into `ContextWindowGate` and deleted the orchestrator's
+pre-dispatch halt, so an over-every-window run began arriving here as
+`AllGated { resume_after: None, human_action: Some(UseLargerContextWindow) }` — and
+`classify_gateway_error` failed the node, making the run terminal. **No supported command
+revives a terminal run:** `SchedulerStore::force_wake` matches `status = 'paused'`,
+`torii run wake` reports "not queued", and `run submit` refuses a used id. Every completed
+node's memo, journaled mutation and spent token stayed durable and unreachable behind
+hand-written SQL against `scheduled_runs`. A terminal state that names a human remedy no
+command can act on is incoherent — and it was incoherent for every gate that produces one
+(auth lockout, capability, budget), which is why the fix is not window-specific.
+
+The pause deliberately carries **no deadline**, so nothing wakes it on a timer into the
+identical refusal. `list_paused` surfaces it; `force_wake` clears it once the operator has
+acted on the remedy the reason names.
+
+Implemented in `classify_gateway_error` (`orchestrator/src/executor/support.rs`, whose doc
+carries this argument) and pinned by
+`a_budgeted_over_window_run_pauses_recoverably_rather_than_dying` (the journal row) and
+`classify_gateway_error_pauses_on_a_deadline_or_a_human_action_and_fails_on_neither` (all
+three arms, including a `TopUpCredits` remedy, so the rule is not read as window-specific).
 
 ---
 
@@ -158,7 +192,7 @@ Per-reason durations (`rate_limit`≈60s; `quota_exhausted`→next reset boundar
 ### 3.3 Quota demote-to-tier + exhaustion
 Demote is emergent (recoverable classification falls over in-walk, §3.1). On full exhaustion the engine builds `resume_after` from **post-walk** state: `min` over `Until` of (a) selection-time timed skips **and** (b) the `until` each `HealthRecorder.on_outcome` returned for attempted-failed candidates, plus `CircuitOpen.until`. Result → `GatewayError::AllGated { resume_after: Option<DateTime<Utc>>, skipped, human_action }`:
 - some timed ⇒ `resume_after = Some(min)` → orchestrator durable pause (wall-clock).
-- all terminal / none timed ⇒ `resume_after = None` + `human_action` (top-up-credits / rotate-key / raise-budget) → **fail-fast, never pause forever**.
+- all terminal / none timed ⇒ `resume_after = None` + `human_action` (top-up-credits / rotate-key / raise-budget) → ~~**fail-fast, never pause forever**~~ → **the INDEFINITE HOTL pause** (M1 reversed 2026-09-04, above): never auto-woken, surfaced by `list_paused`, cleared by an operator's `force_wake` once they have acted on the remedy. Only an `AllGated` with neither a `resume_after` nor a `human_action` fails — that is the "pause forever on nothing" case M1 was right to fear.
 `resume_after` means "earliest eligibility, retry not guaranteed." Subscription `GatewayError::QuotaExceeded` (subject/tier) stays a **hard stop**, never demotes, never carries `resume_after`.
 
 ## 4. Config

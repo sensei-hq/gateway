@@ -287,3 +287,27 @@ That is a recoverable outcome traded for a terminal one, and it is the right tra
 pause was preserving a run against a remedy it could not name — `torii run wake --budget-tokens N`
 has never made a prompt fit a window. Recorded here because it is the one user-visible regression
 in the slice.
+
+> **CORRECTED 2026-09-04 — that trade was wrong, and this regression is CLOSED.** The paragraph
+> above reasons about which LEVER the pause named and never asks whether the terminal outcome is
+> recoverable at all. It is not. `SchedulerStore::force_wake` is `… where run_id = $1 and status =
+> 'paused'`, `torii run wake` answers "not queued", and `run submit` refuses a used id — so a
+> `NodeFailed` here left every completed node's memo, journaled mutation and spent token durable
+> and unreachable behind hand-written SQL against `scheduled_runs`. The parent commit's own test
+> doc said as much ("the pause CLASS is deliberately kept … where a `NodeFailed` destroys it") and
+> this slice traded it away anyway.
+>
+> The lever complaint was real and is answered separately: the pause is now cleared by
+> `force_wake` after the operator widens the chain, and its reason is the gate's per-candidate
+> diagnosis naming `UseLargerContextWindow` — not budget wording, and not a cap raise. So both
+> arms halt recoverably, with the right remedy named.
+>
+> The fix is one arm in `classify_gateway_error`: an `AllGated { resume_after: None }` carrying a
+> `human_action` is the indefinite HOTL pause rather than a failure, and only an `AllGated`
+> carrying neither a deadline nor an action still fails. **This REVERSES risk M1** in
+> `docs/design/selection-policy-pipeline.md`, which SP-7a's spec put out of scope; Jerry approved
+> the reversal on 2026-09-04 over three narrower alternatives, because the incoherence — a terminal
+> state naming a human remedy no command can act on — belongs to every gate that produces one, not
+> only the window. Pinned by `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying`
+> (the journal row: exactly one `RunPaused`, `resume_after` NULL, no `NodeFailed`) and by
+> `classify_gateway_error_pauses_on_a_deadline_or_a_human_action_and_fails_on_neither`.

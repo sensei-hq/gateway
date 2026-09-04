@@ -101,11 +101,18 @@ Feature: Quota demote-to-tier (additional)
     And a human-action hint is surfaced for modelA
     And resume_after ignores the terminal model
 
-  Scenario: All candidates terminal → fail fast, never pause
+  Scenario: All candidates terminal → the indefinite HOTL pause (M1 reversed 2026-09-04)
     Given every candidate is credits_exhausted or auth-locked (until = None)
     When every candidate is gated
     Then AllGated.resume_after is None
-    And a human-action error is returned (the run does not pause forever)
+    And a human_action names the remedy
+    And the orchestrator pauses the run INDEFINITELY rather than failing it
+    And nothing wakes it on a timer — only an operator's force_wake, after acting
+
+  Scenario: All candidates gated with no remedy at all → fail fast
+    Given every candidate is gated with neither a timed until nor a human_action
+    When every candidate is gated
+    Then the run FAILS — a pause nobody can clear is worse than a failure
 
   Scenario: All candidates circuit-open → resume_after from breaker next_retry
     Given every endpoint's breaker is Open with next_retry = T

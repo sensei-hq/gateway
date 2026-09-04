@@ -49,6 +49,14 @@ that land in this plan:
   over-window-everything request was, and remains, a terminal `NodeFailed`. Spec §3 / §2 / AC3 are
   corrected; the two comments in `skip_reason.rs` that asserted otherwise are rewritten. Reversing
   that behaviour is now an explicit **deferred** item with its argument, not an assumed benefit.
+
+  > **That deferred item was TAKEN on 2026-09-04 and this bullet is now history.** Review of the
+  > serving-window follow-on showed the terminal outcome is not merely undesirable but
+  > **unrecoverable** — `force_wake` matches `status = 'paused'`, `torii run wake` reports "not
+  > queued", `submit` refuses a used id — so a run's memos and spend were reachable only by hand
+  > SQL. `classify_gateway_error` now treats `resume_after: None` WITH a `human_action` as the
+  > indefinite HOTL pause, failing only when neither is present. Risk M1 in
+  > `docs/design/selection-policy-pipeline.md` carries the full argument.
 - **`AllGated` rendered neither `skipped` nor `human_action`.** Every number this slice adds was
   being dropped at the orchestrator boundary, which would have made Task 6 a diagnostics
   REGRESSION against `PromptOverBudget`. Fixed in `kernel::types::error` with its own test; this is
