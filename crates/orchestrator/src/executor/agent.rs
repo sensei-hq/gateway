@@ -348,12 +348,25 @@ impl Executor {
     /// There is no window pre-check here any more. It used to run first, testing this
     /// turn's prompt against `min_context_window(chain)` — the chain's SMALLEST window —
     /// and failing the node before dispatch. SP-7a moved that question to the gateway's
-    /// `ContextWindowGate`, which asks it per CANDIDATE, so a chain of `[128k, 8k]` now
-    /// serves a 20k prompt the primary can hold instead of refusing it against the 8k
-    /// entry. An over-EVERY-window prompt is still a terminal node failure, but it
-    /// arrives as an `AllGated` naming each candidate's own window and the remedy, and
-    /// selection still refuses it before any provider is called — so the "halts before
-    /// spending" property the pre-check had is preserved rather than traded away.
+    /// `ContextWindowGate`, which asks it per CANDIDATE, so on an UNBUDGETED run a chain
+    /// of `[128k, 8k]` now serves a 20k prompt the primary can hold instead of refusing
+    /// it against the 8k entry. An over-EVERY-window prompt is still a terminal node
+    /// failure, but it arrives as an `AllGated` naming each candidate's own window and
+    /// the remedy, and selection still refuses it before any provider is called — so the
+    /// "halts before spending" property the pre-check had is preserved rather than traded
+    /// away.
+    ///
+    /// **On a BUDGETED run none of that applies, and the qualification is not a footnote.**
+    /// `dispatch_metered`'s SP-DATA-5 clamp — the sibling module `executor/dispatch.rs` —
+    /// runs before `Gateway::execute` and bounds `max_tokens` by
+    /// `min_context_window(chain) − est`, the chain MINIMUM this slice exists to stop
+    /// trusting. When that lands under `MIN_OUTPUT_TOKENS` it refuses with
+    /// `Refusal::BudgetExhausted { cause: BelowFloor }` and the gate is never asked, so a
+    /// budgeted `[128k, 8k]` chain still refuses the 20k prompt — as a durable PAUSE now
+    /// rather than the node failure the deleted halt produced. See
+    /// `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`, which
+    /// asserts both arms, and the SP-7a spec's §8, which records bounding the clamp by the
+    /// SELECTED candidate as the fix.
     async fn agent_turn_output(
         &self,
         ar: &AgentRun<'_>,
@@ -375,6 +388,18 @@ impl Executor {
         }
 
         // Live turn.
+        //
+        // SP-7a's deletion moved TWO observable events past this line, not one. The halt
+        // returned ABOVE this block, so an over-window agent node used to journal
+        // `[RunStarted, NodeFailed]` with no `NodeStarted` between them and fire neither
+        // `on_node_started` nor `on_agent_turn`. Now it journals
+        // `[RunStarted, NodeStarted, NodeFailed]` and fires both. That is the intended
+        // shape — a node that reaches dispatch IS started, and an attempted turn IS a
+        // turn — but it is a real change for every observer: `fold.started`, `torii
+        // status` / `list_paused`, and any hook that counts or bills turns. Pinned by
+        // `an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis`, which
+        // asserts the journal shape and the hook count so a re-introduced pre-dispatch
+        // halt reddens on the property rather than only on message wording.
         if !*node_started {
             self.append(
                 ar.run,

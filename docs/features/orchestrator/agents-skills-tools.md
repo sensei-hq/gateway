@@ -59,7 +59,9 @@ source: crates/orchestrator*
 > a skill body / tool schema only when `activation.is_active(query)` for the agent's
 > rendered input (matched once per run, case-insensitive substring ANY-of) —
 > progressive disclosure to fit the prompt budget. `Always` is byte-identical to the
-> old behavior; over-budget still halts loud (no silent truncation). Determinism-safe
+> old behavior; an over-window turn is still refused rather than truncated — SP-7a moved
+> that refusal to the gateway's `ContextWindowGate`, which asks it per candidate.
+> Determinism-safe
 > (the query is the node input, already in `agent_input_hash`). Activation gates prompt
 > **disclosure**, not execution: a tool gated out of a run's prompt simply isn't offered
 > to the model that run — the permission grants (slice 3), validated at load, remain the
@@ -244,9 +246,13 @@ Feature: Agent runtime
   md+frontmatter-subset parser (`from_frontmatter`) and `Registry::validate`
   (dangling agent/skill/tool refs are a loud load-time error).
 - **Prompt assembly** (`assemble_prompt`: system-prompt body + each listed
-  skill's body, in order) with **per-turn window budgeting** (`over_budget`) —
-  halt-loud when a turn's estimate exceeds the chain's smallest context window;
-  no silent truncation.
+  skill's body, in order). As shipped in this slice it carried **per-turn window
+  budgeting** (`over_budget`) — halt-loud when a turn's estimate exceeded the chain's
+  SMALLEST context window. **SP-7a removed that**: the chain minimum is not a fact about
+  any candidate, so a `[128k, 8k]` chain refused prompts the primary would have served.
+  The question is now asked per candidate by the gateway's `ContextWindowGate`
+  (`crates/gateway/src/gates/context_window.rs`), which skips the candidates that cannot
+  hold the request and only fails when none can. Still no silent truncation.
 - A **Pure-only tool runtime** (`Tool` / `ToolRegistry` + the demo `calc` tool);
   Observation/Mutation tools are rejected loud (`ToolEffectDeferred`), never
   silently skipped or run early.
@@ -257,7 +263,8 @@ Feature: Agent runtime
 
 **Deferred:** Observation/Mutation tools + TTL/two-phase/reconcile (slice 4);
 a filesystem directory loader for the registry; a summarize/select budgeting
-strategy (today's over-budget turn halts rather than compacting);
+strategy (SP-7b — today an over-window turn is refused at selection rather than
+compacted);
 blackboard/shared-context, `Map` fan-out, subagents, per-phase chains, and
 streaming (slice 3+).
 

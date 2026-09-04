@@ -94,7 +94,11 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 
 /// A deliberately pessimistic input estimate, for the CONTEXT-WINDOW gate only.
 ///
-/// # What it counts that [`estimate_input_tokens`] does not
+/// # What it counts that [`estimate_input_tokens`] does not, on a `Chat` payload
+///
+/// The other payload kinds are answered in a different unit or not at all; see "The unit
+/// is ONE inference the model's window has to hold" below, which is where the arms that
+/// are NOT simply a more pessimistic rounding of the cost figure are argued.
 ///
 /// 1. **Tool schemas.** The cost estimator sums messages + system and stops. An agent's
 ///    activated schemas routinely outweigh its prompt, so omitting them is not a
@@ -125,24 +129,26 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// `Stt` arm below refuses — an estimate so large that every candidate is skipped and a
 /// perfectly serviceable request becomes a terminal `AllGated`.
 ///
-/// So the honest statement is narrower than "pessimistic": this is an upper bound on the
-/// TEXT of a request, not on the request. A multimodal call is estimated on its text
-/// alone, so the gate can still admit a candidate that its images push over. That is the
-/// status quo for every caller — nothing gates on the window today — but it is not what
-/// the word "pessimistic" would lead a reader to assume, and a caller that starts
-/// attaching media owes this function a per-attachment token term (providers publish the
-/// maxima; the term belongs in tokens, added after the divide, not in bytes before it).
-/// No producer in this workspace attaches media today: `executor/agent.rs` and
-/// `executor/dispatch.rs` both pass `Vec::new()`, and the adapters only translate what
-/// they are handed.
+/// So the honest statement is narrower than "pessimistic": on a `Chat` payload this is an
+/// upper bound on the TEXT of a request, not on the request. A multimodal call is
+/// estimated on its text alone, so the gate can still admit a candidate that its images
+/// push over. That was the status quo for every caller before SP-7a — nothing gated on the
+/// window at all — but it is not what the word "pessimistic" would lead a reader to assume,
+/// and a caller that starts attaching media owes this function a per-attachment token term
+/// (providers publish the maxima; the term belongs in tokens, added after the divide, not
+/// in bytes before it). No producer in this workspace attaches media today:
+/// `executor/agent.rs` and `executor/dispatch.rs` both pass `Vec::new()`, and the adapters
+/// only translate what they are handed.
 ///
 /// # Why a third estimator rather than a call to one of the two that exist
 ///
-/// Kept SEPARATE from [`estimate_input_tokens`] because the two gates want opposite
-/// biases over the same payload: an under-count is optimistic pricing for the cost gate
-/// and an admitted-but-doesn't-fit candidate for this one. Changing the shared figure
+/// Kept SEPARATE from [`estimate_input_tokens`] because, where the two measure the same
+/// quantity, they want opposite biases: an under-count is optimistic pricing for the cost
+/// gate and an admitted-but-doesn't-fit candidate for this one. Changing the shared figure
 /// would silently make every `BudgetGate` decision more conservative — a real
-/// improvement, and a different slice's call.
+/// improvement, and a different slice's call. On two payload kinds they do not measure the
+/// same quantity at all, which is a second and independent reason they cannot be one
+/// function; see the arm-by-arm section below.
 ///
 /// The workspace's other pessimistic estimator, `agent::prompt::est_tokens_pessimistic`
 /// (`crates/orchestrator`), divides by 3 as well but over `chars().count()` rather than
@@ -151,11 +157,55 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// other way — so this is a third function by necessity, not by preference. The two
 /// agree on the divisor and differ on the unit; both err high.
 ///
-/// Every non-chat arm mirrors [`estimate_input_tokens`]'s handling at `/3` rather than
-/// collapsing to `0`. A `_ => 0` catch-all would make this function *under*-count a Tts
-/// or ImageGenerate payload relative to the cost estimate, inverting the one ordering the
-/// gate's safety rests on. `Stt` is 0 in both: audio bytes are not characters, and
-/// counting them would skip every candidate for a 30-second clip.
+/// # The unit is ONE inference the model's window has to hold, arm by arm
+///
+/// This is not the same question [`estimate_input_tokens`] answers, and on two payload
+/// kinds the two functions deliberately return different QUANTITIES rather than
+/// different roundings of the same one. The cost estimator prices the whole request;
+/// this one measures what a single candidate's `context_window` is asked to hold. Where
+/// the window does not bound the payload kind at all, the honest answer is 0, because
+/// `est > window` is the only question the gate asks and 0 is how an arm says "not
+/// applicable" (`Stt` has said it that way since this function was written).
+///
+/// - **`Chat`** — the whole conversation, plus system, plus tool schemas. One request,
+///   one window. This is the arm the pessimism argument above is about, and the arm
+///   where this figure must never undercut the cost estimate.
+/// - **`Embed`** — the LARGEST single text, not the batch total. An embeddings request
+///   is a BATCH: `dispatch::to_embed_request` forwards `texts` verbatim, and the
+///   providers apply the model's max-input-tokens limit to each ARRAY ELEMENT. There is
+///   usually a per-REQUEST aggregate limit too, but it is a separate and much larger
+///   figure and it is not `context_window`; §8 of the SP-7a spec records it as ungated. The
+///   original implementation summed the batch, which terminally refused 100 RAG chunks
+///   of 300 bytes against an 8 k model — every one of them ~1.2% of the window — with a
+///   remedy ("use a larger-window model") that is not even the fix; splitting the batch
+///   is. So the sum is the COST (every text is embedded and every text is billed) and
+///   the max is the WINDOW, and the two functions differ here on purpose. Pinned by
+///   `an_embed_batch_of_individually_small_texts_is_admitted`.
+/// - **`Stt`** — 0. Audio bytes are not characters; counting them would skip every
+///   candidate for a 30-second clip.
+/// - **`Tts` / `ImageGenerate` / `VideoGenerate`** — 0, because `context_window` is a
+///   chat-model concept and these models do not publish one. What a speech or image
+///   model publishes is a maximum prompt LENGTH in characters — a different bound, in a
+///   different unit, that this config has no field for — so the number on such an entry
+///   is filler and `0` is what an operator naturally writes for "not applicable".
+///   Judging a TTS request against it would make every such request a terminal
+///   `AllGated` telling the operator to route to a model with a bigger window, which is
+///   not a property the model has. Gating them properly needs a real per-capability
+///   input limit; that is recorded as deferred in the SP-7a spec's §8, and until it
+///   exists these are exactly as ungated as they were before SP-7a. Pinned by
+///   `tts_image_and_video_requests_admit_even_a_zero_window_candidate`.
+///
+/// **What this costs, stated so the `0`s are not read as "safe":** a TTS prompt longer
+/// than the provider's character limit still earns a 400, and an oversized single embed
+/// input is still caught but an oversized BATCH AGGREGATE is not. Both were true before
+/// this slice — nothing gated on the window at all — so neither is a regression, and
+/// both are cheaper than the over-refusal the alternatives produce.
+///
+/// An earlier version of this comment argued the opposite for the three media arms: that
+/// a `_ => 0` catch-all would under-count them relative to the cost estimate and invert
+/// "the one ordering the gate's safety rests on". That argument is circular. The ordering
+/// matters only where the window question APPLIES; where it does not, matching the cost
+/// estimate buys nothing and costs a permanently refused capability.
 ///
 /// The accepted cost, stated plainly: a pessimistic figure can skip a model the prompt
 /// would actually have fitted, sending the request to a larger, likely costlier
@@ -205,13 +255,18 @@ pub(super) fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
                 .sum();
             msg_chars + sys_chars + tool_chars
         }
-        Payload::Embed { texts } => texts.iter().map(|t| t.len()).sum(),
-        // STT has no meaningful text input to estimate — mirrors `estimate_input_tokens`.
-        Payload::Stt { .. } => 0,
-        Payload::Tts { text, .. } => text.len(),
-        Payload::ImageGenerate { prompt, .. } | Payload::VideoGenerate { prompt, .. } => {
-            prompt.len()
-        }
+        // The LARGEST input, not their sum: the window bounds one array element. See the
+        // arm-by-arm section above — `estimate_input_tokens` sums the same texts, and
+        // that is right for COST and wrong for the window.
+        Payload::Embed { texts } => texts.iter().map(|t| t.len()).max().unwrap_or(0),
+        // The four payload kinds a `context_window` does not bound. Written out rather
+        // than left to a `_ => 0` catch-all so that adding a seventh `Payload` variant is
+        // a compile error here, and whoever adds it has to answer the window question for
+        // it rather than inheriting a silent 0.
+        Payload::Stt { .. }
+        | Payload::Tts { .. }
+        | Payload::ImageGenerate { .. }
+        | Payload::VideoGenerate { .. } => 0,
     };
     // Saturate rather than wrap. `estimate_input_tokens` uses `as u32`, which is harmless
     // there because an overflowed cost estimate only mis-prices; here a wrap would turn a
@@ -499,16 +554,23 @@ mod tests {
         );
     }
 
-    /// AC10, the Embed half — an Embed request IS gated by the window, deliberately.
+    /// AC10, the Embed half — an Embed request IS gated by the window, deliberately, on
+    /// the size of its LARGEST input.
     ///
     /// "Unaffected" is the wrong word for Embed and this test is here to stop it being
     /// assumed: embedding models publish real context windows (8 k is typical), the
-    /// estimator returns a real number for `Payload::Embed`, and a batch that exceeds a
-    /// candidate's window earns the same provider 400 as an oversized chat. So Embed is
-    /// gated exactly like Chat, and the honest reading of AC10 is that **Stt** is the
-    /// unaffected payload kind.
+    /// estimator returns a real number for `Payload::Embed`, and a single text that
+    /// exceeds a candidate's max input earns the same provider 400 as an oversized chat.
+    /// The honest reading of AC10 is that **Stt** is the unaffected payload kind.
+    ///
+    /// The fixture's texts are 30 KB EACH, so the skip below holds under the per-item
+    /// rule this gate applies. That is not an accident of the numbers — it is the reason
+    /// this test cannot stand alone: it would pass just as well under the batch-SUM rule
+    /// the estimator originally used, which is why
+    /// `an_embed_batch_of_individually_small_texts_is_admitted` exists beside it and
+    /// separates the two.
     #[test]
-    fn an_embed_request_is_gated_by_the_window_like_a_chat() {
+    fn a_single_oversized_embed_input_is_gated_by_the_window_like_a_chat() {
         let payload = Payload::Embed {
             texts: vec!["x".repeat(30_000), "y".repeat(30_000)],
         };
@@ -517,7 +579,8 @@ mod tests {
                 gate_verdict_for(&payload, 8_192),
                 crate::gates::GateVerdict::Skip(SkipReason::OverContextWindow { .. })
             ),
-            "60 KB of text is ~20k tokens and does not fit an 8192-token embedding model"
+            "one 30 KB text is 10k tokens on its own and does not fit an 8192-token \
+             embedding model"
         );
         assert!(
             matches!(
@@ -526,6 +589,97 @@ mod tests {
             ),
             "and it does fit a large one — the gate is per candidate for Embed too"
         );
+    }
+
+    /// A batch of individually SMALL texts is admitted, however many of them there are.
+    ///
+    /// The quantity a model's `context_window` bounds for an embedding request is ONE
+    /// input, not the sum of the array: `to_embed_request` (`dispatch.rs`) forwards
+    /// `texts` verbatim and every embeddings API applies its max-input-tokens limit per
+    /// array ELEMENT (the aggregate per-request limit is a separate figure, orders of
+    /// magnitude larger). So summing the batch and comparing that to the window refuses
+    /// a perfectly serviceable request — 100 RAG chunks of 300 bytes here, each ~100
+    /// tokens against an 8192-token model, ~1.2% of the window apiece.
+    ///
+    /// This is the case the sibling test below CANNOT see: its two texts EACH exceed the
+    /// window, so it passes under either rule. This one passes only under the per-item
+    /// rule, which is why the two are kept apart rather than merged.
+    #[test]
+    fn an_embed_batch_of_individually_small_texts_is_admitted() {
+        let payload = Payload::Embed {
+            texts: vec!["x".repeat(300); 100],
+        };
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&payload),
+            100,
+            "the figure the window bounds is the LARGEST single input (300 bytes ⇒ 100 \
+             tokens), not the batch total (30 000 bytes ⇒ 10 000 tokens)"
+        );
+        assert!(
+            matches!(
+                gate_verdict_for(&payload, 8_192),
+                crate::gates::GateVerdict::Admit
+            ),
+            "every item fits the window with room to spare, so the batch must be \
+             admitted — the remedy an over-refusal would offer (a larger-window model) \
+             is not even the right fix; splitting the batch is"
+        );
+    }
+
+    /// AC10, the media half — a Tts / ImageGenerate / VideoGenerate request admits EVERY
+    /// candidate, including one whose window is zero.
+    ///
+    /// `ModelConfig.context_window` is a chat-model concept: it is the provider-published
+    /// PROMPT limit of a language model. A speech, image or video model publishes no such
+    /// figure — what it publishes is a maximum prompt LENGTH in characters, a different
+    /// field this config does not have — so `context_window` on such an entry is filler,
+    /// and `0` is the natural thing an operator writes for "not applicable".
+    ///
+    /// Gating on it would therefore turn every request of those capabilities into a
+    /// terminal `AllGated` whose remedy ("route to a model with a larger context window")
+    /// names a lever that does not exist for the call. A zero window rather than a
+    /// realistic one for the same reason the Stt test uses zero: with any positive window
+    /// a broad range of wrong estimates still admits, and only an estimate of 0 admits
+    /// against 0.
+    #[test]
+    fn tts_image_and_video_requests_admit_even_a_zero_window_candidate() {
+        let long_prompt = "a".repeat(50_000);
+        let payloads = vec![
+            (
+                "tts",
+                Payload::Tts {
+                    text: long_prompt.clone(),
+                    voice: None,
+                    speed: None,
+                    output_format: crate::types::request::AudioFormat::Mp3,
+                },
+            ),
+            (
+                "image",
+                Payload::ImageGenerate {
+                    prompt: long_prompt.clone(),
+                    size: None,
+                    quality: None,
+                    style: None,
+                    n: 1,
+                },
+            ),
+            (
+                "video",
+                Payload::VideoGenerate {
+                    prompt: long_prompt.clone(),
+                    duration_secs: Some(10),
+                    resolution: Some("1080p".to_string()),
+                },
+            ),
+        ];
+        for (name, p) in &payloads {
+            assert!(
+                matches!(gate_verdict_for(p, 0), crate::gates::GateVerdict::Admit),
+                "{name}: a model's context window does not bound this payload kind, so \
+                 the window gate must never be the reason such a candidate is skipped"
+            );
+        }
     }
 
     /// AC6 + AC7 — the window estimate is >= the cost estimate for the same payload, and
@@ -569,25 +723,63 @@ mod tests {
         );
     }
 
-    /// AC7 + AC10 — the "never undercuts" guarantee holds for EVERY payload kind, not
-    /// just chat.
+    /// AC7 + AC10 — every payload kind's answer, pinned as an ABSOLUTE figure, and the
+    /// one kind where the "never undercuts the cost estimate" ordering applies.
     ///
-    /// The obvious way to write the pessimistic estimator is `Chat`/`Embed` arms and
-    /// `_ => 0`, and it is wrong: a Tts or ImageGenerate payload would then estimate 0
-    /// against a cost estimate of `chars/4`, breaking the ordering the gate relies on to
-    /// be safe. Non-chat payloads mirror `estimate_input_tokens` arm for arm, at `/3`.
-    /// Stt stays 0 in both because there is no text to measure — audio bytes are not
-    /// characters, and counting them would skip every candidate for a 30-second clip.
+    /// **This test used to assert that ordering for every kind, and that was wrong.** The
+    /// two functions answer different questions, and on two payload kinds they therefore
+    /// measure different QUANTITIES rather than the same quantity at two roundings:
+    ///
+    /// - `Embed` — the cost estimate sums the batch (every text is embedded and every
+    ///   text is billed); the window bounds one array ELEMENT, so this one takes the max.
+    ///   On a batch of many small texts the max is far BELOW the sum, and demanding
+    ///   `pess >= cost` there is demanding the over-refusal
+    ///   `an_embed_batch_of_individually_small_texts_is_admitted` exists to prevent.
+    /// - `Tts` / `ImageGenerate` / `VideoGenerate` — `context_window` does not bound them
+    ///   at all, so the honest answer is 0 and the ordering is vacuous. The old comment
+    ///   argued the opposite ("a `_ => 0` catch-all … inverts the one ordering the gate's
+    ///   safety rests on"); that argument assumed the window question applies, which is
+    ///   the thing in question.
+    ///
+    /// So the ordering is asserted where it is meaningful — `Chat`, where both functions
+    /// price the same single request — and every other arm is pinned by the exact number
+    /// it must return. Absolute figures rather than an ordering for the reason AC7 gives
+    /// generally: an ordering cannot see a divisor change, and here it also cannot see a
+    /// sum silently returning where a max belongs.
     #[test]
-    fn the_pessimistic_estimate_never_undercuts_the_cost_estimate_for_any_payload_kind() {
-        let payloads = vec![
-            ("chat", chat(vec![fs_write_tool()])),
-            (
-                "embed",
-                Payload::Embed {
-                    texts: vec!["some text to embed".into(), "and another".into()],
-                },
-            ),
+    fn each_payload_kind_is_measured_in_the_unit_its_window_bounds() {
+        // Chat: the SAME quantity as the cost estimate, and never below it.
+        let with_tools = chat(vec![fs_write_tool()]);
+        assert!(
+            estimate_input_tokens_pessimistic(&with_tools) >= estimate_input_tokens(&with_tools),
+            "chat: the window estimate must never undercut the cost estimate ({} < {}), \
+             which would admit a candidate the request does not fit",
+            estimate_input_tokens_pessimistic(&with_tools),
+            estimate_input_tokens(&with_tools)
+        );
+
+        // Embed: the LARGEST text, not the sum — and here that is strictly BELOW the
+        // cost estimate, which is the arm the old blanket ordering forbade.
+        let embed = Payload::Embed {
+            texts: vec!["some text to embed".into(), "and another".into()],
+        };
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&embed),
+            6,
+            "the largest of the two texts is 18 bytes ⇒ 6 tokens; the SUM would be 29 \
+             bytes ⇒ 10, and that is the figure the provider does not apply"
+        );
+        assert_eq!(
+            estimate_input_tokens(&embed),
+            7,
+            "while the COST estimate does sum them (29/4) — the two functions measure \
+             different quantities here, deliberately, and this pins that they do"
+        );
+
+        // The four kinds a context window does not bound. A long prompt on each, so a
+        // regression to `prompt.len()/3` cannot pass by rounding to zero.
+        let long = "a".repeat(50_000);
+        let unbounded: Vec<(&str, Payload)> = vec![
             (
                 "stt",
                 Payload::Stt {
@@ -599,7 +791,7 @@ mod tests {
             (
                 "tts",
                 Payload::Tts {
-                    text: "Hello world, this is a test!".to_string(),
+                    text: long.clone(),
                     voice: None,
                     speed: None,
                     output_format: crate::types::request::AudioFormat::Mp3,
@@ -608,7 +800,7 @@ mod tests {
             (
                 "image",
                 Payload::ImageGenerate {
-                    prompt: "A beautiful sunset over mountains".to_string(),
+                    prompt: long.clone(),
                     size: None,
                     quality: None,
                     style: None,
@@ -618,19 +810,18 @@ mod tests {
             (
                 "video",
                 Payload::VideoGenerate {
-                    prompt: "A timelapse of a blooming flower".to_string(),
+                    prompt: long.clone(),
                     duration_secs: Some(10),
                     resolution: Some("1080p".to_string()),
                 },
             ),
         ];
-        for (name, p) in &payloads {
-            let pess = estimate_input_tokens_pessimistic(p);
-            let cost = estimate_input_tokens(p);
-            assert!(
-                pess >= cost,
-                "{name}: the window estimate undercuts the cost estimate ({pess} < \
-                 {cost}), which would admit a candidate the request does not fit"
+        for (name, p) in &unbounded {
+            assert_eq!(
+                estimate_input_tokens_pessimistic(p),
+                0,
+                "{name}: a model's context window is not a bound on this payload kind, \
+                 so the gate must be given nothing to judge"
             );
         }
     }

@@ -1,10 +1,10 @@
 use super::*;
 use crate::test_support::{
-    CallLog, FIXTURE_MAX_OUTPUT_TOKENS, clamp_observing_gateway, content_gated_gateway,
-    demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
-    failing_after_gateway, final_response, metered_embed_gateway, metered_gateway,
-    metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
-    tool_call_response,
+    CallLog, FIXTURE_MAX_OUTPUT_TOKENS, TWO_WINDOW_BIG, TWO_WINDOW_SMALL, clamp_observing_gateway,
+    content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
+    echo_system_gateway, failing_after_gateway, final_response, metered_embed_gateway,
+    metered_gateway, metered_latency_gateway, prompt_recording_gateway, recording_gateway,
+    scripted_gateway, tool_call_response, two_window_chain_gateway, two_window_scripted_gateway,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -452,12 +452,26 @@ async fn phase_override_wins_over_base_route_through_from_config() {
 /// named one number — the chain's smallest window, possibly belonging to a model this
 /// request never wanted — and no remedy. The new one names the candidate, its own window,
 /// the estimate that exceeded it, and the lever.
+///
+/// # What the deletion DID change, asserted here because prose is not a guard
+///
+/// The old halt returned before the `if !*node_started` block in `agent_turn_output`, so
+/// an over-window node journaled `[RunStarted, NodeFailed]` and fired neither
+/// `on_node_started` nor `on_agent_turn`. Now the turn reaches dispatch, so the shape is
+/// `[RunStarted, NodeStarted, NodeFailed]` and both hooks fire for a turn that never
+/// reaches a provider. That is a real change to what every observer sees — `torii status`
+/// and `list_paused` read the journal, and any hook that counts or bills turns now counts
+/// this one — and it is the intended shape: a node that reached dispatch IS started, and
+/// a turn that was attempted IS a turn. Pinning it here means re-introducing any
+/// pre-dispatch halt reddens on the property rather than only on message wording.
 #[tokio::test]
 async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis() {
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
+    let hooks = RecordingHooks::default();
     let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
         .with_registry(over_window_agent_registry())
+        .with_hooks(Arc::new(hooks.clone()))
         .with_tools(Arc::new(ToolRegistry::default()));
 
     let graph = Graph {
@@ -491,6 +505,105 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
         0,
         "and it still halts before spending — selection refuses the request, so no \
          adapter is reached"
+    );
+
+    // The journal shape the deletion changed: the node is STARTED and then fails, where
+    // the pre-dispatch halt produced a `NodeFailed` with no `NodeStarted` before it.
+    let kinds: Vec<&'static str> = journal
+        .load(run)
+        .await
+        .expect("load")
+        .iter()
+        .map(|(_, e)| match e {
+            JournalEvent::RunStarted { .. } => "RunStarted",
+            JournalEvent::NodeStarted { .. } => "NodeStarted",
+            JournalEvent::NodeFailed { .. } => "NodeFailed",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["RunStarted", "NodeStarted", "NodeFailed"],
+        "a node that reaches dispatch is STARTED first — this is the shape a resume and \
+         a `torii status` see, and the pre-dispatch halt used to skip the middle event"
+    );
+
+    // And the hook contract: both fire for a turn that never reaches a provider.
+    let log = hooks.log();
+    assert!(
+        log.contains(&"node_started(n1)".to_string()),
+        "on_node_started fires for an over-window node: {log:?}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.as_str() == "agent_turn(n1,0)")
+            .count(),
+        1,
+        "and on_agent_turn fires exactly once for the turn that was attempted — any \
+         hook that counts or bills turns now counts this one: {log:?}"
+    );
+}
+
+/// AC1's SUCCESS half, at the executor boundary — a chain `[small, big]` serves a prompt
+/// only `big` can hold, and the dispatch really goes to `big`.
+///
+/// The failure half is everywhere in this file; this half was proven only inside
+/// `sensei-gateway`, and the pre-check AC1 is about ("where today it fails terminally")
+/// was the ORCHESTRATOR's. `single_chain_config` has one chat model, so no orchestrator
+/// test could express "over the chain minimum but under the primary's window" at all
+/// until [`two_window_chain_config`] existed. Without this, a partially re-introduced
+/// chain-minimum check would be caught only incidentally, by the wording of the failure
+/// tests.
+///
+/// The system prompt is sized from the fixture's own constants rather than a literal, so
+/// the test states its arithmetic: over `TWO_WINDOW_SMALL`, well under `TWO_WINDOW_BIG`.
+#[tokio::test]
+async fn a_prompt_over_the_chain_minimum_is_served_by_the_larger_model() {
+    // `chars/3` bytes past the small window, with a wide margin so a change to the
+    // estimator's constant does not silently move this fixture to the wrong side.
+    let system = "x".repeat((TWO_WINDOW_SMALL as usize) * 3 * 4);
+    let est = system.len().div_ceil(3) as u32;
+    assert!(
+        est > TWO_WINDOW_SMALL && est < TWO_WINDOW_BIG,
+        "the fixture must sit BETWEEN the two windows or it proves nothing: {est} \
+         against {TWO_WINDOW_SMALL} / {TWO_WINDOW_BIG}"
+    );
+
+    let (gateway, calls) = two_window_chain_gateway().await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(Arc::new(Registry::default().with_agent(AgentDefinition {
+            system_prompt: system,
+            ..agent_def("c")
+        })))
+        .with_tools(Arc::new(ToolRegistry::default()));
+
+    let run = RunId(uuid::Uuid::new_v4());
+    let outcome = exec
+        .run(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("run yields an outcome");
+    assert!(
+        outcome.failed.is_none(),
+        "the 200k model can hold this prompt, so the node must COMPLETE — a \
+         chain-minimum check anywhere would refuse it against `small`'s 4096: {:?}",
+        outcome.failed
+    );
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect::<Vec<_>>(),
+        vec![Some("big".to_string())],
+        "and exactly one dispatch, to `big` — `small` is the priority-1 entry, so this \
+         is only true because the window gate removed it"
     );
 }
 
@@ -24147,23 +24260,36 @@ fn over_window_agent_registry() -> Arc<Registry> {
 /// That is the whole of what this slice buys, and it is a better-diagnosed terminal
 /// failure rather than a recoverable one (`AllGated` with no timed gate does not pause).
 ///
-/// On a BUDGETED run it does NOT reach the gate, and deleting the orchestrator's
-/// pre-check does not change that. The SP-DATA-5 clamp runs first
+/// On a BUDGETED run it does NOT reach the gate. The SP-DATA-5 clamp runs first
 /// (`executor/dispatch.rs`) and bounds `max_tokens` by `min_context_window(chain) − est`
 /// — the chain MINIMUM, the very figure this slice exists to stop trusting — then
 /// refuses with `Refusal::BudgetExhausted { cause: BelowFloor }` when the resulting
-/// ceiling falls under `MIN_OUTPUT_TOKENS`. So the run PAUSES on the budget and the
-/// operator is pointed at a cap raise that cannot help, which the clamp's own comment
-/// already records as a known gap.
+/// ceiling falls under `MIN_OUTPUT_TOKENS`.
+///
+/// # Deleting the pre-check DID change this arm, and an earlier version of this comment
+/// # said it did not
+///
+/// The halt ran in `agent_turn_output` BEFORE `dispatch_metered`, so on a budgeted run it
+/// fired first and the outcome was a terminal `NodeFailed` ("prompt over budget at node
+/// n1 turn 0: est 25000 > window 4096"). With it gone the clamp gets there first and the
+/// run PAUSES instead — a different outcome class, and one that cannot be cleared by the
+/// lever the pause used to name: the window term never reads the cap, so the same refusal
+/// arrives at a cap of 1e6, 1e8 or `i64::MAX`, and an operator who does what a budget
+/// pause asks re-pauses forever.
+///
+/// The refusal's WORDING is fixed rather than the flip: when the window is the binding
+/// term the message now says so and says a raise will not help, which is asserted below.
+/// The pause CLASS is deliberately kept — `RunPaused { resume_after: None }` is SP-DATA-3's
+/// HOTL class, and it preserves the run for an operator who widens the chain, where a
+/// `NodeFailed` destroys it. Moving the clamp's window term to the SELECTED candidate is
+/// the real fix and is the clamp spec's own §8 item; it needs selection to have happened
+/// first, so it is not this slice's.
 ///
 /// Both halves are asserted here so the boundary is a fact in the suite rather than a
 /// paragraph in a spec, and so the pause/fail split cannot drift without a red test. The
 /// unbudgeted arm asserts only the OUTCOME KIND, because
 /// [`an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis`] already
 /// pins the message; what is under test here is that the two runs end differently at all.
-///
-/// Moving the clamp's window term to the SELECTED candidate is the clamp spec's own §8
-/// item — it needs selection to have happened first — and is not this slice's to fix.
 #[tokio::test]
 async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked() {
     let graph = Graph {
@@ -24221,16 +24347,23 @@ async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked(
         .expect("the budgeted run pauses on the clamp rather than failing on the window");
     assert_eq!(pause.node.0, "n1");
     assert!(
-        pause.reason.contains("budget"),
-        "the clamp's refusal is worded as a budget problem even though the WINDOW is \
-         the binding term — the known gap, pinned so a fix to it reddens here rather \
-         than passing unnoticed: {}",
+        pause.reason.starts_with("context window: "),
+        "the WINDOW is the binding term here — the cap is 1 000 000 and the run has \
+         spent nothing — so the refusal must say so rather than reading as a budget \
+         problem: {}",
         pause.reason
     );
     assert!(
-        !pause.reason.contains("context window"),
-        "and it says nothing about the window, which is exactly why AC1 does not hold \
-         on a budgeted run: {}",
+        pause.reason.contains("4096"),
+        "and name the window that bound it, which is the number an operator has to \
+         change: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains("--budget-tokens"),
+        "and it must NOT point at a cap raise: the window term never reads the cap, so \
+         the identical refusal arrives at any cap whatever and an operator who raises \
+         it re-pauses on the same node forever: {}",
         pause.reason
     );
     assert!(
@@ -24241,6 +24374,33 @@ async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked(
     assert!(
         calls_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "neither path spends"
+    );
+
+    // The claim that the cap is irrelevant, as an experiment rather than an assertion
+    // about one number: an astronomically larger budget produces the SAME refusal. This
+    // is what makes "raising the cap cannot help" a measurement.
+    let (gateway_c, _calls_c) = clamp_observing_gateway(10, 100).await;
+    let journal_c = InMemoryJournal::new();
+    let run_c = RunId(uuid::Uuid::new_v4());
+    journal_c
+        .append(run_c, run_started_with_budget(u64::MAX / 2))
+        .await
+        .unwrap();
+    let out_c = Executor::new(Arc::new(gateway_c), Arc::new(journal_c.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .start(run_c, &graph)
+        .await
+        .expect("drives");
+    let pause_c = out_c
+        .paused
+        .as_ref()
+        .expect("a colossal cap does not help either");
+    assert!(
+        pause_c.reason.starts_with("context window: "),
+        "the same refusal at a cap of {} — the window term subtracts the estimate from \
+         the chain's smallest window and never looks at the budget: {}",
+        u64::MAX / 2,
+        pause_c.reason
     );
 }
 
@@ -24270,9 +24430,20 @@ async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked(
 /// it claims to catch. So run 1 dies at turn 1 with turn 0 already journaled, and run 2
 /// re-enters the loop, recomputes turn 0's key, and must find it equal.
 ///
-/// Run 2's gateway also answers as a DIFFERENT model, which is the "selection may
-/// differ" half: the memo key covers the CHAIN string, not the model that served it, so
-/// a drive routed elsewhere within the same chain still replays.
+/// # How "selection may differ" is made REAL rather than labelled
+///
+/// This half used to be a scripted response carrying `model: "a-different-model"`, and it
+/// was inert twice over: the label is the adapter's own answer, not selection's, and
+/// `single_chain_config`'s chain `"c"` has exactly ONE chat model, so selection could not
+/// have differed in that fixture however it was driven.
+///
+/// So run 2 runs against [`two_window_chain_config`] instead, where the same chain name
+/// `"c"` resolves to `small`/`big` rather than `m` — the shape a config reload between
+/// two processes produces, and the case SP-DATA-2's durable config generation exists for.
+/// The `CallLog` records the RESOLVED model per dispatch, so the assertions below show
+/// run 1 served by `m` and run 2 by `small` with the memo key unchanged across them. That
+/// is the structural claim stated as an observation: `agent_input_hash` covers
+/// `{chain, system, messages, tools}` and no code path puts a model into it.
 #[tokio::test]
 async fn an_agent_turn_replays_from_its_memo_though_selection_may_differ() {
     use kernel::types::io::ChatResponse;
@@ -24300,19 +24471,24 @@ async fn an_agent_turn_replays_from_its_memo_though_selection_may_differ() {
         .expect("run 1 yields an outcome");
     assert!(out1.failed.is_some(), "run 1 dies at turn 1");
     assert_eq!(
-        calls1.lock().unwrap_or_else(|e| e.into_inner()).len(),
-        2,
-        "run 1 called the gateway for turn 0 and the failing turn 1"
+        calls1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect::<Vec<_>>(),
+        vec![Some("m".to_string()), Some("m".to_string())],
+        "run 1 called the gateway for turn 0 and the failing turn 1, both served by `m`"
     );
 
-    // Run 2: a fresh gateway over the SAME journal, serving only turn 1 — and answering
-    // as `a-different-model`, standing in for a drive that selected another candidate
-    // from the same chain.
-    let (gw2, calls2) = scripted_gateway(vec![ChatResponse {
+    // Run 2: a fresh gateway over the SAME journal and the SAME chain name, but a config
+    // in which `"c"` resolves to a different model table — what a config reload between
+    // two processes looks like from the executor's side. Serving only turn 1.
+    let (gw2, calls2) = two_window_scripted_gateway(vec![ChatResponse {
         content: Some("the answer is 5".into()),
         tool_calls: Vec::new(),
         usage: None,
-        model: Some("a-different-model".into()),
+        model: None,
         degraded: false,
     }])
     .await;
@@ -24328,11 +24504,22 @@ async fn an_agent_turn_replays_from_its_memo_though_selection_may_differ() {
          recomputed key equals the journaled one: {:?}",
         out2.failed
     );
+    // Bound to a local BEFORE the assertion, and that is not style. `assert_eq!` binds
+    // `&$left` for the whole match, so a guard taken inside `$left` is still held when
+    // the failure branch formats its arguments — a second `calls2.lock()` there
+    // DEADLOCKS the test process instead of reporting the mismatch. Found the hard way:
+    // a mutation run of this very test hung for 60 s rather than failing.
+    let run2_models: Vec<Option<String>> = calls2
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(model, _)| model.clone())
+        .collect();
     assert_eq!(
-        calls2.lock().unwrap_or_else(|e| e.into_inner()).len(),
-        1,
-        "turn 0 replayed from its memo — the single call is turn 1's: {:?}",
-        calls2.lock().unwrap_or_else(|e| e.into_inner())
+        run2_models,
+        vec![Some("small".to_string())],
+        "turn 0 replayed from its memo — the single call is turn 1's, and selection \
+         really did land on a DIFFERENT model than run 1's `m` while the memo key held"
     );
 
     // And it was replayed rather than re-run: turn 0's model effect appears in exactly

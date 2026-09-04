@@ -594,7 +594,18 @@ pub(crate) fn classify_gateway_error(
             ..
         } => GatewayDisposition::Pause {
             resume_after: *t,
-            reason: format!("all candidates gated; resume after {t}"),
+            // `err.to_string()`, exactly as the `Fail` arm below does, and NOT a
+            // hand-built sentence naming only the deadline. `AllGated`'s `Display`
+            // renders the per-candidate skips and the remedy, and this string is what
+            // gets journaled into `RunPaused` and read back by `torii status` — so a
+            // string that names only `t` told the operator strictly LESS about a
+            // recoverable pause than about a terminal failure. It matters more since
+            // SP-7a: `all_gated_error` now keeps a `human_action` beside a `resume_after`
+            // (a chain with one breaker-open candidate and one whose window is too small
+            // yields both), and the whole point of keeping it is that waiting will not
+            // fix the second half. Dropping it here would have made that change invisible
+            // on the one path it was made for.
+            reason: err.to_string(),
         },
         other => GatewayDisposition::Fail(other.to_string()),
     }
@@ -1437,6 +1448,38 @@ mod tests {
             } => {
                 assert_eq!(resume_after, t);
                 assert!(reason.contains(&t.to_string()), "reason names t: {reason}");
+            }
+            d => panic!("expected Pause, got {d:?}"),
+        }
+        // A PAUSE carries the per-candidate diagnostics and the remedy too, and this is
+        // what makes SP-7a's `all_gated_error` change reach anybody. That function now
+        // keeps `human_action` beside a `resume_after` — a chain with one breaker-open
+        // candidate and one whose window is too small yields both — but this reason is
+        // what gets journaled into `RunPaused` and read back by `torii status`, so a
+        // hand-built string that names only the instant discards the whole diagnosis at
+        // the last step. The FAIL arm below has always used `err.to_string()`; the pause
+        // arm did not, which meant the recoverable case told the operator strictly less
+        // than the terminal one.
+        match classify_gateway_error(&GatewayError::AllGated {
+            resume_after: Some(t),
+            skipped: vec![
+                "noop:small — circuit breaker open".to_string(),
+                "noop:big — estimated 200000 input tokens exceeds the model's \
+                 128000-token context window"
+                    .to_string(),
+            ],
+            human_action: Some(HumanAction::UseLargerContextWindow),
+        }) {
+            GatewayDisposition::Pause { reason, .. } => {
+                assert!(
+                    reason.contains("128000-token context window"),
+                    "the paused run's durable reason must carry each candidate's own \
+                     diagnosis: {reason}"
+                );
+                assert!(
+                    reason.contains("larger context window"),
+                    "and the remedy, which no amount of waiting supplies: {reason}"
+                );
             }
             d => panic!("expected Pause, got {d:?}"),
         }

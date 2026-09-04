@@ -794,6 +794,9 @@ Remove the now-unused `over_budget` / `est_prompt_tokens` imports if nothing els
 `cargo clippy -D warnings` will name them.
 
 **Leave `over_budget` and `est_tokens` in `agent/prompt.rs` alone unless clippy reports them dead.**
+*(Superseded: clippy CANNOT report either — both are `pub` in a `pub mod`, so `dead_code` never
+fires. `over_budget` was deleted in Task 6 on judgement; `est_tokens` was deleted in the review
+round for the same reason. See the Task 5-6 notes below.)*
 If they become dead, delete them and say so; a function kept only because it might be wanted is the
 thing this codebase argues against.
 
@@ -864,13 +867,19 @@ that way it stayed GREEN with `SystemTime::now()` folded into the hashed string.
 now a MID-node crash (turn 0 journaled, turn 1 dies on an exhausted script), and the same
 mutation produces `DeterminismViolation { node: "n1" }`.
 
-**Two helpers died with the halt and were deleted:** `executor::support::est_prompt_tokens`
-(clippy named it) and `agent::prompt::over_budget` — which *was* the chain-minimum check,
-so keeping it would leave a second window check available to be called beside the
-per-candidate one. **`agent::prompt::est_tokens` survives with NO production caller**; its
-doc now says so outright rather than letting a reader infer one from its presence. Worth a
-decision in Task 7 or later: it is retained as the prose baseline `est_tokens_pessimistic`'s
-bias is defined against, and the tests compare the two.
+**Three helpers died with the halt.** `executor::support::est_prompt_tokens` (clippy named
+it) and `agent::prompt::over_budget` — which *was* the chain-minimum check, so keeping it
+would leave a second window check available to be called beside the per-candidate one —
+went with Task 6. `agent::prompt::est_tokens` shipped one commit longer, documented as
+having no production caller, and **the review round deleted it too**: `pub` in a `pub mod`
+hides it from `dead_code`, so clippy could never report what it had become, and the commit's
+own argument against keeping `over_budget` ("a function kept because it might be wanted
+again is exactly the kind of thing that gets called again by mistake") applies with more
+force to the `chars/4` UNDER-count the window check's whole failure history came from. The
+"prose baseline" justification did not survive either — `est_tokens_pessimistic` is
+`chars/3` outright rather than a multiplier on it, so the two were already independent. Its
+two tests went with it, the ordering one subsumed by an absolute assertion in
+`the_pessimistic_estimate_is_chars_over_three_rounded_up`.
 
 **The two reddened orchestrator tests were both updated in place, and one was removed:**
 
@@ -878,13 +887,22 @@ bias is defined against, and the tests compare the two.
 |---|---|
 | `agent_node_halts_over_budget_before_any_gateway_call` | **Renamed** `an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis`. Same fixture, same two claims (fails the node; zero provider calls — selection refuses before an adapter is reached). New wording, plus assertions on the window, the estimate and the remedy the old message never carried. |
 | `oversized_dependency_context_halts_over_budget_never_truncates` | **Kept, name and all.** Its invariant is "never silently truncated" and it is untouched: the model path's `## Context` is unbounded. Only who NOTICES moved, so the assertion now requires the halt to name the window rather than say "over budget", which read as a money problem. |
-| `prompt::tests::over_budget_true_when_estimate_exceeds_window_and_false_otherwise` | **Removed with the function.** It asserted a chain-MINIMUM answer, which is the thing replaced rather than a property that moved. Its two cases have homes in the gateway: `gates::context_window::over_window_skips_and_under_window_admits` (per candidate, so one request gets two answers) and `no_estimate_admits`. |
+| `prompt::tests::over_budget_true_when_estimate_exceeds_window_and_false_otherwise` | **Removed with the function.** It asserted a chain-MINIMUM answer, which is the thing replaced rather than a property that moved. Its "tiny window → over" and "large window → not over" cases are `gates::context_window::over_window_skips_and_under_window_admits` (per candidate, so one request gets two answers). Its third case — "unknown window (`min_context_window` → `None`) → never a hard fail" — is **unreachable post-slice, not relocated**: the gate reads a resolved candidate's `ModelConfig.context_window`, a plain required `u32`, so there is no absent-window branch to have. *(Corrected by review: this row and the tombstone comment both said the case "is `no_estimate_admits`", which covers an absent ESTIMATE and is a different question.)* The only surviving consumer of an OPTIONAL window is the SP-DATA-5 clamp's chain fold in `executor/dispatch.rs` (`(a, b) => a.or(b)`), untouched here. |
 
 **Step 0's boundary is now a test**, `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`:
 unbudgeted ⇒ the gateway gates and the node FAILS; budgeted ⇒ the SP-DATA-5 clamp refuses
-first and the run PAUSES on a budget message that says nothing about the window. Proven
-non-vacuous by dropping the clamp's window term (`(Some(a), Some(b)) => Some(a)`), which
-makes the budgeted arm fail instead of pause.
+first and the run PAUSES. Proven non-vacuous by dropping the clamp's window term
+(`(Some(a), Some(b)) => Some(a)`), which makes the budgeted arm fail instead of pause.
+
+**Corrected by review: that pause is an outcome-class FLIP, not a no-op.** The deleted halt
+ran before `dispatch_metered`, so a budgeted over-window run used to end in a terminal
+`NodeFailed` naming the window; now it ends in a `RunPaused` that named the cap — measured
+identically at 1e6, 1e8 and `u64::MAX`, because the window term never reads the cap. The
+test had been pinning the misleading message (`assert!(!reason.contains("context window"))`).
+Fixed by making the clamp's `BelowFloor` refusal carry the binding window and say so:
+`"context window: … the budget is not the binding term … no cap raise clears this"`, with no
+`--budget-tokens` remedy. The pause CLASS is kept deliberately (see the spec's §8). Pinned by
+mutating `binding_window` to `None`, which restores the budget wording and reddens.
 
 ---
 
@@ -917,7 +935,21 @@ Baseline **16**. Higher means this slice added broken links.
   SP-7a as shipped, and that SP-7's original bundle is now three slices (a: selection, b: context
   budgeting, c: semantic activation) with the reason for the split.
 - **`docs/features/orchestrator/agents-skills-tools.md`** — check whether it describes the
-  over-window behaviour; if it does, it is now wrong.
+  over-window behaviour; if it does, it is now wrong. *(It did, in three places: `:62`, `:247`
+  ("per-turn window budgeting (`over_budget`)" listed as an implemented Slice 2 component) and
+  `:260`. All three rewritten in the review round.)*
+- **`docs/features/orchestrator/shared-context.md:31-32`** — "over-budget currently halts loud via
+  `PromptOverBudget`, never truncates". Named explicitly because the generic grep bullet below is
+  the only thing that would have caught it, and a partial Task 7 would have shipped it. Rewritten.
+- **`crates/orchestrator/src/executor/dispatch.rs`** — THREE comments describe `over_budget` /
+  `est_prompt_tokens` as live code (`:155`, `:174-179`, `:491`). The `:174` paragraph is a whole
+  design rationale ("deliberately NOT shared … those want the opposite bias") resting on a function
+  that no longer exists, and its argument is wrong twice over: the successor estimator wants the
+  SAME bias and counts `tool_calls` too. The real reason the two are separate is the crate
+  dependency direction. All three rewritten in the review round.
+- **`crates/gateway/src/engine/mod.rs`** — `min_context_window`'s doc ("used by the agent runtime
+  … selection is untouched") is false in both halves after Tasks 5 and 6. Rewritten to name the
+  SP-DATA-5 clamp as its one production caller.
 - Grep for other surfaces: `rg -n 'PromptOverBudget|min_context_window|over_budget' --no-ignore -g '!target' crates/ docs/`
 
 - [ ] **Step 4: Checkpoint**

@@ -28,8 +28,9 @@ source: crates/orchestrator*
 > rather than mixing).
 >
 > **Deferred:** agent-facing `read_context`/`write_context` tools; active
-> summarize/select budgeting (over-budget currently halts loud via
-> `PromptOverBudget`, never truncates); `Scope::Node`/`Plan` reads + per-agent
+> summarize/select budgeting (SP-7b — an over-window prompt is currently refused at
+> SELECTION by the gateway's `ContextWindowGate`, never truncated; the orchestrator's
+> own `PromptOverBudget` halt was deleted by SP-7a); `Scope::Node`/`Plan` reads + per-agent
 > private scratch; TTL/as-of freshness; unifying `Consolidate`'s `prior_outputs`
 > threading onto the blackboard; concurrent-write policies beyond reject.
 
