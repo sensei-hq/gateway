@@ -8,9 +8,9 @@
 `9bda14d` The refusal's remedy was false the same way twice. "Put a model with a larger
 window in this chain" cannot clear it: the term is `min { w : w >= est }` and adding to a set
 cannot RAISE its minimum — one prompt down `{4096}` and `{4096, 200 000}` gives byte-identical
-refusals. It now names the guaranteed remedy, and a TIE names `max_output_tokens` as co-cause.
-Cap-independence went unpinned when the two-cap drive moved to the gate path — two mutations
-passed all 427 tests. `becbf17` Docs: the overview's "bias-flip is GONE" was a non-sequitur
+refusals. It now names the guaranteed remedy; a TIE names `max_output_tokens` as co-cause; and
+cap-independence, unpinned when the two-cap drive moved to the gate path, is pinned (two
+mutations had passed all 427 tests). `becbf17` Docs: "the bias-flip is GONE" was a non-sequitur
 (bytes ≥ chars ⇏ ≥ true tokens) contradicting `dispatch.rs`; the module README kept the
 chain-minimum formula; a renamed test's dead citation hid the unpinned property.
 
@@ -23,10 +23,9 @@ same state. `dfe33d0` records it on all ten doc surfaces that stated the old rul
 
 ## Verified
 
-`cargo test --workspace` **1721 passed / 0 failed / 56 ignored, exit 0** · `clippy
---all-targets -D warnings` 0 · `fmt --check` 0 · `cargo doc` private-item unresolved links
-**16 = baseline**. Every new test mutation-verified; the M1 arm reddens both new tests when it
-pauses with a deadline instead of NULL.
+`cargo test --workspace` **1721 passed / 0 failed / 56 ignored, exit 0** · `clippy -D warnings`
+0 · `fmt --check` 0 · `cargo doc` private-item unresolved links **16 = baseline**. Every new
+test mutation-verified; the M1 arm reddens both when it pauses with a deadline instead of NULL.
 
 ## Next
 
@@ -38,4 +37,4 @@ did not), then SP-7c. A develop→main PR when wanted.
 `both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` failed ONCE; its
 `Interest`-cache diagnosis is **DISPROVEN by three probes**, so no fix shipped; the panic now
 dumps every record. Deferred: a sub-floor `min_max_output_tokens` alone renders as the BUDGET
-arm. **Sensei daemon NOT running — this file is the only record.**
+arm. **Sensei daemon NOT running — this file is the only durable record.**
