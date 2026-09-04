@@ -1253,6 +1253,26 @@ KNOWN FAILING, resolved in the guard-test task:
 
 ### Task 6: The replay property (AC4) — the slice's central claim
 
+> **DONE, in Task 5's review round — do not write it twice.** Review found that NOTHING pinned
+> either half of the replay mechanism (the append and the read could both be deleted with the whole
+> suite green), and the unpinned failure mode is the unrecoverable one, so this task was pulled
+> forward rather than deferred. `a_budgeted_turn_replays_after_the_window_changes_underneath_it`
+> exists with the name below, and it asserts more than this task specified: one `ContextBudgeted`
+> row across BOTH drives, one `EffectRecorded` for turn 0, zero re-spend, and the row still
+> carrying drive 1's `source_window`.
+>
+> Two deviations from the sketch below, both forced by the fixtures:
+> - `window_chain_config(64_000, 8_192)` does not exist and `update_config` on the drive-1 gateway
+>   cannot re-script the adapter, so drive 2 runs a SECOND gateway over
+>   `wide_window_scripted_gateway(300_000, …)` — a real config swap, and one WIDE enough to serve
+>   drive 1's cut so the resume COMPLETES rather than merely not-dying.
+> - Drive 1 must die mid-node (script exhausted at turn 1), or the completed run short-circuits the
+>   resume and the hash is never recomputed — the same trap
+>   `an_agent_turn_replays_from_its_memo_though_selection_may_differ` records.
+>
+> Its complement was added beside it: `an_unbudgeted_turn_replays_after_the_window_shrinks_under_it`,
+> for the case AC4 does not cover and the spec had missed (see §4.1).
+
 **Files:**
 - Test: `crates/orchestrator/src/executor/tests.rs`
 
