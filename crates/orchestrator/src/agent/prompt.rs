@@ -515,8 +515,18 @@ fn context_section_overhead(entries: &[(String, String)]) -> usize {
 ///   budget EVENLY and never redistributes an unused share (spec §5.2 records that as an
 ///   inherited limitation) — a 10-byte dependency beside a 10-KiB one leaves half the budget
 ///   unspent, and the retained total lands under a floor this arithmetic had reserved for;
-/// - and it reserves conservatively, so it can demand a few dozen bytes per entry more than the
-///   render needs, which costs at most one further dropped schema.
+/// - and it reserves conservatively, so it can demand more bytes than the render needs. **How
+///   much more grows with the ENTRY COUNT, and nothing bounds what that costs.** The
+///   over-reservation is about one marker width per entry plus `entries.len() - 1` for the
+///   remainder the even split discards, so it scales with `n`; the schemas it pays for are sized
+///   independently of `n`. A wide-but-shallow context — many small dependencies — can therefore
+///   over-reserve by enough to drop several schemas that would have fitted.
+///
+///   An earlier revision of this sentence said the over-reservation "costs at most one further
+///   dropped schema". That was a quantified claim with nothing behind it and it is false for any
+///   `n` where `n × marker_width` approaches a schema's size. Recorded rather than quietly
+///   deleted because it was introduced by the commit that FIXED the unit mismatch above — the
+///   third time in this slice's history that a fix shipped a fresh false claim.
 ///
 /// So a caller must handle a post-render floor failure rather than treating a plan as proof of
 /// fit.
@@ -997,10 +1007,42 @@ mod tests {
         }
     }
 
+    /// The overhead subtraction saturates, and that choice only shows at a floor of ZERO.
+    ///
+    /// `plan_budget`'s comment argues the saturation "only changes the ANSWER when the floor is
+    /// `0`" — with any larger floor, `0 >= floor` is false and the loop keeps dropping either way.
+    /// That reasoning is correct and was UNPINNED: the fix commit claimed every new arithmetic
+    /// term was mutation-pinned and this term was not, so the claim was true of three terms out of
+    /// four. This is the fourth.
+    ///
+    /// The case: a context section whose headings alone exceed the available room, with no body
+    /// bytes to retain (`requested == 0`, so `floor == 0`). Saturating yields `0 >= 0` and a plan;
+    /// a `checked_sub` there would yield `None` and REFUSE the turn because its headings did not
+    /// fit — refusing over nothing, when whether the headings survive is the renderer's own final
+    /// clamp to answer.
+    #[test]
+    fn a_zero_floor_is_not_refused_when_only_the_overhead_does_not_fit() {
+        // One entry with an EMPTY body: `requested == 0` ⇒ `floor == 0`, while the section still
+        // costs `"\n\n## Context"` plus a `### k` heading. Room is deliberately under that.
+        let entries = vec![("k".to_string(), String::new())];
+        let plan = plan_budget(4, 0, &[], &entries)
+            .expect("a zero floor must not be refused because the HEADINGS do not fit");
+        assert_eq!(
+            plan.context_budget_bytes, 4,
+            "and the budget is the room that was actually available — the renderer's own final \
+             clamp decides what survives of the headings"
+        );
+    }
+
     /// The window arithmetic: the reserve comes off the top, the transcript next, and what is
     /// left becomes bytes.
     ///
-    /// What this pins is THIS crate's `× 3` and the two `None` boundaries — nothing more. It does
+    /// What this pins is THIS crate's `× 3`, the two `None` boundaries, and — as a side effect of
+    /// deriving `11_232` from `(4096 - 256 - 96) × 3` — `MIN_OUTPUT_TOKENS == 256` as a hard
+    /// literal. That last one is worth naming rather than leaving as a surprise: changing the
+    /// output reserve reddens this test, which is correct but will read as unrelated. An earlier
+    /// revision of this paragraph said "nothing more", which was false precision of the same kind
+    /// it was written to correct. It does
     /// NOT hold that multiplier to `estimate_input_tokens_pessimistic`'s divisor: the estimator is
     /// never called here, so `11_232` is a hand-derived literal and a gateway that started
     /// dividing by something else would leave this green. That claim was made here twice and was

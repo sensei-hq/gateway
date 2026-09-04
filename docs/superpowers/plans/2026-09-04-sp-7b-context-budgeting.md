@@ -1004,7 +1004,7 @@ Replace the `let (system, tools) = parts.join();` line with:
                     available as usize,
                     parts.authored.len(),
                     &parts.tools,
-                    requested_context_bytes,
+                    &parts.context,
                 )
                 .ok_or_else(|| OrchestratorError::Internal {
                     message: format!(
@@ -1079,7 +1079,7 @@ Replace the `None` arm's body with:
                             available,
                             parts.authored.len(),
                             &parts.tools,
-                            requested_context_bytes,
+                            &parts.context,
                         ) else {
                             return Ok(self
                                 .pause_context_floor(run, node_id, w, requested_context_bytes, 0)
@@ -1677,7 +1677,7 @@ AC9 → Task 5 step 6 + Task 8 step 1. AC10 → Task 7. AC11 → Task 7 step 6. 
 **Type consistency:** `BudgetPlan { context_budget_bytes: usize, dropped_tools: Vec<String> }` and
 `ContextCut { requested_bytes, retained_bytes, deps_shown, deps_total }` are defined in Task 2 and
 used unchanged in Tasks 3, 5 and 7. `available_context_bytes(u32, u32) -> Option<usize>`,
-`plan_budget(usize, usize, &[ToolDefinition], usize) -> Option<BudgetPlan>` and
+`plan_budget(usize, usize, &[ToolDefinition], &[(String, String)]) -> Option<BudgetPlan>` and
 `retained_meets_floor(usize, usize) -> bool` are consistent across every use.
 `ContextBudgeted.budget_bytes` is `u64` in the journal and cast at both boundaries, which is
 deliberate — journal integers are `u64` throughout — and the casts are named in Task 5.
@@ -1703,3 +1703,17 @@ deliberate — journal integers are `u64` throughout — and the casts are named
   `.expect("config swap")` would not have compiled. The plan now also says why that method is the
   right one for the test: it is the unvalidated swap, which is the path an operator's edit takes and
   the one the fence cannot see.
+
+**Amended 2026-09-04 after Task 2's review — `plan_budget` takes the ENTRIES, not a byte total.**
+Its real signature is
+`plan_budget(available_bytes: usize, authored_bytes: usize, tools: &[ToolDefinition], entries: &[(String, String)]) -> Option<BudgetPlan>`.
+Task 2's review found the original signature caused a UNIT MISMATCH: the floor is a fraction of the
+raw entry BODIES, but the budget the renderer consumes bounds the whole rendered SECTION — the
+`"\n\n## Context"` head, a `### {key}` heading per entry and a truncation marker per truncated entry
+all come out of it. A plan approved AT the floor therefore rendered BELOW it (one 1000-byte
+dependency approved at 250 retained 189), and the schema-drop loop stopped as soon as the SECTION
+bytes cleared a BODY-byte floor — **turning turns that could have been degraded into refusals**,
+which is the opposite of this slice's purpose. Taking the entries lets the planner subtract
+`context_section_overhead` and compare in the floor's own unit. Task 5's two call sites above pass
+`&parts.context`. The Task 1 test's `plan_budget(900, 0, &tools, 500)` at line 239 is illustrative
+only and its 4th argument is stale; use entries whose bodies sum to the intended figure.
