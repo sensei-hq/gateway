@@ -335,10 +335,28 @@ impl Gateway {
     /// `openai_compat/mod.rs`). So the clamp bounds itself by this before emitting.
     ///
     /// `min` over the chain rather than the selected model's own figure, for exactly the
-    /// reason `min_context_window` takes a `min`: the caller sets `max_tokens` before
-    /// selection, a request that fails over lands on a DIFFERENT entry, and a value the
-    /// fallback model would reject turns a survivable failover into a hard 400. The
-    /// smallest limit in the chain is the only one safe for every entry in it.
+    /// reason [`Self::min_serving_context_window`] takes a `min`: the caller sets
+    /// `max_tokens` before selection, a request that fails over lands on a DIFFERENT
+    /// entry, and a value the fallback model would reject turns a survivable failover
+    /// into a hard 400. The smallest limit in the chain is the only one safe for every
+    /// entry in it.
+    ///
+    /// **But it is a `min` over the WHOLE chain, where its window sibling folds over a
+    /// SUBSET, and that asymmetry is forced rather than chosen.** The serving-window bound
+    /// can narrow to `{ m : m.context_window >= est }` only because
+    /// [`gates::context_window::ContextWindowGate`] skips exactly the complement on
+    /// exactly that `est` — so the fold and selection reason over one set. There is no
+    /// counterpart gate for the output limit: nothing skips a candidate for declaring a
+    /// small `max_output_tokens`, so every entry stays reachable and the plain chain
+    /// minimum is the only fold safe for all of them. Adding a filter here without adding
+    /// the gate that justifies it would send a value the surviving entries reject.
+    ///
+    /// [`gates::context_window::ContextWindowGate`]: crate::gates::context_window::ContextWindowGate
+    ///
+    /// (This paragraph named `min_context_window` until the serving-window follow-on. That
+    /// accessor is still the plain chain fold and still `pub`, but it has no production
+    /// caller: the clamp's window term is the serving one now, so citing it here pointed a
+    /// reader at the shape the clamp had stopped using.)
     ///
     /// **The cost of that `min` on a HETEROGENEOUS chain, stated plainly.** A budgeted
     /// run on `[gpt-4o 16384, small-fallback 4096]` has its replies capped at 4096 on the
@@ -749,12 +767,20 @@ mod min_window_tests {
         }
     }
 
-    /// The output twin of `min_context_window`, and the SP-DATA-5 clamp's ceiling.
+    /// The output half of the SP-DATA-5 clamp's ceiling — **one of two terms, not the
+    /// ceiling itself.** The clamp takes `min(this, min_serving_context_window − est)`,
+    /// so a test that pins only this number says nothing about which term binds; the
+    /// window half is pinned by
+    /// `min_serving_context_window_is_the_smallest_window_that_can_hold_the_estimate`
+    /// here and by the orchestrator's
+    /// `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits`.
     ///
     /// `min` over the chain rather than the selected model's own figure, for the same
     /// reason the window accessor takes a `min`: the caller does not know which entry
     /// the request will land on, and a fallback to the smaller model must not carry a
-    /// `max_tokens` that model would reject.
+    /// `max_tokens` that model would reject. Unlike the window accessor it cannot narrow
+    /// to a serving SUBSET — see the production doc for why the absent gate is what
+    /// forbids it.
     ///
     /// The unknown-chain leg is asserted too, because it is the leg the clamp treats as
     /// "no ceiling from here" — a `Some(0)` or a panic there would silently refuse or
