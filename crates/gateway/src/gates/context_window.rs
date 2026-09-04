@@ -60,13 +60,26 @@ use crate::skip_reason::SkipReason;
 /// sound only because selection cannot return a candidate this gate skipped: the minimum
 /// over the admitted set is safe for whichever member wins.
 ///
-/// Two consequences for anyone editing this file. **The boundary must stay in step:** the
-/// accessor's `>=` is the exact complement of this `>`, so moving one without the other
-/// makes the clamp reason about a set selection does not draw from. And **de-registering
-/// this gate is no longer a local change** — it would leave the clamp bounding by a
-/// window belonging to a model that could then be selected without fitting. The
-/// accessor's doc states that coupling as the price of not moving the clamp downstream of
-/// selection, which is the real fix and is deferred.
+/// Three consequences for anyone editing this file.
+///
+/// **The `est` must be the same NUMBER, not the same idea.** This is the one that shipped
+/// broken: the clamp computed its own figure with its own estimator, which came out
+/// LARGER on ASCII text, so the set it folded over was a strict subset of the set this
+/// gate admits — and an over-window `max_tokens` went on the wire. The clamp now calls
+/// `crate::estimate_input_tokens_pessimistic`, the same function
+/// `engine::execute` puts on `SelectionCriteria::input_tokens_pessimistic` for this gate,
+/// over the same `Payload`. **Whatever this gate judges by must stay the thing the clamp
+/// can call.** Reading a different field here — `input_tokens`, say — would re-open the
+/// gap silently and would compile.
+///
+/// **The boundary must stay in step:** the accessor's `>=` is the exact complement of
+/// this `>`, so moving one without the other makes the clamp reason about a set selection
+/// does not draw from.
+///
+/// And **de-registering this gate is no longer a local change** — it would leave the
+/// clamp bounding by a window belonging to a model that could then be selected without
+/// fitting. The accessor's doc states that coupling as the price of not moving the clamp
+/// downstream of selection, which is the real fix and is deferred.
 pub struct ContextWindowGate;
 
 impl AdmissionGate for ContextWindowGate {

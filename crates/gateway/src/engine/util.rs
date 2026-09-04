@@ -94,7 +94,11 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 
 /// A deliberately pessimistic input estimate, for the CONTEXT-WINDOW gate only.
 ///
-/// # What it counts that [`estimate_input_tokens`] does not, on a `Chat` payload
+/// # What it counts that `estimate_input_tokens` does not, on a `Chat` payload
+///
+/// (Its sibling is named in backticks rather than linked throughout this doc: this
+/// function is `pub` and that one is private to `engine`, so an intra-doc link from here
+/// to there is a rustdoc warning. The private one is in this same file.)
 ///
 /// The other payload kinds are answered in a different unit or not at all; see "The unit
 /// is ONE inference the model's window has to hold" below, which is where the arms that
@@ -142,7 +146,7 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 ///
 /// # Why a third estimator rather than a call to one of the two that exist
 ///
-/// Kept SEPARATE from [`estimate_input_tokens`] because, where the two measure the same
+/// Kept SEPARATE from `estimate_input_tokens` because, where the two measure the same
 /// quantity, they want opposite biases: an under-count is optimistic pricing for the cost
 /// gate and an admitted-but-doesn't-fit candidate for this one. Changing the shared figure
 /// would silently make every `BudgetGate` decision more conservative — a real
@@ -150,16 +154,18 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// same quantity at all, which is a second and independent reason they cannot be one
 /// function; see the arm-by-arm section below.
 ///
-/// The workspace's other pessimistic estimator, `agent::prompt::est_tokens_pessimistic`
-/// (`crates/orchestrator`), divides by 3 as well but over `chars().count()` rather than
-/// bytes, and it takes a `&str` rather than a `Payload`. It is not reachable from here —
-/// the gateway crate does not depend on the orchestrator, and the dependency runs the
-/// other way — so this is a third function by necessity, not by preference. The two
-/// agree on the divisor and differ on the unit; both err high.
+/// The workspace once had a second pessimistic estimator,
+/// `agent::prompt::est_tokens_pessimistic` (`crates/orchestrator`), which divided by 3 as
+/// well but over `chars().count()` rather than bytes and took a `&str` rather than a
+/// `Payload`. It is DELETED, and so is the `dispatch::est_input_tokens` that summed it
+/// per string: the serving-window review found the two figures were not the same number
+/// and that the budget clamp's soundness argument required them to be. This function is
+/// the survivor and now serves both questions — see "Why this is `pub`" below for what
+/// that cost and why it was the right trade.
 ///
 /// # The unit is ONE inference the model's window has to hold, arm by arm
 ///
-/// This is not the same question [`estimate_input_tokens`] answers, and on two payload
+/// This is not the same question `estimate_input_tokens` answers, and on two payload
 /// kinds the two functions deliberately return different QUANTITIES rather than
 /// different roundings of the same one. The cost estimator prices the whole request;
 /// this one measures what a single candidate's `context_window` is asked to hold. Where
@@ -212,11 +218,59 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// candidate. That is the cheaper error — the alternative is a provider 400 — and it is
 /// visible, because the skip records both numbers.
 /// Called once per request by `engine::execute` and once by `engine::execute_stream`,
-/// beside [`estimate_input_tokens`], and carried to the gate on
-/// `SelectionCriteria::input_tokens_pessimistic`. Those two call sites are the whole of
-/// its production use: if `clippy -D warnings` ever reports this function dead, the
-/// plumbing has been removed and every request is silently ungated on the window again.
-pub(super) fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
+/// beside `estimate_input_tokens`, and carried to the gate on
+/// `SelectionCriteria::input_tokens_pessimistic` — plus once per budgeted `Chat` by the
+/// orchestrator's clamp, for the reason argued below.
+///
+/// This used to add: "if `clippy -D warnings` ever reports this function dead, the
+/// plumbing has been removed and every request is silently ungated on the window again."
+/// **That tripwire is GONE** and the sentence would now be false: `dead_code` cannot fire
+/// on a `pub` item re-exported at the crate root, whatever calls it. What stands in for it
+/// is `the_engine_selects_on_the_pessimistic_estimate_not_the_cost_one` (the engine wiring)
+/// and `tool_schemas_alone_push_a_request_over_a_small_candidates_window` (the composed
+/// payload → estimator → gate path) — tests rather than a lint, which is the weaker
+/// guarantee and the honest one to record.
+///
+/// # Why this is `pub`, and why that matters more than the API surface it costs
+///
+/// It is re-exported at the crate root — `gateway::estimate_input_tokens_pessimistic`, the
+/// name the dependency rename in the orchestrator's `Cargo.toml` gives it — for ONE
+/// out-of-crate caller: the orchestrator's SP-DATA-5 budget clamp
+/// (`orchestrator/src/executor/dispatch.rs`), which sets a request's `max_tokens` before
+/// [`crate::Gateway::execute`] is called and bounds it by
+/// [`crate::Gateway::min_serving_context_window`] — the fold over
+/// `{ m : m.context_window >= est }`, i.e. exactly the candidate set
+/// [`crate::gates::context_window::ContextWindowGate`] admits on the same `est`.
+///
+/// That bound is sound only if the clamp's `est` and the gate's `est` are the SAME
+/// NUMBER, and for one day they were not. The clamp had its own estimator — same parts,
+/// same divisor, `ceil` applied PER STRING and summed rather than once over the total,
+/// and over `chars` rather than bytes. On ASCII `Σ ceil(Lᵢ/3) >= ceil(Σ Lᵢ/3)`, so the
+/// clamp's figure was the LARGER one and its serving set a strict SUBSET of the gate's:
+/// the clamp could find nothing able to serve a request the gate then happily admitted
+/// (dropping the window term entirely and dispatching `max_tokens` bounded only by the
+/// output limit), or bound by a bigger model's window and send that figure to a smaller
+/// winner. Both end at a provider 400 — `prompt + max_tokens > context_window` — which
+/// on a budgeted run arrives as a terminal `NodeFailed` that no cap raise can clear,
+/// on a call an UNBUDGETED run serves (unbudgeted omits `max_tokens` from the wire).
+/// On multi-byte text the drift runs the other way (bytes here, chars there), so the two
+/// figures were not ordered in either direction and no slack constant could fix it.
+///
+/// So the duplicate was deleted rather than aligned, and this function widened: one
+/// estimator, called by both halves, makes the equality structural instead of an
+/// invariant someone has to keep re-proving. Widening a production visibility to suit a
+/// TEST would be the wrong trade (this module's own composed tests say so); widening it
+/// so two crates cannot disagree about a number they must agree on is a different trade
+/// and worth the surface.
+///
+/// Pinned across the boundary by the orchestrator's
+/// `the_clamp_bounds_max_tokens_by_the_estimate_the_gate_will_judge_by` and
+/// `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits`, which
+/// assert the wire rule a provider enforces with a 400 —
+/// `est + max_tokens <= context_window(model dispatched to)` — with `est` measured by
+/// THIS function on the request that actually went out. Both were red before the
+/// unification, in the two different ways a subset relation fails.
+pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
     let chars: usize = match payload {
         Payload::Chat {
             messages,
@@ -227,9 +281,10 @@ pub(super) fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
             // Each message contributes its text body AND its tool calls. The second
             // term is not defensive: an assistant turn in the ReAct loop has an empty
             // body and carries everything in `tool_calls`, so a sum over `as_text()`
-            // alone returns 0 for the largest messages the loop produces. Mirrors
-            // `executor/dispatch.rs::est_input_tokens`, which counts the same two parts
-            // of a call (`name` + `arguments`) for the budget clamp.
+            // alone returns 0 for the largest messages the loop produces. The budget
+            // clamp's deleted `executor/dispatch.rs::est_input_tokens` counted the same
+            // two parts of a call (`name` + `arguments`) for the same reason; the clamp
+            // now reaches this line instead of mirroring it.
             let msg_chars: usize = messages
                 .iter()
                 .map(|m| {
@@ -362,9 +417,14 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Composed tests: payload → estimator → `SelectionCtx` → gate.
     //
-    // These live here rather than in `gates/context_window.rs` because
-    // `estimate_input_tokens_pessimistic` is `pub(super)` to `engine`, and widening a
-    // production visibility to suit a test is the wrong trade. What they buy over the
+    // These live here rather than in `gates/context_window.rs` because that is where the
+    // estimator is, and a composed test belongs beside the half of the pair it is
+    // asserting the units of. (They were originally here because
+    // `estimate_input_tokens_pessimistic` was `pub(super)` to `engine` and widening a
+    // production visibility to suit a TEST is the wrong trade. It is `pub` now — widened
+    // for a PRODUCTION caller in another crate, which is a different trade and argued at
+    // the function — so that reason has expired while the placement stays right.) What
+    // they buy over the
     // gate's own unit tests is that the two halves agree about UNITS and DIRECTION over
     // a real `Payload`: the gate's tests hand-set a number, so a payload that estimates
     // in the wrong unit — or an estimator term that silently returns 0 — is invisible to
@@ -866,6 +926,58 @@ mod tests {
         );
     }
 
+    /// The SYSTEM prompt is counted, as its own term, to the byte.
+    ///
+    /// It was guarded only INDIRECTLY before: setting `sys_chars` to `0` reddened exactly
+    /// one test in the workspace — `the_pessimistic_estimate_counts_tools_and_never_
+    /// undercuts_the_cost_estimate`, and only because the COST estimate counts the system
+    /// prompt, so dropping it here inverted an ordering that test asserts for an entirely
+    /// different reason. A guard that fires because of what a SIBLING function counts is
+    /// one refactor of that sibling away from not firing.
+    ///
+    /// It is pinned directly now because this function became the budget clamp's estimate
+    /// too (`orchestrator/src/executor/dispatch.rs`), and the clamp's own direct guard —
+    /// `every_part_of_the_input_is_counted_in_the_estimate`, over the `est_input_tokens`
+    /// that unification deleted — went with it. An agent's system prompt is the term most
+    /// likely to be dropped by accident, because it is the one every `ModelCall` fixture
+    /// leaves `None`.
+    ///
+    /// An exact equality over a system-only payload, so a term that counted the system
+    /// prompt at a fraction of its length would fail as loudly as one that dropped it.
+    #[test]
+    fn the_system_prompt_is_counted_in_the_window_estimate() {
+        let system = "you are a careful assistant; prefer the smallest correct change";
+        let payload = Payload::Chat {
+            messages: Vec::new(),
+            system: Some(system.to_string()),
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        };
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&payload),
+            system.len().div_ceil(3) as u32,
+            "a payload whose only content is a system prompt estimates at that prompt's \
+             own size — the system half of what the provider is sent is not free"
+        );
+        // And it is ADDITIVE with the message term rather than replacing it: a payload
+        // carrying both must cost both, which an implementation that returned
+        // `max(system, messages)` would satisfy the assertion above and fail here.
+        let user = "hello";
+        let both = Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, user)],
+            system: Some(system.to_string()),
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        };
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&both),
+            (system.len() + user.len()).div_ceil(3) as u32,
+            "the system prompt and the messages are SUMMED, and the sum is rounded once"
+        );
+    }
+
     /// The unit is `ceil(UTF-8 BYTES / 3)`, and both halves of that are load-bearing.
     ///
     /// `/3` rather than the prose `/4` is half the margin this estimate is built on, and
@@ -874,14 +986,32 @@ mod tests {
     /// reverting the divisor to 4 leaves every ordering intact — so one absolute figure
     /// pins both.
     ///
-    /// BYTES rather than characters is deliberate too, and is where this function
-    /// differs from `agent::prompt::est_tokens_pessimistic`, which counts
-    /// `chars().count()`. Bytes ≥ chars always, so the difference is more margin, and it
-    /// is largest exactly where a chars-per-token heuristic is weakest: CJK text is 3
-    /// bytes per character and tokenizes near 1 token per character, so the byte count
-    /// lands close to the truth where the character count would be a third of it.
+    /// BYTES rather than characters is deliberate too, and it is the unit the budget
+    /// clamp inherited when the two estimators became one function. Its predecessor,
+    /// `agent::prompt::est_tokens_pessimistic`, counted `chars().count()`; bytes ≥ chars
+    /// always, so the difference is more margin, and it is largest exactly where a
+    /// chars-per-token heuristic is weakest: CJK text is 3 bytes per character and
+    /// tokenizes near 1 token per character, so the byte count lands close to the truth
+    /// where the character count was a third of it. The CJK case below is that claim.
+    ///
+    /// The EMPTY payload is asserted here too, and it is the boundary the clamp cares
+    /// about most: `allowance = remaining − est`, so rounding up — right for every
+    /// non-empty input — must not charge a token for a system prompt that is not there.
+    /// A `div_ceil` over a length that had been nudged (a `+1`, a `max(1)`) passes both
+    /// figures above and fails this one. It carries what
+    /// `agent::prompt::the_pessimistic_estimate_of_nothing_is_zero` used to.
     #[test]
     fn the_estimate_is_ceil_of_utf8_bytes_over_three() {
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&chat_of(Vec::new())),
+            0,
+            "a payload with nothing in it costs nothing"
+        );
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&chat_of(vec![Message::text(MessageRole::User, "")])),
+            0,
+            "and neither does an empty message body"
+        );
         assert_eq!(
             estimate_input_tokens_pessimistic(&chat_of(vec![Message::text(
                 MessageRole::User,

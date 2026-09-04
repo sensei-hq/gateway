@@ -1,11 +1,12 @@
 use super::*;
 use crate::test_support::{
-    CallLog, FIXTURE_MAX_OUTPUT_TOKENS, TWO_WINDOW_BIG, TWO_WINDOW_SMALL, clamp_observing_gateway,
-    content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
-    echo_system_gateway, failing_after_gateway, final_response, metered_embed_gateway,
-    metered_gateway, metered_latency_gateway, prompt_recording_gateway, recording_gateway,
-    scripted_gateway, tool_call_response, two_window_chain_gateway,
-    two_window_clamp_observing_gateway, two_window_scripted_gateway,
+    CallLog, FIXTURE_CONTEXT_WINDOW, FIXTURE_MAX_OUTPUT_TOKENS, SUB_FLOOR_MAX_OUTPUT_TOKENS,
+    TWO_WINDOW_BIG, TWO_WINDOW_SMALL, clamp_observing_gateway, content_gated_gateway,
+    demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
+    failing_after_gateway, final_response, metered_embed_gateway, metered_gateway,
+    metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
+    sub_floor_output_clamp_observing_gateway, tool_call_response, two_window_chain_gateway,
+    two_window_clamp_observing_gateway, two_window_scripted_gateway, window_watching_clamp_gateway,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -14486,7 +14487,7 @@ async fn a_budgeted_call_is_never_clamped_past_the_context_window() {
 // refuses it, with per-candidate diagnostics the clamp could never produce.
 // ------------------------------------------------------------------------------------
 
-/// **AC3 + AC4 + AC9 — a BUDGETED run serves a prompt only the chain's larger model can
+/// **AC3 + AC9 — a BUDGETED run serves a prompt only the chain's larger model can
 /// hold.** This is SP-7a's own AC1, which passed unbudgeted and failed budgeted, and it
 /// is the entire reason this follow-on exists.
 ///
@@ -14498,17 +14499,42 @@ async fn a_budgeted_call_is_never_clamped_past_the_context_window() {
 /// two-window chain, and until it existed nothing in the suite could tell that the
 /// benefit stopped short of exactly the runs an operator puts a cap on.
 ///
-/// Three claims, and the second and third do not follow from the first:
+/// Two claims, and the second does not follow from the first:
 ///
 /// - **AC3** the run completes and the dispatch goes to `big`. `small` is the priority-1
 ///   entry, so landing on `big` is only possible because the gate removed it — which
 ///   requires the request to have reached the gateway at all.
-/// - **AC4** the emitted `max_tokens` leaves the prompt room inside `big`'s window. The
-///   bound is only sound if it is safe for the candidate that actually won.
-/// - **AC9** it is also at or under the model's own `max_output_tokens`. A serving window
-///   of 200 000 is enormously wider than the 1024-token output limit, so this pins that
-///   widening the window term did not delete the OTHER term — the failure mode would be
-///   a `max_tokens` of ~192 000 that a real provider answers with a 400.
+/// - **AC9** the emitted value is the model's own `max_output_tokens`, EXACTLY. A serving
+///   window of 200 000 leaves room for far more than the model can emit, so this pins
+///   that widening the window term did not delete the OTHER term — the failure mode
+///   would be a `max_tokens` of ~192 000 that a real provider answers with a 400.
+///
+/// # AC4 is NOT tested here, and the assertion that claimed to test it was vacuous
+///
+/// This test used to carry a third claim — "the emitted `max_tokens` leaves the prompt
+/// room inside `big`'s window; the bound is only sound if it is safe for the candidate
+/// that actually won" — asserted as `emitted <= TWO_WINDOW_BIG - est`, i.e.
+/// `emitted <= 191 808`, one line above an assertion pinning `emitted <= 1024`. It could
+/// not fail for any implementation, and the whole-slice review mutation-proved it twice
+/// over: dropping the clamp's `− est` term outright left THIS test green (two others
+/// reddened, neither on a heterogeneous chain), and flipping the accessor's fold from
+/// `.min()` to `.max()` — the hazard the accessor's own decision row names — left every
+/// one of the 426 orchestrator tests green.
+///
+/// The reason is structural, not an oversight of sizing: on THIS fixture the window term
+/// is `200 000 − 8192` and the output limit is 1024, so the output limit binds by a
+/// factor of ~187 and the window arithmetic is never observed. No prompt size fixes that
+/// — a prompt big enough to bring `big`'s window term under 1024 would need ~199k tokens,
+/// and `small` would then be excluded from the serving set, changing which claim the test
+/// makes. So AC4 needs a fixture where the windows sit close enough together for the
+/// window term to be the binding ceiling, and it has one:
+/// `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits` below,
+/// which pins `est + emitted == TWO_WINDOW_SMALL` to the token on the run that lands on
+/// `small`, and reddens under both mutations above.
+///
+/// What is left here is honest: `assert_eq!(emitted, FIXTURE_MAX_OUTPUT_TOKENS)` is a
+/// falsifiable statement about this fixture (the output limit is what binds, and it is
+/// still applied), and AC3's routing claim is strong on its own.
 #[tokio::test]
 async fn a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold() {
     // Between the two windows: twice `small`'s in tokens, a factor of ~24 under `big`'s.
@@ -14526,7 +14552,7 @@ async fn a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold() {
     // A cap far above anything in play, so the BUDGET is provably not what holds the
     // emitted value down and cannot be confused with the window term.
     const CAP: u64 = 1_000_000;
-    let (gateway, seen, models) = two_window_clamp_observing_gateway(10, 5_000).await;
+    let (gateway, seen, models, ests) = two_window_clamp_observing_gateway(10, 5_000).await;
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
     journal
@@ -14563,6 +14589,18 @@ async fn a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold() {
         "exactly one dispatch, to `big` — `small` is the priority-1 entry, so this is \
          only true because the request reached the gateway and the window gate removed it"
     );
+    // The `est` this test sized its fixture from is the number the GATE actually judged
+    // by, measured on the request the provider received. Cheap, and it stops the fixture
+    // assertion above from being a claim about the test's own arithmetic: if a
+    // `ModelCall`'s builder ever adds a system prompt or a tool to the payload, `est`
+    // stops describing the request and this reddens rather than the sizing silently
+    // drifting off the target.
+    assert_eq!(
+        ests.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec![est],
+        "the gateway estimated the dispatched request at exactly the figure this test \
+         sized the prompt to"
+    );
 
     let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let emitted = seen
@@ -14570,16 +14608,262 @@ async fn a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold() {
         .copied()
         .flatten()
         .expect("the budgeted call still carries a clamp");
+    assert_eq!(
+        emitted, FIXTURE_MAX_OUTPUT_TOKENS,
+        "AC9 — the output-limit term still applies independently, and on THIS fixture it \
+         is the term that binds. A {TWO_WINDOW_BIG}-token serving window leaves room for \
+         far more than the model can emit, so widening the window term must not widen the \
+         clamp past `max_output_tokens`: {emitted}"
+    );
+}
+
+// ------------------------------------------------------------------------------------
+// The cross-crate invariant the serving-window bound rests on: `est + max_tokens <=
+// context_window(the model that was dispatched)` — the rule a real provider enforces
+// with a 400 — where `est` is the figure the GATEWAY computed, not one the test or the
+// clamp re-derived.
+//
+// The bound's soundness argument is a statement about SETS: the clamp folds the minimum
+// over `S = { m : m.context_window >= est }`, selection can only return a member of `S`,
+// so `min(S) − est` is safe for the winner. Every step of that names `est`, and for one
+// day the two halves computed it differently — the clamp summed `ceil(chars_i / 3)` PER
+// STRING (`dispatch::est_input_tokens`), the gate took `ceil(Σ bytes_i / 3)` once
+// (`gateway::estimate_input_tokens_pessimistic`). On ASCII `Σ ceil >= ceil Σ`, so the
+// clamp's figure was the LARGER one and `S_clamp` a strict SUBSET of the set selection
+// actually drew from. Both tests below were RED before the two were made one function,
+// and they fail in the two different ways that subset relation produces.
+// ------------------------------------------------------------------------------------
+
+/// How many user messages the straddling payload carries, and how many ASCII bytes each
+/// one holds.
+///
+/// The two estimator formulas differ by `Σ ceil(Lᵢ/3) − ceil(Σ Lᵢ/3)`, which is at most
+/// ⅔ of a token per string — so the gap is bought with the NUMBER of strings, not their
+/// size, and 600 of them is what makes it wide enough to straddle a window with room to
+/// spare on both sides. 19 bytes hits that maximum, being `1 mod 3`:
+/// `ceil(19/3) = 7` against a true `6⅓`, so each message over-counts by ⅔ and 600 of them
+/// by 400.
+///
+/// `600 × 19 = 11 400` bytes ⇒ the gate's figure is `11 400 / 3 = 3800` exactly and the
+/// old per-string figure is `600 × 7 = 4200`. The fixture window is 4096, so 3800 FITS it
+/// and 4200 does not — one figure on each side of the boundary, which is the whole point.
+/// The tests assert every one of those relations rather than trusting this comment.
+const STRADDLE_PARTS: usize = 600;
+/// See [`STRADDLE_PARTS`].
+const STRADDLE_PART_BYTES: usize = 19;
+
+/// The straddling `Chat` request on `chain`, plus the two estimates of it: `(request,
+/// ceil_of_sum, sum_of_ceils)`.
+///
+/// Hand-built and driven through `dispatch_metered` directly rather than through a graph,
+/// because no orchestrator producer emits a multi-part payload whose parts a test can
+/// size. `support::build_request` hardcodes `system: None, tools: []` and one message —
+/// a ONE-string payload, where `ceil(L/3) == ceil(L/3)` and the two formulas coincide
+/// identically, which is exactly why the whole clamp suite could not see the drift. An
+/// agent turn does carry system + tools, but its byte count is the ReAct assembler's to
+/// decide, and a fixture that has to be re-tuned whenever a prompt template changes is a
+/// fixture that will one day be re-tuned to the wrong side of the window and pass.
+fn straddling_chat_request(chain: &str) -> (kernel::types::request::InferenceRequest, u32, u32) {
+    let total_bytes = STRADDLE_PARTS * STRADDLE_PART_BYTES;
+    let ceil_of_sum = u32::try_from(total_bytes.div_ceil(3)).expect("fits a u32");
+    let sum_of_ceils =
+        u32::try_from(STRADDLE_PARTS * STRADDLE_PART_BYTES.div_ceil(3)).expect("fits a u32");
+    let request = kernel::types::request::InferenceRequest {
+        capability: kernel::types::capability::Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some(chain.to_string()),
+        payload: kernel::types::request::Payload::Chat {
+            messages: (0..STRADDLE_PARTS)
+                .map(|_| {
+                    kernel::types::request::Message::text(
+                        kernel::types::request::MessageRole::User,
+                        "x".repeat(STRADDLE_PART_BYTES),
+                    )
+                })
+                .collect(),
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+    };
+    (request, ceil_of_sum, sum_of_ceils)
+}
+
+/// The straddling payload really does straddle: the gate's figure FITS the fixture
+/// window, the old per-string figure does not, and the gap the window term leaves is big
+/// enough to dispatch on and small enough to be the binding ceiling.
+///
+/// Factored out so both tests below assert it — a fixture claim asserted in one test and
+/// assumed in the other is how the second one quietly stops proving anything.
+fn assert_straddles_the_fixture_window(ceil_of_sum: u32, sum_of_ceils: u32) {
     assert!(
-        emitted <= TWO_WINDOW_BIG - est,
-        "AC4 — the clamp must leave the prompt room inside the window of the model it \
-         actually reached: emitted {emitted} + est {est} exceeds {TWO_WINDOW_BIG}"
+        ceil_of_sum <= FIXTURE_CONTEXT_WINDOW,
+        "the GATE must admit this payload — {ceil_of_sum} against {FIXTURE_CONTEXT_WINDOW}"
     );
     assert!(
-        emitted <= FIXTURE_MAX_OUTPUT_TOKENS,
-        "AC9 — the output-limit term still applies independently. A {TWO_WINDOW_BIG}-token \
-         serving window leaves room for far more than the model can emit, and widening \
-         the window term must not widen the clamp past `max_output_tokens`: {emitted}"
+        sum_of_ceils > FIXTURE_CONTEXT_WINDOW,
+        "and the old per-string figure must NOT fit it, or the two halves never disagree \
+         and neither test proves anything: {sum_of_ceils} against {FIXTURE_CONTEXT_WINDOW}"
+    );
+    let term = u64::from(FIXTURE_CONTEXT_WINDOW - ceil_of_sum);
+    assert!(
+        term >= orchestrator_core::MIN_OUTPUT_TOKENS,
+        "the window term must clear the output floor, or the call is REFUSED and the \
+         invariant below is asserted over an empty log: {term}"
+    );
+    assert!(
+        term < u64::from(FIXTURE_MAX_OUTPUT_TOKENS),
+        "and it must be UNDER the output limit, or the output limit binds and the window \
+         arithmetic is never observed — the vacuity the AC4 assertion above had: {term} \
+         against {FIXTURE_MAX_OUTPUT_TOKENS}"
+    );
+}
+
+/// **The clamp bounds `max_tokens` by the estimate the GATE will judge the same request
+/// by** — on the HOMOGENEOUS chain, the one the slice's AC7 calls unchanged.
+///
+/// This is the failure the empty-serving-set handover produces when the clamp's estimate
+/// is the larger of the two. `sum_of_ceils` (4200) exceeds the fixture's 4096 window, so
+/// the clamp finds NOTHING that can serve the request and — by design — contributes no
+/// window term at all, leaving the ceiling to `min_max_output_tokens` alone (1024). The
+/// gate then judges the same request at `ceil_of_sum` (3800), admits the model, and the
+/// call goes out asking for `3800 + 1024 = 4824` tokens against a 4096 window: the
+/// `prompt + max_tokens > context_window` provider 400 that the clamp's window term
+/// exists to prevent, on a BUDGETED run, where the identical unbudgeted call succeeds
+/// because `max_tokens: None` is omitted from the wire entirely.
+///
+/// That outcome is strictly worse than the bug this slice fixed, and it was verified
+/// rather than argued: restoring BOTH halves of the parent's behaviour — the
+/// `min_context_window(chain)` bound and the per-string over-count — makes this test fail
+/// with `ests == []`, i.e. NO dispatch at all. `4096.saturating_sub(4200)` is 0, under the
+/// output floor, so the parent refused before the call, which through `Executor::start` is
+/// the durable `RunPaused { resume_after: None }` an operator can clear with a
+/// `BudgetRaised` + `force_wake`. The un-unified serving bound dispatched it instead, into
+/// a terminal `NodeFailed` that no cap raise touches.
+///
+/// **The assertion is an equality, not a bound.** `est + emitted == FIXTURE_CONTEXT_WINDOW`
+/// says the clamp handed the provider exactly the room the window has left, which is the
+/// tightest true statement available and the only form that reddens under a window term
+/// computed too SMALL as well as too large.
+#[tokio::test]
+async fn the_clamp_bounds_max_tokens_by_the_estimate_the_gate_will_judge_by() {
+    let (request, ceil_of_sum, sum_of_ceils) = straddling_chat_request("c");
+    assert_straddles_the_fixture_window(ceil_of_sum, sum_of_ceils);
+
+    // A cap far above anything in play: the BUDGET is provably not the binding term, so
+    // whatever bounds the emitted value is a model bound.
+    const CAP: u64 = 1_000_000;
+    let (gateway, seen, ests) = window_watching_clamp_gateway(10, 100).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let gate = tokio::sync::Mutex::new(());
+    let meter = super::dispatch::Meter::new(0, Some(CAP), &live, &gate);
+    // The dispatch RESULT is not what is under test — a refusal would be a SAFE answer
+    // here, just a needlessly strict one — so the assertion is on what reached the
+    // provider. `ClampObservingAdapter` accepts anything up to the fixture's own output
+    // limit, so an over-window `max_tokens` is recorded rather than rejected, which is
+    // what makes the violation visible instead of arriving as a provider error.
+    let _ = exec.dispatch_metered(&request, &meter).await;
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let ests = ests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        ests,
+        vec![ceil_of_sum],
+        "the gateway judged the dispatched request at `ceil(Σ bytes / 3)`, which is what \
+         makes the sizing above a fact about the request rather than about this test"
+    );
+    let emitted = seen
+        .first()
+        .copied()
+        .flatten()
+        .expect("the budgeted call carries a clamp");
+    assert_eq!(
+        u64::from(ests[0]) + u64::from(emitted),
+        u64::from(FIXTURE_CONTEXT_WINDOW),
+        "the clamp must leave the prompt room inside the window of the model the request \
+         was dispatched to, measured by the estimate the GATE admitted it on: est \
+         {} + max_tokens {emitted} against a {FIXTURE_CONTEXT_WINDOW} window",
+        ests[0]
+    );
+}
+
+/// **AC4 — the serving-window bound is safe for the candidate that actually WINS**, on a
+/// heterogeneous chain where the window term is the binding ceiling.
+///
+/// The sibling above shows the drift emptying the serving set. This shows the other half
+/// of the same subset relation, which is worse because nothing looks absent: on
+/// `[small 4096 pri-1, big 200 000]` the old per-string figure of 4200 excludes `small`,
+/// so the clamp folds `min(S) = 200 000` and bounds by `200 000 − 4200`; the gate judges
+/// the same request at 3800, admits BOTH candidates, and selection returns `small`
+/// because it is priority 1. So a big model's `max_tokens` is sent to a small one — the
+/// exact outcome the accessor's doc rejects the "bound by the chain's LARGEST window"
+/// alternative for, arrived at by the other route.
+///
+/// **This is the assertion the old AC4 was supposed to be.** `small` is the SMALLEST
+/// member of the admitted set and the one that wins, so `est + emitted ==
+/// TWO_WINDOW_SMALL` pins `min(S) − est` to the token on the winner. It reddens under
+/// every mutation of that arithmetic, which the fixture guarantees by construction:
+///
+/// - drop the `− est` term (`min_win.map(|w| w.saturating_sub(est))` → `min_win`) ⇒ the
+///   ceiling becomes the 1024 output limit and `3800 + 1024 > 4096`;
+/// - fold the accessor with `.max()` instead of `.min()` ⇒ 200 000 − 3800 ⇒ the same
+///   1024 ⇒ the same failure. That mutation left all 426 orchestrator tests green before
+///   this test existed, and it is the hazard the accessor's decision row names.
+#[tokio::test]
+async fn the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits() {
+    let (request, ceil_of_sum, sum_of_ceils) = straddling_chat_request("c");
+    assert_straddles_the_fixture_window(ceil_of_sum, sum_of_ceils);
+    assert!(
+        sum_of_ceils <= TWO_WINDOW_BIG,
+        "and `big` must still hold the old figure, or the serving set is empty for BOTH \
+         estimates and this collapses into the test above: {sum_of_ceils}"
+    );
+
+    const CAP: u64 = 1_000_000;
+    let (gateway, seen, models, ests) = two_window_clamp_observing_gateway(10, 100).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let live = std::sync::atomic::AtomicU64::new(0);
+    let gate = tokio::sync::Mutex::new(());
+    let meter = super::dispatch::Meter::new(0, Some(CAP), &live, &gate);
+    let _ = exec.dispatch_metered(&request, &meter).await;
+
+    let models = models.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        models,
+        vec![Some("small".to_string())],
+        "the gate ADMITS `small` on this payload (3800 fits 4096) and it is priority 1, \
+         so it is the candidate the bound has to be safe for — landing anywhere else \
+         would mean the fixture stopped exercising the case: {models:?}"
+    );
+    let ests = ests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        ests,
+        vec![ceil_of_sum],
+        "and the gate judged it at `ceil(Σ / 3)`"
+    );
+    let emitted = seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .first()
+        .copied()
+        .flatten()
+        .expect("the budgeted call carries a clamp");
+    assert_eq!(
+        u64::from(ests[0]) + u64::from(emitted),
+        u64::from(TWO_WINDOW_SMALL),
+        "AC4 — `min(S) − est` must be safe for the WINNER, not merely for some member of \
+         the chain: est {} + max_tokens {emitted} against `small`'s {TWO_WINDOW_SMALL} \
+         window",
+        ests[0]
     );
 }
 
@@ -14595,12 +14879,21 @@ async fn a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold() {
 ///    system.is_none() => {` on the match arm — reddened NOTHING before this test. The
 ///    agent and the selector are the two producers that spend the most per call, and they
 ///    were the two the clamp was never observed on.
-/// 2. **The estimate's `system` and `tools` terms are actually WIRED.** Passing
-///    `est_input_tokens(None, messages, &[])` at the call site also reddened nothing,
+/// 2. **The estimate's `system` and `tools` terms actually reach the clamp.** Before this
+///    test, feeding the estimator a payload stripped of both — which the clamp's deleted
+///    `est_input_tokens(None, messages, &[])` made a one-argument edit — reddened nothing,
 ///    because no test drove a payload where those terms were non-empty. That mutation is
 ///    the direction §4 forbids: the estimate collapses to the user message, `allowance =
 ///    remaining − est` comes out too high, and the clamp over-asks by the whole
 ///    system-plus-schemas term — measured at ~98% of the estimate on this fixture.
+///
+///    The estimator is now the gateway's and is passed `&request.payload` whole, so the
+///    shape of that mutation changed: the terms cannot be dropped at the CALL site any
+///    more, only inside the estimator, where
+///    `gateway::engine::util::the_system_prompt_is_counted_in_the_window_estimate` and
+///    `a_tools_json_schema_is_counted_not_just_the_tools_name` pin them to the byte. What
+///    this test still owns is the wiring in between — that a payload carrying both
+///    reaches the clamp with both intact — which no unit test of the estimator can see.
 ///
 /// The upper bound is what separates them: asserting merely `Some(_)` stays green under
 /// mutation 2. `cap − 1` is what a one-character user message alone would leave, so
@@ -24651,6 +24944,24 @@ async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_wind
          names a model that was filtered out of the decision: {}",
         pause.reason
     );
+    // The other half of AC8, and it needs its own assertion: the two forbidden strings
+    // share no substring, so the negative above passed with the old REMEDY restored
+    // verbatim. Mutation-proven — putting "send less input, or route to a chain whose
+    // smallest model has a larger window" back into the message left this test and the
+    // whole orchestrator suite green before this line existed.
+    //
+    // The remedy is the half that costs an operator something. Each round trip on this
+    // pause is a manual `BudgetRaised` plus a `force_wake`, and "widen the chain's
+    // smallest model" points at an entry heterogeneous-chain selection may already have
+    // filtered out — so following it changes nothing and costs one of those.
+    assert!(
+        !pause
+            .reason
+            .contains("route to a chain whose smallest model"),
+        "and it must not offer the old REMEDY either — widening the chain's smallest \
+         model does not move a bound taken over the models that can SERVE the request: {}",
+        pause.reason
+    );
     assert!(
         pause.reason.contains("can hold"),
         "and it must say the input FITS the window it names. That is what a serving \
@@ -24663,6 +24974,109 @@ async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_wind
         calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "and it refuses BEFORE the call, so no input tokens are paid for a reply too \
          short to use"
+    );
+}
+
+/// **A TIE between the clamp's two model bounds counts as window-bound**, so the refusal
+/// keeps the window's wording rather than the budget's.
+///
+/// `ceiling = min(min_max_output_tokens, window_term)`, and `binding_window` is set when
+/// `window_term == ceiling` — which on a tie is true. The clamp's comment asserts the
+/// rule ("when both terms land on the same figure the window is a true cause of the
+/// refusal, and the window is the half a cap raise cannot move") and nothing guarded it:
+/// mutating the arm to `if term == c && out != Some(term)`, so a tie yields
+/// `binding = None`, left the whole orchestrator suite green. The only other test of
+/// this arm — `a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_window`
+/// — exercises the strict case, a 96-token window term against a 1024 output limit.
+///
+/// # Why the tie needs its own fixture
+///
+/// `binding_window` is observable ONLY through the refusal's wording, and there is only a
+/// refusal when the ceiling lands under `MIN_OUTPUT_TOKENS`. So the tie has to be a tie
+/// UNDER 256, and with the default fixture's 1024 output limit that is unreachable: a tie
+/// there is a ceiling of 1024, which dispatches. Hence
+/// [`sub_floor_output_clamp_observing_gateway`], whose model declares 200.
+///
+/// The arithmetic is then forced: the window term must also be 200, so
+/// `est == FIXTURE_CONTEXT_WINDOW − 200` and the prompt is three bytes per token of that.
+/// Both terms are asserted to be equal before the outcome is read, because a fixture that
+/// silently missed the tie would leave this test passing on the strict case that is
+/// already covered.
+///
+/// # And it is the RIGHT rule, not merely the implemented one
+///
+/// Both terms are cap-blind, so on a tie neither wording could sell a cap raise honestly
+/// — but only the window arm SAYS so. Naming the window is therefore the answer that
+/// misdirects least: it tells the operator the two things that do move it (send less
+/// input, widen the chain) instead of the one that cannot.
+#[tokio::test]
+async fn a_tie_between_the_output_limit_and_the_window_term_names_the_window() {
+    // `est` chosen so `window_term == FIXTURE_CONTEXT_WINDOW − est == 200`, the same
+    // figure as the model's own output limit. `est` is `ceil(bytes/3)`, so the prompt is
+    // exactly `3 × est` ASCII bytes and the estimate is exact rather than rounded.
+    let est = FIXTURE_CONTEXT_WINDOW - SUB_FLOOR_MAX_OUTPUT_TOKENS;
+    let prompt = "x".repeat(est as usize * 3);
+    assert_eq!(
+        u32::try_from(prompt.len().div_ceil(3)).expect("fits"),
+        est,
+        "the prompt must estimate at exactly `est` or the two terms do not tie"
+    );
+    let window_term = FIXTURE_CONTEXT_WINDOW - est;
+    assert_eq!(
+        window_term, SUB_FLOOR_MAX_OUTPUT_TOKENS,
+        "the WINDOW term and the OUTPUT limit must land on the same figure — that is the \
+         tie, and without it this test duplicates the strict case"
+    );
+    assert!(
+        u64::from(window_term) < orchestrator_core::MIN_OUTPUT_TOKENS,
+        "and the tie must be UNDER the floor, or the call dispatches and the refusal \
+         whose wording carries `binding_window` never happens: {window_term}"
+    );
+
+    let (gateway, calls) = sub_floor_output_clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // A cap far above anything in play: the budget is provably not a cause, so a
+    // budget-flavoured message would be a pure misdirection.
+    journal
+        .append(run, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .start(
+            run,
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("n1".into()),
+                    kind: model_call("c", &prompt),
+                    deps: vec![],
+                }],
+            },
+        )
+        .await
+        .expect("drives");
+
+    let pause = out
+        .paused
+        .as_ref()
+        .expect("a ceiling under the output floor is refused before the call");
+    assert_eq!(pause.node.0, "n1");
+    assert!(
+        pause.reason.starts_with("context window: "),
+        "a TIE is window-bound: with both terms on {window_term} the window is a true \
+         cause, and it is the one a cap raise cannot move — so the prefix must not \
+         revert to `budget`: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains("--budget-tokens"),
+        "and it must not name the cap, which neither term reads: {}",
+        pause.reason
+    );
+    assert!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and nothing was dispatched — which is also why this fixture's adapter still \
+         enforcing 1024 cannot affect the outcome"
     );
 }
 

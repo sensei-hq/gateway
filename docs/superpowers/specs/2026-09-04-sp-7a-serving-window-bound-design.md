@@ -58,9 +58,11 @@ which is exactly the set the gate admits.
 
 ## 4. Why the bound is sound
 
-Let `S = { c in chain : c.context_window >= est }` — the set `ContextWindowGate` admits.
+Let `S = { c in chain : c.context_window >= est }` — the set `ContextWindowGate` admits — **where
+`est` is ONE value that the clamp and the gate both use.** That premise is not decoration; §4.1
+records that it shipped violated and how it is now met.
 
-- Selection can only return a member of `S` (the gate skips every non-member).
+- Selection can only return a member of `S` (the gate skips every non-member, on the same `est`).
 - `min_serving_context_window` returns `min { c.context_window : c in S }`.
 - For any `c in S`, `c.context_window >= min(S) `, so bounding output by `min(S) − est` leaves at
   least that much room in every admissible candidate.
@@ -70,12 +72,50 @@ Let `S = { c in chain : c.context_window >= est }` — the set `ContextWindowGat
 `S` empty ⇒ `None` ⇒ no window term, and selection will admit nothing, so the request never reaches
 a provider regardless.
 
-**The one coupling this creates, stated plainly:** the bound's soundness depends on the gate
-actually being registered and using the same estimate. If the gate were removed, the clamp would
-bound by a window belonging to a model that could then be selected without fitting. That is a real
-coupling between two crates, and it is why the alternative "bound by the chain's largest" was
-rejected — this version at least degrades to *over*-bounding rather than under-bounding, because
-`min(S) >= min(chain)` for the entries that remain.
+**The coupling this creates, stated plainly:** the bound's soundness depends on the gate actually
+being registered. If it were removed, the clamp would bound by a window belonging to a model that
+could then be selected without fitting. That is a real coupling between two crates, and it is why
+the alternative "bound by the chain's largest" was rejected — this version at least degrades to
+*over*-bounding rather than under-bounding, because `min(S) >= min(chain)` for the entries that
+remain.
+
+### 4.1 Correction — the shared `est` was NOT a detail, and the first version shipped without it
+
+Everything above says `est`. The implementation gave the two halves two different numbers, and the
+whole-slice review found it: `dispatch::est_input_tokens` applied `ceil` **per string** over
+CHARACTERS and summed; `gateway::engine::util::estimate_input_tokens_pessimistic` sums BYTES and
+applies `ceil` **once**. On ASCII `Σ ceil(Lᵢ/3) >= ceil(Σ Lᵢ/3)`, so the clamp's figure was the
+larger one and `S_clamp` was a strict SUBSET of the set selection drew from. The first bullet above
+was therefore false, and so was the `S`-empty handover — "nothing can serve it" was being decided
+on a number the gate did not use.
+
+Two reachable failures, both reproduced end to end, both ending in
+`prompt + max_tokens > context_window` — a provider 400 that arrives as a terminal `NodeFailed` on
+a budgeted run, on a call an unbudgeted run serves (unbudgeted omits `max_tokens` from the wire):
+
+1. **`S_clamp` empty while `S_gate` is not.** On the homogeneous 4096 chain — the one AC7 calls
+   unchanged — a 600-message payload estimating 4200 per-string and 3800 in total left the clamp
+   with nothing able to serve the request, so it contributed no window term at all and bounded
+   `max_tokens` by the 1024 output limit alone. The gate then admitted the model at 3800 and the
+   request went out asking for 4824 against a 4096 window. **Strictly worse than the defect this
+   slice fixed**: the parent commit refused the same request with a recoverable pause.
+2. **`S_clamp` missing the small candidate `S_gate` keeps.** On `[small 4096 pri-1, big 200 000]`
+   the same payload put `min(S_clamp) = 200 000` while selection returned `small` — a big model's
+   `max_tokens` sent to a small one, which is exactly the outcome §3's decision row rejects the
+   `max` alternative for, reached by another route.
+
+**Fixed by making the two one function, not by aligning two.** `dispatch::est_input_tokens` and its
+own last dependency `agent::prompt::est_tokens_pessimistic` are DELETED;
+`estimate_input_tokens_pessimistic` is `pub` and the clamp calls it on the very `Payload` it is
+about to dispatch, which is the same payload `Gateway::execute` estimates. Aligning the formulas by
+hand was rejected: it leaves an invariant between two crates that nothing enforces, and the drift
+ran the OTHER way on multi-byte text (bytes there, chars here), so neither figure bounded the other
+and no slack constant could have covered it.
+
+Two side effects worth recording. The clamp's `est` is now over BYTES, which is more margin
+everywhere and much more where the old figure was weakest (CJK is 3 bytes/char and tokenizes near
+1 token/char — `chars/3` under-counted it threefold). And AC10 below is the criterion this
+correction adds.
 
 ## 5. What the operator sees, and what changes about it
 
@@ -121,7 +161,16 @@ new false comment in place of an old one, and would have cost an operator a manu
 2. It never returns a window below `est` — proven on a chain whose entries straddle the estimate.
 3. **A BUDGETED run on `[big 128k, small 8k]` with a ~20 k prompt SUCCEEDS**, selecting `big`. This
    is SP-7a's AC1, which passes unbudgeted and fails budgeted today — the slice's whole point.
-4. The clamp's emitted `max_tokens` on that run is at or below `big`'s window minus the estimate.
+4. The clamp's emitted `max_tokens` leaves the prompt room inside the window of the candidate that
+   actually WON. **Amended** — it read "at or below `big`'s window minus the estimate", and on the
+   AC3 fixture that is `emitted <= 191 808` against an output limit of 1024, which no
+   implementation can fail. The review mutation-proved the vacuity: dropping the `− est` term, and
+   even folding the accessor with `.max()` instead of `.min()`, left it green. The criterion now
+   requires a fixture where the WINDOW term is the binding ceiling on the winning candidate, and is
+   carried by `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits`
+   (`est + emitted == 4096` exactly, on the run that lands on `small`), which reddens under both
+   mutations. The AC3 fixture keeps only what it can falsify: the routing, and
+   `emitted == max_output_tokens`.
 5. A budgeted run whose prompt exceeds EVERY window is refused by the **gate** (`AllGated`, naming
    a window), not by the clamp's `BelowFloor`.
 6. An unbudgeted run is byte-identical — the clamp does not run.
@@ -131,25 +180,65 @@ new false comment in place of an old one, and would have cost an operator a manu
    longer offers "route to a chain whose smallest model has a larger window", and states that the
    input FITS the window it names; no test asserts the old wording. **Amended** from "no longer
    claims the refusal cannot be cleared by any cap" — see §5's correction: that claim is still
-   true, and the message keeps it.
+   true, and the message keeps it. Both negatives are asserted: the review found the remedy clause
+   unpinned (the two forbidden strings share no substring, so restoring the old remedy verbatim
+   left the suite green) and it now has its own assertion, mutation-proven.
 9. The output-limit term (`min_max_output_tokens`) still applies independently — a serving window
-   larger than the model's output limit does not widen `max_tokens`.
+   larger than the model's output limit does not widen `max_tokens`. A TIE between the two terms
+   counts as window-bound, so the refusal keeps the window's wording; that rule is stated in the
+   clamp's comment and was unguarded, and is now pinned by
+   `a_tie_between_the_output_limit_and_the_window_term_names_the_window` (which needs a fixture
+   whose output limit is under the floor, since a tie only becomes observable through a refusal).
+10. **The clamp and the gate judge one request by one `est`.** Added by §4.1's correction. Asserted
+    across the crate boundary rather than as an equality between two functions, because there is
+    only one function now: for a dispatched call,
+    `gateway_est(request) + max_tokens <= context_window(model dispatched to)`, with `gateway_est`
+    measured by the gateway's own estimator on the request the provider received.
 
 ## 7. Deferred
 
 - Moving the clamp downstream of selection, for a bound on the ACTUAL selected model (clamp spec
   §8; this slice makes the gap smaller but does not close it).
 - SP-7b context budgeting, SP-7c semantic activation, the M1 reversal.
-- Teaching the gate and the clamp to share one estimate value rather than each computing its own —
-  they agree today because both use the pessimistic estimator, but nothing enforces it. They do at
-  least agree in the safe DIRECTION: the gateway's estimator adds tool schemas the clamp's omits, so
-  the gate's figure is never smaller, and a request the clamp thinks nothing can serve is one the
-  gate skips too.
+- **A sub-floor `min_max_output_tokens` still renders as the BUDGET arm.** `binding_window`
+  discriminates the window term from the budget, and there are two model bounds: when the OUTPUT
+  limit is what lands under `MIN_OUTPUT_TOKENS`, `window` is `None` and the operator is told to
+  raise a cap that the output term does not read either. Reachable — `collect_validation_errors`
+  Rule 5 rejects only `max_output_tokens == 0` — and left because closing it means a THIRD message
+  arm with a third remedy ("drop that entry, or raise its declared limit"), which is a wording
+  decision this review did not ask for. The field's doc names it as a known misdirection rather
+  than claiming to discriminate every model bound.
 - Deleting `Gateway::min_context_window`. The clamp was its last production caller, so it now has
   none. Kept deliberately: it is a `pub` read accessor on a library type, removing it is a breaking
   change for no gain, and its own test asserts the number the serving bound stopped using — which
   is how a silent revert to the chain minimum stays visible. Its doc says all of this so the next
   reader does not have to re-derive it.
+
+### Removed from this list: "teach the gate and the clamp to share one estimate value"
+
+It was deferred with this reason: *"they agree today because both use the pessimistic estimator,
+but nothing enforces it. They do at least agree in the safe DIRECTION: the gateway's estimator adds
+tool schemas the clamp's omits, so the gate's figure is never smaller, and a request the clamp
+thinks nothing can serve is one the gate skips too."*
+
+**Every clause of that was false, and it is the sentence that let the Critical in §4.1 ship.**
+
+- The clamp's estimator did NOT omit tool schemas. `dispatch::est_input_tokens` summed
+  `est(name) + est(description) + est(schema.to_string())` over every tool, and its own doc said so
+  in its first sentence.
+- The direction was inverted. Measured on this repo's own `tool_agent_registry` fixture the clamp
+  said 60 and the gateway said 59; on a 600-message ASCII payload, 4200 against 3800. The two
+  formulas differ in ROUNDING (per string vs once) and in UNIT (chars vs bytes), and those push
+  opposite ways — per-string rounding makes the clamp's figure larger on Latin text, byte counting
+  makes the gateway's larger on multi-byte text. **Neither figure bounded the other in either
+  direction.**
+- "A request the clamp thinks nothing can serve is one the gate skips too" is the precise inverse of
+  what happens: the clamp's serving set empties FIRST, and the gate admits models in the gap.
+
+So this was never a tidy-up; it was a prerequisite for §4's soundness argument, and it is now
+CLOSED rather than deferred (§4.1). Recorded here rather than deleted because a deferral list is
+where the next author looks to decide whether a residual is benign, and "we checked and it was
+safe" is the most expensive kind of wrong entry to leave there.
 
 ## 8. What changed for an operator, in one line
 
