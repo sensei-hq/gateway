@@ -104,6 +104,16 @@ pub fn assemble_prompt_parts(
     })
 }
 
+/// The heading both renderers open the section with, and the first thing
+/// [`render_context_section_bounded`] spends its budget on.
+///
+/// A const rather than a literal because SP-7b's [`context_section_overhead`] has to charge for
+/// it too — see that function for why a section's structural bytes have to be priced outside the
+/// renderer at all. Both renderers take it from here, so they cannot open a section differently.
+/// The per-entry heading is NOT shared with the unbounded renderer below: it builds that inline
+/// to avoid an allocation per dependency on the model path, which is the hot one.
+const CONTEXT_HEAD: &str = "\n\n## Context";
+
 /// Render the `## Context` section exactly as the model receives it: no bound, no
 /// truncation. An empty `entries` renders the EMPTY STRING, which is what keeps a
 /// no-dependency agent's prompt byte-identical to the pre-blackboard prompt.
@@ -111,7 +121,7 @@ pub fn render_context_section(entries: &[(String, String)]) -> String {
     if entries.is_empty() {
         return String::new();
     }
-    let mut out = String::from("\n\n## Context");
+    let mut out = String::from(CONTEXT_HEAD);
     for (key, body) in entries {
         out.push_str("\n\n### ");
         out.push_str(key);
@@ -163,6 +173,17 @@ fn floor_char_boundary(s: &str, n: usize) -> usize {
     i
 }
 
+/// The marker [`truncate_with_marker`] appends, as its own function because SP-7b's
+/// [`context_section_overhead`] has to know how wide it can get in order to reserve room for it.
+///
+/// One function called by both rather than a format string written twice: the reservation is only
+/// as good as its agreement with what actually gets rendered, and this module's own tombstone
+/// (below [`render_context_section_bounded`]) records what a duplicated size calculation cost the
+/// last time — two figures that drifted and a provider 400 at the end of it.
+fn truncation_marker(shown: usize, total: usize) -> String {
+    format!("\n… (truncated: {shown} of {total} bytes shown)")
+}
+
 /// Truncate `s` to at most `max` bytes, appending a marker that says so.
 ///
 /// The marker is not decoration. A human-backed reviewer shown a clipped contract with no
@@ -178,7 +199,7 @@ fn truncate_with_marker(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let marker = |shown: usize| format!("\n… (truncated: {shown} of {} bytes shown)", s.len());
+    let marker = |shown: usize| truncation_marker(shown, s.len());
     // The marker's own length depends on `shown`, so budget with the widest it can be
     // (`shown` can never exceed `max`) and then re-render with the real number: fewer digits
     // only ever makes it shorter, so the total cannot grow past `max`.
@@ -208,6 +229,15 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
     let mut out = truncate_with_marker(&text, max);
     out.truncate(floor_char_boundary(&out, max));
     out
+}
+
+/// The `### {key}` heading [`render_context_section_bounded`] writes before each entry's body.
+///
+/// Shared with [`context_section_overhead`] for the same reason as [`truncation_marker`]: the
+/// overhead is a reservation, and a reservation computed from a second copy of the layout is one
+/// edit away from being wrong.
+fn context_entry_heading(key: &str) -> String {
+    format!("\n\n### {key}\n")
 }
 
 /// Render the `## Context` section for a HUMAN-backed node's question, bounded to `budget`
@@ -252,15 +282,14 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
     if entries.is_empty() {
         return String::new();
     }
-    const HEAD: &str = "\n\n## Context";
-    let share = budget.saturating_sub(HEAD.len()) / entries.len();
-    let mut out = String::from(HEAD);
+    let share = budget.saturating_sub(CONTEXT_HEAD.len()) / entries.len();
+    let mut out = String::from(CONTEXT_HEAD);
     // Where each entry ENDS, recorded as it is written. This is what lets the degradation
     // below report an EXACT count and cut on an entry boundary; recomputing it afterwards
     // would mean re-parsing the very headings a dependency's own body is free to forge.
     let mut ends = Vec::with_capacity(entries.len());
     for (key, body) in entries {
-        let head = format!("\n\n### {key}\n");
+        let head = context_entry_heading(key);
         // The heading is what tells the human WHICH dependency this is, so it is never the
         // thing truncated; only the body competes for what is left of this entry's share.
         let room = share.saturating_sub(head.len());
@@ -277,10 +306,10 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
     let omitted = |shown: usize| format!("\n\n… ({shown} of {} dependencies shown)", entries.len());
     let ceiling = budget.saturating_sub(omitted(entries.len()).len());
     let shown = ends.iter().take_while(|end| **end <= ceiling).count();
-    // `HEAD.len()` rather than 0 when not even the first entry fits: the section heading is
-    // what makes the remaining line legible as a statement about context at all.
+    // `CONTEXT_HEAD.len()` rather than 0 when not even the first entry fits: the section heading
+    // is what makes the remaining line legible as a statement about context at all.
     out.truncate(if shown == 0 {
-        HEAD.len()
+        CONTEXT_HEAD.len()
     } else {
         ends[shown - 1]
     });
@@ -391,14 +420,27 @@ pub fn available_context_bytes(window: u32, transcript_tokens: u32) -> Option<us
 /// into it because the estimator answers in TOKENS over a whole payload, and dropping schemas
 /// needs a per-schema BYTE figure.
 ///
-/// Being a mirror, it can drift, and NOTHING in this workspace pins the two together. The plan
-/// this came from claimed `the_planner_converts_a_token_window_into_a_byte_budget` was that
-/// guard; it is not — that test pins the estimator's DIVISOR (the `× 3`), and no test compares
-/// this term to the estimator's. So if the estimator starts pricing something else per tool,
-/// this undercounts silently and a budgeted prompt lands over the window. What bounds the damage
-/// is that the budget does not decide admission: the per-candidate `ContextWindowGate` still
-/// measures the real payload, so the outcome is a skipped candidate, not a prompt the provider
-/// chokes on.
+/// Being a mirror, it can drift, so it is pinned to the estimator ACROSS THE CRATE BOUNDARY by
+/// `the_byte_budget_is_the_gateway_estimators_own_arithmetic`. That test builds a payload whose
+/// counted content is one whole budget, sized as `system` bytes PLUS one real schema priced by
+/// this function, and asserts the estimator returns exactly the token spare the budget came from.
+/// Sizing the system half as the remainder is what puts this term on trial: price the schema
+/// differently from the gateway and the total stops being one budget, whatever the schema's share
+/// of it. Mutation-checked three ways — the gateway's tools term, the gateway's divisor, and this
+/// crate's `× 3` — each reddens it.
+///
+/// Two earlier claims here were wrong and are recorded because the correction is the point. The
+/// first said `the_planner_converts_a_token_window_into_a_byte_budget` was the guard: it is not,
+/// it asserts a hand-derived literal over THIS crate's `× 3` and never calls the estimator. The
+/// second, added while removing the first, said that test pinned the estimator's DIVISOR — the
+/// same error from the other side. Nothing pinned either half until the test named above existed.
+///
+/// The residual, stated so the guard is not read as total: it holds the two together at ONE point
+/// and only to within `div_ceil(3)`'s rounding, so a mirror one or two bytes light stays
+/// invisible. If the terms do drift, the budget does not decide admission — the per-candidate
+/// `ContextWindowGate` still measures the real payload — so the cost is a skipped candidate, and
+/// when every candidate is skipped selection refuses before any provider is called rather than
+/// putting an over-window prompt on the wire.
 ///
 /// This is not the per-string estimator the tombstone above warns about, and the difference is
 /// the rounding: that one divided and rounded UP per string, so summing its answers exceeded the
@@ -412,6 +454,41 @@ fn tool_bytes(t: &ToolDefinition) -> usize {
         + t.input_schema.to_string().len()
 }
 
+/// The bytes a rendered `## Context` section spends on STRUCTURE rather than on dependency
+/// bodies: [`CONTEXT_HEAD`], one [`context_entry_heading`] per entry, and the widest
+/// [`truncation_marker`] each entry could be charged.
+///
+/// It exists because the two numbers SP-7b compares are in different units. The floor is measured
+/// over BODY bytes ([`ContextCut::retained_bytes`], spec §5.3), but the figure
+/// [`render_context_section_bounded`] takes bounds the WHOLE section — every heading and every
+/// marker is paid for out of it. Subtracting this puts [`plan_budget`]'s fit check back in the
+/// floor's unit; without it, a budget approved AT the floor renders below it, because the
+/// structure was silently charged to the body's share.
+///
+/// Deliberately an OVER-estimate in two places, since being light is what re-opens that gap:
+/// - a marker is reserved for EVERY entry, though only the truncated ones pay one, and at its
+///   widest: a marker appears only when the body did NOT fit, so both the width the renderer
+///   reserves and the one it finally emits are rendered from figures below `total`, and pricing
+///   it at `total` bounds them both;
+/// - `entries.len() - 1` absorbs the remainder the renderer's `budget / entries.len()` integer
+///   division throws away.
+///
+/// Zero for no entries, matching the renderer's own early return: no entries, no section, nothing
+/// charged. That branch is load-bearing rather than decorative — `entries.len() - 1` underflows on
+/// an empty slice, which is a dependency-free agent, i.e. the most ordinary node there is.
+fn context_section_overhead(entries: &[(String, String)]) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let per_entry: usize = entries
+        .iter()
+        .map(|(key, body)| {
+            context_entry_heading(key).len() + truncation_marker(body.len(), body.len()).len()
+        })
+        .sum();
+    CONTEXT_HEAD.len() + (entries.len() - 1) + per_entry
+}
+
 /// Decide the context budget, dropping whole tool schemas from the END of the activation order
 /// until the context floor fits.
 ///
@@ -419,20 +496,47 @@ fn tool_bytes(t: &ToolDefinition) -> usize {
 /// the journaled-budget determinism argument work (spec §4.2): the caller journals
 /// `available_bytes`, and every later drive reproduces this plan from it.
 ///
+/// Takes the context ENTRIES rather than a byte total because both of the figures it needs come
+/// from them and must agree: the floor is a fraction of the entry bodies, and the room those
+/// bodies will actually get is the budget minus the section structure the keys and bodies imply
+/// (see [`context_section_overhead`]). A caller passing the two separately could pass a pair that
+/// does not describe the same section.
+///
+/// **The fit check is an APPROXIMATION, in both directions, and [`retained_meets_floor`] over
+/// the MEASURED cut is what actually decides (spec §5.2/§5.3).** What the overhead subtraction
+/// buys is that the ordinary shapes cannot be approved here and refused there — one dependency,
+/// or several of the SAME size, render at or above the floor whenever this approves, which
+/// `a_budget_the_planner_approves_renders_at_or_above_the_floor` sweeps across the whole boundary
+/// region for both — and that the drop loop no longer ends one schema early because heading bytes
+/// were charged to the floor.
+///
+/// It does not make the two agree in general:
+/// - it can still APPROVE a budget the render falls short of, because the renderer splits the
+///   budget EVENLY and never redistributes an unused share (spec §5.2 records that as an
+///   inherited limitation) — a 10-byte dependency beside a 10-KiB one leaves half the budget
+///   unspent, and the retained total lands under a floor this arithmetic had reserved for;
+/// - and it reserves conservatively, so it can demand a few dozen bytes per entry more than the
+///   render needs, which costs at most one further dropped schema.
+///
+/// So a caller must handle a post-render floor failure rather than treating a plan as proof of
+/// fit.
+///
 /// `None` means the floor cannot be met however many schemas are dropped, and the caller must
 /// refuse.
 pub fn plan_budget(
     available_bytes: usize,
     authored_bytes: usize,
     tools: &[ToolDefinition],
-    requested_context_bytes: usize,
+    entries: &[(String, String)],
 ) -> Option<BudgetPlan> {
     // The authored half is never cut (spec §5.2), so it comes off the top.
     let room = available_bytes.checked_sub(authored_bytes)?;
-    // The least context worth dispatching. Computed from the floor rather than from a constant
-    // so the two can never disagree: a plan that met some other minimum and then failed the
-    // floor check would refuse AFTER doing all the work.
-    let floor = floor_bytes(requested_context_bytes);
+    // The least BODY bytes worth dispatching, and beside it the bytes that never reach a body.
+    // Both are derived here rather than taken as arguments so they cannot describe different
+    // sections — the point of computing the floor inside the planner is that the drop loop stops
+    // at a budget the renderer has a chance of meeting, not at one it demonstrably cannot.
+    let floor = floor_bytes(entries.iter().map(|(_, body)| body.len()).sum());
+    let overhead = context_section_overhead(entries);
     let mut kept = tools.len();
     let mut dropped_tools = Vec::new();
     loop {
@@ -442,8 +546,15 @@ pub fn plan_budget(
         // subtraction reports that as `0` bytes spare, which clears a floor of `0` (i.e. any
         // dependency-free agent) and returns a "plan" for a prompt that still does not fit. It
         // also underflowed `room - tool_total` on the way out. Keep dropping instead.
+        //
+        // The overhead subtraction IS saturating, which is the opposite choice for the opposite
+        // reason: it only changes the ANSWER when the floor is `0` — with any larger floor,
+        // `0 >= floor` is false and the loop keeps dropping either way — and a floor of `0` is a
+        // section with no body bytes to retain. Refusing a turn because its HEADINGS do not fit
+        // would be refusing over nothing; whether those survive is the renderer's own final
+        // clamp to answer.
         if let Some(spare) = room.checked_sub(tool_total)
-            && spare >= floor
+            && spare.saturating_sub(overhead) >= floor
         {
             return Some(BudgetPlan {
                 context_budget_bytes: spare,
@@ -886,12 +997,16 @@ mod tests {
         }
     }
 
-    /// The planner is PURE and its arithmetic mirrors the gateway estimator exactly.
+    /// The window arithmetic: the reserve comes off the top, the transcript next, and what is
+    /// left becomes bytes.
     ///
-    /// `estimate_input_tokens_pessimistic` is `ceil(bytes/3)`, so a token budget T is exactly a
-    /// byte budget of 3T over the counted parts. These cases pin that identity rather than a
-    /// hand-tuned constant: if the estimator's divisor ever changes, `available_context_bytes`
-    /// must change with it and this test is what says so.
+    /// What this pins is THIS crate's `× 3` and the two `None` boundaries — nothing more. It does
+    /// NOT hold that multiplier to `estimate_input_tokens_pessimistic`'s divisor: the estimator is
+    /// never called here, so `11_232` is a hand-derived literal and a gateway that started
+    /// dividing by something else would leave this green. That claim was made here twice and was
+    /// false both times; the guard actually doing that job is
+    /// `the_byte_budget_is_the_gateway_estimators_own_arithmetic`, which was written for it and
+    /// mutation-checked from both sides of the boundary.
     #[test]
     fn the_planner_converts_a_token_window_into_a_byte_budget() {
         // window 4096, reserve 256 for output, transcript 96 tokens ⇒ 3744 tokens ⇒ 11232 bytes.
@@ -919,12 +1034,14 @@ mod tests {
             tool_def("beta", 300),
             tool_def("gamma", 300),
         ];
-        // Room for authored(0) + one tool(300) + a 500-byte context floor, and no more. The
-        // REQUESTED figure is derived from the fraction rather than written as a literal 2000:
-        // the constant's own doc says it exists to be replaced by a measurement, and a test that
-        // pinned today's 0.25 would stop exercising two drops the moment it was re-tuned.
-        let requested = (500.0 / orchestrator_core::CONTEXT_FLOOR_FRACTION) as usize;
-        let plan = plan_budget(900, 0, &tools, requested).expect("above the floor");
+        // Room for authored(0) + one tool(300) + a 500-byte context floor and the section bytes
+        // around it, and no more. The entry's BODY is derived from the fraction rather than
+        // written as a literal 2000: the constant's own doc says it exists to be replaced by a
+        // measurement, and a test that pinned today's 0.25 would stop exercising two drops the
+        // moment it was re-tuned.
+        let body = (500.0 / orchestrator_core::CONTEXT_FLOOR_FRACTION) as usize;
+        let entries = vec![("A".to_string(), "z".repeat(body))];
+        let plan = plan_budget(900, 0, &tools, &entries).expect("above the floor");
         assert_eq!(
             plan.dropped_tools,
             vec!["gamma".to_string(), "beta".to_string()],
@@ -950,7 +1067,7 @@ mod tests {
     #[test]
     fn schemas_heavier_than_the_window_are_dropped_rather_than_budgeted_around() {
         let tools = vec![tool_def("heavy", 500)];
-        let plan = plan_budget(100, 0, &tools, 0).expect("a dependency-free turn can still run");
+        let plan = plan_budget(100, 0, &tools, &[]).expect("a dependency-free turn can still run");
         assert_eq!(
             plan.dropped_tools,
             vec!["heavy".to_string()],
@@ -972,12 +1089,13 @@ mod tests {
     #[test]
     fn the_planner_refuses_when_the_floor_cannot_be_met_at_all() {
         let tools = vec![tool_def("heavy", 500)];
+        let entries = vec![("A".to_string(), "z".repeat(4_000))];
         assert!(
-            plan_budget(100, 0, &tools, 4_000).is_none(),
+            plan_budget(100, 0, &tools, &entries).is_none(),
             "dropping every schema still leaves less than the floor"
         );
         assert!(
-            plan_budget(100, 900, &[], 0).is_none(),
+            plan_budget(100, 900, &[], &[]).is_none(),
             "the authored half alone overruns the window, and it is never cut"
         );
     }
@@ -1010,6 +1128,155 @@ mod tests {
         assert!(
             !retained_meets_floor(requested, exactly_the_floor - 1),
             "a byte under it is refused"
+        );
+    }
+
+    /// A budget the planner APPROVES must render at or above the floor.
+    ///
+    /// The two figures are in different units unless the planner is careful: the floor is
+    /// measured over dependency BODY bytes, while the number the renderer takes bounds the whole
+    /// SECTION — heading, per-entry `### key` headings and the truncation markers all come out of
+    /// it. A planner that compares `spare` straight against the floor therefore approves a budget
+    /// that renders SHORT of it, and the turn is refused after the whole plan was built.
+    ///
+    /// Asserted as a property over the boundary region rather than at one hand-computed budget,
+    /// so it cannot be satisfied by re-deriving the implementation's own arithmetic: whatever the
+    /// smallest `available` the planner accepts turns out to be, the section rendered at the
+    /// budget it returns has to clear the floor. The body is `z` because the scaffolding the
+    /// renderer adds around it — `## Context`, `### A`, `(truncated: N of M bytes shown)`,
+    /// `(N of M dependencies shown)` — contains no `z`, so counting them counts body bytes and
+    /// nothing else.
+    ///
+    /// The second shape is not a duplicate of the first. `budget / entries.len()` throws its
+    /// remainder away, so with more than one entry an approval has to reserve for that loss as
+    /// well; two 301-byte bodies put the floor on an odd number and give the division something
+    /// to lose. Dropping the reservation's `entries.len() - 1` term reddens this shape ALONE —
+    /// one byte per entry is exactly the size of defect a single hand-picked example misses.
+    #[test]
+    fn a_budget_the_planner_approves_renders_at_or_above_the_floor() {
+        for entries in [
+            vec![("A".to_string(), "z".repeat(1_000))],
+            vec![
+                ("A".to_string(), "z".repeat(301)),
+                ("B".to_string(), "z".repeat(301)),
+            ],
+        ] {
+            let requested: usize = entries.iter().map(|(_, b)| b.len()).sum();
+            let floor =
+                (requested as f64 * orchestrator_core::CONTEXT_FLOOR_FRACTION).ceil() as usize;
+            let mut approvals = 0usize;
+            for available in floor..floor + 400 {
+                let Some(plan) = plan_budget(available, 0, &[], &entries) else {
+                    continue;
+                };
+                approvals += 1;
+                let retained = render_context_section_bounded(&entries, plan.context_budget_bytes)
+                    .matches('z')
+                    .count();
+                assert!(
+                    retained >= floor,
+                    "{} entries: approved {available} available ⇒ a budget of {} ⇒ only \
+                     {retained} body bytes rendered, under the floor of {floor}",
+                    entries.len(),
+                    plan.context_budget_bytes
+                );
+            }
+            assert!(
+                approvals > 0,
+                "the sweep over {} entries has to reach an approving budget or it asserts nothing",
+                entries.len()
+            );
+        }
+    }
+
+    /// A schema is dropped when the floor needs the room the headings and markers take.
+    ///
+    /// The other half of the unit mismatch, and the behavioural one: dropping schemas is how the
+    /// planner buys room for context, and stopping one schema early because the heading bytes
+    /// were charged to the floor converts a turn that could have been DEGRADED into a refusal —
+    /// exactly the outcome SP-7b exists to prevent. The schema here is sized to leave just over
+    /// the floor in section bytes and just under it in body bytes, derived from the fraction
+    /// rather than written as a literal so re-tuning the constant does not silently change what
+    /// the case exercises.
+    #[test]
+    fn a_schema_is_dropped_when_the_headings_and_markers_need_the_room() {
+        let entries = vec![
+            ("alpha_output".to_string(), "z".repeat(200)),
+            ("beta_output".to_string(), "z".repeat(200)),
+        ];
+        let requested: usize = entries.iter().map(|(_, b)| b.len()).sum();
+        let floor = (requested as f64 * orchestrator_core::CONTEXT_FLOOR_FRACTION).ceil() as usize;
+        let available = 1_000usize;
+        let tools = vec![tool_def("wide", available - floor - 10)];
+        let plan = plan_budget(available, 0, &tools, &entries).expect("the floor is reachable");
+        assert_eq!(
+            plan.dropped_tools,
+            vec!["wide".to_string()],
+            "the schema goes, because keeping it leaves the floor unreachable once the section's \
+             own bytes are paid for"
+        );
+        let retained = render_context_section_bounded(&entries, plan.context_budget_bytes)
+            .matches('z')
+            .count();
+        assert!(
+            retained >= floor,
+            "and the room it freed really does render the floor: {retained} of {floor}"
+        );
+    }
+
+    /// The byte budget is the GATEWAY estimator's own arithmetic, asserted across the crate
+    /// boundary.
+    ///
+    /// [`available_context_bytes`] and [`tool_bytes`] are both mirrors of
+    /// `estimate_input_tokens_pessimistic` — one of its divisor, one of its tools term — and
+    /// until this test nothing in the workspace held either of them to it. This closes both at
+    /// once, and in the only unit that matters: a `Chat` payload whose ENTIRE counted content is
+    /// one budget's worth of bytes must price at exactly the token spare that budget was computed
+    /// from. Part of that content is a real tool schema and the `system` half is sized as the
+    /// REMAINDER after `tool_bytes` prices it, which is what puts the tools term on trial beside
+    /// the divisor: price the schema differently from the gateway and the total stops being one
+    /// budget. The schema is a small share of the bytes, and that does not matter — only the
+    /// difference does.
+    ///
+    /// `assert_eq!` rather than `<=` deliberately. `<=` would pass a divisor CHANGE in the
+    /// direction that merely wastes window (a bigger divisor ⇒ the same bytes price cheaper ⇒
+    /// the budget under-fills), and the equality is what pins the `× 3` from both sides without
+    /// naming `3` anywhere in the test.
+    ///
+    /// It does NOT pin a drift smaller than the estimator's own rounding: `div_ceil(3)` maps
+    /// three byte counts to one token, so a mirror one or two bytes light is invisible here. A
+    /// tools term that gained or lost a whole field is not.
+    #[test]
+    fn the_byte_budget_is_the_gateway_estimators_own_arithmetic() {
+        let window = 4_096u32;
+        let transcript = 96u32;
+        let budget = available_context_bytes(window, transcript).expect("room to budget");
+        // A schema with all three counted parts non-empty, so a tools term that stopped counting
+        // any one of them shows up as a difference rather than as a zero either way.
+        let tool = ToolDefinition {
+            name: "fs_write".to_string(),
+            description: Some("Write a file to the run's workspace".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        };
+        let schema_bytes = tool_bytes(&tool);
+        let payload = kernel::types::request::Payload::Chat {
+            messages: Vec::new(),
+            system: Some("s".repeat(budget - schema_bytes)),
+            max_tokens: None,
+            temperature: None,
+            tools: vec![tool],
+        };
+        let spare_tokens = window
+            - u32::try_from(orchestrator_core::MIN_OUTPUT_TOKENS).expect("the reserve is small")
+            - transcript;
+        assert_eq!(
+            gateway::estimate_input_tokens_pessimistic(&payload),
+            spare_tokens,
+            "one budget's worth of bytes must price at exactly the tokens it was budgeted from"
         );
     }
 
