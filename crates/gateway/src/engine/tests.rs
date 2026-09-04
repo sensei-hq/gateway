@@ -3891,11 +3891,22 @@ async fn all_gated_all_terminal_returns_none_resume_with_human_action() {
 }
 
 /// (3) Mixed terminal (A, credits) + timed (B, quota) → `resume_after` is the
-/// min over the TIMED gates only (B ~1800s); the terminal A is excluded, and a
-/// timed retry wins over the human action.
+/// min over the TIMED gates only (B ~1800s), so the terminal A is excluded from the
+/// wake; A's remedy is still REPORTED beside it.
+///
+/// This test asserted `human_action.is_none()` here — "a timed retry wins over the
+/// terminal remedy" — until SP-7a's review. The two fields answer different questions:
+/// `resume_after` decides whether the caller pauses (and only the timed gates can
+/// contribute to it, which is the half this test has always been about), while
+/// `human_action` is the diagnosis of what will STILL be wrong after the wake. Nulling
+/// the second because the first exists loses information no caller can recover, and it
+/// bites hardest on the reason SP-7a introduced: no deadline makes a context window
+/// bigger, so an over-window candidate beside a timed one produced a wake, a retry, and
+/// only then the truth.
 #[tokio::test]
 async fn all_gated_mixed_terminal_and_timed_uses_min_over_timed_only() {
     use crate::gates::lockout::LockReason;
+    use crate::types::error::HumanAction;
 
     let gw = ab_gateway(ab_chain_config(vec![]));
     gw.apply_lockout("A:a-model", LockReason::CreditsExhausted, None); // terminal
@@ -3912,9 +3923,11 @@ async fn all_gated_mixed_terminal_and_timed_uses_min_over_timed_only() {
             ..
         } => {
             assert_resume_near(resume_after, 1800, 150); // terminal A excluded from the min
-            assert!(
-                human_action.is_none(),
-                "a timed retry wins over the terminal remedy"
+            assert_eq!(
+                human_action,
+                Some(HumanAction::TopUpCredits),
+                "and A's remedy travels with the wake rather than being discarded by \
+                 it — B's quota clears in 30 minutes, A's credits never do"
             );
         }
         other => panic!("expected AllGated, got: {other}"),
@@ -4464,6 +4477,85 @@ async fn the_engine_selects_on_the_pessimistic_estimate_not_the_cost_one() {
         Some("big".to_string()),
         "`small` is the priority-1 entry and the cost estimate fits it, so it is \
          selected unless the engine forwarded the PESSIMISTIC figure"
+    );
+}
+
+/// A candidate that is BOTH over-window and circuit-open still lets the run PAUSE — and
+/// the terminal remedy travels with the pause instead of being discarded.
+///
+/// Two properties, in the one place their consequence is visible.
+///
+/// **(a) The gate's registration position.** `ContextWindowGate` is registered after the
+/// health gates, so `small` — over-window AND breaker-open — reports `CircuitOpen`, which
+/// is `Timed`, which is what puts a `resume_after` on the `AllGated`. The orchestrator's
+/// `classify_gateway_error` pauses only on `Some(t)`; reporting the window instead would
+/// make this a terminal `NodeFailed`, so a transient provider outage would permanently
+/// kill every run whose prompt is also too big for that entry. Moving the gate to the
+/// front of `ModelSelectionService::new`'s vector left the whole workspace green before
+/// this test existed.
+///
+/// **(b) `human_action` survives a `resume_after`.** `all_gated_error` used to null the
+/// remedy whenever any timed gate set a wake, on the reasoning that "a timed retry wins
+/// over the terminal remedy". SP-7a is what makes that lossy: the window is the first
+/// terminal reason no elapsed time can EVER clear, so this run wakes in five minutes,
+/// finds `big` still too small, and only then fails — having never told the operator the
+/// one thing that was true from the start. The wake is still scheduled (waking can help;
+/// `small`'s breaker may close onto a request that fits), but the message now carries
+/// both halves.
+#[tokio::test]
+async fn an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause() {
+    use crate::types::error::HumanAction;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default()); // threshold 5, timeout 300s
+    cb.can_execute("noop:small");
+    for _ in 0..5 {
+        cb.record_failure("noop:small");
+    }
+    assert!(
+        !cb.can_execute("noop:small"),
+        "the fixture needs `small`'s breaker genuinely open"
+    );
+    let gw = Gateway::new(
+        window_chain_config(128_000, 8_192),
+        AdapterRegistry::new(),
+        cb,
+    );
+
+    // 600 KB ⇒ 200 000 tokens: over BOTH windows, so `big` is terminal-gated and
+    // `small` is gated twice over.
+    let err = gw
+        .execute(&chat_request_of_length(600_000))
+        .await
+        .expect_err("nothing in the chain can hold 200k tokens");
+    let GatewayError::AllGated {
+        skipped,
+        human_action,
+        resume_after,
+    } = &err
+    else {
+        panic!("expected AllGated, got: {err:?}");
+    };
+
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.contains("small") && s.contains("circuit breaker open")),
+        "`small` must report the BREAKER, not the window — the breaker clears by \
+         itself and the window never does: {skipped:?}"
+    );
+    assert_resume_near(*resume_after, 300, 120);
+    assert_eq!(
+        *human_action,
+        Some(HumanAction::UseLargerContextWindow),
+        "and the unclearable half must not be thrown away just because a wake was \
+         scheduled: waking cannot make `big` bigger, and the operator needs to know \
+         that now rather than in five minutes"
+    );
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("resume after") && rendered.contains("larger context window"),
+        "both must survive Display, which is the only channel that reaches a \
+         NodeFailed: {rendered}"
     );
 }
 

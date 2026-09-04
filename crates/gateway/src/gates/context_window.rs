@@ -18,6 +18,16 @@ use crate::skip_reason::SkipReason;
 /// `engine::util::estimate_input_tokens_pessimistic` — including its statement of what
 /// it does NOT count, since the gate is exactly as complete as its input.
 ///
+/// **Which payload kinds this gate applies to is decided THERE, not here.** The estimator
+/// answers in the unit each kind's window actually bounds and returns 0 where a
+/// `context_window` bounds nothing (`Stt`, `Tts`, `ImageGenerate`, `VideoGenerate` — none
+/// of those models publishes such a figure), and 0 can never exceed a window, so those
+/// kinds admit unconditionally. Keeping that decision in the estimator rather than
+/// branching on `SelectionCtx::capability` here is deliberate: the estimator matches on
+/// the `Payload` itself, which is the ground truth of what goes on the wire, while
+/// `Capability` has eleven variants against six payload kinds and does not map cleanly
+/// (an `ImageAnalyze` request is a `Chat` payload and must be gated like one).
+///
 /// `None` admits, matching `BudgetGate`'s treatment of a model with no pricing: an absent
 /// estimate is not evidence of a problem, and a gate that skipped on missing data would
 /// refuse every request that did not carry one.

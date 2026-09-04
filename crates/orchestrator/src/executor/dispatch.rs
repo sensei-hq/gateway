@@ -152,9 +152,10 @@ impl<'a> Meter<'a> {
 /// Tool schemas are counted rather than waved off as small for two reasons. They are pure
 /// JSON, which is the worst case for a chars-per-token heuristic and the reason
 /// [`est_tokens_pessimistic`](crate::agent::prompt::est_tokens_pessimistic) exists at all;
-/// and an agent's activated schemas routinely outweigh its prompt. `over_budget` already
-/// counts them, for the same reason, and is the reference this mirrors — including its
-/// treatment of `description` as optional.
+/// and an agent's activated schemas routinely outweigh its prompt. The deleted
+/// `over_budget` counted them for the same reason and was the reference this mirrored —
+/// including its treatment of `description` as optional. Its successor,
+/// `gateway::engine::util::estimate_input_tokens_pessimistic`, counts them too.
 ///
 /// A message's `tool_calls` are counted for a plainer reason: they are SENT. The ReAct
 /// loop appends an assistant turn carrying them on every turn (`agent.rs`) and re-sends
@@ -171,12 +172,25 @@ impl<'a> Meter<'a> {
 /// attaching media owes this function a term, and there is no way for it to find out
 /// except by reading this paragraph.
 ///
-/// Deliberately NOT shared with `over_budget`/`est_prompt_tokens`: those answer "will this
-/// fit the context window", which wants to avoid false alarms and so wants the opposite
-/// bias. One function cannot serve both, and merging them would silently change a
-/// window-fit behaviour this slice has no business touching. `over_budget` has the same
-/// `tool_calls` gap and keeps it: an under-count there is the SAFE direction (it lets a
-/// turn through that might not fit) where here it is the expensive one.
+/// # Why the window question has its own estimator, and it is not the reason this comment
+/// # used to give
+///
+/// It used to read: "deliberately NOT shared with `over_budget`/`est_prompt_tokens`: those
+/// answer 'will this fit the context window', which wants to avoid false alarms and so
+/// wants the opposite bias … `over_budget` has the same `tool_calls` gap and keeps it".
+/// Every clause of that is now wrong. SP-7a DELETED both functions along with the halt
+/// they served, so the reference points at nothing; and their successor,
+/// `gateway::engine::util::estimate_input_tokens_pessimistic`, wants the SAME bias this
+/// one does, not the opposite — it counts `tool_calls` and tool schemas, and it divides by
+/// 3. An over-count there refuses a fit that would have worked, which is cheaper than the
+/// provider 400 an under-count buys, exactly as an over-count here is cheaper than
+/// overshooting the cap.
+///
+/// So the two are separate for a structural reason rather than a behavioural one: the
+/// gateway crate cannot depend on the orchestrator (the dependency runs the other way),
+/// which that function's own doc states. They also measure in different units — bytes
+/// there, characters here — and over different inputs (a whole `Payload` there, a `&str`
+/// at a time here). Both err high; neither is a real tokenizer.
 fn est_input_tokens(system: Option<&str>, messages: &[Message], tools: &[ToolDefinition]) -> u64 {
     let est = |s: &str| crate::agent::prompt::est_tokens_pessimistic(s) as u64;
     let mut total = system.map_or(0, est);
@@ -264,7 +278,20 @@ pub(super) enum BudgetRefusal {
     /// Deriving the raise from the allowance instead (`budget + floor − allowance`)
     /// agrees everywhere else and understates it by exactly that difference here, which
     /// is the arm nothing else can observe.
-    BelowFloor { allowance: u64, est_input: u64 },
+    ///
+    /// `window` is `Some(w)` when the CHAIN's smallest context window — not the budget —
+    /// is what pushed the ceiling under the floor, and `w` is that raw window. It exists
+    /// because the two situations have opposite remedies and were reported identically:
+    /// the budget arm is cleared by `torii run wake --budget-tokens N`, and the window
+    /// arm cannot be cleared by any cap at all (the window term is
+    /// `min_context_window(chain) − est`, which never reads the cap, so the same refusal
+    /// arrives at 1e6 and at `u64::MAX`). Telling an operator to raise a cap that is
+    /// already astronomical is a round trip that ends where it started.
+    BelowFloor {
+        allowance: u64,
+        est_input: u64,
+        window: Option<u32>,
+    },
 }
 
 /// What a journaled refusal means for the producer that hit it: a durable pause the
@@ -475,6 +502,10 @@ impl Executor {
                         cause: BudgetRefusal::BelowFloor {
                             allowance,
                             est_input: est,
+                            // The BUDGET allowance alone fell under the floor — no model
+                            // bound was consulted to reach this point, so there is no
+                            // window to blame and a cap raise genuinely is the remedy.
+                            window: None,
                         },
                     }));
                 }
@@ -488,9 +519,12 @@ impl Executor {
                 // failure it exists to prevent.
                 //
                 // `None` (an unknown chain, or one with no resolvable models) means "no
-                // ceiling from here", matching how `over_budget` treats an unknown
-                // context window — a missing catalog entry must not silently truncate
-                // every reply, and the budget allowance still bounds the call.
+                // ceiling from here" — a missing catalog entry must not silently truncate
+                // every reply, and the budget allowance still bounds the call. The
+                // deleted `over_budget` treated an unknown window the same way, and this
+                // is now the LAST place that convention lives: the gateway's
+                // `ContextWindowGate` has no unknown-window case at all, because it reads
+                // a resolved candidate's non-optional `ModelConfig.context_window`.
                 //
                 // It is a `min` over the CHAIN, which has a cost §6 records: on a
                 // HETEROGENEOUS fallback chain the weakest entry's limit binds from the
@@ -538,20 +572,33 @@ impl Executor {
                 // comes back, and `est` is biased HIGH, so this bound errs toward asking
                 // for less. Same `None` handling as the output limit — an unknown chain
                 // yields no bound from here rather than a silent truncation.
-                let ceiling = match request.chain.as_deref() {
+                //
+                // `binding_window` carries the chain's RAW smallest window when the
+                // window term is what produced the ceiling, and it exists purely so the
+                // refusal below can be truthful. Without it the two very different
+                // situations — "your cap is too small" and "your prompt does not fit any
+                // model in this chain" — reach the operator in identical budget wording,
+                // and only one of them is fixed by the `torii run wake --budget-tokens N`
+                // that wording names. A tie counts as window-bound: when both terms land
+                // on the same figure the window is a true cause of the refusal, and the
+                // window is the half a cap raise cannot move.
+                let (ceiling, binding_window) = match request.chain.as_deref() {
                     Some(chain) => {
                         let out = self.gateway.min_max_output_tokens(chain).await;
-                        let window = self
-                            .gateway
-                            .min_context_window(chain)
-                            .await
+                        let min_win = self.gateway.min_context_window(chain).await;
+                        let window = min_win
                             .map(|w| w.saturating_sub(u32::try_from(est).unwrap_or(u32::MAX)));
-                        match (out, window) {
+                        let ceiling = match (out, window) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
-                        }
+                        };
+                        let binding = match (ceiling, window, min_win) {
+                            (Some(c), Some(term), Some(raw)) if term == c => Some(raw),
+                            _ => None,
+                        };
+                        (ceiling, binding)
                     }
-                    None => None,
+                    None => (None, None),
                 };
                 // The floor again, now against the bound that will ACTUALLY be emitted.
                 // The check above tests the budget allowance alone, which is the right
@@ -566,11 +613,14 @@ impl Executor {
                 // ignoring it sends an over-large `max_tokens` at a model that cannot
                 // take it, which is the 400 this whole block exists to avoid.
                 //
-                // KNOWN GAP, and it is the honest one to state: when the WINDOW is the
-                // binding term the message still reads as a budget problem and names a
-                // raise that will not help, because no cap change makes a prompt fit.
-                // Recorded rather than papered over; the refusal wording is the subject
-                // of its own review finding.
+                // `window` is threaded through so the refusal can name the term that
+                // actually bound it. This USED to be recorded here as a known gap — the
+                // message read as a budget problem whatever the cause and named a raise
+                // that could not help — which was survivable while SP-DATA-5 shipped
+                // alone and stopped being so when SP-7a deleted the orchestrator's
+                // pre-dispatch window halt: that halt used to fire FIRST on a budgeted
+                // run and fail the node with a window message, so this arm is now the
+                // only thing an over-window budgeted run ever sees.
                 if ceiling.is_some_and(|c| u64::from(c) < orchestrator_core::MIN_OUTPUT_TOKENS) {
                     return Ok(Err(Refusal::BudgetExhausted {
                         spent,
@@ -578,6 +628,7 @@ impl Executor {
                         cause: BudgetRefusal::BelowFloor {
                             allowance: ceiling.map_or(allowance, u64::from),
                             est_input: est,
+                            window: binding_window,
                         },
                     }));
                 }
@@ -714,9 +765,13 @@ impl Executor {
                 budget,
                 cause,
             } => {
-                // Both messages start `budget: ` — that prefix is the operator- and
-                // test-visible marker for "this pause is about the cap", and torii's
-                // status/list-paused surfaces match on it.
+                // The two BUDGET messages start `budget: ` — that prefix is the operator-
+                // and test-visible marker for "this pause is about the cap". The third,
+                // `BelowFloor { window: Some(_) }`, deliberately does NOT: it travels the
+                // same durable-pause path but the cap is not what refused it, and saying
+                // "budget" there sends the operator to the one lever that cannot help.
+                // Nothing in torii matches these prefixes in production code (checked);
+                // the convention is for humans and for this file's own tests.
                 let reason = match cause {
                     // Names a concrete lower bound, not just the arithmetic. It used to
                     // end at "raise it", which is a dead end precisely where an operator
@@ -773,9 +828,43 @@ impl Executor {
                     // is still shown — it is the right answer when nothing else spends,
                     // which is the common single-node case — but it is labelled as a
                     // floor under the real requirement rather than as the answer.
+                    //
+                    // **And when the WINDOW is what bound the ceiling, none of that
+                    // arithmetic applies and the message says something else entirely.**
+                    // The window term is `min_context_window(chain) − est`, which never
+                    // reads the cap, so every figure above — headroom, needed, "raise it
+                    // with `torii run wake --budget-tokens N`" — names a lever that
+                    // cannot move this refusal: the identical pause arrives at a cap of
+                    // 1e6 and at one of `u64::MAX`. An operator who follows the budget
+                    // wording raises the cap, wakes the run, and re-pauses on the same
+                    // node having spent a manual round trip on nothing.
+                    //
+                    // The prefix differs too (`context window: ` rather than `budget: `),
+                    // which is deliberate: that prefix is the operator- and test-visible
+                    // marker for what a pause is ABOUT, and this one is not about the
+                    // cap. It is still a `BudgetExhausted` refusal on the same durable
+                    // pause path — `resume_after: None`, SP-DATA-3's HOTL class — because
+                    // the run is worth preserving for an operator who widens the chain,
+                    // where a node failure would destroy it.
                     BudgetRefusal::BelowFloor {
                         allowance,
                         est_input,
+                        window: Some(window),
+                    } => {
+                        let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+                        format!(
+                            "context window: this call's input is estimated at {est_input} \
+                             tokens against the chain's smallest context window of {window}, \
+                             leaving {allowance} for output — below the {floor}-token floor. \
+                             The budget is not the binding term ({spent} of {budget} spent) \
+                             and no cap raise clears this: send less, or route to a chain \
+                             whose smallest model has a larger window."
+                        )
+                    }
+                    BudgetRefusal::BelowFloor {
+                        allowance,
+                        est_input,
+                        window: None,
                     } => {
                         let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
                         let headroom = est_input.saturating_add(floor);

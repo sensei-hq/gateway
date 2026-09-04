@@ -102,15 +102,36 @@ impl<'a> ModelSelectionService<'a> {
                 Box::new(CircuitBreakerGate),
                 Box::new(crate::gates::lockout::ModelLockoutGate),
                 Box::new(BudgetGate),
-                // LAST, and after `BudgetGate` specifically. The vector is ordered and
-                // `admit` returns the FIRST skip, so this position decides which reason
-                // a multiply-gated candidate reports. Every gate ahead of it is either
-                // structural (the candidate cannot serve this at all) or health (the
-                // candidate is temporarily unavailable), and both are cheaper answers
-                // for an operator than "your request is too big": a candidate that is
-                // over-window AND circuit-open should surface the BREAKER, because that
-                // one clears by itself. Moving this earlier would report the window at
-                // candidates whose real problem is transient.
+                // LAST. The vector is ordered and `admit` returns the FIRST skip, so this
+                // position decides which reason a multiply-gated candidate reports — and
+                // that is a behaviour, not a presentation detail: `gate_status()` makes
+                // `CircuitOpen`/`Cooling`/a timed lockout `Timed`, which becomes
+                // `AllGated { resume_after: Some(t) }` and a durable PAUSE at the
+                // orchestrator's `classify_gateway_error`, while `OverContextWindow` is
+                // `Terminal` — `resume_after: None`, a `NodeFailed`.
+                //
+                // **After the three HEALTH gates (cooldown, breaker, lockout), and that
+                // is the load-bearing half.** A candidate that is both over-window and
+                // circuit-open must report the BREAKER, because that one clears by
+                // itself; reporting the window instead turns a transient provider outage
+                // into a permanently dead run. Pinned by
+                // `a_health_skip_is_reported_ahead_of_the_window_for_the_same_candidate`
+                // and, at the engine boundary where the pause/fail split is visible, by
+                // `engine::tests::an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause`.
+                //
+                // **After `BudgetGate` too, and that half is a JUDGEMENT with a cost.**
+                // An earlier version of this comment claimed every gate ahead of this one
+                // is "either structural or health", and that is simply false: `OverBudget`
+                // is `Terminal(RaiseBudget)` and a `CreditsExhausted`/auth lockout is
+                // `Terminal(TopUpCredits/RotateCredential)`. `all_gated_error` keeps the
+                // FIRST terminal remedy it meets, so a request that is over budget AND
+                // over every window is reported as `RaiseBudget` and says nothing about
+                // the window: the operator raises the cap, retries, and only then learns
+                // the prompt does not fit. Accepted deliberately — money is the
+                // irreversible lever, and a caller that has set a cap wants to hear about
+                // the cap first — but it is a two-step diagnosis, not a free ordering,
+                // and `a_budget_skip_is_reported_ahead_of_the_window` pins it so the
+                // choice cannot drift by accident.
                 Box::new(crate::gates::context_window::ContextWindowGate),
             ],
             health: circuit_breaker,
@@ -1392,6 +1413,103 @@ mod tests {
              single chain-wide figure is exactly what this slice replaced: {:?}",
             result.skipped
         );
+    }
+
+    /// The gate's POSITION in the vector, pinned by its consequence.
+    ///
+    /// `admit` returns the FIRST skip, so where `ContextWindowGate` sits decides which
+    /// reason a multiply-gated candidate reports — and that is not cosmetic. A skip
+    /// reason's `gate_status()` is what `all_gated_error` aggregates: `CircuitOpen` is
+    /// `Timed`, which becomes `AllGated { resume_after: Some(t) }` and a durable PAUSE at
+    /// `classify_gateway_error`; `OverContextWindow` is `Terminal`, which becomes
+    /// `resume_after: None` and a `NodeFailed`. So a candidate that is both over-window
+    /// and circuit-open must surface the BREAKER, or a transient provider outage
+    /// permanently kills every run whose prompt is also too large for that entry.
+    ///
+    /// Nothing enforced this before: moving `Box::new(ContextWindowGate)` from last to
+    /// FIRST in `ModelSelectionService::new` left the whole workspace green, while
+    /// changing this candidate's reported reason from `CircuitOpen` to
+    /// `OverContextWindow`. The engine-level consequence is asserted in
+    /// `engine::tests::an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause`;
+    /// this is the same claim where the ordering actually lives.
+    #[test]
+    fn a_health_skip_is_reported_ahead_of_the_window_for_the_same_candidate() {
+        let config = two_model_chain_windows(128_000, 8_192);
+        let cb = test_cb();
+        // Trip `small`'s breaker Open. It is ALSO the candidate that cannot hold the
+        // request below, which is the whole point: two gates fire on one candidate.
+        cb.can_execute("r:small");
+        for _ in 0..5 {
+            cb.record_failure("r:small");
+        }
+        assert!(
+            !cb.can_execute("r:small"),
+            "the fixture needs the breaker genuinely open"
+        );
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&criteria_with_pessimistic(Some(20_000)));
+        let small = result
+            .skipped
+            .iter()
+            .find(|s| s.model == "small")
+            .expect("`small` is skipped twice over and must be recorded");
+        assert!(
+            matches!(small.reason, SkipReason::CircuitOpen { .. }),
+            "the BREAKER must win: it is `Timed`, so the caller can pause and retry, \
+             where `OverContextWindow` is `Terminal` and kills the run. Registering the \
+             window gate ahead of the health gates inverts this: {:?}",
+            small.reason
+        );
+    }
+
+    /// The budget half of the same ordering, pinned because it is a JUDGEMENT rather
+    /// than a forced move.
+    ///
+    /// Both `OverBudget` and `OverContextWindow` are `Terminal`, so unlike the breaker
+    /// case neither ordering costs a pause — what it costs is a round trip. Reporting
+    /// budget first means an operator whose request is over budget AND over every window
+    /// raises the cap, retries, and only then learns the prompt does not fit; reporting
+    /// the window first means the mirror image. Money-first is the shipped choice (see
+    /// the registration comment), and this test is what makes reversing it a deliberate
+    /// edit instead of an accident of vector order.
+    #[test]
+    fn a_budget_skip_is_reported_ahead_of_the_window() {
+        let mut config = two_model_chain_windows(128_000, 8_192);
+        // Price both models so the `BudgetGate` has an estimate to judge. The figures
+        // only have to exceed the caller's budget; `max_output_tokens` alone (4096 at
+        // $1/1k) puts every candidate over a $0.01 cap.
+        for m in config.models.values_mut() {
+            m.pricing = Some(crate::types::config::ModelPricing {
+                input_per_1k: 1.0,
+                output_per_1k: 1.0,
+                per_request: None,
+            });
+        }
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&SelectionCriteria {
+            budget: Some(0.01),
+            // The COST gate reads this one; the window gate reads the other. Both
+            // candidates are over both.
+            input_tokens: Some(20_000),
+            ..criteria_with_pessimistic(Some(200_000))
+        });
+        assert!(result.all_candidates.is_empty(), "everything is gated");
+        for s in &result.skipped {
+            assert!(
+                matches!(s.reason, SkipReason::OverBudget { .. }),
+                "money is reported first, deliberately — see the registration comment \
+                 in `ModelSelectionService::new` for the accepted cost: {} reported {:?}",
+                s.model,
+                s.reason
+            );
+        }
     }
 
     /// AC4 — an in-window request selects byte-identically to one carrying no estimate.

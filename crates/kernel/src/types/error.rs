@@ -108,11 +108,20 @@ pub enum GatewayError {
 
     /// Every candidate was gated (health-locked / cooling / breaker-open / over
     /// budget / over its context window) — none was attemptable. `resume_after` is
-    /// the **wall-clock** earliest eligibility (min over timed gates); `None` ⇒ all
-    /// gates are terminal ⇒ `human_action` carries the remedy and the caller must
-    /// not pause forever. `skipped` is human-readable diagnostics. Distinct from
-    /// `AllAttemptsFailed` (a candidate genuinely failed) and `NoCandidates`
-    /// (nothing configured/eligible). Never triggers fallback.
+    /// the **wall-clock** earliest eligibility (min over timed gates); `None` ⇒ no
+    /// gate clears on its own and the caller must not pause forever. `skipped` is
+    /// human-readable diagnostics. Distinct from `AllAttemptsFailed` (a candidate
+    /// genuinely failed) and `NoCandidates` (nothing configured/eligible). Never
+    /// triggers fallback.
+    ///
+    /// **The two fields are independent, and the caller must key on `resume_after`
+    /// alone.** `human_action` is DIAGNOSIS, and it can be `Some` beside a `Some`
+    /// `resume_after`: a chain with one breaker-open candidate and one whose window is
+    /// too small for the request yields a wake (the breaker will close) AND a remedy
+    /// (nothing about waiting makes the other model bigger). Reading `human_action` as
+    /// "this is terminal" was safe only while `all_gated_error` nulled it whenever a
+    /// wake existed, which threw the remedy away — see that function for why the
+    /// suppression was removed.
     ///
     /// **`Display` renders all three fields**, and that is load-bearing rather than
     /// cosmetic: the orchestrator's `classify_gateway_error` turns this error into a
@@ -120,13 +129,18 @@ pub enum GatewayError {
     /// never reaches the operator who has to act. It rendered only the first field
     /// for several slices, which silently discarded every per-candidate reason and
     /// the remedy alike — the caller was told "human action required" and not which.
-    #[error("all candidates gated{}{}",
+    #[error("all candidates gated{}{}{}",
         resume_after
             .map(|t| format!(", resume after {t}"))
-            .unwrap_or_else(|| match human_action {
-                Some(h) => format!(", human action required: {h}"),
-                None => ", human action required".to_string(),
-            }),
+            .unwrap_or_default(),
+        match (human_action, resume_after) {
+            (Some(h), _) => format!(", human action required: {h}"),
+            // No remedy AND no deadline: `all_gated_error` cannot build this (a gate is
+            // either Timed or Terminal, and Terminal always carries an action), so it
+            // is a hand-constructed value. Say the bare thing rather than nothing.
+            (None, None) => ", human action required".to_string(),
+            (None, Some(_)) => String::new(),
+        },
         if skipped.is_empty() {
             String::new()
         } else {
@@ -281,6 +295,37 @@ mod tests {
             shown.contains("larger context window"),
             "as must the remedy, or the message says 'human action required' without \
              saying which: {shown}"
+        );
+    }
+
+    /// A wake and a remedy render TOGETHER — the two fields are independent.
+    ///
+    /// The old `#[error]` put them in an `unwrap_or_else`, so a `Some` `resume_after`
+    /// swallowed the remedy at the rendering layer as well as at the aggregation one.
+    /// A chain with one breaker-open candidate and one whose window is too small
+    /// produces exactly this pair, and the operator needs both: retry at `t`, and the
+    /// other model will still be too small then.
+    #[test]
+    fn all_gated_renders_a_wake_and_a_remedy_together() {
+        let t = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let shown = GatewayError::AllGated {
+            resume_after: Some(t),
+            skipped: vec![
+                "noop:small — circuit breaker open".to_string(),
+                "noop:big — estimated 200000 input tokens exceeds the model's \
+                 128000-token context window"
+                    .to_string(),
+            ],
+            human_action: Some(HumanAction::UseLargerContextWindow),
+        }
+        .to_string();
+        assert!(
+            shown.contains("resume after"),
+            "the wake decides whether the caller pauses: {shown}"
+        );
+        assert!(
+            shown.contains("larger context window"),
+            "and the remedy says what will still be wrong after it: {shown}"
         );
     }
 

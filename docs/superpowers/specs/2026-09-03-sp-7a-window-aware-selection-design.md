@@ -92,6 +92,16 @@ The numerator is UTF-8 **bytes**, not characters (`str::len()`), which is furthe
 safe direction and largest exactly where a chars-per-token heuristic is weakest: CJK text is 3
 bytes per character and tokenizes near 1 token per character.
 
+**The estimate is per INFERENCE UNIT, not per request, and on two payload kinds that differs from
+what the cost estimator measures.** Added after review, because the first implementation summed an
+embedding BATCH and priced a TTS prompt, and both were wrong in the same way: they answered "how
+much text is in this request" where the gate asks "what is one candidate's `context_window` being
+asked to hold". For `Embed` the answer is the largest single input; for `Tts` / `ImageGenerate` /
+`VideoGenerate` there is no answer, because those models publish no context window at all, and the
+honest return is `0` — the same way the `Stt` arm has always said "not applicable". AC10 states
+each arm and its test. The consequence for §4's ordering argument is recorded in AC7: it holds
+where the two functions measure the same quantity, which is `Chat`.
+
 **So the window gate uses its own pessimistic figure**, and `estimate_input_tokens` is left alone.
 Not because sharing would be wrong in principle, but because widening the shared estimator silently
 changes every cost estimate the `BudgetGate` makes, which is a different slice's decision to take.
@@ -186,6 +196,22 @@ now renders all three fields, and `HumanAction` gained a `Display` so "human act
 Since the outcome is terminal (§3), this diagnosis is the whole of what an operator gets, which is
 why it is the part with a test rather than a sentence.
 
+**A second `all_gated_error` change, found by review:** it nulled `human_action` whenever any timed
+gate set a `resume_after` ("a timed retry wins over the terminal remedy"). That was survivable while
+every terminal reason was a credential or a cap — those are at least plausibly related to waiting —
+and stopped being so here, because the window is the first reason no elapsed time can EVER clear. A
+chain with one breaker-open candidate and one whose window is too small produced a five-minute
+pause, a wake, and only then the diagnosis that had been true from the start. The two fields are now
+independent: `resume_after` still decides the pause (the caller keys on it alone, unchanged), and
+`human_action` says what will still be wrong after the wake. `Display` renders both.
+
+**And one more step was needed for that to reach anyone.** `classify_gateway_error`'s Pause arm
+built its reason by hand — `"all candidates gated; resume after {t}"` — discarding the skips and
+the remedy that its own Fail arm passes through as `err.to_string()`. So the recoverable case told
+an operator strictly less than the terminal one, and the change above would have been invisible on
+the one path it was made for. The Pause arm now uses `err.to_string()` too, which is what gets
+journaled into `RunPaused` and read back by `torii status`.
+
 ## 7. Acceptance criteria
 
 1. A chain `[big 128k, small 8k]` serves a ~20k-token prompt — it selects `big` and succeeds, where
@@ -205,19 +231,43 @@ why it is the part with a test rather than a sentence.
    *composed* — from a real `Payload` through the estimator and the gate to a verdict — because
    the two halves passing separately is what let the `tool_calls` gap ship. Removing the tools
    term must make it fail.
-7. The pessimistic estimate is **≥** the existing `estimate_input_tokens` for the same payload,
-   and its unit is pinned by at least one ABSOLUTE assertion (`ceil(bytes/3)`) — an ordering-only
-   test cannot see the divisor change.
+7. For a **`Chat`** payload the pessimistic estimate is **≥** the existing
+   `estimate_input_tokens`, and its unit is pinned by at least one ABSOLUTE assertion
+   (`ceil(bytes/3)`) — an ordering-only test cannot see the divisor change. **Revised after
+   review: the ordering is asserted for `Chat` alone, not for every payload kind**, because on the
+   other kinds the two functions measure different QUANTITIES on purpose (AC10). Each of those
+   arms is pinned by an absolute figure instead, which is strictly stronger than the ordering it
+   replaces.
 8. `OrchestratorError::PromptOverBudget` no longer exists, and no test asserts it.
 9. `agent_input_hash` is unchanged for a given prompt — a resumed agent turn replays from its memo
-   across a drive where a *different* candidate was selected.
-10. **Stt** is unaffected: its estimate is 0, so `est > window` is false for every candidate —
-    asserted against a candidate whose window is **zero**, since any non-zero estimate would
-    otherwise pass. **Embed is NOT unaffected, and that is deliberate** (revised after review: the
-    original wording was simply wrong about it). The estimator returns a real number for
-    `Payload::Embed`, embedding models publish real context windows, and an oversized batch earns
-    the same provider 400 as an oversized chat — so Embed is gated exactly like Chat, and it is
-    pinned both ways (a large batch skips an 8 k candidate and admits a 128 k one).
+   across a drive where a *different* candidate was selected. Proven with a second drive whose
+   config resolves the SAME chain name to a different model (a config reload between processes),
+   not with a relabelled response.
+10. **The gate applies to the payload kinds a `context_window` actually bounds, and to no others.**
+    Revised twice after review; the current statement is:
+    - **`Chat`** — gated, on the whole conversation + system + tool schemas.
+    - **`Embed`** — gated, on the **largest single text in the batch**, not the sum. An embeddings
+      request is a batch: `to_embed_request` forwards `texts` verbatim and the providers apply the
+      model's max-input-tokens limit to each ARRAY ELEMENT, with a separate and far larger
+      per-request aggregate. Summing terminally refused 100 RAG chunks of 300 bytes against an 8 k
+      model — each ~1.2% of the window — with a remedy ("use a larger-window model") that is not
+      the fix. Pinned both ways: one oversized text skips an 8 k candidate and admits a 128 k one;
+      a batch of individually small texts is admitted whatever its total.
+    - **`Stt`** — not gated (estimate 0), asserted against a candidate whose window is **zero**,
+      since any non-zero estimate would otherwise pass.
+    - **`Tts` / `ImageGenerate` / `VideoGenerate`** — **not gated**, same zero-window assertion.
+      `context_window` is a chat-model concept and these models do not publish one; what they
+      publish is a maximum prompt LENGTH in characters, a different bound in a different unit that
+      this config has no field for. Gating on the filler value would make every such request a
+      terminal `AllGated` naming a lever the operator cannot pull. §8 records the real fix.
+11. **`context_window == 0` is a config error** (`collect_validation_errors`), mirroring
+    SP-DATA-5's Rule 5 for `max_output_tokens`. Added after review: SP-7a is what turns this field
+    into a hard-fail selection input, and `0` is both existing fixture filler and the natural
+    "not applicable" entry.
+12. **A terminal remedy survives a timed wake.** `all_gated_error` no longer nulls `human_action`
+    when `resume_after` is `Some`. Added after review: the window is the first terminal reason no
+    elapsed time can EVER clear, so a chain with one breaker-open candidate and one too-small one
+    used to pause, wake, and only then report a problem that was true from the start.
 
 ## 8. Deferred
 
@@ -235,14 +285,36 @@ why it is the part with a test rather than a sentence.
   `MIN_OUTPUT_TOKENS` (`executor/dispatch.rs`). For AC1's own example — chain `[big 128k, small
   8k]`, a 20 k prompt — that is `8192.saturating_sub(20000) = 0`, `0 < 256`, so the request is
   refused in the orchestrator **before `Gateway::execute` is called** and the new gate never runs.
-  The clamp's own comment already records the wording half of this as a KNOWN GAP ("when the WINDOW
-  is the binding term the message still reads as a budget problem and names a raise that will not
-  help"). So: **AC1 holds on an unbudgeted run — every pre-SP-DATA-5 run, and the default — and
-  does not hold on a budgeted one until the clamp's window term moves to the selected candidate.**
-  Task 6 must not delete the orchestrator pre-check while believing otherwise.
+  So: **AC1 holds on an unbudgeted run — every pre-SP-DATA-5 run, and the default — and does not
+  hold on a budgeted one until the clamp's window term moves to the selected candidate.** Task 6
+  must not delete the orchestrator pre-check while believing otherwise.
+
+  **And deleting the pre-check CHANGED this arm's outcome class, which an earlier version of this
+  paragraph said it did not.** The halt ran in `agent_turn_output` before `dispatch_metered`, so on
+  a budgeted run it fired first and produced a terminal `NodeFailed` naming the window. With it
+  gone the clamp gets there first and the run PAUSES — measured identically at caps of 1e6, 1e8 and
+  `u64::MAX`, because the window term never reads the cap, so the pause named a lever that could
+  not move it. Fixed within this slice by wording rather than by reversing the flip: when the
+  window is the binding term the refusal now says so, names the window, and does NOT offer
+  `torii run wake --budget-tokens N`. The pause CLASS is kept deliberately — `resume_after: None`
+  is SP-DATA-3's HOTL class and preserves a run an operator can widen the chain for, where a node
+  failure destroys it. Asserted in
+  `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`, including the
+  cap-independence.
 - **A per-attachment token term for the pessimistic estimate** (§4). Owed by the first caller that
   attaches media; the term belongs in tokens, added after the divide, and must not be derived from
   the base64 length.
+- **A real input bound for the non-chat capabilities** (AC10). `Tts` / `ImageGenerate` /
+  `VideoGenerate` DO have provider-published input maxima — a prompt character limit — but it is
+  not `context_window` and `ModelConfig` has no field for it. Until one exists those payload kinds
+  are exactly as ungated as they were before this slice, which is the status quo rather than a
+  regression; the failure mode is a provider 400 on an over-long prompt. The same gap covers an
+  `Embed` batch's per-request AGGREGATE limit, which is separate from the per-item limit AC10
+  gates on.
+- **Splitting an oversized `Embed` batch** rather than refusing the request. The gate now judges
+  the largest single input, so an over-limit batch of small texts is admitted and reaches the
+  provider intact; a batch containing one over-limit text is refused whole, where splitting it out
+  would serve the rest.
 - **Making a deadline-less `AllGated` pausable** — i.e. reversing risk M1 of the selection-policy
   design so `classify_gateway_error` pauses on `AllGated { resume_after: None, human_action:
   Some(_) }` and an operator wakes it with SP-DATA-3's `force_wake` (which already models exactly

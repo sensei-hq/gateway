@@ -272,6 +272,130 @@ fn single_chain_config() -> GatewayConfig {
     }
 }
 
+/// The two windows of [`two_window_chain_config`], named so a test can compute the
+/// prompt size it needs from them instead of repeating literals that could drift apart.
+///
+/// `SMALL` matches [`single_chain_config`]'s only model, so a prompt sized against one
+/// fixture behaves the same way in the other.
+pub const TWO_WINDOW_SMALL: u32 = 4096;
+/// See [`TWO_WINDOW_SMALL`]. Large enough that no fixture prompt in this repo approaches
+/// it, so "over the small window" and "under the big one" is a wide target.
+pub const TWO_WINDOW_BIG: u32 = 200_000;
+
+/// A HETEROGENEOUS chain `"c"`: `small` (window [`TWO_WINDOW_SMALL`]) at priority 1 and
+/// `big` (window [`TWO_WINDOW_BIG`]) at priority 2, both `TextChat` on router `"r"`.
+///
+/// SP-7a's whole point, as a fixture. [`single_chain_config`] — the only gateway config
+/// this harness had — has one chat model, so every orchestrator test of the window
+/// behaviour could only exercise the over-EVERY-window FAILURE. The scenario the slice
+/// exists to unblock (a prompt over the chain MINIMUM but under the primary's window,
+/// which the deleted `over_budget` pre-check refused outright) had no fixture above the
+/// gateway crate at all, and the deleted pre-check was the orchestrator's.
+///
+/// `small` is priority 1 deliberately: it is the entry selection returns FIRST, so a test
+/// that ends up on `big` did so because the window gate removed `small`, not because of
+/// ordering luck.
+pub fn two_window_chain_config() -> GatewayConfig {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "r".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+
+    let mut models = HashMap::new();
+    for (id, context_window) in [("small", TWO_WINDOW_SMALL), ("big", TWO_WINDOW_BIG)] {
+        models.insert(
+            id.to_string(),
+            ModelConfig {
+                id: id.to_string(),
+                api_model_id: None,
+                provider: "r".to_string(),
+                family: None,
+                capabilities: vec![Capability::TextChat],
+                context_window,
+                max_output_tokens: FIXTURE_MAX_OUTPUT_TOKENS,
+                pricing: None,
+                catalog: None,
+            },
+        );
+    }
+
+    let mut chains = HashMap::new();
+    chains.insert(
+        "c".to_string(),
+        FallbackChainConfig {
+            id: "c".to_string(),
+            capability: Capability::TextChat,
+            models: vec![
+                ChainEntry {
+                    model: "small".to_string(),
+                    router: Some("r".to_string()),
+                    api_model_id: None,
+                    priority: 1,
+                },
+                ChainEntry {
+                    model: "big".to_string(),
+                    router: Some("r".to_string()),
+                    api_model_id: None,
+                    priority: 2,
+                },
+            ],
+            fallback_triggers: Vec::new(),
+        },
+    );
+
+    GatewayConfig {
+        routers,
+        models,
+        chains,
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
+}
+
+/// [`recording_gateway`] over [`two_window_chain_config`]: the chain name is still
+/// `"c"`, so every agent fixture keyed on that chain works unchanged and the only
+/// difference is which models it resolves to.
+pub async fn two_window_chain_gateway() -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(RecordingAdapter {
+            calls: calls.clone(),
+            fail_after: None,
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(two_window_chain_config(), adapters, cb), calls)
+}
+
+/// [`scripted_gateway`] over [`two_window_chain_config`].
+///
+/// Exists for the AC9 memo-replay test, whose second drive must resolve chain `"c"` to a
+/// DIFFERENT model than its first — the shape a config reload between two processes
+/// produces, and the only way to exercise "selection may differ" for real rather than by
+/// relabelling a response.
+pub async fn two_window_scripted_gateway(responses: Vec<ChatResponse>) -> (Gateway, CallLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(ScriptedAdapter {
+            calls: calls.clone(),
+            script: Mutex::new(responses.into()),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (Gateway::new(two_window_chain_config(), adapters, cb), calls)
+}
+
 /// Build a minimal gateway whose chain `"c"` resolves `TextChat` to the
 /// recording adapter (router `"r"`, model `"m"`), returning the gateway and the
 /// shared call log. `fail_after` is threaded into the adapter's crash injector.
