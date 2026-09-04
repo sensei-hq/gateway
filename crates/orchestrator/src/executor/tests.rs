@@ -24879,8 +24879,17 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
 /// refusal that meant "your prompt does not fit", and this arm no longer means that: the
 /// prompt fits, and pointing at the chain's SMALLEST model is now pointing at a model
 /// that may have been filtered out of the decision altogether. The replacement says what
-/// bound it — the smallest window that can hold the prompt — and both remedies that
+/// bound it — the smallest window that can hold the prompt — and a remedy that can
 /// actually move it.
+///
+/// The first replacement wording did not manage that second half. It read "send less
+/// input, or put a model with a larger window in this chain", and review showed the
+/// second clause cannot clear the refusal for the same reason the FIRST wording could
+/// not: the term is a minimum over the models that can serve the request, and adding to a
+/// set cannot raise its minimum. See
+/// `adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal`, which
+/// drives this same prompt down a chain with and without a 200 000-window model and gets
+/// byte-identical refusals.
 #[tokio::test]
 async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_window() {
     // 12 000 chars ⇒ est 4000 against the fixture's 4096 window: it FITS (so the serving
@@ -24977,6 +24986,206 @@ async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_wind
     );
 }
 
+/// **Adding a larger model to the chain cannot clear this refusal** — so the message must
+/// not offer that as a remedy.
+///
+/// The review finding this pins is an arithmetic one, and it is decisive. The window term
+/// is a MINIMUM over `{ w ∈ chain : w >= est }`, and adding an element to a set cannot
+/// RAISE its minimum. So "put a model with a larger window in this chain" — which the
+/// message said, and which the field's own doc comment said before it — is at best a
+/// no-op and at worst harmful: a larger entry leaves the minimum where it was, and a
+/// SMALLER one that still holds the input LOWERS it.
+///
+/// # The demonstration, not the assertion
+///
+/// A wording assertion alone would pin the string without proving the claim, so this
+/// drives the SAME prompt down two chains that differ by exactly the recommended change:
+/// the homogeneous 4096 chain, and the two-window chain that adds a 200 000-window model
+/// beside it. The prompt fits BOTH windows (est 4000), so the serving set genuinely gains
+/// the large entry rather than being filtered back to one — and the refusals come out
+/// BYTE-IDENTICAL. That is the finding, in the form a future author cannot read past.
+///
+/// The old remedy is then asserted absent, because the equality above passes whether or
+/// not the message recommends the thing it just proved useless.
+#[tokio::test]
+async fn adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal() {
+    // The same 12 000 chars as the arm's own test ⇒ est 4000, which FITS 4096 (so the
+    // serving set is `{4096}` on the homogeneous chain) and fits 200 000 as well (so on
+    // the two-window chain the set is `{4096, 200 000}` and the minimum is unmoved).
+    let prompt = "x".repeat(12_000);
+    let est = prompt.len().div_ceil(3) as u64;
+    assert!(
+        est <= u64::from(TWO_WINDOW_SMALL) && est <= u64::from(TWO_WINDOW_BIG),
+        "the prompt must fit BOTH windows or the larger model is not ADDED to the serving \
+         set and this test proves nothing about a minimum: est {est}"
+    );
+    assert!(
+        u64::from(TWO_WINDOW_SMALL) - est < orchestrator_core::MIN_OUTPUT_TOKENS,
+        "and the smaller window must still leave under the floor, or neither chain refuses"
+    );
+
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", &prompt),
+            deps: vec![],
+        }],
+    };
+
+    // Chain `{4096}`.
+    let (one_model, one_calls) = clamp_observing_gateway(10, 100).await;
+    let journal_a = InMemoryJournal::new();
+    let run_a = RunId(uuid::Uuid::new_v4());
+    journal_a
+        .append(run_a, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out_a = Executor::new(Arc::new(one_model), Arc::new(journal_a), "v1")
+        .start(run_a, &graph)
+        .await
+        .expect("drives");
+
+    // Chain `{4096, 200 000}` — the same chain plus exactly the model the old remedy
+    // told the operator to add.
+    let (two_models, two_calls, _models, _ests) = two_window_clamp_observing_gateway(10, 100).await;
+    let journal_b = InMemoryJournal::new();
+    let run_b = RunId(uuid::Uuid::new_v4());
+    journal_b
+        .append(run_b, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out_b = Executor::new(Arc::new(two_models), Arc::new(journal_b), "v1")
+        .start(run_b, &graph)
+        .await
+        .expect("drives");
+
+    let pause_a = out_a.paused.as_ref().expect("the one-model chain refuses");
+    let pause_b = out_b
+        .paused
+        .as_ref()
+        .expect("and so does the chain with a 200 000-window model added — that is the point");
+    assert_eq!(
+        pause_b.reason, pause_a.reason,
+        "adding a larger model changed NOTHING: the window term is a minimum over the \
+         models that can serve the request, and adding to a set cannot raise its minimum. \
+         Both refusals name the same {TWO_WINDOW_SMALL}-token window."
+    );
+    assert!(
+        !pause_a
+            .reason
+            .contains("put a model with a larger window in this chain"),
+        "so the message must not recommend it. Each round trip on this pause costs the \
+         operator a manual `BudgetRaised` plus a `force_wake`, and this advice buys one \
+         of those and an unchanged refusal: {}",
+        pause_a.reason
+    );
+    assert!(
+        pause_a.reason.contains("cannot help"),
+        "and it should say so outright rather than merely omitting it — an operator \
+         staring at a {TWO_WINDOW_SMALL}-token window will reach for a bigger model \
+         unprompted: {}",
+        pause_a.reason
+    );
+    assert!(
+        one_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            && two_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+        "and neither chain paid for a truncated reply"
+    );
+}
+
+/// **The serving-window refusal is CAP-INDEPENDENT, and the message says so** — pinned at
+/// two caps five orders of magnitude apart.
+///
+/// The arm's message ends "raising the cap does not move this", which is a claim about the
+/// arithmetic: the ceiling is `min(min_max_output_tokens, window − est)` and neither term
+/// reads `cap` or `spent`. The claim was true and unguarded. The parent commit's test drove
+/// this scenario at `1e6` and at `u64::MAX / 2`, but the serving-window bound moved that
+/// scenario onto the GATE path, and the replacement test of this arm uses one cap — so a
+/// review mutation that gated the refusal on the cap (`&& remaining < 10_000_000`, letting
+/// a large cap dispatch) left the whole workspace green, and so did deleting the clause.
+///
+/// # Why the comparison strips one clause rather than asserting the whole string
+///
+/// The message names the ledger — "(0 of 1000000 spent)" — precisely so an operator can
+/// see the budget is NOT the cause, so a raw equality across two caps would fail on the
+/// one clause that is supposed to differ. Removing exactly that clause and demanding
+/// equality of the remainder is the strong form: it pins that NOTHING else about the
+/// refusal — the binding window, the allowance, the remedies — moves with the cap.
+#[tokio::test]
+async fn a_serving_window_refusal_is_unmoved_by_the_cap() {
+    let prompt = "x".repeat(12_000);
+    // Two caps that cannot both be near a boundary: one an ordinary operator figure, one
+    // so large that `remaining` is effectively unbounded.
+    let caps = [1_000_000_u64, u64::MAX / 2];
+    let mut stripped: Vec<String> = Vec::new();
+
+    for cap in caps {
+        let (gateway, calls) = clamp_observing_gateway(10, 100).await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        journal
+            .append(run, run_started_with_budget(cap))
+            .await
+            .unwrap();
+        let out = Executor::new(Arc::new(gateway), Arc::new(journal), "v1")
+            .start(
+                run,
+                &Graph {
+                    nodes: vec![Node {
+                        id: NodeId("n1".into()),
+                        kind: model_call("c", &prompt),
+                        deps: vec![],
+                    }],
+                },
+            )
+            .await
+            .expect("drives");
+
+        let pause = out.paused.as_ref().unwrap_or_else(|| {
+            panic!(
+                "a cap of {cap} must not change WHETHER the window refuses — the \
+                    ceiling reads neither `cap` nor `spent`"
+            )
+        });
+        assert!(
+            pause.reason.starts_with("context window: "),
+            "nor which term it blames, at cap {cap}: {}",
+            pause.reason
+        );
+        assert!(
+            pause.reason.contains("raising the cap does not move"),
+            "and the message must SAY the cap cannot move it, at cap {cap} — an operator \
+             who is not told spends a `BudgetRaised` and a `force_wake` to find out: {}",
+            pause.reason
+        );
+        assert!(
+            calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "and nothing was dispatched at cap {cap}"
+        );
+        // The one clause that is MEANT to vary with the cap.
+        let ledger = format!("(0 of {cap} spent)");
+        assert!(
+            pause.reason.contains(&ledger),
+            "the message must name the ledger so the operator can see the budget is not \
+             the cause, at cap {cap}: {}",
+            pause.reason
+        );
+        stripped.push(pause.reason.replace(&ledger, ""));
+    }
+
+    assert_eq!(
+        stripped[1], stripped[0],
+        "and with that clause removed the two refusals are identical: the binding window, \
+         the allowance and both remedies are all cap-blind"
+    );
+}
+
 /// **A TIE between the clamp's two model bounds counts as window-bound**, so the refusal
 /// keeps the window's wording rather than the budget's.
 ///
@@ -25007,8 +25216,23 @@ async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_wind
 ///
 /// Both terms are cap-blind, so on a tie neither wording could sell a cap raise honestly
 /// — but only the window arm SAYS so. Naming the window is therefore the answer that
-/// misdirects least: it tells the operator the two things that do move it (send less
-/// input, widen the chain) instead of the one that cannot.
+/// misdirects least.
+///
+/// # But naming the window ALONE is not enough on a tie, and that took a review to see
+///
+/// This doc used to justify the tie by saying the window arm "tells the operator the two
+/// things that do move it (send less input, widen the chain)". Both halves were wrong.
+/// Widening the chain never moved this refusal —
+/// `adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal` demonstrates
+/// that a minimum over the serving set cannot be raised by adding to it — and on a TIE
+/// even the correct window remedies are INSUFFICIENT: the ceiling is
+/// `min(min_max_output_tokens, window_term)` with both terms on the same sub-floor figure,
+/// so clearing the window half leaves the output half binding and the refusal standing.
+///
+/// So the tie keeps the window's classification (it is a true cause, and the only arm that
+/// says the cap is irrelevant) and the message additionally names the output limit as a
+/// co-cause. Asserted below, because a message that classified correctly and still sent
+/// the operator on a round trip that cannot succeed is the same defect in a new place.
 #[tokio::test]
 async fn a_tie_between_the_output_limit_and_the_window_term_names_the_window() {
     // `est` chosen so `window_term == FIXTURE_CONTEXT_WINDOW − est == 200`, the same
@@ -25071,6 +25295,21 @@ async fn a_tie_between_the_output_limit_and_the_window_term_names_the_window() {
     assert!(
         !pause.reason.contains("--budget-tokens"),
         "and it must not name the cap, which neither term reads: {}",
+        pause.reason
+    );
+    // The tie's own assertion, and the one the classification does not give for free.
+    assert!(
+        pause.reason.contains("max_output_tokens"),
+        "on a TIE the output limit binds too, so the message must name it. Without this \
+         the operator is told to send less input or drop the {window_term}-token-window \
+         model, does one of them at the cost of a `BudgetRaised` and a `force_wake`, and \
+         hits the identical refusal from the other term: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("binds too"),
+        "and must say it BINDS, not merely mention the figure — the operator needs to \
+         know the window remedies alone will not clear this: {}",
         pause.reason
     );
     assert!(
