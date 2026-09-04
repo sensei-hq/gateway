@@ -43,6 +43,44 @@ impl PromptParts {
         system.push_str(&render_context_section(&self.context));
         (system, self.tools)
     }
+
+    /// [`Self::join`]'s budgeted sibling: the model path's answer to a prompt no candidate can
+    /// hold.
+    ///
+    /// [`Self::join`]'s doc argues the model path must never truncate, "so a model is never
+    /// silently asked about half a document". The operative word is SILENTLY, and SP-7b answers it
+    /// on four channels rather than by keeping the refusal: the per-entry marker and the
+    /// `(N of M dependencies shown)` tail [`render_context_section_measured`] already emits, the
+    /// `ContextBudgeted` journal record, an additive `context_budgeted` key on the node's output,
+    /// and an operator warn. See the spec's §5.5. Only the first of those is this function's own
+    /// work; it returns the [`ContextCut`] so its caller can drive the other three, and so the
+    /// caller can check the cut against the context floor ([`retained_meets_floor`]) — a plan is
+    /// not proof of fit, which [`plan_budget`]'s doc spells out.
+    ///
+    /// `authored` is never cut (spec §5.2) — those are the config author's own bytes and they can
+    /// trim them, which is the same asymmetry that made [`PromptParts`] two halves in the first
+    /// place. Tool schemas are dropped WHOLE, per `plan.dropped_tools`, because a schema
+    /// truncated mid-JSON is an invalid tool definition a provider rejects with a 400: a
+    /// degradation turned into a hard failure.
+    ///
+    /// Filtering by NAME rather than by index is deliberate. `dropped_tools` carries the names
+    /// [`plan_budget`] read off this same activation order, so a name it holds that no longer
+    /// matches drops nothing and the prompt stays over-window — which the per-candidate
+    /// `ContextWindowGate` then refuses, loudly, rather than putting an over-window request on the
+    /// wire. An index into a list that had shifted would drop the WRONG schema and dispatch
+    /// happily.
+    pub fn join_bounded(self, plan: &BudgetPlan) -> (String, Vec<ToolDefinition>, ContextCut) {
+        let (section, cut) =
+            render_context_section_measured(&self.context, plan.context_budget_bytes);
+        let mut system = self.authored;
+        system.push_str(&section);
+        let tools = self
+            .tools
+            .into_iter()
+            .filter(|t| !plan.dropped_tools.contains(&t.name))
+            .collect();
+        (system, tools, cut)
+    }
 }
 
 /// [`assemble_prompt`]'s work, stopping one step short of joining the halves — see
@@ -184,7 +222,8 @@ fn truncation_marker(shown: usize, total: usize) -> String {
     format!("\n… (truncated: {shown} of {total} bytes shown)")
 }
 
-/// Truncate `s` to at most `max` bytes, appending a marker that says so.
+/// Truncate `s` to at most `max` bytes, appending a marker that says so, and report how many
+/// bytes OF `s` the result carries.
 ///
 /// The marker is not decoration. A human-backed reviewer shown a clipped contract with no
 /// indication it was clipped will answer about the part they were given as though it were
@@ -195,9 +234,16 @@ fn truncation_marker(shown: usize, total: usize) -> String {
 /// When `max` is smaller than the marker itself the marker wins and the result overruns;
 /// the caller's final clamp catches that. It needs hundreds of simultaneous dependencies to
 /// reach, and "the section says it was cut but the section is itself cut" is still honest.
-fn truncate_with_marker(s: &str, max: usize) -> String {
+///
+/// The second return value is the SOURCE bytes emitted — the length of the `&s[..shown]` prefix,
+/// with the marker excluded. It is returned rather than left to the caller because a caller that
+/// wanted it would have to re-derive `shown` from `max` and the marker's width, which is the
+/// duplicated size calculation [`truncation_marker`]'s own doc exists to prevent; and it cannot be
+/// recovered from the returned string, whose two halves are not separable once concatenated (a
+/// body is free to contain the marker's text). [`ContextCut::retained_bytes`] is the sum of these.
+fn truncate_with_marker(s: &str, max: usize) -> (String, usize) {
     if s.len() <= max {
-        return s.to_string();
+        return (s.to_string(), s.len());
     }
     let marker = |shown: usize| truncation_marker(shown, s.len());
     // The marker's own length depends on `shown`, so budget with the widest it can be
@@ -205,7 +251,7 @@ fn truncate_with_marker(s: &str, max: usize) -> String {
     // only ever makes it shorter, so the total cannot grow past `max`.
     let widest = marker(max).len();
     let shown = floor_char_boundary(s, max.saturating_sub(widest));
-    format!("{}{}", &s[..shown], marker(shown))
+    (format!("{}{}", &s[..shown], marker(shown)), shown)
 }
 
 /// Clamp an already-composed human question to the absolute size its durable journal row
@@ -226,7 +272,10 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
     // `AgentAwaited.prompt` — so there is no later caller to catch the marker overrun, and
     // without this line a `max` below the ~36-byte marker width returned MORE than `max`.
     // Guarded by `a_prompt_clamp_never_overruns_its_bound`.
-    let mut out = truncate_with_marker(&text, max);
+    //
+    // `.0` discards the emitted-source-byte count: this clamp bounds a durable journal row, and
+    // nothing downstream of it compares what survived against what was asked for.
+    let (mut out, _emitted) = truncate_with_marker(&text, max);
     out.truncate(floor_char_boundary(&out, max));
     out
 }
@@ -263,6 +312,28 @@ fn context_entry_heading(key: &str) -> String {
 /// unbudgeted runs both fall through. See
 /// `a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold`.
 ///
+/// The even split, the per-entry marker and the reserved tail are documented on
+/// [`render_context_section_measured`], where the code is. This is that function with the
+/// counts dropped — a wrapper rather than a second copy, so the human path and SP-7b's
+/// budgeted model path cannot come to disagree about what "bounded to `budget`" renders.
+/// Its own name is kept because `executor/human.rs` calls it and SP-6 s3's tests pin it.
+pub fn render_context_section_bounded(entries: &[(String, String)], budget: usize) -> String {
+    render_context_section_measured(entries, budget).0
+}
+
+/// [`render_context_section_bounded`]'s work, with the counts it computed on the way out.
+///
+/// Two callers, and they want different halves of the same render:
+/// [`render_context_section_bounded`] (the human path, which needs only the string) and
+/// [`PromptParts::join_bounded`] (SP-7b's budgeted model path, which must then check the cut
+/// against the context floor). The bound itself is applied identically for both.
+///
+/// The counts cannot be recovered from the returned string: dependency bodies are arbitrary run
+/// data and are free to contain the very `### ` headings and truncation markers a parser would key
+/// on, so measuring afterwards would mean re-parsing text a dependency controls. So they are
+/// accumulated as the section is written — `retained` from the same per-entry `room` the loop
+/// already computes, via what [`truncate_with_marker`] reports it emitted.
+///
 /// The budget is split EVENLY across dependencies rather than first-come-first-served, so
 /// one verbose upstream cannot crowd the others out of the question entirely — the human is
 /// shown something from every node they were meant to consider, and when even that is
@@ -278,27 +349,54 @@ fn context_entry_heading(key: &str) -> String {
 /// the end of the last COMPLETE entry (never mid-entry, so the number is exact rather than
 /// estimated), and the section says `(N of M dependencies shown)`. Guarded by
 /// `a_context_section_that_drops_dependencies_says_how_many`.
-pub fn render_context_section_bounded(entries: &[(String, String)], budget: usize) -> String {
+pub fn render_context_section_measured(
+    entries: &[(String, String)],
+    budget: usize,
+) -> (String, ContextCut) {
     if entries.is_empty() {
-        return String::new();
+        // No entries, no section, nothing asked for and nothing retained — and `deps_total: 0` is
+        // what makes `retained_meets_floor(0, 0)`'s "never refused for retaining none of it"
+        // branch the one this reaches.
+        return (
+            String::new(),
+            ContextCut {
+                requested_bytes: 0,
+                retained_bytes: 0,
+                deps_shown: 0,
+                deps_total: 0,
+            },
+        );
     }
+    let requested_bytes = entries.iter().map(|(_, body)| body.len()).sum();
     let share = budget.saturating_sub(CONTEXT_HEAD.len()) / entries.len();
     let mut out = String::from(CONTEXT_HEAD);
     // Where each entry ENDS, recorded as it is written. This is what lets the degradation
     // below report an EXACT count and cut on an entry boundary; recomputing it afterwards
     // would mean re-parsing the very headings a dependency's own body is free to forge.
     let mut ends = Vec::with_capacity(entries.len());
+    // And what each entry contributed in BODY bytes, in the same order and for the same reason:
+    // the degradation below drops WHOLE trailing entries, so the retained total has to lose
+    // exactly the bytes those entries put in, which needs them attributed per entry.
+    let mut retained = Vec::with_capacity(entries.len());
     for (key, body) in entries {
         let head = context_entry_heading(key);
         // The heading is what tells the human WHICH dependency this is, so it is never the
         // thing truncated; only the body competes for what is left of this entry's share.
         let room = share.saturating_sub(head.len());
         out.push_str(&head);
-        out.push_str(&truncate_with_marker(body, room));
+        let (rendered, body_bytes) = truncate_with_marker(body, room);
+        out.push_str(&rendered);
         ends.push(out.len());
+        retained.push(body_bytes);
     }
+    let cut = |deps_shown: usize| ContextCut {
+        requested_bytes,
+        retained_bytes: retained[..deps_shown].iter().sum(),
+        deps_shown,
+        deps_total: entries.len(),
+    };
     if out.len() <= budget {
-        return out;
+        return (out, cut(entries.len()));
     }
     // Budget with the WIDEST count the marker can carry (`shown` can never exceed the total)
     // and re-render with the real one: fewer digits only ever makes it shorter, so the total
@@ -317,8 +415,16 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
     // The unconditional clamp, kept. Everything above is best-effort shaping; this is the
     // line that makes "the journaled question is bounded" true no matter how many
     // dependencies, how long their keys, or how the marker arithmetic lands.
+    //
+    // It cannot make `retained_bytes` overstate the string, and that is derived rather than
+    // assumed: with `shown >= 1` the clamp is a NO-OP here, because `ends[shown - 1] <= ceiling`
+    // by the `take_while` and `omitted(shown).len() <= omitted(entries.len()).len()` (a count that
+    // cannot exceed the total cannot need more digits than it), so the pushed tail lands at or
+    // under `budget`. With `shown == 0` the clamp does bite, and `cut(0)` counts no body bytes at
+    // all — what it eats is `CONTEXT_HEAD` and the tail. Either way the count matches the bodies
+    // in `out`.
     out.truncate(floor_char_boundary(&out, budget));
-    out
+    (out, cut(shown))
 }
 
 // This module holds NO token estimator any more, and the two it held are gone for the
@@ -1322,6 +1428,113 @@ mod tests {
         );
     }
 
+    /// The measured renderer returns the SAME string as the existing bounded one, plus the counts.
+    ///
+    /// This is the no-regression half: `render_context_section_bounded` has one production caller
+    /// today (the human path) and six reviewed behaviours, so the measured variant must be the
+    /// same function with an extra return value, not a reimplementation.
+    ///
+    /// What it can catch, stated exactly, because as written it looks stronger than it is: while
+    /// `render_context_section_bounded` is a one-line delegation this assertion CANNOT fail, so it
+    /// proves nothing about the extraction today. It is a drift guard for the day someone gives
+    /// the wrapper a body of its own — which is the shape the human path shipped in before this
+    /// commit and the shape a merge conflict most easily restores.
+    ///
+    /// The extraction's byte-identity is established by the tests that predate it and still pass
+    /// unchanged — `a_bounded_context_section_fits_its_budget_and_says_where_it_cut`,
+    /// `a_bounded_context_section_splits_its_budget_evenly_across_dependencies`,
+    /// `a_context_section_that_drops_dependencies_says_how_many`,
+    /// `a_budget_the_planner_approves_renders_at_or_above_the_floor`,
+    /// `a_schema_is_dropped_when_the_headings_and_markers_need_the_room` and the 81 `human`
+    /// tests — plus `the_counts_describe_the_string_at_every_budget`, which re-checks the bound
+    /// itself across 1,200 budgets on eight shapes.
+    #[test]
+    fn the_measured_renderer_matches_the_bounded_one_byte_for_byte() {
+        let entries = vec![
+            ("A".to_string(), "a".repeat(500)),
+            ("B".to_string(), "b".repeat(500)),
+        ];
+        for budget in [50usize, 200, 1000, 5000] {
+            let (measured, _cut) = render_context_section_measured(&entries, budget);
+            assert_eq!(
+                measured,
+                render_context_section_bounded(&entries, budget),
+                "the two renderers must not drift at budget {budget}"
+            );
+        }
+    }
+
+    /// `retained_bytes` counts BODY bytes only — not headings, not markers, not the tail.
+    ///
+    /// The body is `z`, not the `a` this test was drafted with, and the difference is the test
+    /// itself: `truncation_marker` renders the word "trunc**a**ted", so counting `a`s counts
+    /// every body byte PLUS one marker byte and the assertion failed 139 against 140 — reporting
+    /// the probe's flaw as a mismatch in the figure under test. `z` is the letter this file's
+    /// other body-counting tests use for exactly that reason: of the four literals the renderer
+    /// emits (`\n\n## Context`, `\n\n### {key}\n`, the truncation marker and the
+    /// `(N of M dependencies shown)` tail) none contains a `z`, so `matches('z')` measures bodies
+    /// and nothing else.
+    ///
+    /// The second assertion is an independent cross-check rather than a restatement: the marker
+    /// is the renderer's HUMAN-facing claim about how much it kept, and `retained_bytes` is the
+    /// machine-facing one SP-7b decides its floor on. They are computed from the same `shown`, so
+    /// a refactor that reported either separately shows up here. It is written for the
+    /// single-entry case only, where the one marker's count IS the section total; with several
+    /// entries the markers each carry their own share and no such equality holds.
+    #[test]
+    fn retained_bytes_excludes_headings_and_markers() {
+        let entries = vec![("A".to_string(), "z".repeat(1000))];
+        let (out, cut) = render_context_section_measured(&entries, 200);
+        assert_eq!(cut.requested_bytes, 1000);
+        assert!(
+            cut.retained_bytes < 200,
+            "bounded below the budget: {}",
+            cut.retained_bytes
+        );
+        assert_eq!(
+            cut.retained_bytes,
+            out.matches('z').count(),
+            "retained counts exactly the body bytes emitted — every 'z' and nothing else, so \
+             the heading, the marker and the tail are all excluded"
+        );
+        assert!(
+            out.contains(&format!(
+                "truncated: {} of 1000 bytes shown",
+                cut.retained_bytes
+            )),
+            "and the section TELLS its reader the same number the floor is decided on: {out:?}"
+        );
+    }
+
+    /// `join_bounded` cuts the context, drops the planned schemas, and never touches `authored`.
+    #[test]
+    fn join_bounded_cuts_context_and_drops_schemas_but_never_authored() {
+        let parts = PromptParts {
+            authored: "AUTHORED".to_string(),
+            context: vec![("A".to_string(), "a".repeat(1000))],
+            tools: vec![tool_def("alpha", 100), tool_def("beta", 100)],
+        };
+        let plan = BudgetPlan {
+            context_budget_bytes: 200,
+            dropped_tools: vec!["beta".to_string()],
+        };
+        let (system, tools, cut) = parts.join_bounded(&plan);
+        assert!(
+            system.starts_with("AUTHORED"),
+            "authored bytes are never cut: {system}"
+        );
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha"],
+            "the planned schema is dropped WHOLE and the survivor is intact"
+        );
+        assert_eq!(cut.deps_total, 1);
+        assert!(
+            cut.retained_bytes < cut.requested_bytes,
+            "and the context really was cut"
+        );
+    }
+
     // Four tests of two token estimators were here: `est_tokens_is_chars_over_four` and
     // `the_pessimistic_estimate_is_never_below_the_window_fit_one` (SP-7a, with
     // `est_tokens`), then `the_pessimistic_estimate_is_chars_over_three_rounded_up` and
@@ -1351,4 +1564,113 @@ mod tests {
     //
     // Removed with the function; nothing it asserted lost its home, and the one case with
     // no home in the gateway ceased to exist rather than moving.
+
+    /// The COUNTS describe the string, at every budget and on the degradation path.
+    ///
+    /// [`ContextCut`] is the whole reason the measured renderer exists, and SP-7b's floor check
+    /// ([`retained_meets_floor`]) is decided on it — so a count that overstates what the section
+    /// actually carries admits a turn whose context was mostly dropped, silently. The plan's
+    /// single-budget test cannot see that: with the trailing-entry accounting mutated to
+    /// `cut(entries.len())` (i.e. counting the dependencies the final clamp DROPPED as shown, and
+    /// their bodies as retained), `retained_bytes_excludes_headings_and_markers`,
+    /// `the_measured_renderer_matches_the_bounded_one_byte_for_byte` and
+    /// `join_bounded_cuts_context_and_drops_schemas_but_never_authored` all stayed green. This
+    /// test reddens at budget 0.
+    ///
+    /// Asserted against the RENDERED STRING rather than against re-derived arithmetic, which is
+    /// what makes it independent of the implementation: the bodies are a single filler character
+    /// absent from all four literals the renderer emits (`\n\n## Context`, `\n\n### {key}\n`,
+    /// the truncation marker — note it spells "truncated", so `a` is NOT such a character and cost
+    /// this test a false failure while it was being written — and the
+    /// `(N of M dependencies shown)` tail), so counting occurrences counts retained bodies, and
+    /// `deps_shown` is checked against the headings actually present. The renderer measuring by
+    /// parsing its own output is the thing the type's doc rules out; a TEST may do it, because a
+    /// test chooses its own inputs and these bodies forge nothing.
+    ///
+    /// The multibyte shapes are here because `retained_bytes` is in BYTES while `matches` counts
+    /// CHARS: `é` is two bytes, so the product form is what holds, and a cut landing mid-character
+    /// would break the equality rather than pass unnoticed.
+    #[test]
+    fn the_counts_describe_the_string_at_every_budget() {
+        /// `(what the case is, the entries, a filler absent from the scaffolding, its byte width)`
+        type Shape = (&'static str, Vec<(String, String)>, char, usize);
+        let shapes: Vec<Shape> = vec![
+            ("no deps", vec![], 'z', 1),
+            ("one dep", vec![("A".into(), "z".repeat(1000))], 'z', 1),
+            (
+                "three even deps",
+                (0..3).map(|i| (format!("d{i}"), "z".repeat(700))).collect(),
+                'z',
+                1,
+            ),
+            (
+                "keys longer than the share",
+                (0..5)
+                    .map(|i| (format!("very_long_key_name_{i}"), "z".repeat(300)))
+                    .collect(),
+                'z',
+                1,
+            ),
+            (
+                // The degradation path: each share falls under the marker width, the section
+                // overruns, and trailing dependencies are dropped WHOLE.
+                "200 deps, share under the marker",
+                (0..200)
+                    .map(|i| (format!("d{i}"), "z".repeat(500)))
+                    .collect(),
+                'z',
+                1,
+            ),
+            ("an empty body", vec![("A".into(), String::new())], 'z', 1),
+            (
+                "multibyte body",
+                vec![("A".into(), "é".repeat(600))],
+                'é',
+                2,
+            ),
+            (
+                "multibyte, two deps",
+                vec![("A".into(), "é".repeat(400)), ("B".into(), "é".repeat(400))],
+                'é',
+                2,
+            ),
+        ];
+        for (name, entries, filler, width) in shapes {
+            let requested: usize = entries.iter().map(|(_, b)| b.len()).sum();
+            for budget in 0usize..1200 {
+                let (out, cut) = render_context_section_measured(&entries, budget);
+                assert!(
+                    out.len() <= budget || entries.is_empty(),
+                    "{name} at budget {budget}: {} bytes, and the bound is the point",
+                    out.len()
+                );
+                assert_eq!(
+                    cut.requested_bytes, requested,
+                    "{name} at budget {budget}: requested is the raw bodies, whatever was cut"
+                );
+                assert_eq!(
+                    cut.retained_bytes,
+                    out.matches(filler).count() * width,
+                    "{name} at budget {budget}: retained disagrees with the bodies in the                      string, which is the number the context floor is decided on"
+                );
+                assert_eq!(
+                    cut.deps_shown,
+                    entries
+                        .iter()
+                        .filter(|(k, _)| out.contains(&format!("\n\n### {k}\n")))
+                        .count(),
+                    "{name} at budget {budget}: deps_shown disagrees with the headings the                      reader can actually see: {out:?}"
+                );
+                assert_eq!(
+                    cut.deps_total,
+                    entries.len(),
+                    "{name}: deps_total is every dep"
+                );
+                assert!(
+                    cut.retained_bytes <= cut.requested_bytes,
+                    "{name} at budget {budget}: retained more than was asked for"
+                );
+            }
+        }
+    }
 }
