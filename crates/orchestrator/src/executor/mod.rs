@@ -356,6 +356,20 @@ struct Fold {
     /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
     /// this makes and why an unbudgeted run must never touch it.
     serial_gate: Arc<tokio::sync::Mutex<()>>,
+    /// SP-7b: the journaled `## Context` byte budget per effect id, folded FIRST-wins from
+    /// `JournalEvent::ContextBudgeted`. See that variant for why the budget is the durable
+    /// value and why a later record must not move it.
+    ///
+    /// Keyed by `EffectId` rather than `NodeId` because an agent node has one budget PER
+    /// TURN, and the turn is what the effect id encodes (`effect_id(node, turn, 0)`). A
+    /// `NodeId` key would make turn 2 of a resumed agent replay turn 1's budget.
+    ///
+    /// Readable strictly before any prompt bytes exist, which is the ordering the whole
+    /// design depends on: `effect_id` is pure over `{parent_path, loop_iteration,
+    /// local_index}`, and `agent_turn_output` (`agent.rs`) computes it on the line before
+    /// `agent_input_hash` — so the budget that shapes the prompt can be looked up by a key
+    /// that does not depend on the prompt.
+    context_budgets: HashMap<EffectId, u64>,
 }
 
 /// SP-6 s3: a folded `AgentAnswered`.
