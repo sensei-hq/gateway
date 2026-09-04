@@ -193,6 +193,25 @@ pub fn assemble_prompt(
     Ok(assemble_prompt_parts(registry, agent, context, query)?.join())
 }
 
+/// The joined `system` string WITHOUT consuming the parts — for PRICING a prompt before
+/// deciding whether to budget it.
+///
+/// [`PromptParts::join`] takes `self`, and the probe must not destroy the parts the real join
+/// still needs. Rendering the same two halves the same way is the whole point: the figure
+/// SP-7b compares against the window has to be the size of the prompt that WOULD have been
+/// dispatched, so this calls [`render_context_section`] — the model path's own renderer —
+/// rather than measuring the halves apart and adding up their lengths, which would omit the
+/// section's structural bytes and could price an over-window prompt as fitting.
+///
+/// The cost is one extra render of the unbounded section on a turn that is about to be
+/// budgeted or dispatched anyway; [`PromptParts::join`] is unchanged and the in-window path
+/// pays it only when the chain's window is known.
+pub fn render_unbounded_system(parts: &PromptParts) -> String {
+    let mut system = parts.authored.clone();
+    system.push_str(&render_context_section(&parts.context));
+    system
+}
+
 /// The largest byte offset at or below `n` that is a char boundary in `s`.
 ///
 /// `str::floor_char_boundary` is still unstable, and slicing on a raw byte index PANICS

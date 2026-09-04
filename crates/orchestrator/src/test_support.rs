@@ -428,16 +428,42 @@ pub async fn two_window_chain_gateway() -> (Gateway, CallLog) {
 /// produces, and the only way to exercise "selection may differ" for real rather than by
 /// relabelling a response.
 pub async fn two_window_scripted_gateway(responses: Vec<ChatResponse>) -> (Gateway, CallLog) {
+    let (gateway, calls, _ests) = two_window_scripted_window_watching_gateway(responses).await;
+    (gateway, calls)
+}
+
+/// [`two_window_scripted_gateway`] plus the [`WindowEstimateLog`] — SCRIPTED response
+/// bodies AND what the gateway made of each dispatched request's size.
+///
+/// SP-7b's AC2 needs both halves at once and no fixture had them. It has to assert on what
+/// reached the PROVIDER, priced by the gateway's own estimator, which is what
+/// [`WindowEstimateLog`] exists for — but the only adapter that carried that log,
+/// [`ClampObservingAdapter`], answers every call with one fixed body. AC2's subject is an
+/// agent whose DEPENDENCY CONTEXT busts the window, so the fixture must be able to make an
+/// upstream node produce hundreds of kilobytes, which only a scripted body can.
+///
+/// The heterogeneous chain, deliberately: a budget derived from the chain's LARGEST window
+/// is only visibly doing anything when the chain has more than one, since the cut prompt
+/// must then be admitted by `big` and still refused by `small`.
+pub async fn two_window_scripted_window_watching_gateway(
+    responses: Vec<ChatResponse>,
+) -> (Gateway, CallLog, WindowEstimateLog) {
     let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let ests: WindowEstimateLog = Arc::new(Mutex::new(Vec::new()));
     let adapters = AdapterRegistry::new();
     adapters
         .register_chat(Arc::new(ScriptedAdapter {
             calls: calls.clone(),
             script: Mutex::new(responses.into()),
+            ests: ests.clone(),
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
-    (Gateway::new(two_window_chain_config(), adapters, cb), calls)
+    (
+        Gateway::new(two_window_chain_config(), adapters, cb),
+        calls,
+        ests,
+    )
 }
 
 /// Build a minimal gateway whose chain `"c"` resolves `TextChat` to the
@@ -924,6 +950,12 @@ pub async fn metered_embed_gateway(total_tokens: u32) -> (Gateway, Arc<Mutex<usi
 pub struct ScriptedAdapter {
     calls: CallLog,
     script: Mutex<VecDeque<ChatResponse>>,
+    /// The gateway's own window estimate of each call's request, in the same order as
+    /// `calls`. See [`WindowEstimateLog`], and [`two_window_scripted_window_watching_gateway`]
+    /// for why a SCRIPTED adapter needs one at all — [`ClampObservingAdapter`] already had it
+    /// but answers every call with the same fixed body, so it cannot produce a large upstream
+    /// output for a dependent node to be budgeted against.
+    ests: WindowEstimateLog,
 }
 
 impl Model for ScriptedAdapter {
@@ -948,6 +980,18 @@ impl ChatModel for ScriptedAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((req.model.clone(), prompt));
+        // In lockstep with `calls`, and recomputed from the arrived `ChatRequest` for the
+        // reason [`WindowEstimateLog`] gives: its fields are verbatim clones of
+        // `Payload::Chat`'s, so this recovers the exact figure `engine::execute` computed.
+        self.ests.lock().unwrap_or_else(|e| e.into_inner()).push(
+            gateway::estimate_input_tokens_pessimistic(&kernel::types::request::Payload::Chat {
+                messages: req.messages.clone(),
+                system: req.system.clone(),
+                max_tokens: req.max_tokens,
+                temperature: req.temperature,
+                tools: req.tools.clone(),
+            }),
+        );
         let next = self
             .script
             .lock()
@@ -1031,6 +1075,10 @@ pub async fn scripted_gateway(responses: Vec<ChatResponse>) -> (Gateway, CallLog
         .register_chat(Arc::new(ScriptedAdapter {
             calls: calls.clone(),
             script: Mutex::new(responses.into()),
+            // Recorded and dropped: this fixture's callers assert on the prompts, not on the
+            // sizes. See [`two_window_scripted_window_watching_gateway`] for the constructor
+            // that hands the log back.
+            ests: Arc::new(Mutex::new(Vec::new())),
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());

@@ -6,7 +6,8 @@ use crate::test_support::{
     failing_after_gateway, final_response, metered_embed_gateway, metered_gateway,
     metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
     sub_floor_output_clamp_observing_gateway, tool_call_response, two_window_chain_gateway,
-    two_window_clamp_observing_gateway, two_window_scripted_gateway, window_watching_clamp_gateway,
+    two_window_clamp_observing_gateway, two_window_scripted_gateway,
+    two_window_scripted_window_watching_gateway, window_watching_clamp_gateway,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -25615,4 +25616,128 @@ async fn an_agent_turn_replays_from_its_memo_though_selection_may_differ() {
 /// `effect_id(node, turn, 0)` that `agent_turn_output` memoizes on.
 fn effect_id_of_turn0() -> EffectId {
     effect_id("n1", 0, 0)
+}
+
+// =============================================================================
+// SP-7b — an over-window agent turn is BUDGETED and dispatched, not refused.
+// =============================================================================
+
+/// A dependency output big enough that the dependent agent's UNBUDGETED prompt busts the
+/// chain's LARGEST window, which is the only shape SP-7b's budget can act on.
+///
+/// Stated as arithmetic rather than a round literal because both sides matter and they pull
+/// in opposite directions. It must be over `3 × TWO_WINDOW_BIG` bytes (the estimator is
+/// `ceil(bytes / 3)`, so that is the window in bytes) or the prompt fits and SP-7a's
+/// fall-through serves it with no budget at all — the test would then pass without any of
+/// this slice. And the FLOOR must still be reachable: `0.25 × requested` has to fit in the
+/// budget left after the agent's own 100 000 authored bytes, which caps it near 2 MiB. The
+/// margin over the window is deliberately wide so a change to the estimator's divisor does
+/// not silently move the fixture to the wrong side of either bound.
+const OVERSIZED_DEP_BYTES: usize = 700_000;
+
+/// `A (model_call) → B (agent, hard-dep A)` — the shape of
+/// `oversized_dependency_context_halts_over_budget_never_truncates`, which is the test SP-7b
+/// changes the outcome of, so AC2 is asserted against the same graph rather than a new one.
+fn oversized_context_graph() -> Graph {
+    Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("A".into()),
+                kind: model_call("c", "plan"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("A")]),
+        ],
+    }
+}
+
+/// AC2 — an over-window agent turn is DEGRADED and dispatched, not refused.
+///
+/// The fixture is the two-window chain and a prompt whose dependency context pushes it past
+/// BOTH windows. Before SP-7b this halted: the gate skipped every candidate and the run
+/// paused with `UseLargerContextWindow`. Now the context is cut to fit the LARGEST window and
+/// the turn completes.
+///
+/// Asserted on what reached the PROVIDER, not on the orchestrator's arithmetic — a budget
+/// that satisfies every assertion phrased in its own terms and still overflows the real
+/// window is the failure this AC exists to exclude, and SP-DATA-5's AC10 was added after
+/// review found exactly that. So the size is the GATEWAY's own estimate, recomputed at the
+/// adapter from the `ChatRequest` that arrived.
+///
+/// # Why it cannot pass without a cut
+///
+/// The premise is asserted first: the unbudgeted prompt estimates OVER `TWO_WINDOW_BIG`. So
+/// "every dispatched request fits `TWO_WINDOW_BIG`" is not a property of the fixture — it can
+/// only hold because bytes were removed between assembly and dispatch. Without the assertion
+/// on the premise this test would pass on a prompt that simply fitted, which is how the AC5
+/// fall-through case already behaves and is not what this AC claims.
+///
+/// The content and context stores are wired because `resolve_context` returns EMPTY without a
+/// `ContextStore` (`executor/mod.rs:1652`) — an unwired fixture gives B no dependency context
+/// at all, no over-window prompt, and a green test that proves nothing.
+#[tokio::test]
+async fn an_over_window_agent_turn_is_budgeted_and_dispatched() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    // The premise, in the estimator's own unit. `over_window_agent_registry`'s agent carries
+    // 100 000 authored bytes and the dependency adds `OVERSIZED_DEP_BYTES` more.
+    let unbudgeted_est = (100_000 + OVERSIZED_DEP_BYTES).div_ceil(3) as u32;
+    assert!(
+        unbudgeted_est > TWO_WINDOW_BIG,
+        "the fixture must be over the LARGEST window or a cut is not needed to dispatch \
+         it: {unbudgeted_est} against {TWO_WINDOW_BIG}"
+    );
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gateway, calls, ests) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        final_response("budgeted-answer"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    assert!(
+        out.paused.is_none(),
+        "it must not halt any more: {:?}",
+        out.paused
+    );
+    assert!(out.failed.is_none(), "nor fail: {:?}", out.failed);
+    assert_eq!(
+        out.outputs
+            .get(&NodeId("B".into()))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str()),
+        Some("budgeted-answer"),
+        "and B really answered — a dispatched turn that produced nothing would satisfy \
+         the two assertions above: {:?}",
+        out.outputs.get(&NodeId("B".into()))
+    );
+    let dispatched = calls.lock().unwrap_or_else(|e| e.into_inner()).len();
+    assert_eq!(
+        dispatched, 2,
+        "A's model call and B's budgeted turn both reached the provider"
+    );
+
+    let seen = ests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        seen.iter().all(|e| *e <= TWO_WINDOW_BIG),
+        "and every dispatched request fits the largest window, measured by the GATEWAY's \
+         own estimator on what the provider received: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|e| *e > TWO_WINDOW_SMALL),
+        "with B's turn still over the SMALL window — the cut takes the prompt to the \
+         largest window, not to the smallest, so `small` is skipped and `big` serves it: \
+         {seen:?}"
+    );
 }
