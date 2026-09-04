@@ -62,7 +62,12 @@ impl super::Gateway {
             });
         }
 
-        // 3. Build SelectionCriteria from request (same as `execute`).
+        // 3. Build SelectionCriteria from request (same as `execute`, including BOTH
+        // size estimates — the cost one for the `BudgetGate` and the pessimistic one for
+        // the `ContextWindowGate`). Streaming is where an unfit candidate is worst: the
+        // provider's 400 arrives after the caller has already committed to a stream,
+        // whereas `execute` can still return an error. Parity pinned by
+        // `tests::execute_stream_gates_on_the_context_window_like_execute`.
         let input_tokens = estimate_input_tokens(&request.payload);
         let criteria = SelectionCriteria {
             capability: request.capability.clone(),
@@ -71,6 +76,7 @@ impl super::Gateway {
             chain: request.chain.clone(),
             budget: request.budget,
             input_tokens: Some(input_tokens),
+            input_tokens_pessimistic: Some(estimate_input_tokens_pessimistic(&request.payload)),
         };
 
         // 4. Select all candidates.
@@ -83,10 +89,11 @@ impl super::Gateway {
         let result = svc.select_all(&criteria);
 
         // No candidates? If every skip was a gate (health-lock / cooling /
-        // breaker-open / over-budget) this is a durable `AllGated` pause rather
-        // than a bare `NoCandidates` — mirrors `execute`'s selection-empty branch.
-        // Only an all-structural (misconfig / wrong-capability) selection stays
-        // `NoCandidates`.
+        // breaker-open / model-lockout / over-budget / over-context-window) this is an
+        // `AllGated` rather than a bare `NoCandidates` — a durable pause when any of
+        // those gates is TIMED, a human-action failure when all are terminal. Mirrors
+        // `execute`'s selection-empty branch. Only an all-structural (misconfig /
+        // wrong-capability) selection stays `NoCandidates`.
         if result.all_candidates.is_empty() {
             tracing::warn!("no candidates available for streaming request");
             if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {

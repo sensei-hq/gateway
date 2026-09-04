@@ -31,8 +31,8 @@ mod panel;
 mod stream;
 mod util;
 use util::{
-    call_estimate, estimate_input_tokens, request_input_text, stream_error_code, usage_value,
-    window_start,
+    call_estimate, estimate_input_tokens, estimate_input_tokens_pessimistic, request_input_text,
+    stream_error_code, usage_value, window_start,
 };
 
 /// Core gateway orchestrator.
@@ -172,8 +172,26 @@ impl Gateway {
 
     /// The smallest `context_window` among a chain's models (read-only; folds the
     /// chain's `ChainEntry`s against the model table). `None` if the chain is
-    /// unknown or has no resolvable models. Used by the agent runtime to budget a
-    /// prompt to the model it might fall over to — selection is untouched.
+    /// unknown or has no resolvable models.
+    ///
+    /// **One production caller: the SP-DATA-5 budget clamp** (`executor/dispatch.rs`),
+    /// which subtracts its input estimate from this to get a `max_tokens` ceiling that
+    /// respects `prompt + max_tokens <= context_window`. A chain MINIMUM is the right
+    /// bound there for the reason [`Self::min_max_output_tokens`] takes one: the clamp
+    /// sets `max_tokens` BEFORE selection, and a request that fails over lands on a
+    /// different entry.
+    ///
+    /// **It is NOT how a candidate's window is judged, and this doc said the opposite
+    /// until SP-7a's review.** It read "used by the agent runtime to budget a prompt to
+    /// the model it might fall over to — selection is untouched": both halves are now
+    /// false. SP-7a deleted the agent runtime's pre-dispatch check (this accessor is
+    /// exactly the chain-minimum guess that slice exists to stop trusting), and selection
+    /// is emphatically no longer untouched — `gates::context_window::ContextWindowGate`
+    /// asks the window question per CANDIDATE, which is the only place it has a correct
+    /// answer. Reach for the gate, not for this.
+    ///
+    /// Bounding the clamp by the SELECTED candidate instead is the clamp spec's own §8
+    /// item and is the remaining reason this fold still exists at all.
     pub async fn min_context_window(&self, chain: &str) -> Option<u32> {
         let cfg = self.config.read().await;
         let chain = cfg.chains.get(chain)?;

@@ -39,8 +39,15 @@ impl super::Gateway {
             return Err(GatewayError::NotConfigured);
         }
 
-        // 2. Build SelectionCriteria from request
+        // 2. Build SelectionCriteria from request. TWO size estimates over one payload,
+        // for two gates that want opposite biases: `input_tokens` is the cost figure the
+        // `BudgetGate` prices from, and `input_tokens_pessimistic` is the window figure
+        // the `ContextWindowGate` judges fit by. They must not be swapped — the cost one
+        // omits tool schemas and divides by 4, so feeding it to the window gate admits
+        // exactly the requests that gate exists to catch, and it compiles. Pinned by
+        // `tests::the_engine_selects_on_the_pessimistic_estimate_not_the_cost_one`.
         let input_tokens = estimate_input_tokens(&request.payload);
+        let input_tokens_pessimistic = estimate_input_tokens_pessimistic(&request.payload);
         let criteria = SelectionCriteria {
             capability: request.capability.clone(),
             model: request.model.clone(),
@@ -48,6 +55,7 @@ impl super::Gateway {
             chain: request.chain.clone(),
             budget: request.budget,
             input_tokens: Some(input_tokens),
+            input_tokens_pessimistic: Some(input_tokens_pessimistic),
         };
 
         // 3. Select all candidates
@@ -60,10 +68,14 @@ impl super::Gateway {
         let result = svc.select_all(&criteria);
 
         // 4. No candidates? Selection admitted nothing. If every skip was a gate
-        // (health-lock / cooling / breaker-open / over-budget), this is a durable
-        // `AllGated` pause rather than a bare `NoCandidates` — only an
-        // all-structural (misconfig / wrong-capability / nothing-configured)
-        // selection stays `NoCandidates`.
+        // (health-lock / cooling / breaker-open / model-lockout / over-budget /
+        // over-context-window), this is an `AllGated` rather than a bare
+        // `NoCandidates` — a durable pause when any of those gates is TIMED, and a
+        // human-action failure when every one is terminal
+        // (`exhaustion::all_gated_error` takes `resume_after` from the timed ones
+        // alone; over-window is always terminal, since no deadline makes a window
+        // bigger). Only an all-structural (misconfig / wrong-capability /
+        // nothing-configured) selection stays `NoCandidates`.
         if result.all_candidates.is_empty() {
             tracing::warn!("no candidates available for request");
             if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {

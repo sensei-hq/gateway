@@ -82,6 +82,41 @@ pub(crate) fn collect_validation_errors(
         }
     }
 
+    // Rule 6: A model must be able to hold at least one input token.
+    //
+    // Rule 5 one field over, and added for the same reason at the moment the field
+    // acquired a reader that REFUSES on it. Before SP-7a `context_window` was read only
+    // by `Gateway::min_context_window` (the SP-DATA-5 clamp's ceiling), where a zero
+    // produced a `saturating_sub` of 0 and a budget pause. Since SP-7a the
+    // `ContextWindowGate` compares every request's estimate against this number during
+    // SELECTION, so a zero makes every non-empty request to that model a skip — and, if
+    // it is the only candidate, a terminal `AllGated` whose remedy ("route to a model
+    // with a larger context window") points at a lever the operator cannot pull, because
+    // the model is not too small; the config is wrong.
+    //
+    // Zero is reachable by hand for two distinct reasons, and both are why this is a rule
+    // rather than a note. `strategy.rs`'s own test fixture pairs `context_window: 0` with
+    // `max_output_tokens: 0` as don't-care filler, which is the shape a hand-written
+    // config acquires from copying an example; and an operator adding a TTS / image /
+    // video model — none of which publishes a context window — has `0` as the natural
+    // "not applicable" entry. The gate no longer
+    // asks the window question for those payload kinds at all (see
+    // `engine::util::estimate_input_tokens_pessimistic`), so this rule is not what makes
+    // THEM work; it is what stops a `0` on a CHAT model being discovered one refused
+    // request at a time.
+    //
+    // Same CHECKED-path caveat as Rule 5: `Gateway::new` and `update_config` validate
+    // nothing by documented design, so this narrows where the value can enter rather than
+    // making it unrepresentable.
+    for (model_id, model) in models {
+        if model.context_window == 0 {
+            errors.push(format!(
+                "model '{model_id}' has context_window 0 — a model that can hold no \
+                 input is skipped for every request that carries any"
+            ));
+        }
+    }
+
     errors
 }
 
@@ -380,6 +415,47 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.contains("gemma3:27b") && e.contains("max_output_tokens")),
+            "the error must name the model and the field: {errors:?}"
+        );
+    }
+
+    /// A model whose `context_window` is ZERO cannot hold any request at all, and since
+    /// SP-7a that is a REFUSAL rather than a number nobody reads.
+    ///
+    /// The exact shape of Rule 5, one field over. Before SP-7a `context_window` was read
+    /// by `Gateway::min_context_window` alone — the SP-DATA-5 clamp's ceiling — where a
+    /// zero merely produced a `saturating_sub` of 0 and the clamp's floor check refused a
+    /// budgeted call. Now `ContextWindowGate` compares every request's estimate against
+    /// it during SELECTION, so a zero window means every non-empty request to that model
+    /// is skipped and, if it is the only candidate, terminally `AllGated` with a remedy
+    /// ("route to a model with a larger context window") naming a lever the operator
+    /// cannot pull — the model is not too small, the config is wrong.
+    ///
+    /// And it is a value a hand-written config acquires easily, for the same reason
+    /// Rule 5 records: `strategy.rs`'s test fixture pairs `context_window: 0` with
+    /// `max_output_tokens: 0` as don't-care filler, and an operator adding a TTS or image
+    /// model — for which no context window is published — has `0` as the natural "not
+    /// applicable" entry. The gate no longer asks
+    /// the window question for those payload kinds (see
+    /// `engine::util::estimate_input_tokens_pessimistic`), so `0` there is inert rather
+    /// than fatal; this rule is what makes it inert on the CHAT path too, by refusing it
+    /// at the door instead of at every request.
+    #[test]
+    fn fails_with_a_model_whose_context_window_is_zero() {
+        let mut model = gemma_model();
+        model.context_window = 0;
+
+        let result = GatewayBuilder::new()
+            .add_router("ollama", ollama_router())
+            .add_model(model)
+            .add_chain(chat_chain())
+            .build();
+
+        let errors = result.expect_err("a zero context window can hold no request");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("gemma3:27b") && e.contains("context_window")),
             "the error must name the model and the field: {errors:?}"
         );
     }

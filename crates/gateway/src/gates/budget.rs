@@ -123,6 +123,10 @@ mod tests {
             capability: Capability::TextChat,
             budget,
             input_tokens,
+            // The BUDGET fixture deliberately leaves this `None`: these tests assert what
+            // the cost gate does with `input_tokens`, and the window gate's own estimate
+            // has no business changing their outcome. `None` admits, so it cannot.
+            input_tokens_pessimistic: None,
             health,
             now: Instant::now(),
             config: gateway_config,

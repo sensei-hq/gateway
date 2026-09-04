@@ -1,6 +1,6 @@
 //! Prompt assembly + per-turn window budgeting for the agent runtime.
 
-use kernel::types::request::{Message, ToolDefinition};
+use kernel::types::request::ToolDefinition;
 use orchestrator_core::{AgentDefinition, ContextKey, OrchestratorError, Registry};
 
 /// An assembled prompt with its two halves still SEPARATE.
@@ -26,8 +26,9 @@ pub struct PromptParts {
 impl PromptParts {
     /// Re-join the two halves into the system prompt the MODEL receives, using the
     /// unbounded [`render_context_section`] — the model's own context window is the bound
-    /// that applies on that path (`over_budget`, below, which HALTS rather than truncating
-    /// so a model is never silently asked about half a document).
+    /// that applies on that path, and it is applied by the GATEWAY's `ContextWindowGate`
+    /// (SP-7a) rather than truncated here, so a model is never silently asked about half
+    /// a document.
     ///
     /// **The model path calls THIS**, and so does [`assemble_prompt`]. That is the whole
     /// reason it exists as a method rather than three lines inlined at each site. Before
@@ -213,12 +214,22 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
 /// bytes in total.
 ///
 /// The model path must NOT use this — [`render_context_section`] is its renderer, and a
-/// model's own context window is the bound that applies there (`over_budget`, below, which
-/// HALTS rather than truncating so a model is never silently asked about half a document).
+/// model's own context window is the bound that applies there. That bound is enforced by
+/// the gateway's `ContextWindowGate` (SP-7a), which SKIPS a candidate the prompt does not
+/// fit rather than truncating, so a model is never silently asked about half a document.
+///
 /// This is the human path's answer to the same problem, and it differs because the failure
-/// modes differ: an over-window model call can be retried against a bigger chain, whereas a
-/// human-backed node that fails takes the whole run terminal AFTER the upstream tokens have
-/// been spent.
+/// modes differ: an over-window model call falls through to a LARGER candidate in the same
+/// chain — true since SP-7a on an UNBUDGETED run, and the reason that slice exists; before
+/// it, the orchestrator refused such a call outright against the chain's smallest window —
+/// whereas a human-backed node that fails takes the whole run terminal AFTER the upstream
+/// tokens have been spent.
+///
+/// The unbudgeted qualifier is load-bearing rather than pedantic: on a run with a token
+/// cap the SP-DATA-5 clamp (`executor/dispatch.rs`) still bounds by
+/// `min_context_window(chain)` BEFORE selection happens and refuses with a durable pause,
+/// so the fall-through never occurs there. See the SP-7a spec's §8 and
+/// `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`.
 ///
 /// The budget is split EVENLY across dependencies rather than first-come-first-served, so
 /// one verbose upstream cannot crowd the others out of the question entirely — the human is
@@ -279,36 +290,56 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
     out
 }
 
-/// Documented heuristic token estimate — `chars / 4`. NOT a real tokenizer; a
-/// conservative approximation, replaceable later without changing callers.
-pub fn est_tokens(s: &str) -> usize {
-    s.chars().count() / 4
-}
+// `est_tokens(s) = s.chars().count() / 4` lived here until SP-7a's review. It was the
+// documented prose heuristic the window pre-check ran on, and SP-7a deleted both of its
+// callers (`over_budget` and `executor::support::est_prompt_tokens`) along with the halt
+// they served — after which it survived only because `pub` in a `pub mod` makes it
+// invisible to `dead_code`, so `clippy -D warnings` could not report what it had become.
+//
+// Kept for one commit as "the prose baseline `est_tokens_pessimistic`'s bias is defined
+// against", and deleted now for the reason that commit itself gave for deleting
+// `over_budget`: a function kept because it might be wanted again is exactly the kind of
+// thing that gets called again by mistake — and this one is the `chars/4` UNDER-count the
+// window check's whole failure history came from. The baseline argument did not survive
+// contact either: `est_tokens_pessimistic` is `chars/3` outright rather than a multiplier
+// on it, deliberately, so the two were already independent.
+//
+// Nothing lost coverage. `the_pessimistic_estimate_is_never_below_the_window_fit_one`
+// compared the two functions; `the_pessimistic_estimate_is_chars_over_three_rounded_up`
+// bounds `est_tokens_pessimistic` from BOTH sides against the raw character count, which
+// implies the comparison for every input, and it now states the prose figure as an
+// absolute so the claim survives without the function.
 
 /// A deliberately pessimistic token estimate, for the BUDGET path only.
 ///
-/// [`est_tokens`]'s `chars / 4` is the standard rough figure for English prose. The
-/// orchestrator's prompts are not mostly English prose: they carry JSON tool schemas and
-/// a `## Context` section rendered from upstream outputs, and JSON tokenizes nearer 3
-/// chars/token. So `chars / 4` UNDER-counts precisely where these prompts are heaviest.
+/// `chars / 4` is the standard rough figure for English prose. The orchestrator's prompts
+/// are not mostly English prose: they carry JSON tool schemas and a `## Context` section
+/// rendered from upstream outputs, and JSON tokenizes nearer 3 chars/token. So `chars / 4`
+/// UNDER-counts precisely where these prompts are heaviest.
 ///
-/// The two estimates want OPPOSITE biases, which is why this is a second function and not
-/// a fix to the first. `est_tokens`'s callers — [`over_budget`] and the `est_prompt_tokens`
-/// diagnostic that reports its `est` — ask "will this prompt fit the window", and an
-/// over-count there halts a turn (`NodeFailed`) that would in fact have fitted. The budget
-/// asks "what is the worst this call can cost", and an under-count there is the expensive
-/// direction: the clamp computes `max_tokens = remaining − est`, so too low an estimate
-/// leaves too high an allowance and the cap is overshot by the difference.
+/// A window-fit estimate and a budget estimate want OPPOSITE biases, which is why the
+/// prose figure was never simply widened. A window check asks "will this prompt fit",
+/// where an over-count refuses a candidate that would in fact have held the request —
+/// under SP-7a a SKIP, and only a failure when it skips the last candidate in the chain;
+/// under the chain-minimum halt this function used to serve, a failed node outright. The
+/// budget asks "what is the worst this call can cost", and an under-count there is the
+/// expensive direction: the clamp computes `max_tokens = remaining − est`, so too low an
+/// estimate leaves too high an allowance and the cap is overshot by the difference.
+///
+/// The window half of that pair is no longer here at all. SP-7a moved the question to the
+/// gateway, which owns its own estimator — `engine::util::estimate_input_tokens_pessimistic`,
+/// over BYTES rather than chars and over a whole `Payload` rather than a `&str`, and a
+/// separate function because the gateway crate cannot depend on this one (the dependency
+/// runs the other way). So this function is the orchestrator's only token estimate now,
+/// and the only caller is `executor::dispatch::est_input_tokens`.
 ///
 /// So this one inverts the bias — it is wrong toward refusing early rather than toward
 /// overspending. It does not make the overshoot zero (the clamp design's §4 writes out the
 /// arithmetic); it bounds it by the remaining estimate error.
 ///
-/// `chars / 3` rather than a multiplier on `est_tokens`, so the two are independent: a
-/// later change to the window-fit heuristic must not silently move the budget's floor.
-/// Neither is a real tokenizer — a real one needs a per-model vocabulary and a per-chain
-/// mapping, and would still need a heuristic like this as its fallback for an unknown
-/// model, so it is additional work on top of this rather than instead of it.
+/// Not a real tokenizer — a real one needs a per-model vocabulary and a per-chain mapping,
+/// and would still need a heuristic like this as its fallback for an unknown model, so it
+/// is additional work on top of this rather than instead of it.
 ///
 /// # The pessimism assumes a LATIN script
 ///
@@ -330,29 +361,19 @@ pub fn est_tokens_pessimistic(s: &str) -> usize {
     s.chars().count().div_ceil(3)
 }
 
-/// True when the assembled prompt (system + messages + tool schemas) is estimated
-/// to exceed the chain's smallest context window. An unknown window (`None`) is
-/// never a hard fail — the caller logs and proceeds.
-pub fn over_budget(
-    min_window: Option<u32>,
-    system: &str,
-    messages: &[Message],
-    tools: &[ToolDefinition],
-) -> bool {
-    let Some(window) = min_window else {
-        return false;
-    };
-    let mut est = est_tokens(system);
-    for m in messages {
-        est += est_tokens(m.content.as_text());
-    }
-    for t in tools {
-        est += est_tokens(&t.name)
-            + t.description.as_deref().map(est_tokens).unwrap_or(0)
-            + est_tokens(&t.input_schema.to_string());
-    }
-    est as u64 > window as u64
-}
+// `over_budget(min_window, system, messages, tools)` lived here until SP-7a. It answered
+// "does this prompt fit the chain's SMALLEST context window", and `executor/agent.rs`
+// called it before every live ReAct turn, failing the node when it said yes.
+//
+// The question was asked in the wrong place and against the wrong number. Selection is
+// the gateway's job, and a chain minimum is not a fact about any candidate: on
+// `[gpt-4o 128k, fallback 8k]` this refused every prompt over 8k, including the ones the
+// primary would have served. The gateway's `ContextWindowGate` now asks it per candidate.
+//
+// Deleted rather than left for a future caller. Its last caller was the halt this slice
+// removed, and a function kept because it might be wanted again is exactly the kind of
+// thing that gets called again by mistake — a second, chain-minimum window check
+// re-introduced beside the per-candidate one would silently restore the bug.
 
 #[cfg(test)]
 mod tests {
@@ -742,52 +763,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn est_tokens_is_chars_over_four() {
-        assert_eq!(est_tokens("abcdefgh"), 2); // 8 chars / 4
-    }
+    // `est_tokens_is_chars_over_four` and
+    // `the_pessimistic_estimate_is_never_below_the_window_fit_one` were here. Both tested
+    // `est_tokens`, deleted with its last caller; the second compared the two estimates
+    // to each other, and the test below subsumes it — bounding `est_tokens_pessimistic`
+    // from both sides against the raw character count implies "at least the prose figure"
+    // for every input, and does so without needing the prose figure to exist as code. The
+    // subsumption is made explicit in that test's last assertion rather than left to be
+    // re-derived.
 
-    /// The budget estimate is never below the window-fit one, on prose AND on the
-    /// JSON-heavy text that is the whole reason it exists.
-    ///
-    /// `est_tokens` is `chars / 4`. English prose is roughly that; JSON tool schemas
-    /// and materialized `## Context` outputs tokenize nearer 3 chars/token, so
-    /// `chars / 4` UNDER-counts exactly where the orchestrator's prompts are heaviest.
-    /// The clamp computes `allowance = remaining − est`, so clamping on an under-count
-    /// leaves too large an allowance and overshoots the cap by the error — the budget
-    /// path needs the bias inverted.
-    ///
-    /// `>=` on every input and STRICTLY `>` on the JSON one: `>=` alone would pass for
-    /// a function that just delegated to `est_tokens`, which is the obvious wrong
-    /// implementation and the one that silently reintroduces the under-count.
-    #[test]
-    fn the_pessimistic_estimate_is_never_below_the_window_fit_one() {
-        let prose = "The quick brown fox jumps over the lazy dog, repeatedly and at length.";
-        let json = r#"{"name":"fs_write","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string"}},"required":["path","contents"]}}"#;
-        for s in [prose, json, "", "a"] {
-            assert!(
-                est_tokens_pessimistic(s) >= est_tokens(s),
-                "pessimistic must not undercut the window-fit estimate for {s:?}: {} < {}",
-                est_tokens_pessimistic(s),
-                est_tokens(s)
-            );
-        }
-        assert!(
-            est_tokens_pessimistic(json) > est_tokens(json),
-            "and must be strictly higher on JSON, which is the case it exists for: {} vs {}",
-            est_tokens_pessimistic(json),
-            est_tokens(json)
-        );
-    }
-
-    /// The DIVISOR, pinned from both sides — the strict inequality above is not enough.
+    /// The DIVISOR, pinned from both sides — an ordering against any other estimate is
+    /// not enough.
     ///
     /// `div_ceil(3)` → `div_ceil(4)` is a one-character edit that removes essentially
     /// all of the margin this function exists for, and it still satisfies "strictly
-    /// greater than `est_tokens`" on any length not divisible by 4, because rounding up
-    /// beats flooring by a token. So the sign of the difference proves nothing about its
-    /// SIZE, and the size is the whole point: JSON tokenizes nearer 3 chars/token, and
-    /// clamping on a `chars / 4` under-count overshoots the cap by the error.
+    /// greater than the `chars / 4` prose figure" on any length not divisible by 4,
+    /// because rounding up beats flooring by a token. So the sign of a difference proves
+    /// nothing about its SIZE, and the size is the whole point: JSON tokenizes nearer 3
+    /// chars/token, and clamping on a `chars / 4` under-count overshoots the cap by the
+    /// error.
     ///
     /// Both bounds are needed. Without the first, the divisor can grow and the margin
     /// silently evaporates. Without the second, it can shrink — `chars / 2` would pass
@@ -814,6 +808,18 @@ mod tests {
                 "and no more than chars/3 rounded up — an over-count is a tax on every \
                  budgeted call, not free caution — for {s:?}: {est} * 3 > {n} + 2"
             );
+            // The property the deleted `the_pessimistic_estimate_is_never_below_the_
+            // window_fit_one` asserted, restated without needing the deleted `est_tokens`
+            // to exist: this estimate is never below the `chars / 4` prose figure the
+            // orchestrator's window check used to run on. Implied by the lower bound
+            // above, and written out because "implied" is not something a future reader
+            // should have to re-derive before touching the divisor.
+            assert!(
+                est >= n / 4,
+                "and never below the chars/4 prose figure it replaced for {s:?}: {est} \
+                 < {}",
+                n / 4
+            );
         }
     }
 
@@ -828,16 +834,24 @@ mod tests {
         assert_eq!(est_tokens_pessimistic(""), 0);
     }
 
-    #[test]
-    fn over_budget_true_when_estimate_exceeds_window_and_false_otherwise() {
-        let (reg, agent) = registry();
-        let (system, tools) = assemble_prompt(&reg, &agent, &[], "").unwrap();
-        let msgs = vec![kernel::types::request::Message::text(
-            kernel::types::request::MessageRole::User,
-            "hi",
-        )];
-        assert!(over_budget(Some(4), &system, &msgs, &tools)); // tiny window → over
-        assert!(!over_budget(Some(100_000), &system, &msgs, &tools)); // huge window → fits
-        assert!(!over_budget(None, &system, &msgs, &tools)); // unknown window → never a hard fail
-    }
+    // `over_budget_true_when_estimate_exceeds_window_and_false_otherwise` was here. It
+    // tested the deleted `over_budget` against a chain MINIMUM, which is the behaviour
+    // SP-7a replaced rather than a property that moved. Its three cases went three ways:
+    //
+    // - "tiny window → over" and "large window → not over" are now
+    //   `gates::context_window::over_window_skips_and_under_window_admits`, asked per
+    //   CANDIDATE, so the same request gets two different answers.
+    // - "unknown window (`min_context_window` → `None`) → never a hard fail" is
+    //   UNREACHABLE in selection rather than relocated. The gate reads
+    //   `ModelConfig.context_window`, a plain required `u32` on a candidate that has
+    //   already resolved, so there is no absent-window branch for it to have. An earlier
+    //   version of this comment said the case "is `no_estimate_admits`", and that was
+    //   wrong: `no_estimate_admits` covers an absent ESTIMATE
+    //   (`input_tokens_pessimistic: None`), which is a different question. The only
+    //   surviving consumer of an OPTIONAL window is the SP-DATA-5 clamp
+    //   (`executor/dispatch.rs`, `(a, b) => a.or(b)` over the chain fold), untouched by
+    //   SP-7a, which is where "unknown window ⇒ no bound from here" still lives.
+    //
+    // Removed with the function; nothing it asserted lost its home, and the one case with
+    // no home in the gateway ceased to exist rather than moving.
 }
