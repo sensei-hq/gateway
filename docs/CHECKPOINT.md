@@ -1,39 +1,52 @@
 # Checkpoint
 
-**SP-7a (window-aware selection) — COMPLETE. All seven tasks done, on `develop`, unpushed.**
+**SP-7a is COMPLETE and ON `main`** — PR #52 merged as `cbb8854`, 23 commits. `develop` and
+`main` are identical (0/0). No slice in flight.
 
-## What shipped
+## Done
 
-`ContextWindowGate` — the sixth `AdmissionGate`, registered LAST — asks the window question PER
-CANDIDATE, so `[128k, 8k]` serves a 20k prompt instead of refusing it against the chain minimum. Over
-EVERY window is an `AllGated` naming each candidate's window, the estimate and
-`HumanAction::UseLargerContextWindow`: refused, never truncated. `PromptOverBudget`, `over_budget`,
-`est_prompt_tokens`, `est_tokens` gone; when BUDGETED the clamp still refuses before selection.
+**SP-7a — window-aware selection.** A sixth `AdmissionGate` asks per CANDIDATE what the
+orchestrator used to ask once against the chain's SMALLEST window before dispatch. The
+`min_context_window` pre-check and `PromptOverBudget` are deleted.
 
-**Task 7 = the gate + the sweep.** `orchestrator-overview.md` now records SP-7a shipped and SP-7 as
-three slices (a selection / b context budgeting / c semantic activation), split because 7a changes
-WHICH MODEL serves a prompt and not one byte of it while `agent_input_hash` hashes
-`{chain, system, messages, tools}` — 7b's truncation moves that key, 7a does not. Plus 3 slice-table
-rows and 2 stale claims (`README.md`'s "per-turn window budget"; the Gherkin "smallest model").
+**My spec's headline claim was wrong and review caught it:** the over-everything case is NOT a
+durable pause. `all_gated_error` takes `resume_after` from TIMED skips only, so all-terminal is
+`AllGated { resume_after: None }` → `Fail`. And that is deliberate — risk M1 in
+`docs/design/selection-policy-pipeline.md` resolved terminal-only exhaustion as "fail-fast, never
+pause". What the slice delivers is the DIAGNOSIS (per-candidate windows), not the recovery.
 
-## Verified — real exit codes
+Also fixed: `AllGated` rendered neither `skipped` nor `human_action`, so every number the slice
+adds was dropped at the orchestrator boundary; the estimator priced an assistant turn's
+`tool_calls` at zero (the ReAct loop's own shape — a 100 KB tool-call argument estimated 0); six
+tests could not fail. Plus the **sandbox flake, genuinely fixed**: `spawn_capped` drained stdout
+and stderr with two SEQUENTIAL graces, so the real bound was `2 × CAPTURE_GRACE` = 4s against a
+5s assertion. One shared deadline — measured 4.02s → 2.01s.
 
-`cargo test --workspace` **1714 passed / 0 failed / 56 ignored, exit 0** (35 suites) · `clippy
---workspace --all-targets -- -D warnings` **0** · `fmt --all --check` **0** · `cargo doc` unresolved
-links **16 = baseline**. No container started; `$DATABASE_URL` never read.
+## Verified at `cbb8854` — real exit codes
 
-## Known-broken — one PRE-EXISTING flake, not this slice
+`cargo test --workspace` **1714 passed / 0 failed / 56 ignored, exit 0** · clippy **0** · fmt
+**0** · `cargo doc` unresolved links **16** (baseline) · 8 consecutive full-suite runs, 0 failures.
+CI ran the PG suites: orchestrator **433/0**, store **69/0**.
 
-`executor::tests::both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` failed 1 of 4
-full-workspace runs (`under-estimated` warn uncaptured; the `clamp bit` info beside it captured).
-Only a doc comment changed in Rust this round. ~17 tests hit that `tracing::warn!` callsite with no
-subscriber on their thread and one asserts it ⇒ thread-local `set_default` racing the global
-callsite-`Interest` cache. Green 6/6 isolated, 20/20 loaded, 1-threaded — no red-first repro, so
-reported not patched; likely fix `rebuild_interest_cache()` after `set_default`.
+## Next — a defect SP-7a's own review found, and it is mine
 
-## Next command
+**SP-7a's benefit does NOT apply on a budgeted run.** The SP-DATA-5 clamp bounds `max_tokens` by
+`min_context_window(chain) − est` and refuses `BelowFloor` when that is under `MIN_OUTPUT_TOKENS`.
+For AC1's own example (`[big 128k, small 8k]`, 20k prompt) that is `8192.saturating_sub(20000) = 0
+< 256`, so the run is refused **in the orchestrator before `Gateway::execute` is called** and the
+new gate never runs. The clamp's chain-minimum bound and the window gate disagree, and the clamp
+wins. Fix = move the clamp's window term to the SELECTED candidate (the clamp spec's own §8 item,
+reachable for the first time now that selection is window-aware). Needs a design pass: the clamp
+runs BEFORE selection today.
 
-`git push origin develop` (the coordinator pushes), then the `develop` → `main` PR — merge
-`origin/main` into `develop` FIRST or the strict ruleset leaves it BEHIND. Deferred (spec §8): bound
-the clamp by the SELECTED candidate's window (AC1 when budgeted); TTS/image/video input bounds; an
-`Embed` AGGREGATE limit. **Sensei daemon is down, so this file is the only durable record.**
+Also open: SP-7b (context budgeting, needs the determinism argument — truncation changes
+`agent_input_hash`), SP-7c (semantic activation), the M1 reversal.
+
+## Known-broken
+
+**One OPEN flake, honestly labelled:** `both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low`
+failed once. Its recorded diagnosis (thread-local `set_default` vs the global callsite `Interest`
+cache) is **disproven** by three probes, so no fix was shipped — it would have been a remedy for a
+mechanism that does not occur. The panic now dumps every captured record so the next occurrence
+distinguishes "never emitted" from "capture missed it". **The sensei daemon is not running, so this
+file is the only durable record.**
