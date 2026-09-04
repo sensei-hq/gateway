@@ -198,7 +198,15 @@ new false comment in place of an old one, and would have cost an operator a manu
 ## 7. Deferred
 
 - Moving the clamp downstream of selection, for a bound on the ACTUAL selected model (clamp spec
-  §8; this slice makes the gap smaller but does not close it).
+  §8; this slice makes the gap smaller but does not close it). **The citation was DANGLING until
+  the release gate.** §2 and §3 above, the SP-7a selection spec's §8, `orchestrator-overview.md`,
+  `executor/agent.rs` and `engine/mod.rs` all name this "the clamp spec's §8 item/wording" — but
+  the clamp spec's §8 did not carry it, and its §5.2 did not describe a window term at all: the
+  term arrived in that slice's OWN whole-slice review, after its spec was written, and nothing went
+  back to the spec. So five files pointed a reader at an item that was not there, which is worse
+  than no pointer — it reads as "already recorded, someone else's problem", which is how a residual
+  survives three slices unexamined. The item is now in the clamp spec's §8 with its provenance, and
+  that §5.2 describes both model terms and this slice's change to the window one.
 - SP-7b context budgeting, SP-7c semantic activation, the M1 reversal.
 - **A sub-floor `min_max_output_tokens` still renders as the BUDGET arm.** `binding_window`
   discriminates the window term from the budget, and there are two model bounds: when the OUTPUT
