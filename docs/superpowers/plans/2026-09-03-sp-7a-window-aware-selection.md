@@ -889,7 +889,10 @@ two tests went with it, the ordering one subsumed by an absolute assertion in
 | `oversized_dependency_context_halts_over_budget_never_truncates` | **Kept, name and all.** Its invariant is "never silently truncated" and it is untouched: the model path's `## Context` is unbounded. Only who NOTICES moved, so the assertion now requires the halt to name the window rather than say "over budget", which read as a money problem. |
 | `prompt::tests::over_budget_true_when_estimate_exceeds_window_and_false_otherwise` | **Removed with the function.** It asserted a chain-MINIMUM answer, which is the thing replaced rather than a property that moved. Its "tiny window → over" and "large window → not over" cases are `gates::context_window::over_window_skips_and_under_window_admits` (per candidate, so one request gets two answers). Its third case — "unknown window (`min_context_window` → `None`) → never a hard fail" — is **unreachable post-slice, not relocated**: the gate reads a resolved candidate's `ModelConfig.context_window`, a plain required `u32`, so there is no absent-window branch to have. *(Corrected by review: this row and the tombstone comment both said the case "is `no_estimate_admits`", which covers an absent ESTIMATE and is a different question.)* The only surviving consumer of an OPTIONAL window is the SP-DATA-5 clamp's chain fold in `executor/dispatch.rs` (`(a, b) => a.or(b)`), untouched here. |
 
-**Step 0's boundary is now a test**, `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`:
+**Step 0's boundary is now a test**, `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`
+(**renamed in the serving-window follow-on** to
+`an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not`, where both arms land on the
+GATE — see that slice's spec for what moved):
 unbudgeted ⇒ the gateway gates and the node FAILS; budgeted ⇒ the SP-DATA-5 clamp refuses
 first and the run PAUSES. Proven non-vacuous by dropping the clamp's window term
 (`(Some(a), Some(b)) => Some(a)`), which makes the budgeted arm fail instead of pause.

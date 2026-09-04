@@ -314,9 +314,10 @@ journaled into `RunPaused` and read back by `torii status`.
   window is the binding term the refusal now says so, names the window, and does NOT offer
   `torii run wake --budget-tokens N`. The pause CLASS is kept deliberately — `resume_after: None`
   is SP-DATA-3's HOTL class and preserves a run an operator can widen the chain for, where a node
-  failure destroys it. Asserted in
+  failure destroys it. Asserted at the time in
   `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`, including the
-  cap-independence.
+  cap-independence — **both that test and that pause class moved in the follow-on; see the
+  correction below.**
 
   > **Correction, 2026-09-04 — this whole item is CLOSED, and not the way it predicted.** The
   > follow-on slice (`2026-09-04-sp-7a-serving-window-bound-design.md`) made the clamp's window
@@ -340,6 +341,24 @@ journaled into `RunPaused` and read back by `torii status`.
   > Also corrected there: the clamp and the gate were computing `est` with two different functions,
   > which broke the soundness argument in a narrow but reachable band. They are one function now
   > (follow-on §4.1).
+  >
+  > **The identifier this item cites is gone, and the property it cited went unguarded for a
+  > commit.** `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked` was renamed
+  > `an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not`, and it changed meaning
+  > with its name: the fits-nothing scenario now lands on the GATE at both caps rather than on the
+  > clamp. The surviving `BelowFloor { window: Some(_) }` arm is
+  > `a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_window`, which drove ONE
+  > cap — so the cap-independence this sentence claims was asserted became unpinned in the move.
+  > The follow-on's review caught it (a mutation gating the refusal on `remaining` passed the whole
+  > workspace) and closed it with `a_serving_window_refusal_is_unmoved_by_the_cap`, which drives
+  > 1e6 and `u64::MAX / 2` and compares the two refusals with the ledger clause stripped.
+  >
+  > Corrected at the same time: the message's remedy. It read "send less input, or put a model with
+  > a larger window in this chain", and the second clause could never work — the term is
+  > `min { w ∈ chain : w >= est }` and **adding to a set cannot raise its minimum**. It now says to
+  > remove or replace the entry it names, says outright that adding a larger model alongside cannot
+  > help, and qualifies "send less input" as conditional on that same entry staying the smallest
+  > one that can hold the prompt.
 - **A per-attachment token term for the pessimistic estimate** (§4). Owed by the first caller that
   attaches media; the term belongs in tokens, added after the divide, and must not be derived from
   the base64 length.
