@@ -216,8 +216,11 @@ source: crates/orchestrator*
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
 instruction modules), and **tools** (executable capabilities with an effect
-class + permissions). The agent runtime assembles a budgeted prompt, resolves
-the role→chain, calls the gateway, and runs a ReAct/tool loop.
+class + permissions). The agent runtime assembles the prompt, resolves the
+role→chain, calls the gateway, and runs a ReAct/tool loop. It does **not**
+budget that prompt to a window any more — since SP-7a the fit question belongs
+to the gateway's selection pipeline, which can ask it of a real candidate
+instead of guessing against the chain's smallest member.
 
 ## Scenarios
 
@@ -235,9 +238,24 @@ Feature: Agent runtime
     Given the model returns a tool call for "fs.read"
     Then the orchestrator executes fs.read (the gateway does not) and feeds the result back
 
-  Scenario: Prompt is budgeted to the smallest model in the chain
-    Given a chain whose smallest model has a 32k context window
-    Then prompt assembly fits within 32k (summarize/select, never silent truncation)
+  # Rewritten by SP-7a. It used to read "Prompt is budgeted to the smallest model in
+  # the chain / Given a chain whose smallest model has a 32k context window / Then
+  # prompt assembly fits within 32k". That scenario described the behaviour SP-7a
+  # DELETED: the chain minimum is not a fact about any candidate, so budgeting to it
+  # refused prompts the chain's larger models could serve. Both replacements below are
+  # executable, unlike the line they replace — see
+  # gateway::selection::a_chain_serves_a_prompt_only_its_larger_model_can_hold and
+  # gateway::engine::tests::a_request_over_every_window_is_all_gated_with_the_numbers.
+  Scenario: A chain serves a prompt only its larger model can hold
+    Given a chain [big 128k, small 8k] and a request estimated at 20k input tokens
+    Then the gateway's ContextWindowGate skips "small" and selects "big"
+
+  Scenario: A prompt over EVERY candidate's window is refused, never truncated
+    Given the same chain and a request estimated at 200k input tokens
+    Then selection admits nothing and the caller gets an AllGated naming each
+      candidate's own window, the estimate that exceeded it, and the remedy
+      UseLargerContextWindow — distinct from RaiseBudget, because spending more
+      at the same model cannot make its window bigger
 ```
 
 ## Slice 2 (implemented)

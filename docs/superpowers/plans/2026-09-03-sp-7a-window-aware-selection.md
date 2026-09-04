@@ -908,7 +908,7 @@ mutating `binding_window` to `None`, which restores the budget wording and redde
 
 ### Task 7: Docs and the gate
 
-- [ ] **Step 1: Verification, real exit codes**
+- [x] **Step 1: Verification, real exit codes**
 
 ```bash
 cargo test --workspace > /tmp/g1.log 2>&1; echo "exit=$?"
@@ -917,14 +917,14 @@ cargo fmt --all --check; echo "exit=$?"
 ```
 All three `exit=0`. Report exact counts. No database work is needed — do not start a container.
 
-- [ ] **Step 2: Doc-link baseline**
+- [x] **Step 2: Doc-link baseline**
 
 ```bash
 cargo clean --doc && cargo doc --workspace --no-deps --document-private-items 2>&1 | grep -c 'unresolved link'
 ```
 Baseline **16**. Higher means this slice added broken links.
 
-- [ ] **Step 3: The documentation sweep**
+- [x] **Step 3: The documentation sweep**
 
 - **`crates/orchestrator/src/agent/prompt.rs:212-221`** — the doc comment on the bounded renderer
   says the model path "HALTS rather than truncating" and that an over-window call "can be retried
@@ -952,18 +952,71 @@ Baseline **16**. Higher means this slice added broken links.
   SP-DATA-5 clamp as its one production caller.
 - Grep for other surfaces: `rg -n 'PromptOverBudget|min_context_window|over_budget' --no-ignore -g '!target' crates/ docs/`
 
-- [ ] **Step 4: Checkpoint**
+- [x] **Step 4: Checkpoint**
 
 Rewrite `docs/CHECKPOINT.md` (**under 40 lines**, one current entry): what shipped, the measured
 numbers, the next command. Note the sensei daemon is not running, so it is the only durable record.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
 git add docs/ crates/orchestrator/src/agent/prompt.rs
 git commit -m "docs: window-aware selection, and the two claims it made false"
 ```
+
+---
+
+## What Task 7 shipped, and where it departed from the draft above
+
+**The gate is green.** `cargo test --workspace` **1714 passed / 0 failed / 56 ignored, exit 0**
+across 35 suites; `clippy --workspace --all-targets -- -D warnings` exit 0; `fmt --all --check`
+exit 0; `cargo clean --doc && cargo doc --workspace --no-deps --document-private-items` reports
+**16** unresolved links, exactly the baseline, so this slice added none. No container was started
+and `$DATABASE_URL` was never read.
+
+**Two of the four named sweep targets were already correct, and saying so is the point.** The task
+brief was written against the PRE-review tree, so it described `agent/prompt.rs:212-221` as still
+claiming the model path "HALTS rather than truncating" and that an over-window call "can be retried
+against a bigger chain", and `orchestrator-overview.md:229` as still reading "today: over-budget
+halts loud, never truncates". The review round had already rewritten both. `dispatch.rs`,
+`engine/mod.rs`, `shared-context.md` and `agents-skills-tools.md`'s three named sites likewise.
+They were re-read rather than re-touched — re-asserting a correction is how a doc acquires two
+slightly different versions of one claim.
+
+**Two stale sites the earlier rounds missed, and neither was on the brief's list:**
+
+| Site | What was wrong |
+|---|---|
+| `docs/features/orchestrator/README.md:22` | The feature table's Agents row still advertised "prompt assembly + per-turn window budget" as a shipped capability. That IS the deleted `over_budget` halt, named as a feature in the index a reader hits first. |
+| `docs/features/orchestrator/agents-skills-tools.md` Gherkin | A `Feature: Agent runtime` scenario read "Prompt is budgeted to the smallest model in the chain / Given a chain whose smallest model has a 32k context window / Then prompt assembly fits within 32k". That is the *precise* behaviour this slice deleted, stated as an executable-looking acceptance criterion. Replaced by two scenarios that describe what the gate actually does, with the old text retained as a `#` comment saying which slice killed it and why. |
+
+The prose above the scenarios ("The agent runtime assembles a budgeted prompt") went with it.
+
+**The overview line gained the split argument the draft only gestured at.** The brief asked for "the
+reason for the split: truncation changes `agent_input_hash` and selection does not". Verified before
+writing rather than paraphrased: `executor::support::agent_input_hash` hashes
+`format!("{chain}|{system}|{messages}|{tools}")` — the chain STRING, never the candidate selection
+resolves out of it. So 7a is safe to ship alone because a turn memoized before the gate existed
+replays byte-identically after it; 7b rewrites `system`/`messages` and moves the key, so it owes a
+resume story 7a does not. Three missing slice-table rows (SP-6 s3, SP-6 s4, SP-7a) were added at the
+same time — the table stopped at SP-6 s2 while the prose two paragraphs below it claimed all four
+SP-6 slices merged.
+
+**One Rust comment was tightened, so this is not a docs-only commit.** `prompt.rs`'s
+`est_tokens_pessimistic` doc argued the opposite-bias case with "a window check asks 'will this
+prompt fit', where an over-count halts a turn that would in fact have fitted". Post-SP-7a an
+over-count SKIPS a candidate; it fails the node only when it skips the last one. The paragraph
+that follows already said the window half had moved to the gateway, so the sentence was not
+load-bearing — but it stated the wrong consequence of this slice's own change, in the file the
+change emptied out, which is exactly the class of comment the review rounds hunt.
+
+**Not changed, deliberately:** the historical spec and plan documents under `docs/superpowers/`
+(`sp1-slice2-agent-runtime-design.md`, `sp2-activation-policy-design.md`, the SP-DATA-5 plan and
+the rest) still describe `PromptOverBudget`/`over_budget` as live. They are dated records of what a
+past slice decided, not statements about today's tree, and rewriting them would destroy the audit
+trail this slice's own review depended on. The live surfaces — `docs/features/**`, the overview,
+and every code comment — are the ones held to current truth.
 
 ---
 
