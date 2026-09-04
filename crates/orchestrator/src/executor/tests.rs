@@ -433,22 +433,25 @@ async fn phase_override_wins_over_base_route_through_from_config() {
     assert!(outcome.outputs.contains_key(&n1));
 }
 
-/// An agent prompt no candidate's window can hold fails the node, before any spend —
-/// and says which window, and what to do about it.
+/// An agent prompt no candidate's window can hold PAUSES the run recoverably, before any
+/// spend — and says which window, and what to do about it.
 ///
 /// This test was `agent_node_halts_over_budget_before_any_gateway_call` and asserted the
 /// orchestrator's own `PromptOverBudget` halt. SP-7a deleted that halt, so the test's
-/// wording had to change; its two CLAIMS did not, and neither did its fixture. That is
-/// why it was updated rather than removed:
+/// wording had to change; its fixture never did. Its claims have now changed twice:
 ///
-/// - **"an over-window prompt fails the node"** still holds. The gateway's
-///   `ContextWindowGate` skips every candidate, `all_gated_error` aggregates that into an
-///   `AllGated` with no timed gate, and `classify_gateway_error` fails on anything that
-///   is not a timed pause. Terminal before, terminal now.
-/// - **"before any gateway call"** still holds, and is worth keeping precisely because it
-///   is the property a reader would expect the move to have cost. It did not: the refusal
-///   happens during SELECTION, so no adapter is reached and no tokens are spent. The call
-///   log is asserted for exactly that reason.
+/// - **"an over-window prompt HALTS the node before any spend"** has held throughout, and
+///   is worth keeping precisely because it is the property a reader would expect these
+///   moves to have cost. They did not: the refusal happens during SELECTION, so no
+///   adapter is reached and no tokens are spent. The call log is asserted for that reason.
+/// - **"...terminally"** held for exactly one slice and is now GONE. The gateway's
+///   `ContextWindowGate` skips every candidate and `all_gated_error` aggregates that into
+///   an `AllGated { resume_after: None, human_action: Some(UseLargerContextWindow) }` —
+///   and since the M1 reversal `classify_gateway_error` treats a named human action as
+///   the HOTL pause class rather than a failure, because a failed run is unreachable by
+///   `force_wake` and every other supported command. See
+///   `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying` for the property
+///   and the classifier's own doc for the argument.
 ///
 /// What changed is the DIAGNOSIS, which is the slice's whole benefit: the old message
 /// named one number — the chain's smallest window, possibly belonging to a model this
@@ -460,14 +463,19 @@ async fn phase_override_wins_over_base_route_through_from_config() {
 /// The old halt returned before the `if !*node_started` block in `agent_turn_output`, so
 /// an over-window node journaled `[RunStarted, NodeFailed]` and fired neither
 /// `on_node_started` nor `on_agent_turn`. Now the turn reaches dispatch, so the shape is
-/// `[RunStarted, NodeStarted, NodeFailed]` and both hooks fire for a turn that never
+/// `[RunStarted, NodeStarted, RunPaused]` and both hooks fire for a turn that never
 /// reaches a provider. That is a real change to what every observer sees — `torii status`
 /// and `list_paused` read the journal, and any hook that counts or bills turns now counts
 /// this one — and it is the intended shape: a node that reached dispatch IS started, and
 /// a turn that was attempted IS a turn. Pinning it here means re-introducing any
 /// pre-dispatch halt reddens on the property rather than only on message wording.
+///
+/// The third event is `RunPaused` rather than `NodeFailed` as of the M1 reversal, and the
+/// distinction is the whole recovery story: `list_paused` finds a `RunPaused` row and
+/// `force_wake` can move it, where a `NodeFailed` left the run terminal and reachable
+/// only by hand-written SQL.
 #[tokio::test]
-async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis() {
+async fn an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis() {
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
     let hooks = RecordingHooks::default();
@@ -481,12 +489,13 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
     };
     let run = RunId(uuid::Uuid::new_v4());
     let outcome = exec.run(run, &graph).await.expect("run yields an outcome");
-    match &outcome.failed {
-        Some((node, msg)) => {
-            assert_eq!(node.0, "n1");
+    match &outcome.paused {
+        Some(pause) => {
+            assert_eq!(pause.node.0, "n1");
+            let msg = &pause.reason;
             assert!(
                 msg.contains("4096-token context window"),
-                "the failure names the CANDIDATE's own window, not a chain-wide \
+                "the pause names the CANDIDATE's own window, not a chain-wide \
                  figure: {msg}"
             );
             assert!(
@@ -500,7 +509,11 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
                  could not tell it apart from a money problem: {msg}"
             );
         }
-        None => panic!("an over-every-window prompt is still a terminal node failure"),
+        None => panic!(
+            "an over-every-window prompt pauses recoverably as of the M1 reversal: \
+             {:?}",
+            outcome.failed
+        ),
     }
     assert_eq!(
         calls.lock().unwrap().len(),
@@ -509,8 +522,9 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
          adapter is reached"
     );
 
-    // The journal shape the deletion changed: the node is STARTED and then fails, where
-    // the pre-dispatch halt produced a `NodeFailed` with no `NodeStarted` before it.
+    // The journal shape both moves changed: the node is STARTED and then the run PAUSES,
+    // where the pre-dispatch halt produced a `NodeFailed` with no `NodeStarted` before
+    // it, and the one slice in between produced `NodeStarted` then `NodeFailed`.
     let kinds: Vec<&'static str> = journal
         .load(run)
         .await
@@ -520,14 +534,16 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
             JournalEvent::RunStarted { .. } => "RunStarted",
             JournalEvent::NodeStarted { .. } => "NodeStarted",
             JournalEvent::NodeFailed { .. } => "NodeFailed",
+            JournalEvent::RunPaused { .. } => "RunPaused",
             _ => "other",
         })
         .collect();
     assert_eq!(
         kinds,
-        vec!["RunStarted", "NodeStarted", "NodeFailed"],
+        vec!["RunStarted", "NodeStarted", "RunPaused"],
         "a node that reaches dispatch is STARTED first — this is the shape a resume and \
-         a `torii status` see, and the pre-dispatch halt used to skip the middle event"
+         a `torii status` see — and the run then PAUSES rather than failing, which is \
+         what leaves it visible to `list_paused` and movable by `force_wake`"
     );
 
     // And the hook contract: both fire for a turn that never reaches a provider.
@@ -4786,11 +4802,17 @@ async fn tampered_upstream_context_on_resume_halts_with_determinism_violation() 
 /// What SP-7a moved is WHO notices. Before it, the orchestrator compared the assembled
 /// prompt against the chain's smallest window and raised `PromptOverBudget` — hence the
 /// old `msg.contains("over budget")`. Now selection notices, per candidate, and the halt
-/// carries the gateway's diagnosis instead. The assertion below therefore checks the
-/// same property through its new wording rather than being relaxed: it still requires a
-/// LOUD failure at B, and it now also requires the failure to name the window that was
-/// busted — which the old one did not, since "over budget" alone reads as a money
-/// problem.
+/// carries the gateway's diagnosis instead. The assertion therefore checks the same
+/// property through its new wording rather than being relaxed: it still requires a LOUD
+/// halt at B, and it now also requires the halt to name the window that was busted —
+/// which the old one did not, since "over budget" alone reads as a money problem.
+///
+/// **The M1 reversal then changed the halt's CLASS from a failure to a durable pause,
+/// and the invariant is unaffected.** "Never silently truncated" is a claim about the
+/// prompt, not about the outcome: B still stops before asking a model about half of A's
+/// output, and the operator still learns which window was busted. It stops recoverably
+/// now, which for this scenario is strictly better — the remedy is a config change, and
+/// A's completed output is expensive to recompute.
 #[tokio::test]
 async fn oversized_dependency_context_halts_over_budget_never_truncates() {
     use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
@@ -4816,19 +4838,27 @@ async fn oversized_dependency_context_halts_over_budget_never_truncates() {
         .run(RunId(uuid::Uuid::new_v4()), &graph)
         .await
         .expect("run yields an outcome");
-    match &out.failed {
-        Some((node, msg)) => {
-            assert_eq!(node.0, "B");
+    match &out.paused {
+        Some(pause) => {
+            assert_eq!(pause.node.0, "B");
             assert!(
-                msg.contains("4096-token context window"),
-                "B must halt naming the window its context busted: {msg}"
+                pause.reason.contains("4096-token context window"),
+                "B must halt naming the window its context busted: {}",
+                pause.reason
             );
         }
         None => panic!(
             "expected B to halt loud — a truncated `## Context` would let it succeed \
-             silently on half of A's output, which is the failure this test exists for"
+             silently on half of A's output, which is the failure this test exists for. \
+             Since the M1 reversal the halt is a durable pause, not a failure: {:?}",
+            out.failed
         ),
     }
+    assert!(
+        !out.outputs.contains_key(&NodeId("B".into())),
+        "and B produced NO output — the point of halting is that half a document never \
+         becomes work product, whichever class the halt has"
+    );
 }
 
 /// Regression (determinism, review Finding 1): a SOFT dependency is NOT read into
@@ -24729,22 +24759,27 @@ fn over_window_agent_registry() -> Arc<Registry> {
 /// contributes no window term, and the call goes through to selection, which gates every
 /// candidate and returns `AllGated`. So the operator gets the same diagnosis either way.
 ///
-/// # The outcome CLASS changes for budgeted runs, and that is the deliberate part
+/// # The outcome CLASS moved twice, and the second move undid the loss the first caused
 ///
-/// It was a durable `RunPaused { resume_after: None }` and is now a terminal
-/// `NodeFailed`. That is a real loss — the pause preserved the run for an operator who
-/// widens the chain — and it is accepted because the pause was preserving the run against
-/// a remedy it could not name: a `BudgetExhausted` pause is cleared by
-/// `torii run wake --budget-tokens N`, and no cap raise has ever made a prompt fit a
-/// window. The unbudgeted path has always failed terminally on this condition, and one
-/// answer for one condition is worth more than a recoverable pause pointing at the wrong
-/// lever. `AllGated` carries `HumanAction::UseLargerContextWindow`, which names the real
-/// one.
+/// A budgeted run's refusal here was a durable `RunPaused { resume_after: None }`; this
+/// slice made it a terminal `NodeFailed`, on the argument that the pause pointed at the
+/// wrong lever (`torii run wake --budget-tokens N` cannot make a prompt fit a window) and
+/// that one answer for one condition beats a misleading pause.
 ///
-/// The cap-irrelevance experiment the old version ran (drive the same graph at
-/// `u64::MAX / 2` and get the identical refusal) is kept and now proves something
-/// stronger: an astronomical cap produces the same GATE failure, so the outcome does not
-/// depend on the budget in either direction.
+/// **Review found that argument traded away the wrong half.** The pause's value was never
+/// the lever it named — it was that a paused run is REACHABLE. `force_wake` matches only
+/// `status = 'paused'`, `torii run wake` answers "not queued" for anything else, and
+/// `submit` refuses a used id, so the terminal version left every completed node's memo
+/// and spent token durable and unreachable behind hand-written SQL. The lever complaint
+/// was answered instead by the `human_action` the gate already carries. So both arms now
+/// PAUSE, indefinitely, with `UseLargerContextWindow` as the remedy — see
+/// `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying`, which asserts the
+/// journal row, and `classify_gateway_error`'s doc for why this reverses risk M1.
+///
+/// What survives unchanged is this test's actual subject: **the gate owns the refusal,
+/// budgeted or not, and gives the same answer either way**. The cap-irrelevance
+/// experiment (drive the same graph at `u64::MAX / 2`) is kept and still proves the
+/// outcome does not depend on the budget in either direction.
 #[tokio::test]
 async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
     let graph = Graph {
@@ -24753,7 +24788,7 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
 
     // (a) UNBUDGETED: the request reaches the gateway, which gates on the window. This
     // arm is unchanged by the serving-window bound — `budget: None` never clamps — and
-    // is here as the reference answer the budgeted arm now has to match.
+    // is here as the reference answer the budgeted arm has to match.
     let (gateway, calls) = clamp_observing_gateway(10, 100).await;
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
@@ -24762,19 +24797,20 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
         .start(run, &graph)
         .await
         .expect("drives");
-    let (node, msg) = out
-        .failed
+    let pause = out
+        .paused
         .as_ref()
-        .expect("an over-window prompt still fails the node — see the spec's §3 row");
-    assert_eq!(node.0, "n1");
+        .expect("an over-window prompt halts the node — see the spec's §3 row");
+    let msg = pause.reason.clone();
+    assert_eq!(pause.node.0, "n1");
     assert!(
         msg.contains("context window"),
-        "the failure must carry the GATEWAY's diagnosis: {msg}"
+        "the halt must carry the GATEWAY's diagnosis: {msg}"
     );
     assert!(
-        out.paused.is_none(),
-        "and it FAILS rather than pausing — an all-terminal AllGated has no deadline \
-         to wait for: {out:?}"
+        out.failed.is_none(),
+        "and it PAUSES rather than failing — the remedy is a human action, and a failed \
+         run is not reachable by the command that acts on one: {out:?}"
     );
     assert!(
         calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
@@ -24798,21 +24834,22 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
         .await
         .expect("drives");
     assert!(
-        out_b.paused.is_none(),
-        "the clamp must NOT refuse this: nothing in the chain can serve the prompt, so \
-         its window term is absent rather than zero, and an absent term must not trip \
-         the output floor: {:?}",
-        out_b.paused
+        out_b.failed.is_none(),
+        "the clamp must NOT refuse this, and nothing must fail: nothing in the chain can \
+         serve the prompt, so the clamp's window term is absent rather than zero, and an \
+         absent term must not trip the output floor: {:?}",
+        out_b.failed
     );
-    let (node_b, msg_b) = out_b.failed.as_ref().expect(
-        "a budgeted over-every-window run now fails on the gate, as an \
-                 unbudgeted one always did",
+    let pause_b = out_b.paused.as_ref().expect(
+        "a budgeted over-every-window run halts on the gate, as an unbudgeted one \
+         always did",
     );
-    assert_eq!(node_b.0, "n1");
+    let msg_b = &pause_b.reason;
+    assert_eq!(pause_b.node.0, "n1");
     assert_eq!(
-        msg_b, msg,
+        msg_b, &msg,
         "and the message is IDENTICAL to the unbudgeted arm's — the point of the \
-         handover is one failure with one owner, not a budget-flavoured paraphrase"
+         handover is one halt with one owner, not a budget-flavoured paraphrase"
     );
     assert!(
         msg_b.contains("4096"),
@@ -24844,16 +24881,126 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
         .await
         .expect("drives");
     assert!(
-        out_c.paused.is_none(),
+        out_c.failed.is_none(),
         "a colossal cap does not change the outcome either: {:?}",
-        out_c.paused
+        out_c.failed
     );
     assert_eq!(
-        out_c.failed.as_ref().map(|(_, m)| m.as_str()),
+        out_c.paused.as_ref().map(|p| p.reason.as_str()),
         Some(msg.as_str()),
-        "the same gate failure at a cap of {} — the window question never reads the \
+        "the same gate refusal at a cap of {} — the window question never reads the \
          budget, in either direction",
         u64::MAX / 2
+    );
+}
+
+/// **An all-gated run whose remedy is a HUMAN pauses recoverably instead of dying** —
+/// the M1 reversal, and the finding that forced it.
+///
+/// `AllGated` carries `human_action: Option<HumanAction>`, and
+/// `classify_gateway_error` used to pause only on `resume_after: Some(t)`. So an
+/// over-every-window run ended `Failed`, and NOTHING could revive it:
+/// `SchedulerStore::force_wake` is `… where run_id = $1 and status = 'paused'`,
+/// `torii run wake` answers "not queued", and `run submit` refuses a used id. Recovery
+/// meant hand-written SQL against `scheduled_runs`, while every completed node's memo,
+/// journaled mutation and spent token stayed durable and unreachable.
+///
+/// The rule now: **a `resume_after: None` with a `human_action` is the HOTL pause class**
+/// (SP-DATA-3) — the scheduler records a NULL `next_wake`, never auto-wakes it, and an
+/// operator who acts on the named remedy clears it with `force_wake`. A
+/// `human_action: None` still fails, because there is nothing for a human to do and a
+/// pause nobody can clear is worse than a failure.
+///
+/// # This reverses risk M1, deliberately and with Jerry's decision
+///
+/// `docs/design/selection-policy-pipeline.md`'s M1 resolved terminal-only exhaustion as
+/// "fail-fast human-action, never pause", and SP-7a's spec put reversing it out of scope.
+/// The argument that overturned it: `human_action: Some(_)` IS the statement that a person
+/// rather than a deadline is the remedy, so a terminal state that names a human remedy no
+/// command can act on is incoherent — and it is incoherent for every gate that produces
+/// one (auth lockout, capability, budget), not only the window.
+///
+/// Asserted on the JOURNAL, not just on the return: `NodeExec::Paused` without a
+/// `RunPaused { resume_after: None }` row would leave nothing for `list_paused` to show
+/// or `force_wake` to find, which is precisely the state this test exists to rule out.
+#[tokio::test]
+async fn a_budgeted_over_window_run_pauses_recoverably_rather_than_dying() {
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "hi")],
+    };
+    let (gateway, calls) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .start(run, &graph)
+        .await
+        .expect("drives");
+
+    let pause = out.paused.as_ref().unwrap_or_else(|| {
+        panic!(
+            "an over-window run names a HUMAN remedy, so it must survive for that human: \
+             {out:?}"
+        )
+    });
+    assert_eq!(pause.node.0, "n1");
+    assert!(
+        out.failed.is_none(),
+        "and it must not ALSO report a failure — one outcome, and it is the recoverable \
+         one: {:?}",
+        out.failed
+    );
+
+    let events = journal.load(run).await.unwrap();
+    let paused_rows: Vec<&Option<chrono::DateTime<chrono::Utc>>> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::RunPaused { resume_after, .. } => Some(resume_after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        paused_rows.len(),
+        1,
+        "exactly one durable pause row — `list_paused` and `force_wake` both key on it"
+    );
+    assert!(
+        paused_rows[0].is_none(),
+        "and its `resume_after` must be NULL: this is the HOTL class, not a deadline. A \
+         `Some(t)` here would have the scheduler auto-wake the run at `t` into the \
+         identical refusal, forever, since no passage of time makes a prompt fit a window"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::NodeFailed { .. })),
+        "and no `NodeFailed` is journaled — a node failure is what destroyed the run"
+    );
+    assert!(
+        pause.reason.contains("4096"),
+        "the durable reason carries each candidate's own window, the number the operator \
+         has to change: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("larger context window"),
+        "and the remedy that no amount of waiting supplies — which is the whole reason \
+         this pause is honest rather than a stall: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains("--budget-tokens"),
+        "and not a cap raise: no cap makes a prompt fit a window: {}",
+        pause.reason
+    );
+    assert!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and nothing was dispatched — the gate refuses before any provider call, so the \
+         run pauses having spent nothing on this node"
     );
 }
 

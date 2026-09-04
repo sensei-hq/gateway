@@ -4487,10 +4487,12 @@ async fn the_engine_selects_on_the_pessimistic_estimate_not_the_cost_one() {
 ///
 /// **(a) The gate's registration position.** `ContextWindowGate` is registered after the
 /// health gates, so `small` — over-window AND breaker-open — reports `CircuitOpen`, which
-/// is `Timed`, which is what puts a `resume_after` on the `AllGated`. The orchestrator's
-/// `classify_gateway_error` pauses only on `Some(t)`; reporting the window instead would
-/// make this a terminal `NodeFailed`, so a transient provider outage would permanently
-/// kill every run whose prompt is also too big for that entry. Moving the gate to the
+/// is `Timed`, which is what puts a `resume_after` on the `AllGated`. That `Some(t)` is
+/// the SELF-HEALING pause: the orchestrator's `classify_gateway_error` schedules a wake
+/// at `t` and the scheduler returns the run unaided. Reporting the window instead yields
+/// `resume_after: None`, which since the M1 reversal is the indefinite HOTL pause — so a
+/// transient provider outage would leave the run waiting on a human with nothing to fix
+/// (and, before that reversal, would have killed it outright). Moving the gate to the
 /// front of `ModelSelectionService::new`'s vector left the whole workspace green before
 /// this test existed.
 ///
@@ -4566,8 +4568,11 @@ async fn an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause
 ///
 /// Both the typed variant AND the rendered string, deliberately. The typed check is the
 /// contract; the rendered one is what an operator actually gets, because the
-/// orchestrator's `classify_gateway_error` builds its `NodeFailed` reason from
-/// `err.to_string()` and nothing downstream destructures the error.
+/// orchestrator's `classify_gateway_error` builds its journaled reason from
+/// `err.to_string()` and nothing downstream destructures the error. Since the M1 reversal
+/// that reason lands in a `RunPaused` rather than a `NodeFailed`, which makes it the text
+/// `list_paused` shows the person who has to act before `force_wake` will help — so the
+/// `human_action` assertion below is guarding recoverability, not just wording.
 ///
 /// This is the improvement over the deleted `OrchestratorError::PromptOverBudget`, and
 /// the only place it is visible: that halt named ONE number, the chain minimum, which

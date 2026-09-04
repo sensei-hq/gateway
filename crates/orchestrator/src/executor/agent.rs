@@ -1068,9 +1068,11 @@ impl Executor {
                 super::dispatch::RefusalKind::Paused(reason) => Ok(ToolOutcome::Paused(reason)),
                 super::dispatch::RefusalKind::Failed(message) => Ok(ToolOutcome::Failed(message)),
             },
-            // A fully-gated chain with a timed re-eligibility (§11.2) is a durable
-            // pause (resumable) — on resume the turn re-attempts (no `EffectRecorded`
-            // was journaled). Every other gateway error fails the node.
+            // A fully-gated chain is a durable pause (resumable) whenever something can
+            // clear it — a deadline, or a human action the reason names — and on resume
+            // the turn re-attempts (no `EffectRecorded` was journaled). `resume_after`
+            // passes through unwrapped: `None` is the HOTL class, not a missing value.
+            // Every other gateway error fails the node.
             Err(error) => match classify_gateway_error(&error) {
                 GatewayDisposition::Pause {
                     resume_after,
@@ -1080,7 +1082,7 @@ impl Executor {
                         run,
                         JournalEvent::RunPaused {
                             reason: reason.clone(),
-                            resume_after: Some(resume_after),
+                            resume_after,
                         },
                     )
                     .await?;

@@ -104,18 +104,23 @@ impl SkipReason {
             // (`engine/execute.rs`), which names no cause and no remedy. Terminal
             // carries a `HumanAction` that names the lever.
             //
-            // What Terminal does NOT do — despite what an earlier version of this
-            // comment asserted — is make the run PAUSABLE. `all_gated_error` takes
+            // What Terminal does NOT do is supply a WAKE. `all_gated_error` takes
             // `resume_after` from the TIMED skips alone, so an all-over-window selection
-            // is `AllGated { resume_after: None }`, and `classify_gateway_error`
-            // (orchestrator `executor/support.rs`) pauses only on `Some(t)`; everything
-            // else fails the node. That is deliberate and predates this slice — risk M1
-            // in `docs/design/selection-policy-pipeline.md` resolved it as "terminal-only
-            // ⇒ fail-fast human-action, never pause", and `GatewayError::AllGated`'s own
-            // doc says the caller must not pause forever. So what this variant buys is a
-            // better-DIAGNOSED terminal failure, not a recoverable one: each candidate's
-            // own window and the estimate that exceeded it, in place of the
-            // orchestrator's single chain-minimum guess.
+            // is `AllGated { resume_after: None }` and nothing will re-run it on a timer
+            // — correctly, since no passage of time makes a model's window bigger.
+            //
+            // It does now make the run PAUSABLE, which is a reversal of what this comment
+            // said for two slices. The orchestrator's `classify_gateway_error` treats
+            // `resume_after: None` WITH a `human_action` as the HOTL pause class
+            // (`RunPaused { resume_after: None }`, NULL `next_wake`, cleared by an
+            // operator's `force_wake`), because a terminal run is unreachable by every
+            // supported command and the `HumanAction` this arm carries is precisely the
+            // statement that a person is the remedy. That reverses risk M1 in
+            // `docs/design/selection-policy-pipeline.md` on a decision recorded
+            // 2026-09-04; see the classifier's doc for the argument. So this variant buys
+            // a better-diagnosed AND recoverable halt: each candidate's own window and
+            // the estimate that exceeded it, in place of the orchestrator's single
+            // chain-minimum guess, on a run that survives to be fixed.
             SkipReason::OverContextWindow { .. } => {
                 GateStatus::Terminal(HumanAction::UseLargerContextWindow)
             }

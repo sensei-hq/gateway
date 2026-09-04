@@ -569,22 +569,52 @@ pub(crate) fn tool_input_hash(name: &str, arguments: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// How the executor should treat a gateway error (§11.2): a timed chain-gate is a
-/// durable pause; everything else fails (a terminal gate carries its human-action
-/// hint in the message).
+/// How the executor should treat a gateway error (§11.2): a fully-gated chain is a
+/// durable pause when *something* can clear it — a deadline, or a named human action;
+/// everything else fails.
+///
+/// `Pause.resume_after` is an `Option` because the two pause classes differ in exactly
+/// that field, and the difference is the whole point. `Some(t)` is the scheduler's timed
+/// wake (SP-DATA-3): the run comes back by itself at `t`. `None` is the HOTL class: a
+/// NULL `next_wake`, never auto-woken, cleared by an operator running `force_wake` after
+/// acting on the remedy the reason names.
 #[derive(Debug)]
 pub(crate) enum GatewayDisposition {
     Pause {
-        resume_after: chrono::DateTime<chrono::Utc>,
+        resume_after: Option<chrono::DateTime<chrono::Utc>>,
         reason: String,
     },
     Fail(String),
 }
 
-/// Classify a gateway error: only `AllGated{resume_after: Some(t)}` (every
-/// candidate gated, with a timed re-eligibility) pauses — to `t`. Every other
-/// error, including `AllGated{None}` (all gates terminal), fails; its `Display`
-/// carries the reason / human-action hint.
+/// Classify a gateway error. `AllGated` pauses when it carries something that can clear
+/// it: `resume_after: Some(t)` (a timed re-eligibility) pauses until `t`, and a
+/// `human_action` with no deadline pauses INDEFINITELY as the HOTL class. Every other
+/// error fails, and so does an `AllGated` carrying neither — a pause nobody and nothing
+/// can clear is strictly worse than a failure.
+///
+/// # The human-action arm REVERSES risk M1, on a decision recorded 2026-09-04
+///
+/// M1 in `docs/design/selection-policy-pipeline.md` resolved terminal-only exhaustion as
+/// "fail-fast human-action, never pause", and this function implemented it: only a timed
+/// gate paused. Review of the serving-window slice showed what that costs once the
+/// orchestrator's own pre-dispatch window halt is gone. A budgeted over-every-window run
+/// reaches `AllGated { resume_after: None, human_action: Some(UseLargerContextWindow) }`,
+/// which failed the node and made the run terminal — and no supported command revives a
+/// terminal run. `SchedulerStore::force_wake` is `… where run_id = $1 and status =
+/// 'paused'`; `torii run wake` reports "not queued"; `run submit` refuses a used id.
+/// Recovery required hand-written SQL, while every completed node's memo, journaled
+/// mutation and spent token stayed durable and unreachable.
+///
+/// The argument that overturned M1: `human_action: Some(_)` IS the statement that a
+/// person rather than a deadline is the remedy, which is the definition of the HOTL pause
+/// class. A terminal state that names a human remedy no command can act on is incoherent
+/// — and incoherent for every gate that produces one (auth lockout, capability, budget),
+/// not just the window. M1's fail-fast instinct is honoured by the `human_action: None`
+/// arm, which still fails.
+///
+/// What this does NOT do is make waiting the remedy. The pause carries no deadline
+/// precisely so nothing wakes it on a timer into the identical refusal forever.
 pub(crate) fn classify_gateway_error(
     err: &kernel::types::error::GatewayError,
 ) -> GatewayDisposition {
@@ -593,7 +623,7 @@ pub(crate) fn classify_gateway_error(
             resume_after: Some(t),
             ..
         } => GatewayDisposition::Pause {
-            resume_after: *t,
+            resume_after: Some(*t),
             // `err.to_string()`, exactly as the `Fail` arm below does, and NOT a
             // hand-built sentence naming only the deadline. `AllGated`'s `Display`
             // renders the per-candidate skips and the remedy, and this string is what
@@ -605,6 +635,21 @@ pub(crate) fn classify_gateway_error(
             // yields both), and the whole point of keeping it is that waiting will not
             // fix the second half. Dropping it here would have made that change invisible
             // on the one path it was made for.
+            reason: err.to_string(),
+        },
+        // No deadline, but a named human action: the HOTL class. `resume_after: None`
+        // is load-bearing rather than incidental — the scheduler stores a NULL
+        // `next_wake` for it, so `tick()` never claims the run and only `force_wake`
+        // moves it. `err.to_string()` for the same reason as the arm above: this string
+        // is what `list_paused` renders and what the operator reads to learn WHICH
+        // remedy, and `AllGated`'s `Display` carries every candidate's own diagnosis
+        // beside the action.
+        kernel::types::error::GatewayError::AllGated {
+            resume_after: None,
+            human_action: Some(_),
+            ..
+        } => GatewayDisposition::Pause {
+            resume_after: None,
             reason: err.to_string(),
         },
         other => GatewayDisposition::Fail(other.to_string()),
@@ -1432,8 +1477,15 @@ mod tests {
         );
     }
 
+    /// The classifier's whole rule, one case per arm: a deadline pauses to it, a named
+    /// human action pauses INDEFINITELY, and neither fails.
+    ///
+    /// Renamed from `classify_gateway_error_pauses_only_on_timed_allgated`, whose name
+    /// asserted the pre-M1-reversal rule — "only" became false the moment the
+    /// human-action arm existed, and a test name that states the old rule is worse than
+    /// no name at all for the next reader.
     #[test]
-    fn classify_gateway_error_pauses_only_on_timed_allgated() {
+    fn classify_gateway_error_pauses_on_a_deadline_or_a_human_action_and_fails_on_neither() {
         use kernel::types::error::{GatewayError, HumanAction};
         let t = chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap();
         // Timed AllGated → Pause (reason names the instant).
@@ -1446,11 +1498,57 @@ mod tests {
                 resume_after,
                 reason,
             } => {
-                assert_eq!(resume_after, t);
+                assert_eq!(resume_after, Some(t));
                 assert!(reason.contains(&t.to_string()), "reason names t: {reason}");
             }
             d => panic!("expected Pause, got {d:?}"),
         }
+        // No deadline but a HUMAN action → the HOTL pause: `resume_after: None`, so the
+        // scheduler stores a NULL `next_wake` and only `force_wake` moves it. This arm
+        // is the M1 reversal (see the function's doc): it used to fail, and a failed run
+        // is unreachable by every supported command — `force_wake` matches only
+        // `status = 'paused'`.
+        match classify_gateway_error(&GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec![
+                "r:m — estimated 20000 input tokens exceeds the model's 8192-token \
+                 context window"
+                    .to_string(),
+            ],
+            human_action: Some(HumanAction::UseLargerContextWindow),
+        }) {
+            GatewayDisposition::Pause {
+                resume_after,
+                reason,
+            } => {
+                assert!(
+                    resume_after.is_none(),
+                    "a human action is not a deadline: waking this on a timer returns it \
+                     to the identical refusal forever, so the pause must carry no instant"
+                );
+                assert!(
+                    reason.contains("8192-token context window")
+                        && reason.contains("larger context window"),
+                    "and the durable reason carries the candidate's diagnosis AND the \
+                     remedy — it is the only thing telling the operator what to change \
+                     before they `force_wake`: {reason}"
+                );
+            }
+            d => panic!("expected the HOTL Pause, got {d:?}"),
+        }
+        // Neither a deadline nor an action → still a FAIL, which is M1's fail-fast
+        // instinct kept rather than discarded: a pause no one and nothing can clear is
+        // strictly worse than a failure, because it stalls silently instead of reporting.
+        let blind = GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec!["r:m — gated".to_string()],
+            human_action: None,
+        };
+        let blind_msg = blind.to_string();
+        assert!(
+            matches!(classify_gateway_error(&blind), GatewayDisposition::Fail(m) if m == blind_msg),
+            "an AllGated naming no remedy at all must fail"
+        );
         // A PAUSE carries the per-candidate diagnostics and the remedy too, and this is
         // what makes SP-7a's `all_gated_error` change reach anybody. That function now
         // keeps `human_action` beside a `resume_after` — a chain with one breaker-open
@@ -1483,16 +1581,28 @@ mod tests {
             }
             d => panic!("expected Pause, got {d:?}"),
         }
-        // Terminal AllGated → Fail (message carries the human-action hint).
-        let none = GatewayError::AllGated {
+        // The reversal is NOT window-specific, and this case is why the narrow fix was
+        // rejected: `TopUpCredits` is a credit/auth remedy, and a run gated on it was
+        // just as terminal and just as unrecoverable. Any named human action pauses.
+        let credits = GatewayError::AllGated {
             resume_after: None,
-            skipped: vec![],
+            skipped: vec!["r:m — model locked out (Auth)".to_string()],
             human_action: Some(HumanAction::TopUpCredits),
         };
-        let none_msg = none.to_string();
-        assert!(
-            matches!(classify_gateway_error(&none), GatewayDisposition::Fail(m) if m == none_msg)
-        );
+        let credits_msg = credits.to_string();
+        match classify_gateway_error(&credits) {
+            GatewayDisposition::Pause {
+                resume_after,
+                reason,
+            } => {
+                assert!(resume_after.is_none(), "the HOTL class, here too");
+                assert_eq!(
+                    reason, credits_msg,
+                    "and the reason is the error's own `Display`, not a paraphrase"
+                );
+            }
+            d => panic!("expected the HOTL Pause for a credits remedy, got {d:?}"),
+        }
         // Other errors → Fail.
         let budget = GatewayError::BudgetExceeded {
             estimated: 1.0,
