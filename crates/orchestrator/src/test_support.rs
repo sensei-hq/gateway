@@ -456,6 +456,9 @@ pub async fn two_window_scripted_window_watching_gateway(
             calls: calls.clone(),
             script: Mutex::new(responses.into()),
             ests: ests.clone(),
+            // Recorded and dropped: AC2's subject is the SIZE of what was dispatched, not
+            // which schemas rode along. See [`scripted_tool_watching_gateway`].
+            tool_names: Arc::new(Mutex::new(Vec::new())),
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
@@ -661,6 +664,16 @@ pub type ModelLog = Arc<Mutex<Vec<Option<String>>>>;
 /// from the agent's registry instead would be asserting against its own model of the
 /// prompt assembler, which is the thing most likely to drift.
 pub type WindowEstimateLog = Arc<Mutex<Vec<u32>>>;
+
+/// The tool schema NAMES each dispatched call carried, in the same order as [`CallLog`].
+///
+/// SP-7b needs it because "which schemas were dropped" is the half of a budgeted cut that
+/// no other log can see. [`WindowEstimateLog`] prices the whole request, so a dropped
+/// schema shows up there only as a smaller number that a test would have to re-derive from
+/// the estimator's own arithmetic — the thing every other SP-7b assertion is written to
+/// avoid — and [`CallLog`] records `(model, first user message)`, neither of which moves
+/// when a schema goes.
+pub type ToolNameLog = Arc<Mutex<Vec<Vec<String>>>>;
 
 /// Records the `max_tokens` each call carried, and HONOURS it in the usage it reports
 /// — `output_tokens = min(scripted_output, max_tokens)`.
@@ -956,6 +969,9 @@ pub struct ScriptedAdapter {
     /// but answers every call with the same fixed body, so it cannot produce a large upstream
     /// output for a dependent node to be budgeted against.
     ests: WindowEstimateLog,
+    /// The tool schema names each call carried. See [`ToolNameLog`] and
+    /// [`scripted_tool_watching_gateway`].
+    tool_names: ToolNameLog,
 }
 
 impl Model for ScriptedAdapter {
@@ -992,6 +1008,10 @@ impl ChatModel for ScriptedAdapter {
                 tools: req.tools.clone(),
             }),
         );
+        self.tool_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.tools.iter().map(|t| t.name.clone()).collect());
         let next = self
             .script
             .lock()
@@ -1069,7 +1089,54 @@ pub async fn content_gated_gateway() -> (Gateway, CallLog) {
 
 /// A gateway on chain "c" whose scripted adapter yields `responses` in order.
 pub async fn scripted_gateway(responses: Vec<ChatResponse>) -> (Gateway, CallLog) {
+    let (gateway, calls, _tools) = scripted_tool_watching_gateway(responses).await;
+    (gateway, calls)
+}
+
+/// [`scripted_gateway`] over [`single_chain_config`] with its one model's `context_window`
+/// replaced — the SECOND-DRIVE half of SP-7b's replay property.
+///
+/// AC4 needs drive 2 to read a different `max_context_window(chain)` than drive 1 AND to be
+/// able to serve the cut drive 1 already dispatched, so the window has to be a parameter
+/// rather than a second hard-coded fixture. Derived from `single_chain_config` by overriding
+/// the field instead of assembling a third routers/models/chains table, so the only
+/// difference from every other single-chain test is the one number under test.
+pub async fn wide_window_scripted_gateway(
+    context_window: u32,
+    responses: Vec<ChatResponse>,
+) -> (Gateway, CallLog) {
     let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(ScriptedAdapter {
+            calls: calls.clone(),
+            script: Mutex::new(responses.into()),
+            ests: Arc::new(Mutex::new(Vec::new())),
+            tool_names: Arc::new(Mutex::new(Vec::new())),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let mut config = single_chain_config();
+    for model in config.models.values_mut() {
+        model.context_window = context_window;
+    }
+    (Gateway::new(config, adapters, cb), calls)
+}
+
+/// [`scripted_gateway`] plus the [`ToolNameLog`] — which tool SCHEMAS each dispatched
+/// request carried.
+///
+/// SP-7b's replay arm reproduces a cut from the journal, and `dropped_tools` is the half of
+/// that cut nothing else observes: the prompt bytes are visible through
+/// [`prompt_recording_gateway`], but whether `calc`'s schema rode along is visible only
+/// here. Over [`single_chain_config`] rather than the two-window one deliberately — a
+/// journaled budget is used verbatim and the window is never read on that path, so the
+/// fixture must not need a second window to exercise it.
+pub async fn scripted_tool_watching_gateway(
+    responses: Vec<ChatResponse>,
+) -> (Gateway, CallLog, ToolNameLog) {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let tool_names: ToolNameLog = Arc::new(Mutex::new(Vec::new()));
     let adapters = AdapterRegistry::new();
     adapters
         .register_chat(Arc::new(ScriptedAdapter {
@@ -1079,10 +1146,15 @@ pub async fn scripted_gateway(responses: Vec<ChatResponse>) -> (Gateway, CallLog
             // sizes. See [`two_window_scripted_window_watching_gateway`] for the constructor
             // that hands the log back.
             ests: Arc::new(Mutex::new(Vec::new())),
+            tool_names: tool_names.clone(),
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
-    (Gateway::new(single_chain_config(), adapters, cb), calls)
+    (
+        Gateway::new(single_chain_config(), adapters, cb),
+        calls,
+        tool_names,
+    )
 }
 
 /// Convenience: a `ChatResponse` carrying a single tool call.

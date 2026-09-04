@@ -1578,6 +1578,32 @@ claimed otherwise and was false by construction.
 
 ### Task 8: Split the guard test, and the doc sweep
 
+> **Amended after Task 5's review round — read this before step 1.**
+>
+> Task 5 shipped work this task's steps assumed it would inherit, and moved two decisions:
+>
+> - **Step 1 is largely MOOT.** `oversized_dependency_context_halts_over_budget_never_truncates`
+>   never went green-on-a-completion: its fixture (a 100 000-byte dependency against a 4096-token
+>   window) already falls below the floor, so it halts at SP-7b's floor rather than the gate and
+>   needed no resizing. Task 5 rewrote its doc to say so and added the `context budget: ` prefix
+>   assertion. What remains for step 1 is a judgment call on whether the NAME still reads right,
+>   nothing more.
+> - **Step 2 is also moot.** `an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis`
+>   still pauses, unchanged: its fixture has no dependency context, so per §5.3 no cut can fit and
+>   the refusal stays the gate's. Neither of the two tasks-5-was-told-to-expect failures ever
+>   materialized.
+> - **AC9's test must key on the `context budget: ` prefix, not on the window.** Both refusals name
+>   the window, which is precisely why the guard test above kept passing when its refusal changed
+>   owner. `the_context_floor_pause_is_recoverable_and_spends_nothing` (added in Task 5) already
+>   asserts the whole AC9 shape — one pause row, `resume_after: None`, no `NodeFailed`, no budget
+>   row, no spend — so what AC9 still owes is the second REFUSAL CONDITION, and §5.3 was amended:
+>   a non-positive budget and an over-budget authored half are the GATE's refusal (AC5), not the
+>   floor's. Do not write an AC9 test against the pre-amendment wording.
+> - **`the_planner_converts_a_token_window_into_a_byte_budget` was NOT the test extended** for this
+>   task's self-review item about the transcript decomposition;
+>   `the_byte_budget_is_the_gateway_estimators_own_arithmetic` was, since it is the one that calls
+>   the estimator. Done in Task 5's review round, not outstanding.
+
 **Files:**
 - Modify: `crates/orchestrator/src/executor/tests.rs:4794-4872` (the guard test)
 - Modify: `crates/orchestrator/src/executor/tests.rs` (the SP-7a agent-path pause test)
@@ -1695,6 +1721,18 @@ deliberate — journal integers are `u64` throughout — and the casts are named
   against `estimate_input_tokens_pessimistic`'s exact arithmetic. **The implementer must verify it
   and adjust**, and Task 2's `the_planner_converts_a_token_window_into_a_byte_budget` is the test
   that should be extended to pin it.
+
+  **CLOSED in Task 5's review round, in a different test than named here.** The probe is now the
+  production function `prompt::transcript_estimate`, and the guard is
+  `the_byte_budget_is_the_gateway_estimators_own_arithmetic` — the test that actually calls the
+  estimator. `the_planner_converts_a_token_window_into_a_byte_budget` could not have pinned it: it
+  asserts a hand-derived literal over this crate's `× 3` and never calls the estimator, which is a
+  correction its own doc already carried. What the guard pins: the transcript figure taken off the
+  window equals what the estimator charges those same messages inside the real payload, in either
+  direction (a probe one token light reddens it, `3841` against `3840`). What it cannot pin, by
+  algebra rather than by omission: any term the estimator charges over the MESSAGES cancels,
+  because the probe carries the same messages — including the per-message overhead this note's
+  reviewer expected to be the hazard.
 - `oversized_context_graph()` is specified by reference to an existing fixture rather than written
   out, because its sizing depends on `TWO_WINDOW_SMALL` arithmetic the implementer must compute
   from the constants. Task 5 step 1 says which fixture to model it on.

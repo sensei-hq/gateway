@@ -57,6 +57,18 @@ machinery.
   not scope-fatigue: `messages` is already not a pure function of journaled state (§4.5), and
   compacting a growing transcript is a different mechanism (the master spec's "restart from a
   summarized checkpoint", `2026-08-06-sensei-orchestrator-design.md:202`).
+
+  **A consequence review made explicit: a budgeted node is effectively SINGLE-TURN.** §5.1 spends
+  the window down to exactly `MIN_OUTPUT_TOKENS`, so a budgeted turn 0 is dispatched at
+  `window − 256` tokens and the transcript's whole remaining headroom is 256 tokens = 768 bytes. An
+  agent that then calls a tool re-sends `system` plus the assistant turn (whose
+  `tool_calls.name + arguments` the estimator counts) plus the tool result; past 768 bytes of that,
+  every candidate is gated and the run takes the `AllGated` HOTL pause — after paying for turn 0.
+  Excluding the transcript from being BUDGETED was always the plan; leaving it no room is the part
+  that was not stated. Reserving a growth allowance is the fix and it needs a number nobody has
+  evidence for, so the behaviour is pinned by a two-turn test instead
+  (`a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn`) and a later change to it
+  is a visible one.
 - **Model-call summarization.** No summarizer effect, at produce time or consume time. §9 records
   both shapes and why neither is needed to deliver this slice's promise.
 - **`Message.attachments`.** Counted by neither the estimator nor any truncator. Pre-existing.
@@ -83,6 +95,25 @@ Let `cut` be the bytes removed from the assembled prompt. The obligation is that
 reloads, binary upgrades, gateway catalog edits, breaker state, or which candidate selection
 returned.
 
+**Including `cut = ∅`, which the first draft of this section missed and review caught.** The
+obligation is symmetric: a turn dispatched UN-cut must stay un-cut on every later drive. That case
+journals nothing (AC11), so absence of a `ContextBudgeted` row cannot distinguish "was not
+budgeted" from "not budgeted yet" — and since this slice makes `max_context_window(chain)` an
+input to the prompt for the first time, a window that SHRINKS between drives would retroactively
+cut a turn already on the wire, with the same terminal §4.3 consequence as budget drift and the
+same durability (the spurious row is appended before the memo hash is checked, so restoring the
+config does not recover the run).
+
+The fix needs no second event, because the journal already records the decision. `ContextBudgeted`
+is appended strictly before the turn's `EffectRecorded`, so
+
+```
+memo has effect_id(node,0,0)  ∧  no budget row for that key   ⟹   turn 0 was dispatched UN-cut
+```
+
+and on that reading the window is not read at all. So the two fences are: the budget integer for a
+cut turn, and the MEMO for an un-cut one.
+
 ### 4.2 The inputs, and where each comes from
 
 `cut = f(context_entries, authored, tool_schemas, budget_bytes)`.
@@ -102,9 +133,18 @@ an operator editing a model's `context_window` between drives changes the budget
 loud anywhere.
 
 Journaling `budget_bytes` moves that row to **Yes**, and then all four inputs are journaled or
-fenced. Since `f` is pure — `prompt.rs`'s only imports are `ToolDefinition` and four
-`orchestrator_core` types; no clock, env, rand, statics or interior mutability — the conclusion
-follows.
+fenced. Since `f` is pure — `prompt.rs` imports `ToolDefinition`, four `orchestrator_core` types
+and (for `transcript_estimate`) the gateway's own estimator, which is a `match` over a payload;
+no clock, env, rand, statics or interior mutability — the conclusion follows.
+
+**A fifth input, found in review: `f` itself.** `dropped_tools` is decided by `plan_budget`, which
+reads `CONTEXT_FLOOR_FRACTION` — a constant §5.3 says exists to be re-tuned — plus the section
+overhead reservation and the per-schema byte mirror. So re-running the PLANNER on a later drive
+made the cut a function of the binary, and re-tuning the fraction would have killed every
+in-flight budgeted run on its next resume. The record already carries `dropped_tools`, so the
+replay reads that back and derives the section budget as `available − authored − Σ kept schemas`,
+which shares none of the deciding arithmetic (`prompt::replayed_plan`). What remains shared is the
+RENDERER, and that is irreducible: both drives must render the same bytes from the same budget.
 
 **The "Conditionally" in rows 2 and 3 is not hedging, and this slice does not repair it.** The
 `#cfg{gen}` suffix is appended by `pinned()` only when a `RegistryHandle` supplies a generation; on a
@@ -230,16 +270,38 @@ Two byte counts, defined so AC9 is unambiguous:
 `CONTEXT_FLOOR_FRACTION = 0.25`, as a named constant beside `MIN_OUTPUT_TOKENS`. The value is a
 judgment call with no evidence behind it; AC10's warn is what replaces it with a measurement.
 
-Refuse when either holds:
-- `budget_bytes <= 0` — the transcript plus the reserve already exceeds the largest window, so there
-  is nothing to budget.
-- `retained_context_bytes < CONTEXT_FLOOR_FRACTION × requested_context_bytes`, evaluated only when
-  `requested_context_bytes > 0` (a node with no dependencies has nothing to retain and must not be
-  refused for retaining none of it).
+**The rule, corrected after review: SP-7b refuses only when a cut that FITS exists and retains too
+little.** Everything else is the GATE's refusal (AC5), because the un-cut prompt is over the
+LARGEST window by the arm's own guard — the same predicate `ContextWindowGate` skips a candidate
+on — so falling through refuses per candidate, with real window figures and a remedy, and
+dispatches nothing.
+
+So the orchestrator refuses when:
+- `retained_context_bytes < CONTEXT_FLOOR_FRACTION × requested_context_bytes` on the MEASURED cut, or
+- no cut meets that floor at any tool-schema count, while the authored half DOES fit the budget.
+
+And it falls through to the gate when no cut can fit at all:
+- `budget_bytes <= 0` — the transcript plus the reserve already fills the largest window; or
+- `authored_bytes > budget_bytes` — the authored half is never cut (§5.2), so no degradation is
+  available.
+
+The first draft of this section listed `budget_bytes <= 0` as an unconditional refusal and made no
+distinction for the authored half. Both were wrong the same way: the floor pause would blame the
+dependency context and the 25% floor for a refusal neither caused, name remedies (shorten the
+upstream output, split the node) that cannot work, and displace the gateway's per-candidate
+diagnosis. It was also non-monotonic — the same agent with ZERO dependency bytes fell through and
+got the accurate answer, and adding one 100-byte dependency replaced it with a worse and false one.
+`prompt::BudgetRefusal` is the type that now carries the distinction.
+
+Note `requested_context_bytes > 0` is a CONSEQUENCE rather than a side condition: the floor of a
+dependency-free node is zero and a zero floor is always met, so a floor refusal implies a non-empty
+context and the pause can never report "0 bytes requested".
 
 The refusal is raised by the orchestrator and must produce `RunPaused { resume_after: None }` — the
-HOTL class — with a reason naming the window, the requested and retained byte counts, and the
-remedy. It must NOT produce a `NodeFailed`.
+HOTL class — with a reason prefixed `context budget: ` and naming the node, the window, the
+requested and retained byte counts, and the remedy. It must NOT produce a `NodeFailed`. The prefix
+is load-bearing for tests: both refusals name the window, so a substring assertion on the window
+alone cannot tell the floor pause from the gate's.
 
 ### 5.4 The journal event
 
@@ -258,6 +320,17 @@ ContextBudgeted {
 Additive variant ⇒ `FORMAT_VERSION` stays 1, via externally-tagged serde over an `event jsonb`
 column with no size constraint (`orchestrator-core/src/journal.rs:128-129`, `:15`). Appended BEFORE
 dispatch, fold-guarded, folded FIRST-wins into a side-map keyed by `effect_id`.
+
+`budget_bytes` **and `dropped_tools`** are the replay inputs, so both are folded and the FIRST-wins
+latch covers both (§4.2's fifth input). `source_window`, `retained_bytes` and `dropped_deps` are
+the audit channel and are deliberately NOT folded, so no reader can mistake a disclosure figure for
+a replay input.
+
+The key is `effect_id(node, 0, 0)` — **one budget per agent NODE, not per turn.** `system` is
+assembled once, above the ReAct turn loop, and is turn-invariant; only `messages` grows and the
+transcript is out of scope (§2), so journaling inside the loop would make `system` a function of
+the transcript. What the `EffectId` key buys is separation of distinct nodes, `Map` children and
+`Loop` iterations, which a bare `NodeId` would collide across.
 
 **Two known traps to close deliberately:**
 - `fold_journal` ends in `_ => {}`, so a new variant that is never folded compiles and silently does
@@ -300,15 +373,24 @@ dispatch, fold-guarded, folded FIRST-wins into a side-map keyed by `effect_id`.
    reverse activation order.
 8. `authored` bytes are never cut.
 9. **The floor halts, recoverably.** A prompt whose retained context would fall below
-   `CONTEXT_FLOOR_FRACTION`, and one whose budget is non-positive, both produce
-   `RunPaused { resume_after: None }` with a reason naming the window and both byte counts, and
-   **no** `NodeFailed`. Exactly one durable pause row.
+   `CONTEXT_FLOOR_FRACTION` — measured, or unreachable at every tool-schema count while the
+   authored half DOES fit — produces `RunPaused { resume_after: None }` with a reason prefixed
+   `context budget: ` and naming the node, the window and both byte counts, and **no**
+   `NodeFailed`. Exactly one durable pause row, and no provider call for that node.
+
+   **A non-positive budget and an over-budget authored half are the GATE's refusal, not this
+   one** (§5.3, AC5): no cut fits, so the un-cut prompt goes to selection and the operator gets
+   the per-candidate diagnosis instead of a false floor report. A test for this AC must key on
+   the `context budget: ` prefix, not on the window figure, which BOTH refusals carry — that
+   substring is why the pre-existing guard test kept passing when its refusal changed owner.
 10. All four disclosure channels fire on a degraded turn: the prompt carries the marker and the
     `N of M` tail, `ContextBudgeted` is journaled, the node output carries `context_budgeted: true`
     alongside an unchanged `text` key, and the warn is emitted.
 11. An in-window turn's PROMPT is **byte-identical** to today, and nothing durable changes: no
     `ContextBudgeted` journaled, no `context_budgeted` key on the output, no warn, and the same
-    number of provider calls carrying the same bytes.
+    number of provider calls carrying the same bytes. **And it stays byte-identical on every
+    later drive, even if the window shrinks under it** — the memo is the fence for that half
+    (§4.1), so no new journal row is needed and this AC is unweakened.
 
     **Deliberately NOT claimed: that nothing new runs.** An earlier draft of this AC said "the window
     accessor is not even called", which is false by construction — deciding whether a prompt is

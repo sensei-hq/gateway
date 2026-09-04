@@ -13,7 +13,7 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{AgentAnswer, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
+use super::{AgentAnswer, ContextBudget, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -410,11 +410,15 @@ pub(crate) fn fold_journal(
             JournalEvent::ContextBudgeted {
                 effect_id,
                 budget_bytes,
+                dropped_tools,
                 ..
             } => {
                 fold.context_budgets
                     .entry(effect_id.clone())
-                    .or_insert(*budget_bytes);
+                    .or_insert_with(|| ContextBudget {
+                        budget_bytes: *budget_bytes,
+                        dropped_tools: dropped_tools.clone(),
+                    });
             }
             _ => {}
         }
@@ -701,25 +705,36 @@ mod tests {
     /// itself — `fold.expansions` (`PlanExpanded`) and `fold.selections` (`PlannerSelected`)
     /// — are both LAST-wins `insert`, so the correct discipline is ONE TOKEN away from the
     /// code most likely to be copied, and both spellings compile. Mutation-verified: with
-    /// `.entry(..).or_insert(..)` replaced by `.insert(..)` this fails with `Some(9999)`.
+    /// `.entry(..).or_insert_with(..)` replaced by `.insert(..)` this fails, reporting the
+    /// second record's `9999`/`["b"]`.
+    ///
+    /// The latch covers the WHOLE record, not only the integer. `dropped_tools` is a replay
+    /// input too (see [`super::ContextBudget`]), so a second record moving the dropped set
+    /// while the budget held would change `system` and `tools` just as surely — and an
+    /// `or_insert` that folded only the budget would leave that half LAST-wins in a way the
+    /// integer assertion could not see.
     #[test]
     fn the_first_context_budget_wins() {
         use orchestrator_core::{EffectId, JournalEvent, NodeId};
         let eid = EffectId("eid-1".into());
-        let ev = |budget_bytes: u64| JournalEvent::ContextBudgeted {
+        let ev = |budget_bytes: u64, dropped: &str| JournalEvent::ContextBudgeted {
             node: NodeId("n1".into()),
             effect_id: eid.clone(),
             budget_bytes,
             source_window: 4096,
             retained_bytes: 0,
             dropped_deps: 0,
-            dropped_tools: vec![],
+            dropped_tools: vec![dropped.to_string()],
         };
-        let (fold, _last, _completed) = fold_journal(&[(0, ev(1000)), (1, ev(9999))]);
+        let (fold, _last, _completed) = fold_journal(&[(0, ev(1000, "a")), (1, ev(9999, "b"))]);
         assert_eq!(
             fold.context_budgets.get(&eid),
-            Some(&1000),
-            "the FIRST budget wins — a later record must not move a cut already hashed against"
+            Some(&ContextBudget {
+                budget_bytes: 1000,
+                dropped_tools: vec!["a".to_string()],
+            }),
+            "the FIRST record wins WHOLE — a later one must not move a cut already hashed \
+             against, in either of the two fields a replay reproduces it from"
         );
     }
 
@@ -730,19 +745,19 @@ mod tests {
     /// which is a misreading the phrase invites and which compiles. The map is keyed by
     /// `EffectId`, so the latch is PER KEY.
     ///
-    /// **What the key will be, once the executor is wired (SP-7b Task 5): `effect_id(node, 0, 0)`
-    /// — ONE budget per agent NODE, not one per turn.** The `system` half is assembled once,
-    /// before the ReAct turn loop, and is turn-INVARIANT by construction; only `messages` grows
-    /// across turns, and the transcript is explicitly out of this slice's scope (spec §2). So
-    /// re-budgeting per turn would make `system` a function of the transcript and couple the two
-    /// halves the design deliberately separates. The `0` in the key is that decision, not a
+    /// **The key the production emitter uses is `effect_id(node, 0, 0)` — ONE budget per agent
+    /// NODE, not one per turn** (`drive_agent`, `agent.rs`). The `system` half is assembled
+    /// once, above the ReAct turn loop, and is turn-INVARIANT by construction; only `messages`
+    /// grows across turns, and the transcript is explicitly out of this slice's scope (spec §2).
+    /// So re-budgeting per turn would make `system` a function of the transcript and couple the
+    /// two halves the design deliberately separates. The `0` in the key is that decision, not a
     /// placeholder.
     ///
-    /// **Future tense deliberately: as of this commit NO production path emits this event.** An
-    /// earlier revision of this paragraph said an agent node "journals one per TURN" — wrong in
-    /// both tense and substance, and it was mine. A doc describing unbuilt behaviour as current is
-    /// the same defect class as one describing behaviour the code lacks, and this slice has now
-    /// produced five of those.
+    /// This test's own two keys are therefore SIBLING NODES rather than two turns of one node —
+    /// what the per-key latch keeps apart in production is distinct nodes, a `Map`'s children
+    /// and a `Loop`'s iterations. It was named `each_turn_of_one_node_…` before the emitter
+    /// existed, which asserted the design was the opposite of what shipped; renamed rather than
+    /// annotated, since a test name is read far more often than its doc.
     ///
     /// Mutation-verified, and the two guards are complementary rather than nested:
     /// - `if fold.context_budgets.is_empty() { insert(..) }` — a run-global latch — leaves
@@ -756,11 +771,10 @@ mod tests {
     /// than by either alone, because each looks up by the effect id it wrote and so gets
     /// `None`. Neither is uniquely the guard for it.
     #[test]
-    fn each_turn_of_one_node_keeps_its_own_context_budget() {
+    fn each_effect_id_keeps_its_own_context_budget() {
         use orchestrator_core::{EffectId, JournalEvent, NodeId};
-        let node = NodeId("n1".into());
-        let turn = |effect_id: &str, budget_bytes: u64| JournalEvent::ContextBudgeted {
-            node: node.clone(),
+        let row = |node: &str, effect_id: &str, budget_bytes: u64| JournalEvent::ContextBudgeted {
+            node: NodeId(node.into()),
             effect_id: EffectId(effect_id.into()),
             budget_bytes,
             source_window: 4096,
@@ -768,17 +782,24 @@ mod tests {
             dropped_deps: 0,
             dropped_tools: vec![],
         };
-        let (fold, _last, _completed) =
-            fold_journal(&[(0, turn("eid-turn-1", 1000)), (1, turn("eid-turn-2", 9999))]);
+        let (fold, _last, _completed) = fold_journal(&[
+            (0, row("n1", "eid-node-1", 1000)),
+            (1, row("n2", "eid-node-2", 9999)),
+        ]);
         assert_eq!(
-            fold.context_budgets.get(&EffectId("eid-turn-1".into())),
-            Some(&1000),
-            "turn 1's budget, keyed by ITS effect id"
+            fold.context_budgets
+                .get(&EffectId("eid-node-1".into()))
+                .map(|b| b.budget_bytes),
+            Some(1000),
+            "the first node's budget, keyed by ITS effect id"
         );
         assert_eq!(
-            fold.context_budgets.get(&EffectId("eid-turn-2".into())),
-            Some(&9999),
-            "turn 2 is a different effect id, so FIRST-wins must not hand it turn 1's budget"
+            fold.context_budgets
+                .get(&EffectId("eid-node-2".into()))
+                .map(|b| b.budget_bytes),
+            Some(9999),
+            "the second is a different effect id, so FIRST-wins must not hand it the first's \
+             budget"
         );
     }
 
