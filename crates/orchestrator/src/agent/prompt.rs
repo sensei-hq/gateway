@@ -517,6 +517,33 @@ pub struct BudgetPlan {
     pub dropped_tools: Vec<String>,
 }
 
+/// Why [`plan_budget`] could not produce a plan — and, at the call site, WHOSE refusal that is.
+///
+/// The two causes look identical as an `Option::None` and they belong to different components.
+/// Getting that wrong shipped a real defect: every `None` was read as a floor failure, so an
+/// agent whose own 100 000-byte system prompt overran a 4096-token window was told its 100-byte
+/// dependency context had failed a 25% floor, with remedies (shorten the upstream output, split
+/// the node) that could not work — while the SAME agent with no dependencies at all fell through
+/// to the gateway's accurate per-candidate diagnosis.
+///
+/// The rule the two variants encode: **SP-7b refuses only when a cut that FITS exists and
+/// retains too little.** When no cut can fit, the un-cut prompt goes to selection and the
+/// per-candidate `ContextWindowGate` refuses it — which is safe rather than a dispatch of an
+/// over-window request, because the caller reaches this decision only under a guard that the
+/// un-cut prompt already exceeds the chain's LARGEST window, and that is the same predicate the
+/// gate skips on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetRefusal {
+    /// `authored` alone overruns the budget. The authored half is never cut (spec §5.2), so no
+    /// cut this planner can make brings the prompt inside the window: **the GATE's refusal.**
+    AuthoredOverBudget,
+    /// `authored` fits — so a dispatchable prompt exists, at every context size from zero up —
+    /// but none of them retains [`orchestrator_core::CONTEXT_FLOOR_FRACTION`] of the dependency
+    /// bodies, even with every tool schema dropped: **SP-7b's own refusal**, the floor, and the
+    /// reason the floor exists at all.
+    FloorUnreachable,
+}
+
 /// The bytes available to the whole `system` half, from the window and the transcript.
 ///
 /// `window - MIN_OUTPUT_TOKENS - transcript_tokens`, converted to bytes by `× 3`. The `× 3` is
@@ -525,8 +552,18 @@ pub struct BudgetPlan {
 /// over the parts that estimator counts. `MIN_OUTPUT_TOKENS` is reserved so a degraded turn still
 /// has room for a usable reply rather than being cut off mid-sentence.
 ///
-/// `None` when the transcript plus the reserve already fills the window — there is nothing to
-/// budget, and the caller must refuse rather than dispatch a prompt with no room for context.
+/// **The reserve is the ONLY headroom the growing transcript gets, and that is a real limit
+/// rather than an oversight.** A budgeted turn 0 is dispatched at exactly
+/// `window - MIN_OUTPUT_TOKENS` tokens, so a ReAct agent that then calls a tool re-sends
+/// `system` plus an assistant turn plus the tool result and has 256 tokens — 768 bytes — of room
+/// for all of it. Past that every candidate is gated and the run takes the `AllGated` HOTL pause,
+/// AFTER paying for turn 0. Spec §2 excludes the TRANSCRIPT from being budgeted; it does not
+/// promise the transcript any room, and this is where those two facts meet. Pinned by
+/// `a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn` so a change here is a
+/// visible one; a growth allowance is the fix and it needs a number nobody has evidence for yet.
+///
+/// `None` when the transcript plus the reserve already fills the window — no cut can fit, so per
+/// [`BudgetRefusal`] the caller hands the un-cut prompt to the gate rather than refusing here.
 pub fn available_context_bytes(window: u32, transcript_tokens: u32) -> Option<usize> {
     let reserve = u32::try_from(orchestrator_core::MIN_OUTPUT_TOKENS).unwrap_or(u32::MAX);
     let spare = window
@@ -656,16 +693,24 @@ fn context_section_overhead(entries: &[(String, String)]) -> usize {
 /// So a caller must handle a post-render floor failure rather than treating a plan as proof of
 /// fit.
 ///
-/// `None` means the floor cannot be met however many schemas are dropped, and the caller must
-/// refuse.
+/// **This is the FIRST drive's planner only.** A later drive must not re-run it: its answer folds
+/// in [`orchestrator_core::CONTEXT_FLOOR_FRACTION`], [`context_section_overhead`]'s reservation
+/// and [`tool_bytes`], so an edit to any of them would change `dropped_tools` — and therefore
+/// `system` and `tools`, and therefore `agent_input_hash` — under a run whose turn is already
+/// memoized against the old answer. [`replayed_plan`] reproduces the shipped plan from the
+/// journal instead, which keeps a constant the spec intends to re-tune out of the replay path.
+///
+/// `Err` is the refusal, and WHICH refusal is [`BudgetRefusal`]'s subject.
 pub fn plan_budget(
     available_bytes: usize,
     authored_bytes: usize,
     tools: &[ToolDefinition],
     entries: &[(String, String)],
-) -> Option<BudgetPlan> {
+) -> Result<BudgetPlan, BudgetRefusal> {
     // The authored half is never cut (spec §5.2), so it comes off the top.
-    let room = available_bytes.checked_sub(authored_bytes)?;
+    let room = available_bytes
+        .checked_sub(authored_bytes)
+        .ok_or(BudgetRefusal::AuthoredOverBudget)?;
     // The least BODY bytes worth dispatching, and beside it the bytes that never reach a body.
     // Both are derived here rather than taken as arguments so they cannot describe different
     // sections — the point of computing the floor inside the planner is that the drop loop stops
@@ -691,18 +736,104 @@ pub fn plan_budget(
         if let Some(spare) = room.checked_sub(tool_total)
             && spare.saturating_sub(overhead) >= floor
         {
-            return Some(BudgetPlan {
+            return Ok(BudgetPlan {
                 context_budget_bytes: spare,
                 dropped_tools,
             });
         }
         if kept == 0 {
             // Every schema is gone and the floor still does not fit.
-            return None;
+            return Err(BudgetRefusal::FloorUnreachable);
         }
         kept -= 1;
         dropped_tools.push(tools[kept].name.clone());
     }
+}
+
+/// Reproduce a SHIPPED plan from the journal: the schemas the writing drive dropped, verbatim,
+/// and the section budget those schemas imply.
+///
+/// This is what makes the cut a function of journaled state in the strong sense the spec's §4.1
+/// asks for. [`plan_budget`] answers "which schemas SHOULD go", and that answer depends on
+/// [`orchestrator_core::CONTEXT_FLOOR_FRACTION`] — a constant whose own doc says it exists to be
+/// replaced by a measurement once AC10's warn supplies one — plus [`context_section_overhead`]'s
+/// reservation and [`tool_bytes`]. Re-running it on a resume therefore made every in-flight
+/// budgeted run's prompt a function of the binary's arithmetic: re-tune the fraction and
+/// `dropped_tools` moves, `system` and `tools` move with it, `agent_input_hash` stops matching
+/// the memo, and the resume dies `DeterminismViolation` — terminal, and unrevivable because
+/// `force_wake` matches only `status = 'paused'`. The executor's own version fence cannot catch
+/// it: that compares a hand-set string.
+///
+/// So the replay asks a different question — "which schemas DID go" — and the journal already
+/// answers it. What is left in the replay path is the renderer, which is irreducible: both drives
+/// must render the same bytes from the same budget, and that is what
+/// [`render_context_section_measured`] being pure buys.
+///
+/// The section budget is re-derived rather than journaled, and it is derived WITHOUT the floor or
+/// the overhead: `available - authored - Σ tool_bytes(kept)` is the same expression
+/// [`plan_budget`] returns as `spare` on the iteration it accepted, so the two agree by
+/// construction while sharing none of the deciding arithmetic. Pinned by
+/// `a_replayed_plan_reproduces_the_planners_own_answer`.
+///
+/// `None` — which the caller must treat as the same drift `agent_turn_output` would raise one step
+/// later off the memo hash — when the journaled record cannot describe THIS activation list:
+/// - more names dropped than there are schemas, or
+/// - the kept/dropped split does not match the tail of the list (the registry's activation drifted
+///   under the run: a renamed, reordered or removed tool), or
+/// - the budget no longer covers `authored` plus the kept schemas.
+///
+/// The names are checked against the tail rather than merely filtered out by name, and that is the
+/// difference between reproducing a cut and approximating one: [`plan_budget`] drops from the END
+/// of the activation order, so `dropped_tools[i]` must be `tools[n-1-i]`. A list that merely
+/// CONTAINS those names in another order describes a different prompt.
+pub fn replayed_plan(
+    available_bytes: usize,
+    authored_bytes: usize,
+    tools: &[ToolDefinition],
+    dropped_tools: &[String],
+) -> Option<BudgetPlan> {
+    let kept = tools.len().checked_sub(dropped_tools.len())?;
+    // The dropped names must BE the tail, in drop order (last activated first).
+    if !dropped_tools
+        .iter()
+        .zip(tools[kept..].iter().rev())
+        .all(|(name, tool)| name == &tool.name)
+    {
+        return None;
+    }
+    let tool_total: usize = tools[..kept].iter().map(tool_bytes).sum();
+    let context_budget_bytes = available_bytes
+        .checked_sub(authored_bytes)?
+        .checked_sub(tool_total)?;
+    Some(BudgetPlan {
+        context_budget_bytes,
+        dropped_tools: dropped_tools.to_vec(),
+    })
+}
+
+/// The transcript's own token weight, priced by the gateway's ONE estimator over a payload
+/// carrying the messages and NOTHING else.
+///
+/// [`available_context_bytes`] takes this figure and the window and returns the bytes the whole
+/// `system` half may use, so the decomposition has to be exact: the sum this subtracts from the
+/// window must be the same sum the estimator will charge for those messages inside the real
+/// payload. It is a function here, rather than a probe built at the call site, so the test that
+/// checks the decomposition across the crate boundary
+/// (`the_byte_budget_is_the_gateway_estimators_own_arithmetic`) measures the PRODUCTION
+/// probe rather than a copy of it.
+///
+/// Pure: `estimate_input_tokens_pessimistic` is a `match` over the payload with no clock, env or
+/// state, which is what lets §4.2's purity argument survive this import.
+pub fn transcript_estimate(messages: &[kernel::types::request::Message]) -> u32 {
+    gateway::estimate_input_tokens_pessimistic(&kernel::types::request::Payload::Chat {
+        messages: messages.to_vec(),
+        // Both empty, because this figure is the COMPLEMENT of the half being budgeted: the
+        // `system` string and the tool schemas are what `available_context_bytes` is sizing.
+        system: None,
+        max_tokens: None,
+        temperature: None,
+        tools: Vec::new(),
+    })
 }
 
 /// The minimum retained body bytes for a turn to be worth dispatching.
@@ -1246,24 +1377,123 @@ mod tests {
         );
     }
 
-    /// `None` is the refusal, and it is reachable two ways.
+    /// The refusal is reachable two ways, and **which way decides WHOSE refusal it is.**
     ///
-    /// Neither path had a test. The first is the floor losing outright — every schema dropped
-    /// and the remaining room still under the floor — which is the input that must reach the
-    /// HOTL pause rather than a dispatch. The second is `authored` alone overrunning the window:
-    /// the authored half is never cut (spec §5.2), so there is no degradation available and the
-    /// only honest answer is to refuse.
+    /// The two causes were an `Option::None` apiece and the call site read every one of them as
+    /// a floor failure. That shipped a real defect: an agent whose own 100 000-byte system
+    /// prompt overran a 4096-token window was told its 100-byte dependency context had failed a
+    /// 25% floor, with remedies that could not work — and the SAME agent with no dependencies
+    /// fell through to the gateway's accurate per-candidate diagnosis instead, so the diagnosis
+    /// was non-monotonic in the dependency size. `BudgetRefusal` is what the call site now keys
+    /// on; this test is what holds the two apart.
+    ///
+    /// `FloorUnreachable` ⇒ `requested > 0` is asserted here rather than argued in prose,
+    /// because the floor pause's message depends on it: `floor_bytes(0) == 0` and the fit check
+    /// clears a zero floor at `kept == 0`, so a dependency-free turn can only ever refuse as
+    /// `AuthoredOverBudget`. That is what makes "only 0 survive" honest in the pause.
     #[test]
     fn the_planner_refuses_when_the_floor_cannot_be_met_at_all() {
         let tools = vec![tool_def("heavy", 500)];
         let entries = vec![("A".to_string(), "z".repeat(4_000))];
-        assert!(
-            plan_budget(100, 0, &tools, &entries).is_none(),
-            "dropping every schema still leaves less than the floor"
+        assert_eq!(
+            plan_budget(100, 0, &tools, &entries),
+            Err(BudgetRefusal::FloorUnreachable),
+            "dropping every schema still leaves less than the floor — SP-7b's own refusal, \
+             because a FITTING cut exists at every context size and none retains enough"
+        );
+        assert_eq!(
+            plan_budget(100, 900, &[], &[]),
+            Err(BudgetRefusal::AuthoredOverBudget),
+            "the authored half alone overruns the window and is never cut, so no cut fits and \
+             the refusal belongs to the per-candidate gate"
+        );
+        assert_eq!(
+            plan_budget(100, 900, &tools, &entries),
+            Err(BudgetRefusal::AuthoredOverBudget),
+            "authored is subtracted FIRST, so it outranks the floor: a dependency context \
+             beside an over-budget authored half must not be reported as a floor failure"
         );
         assert!(
-            plan_budget(100, 900, &[], &[]).is_none(),
-            "the authored half alone overruns the window, and it is never cut"
+            plan_budget(100, 0, &tools, &[]).is_ok(),
+            "and a dependency-free turn is never a FLOOR refusal — `floor_bytes(0) == 0`, so \
+             `FloorUnreachable` implies `requested > 0`, which is what lets the floor pause \
+             name a non-zero requested figure"
+        );
+    }
+
+    /// A replayed plan reproduces the PLANNER's answer without re-running the planner.
+    ///
+    /// The equivalence is the whole contract: for the inputs the writing drive had,
+    /// `replayed_plan(available, authored, tools, plan.dropped_tools)` must equal
+    /// `plan_budget(available, authored, tools, entries)` — while sharing NONE of the deciding
+    /// arithmetic. `replayed_plan` never touches `CONTEXT_FLOOR_FRACTION`,
+    /// `context_section_overhead` or the `entries` at all, which is why a re-tune of the
+    /// fraction can no longer change the prompt of a run whose turn is already memoized.
+    ///
+    /// The second assertion is the half that makes the first non-trivial: fed a record that
+    /// dropped NOTHING at the same `available` the planner refused to keep everything at, the
+    /// replay keeps everything. A `replayed_plan` that quietly re-consulted the floor could not
+    /// do that.
+    ///
+    /// The drift cases return `None` — the caller raises the same `DeterminismViolation` the
+    /// memo hash would raise one step later — and the ORDER case is the one that says why the
+    /// names are checked against the tail rather than filtered out: `plan_budget` drops from the
+    /// END of the activation order, so `["beta", "gamma"]` describes a prompt this list cannot
+    /// produce. Mutation: replace the tail check with `dropped.contains(&t.name)` filtering and
+    /// the order case starts returning a plan.
+    #[test]
+    fn a_replayed_plan_reproduces_the_planners_own_answer() {
+        let tools = vec![
+            tool_def("alpha", 300),
+            tool_def("beta", 300),
+            tool_def("gamma", 300),
+        ];
+        let body = (500.0 / orchestrator_core::CONTEXT_FLOOR_FRACTION) as usize;
+        let entries = vec![("A".to_string(), "z".repeat(body))];
+        let plan = plan_budget(900, 0, &tools, &entries).expect("above the floor");
+        assert_eq!(
+            plan.dropped_tools,
+            vec!["gamma".to_string(), "beta".to_string()],
+            "the premise: the planner really did drop two schemas here"
+        );
+        assert_eq!(
+            replayed_plan(900, 0, &tools, &plan.dropped_tools),
+            Some(plan.clone()),
+            "and the replay reproduces that plan EXACTLY, from the journal's `dropped_tools` \
+             plus `available` — no floor, no overhead, no entries"
+        );
+        assert_eq!(
+            replayed_plan(900, 0, &tools, &[]).map(|p| p.context_budget_bytes),
+            Some(0),
+            "fed a record that dropped nothing, it keeps all three schemas — 900 available \
+             less 3 × 300 — rather than re-deciding that the floor needs the room"
+        );
+        assert_eq!(
+            replayed_plan(900, 0, &tools, &["beta".into(), "gamma".into()]),
+            None,
+            "the drop order is load-bearing: schemas go from the END, so this record does not \
+             describe any prompt this activation list can produce"
+        );
+        assert_eq!(
+            replayed_plan(900, 0, &tools, &["alpha".into()]),
+            None,
+            "nor does one naming a schema that is not the last"
+        );
+        assert_eq!(
+            replayed_plan(
+                900,
+                0,
+                &tools,
+                &["d".into(), "c".into(), "b".into(), "a".into()]
+            ),
+            None,
+            "nor one dropping more schemas than the agent activates"
+        );
+        assert_eq!(
+            replayed_plan(100, 900, &[], &[]),
+            None,
+            "and a budget that no longer covers the authored half is drift too — the authored \
+             text changed under the run"
         );
     }
 
@@ -1333,7 +1563,7 @@ mod tests {
                 (requested as f64 * orchestrator_core::CONTEXT_FLOOR_FRACTION).ceil() as usize;
             let mut approvals = 0usize;
             for available in floor..floor + 400 {
-                let Some(plan) = plan_budget(available, 0, &[], &entries) else {
+                let Ok(plan) = plan_budget(available, 0, &[], &entries) else {
                     continue;
                 };
                 approvals += 1;
@@ -1413,6 +1643,33 @@ mod tests {
     /// It does NOT pin a drift smaller than the estimator's own rounding: `div_ceil(3)` maps
     /// three byte counts to one token, so a mirror one or two bytes light is invisible here. A
     /// tools term that gained or lost a whole field is not.
+    ///
+    /// # The second case pins the DECOMPOSITION, and only a specific class of drift can break it
+    ///
+    /// The plan's own self-review flagged that the transcript term — `transcript_estimate`, a
+    /// payload carrying the messages and nothing else — was "a reasonable decomposition of the
+    /// estimator's sum but NOT verified against `estimate_input_tokens_pessimistic`'s exact
+    /// arithmetic". The second case verifies it, through the PRODUCTION function rather than a
+    /// copy of the probe: measure the transcript, take it off the window, size the whole
+    /// `system` half to what is left, and the full payload must price at exactly
+    /// `window - MIN_OUTPUT_TOKENS`.
+    ///
+    /// What it catches is worth stating exactly, because the reviewer's stated hazard — "add a
+    /// per-message overhead term or count `Message.attachments` and `transcript` becomes an
+    /// under-estimate" — turns out NOT to be one, and asserting it here would have been a fifth
+    /// false claim. `est(3T + rest) == T + est(rest)` for any `rest`, so a term the estimator
+    /// charges over the MESSAGES is charged in the probe AND in the payload and CANCELS. That
+    /// holds whether the term is in chars or added in tokens after the division: verified by
+    /// mutation — `+ messages.len()` on the estimator's return leaves BOTH cases green.
+    ///
+    /// What it does catch is a DISAGREEMENT between [`transcript_estimate`] and what the
+    /// estimator charges those same messages inside the real payload, in either direction. The
+    /// equality is two-sided and the `system` half is sized FROM the transcript figure, so a
+    /// probe `δ` tokens light leaves the payload pricing `δ` over the window and one `δ` heavy
+    /// leaves it `δ` under. Mutation-verified: a `transcript_estimate` one token light reddens
+    /// this case with `3841` against `3840` and leaves the first one green, because that one has
+    /// no transcript to measure. That disagreement is exactly what the plan's self-review asked
+    /// to be verified, and it is the failure that would silently overflow a real window.
     #[test]
     fn the_byte_budget_is_the_gateway_estimators_own_arithmetic() {
         let window = 4_096u32;
@@ -1444,6 +1701,44 @@ mod tests {
             gateway::estimate_input_tokens_pessimistic(&payload),
             spare_tokens,
             "one budget's worth of bytes must price at exactly the tokens it was budgeted from"
+        );
+
+        // The decomposition, with a real transcript: exactly what `drive_agent` does.
+        let messages = vec![
+            kernel::types::request::Message::text(
+                kernel::types::request::MessageRole::User,
+                "summarize the attached brief in two paragraphs",
+            ),
+            kernel::types::request::Message::text(
+                kernel::types::request::MessageRole::Assistant,
+                "which section should I start from?",
+            ),
+        ];
+        let measured_transcript = transcript_estimate(&messages);
+        assert!(
+            measured_transcript > 0,
+            "the case is vacuous with an empty transcript — that is the FIRST case"
+        );
+        let budget = available_context_bytes(window, measured_transcript).expect("room to budget");
+        let tool = ToolDefinition {
+            name: "fs_read".to_string(),
+            description: Some("Read a file from the run's workspace".to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+        };
+        let payload = kernel::types::request::Payload::Chat {
+            messages,
+            system: Some("s".repeat(budget - tool_bytes(&tool))),
+            max_tokens: None,
+            temperature: None,
+            tools: vec![tool],
+        };
+        assert_eq!(
+            gateway::estimate_input_tokens_pessimistic(&payload),
+            window - u32::try_from(orchestrator_core::MIN_OUTPUT_TOKENS).expect("small"),
+            "the transcript measured by `transcript_estimate`, taken off the window by \
+             `available_context_bytes`, and the `system` half filled to the result must \
+             price at exactly the window less the output reserve — the identity the \
+             executor's budget rests on"
         );
     }
 
