@@ -395,6 +395,27 @@ pub(crate) fn fold_journal(
             JournalEvent::BudgetRaised { new_total_tokens } => {
                 fold.budget = Some(*new_total_tokens);
             }
+            // SP-7b: the `## Context` byte budget a turn was cut to. FIRST wins —
+            // `entry().or_insert()`, NOT `insert`. A budget a later record could move is not
+            // a fence: the determinism argument is that drive 2 reproduces drive 1's cut, and
+            // LAST-wins would let a second record shift a cut a completed turn was already
+            // hashed against. The two nearest templates in this same function — `expansions`
+            // (`PlanExpanded`) and `selections` (`PlannerSelected`) — are both LAST-wins, so
+            // this one token is the whole difference from the code most likely to be copied
+            // here, and both spellings compile.
+            //
+            // Also an EXPLICIT arm rather than the `_` catch-all below, for the same reason as
+            // the two SP-DATA-5 arms above: an unfolded budget compiles, runs, and silently
+            // makes every resume recompute the cut from a live window.
+            JournalEvent::ContextBudgeted {
+                effect_id,
+                budget_bytes,
+                ..
+            } => {
+                fold.context_budgets
+                    .entry(effect_id.clone())
+                    .or_insert(*budget_bytes);
+            }
             _ => {}
         }
     }
@@ -668,6 +689,39 @@ pub(crate) fn classify_gateway_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SP-7b AC6 — `ContextBudgeted` folds FIRST-wins.
+    ///
+    /// A budget a later event can rewrite is not a fence. The whole determinism argument is
+    /// that drive 2 reproduces drive 1's cut, and LAST-wins would let a second record move a
+    /// cut a completed turn was already hashed against — which surfaces as a
+    /// `DeterminismViolation` on a resume, not as a wrong answer here.
+    ///
+    /// The hazard this guard exists for is that the two nearest templates in `fold_journal`
+    /// itself — `fold.expansions` (`PlanExpanded`) and `fold.selections` (`PlannerSelected`)
+    /// — are both LAST-wins `insert`, so the correct discipline is ONE TOKEN away from the
+    /// code most likely to be copied, and both spellings compile. Mutation-verified: with
+    /// `.entry(..).or_insert(..)` replaced by `.insert(..)` this fails with `Some(9999)`.
+    #[test]
+    fn the_first_context_budget_wins() {
+        use orchestrator_core::{EffectId, JournalEvent, NodeId};
+        let eid = EffectId("eid-1".into());
+        let ev = |budget_bytes: u64| JournalEvent::ContextBudgeted {
+            node: NodeId("n1".into()),
+            effect_id: eid.clone(),
+            budget_bytes,
+            source_window: 4096,
+            retained_bytes: 0,
+            dropped_deps: 0,
+            dropped_tools: vec![],
+        };
+        let (fold, _last, _completed) = fold_journal(&[(0, ev(1000)), (1, ev(9999))]);
+        assert_eq!(
+            fold.context_budgets.get(&eid),
+            Some(&1000),
+            "the FIRST budget wins — a later record must not move a cut already hashed against"
+        );
+    }
 
     #[test]
     fn fold_journal_captures_plan_expansions() {

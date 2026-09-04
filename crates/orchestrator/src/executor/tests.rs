@@ -2702,6 +2702,16 @@ fn label(event: &JournalEvent) -> String {
         // workspace — `fold_journal`'s included — carries a `_` catch-all and would have
         // absorbed it silently.
         JournalEvent::LoopGateSettled { node, .. } => format!("LoopGateSettled({})", node.0),
+        // A fifth time, and this one was found DELIBERATELY rather than by the compiler
+        // complaining, because `cargo build --workspace` compiles neither this file nor this
+        // arm: SP-7b's `ContextBudgeted` was added, `cargo build --workspace` exited 0, and
+        // `cargo check --workspace --all-targets` exited 101 with this single `E0004`. The
+        // Node only, no `budget_bytes`: this helper's contract is "kind + node, without
+        // matching payloads", and a label carrying the budget would make every exact-sequence
+        // assertion in the slice depend on the cut arithmetic. What a sequence needs to show
+        // is that the event is there and WHERE — a test that cares about the number reads the
+        // event itself.
+        JournalEvent::ContextBudgeted { node, .. } => format!("ContextBudgeted({})", node.0),
     }
 }
 
