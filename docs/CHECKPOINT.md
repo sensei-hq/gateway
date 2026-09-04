@@ -1,36 +1,39 @@
 # Checkpoint
 
-**SP-7a serving-window bound: shipped, then REVIEWED. 5 of 6 findings fixed on `develop`
-(`9bda14d` code, `becbf17` docs). ONE open decision for Jerry — the M1 reversal.** Review
-range `cbb8854..b91403b`, five lenses; security and test-quality clean.
+**SP-7a serving-window bound: REVIEWED and all 6 findings CLOSED on `develop`.** Review range
+`cbb8854..b91403b`, five lenses; security and test-quality clean. Nothing open from it.
 
 ## Done — the review fixes
 
-The refusal's remedy was false the same way twice. "Put a model with a larger window in
-this chain" cannot clear it: the term is `min { w : w >= est }` and adding to a set cannot
-RAISE its minimum — one prompt down `{4096}` and `{4096, 200 000}` gives byte-identical
-refusals. It now names the guaranteed remedy (remove/replace that entry), and a TIE names
-`max_output_tokens` as co-cause. Cap-independence went unpinned when the two-cap drive
-moved to the gate path — two mutations passed all 427 tests. Docs: the overview's
+`9bda14d` The refusal's remedy was false the same way twice. "Put a model with a larger
+window in this chain" cannot clear it: the term is `min { w : w >= est }` and adding to a
+set cannot RAISE its minimum — one prompt down `{4096}` and `{4096, 200 000}` gives
+byte-identical refusals. It now names the guaranteed remedy, and a TIE names
+`max_output_tokens` as co-cause. Cap-independence went unpinned when the two-cap drive moved
+to the gate path — two mutations passed all 427 tests. `becbf17` Docs: the overview's
 "bias-flip is GONE" was a non-sequitur (bytes ≥ chars ⇏ ≥ true tokens) contradicting
-`dispatch.rs`; the module README kept the chain-minimum formula; SP-7a's spec+plan cited a
-renamed test — and that dead citation was what hid the unpinned property.
+`dispatch.rs`; the module README kept the chain-minimum formula; a renamed test's dead
+citation was what hid the unpinned property.
+
+`64325f1` **M1 REVERSED — Jerry's call.** An `AllGated { resume_after: None }` carrying a
+`human_action` is now the indefinite HOTL pause, not a `NodeFailed`; `None` with no action
+still fails. The serving-window slice had made a budgeted over-window run terminal, and
+nothing revives a terminal run (`force_wake` matches `status='paused'`; `wake` says "not
+queued"; `submit` refuses the id) — memos and spend were reachable only by hand SQL. Not
+window-specific: an auth lockout produced the same state. `dfe33d0` records it on all ten
+doc surfaces that stated the old rule, M1 itself carrying the argument.
 
 ## Verified
 
-`cargo test --workspace` **1720 passed / 0 failed / 56 ignored, exit 0** (1718 + 2) ·
-`clippy --all-targets -D warnings` 0 · `fmt --check` 0 · `cargo doc` private-item
-unresolved links **16 = baseline**, none in the changed items.
+`cargo test --workspace` **1721 passed / 0 failed / 56 ignored, exit 0** · `clippy
+--all-targets -D warnings` 0 · `fmt --check` 0 · `cargo doc` private-item unresolved links
+**16 = baseline**. Every new test mutation-verified; the M1 arm reddens both new tests when
+it pauses with a deadline instead of NULL.
 
-## Next — Jerry's call, then push
+## Next
 
-**The M1 question.** A budgeted over-window run is now TERMINAL and unrecoverable:
-`min_serving_context_window` → `None` → gate skips all → `AllGated{resume_after: None}` →
-`classify_gateway_error` = `Fail` → `record_terminal(Failed)`. `force_wake` is
-`where status='paused'`, `torii run wake` says "not queued" — recovery needs hand-written
-SQL. `cbb8854` kept a force-wakeable `RunPaused{resume_after: None}` here deliberately and
-I traded it away. The fix (pause when `AllGated` carries a `human_action`) REVERSES risk M1
-in `docs/design/selection-policy-pipeline.md` and changes every all-gated terminal case.
+`git push origin develop`, then SP-7b (context budgeting — truncation rewrites
+`agent_input_hash`, needing a resume story 7a did not), then SP-7c.
 
 ## Open
 
