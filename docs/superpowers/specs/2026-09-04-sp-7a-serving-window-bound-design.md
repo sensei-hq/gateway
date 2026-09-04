@@ -80,13 +80,39 @@ rejected — this version at least degrades to *over*-bounding rather than under
 ## 5. What the operator sees, and what changes about it
 
 `BelowFloor` carries `window: Option<u32>`, and its doc says a `Some` means the refusal "cannot be
-cleared by any cap at all". That was true when the term was the chain minimum, and it is **false**
-after this change: a window that binds now means the request fits *some* model and the reply will
-simply be short.
+cleared by any cap at all (the window term is `min_context_window(chain) − est`, which never reads
+the cap)".
 
-So the wording is rewritten rather than rewired. A window-bound clamp is no longer a dead end, and
-the message must not tell an operator it is. Where the request genuinely fits nothing, the message
-comes from `AllGated` instead and names each candidate's window.
+So the wording is rewritten rather than rewired. A window that BINDS THE CEILING is no longer a
+dead end — it now usually just means a shorter reply, and the run proceeds. Where the request
+genuinely fits nothing, the message comes from `AllGated` instead and names each candidate's window.
+
+### Correction, made during implementation
+
+This section originally said the "cannot be cleared by any cap" claim becomes **false** after the
+change, and AC8 was written from that. Checked against the code, it does not:
+
+- The window term is floor-checked at `ceiling < MIN_OUTPUT_TOKENS`, and `ceiling` is
+  `min(min_max_output_tokens, window_term)`. Neither reads the cap. So a `BelowFloor` carrying
+  `window: Some(_)` still arrives identically at a cap of 1e6 and at `u64::MAX`.
+- What the section is really describing — "a window that binds means the reply will simply be
+  short" — is the case where the window term binds the ceiling *above* the floor. That path emits a
+  smaller `max_tokens` and never reaches this message at all.
+
+What IS false after the change, and what the rewrite therefore fixes:
+
+1. the parenthetical naming `min_context_window(chain) − est`, which is no longer the term;
+2. "the chain's smallest context window of {window}" in the operator message — it is now the
+   smallest window that can HOLD the input;
+3. the remedy "route to a chain whose smallest model has a larger window", which on a heterogeneous
+   chain points at a model already filtered out of the decision;
+4. the implicature that a `Some` means the prompt does not fit. It now means the opposite: the
+   prompt fits (`w >= est` by construction) and the shortfall is OUTPUT room. The fits-nothing case
+   has moved to the gate.
+
+**AC8 is amended accordingly** (see §6). Deleting the cap sentence outright would have shipped a
+new false comment in place of an old one, and would have cost an operator a manual
+`BudgetRaised` + `force_wake` round trip to rediscover it.
 
 ## 6. Acceptance criteria
 
@@ -101,8 +127,11 @@ comes from `AllGated` instead and names each candidate's window.
 6. An unbudgeted run is byte-identical — the clamp does not run.
 7. A homogeneous chain (all windows equal) behaves exactly as before, since `min(S) == min(chain)`
    whenever every entry qualifies.
-8. `BelowFloor`'s window wording no longer claims the refusal cannot be cleared by any cap, and no
-   test asserts the old wording.
+8. `BelowFloor`'s window wording no longer describes the bound as the CHAIN's smallest window, no
+   longer offers "route to a chain whose smallest model has a larger window", and states that the
+   input FITS the window it names; no test asserts the old wording. **Amended** from "no longer
+   claims the refusal cannot be cleared by any cap" — see §5's correction: that claim is still
+   true, and the message keeps it.
 9. The output-limit term (`min_max_output_tokens`) still applies independently — a serving window
    larger than the model's output limit does not widen `max_tokens`.
 
@@ -112,4 +141,22 @@ comes from `AllGated` instead and names each candidate's window.
   §8; this slice makes the gap smaller but does not close it).
 - SP-7b context budgeting, SP-7c semantic activation, the M1 reversal.
 - Teaching the gate and the clamp to share one estimate value rather than each computing its own —
-  they agree today because both use the pessimistic estimator, but nothing enforces it.
+  they agree today because both use the pessimistic estimator, but nothing enforces it. They do at
+  least agree in the safe DIRECTION: the gateway's estimator adds tool schemas the clamp's omits, so
+  the gate's figure is never smaller, and a request the clamp thinks nothing can serve is one the
+  gate skips too.
+- Deleting `Gateway::min_context_window`. The clamp was its last production caller, so it now has
+  none. Kept deliberately: it is a `pub` read accessor on a library type, removing it is a breaking
+  change for no gain, and its own test asserts the number the serving bound stopped using — which
+  is how a silent revert to the chain minimum stays visible. Its doc says all of this so the next
+  reader does not have to re-derive it.
+
+## 8. What changed for an operator, in one line
+
+A budgeted run's over-window failure used to be a durable `RunPaused { resume_after: None }`
+carrying budget wording; on a prompt nothing in the chain can serve it is now a terminal
+`NodeFailed` carrying the gate's per-candidate diagnosis and `HumanAction::UseLargerContextWindow`.
+That is a recoverable outcome traded for a terminal one, and it is the right trade because the
+pause was preserving a run against a remedy it could not name — `torii run wake --budget-tokens N`
+has never made a prompt fit a window. Recorded here because it is the one user-visible regression
+in the slice.
