@@ -27,6 +27,11 @@ pub use kernel::registry;
 pub use config::GatewayBuilder;
 pub use consensus::ConsensusResult;
 pub use engine::Gateway;
+/// The pessimistic input-token estimate the `ContextWindowGate` judges fit by, exported
+/// so the orchestrator's budget clamp can bound `max_tokens` on the SAME number rather
+/// than a second one of its own. See the function's doc for the defect that made this
+/// worth a public surface.
+pub use engine::estimate_input_tokens_pessimistic;
 pub use facade::{Facade, FacadeBuilder};
 pub use panel::{PanelResponse, PanelSlotResult};
 pub use pruning::{Availability, ChainWarning, prune_unavailable};

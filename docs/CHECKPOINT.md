@@ -1,39 +1,39 @@
 # Checkpoint
 
-**SP-7a (window-aware selection) — COMPLETE. All seven tasks done, on `develop`, unpushed.**
+**SP-7a serving-window bound: COMPLETE on `develop`, release gate GREEN, not pushed.**
+Spec `docs/superpowers/specs/2026-09-04-sp-7a-serving-window-bound-design.md` (10 ACs).
 
-## What shipped
+## Done
 
-`ContextWindowGate` — the sixth `AdmissionGate`, registered LAST — asks the window question PER
-CANDIDATE, so `[128k, 8k]` serves a 20k prompt instead of refusing it against the chain minimum. Over
-EVERY window is an `AllGated` naming each candidate's window, the estimate and
-`HumanAction::UseLargerContextWindow`: refused, never truncated. `PromptOverBudget`, `over_budget`,
-`est_prompt_tokens`, `est_tokens` gone; when BUDGETED the clamp still refuses before selection.
+The clamp's window term is `min_serving_context_window(chain, est) − est` — the minimum over
+exactly the set `ContextWindowGate` admits — so a budgeted `[big 128k, small 8k]` run now serves a
+20k prompt on `big`, where the chain minimum gave `8192 − 20000 → 0` and refused before the gate
+ran. `None` (nothing can hold it) ⇒ NO window term; the GATE refuses, naming every candidate. One
+`est`: the clamp calls the gateway's `estimate_input_tokens_pessimistic` on the payload it
+dispatches, and both orchestrator estimators are deleted.
 
-**Task 7 = the gate + the sweep.** `orchestrator-overview.md` now records SP-7a shipped and SP-7 as
-three slices (a selection / b context budgeting / c semantic activation), split because 7a changes
-WHICH MODEL serves a prompt and not one byte of it while `agent_input_hash` hashes
-`{chain, system, messages, tools}` — 7b's truncation moves that key, 7a does not. Plus 3 slice-table
-rows and 2 stale claims (`README.md`'s "per-turn window budget"; the Gherkin "smallest model").
+Release gate = verification + the doc sweep, which found the SP-DATA-5 clamp spec described **no
+window term at all** (it arrived in that slice's own review, after the spec) and its §8 lacked the
+"bound by the SELECTED candidate" residual FIVE other files cite as living there. Both fixed; §5.2
+states both ceiling terms, §5.3 that its estimator is deleted. Overview: the `max_tokens` formula,
+the `chars/3` bias-flip (gone — bytes now), line 230. Two code comments named `min_context_window`
+as the live window half; the output accessor now says WHY it cannot narrow to a serving subset.
 
-## Verified — real exit codes
+## Verified
 
-`cargo test --workspace` **1714 passed / 0 failed / 56 ignored, exit 0** (35 suites) · `clippy
---workspace --all-targets -- -D warnings` **0** · `fmt --all --check` **0** · `cargo doc` unresolved
-links **16 = baseline**. No container started; `$DATABASE_URL` never read.
+`cargo test --workspace` **1718 passed / 0 failed / 56 ignored, exit 0** · `clippy --all-targets -D
+warnings` 0 · `fmt --check` 0 · `cargo doc` unresolved links **16 = baseline**, no new breakage.
 
-## Known-broken — one PRE-EXISTING flake, not this slice
+## Next
 
-`executor::tests::both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` failed 1 of 4
-full-workspace runs (`under-estimated` warn uncaptured; the `clamp bit` info beside it captured).
-Only a doc comment changed in Rust this round. ~17 tests hit that `tracing::warn!` callsite with no
-subscriber on their thread and one asserts it ⇒ thread-local `set_default` racing the global
-callsite-`Interest` cache. Green 6/6 isolated, 20/20 loaded, 1-threaded — no red-first repro, so
-reported not patched; likely fix `rebuild_interest_cache()` after `set_default`.
+`git push origin develop`, then re-review, then SP-7b (context budgeting — truncation rewrites
+`agent_input_hash`, needing a resume story 7a did not), SP-7c, the M1 reversal.
 
-## Next command
+## Known-broken / open
 
-`git push origin develop` (the coordinator pushes), then the `develop` → `main` PR — merge
-`origin/main` into `develop` FIRST or the strict ruleset leaves it BEHIND. Deferred (spec §8): bound
-the clamp by the SELECTED candidate's window (AC1 when budgeted); TTS/image/video input bounds; an
-`Embed` AGGREGATE limit. **Sensei daemon is down, so this file is the only durable record.**
+One OPEN flake: `both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` failed ONCE.
+Its diagnosis — thread-local `set_default` racing the global callsite `Interest` cache — is
+**DISPROVEN by three probes**, so no fix shipped rather than a cargo-culted one; the panic now
+dumps every captured record, so the next occurrence distinguishes "never emitted" from "the
+capture missed it". Deferred: a sub-floor `min_max_output_tokens` renders as the BUDGET arm (§7).
+**Sensei daemon is NOT running — this file is the only durable record.**

@@ -32,9 +32,7 @@
 //! Map child's `MapChildPaused`).
 
 use gateway::GatewayError;
-use kernel::types::request::{
-    InferenceRequest, InferenceResponse, Message, Payload, ToolDefinition,
-};
+use kernel::types::request::{InferenceRequest, InferenceResponse, Payload};
 use orchestrator_core::{JournalEvent, NodeId, OrchestratorError, RunId};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -144,69 +142,63 @@ impl<'a> Meter<'a> {
     }
 }
 
-/// The pessimistic input estimate for the budget clamp: the system prompt, every
-/// message body, every assistant turn's tool CALLS, and the tool schemas.
-///
-/// # What is counted, and what is not
-///
-/// Tool schemas are counted rather than waved off as small for two reasons. They are pure
-/// JSON, which is the worst case for a chars-per-token heuristic and the reason
-/// [`est_tokens_pessimistic`](crate::agent::prompt::est_tokens_pessimistic) exists at all;
-/// and an agent's activated schemas routinely outweigh its prompt. The deleted
-/// `over_budget` counted them for the same reason and was the reference this mirrored —
-/// including its treatment of `description` as optional. Its successor,
-/// `gateway::engine::util::estimate_input_tokens_pessimistic`, counts them too.
-///
-/// A message's `tool_calls` are counted for a plainer reason: they are SENT. The ReAct
-/// loop appends an assistant turn carrying them on every turn (`agent.rs`) and re-sends
-/// the whole transcript on every turn after that; `anthropic/convert.rs` renders each as
-/// a `ToolUse` block and `openai_compat/convert.rs` as a `tool_calls` array. Those turns
-/// have an EMPTY `content`, so counting only `as_text()` priced a serialized plan or an
-/// `fs_write` body — the largest payloads the loop produces — at zero, which under-counts
-/// in the one direction this function must not: `allowance = remaining − est`, so an
-/// estimate that is too low leaves an allowance that is too high.
-///
-/// `attachments` are NOT counted, and this is not an oversight to be silent about: the
-/// orchestrator never populates them (`agent.rs:469` and this module's own builder both
-/// pass `Vec::new()`), so counting them would be dead arithmetic. A producer that starts
-/// attaching media owes this function a term, and there is no way for it to find out
-/// except by reading this paragraph.
-///
-/// # Why the window question has its own estimator, and it is not the reason this comment
-/// # used to give
-///
-/// It used to read: "deliberately NOT shared with `over_budget`/`est_prompt_tokens`: those
-/// answer 'will this fit the context window', which wants to avoid false alarms and so
-/// wants the opposite bias … `over_budget` has the same `tool_calls` gap and keeps it".
-/// Every clause of that is now wrong. SP-7a DELETED both functions along with the halt
-/// they served, so the reference points at nothing; and their successor,
-/// `gateway::engine::util::estimate_input_tokens_pessimistic`, wants the SAME bias this
-/// one does, not the opposite — it counts `tool_calls` and tool schemas, and it divides by
-/// 3. An over-count there refuses a fit that would have worked, which is cheaper than the
-/// provider 400 an under-count buys, exactly as an over-count here is cheaper than
-/// overshooting the cap.
-///
-/// So the two are separate for a structural reason rather than a behavioural one: the
-/// gateway crate cannot depend on the orchestrator (the dependency runs the other way),
-/// which that function's own doc states. They also measure in different units — bytes
-/// there, characters here — and over different inputs (a whole `Payload` there, a `&str`
-/// at a time here). Both err high; neither is a real tokenizer.
-fn est_input_tokens(system: Option<&str>, messages: &[Message], tools: &[ToolDefinition]) -> u64 {
-    let est = |s: &str| crate::agent::prompt::est_tokens_pessimistic(s) as u64;
-    let mut total = system.map_or(0, est);
-    for m in messages {
-        total += est(m.content.as_text());
-        for call in &m.tool_calls {
-            total += est(&call.name) + est(&call.arguments);
-        }
-    }
-    for t in tools {
-        total += est(&t.name)
-            + t.description.as_deref().map_or(0, est)
-            + est(&t.input_schema.to_string());
-    }
-    total
-}
+// `est_input_tokens(system, messages, tools)` lived here until the serving-window
+// review. It was the budget clamp's own pessimistic input estimate — the same parts the
+// gateway's `estimate_input_tokens_pessimistic` counts (system prompt, every message
+// body, every assistant turn's tool CALLS, every tool's name/description/schema), the
+// same `/3` divisor, and `attachments` omitted from both because no orchestrator
+// producer populates them.
+//
+// It is deleted rather than aligned, and the clamp now calls
+// `gateway::estimate_input_tokens_pessimistic` on the very `Payload` it is about to
+// dispatch. The reason is not tidiness — it is that the two functions were not the same
+// number, and the serving-window bound's soundness is a statement about the SET
+// `{ m : m.context_window >= est }` being the set selection draws from, which is only
+// true if both halves say `est`.
+//
+// They did not. This one applied `ceil` PER STRING and summed; the gateway's sums the
+// byte lengths of every string and applies `ceil` ONCE. On ASCII `Σ ceil(Lᵢ/3) >=
+// ceil(Σ Lᵢ/3)`, so this figure was the LARGER one — 4200 against 3800 on the
+// 600-message payload the tests below use, and 60 against 59 on this repo's own
+// `tool_agent_registry` fixture as the review measured it — and the clamp's serving set
+// was a strict SUBSET of the gate's admitted set.
+// Two reachable consequences, both a provider 400 (`prompt + max_tokens >
+// context_window`) arriving as a terminal `NodeFailed` on a budgeted run where the
+// identical UNBUDGETED call succeeds, since `max_tokens: None` is omitted from the wire:
+//
+// - the subset is EMPTY while the gate's is not ⇒ no window term at all ⇒ `max_tokens`
+//   bounded only by the output limit (`the_clamp_bounds_max_tokens_by_the_estimate_the_
+//   gate_will_judge_by`);
+// - the subset drops the SMALL candidate the gate keeps ⇒ the bound is a big model's
+//   window and the request lands on the small one (`the_serving_window_bound_is_safe_
+//   for_the_smallest_candidate_the_gate_admits`).
+//
+// Aligning the arithmetic by hand instead would have left an invariant between two
+// crates that nothing enforces; on multi-byte text the drift ran the OTHER way (bytes
+// there, chars here), so the two figures were not ordered in either direction and no
+// slack constant could have covered it. Calling one function makes the equality
+// structural. The cost is a `pub` on the gateway side, argued in that function's own doc.
+//
+// What the BUDGET half trades for that, in both directions, because the two differences
+// do not point the same way and "more margin" would be a false summary:
+//
+// - UNIT, bytes instead of characters: strictly more margin, since bytes >= chars, and
+//   much more where the old figure was weakest — CJK is 3 bytes per character and
+//   tokenizes near 1 token per character, so `chars/3` under-counted it threefold and
+//   `bytes/3` lands close to the truth.
+// - ROUNDING, one `ceil` instead of one per string: strictly LESS margin on ASCII, by
+//   `Σ ceil(Lᵢ/3) − ceil(Σ Lᵢ/3)`, which is at most ⅔ of a token per payload part (the
+//   worst case being a length that is `1 mod 3`). A ReAct turn has a system prompt, a
+//   handful of messages and its tool schemas, so that is tens of tokens; the tests' own
+//   600-part fixture is built to maximise it and reaches 400.
+//
+// So on Latin text the estimate came DOWN by up to `parts` tokens, which widens the §4
+// residual (`actual_input − est_input`) by the same amount and nothing else — the bound
+// is still `remaining`, the overshoot is still the estimate's error, and tens of tokens
+// against `MIN_OUTPUT_TOKENS = 256` and any real cap is noise. Worth the trade for a
+// window bound that is sound. The AC11 `budget clamp under-estimated the input` warning
+// below is what measures the residual in production, and it is the same warning either
+// way.
 
 /// What the clamp did on one call, kept so the two post-response diagnostics can be
 /// emitted against it (design §5.4). `None` on an unbudgeted run and on a non-`Chat`
@@ -279,14 +271,71 @@ pub(super) enum BudgetRefusal {
     /// agrees everywhere else and understates it by exactly that difference here, which
     /// is the arm nothing else can observe.
     ///
-    /// `window` is `Some(w)` when the CHAIN's smallest context window — not the budget —
-    /// is what pushed the ceiling under the floor, and `w` is that raw window. It exists
-    /// because the two situations have opposite remedies and were reported identically:
-    /// the budget arm is cleared by `torii run wake --budget-tokens N`, and the window
-    /// arm cannot be cleared by any cap at all (the window term is
-    /// `min_context_window(chain) − est`, which never reads the cap, so the same refusal
-    /// arrives at 1e6 and at `u64::MAX`). Telling an operator to raise a cap that is
-    /// already astronomical is a round trip that ends where it started.
+    /// `window` is `Some(w)` when the SERVING CONTEXT WINDOW pushed the ceiling under the
+    /// floor, and `w` is the raw window that did it: the smallest context window in the
+    /// chain that **can actually hold this call's input**. It exists because that
+    /// situation and an exhausted budget have different remedies and were once reported
+    /// identically, in budget wording naming a cap raise.
+    ///
+    /// # It discriminates ONE of the two model bounds, and the other one still misdirects
+    ///
+    /// Stated narrowly on purpose: an earlier version of this sentence read "when a MODEL
+    /// bound — not the budget — pushed the ceiling under the floor", and there are two
+    /// model bounds. `ceiling = min(min_max_output_tokens, window_term)`, and when the
+    /// OUTPUT LIMIT is what lands under [`orchestrator_core::MIN_OUTPUT_TOKENS`] the
+    /// `term == c` test fails, `window` is `None`, and the operator gets the budget arm's
+    /// message — "raise it with `torii run wake --budget-tokens N`" — for a term that does
+    /// not read the cap either. **That is a known misdirection, not a claim this field
+    /// makes.**
+    ///
+    /// It is reachable rather than theoretical: `collect_validation_errors`' Rule 5
+    /// rejects only `max_output_tokens == 0`, so a chain entry declaring 200 is valid
+    /// config and `Gateway::new` validates nothing at all. It is left rather than fixed
+    /// because closing it means a THIRD message arm — the refusal would have to name
+    /// "this chain's smallest model can only emit 200 tokens" and the remedy is a
+    /// different one again (drop the entry, or raise its declared limit) — and inventing
+    /// that wording is a change the serving-window review did not ask for and no test
+    /// currently pins. The spec's deferred list carries it.
+    ///
+    /// A TIE goes to the window (`term == c` holds when both terms are equal), which is
+    /// the least-misdirecting answer available: both terms are cap-blind, and only the
+    /// window arm's wording says so. Pinned by
+    /// `a_tie_between_the_output_limit_and_the_window_term_names_the_window`.
+    ///
+    /// # What a `Some` MEANS changed with the serving-window bound
+    ///
+    /// The term used to be `min_context_window(chain) − est`, so a `Some(w)` meant "your
+    /// prompt is bigger than the chain's SMALLEST model" — a claim about a model the
+    /// request might never have been routed to, and one that swept up the genuinely
+    /// different "fits nothing at all" case with it. That case no longer arrives here.
+    /// An empty serving set yields NO window term, the call is dispatched, and the
+    /// gateway's `ContextWindowGate` refuses it as an `AllGated` naming each candidate's
+    /// own window and a `UseLargerContextWindow` remedy
+    /// (`an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not`).
+    ///
+    /// So a `Some(w)` now certifies something narrower and strictly true: **the input
+    /// FITS.** `w >= est_input` holds by construction of
+    /// `Gateway::min_serving_context_window`, and the refusal is about the room left
+    /// BESIDE the input. `w − est_input` is under [`orchestrator_core::MIN_OUTPUT_TOKENS`],
+    /// so the reply would arrive truncated mid-sentence and travel downstream as work
+    /// product — worse than not making the call.
+    ///
+    /// The remedies follow from that, and they are not the ones the old message named.
+    /// "Route to a chain whose smallest model has a larger window" was advice about the
+    /// wrong model: on a heterogeneous chain the smallest entry may already have been
+    /// filtered out of the decision, and widening it changes nothing. What moves this
+    /// refusal is sending less input, or putting a model with a larger window into the
+    /// chain.
+    ///
+    /// What has NOT changed is that the cap is not one of them, and the message still
+    /// says so. The window term reads no budget figure, so the identical refusal arrives
+    /// at a cap of 1e6 and at `u64::MAX`; and every round trip on this pause is a manual
+    /// `BudgetRaised` plus a `force_wake` by a human, so pointing at a cap that is
+    /// already astronomical costs an operator one of those and ends where it started.
+    /// (The slice design's §5 predicted this sentence would become false too. It did not
+    /// — the arithmetic is unchanged — and the design has been corrected rather than the
+    /// code made to match it; a comment that told an operator to try the cap here would
+    /// be a new false claim, not a repaired one.)
     BelowFloor {
         allowance: u64,
         est_input: u64,
@@ -403,19 +452,25 @@ impl Executor {
         // `actual_input + output ≤ actual_input + (remaining − est_input)`, which
         // exceeds `remaining` by exactly `actual_input − est_input`. So the residual is
         // the ESTIMATE's error, biased toward refusing early because
-        // `est_tokens_pessimistic` over-counts on the JSON-heavy prompts this
+        // `gateway::estimate_input_tokens_pessimistic` divides by 3 and counts every part
+        // that goes on the wire, which over-counts on the JSON-heavy prompts this
         // orchestrator actually sends. Bounded and biased safe, not zero.
         //
         // "Biased toward refusing early" carries a SCRIPT assumption, and it is worth
-        // naming because nothing else in the code does. `chars / 3` over-counts only
-        // where a token is worth three or more characters, which is Latin-script text.
-        // CJK, Cyrillic and emoji run nearer 1–3 tokens PER character, so on such a
-        // prompt the estimate under-counts by a multiple and the §4 residual
-        // (`actual_input − est_input`) stops being a small error and becomes a fraction
-        // of the prompt. The bias flips sign; the bound does not vanish, but it widens by
-        // a factor a reader could not otherwise anticipate. The AC11 `tracing::warn!`
-        // below is the mitigation — a non-Latin prompt is exactly the case it is expected
-        // to fire on — and a real tokenizer (design §8) is the fix.
+        // naming because nothing else in the code does. The estimate is
+        // `ceil(UTF-8 BYTES / 3)`, and three bytes per token is an over-count only where
+        // a token is worth three or more bytes — Latin-script text, where a byte is a
+        // character. It used to be `chars / 3`, which under-counted CJK by a factor of
+        // three (3 bytes per character, tokenizing near 1 token PER character), and
+        // counting bytes closes most of that: 3 bytes/3 lands at ~1 token per CJK
+        // character, which is roughly the truth rather than a third of it. The margin is
+        // thinner there than on Latin text and the sign can still flip on scripts that
+        // tokenize worse than one token per character, so the §4 residual
+        // (`actual_input − est_input`) is not guaranteed non-negative on non-Latin input.
+        // The AC11 `tracing::warn!` below is the measurement of what is left, and a real
+        // tokenizer (design §8) is the fix. (The byte count arrived with the estimator
+        // unification — see the tombstone above `ClampRecord` — so this paragraph is the
+        // one place that records the improvement it brought as a side effect.)
         //
         // Only for a budgeted run, and only for `Chat`: `Embed`/`Stt` have no
         // `max_tokens` to set, so they fall through to the pre-existing floor-trigger
@@ -434,16 +489,29 @@ impl Executor {
         let clamped;
         let mut clamp: Option<ClampRecord> = None;
         let request = match (meter.budget(), &request.payload) {
-            (
-                Some(cap),
-                Payload::Chat {
-                    system,
-                    messages,
-                    tools,
-                    ..
-                },
-            ) => {
-                let est = est_input_tokens(system.as_deref(), messages, tools);
+            (Some(cap), Payload::Chat { .. }) => {
+                // ONE estimate, computed by the GATEWAY's estimator over the very payload
+                // that is about to be dispatched — not a second one of the orchestrator's
+                // own. The tombstone above `ClampRecord` records the function this
+                // replaced and the defect that made two numbers unacceptable; the short
+                // version is that everything below reasons about the set
+                // `{ m : m.context_window >= est }` being the set selection draws from,
+                // and that is a claim about ONE `est`.
+                //
+                // `&request.payload` and not the destructured parts: `Gateway::execute`
+                // estimates `&request.payload` too (`engine/execute.rs`), and the clone
+                // this block goes on to make differs from it only in `max_tokens`, which
+                // the `Chat` arm of the estimator does not read. So the figure here is
+                // the figure the `ContextWindowGate` will judge this request by, by
+                // construction rather than by agreement.
+                //
+                // `u32`, as the accessor wants it. The saturation the old `u64` sum
+                // needed at the accessor boundary is now inside the estimator, which
+                // saturates to `u32::MAX` on a payload too large to count — safe in the
+                // only direction that matters, because it can only ask for a LARGER
+                // window than the truth and so shrink the serving set.
+                let est_u32 = gateway::estimate_input_tokens_pessimistic(&request.payload);
+                let est = u64::from(est_u32);
                 // `cap - spent` cannot underflow while the gate at the top of this
                 // function stands: it returned when `spent >= cap`, reading the same two
                 // values (`cap` from `meter.budget()`, a plain field read, and this same
@@ -573,21 +641,82 @@ impl Executor {
                 // for less. Same `None` handling as the output limit — an unknown chain
                 // yields no bound from here rather than a silent truncation.
                 //
-                // `binding_window` carries the chain's RAW smallest window when the
-                // window term is what produced the ceiling, and it exists purely so the
-                // refusal below can be truthful. Without it the two very different
-                // situations — "your cap is too small" and "your prompt does not fit any
-                // model in this chain" — reach the operator in identical budget wording,
-                // and only one of them is fixed by the `torii run wake --budget-tokens N`
-                // that wording names. A tie counts as window-bound: when both terms land
-                // on the same figure the window is a true cause of the refusal, and the
-                // window is the half a cap raise cannot move.
+                // **The window it subtracts from is the smallest one that can SERVE this
+                // request, not the chain's smallest — and the difference is a whole
+                // slice.** `min_context_window(chain)` was safe, because a value fitting
+                // the weakest entry fits every entry, and far too strong: on a
+                // `[128k, 8k]` chain a 20k prompt gave `8192 − 20000`, `saturating_sub`
+                // floored it at 0, the floor check below refused — and it refused HERE,
+                // inside the orchestrator, before `Gateway::execute` was called at all.
+                // So SP-7a's `ContextWindowGate`, which admits the 128k entry and serves
+                // the request, never ran on any budgeted run. Two components disagreed
+                // about one request and the upstream one won.
+                //
+                // `min_serving_context_window(chain, est)` folds the min over exactly the
+                // candidates the gate admits (`window >= est`). Selection can only return
+                // a member of that set, and every member is at least the minimum over it,
+                // so the bound is safe for whichever candidate wins WITHOUT knowing which
+                // — the property the chain minimum bought by being needlessly pessimistic.
+                // The accessor's own doc carries the full argument, including why
+                // bounding by the chain's LARGEST window was rejected.
+                //
+                // **"Exactly the candidates the gate admits" is a claim about ONE `est`,
+                // and it shipped false for a day.** The clamp had its own estimator and it
+                // returned a bigger number than the gate's on ASCII text, so its serving
+                // set was a strict SUBSET of the set selection drew from and both bullets
+                // above failed — either the subset was empty and no window term was
+                // contributed at all, or it excluded the small candidate that then won.
+                // The tombstone above `ClampRecord` has the arithmetic. `est` is now the
+                // gate's own figure from the gate's own function, which is why the two
+                // sets are the same set rather than two sets that agree in testing.
+                //
+                // **`None` here means nothing in the chain can serve the request, and it
+                // must contribute NO window term** — not a zero, which would trip the
+                // floor below and re-create the early refusal this change exists to
+                // remove. The `(a, b) => a.or(b)` arm is what delivers that: with the
+                // output limit `Some` and the window `None` the ceiling is the output
+                // limit alone, the call proceeds, and the GATE refuses it — naming each
+                // candidate's own window, which is a diagnosis the clamp cannot produce.
+                // That handover is the design's choice, not a fallback: the clamp's
+                // `BelowFloor` is budget-flavoured and names a cap raise, and a cap raise
+                // has never been able to make a prompt fit a window.
+                //
+                // `est_u32` is passed straight through — the estimator returns a `u32`, so
+                // there is no conversion here to get wrong any more. Its own saturation to
+                // `u32::MAX` on an uncountable payload is documented at the estimator and
+                // errs the safe way: a larger `est` shrinks the serving set and shrinks
+                // the bound. Reaching it takes a prompt of some 12.9 billion bytes, at
+                // which point the set is empty for every `context_window` short of
+                // `u32::MAX` itself and the refusal is the gate's. A config that literally
+                // declared `u32::MAX` would keep that entry with a window term of 0 and
+                // refuse on the floor below, which is also correct — nothing is dispatched
+                // either way.
+                //
+                // `saturating_sub` on the next line is now UNREACHABLE saturation: every
+                // window in the serving set satisfies `w >= est_u32` by construction, so
+                // the subtraction is always exact. Kept rather than swapped for `-`
+                // because a plain subtraction would panic in debug and WRAP in release
+                // (the workspace profile sets no `overflow-checks`) if the accessor's
+                // filter were ever loosened, and a wrapped window term is an enormous
+                // `max_tokens` sent at a model that cannot take it.
+                //
+                // `binding_window` carries the RAW serving window when the window term is
+                // what produced the ceiling, and it exists purely so the refusal below can
+                // be truthful. Without it the two very different situations — "your cap is
+                // too small" and "the smallest model that can hold this prompt has no room
+                // left for a reply" — reach the operator in identical budget wording, and
+                // only one of them is fixed by the `torii run wake --budget-tokens N` that
+                // wording names. A tie counts as window-bound: when both terms land on the
+                // same figure the window is a true cause of the refusal, and the window is
+                // the half a cap raise cannot move.
                 let (ceiling, binding_window) = match request.chain.as_deref() {
                     Some(chain) => {
                         let out = self.gateway.min_max_output_tokens(chain).await;
-                        let min_win = self.gateway.min_context_window(chain).await;
-                        let window = min_win
-                            .map(|w| w.saturating_sub(u32::try_from(est).unwrap_or(u32::MAX)));
+                        let min_win = self
+                            .gateway
+                            .min_serving_context_window(chain, est_u32)
+                            .await;
+                        let window = min_win.map(|w| w.saturating_sub(est_u32));
                         let ceiling = match (out, window) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
@@ -831,13 +960,27 @@ impl Executor {
                     //
                     // **And when the WINDOW is what bound the ceiling, none of that
                     // arithmetic applies and the message says something else entirely.**
-                    // The window term is `min_context_window(chain) − est`, which never
-                    // reads the cap, so every figure above — headroom, needed, "raise it
-                    // with `torii run wake --budget-tokens N`" — names a lever that
-                    // cannot move this refusal: the identical pause arrives at a cap of
-                    // 1e6 and at one of `u64::MAX`. An operator who follows the budget
-                    // wording raises the cap, wakes the run, and re-pauses on the same
-                    // node having spent a manual round trip on nothing.
+                    // The window term is `min_serving_context_window(chain, est) − est`,
+                    // which never reads the cap, so every figure above — headroom,
+                    // needed, "raise it with `torii run wake --budget-tokens N`" — names
+                    // a lever that cannot move this refusal: the identical pause arrives
+                    // at a cap of 1e6 and at one of `u64::MAX`. An operator who follows
+                    // the budget wording raises the cap, wakes the run, and re-pauses on
+                    // the same node having spent a manual round trip on nothing.
+                    //
+                    // **What this arm MEANS is not what it meant before the serving-window
+                    // bound, and the wording is rewritten rather than rewired.** The term
+                    // was the chain MINIMUM, so this message used to fire on a prompt too
+                    // big for the chain's weakest entry — including one too big for every
+                    // entry — and named "the chain's smallest context window", a model the
+                    // request may never have been routed to. Now the window is the
+                    // smallest that CAN HOLD the input, so reaching this arm proves the
+                    // input fits and the shortfall is output room; and the fits-nothing
+                    // case does not reach it at all (empty serving set ⇒ no window term ⇒
+                    // the gate refuses, naming every candidate). The old remedy — "route
+                    // to a chain whose smallest model has a larger window" — was therefore
+                    // pointing at a model that may already have been filtered out of the
+                    // decision, where widening it changes nothing.
                     //
                     // The prefix differs too (`context window: ` rather than `budget: `),
                     // which is deliberate: that prefix is the operator- and test-visible
@@ -854,11 +997,13 @@ impl Executor {
                         let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
                         format!(
                             "context window: this call's input is estimated at {est_input} \
-                             tokens against the chain's smallest context window of {window}, \
-                             leaving {allowance} for output — below the {floor}-token floor. \
-                             The budget is not the binding term ({spent} of {budget} spent) \
-                             and no cap raise clears this: send less, or route to a chain \
-                             whose smallest model has a larger window."
+                             tokens; the smallest model in this chain that can hold it has \
+                             a {window}-token context window, leaving {allowance} for \
+                             output — below the {floor}-token floor, so the reply would be \
+                             cut off mid-sentence. The budget is not the binding term \
+                             ({spent} of {budget} spent) and raising the cap does not move \
+                             this: send less input, or put a model with a larger window in \
+                             this chain."
                         )
                     }
                     BudgetRefusal::BelowFloor {
@@ -1145,124 +1290,26 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kernel::types::request::{MessageContent, MessageRole, ToolCall};
-
-    fn user(text: &str) -> Message {
-        Message::text(MessageRole::User, text)
-    }
-
-    fn tool(name: &str, description: Option<&str>, schema: serde_json::Value) -> ToolDefinition {
-        ToolDefinition {
-            name: name.to_string(),
-            description: description.map(str::to_string),
-            input_schema: schema,
-        }
-    }
-
-    /// Every term of the estimate is COUNTED, proven one term at a time.
-    ///
-    /// The estimate is the whole clamp: `allowance = remaining − est`, so a term that
-    /// silently contributes nothing leaves the allowance too high and the cap is
-    /// overshot by exactly that much. Before this test, deleting the tool loop or
-    /// replacing the system term with `0` left `cargo test --workspace` green, and the
-    /// only guarded term was messages — guarded by one token of margin, because every
-    /// clamp test used a two-character prompt.
-    ///
-    /// Strict `>` on each step, against the same call with that one term absent. A
-    /// weaker `>=` would pass for a function that ignored the term entirely.
-    #[test]
-    fn every_part_of_the_input_is_counted_in_the_estimate() {
-        let msgs = vec![user("the user's question, which is not short")];
-        let bare = est_input_tokens(None, &msgs, &[]);
-        assert!(bare > 0, "the message body itself costs something");
-
-        assert!(
-            est_input_tokens(Some("a system prompt the agent was given"), &msgs, &[]) > bare,
-            "the system prompt is counted"
-        );
-
-        let named = tool("fs_write", None, serde_json::json!({}));
-        let with_name = est_input_tokens(None, &msgs, std::slice::from_ref(&named));
-        assert!(with_name > bare, "a tool's NAME is counted");
-
-        let described = tool(
-            "fs_write",
-            Some("write a file, creating parent directories"),
-            serde_json::json!({}),
-        );
-        assert!(
-            est_input_tokens(None, &msgs, &[described]) > with_name,
-            "a tool's DESCRIPTION is counted — it is optional, not free"
-        );
-
-        let schemad = tool(
-            "fs_write",
-            None,
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "contents": { "type": "string" }
-                },
-                "required": ["path", "contents"]
-            }),
-        );
-        assert!(
-            est_input_tokens(None, &msgs, &[schemad]) > with_name,
-            "a tool's JSON SCHEMA is counted — the term the estimate exists for"
-        );
-    }
-
-    /// An assistant turn's `tool_calls` are counted, because the provider is sent them.
-    ///
-    /// The ReAct loop appends exactly such a message every turn (`agent.rs`), and every
-    /// subsequent turn re-sends it: `anthropic/convert.rs` emits a `ToolUse` block per
-    /// entry, `openai_compat/convert.rs` emits `tool_calls`. `Message::content` is empty
-    /// on those turns, so counting only `as_text()` made a serialized plan or an
-    /// `fs_write` body — the biggest payloads the loop produces — cost zero.
-    ///
-    /// That under-counts in the one direction the design forbids: `allowance =
-    /// remaining − est` comes out too high, so the residual overshoot exceeds the
-    /// design's §4 bound and "biased toward refusing early" stops being true for the
-    /// agent path, which is the path that generates the large arguments.
-    #[test]
-    fn an_assistant_turns_tool_call_arguments_are_counted() {
-        let plain = Message {
-            role: MessageRole::Assistant,
-            content: MessageContent::Text {
-                text: String::new(),
-            },
-            tool_calls: Vec::new(),
-            attachments: Vec::new(),
-        };
-        let calling = Message {
-            tool_calls: vec![ToolCall {
-                id: "t0".into(),
-                name: "fs_write".into(),
-                arguments: serde_json::json!({
-                    "path": "notes.md",
-                    "contents": "a body long enough to matter to a token budget"
-                })
-                .to_string(),
-            }],
-            ..plain.clone()
-        };
-
-        let without = est_input_tokens(None, std::slice::from_ref(&plain), &[]);
-        let with = est_input_tokens(None, std::slice::from_ref(&calling), &[]);
-        assert!(
-            with > without,
-            "a tool call's arguments are sent to the provider, so they are estimated: \
-             {with} vs {without}"
-        );
-        // And by roughly what they cost: the arguments alone are ~90 characters, so a
-        // token or two of difference would mean only the NAME was counted.
-        assert!(
-            with - without >= 20,
-            "the ARGUMENTS are counted, not just the call's name: {with} vs {without}"
-        );
-    }
-}
+// ------------------------------------------------------------------------------------
+// This module has no `mod tests`, and that is a deliberate deletion rather than a gap.
+//
+// It held `every_part_of_the_input_is_counted_in_the_estimate` and
+// `an_assistant_turns_tool_call_arguments_are_counted` over `est_input_tokens`. Both
+// went with that function (see its tombstone above `ClampRecord`); the coverage did NOT.
+// The clamp's estimate is now `gateway::estimate_input_tokens_pessimistic`, whose own
+// module holds the same claims over a whole `Payload`, and holds them as exact
+// equalities rather than the strict `>` these used:
+//
+// - the system prompt: `the_system_prompt_is_counted_in_the_window_estimate`
+// - a tool's name + description + schema: `a_tools_json_schema_is_counted_not_just_the_tools_name`
+// - an assistant turn's `tool_calls`: `an_assistant_turns_tool_call_arguments_are_counted`
+// - the divisor and the rounding: `the_estimate_is_ceil_of_utf8_bytes_over_three`
+//
+// Re-asserting them here would test the same function twice and, worse, imply that the
+// clamp still has an estimate of its own to verify — which is the belief the deleted
+// function encoded. What the clamp owes a test is that it bounds by the figure the GATE
+// will judge the same request by, and that is
+// `the_clamp_bounds_max_tokens_by_the_estimate_the_gate_will_judge_by` plus
+// `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits` in
+// `executor/tests.rs`. No unit test of an estimator can stand in for either.
+// ------------------------------------------------------------------------------------
