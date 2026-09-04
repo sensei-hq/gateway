@@ -675,9 +675,23 @@ pub enum JournalEvent {
     /// NOT like `PlanExpanded`/`PlannerSelected`, which are both `insert`. A budget a later
     /// record could move is not a fence.
     ///
-    /// The remaining five fields are DISCLOSURE, not inputs: they are what `torii` and an audit
-    /// read to learn that a turn answered on a degraded prompt. Nothing reconstructs the cut
-    /// from them, and no executor code path reads them back.
+    /// Of the SEVEN fields, exactly TWO are replay inputs, and `fold_journal`
+    /// (`orchestrator::executor::support`) destructures precisely those two: `budget_bytes` is
+    /// the replayed VALUE, and `effect_id` is the KEY it is filed under — FIRST-wins, into
+    /// `Fold::context_budgets`. So `effect_id` is as load-bearing as the integer beside it:
+    /// change which turn it names and a journaled budget replays for the wrong turn, or for
+    /// none. It is a replay input, NOT disclosure, and must not be treated as free to change.
+    ///
+    /// The other FIVE — `node`, `source_window`, `retained_bytes`, `dropped_deps`,
+    /// `dropped_tools` — are DISCLOSURE, not inputs: they are what `torii` and an audit read
+    /// to learn that a turn answered on a degraded prompt. Nothing reconstructs the cut from
+    /// them, and no code path reads any of the five back OFF THIS EVENT — the sole reader of
+    /// any of the five is the exhaustive `label` test helper in
+    /// `crates/orchestrator/src/executor/tests.rs`, which prints `node`. (Two of the five
+    /// names — `retained_bytes` and `dropped_tools` — are ALSO fields of `ContextCut` and
+    /// `BudgetPlan` in `orchestrator::agent::prompt`, which the pure cutter both writes and
+    /// reads. Those are other structs entirely, not this event; a grep for either bare name
+    /// hits them, so search by field granularity, not by name.)
     ContextBudgeted {
         node: NodeId,
         effect_id: EffectId,
@@ -1303,11 +1317,11 @@ mod tests {
     /// SP-7b AC12 — the `ContextBudgeted` variant round-trips and the fence stays at 1.
     ///
     /// The round-trip is compared as a whole `Debug` rendering rather than field by field,
-    /// because the only field the executor READS BACK is `budget_bytes` while the other five
-    /// are disclosure — and a disclosure field silently lost on the wire (a stray
-    /// `#[serde(skip)]`, say) would still leave every executor assertion in this slice green.
-    /// Comparing the whole rendering covers all six, and any field added later, without
-    /// naming them.
+    /// because only TWO of the seven fields are read back — `budget_bytes`, the value, and
+    /// `effect_id`, the key it folds under — while the other five are disclosure, and a
+    /// disclosure field silently lost on the wire would leave `fold_journal`, the only
+    /// executor code that reads this event at all, entirely unaffected. Comparing the whole
+    /// rendering covers all seven, and any field added later, without naming them.
     ///
     /// The `FORMAT_VERSION` assertion here is a deliberate restatement of
     /// `the_durable_journal_format_version_is_pinned_at_1`, not an independent guard: it is

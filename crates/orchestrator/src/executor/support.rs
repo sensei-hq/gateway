@@ -723,6 +723,53 @@ mod tests {
         );
     }
 
+    /// SP-7b AC6, the other half — FIRST-wins is PER EFFECT ID, not per run.
+    ///
+    /// `the_first_context_budget_wins` above feeds ONE effect id twice, so every record it
+    /// folds is a duplicate. That leaves "FIRST record wins" readable as a run-global latch,
+    /// which is a misreading the phrase invites and which compiles. An agent node journals one
+    /// `ContextBudgeted` PER TURN (the key is `effect_id(node, turn, 0)`, see
+    /// `Fold::context_budgets`), so under that reading turn 2 of a two-turn agent finds no
+    /// budget of its own — on the first drive as well as on resume.
+    ///
+    /// Mutation-verified, and the two guards are complementary rather than nested:
+    /// - `if fold.context_budgets.is_empty() { insert(..) }` — a run-global latch — leaves
+    ///   `the_first_context_budget_wins` GREEN and fails this test's second assertion with
+    ///   `left: None, right: Some(9999)`.
+    /// - `.insert(..)` for `.entry(..).or_insert(..)` — LAST-wins — fails that test with
+    ///   `Some(9999)` and leaves THIS one green, because its two events carry different keys.
+    ///
+    /// Keying by `node` instead of `effect_id` — `.entry(EffectId(node.0.clone()))`, the
+    /// mutation `Fold::context_budgets`' doc warns about — is caught by BOTH tests rather
+    /// than by either alone, because each looks up by the effect id it wrote and so gets
+    /// `None`. Neither is uniquely the guard for it.
+    #[test]
+    fn each_turn_of_one_node_keeps_its_own_context_budget() {
+        use orchestrator_core::{EffectId, JournalEvent, NodeId};
+        let node = NodeId("n1".into());
+        let turn = |effect_id: &str, budget_bytes: u64| JournalEvent::ContextBudgeted {
+            node: node.clone(),
+            effect_id: EffectId(effect_id.into()),
+            budget_bytes,
+            source_window: 4096,
+            retained_bytes: 0,
+            dropped_deps: 0,
+            dropped_tools: vec![],
+        };
+        let (fold, _last, _completed) =
+            fold_journal(&[(0, turn("eid-turn-1", 1000)), (1, turn("eid-turn-2", 9999))]);
+        assert_eq!(
+            fold.context_budgets.get(&EffectId("eid-turn-1".into())),
+            Some(&1000),
+            "turn 1's budget, keyed by ITS effect id"
+        );
+        assert_eq!(
+            fold.context_budgets.get(&EffectId("eid-turn-2".into())),
+            Some(&9999),
+            "turn 2 is a different effect id, so FIRST-wins must not hand it turn 1's budget"
+        );
+    }
+
     #[test]
     fn fold_journal_captures_plan_expansions() {
         use orchestrator_core::{Graph, JournalEvent, Node, NodeId, NodeKind};
