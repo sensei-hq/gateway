@@ -319,10 +319,12 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
 ///
 /// A window-fit estimate and a budget estimate want OPPOSITE biases, which is why the
 /// prose figure was never simply widened. A window check asks "will this prompt fit",
-/// where an over-count halts a turn that would in fact have fitted. The budget asks "what
-/// is the worst this call can cost", and an under-count there is the expensive direction:
-/// the clamp computes `max_tokens = remaining − est`, so too low an estimate leaves too
-/// high an allowance and the cap is overshot by the difference.
+/// where an over-count refuses a candidate that would in fact have held the request —
+/// under SP-7a a SKIP, and only a failure when it skips the last candidate in the chain;
+/// under the chain-minimum halt this function used to serve, a failed node outright. The
+/// budget asks "what is the worst this call can cost", and an under-count there is the
+/// expensive direction: the clamp computes `max_tokens = remaining − est`, so too low an
+/// estimate leaves too high an allowance and the cap is overshot by the difference.
 ///
 /// The window half of that pair is no longer here at all. SP-7a moved the question to the
 /// gateway, which owns its own estimator — `engine::util::estimate_input_tokens_pessimistic`,
