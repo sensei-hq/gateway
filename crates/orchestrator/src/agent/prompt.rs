@@ -220,16 +220,18 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
 ///
 /// This is the human path's answer to the same problem, and it differs because the failure
 /// modes differ: an over-window model call falls through to a LARGER candidate in the same
-/// chain — true since SP-7a on an UNBUDGETED run, and the reason that slice exists; before
-/// it, the orchestrator refused such a call outright against the chain's smallest window —
-/// whereas a human-backed node that fails takes the whole run terminal AFTER the upstream
-/// tokens have been spent.
+/// chain — true since SP-7a, and the reason that slice exists; before it, the orchestrator
+/// refused such a call outright against the chain's smallest window — whereas a
+/// human-backed node that fails takes the whole run terminal AFTER the upstream tokens
+/// have been spent.
 ///
-/// The unbudgeted qualifier is load-bearing rather than pedantic: on a run with a token
-/// cap the SP-DATA-5 clamp (`executor/dispatch.rs`) still bounds by
-/// `min_context_window(chain)` BEFORE selection happens and refuses with a durable pause,
-/// so the fall-through never occurs there. See the SP-7a spec's §8 and
-/// `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`.
+/// This paragraph used to carry an "on an UNBUDGETED run" qualifier, because SP-DATA-5's
+/// clamp (`executor/dispatch.rs`) bounded by `min_context_window(chain)` BEFORE selection
+/// and refused a budgeted run with a durable pause, so the fall-through never happened
+/// there. The SP-7a follow-on bounds by the smallest window that can SERVE the request
+/// instead, which is the set the gate admits, so the qualifier is gone: budgeted and
+/// unbudgeted runs both fall through. See
+/// `a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold`.
 ///
 /// The budget is split EVENLY across dependencies rather than first-come-first-served, so
 /// one verbose upstream cannot crowd the others out of the question entirely — the human is
@@ -290,76 +292,35 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
     out
 }
 
-// `est_tokens(s) = s.chars().count() / 4` lived here until SP-7a's review. It was the
-// documented prose heuristic the window pre-check ran on, and SP-7a deleted both of its
-// callers (`over_budget` and `executor::support::est_prompt_tokens`) along with the halt
-// they served — after which it survived only because `pub` in a `pub mod` makes it
-// invisible to `dead_code`, so `clippy -D warnings` could not report what it had become.
+// This module holds NO token estimator any more, and the two it held are gone for the
+// same reason one commit apart.
 //
-// Kept for one commit as "the prose baseline `est_tokens_pessimistic`'s bias is defined
-// against", and deleted now for the reason that commit itself gave for deleting
-// `over_budget`: a function kept because it might be wanted again is exactly the kind of
-// thing that gets called again by mistake — and this one is the `chars/4` UNDER-count the
-// window check's whole failure history came from. The baseline argument did not survive
-// contact either: `est_tokens_pessimistic` is `chars/3` outright rather than a multiplier
-// on it, deliberately, so the two were already independent.
+// `est_tokens(s) = s.chars().count() / 4` — the prose heuristic the deleted window
+// pre-check ran on — went in SP-7a's review, once both of its callers (`over_budget` and
+// `executor::support::est_prompt_tokens`) went with the halt they served.
 //
-// Nothing lost coverage. `the_pessimistic_estimate_is_never_below_the_window_fit_one`
-// compared the two functions; `the_pessimistic_estimate_is_chars_over_three_rounded_up`
-// bounds `est_tokens_pessimistic` from BOTH sides against the raw character count, which
-// implies the comparison for every input, and it now states the prose figure as an
-// absolute so the claim survives without the function.
-
-/// A deliberately pessimistic token estimate, for the BUDGET path only.
-///
-/// `chars / 4` is the standard rough figure for English prose. The orchestrator's prompts
-/// are not mostly English prose: they carry JSON tool schemas and a `## Context` section
-/// rendered from upstream outputs, and JSON tokenizes nearer 3 chars/token. So `chars / 4`
-/// UNDER-counts precisely where these prompts are heaviest.
-///
-/// A window-fit estimate and a budget estimate want OPPOSITE biases, which is why the
-/// prose figure was never simply widened. A window check asks "will this prompt fit",
-/// where an over-count refuses a candidate that would in fact have held the request —
-/// under SP-7a a SKIP, and only a failure when it skips the last candidate in the chain;
-/// under the chain-minimum halt this function used to serve, a failed node outright. The
-/// budget asks "what is the worst this call can cost", and an under-count there is the
-/// expensive direction: the clamp computes `max_tokens = remaining − est`, so too low an
-/// estimate leaves too high an allowance and the cap is overshot by the difference.
-///
-/// The window half of that pair is no longer here at all. SP-7a moved the question to the
-/// gateway, which owns its own estimator — `engine::util::estimate_input_tokens_pessimistic`,
-/// over BYTES rather than chars and over a whole `Payload` rather than a `&str`, and a
-/// separate function because the gateway crate cannot depend on this one (the dependency
-/// runs the other way). So this function is the orchestrator's only token estimate now,
-/// and the only caller is `executor::dispatch::est_input_tokens`.
-///
-/// So this one inverts the bias — it is wrong toward refusing early rather than toward
-/// overspending. It does not make the overshoot zero (the clamp design's §4 writes out the
-/// arithmetic); it bounds it by the remaining estimate error.
-///
-/// Not a real tokenizer — a real one needs a per-model vocabulary and a per-chain mapping,
-/// and would still need a heuristic like this as its fallback for an unknown model, so it
-/// is additional work on top of this rather than instead of it.
-///
-/// # The pessimism assumes a LATIN script
-///
-/// Three characters per token is an over-count only where a token is worth three or more
-/// characters, which is Latin-script text — the case both this and `est_tokens` were
-/// calibrated on. CJK, Cyrillic and emoji run nearer 1–3 tokens PER character, so on such
-/// a prompt this UNDER-counts by a multiple and the bias flips: the clamp's residual
-/// (`actual_input − est_input`, the clamp design's §4) stops being a small error and
-/// becomes a fraction of the prompt.
-///
-/// That is stated rather than fixed because the fix is the deferred real tokenizer, and a
-/// heuristic cannot be made script-agnostic by choosing a different divisor — a divisor
-/// pessimistic enough for CJK would refuse most Latin prompts outright. The AC11
-/// `budget clamp under-estimated the input` warning is the mitigation, and a non-Latin
-/// prompt is precisely the case it is expected to fire on.
-///
-/// Rounds UP, so any non-empty text costs at least one token, and `""` costs none.
-pub fn est_tokens_pessimistic(s: &str) -> usize {
-    s.chars().count().div_ceil(3)
-}
+// `est_tokens_pessimistic(s) = s.chars().count().div_ceil(3)` went in the serving-window
+// review, when its last caller — `executor::dispatch::est_input_tokens` — was deleted in
+// favour of `gateway::estimate_input_tokens_pessimistic`. It is deleted rather than kept
+// as a utility for exactly the reason that commit gave for deleting the other two: `pub`
+// in a `pub mod` makes a callerless function invisible to `dead_code`, so
+// `clippy -D warnings` cannot report what it has become, and a function kept because it
+// might be wanted again is the kind of thing that gets called again by mistake.
+//
+// Here that is not a general worry, it is the specific defect the review found. This
+// function applied `ceil` PER STRING, and summing per-string ceilings is what made the
+// clamp's estimate LARGER than the gateway's `ceil(Σ bytes / 3)` on ASCII text — which
+// made the clamp's serving set a strict subset of the set selection drew from and put an
+// over-window `max_tokens` on the wire. A second caller reaching for a convenient
+// `est_tokens_pessimistic(&str)` would rebuild that divergence one string at a time. The
+// orchestrator now has ONE way to size a payload: ask the gateway, over the whole
+// `Payload`, with the function the `ContextWindowGate` uses.
+//
+// Nothing lost coverage. `the_pessimistic_estimate_is_chars_over_three_rounded_up` and
+// `the_pessimistic_estimate_of_nothing_is_zero` tested this function's divisor and its
+// empty-string boundary; `gateway::engine::util::the_estimate_is_ceil_of_utf8_bytes_over_
+// three` pins both for the estimator that replaced it, from both sides and in the right
+// unit (it asserts the CJK case this one got wrong by a factor of three).
 
 // `over_budget(min_window, system, messages, tools)` lived here until SP-7a. It answered
 // "does this prompt fit the chain's SMALLEST context window", and `executor/agent.rs`
@@ -763,76 +724,14 @@ mod tests {
         );
     }
 
-    // `est_tokens_is_chars_over_four` and
-    // `the_pessimistic_estimate_is_never_below_the_window_fit_one` were here. Both tested
-    // `est_tokens`, deleted with its last caller; the second compared the two estimates
-    // to each other, and the test below subsumes it — bounding `est_tokens_pessimistic`
-    // from both sides against the raw character count implies "at least the prose figure"
-    // for every input, and does so without needing the prose figure to exist as code. The
-    // subsumption is made explicit in that test's last assertion rather than left to be
-    // re-derived.
-
-    /// The DIVISOR, pinned from both sides — an ordering against any other estimate is
-    /// not enough.
-    ///
-    /// `div_ceil(3)` → `div_ceil(4)` is a one-character edit that removes essentially
-    /// all of the margin this function exists for, and it still satisfies "strictly
-    /// greater than the `chars / 4` prose figure" on any length not divisible by 4,
-    /// because rounding up beats flooring by a token. So the sign of a difference proves
-    /// nothing about its SIZE, and the size is the whole point: JSON tokenizes nearer 3
-    /// chars/token, and clamping on a `chars / 4` under-count overshoots the cap by the
-    /// error.
-    ///
-    /// Both bounds are needed. Without the first, the divisor can grow and the margin
-    /// silently evaporates. Without the second, it can shrink — `chars / 2` would pass
-    /// every other assertion here while charging a budgeted run double for its input and
-    /// refusing calls that would comfortably have fitted.
-    #[test]
-    fn the_pessimistic_estimate_is_chars_over_three_rounded_up() {
-        let json = r#"{"name":"fs_write","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string"}},"required":["path","contents"]}}"#;
-        for s in [
-            json,
-            "The quick brown fox jumps over the lazy dog.",
-            "",
-            "a",
-            "ab",
-        ] {
-            let n = s.chars().count();
-            let est = est_tokens_pessimistic(s);
-            assert!(
-                est * 3 >= n,
-                "the estimate must be at least chars/3 for {s:?}: {est} * 3 < {n}"
-            );
-            assert!(
-                est * 3 <= n + 2,
-                "and no more than chars/3 rounded up — an over-count is a tax on every \
-                 budgeted call, not free caution — for {s:?}: {est} * 3 > {n} + 2"
-            );
-            // The property the deleted `the_pessimistic_estimate_is_never_below_the_
-            // window_fit_one` asserted, restated without needing the deleted `est_tokens`
-            // to exist: this estimate is never below the `chars / 4` prose figure the
-            // orchestrator's window check used to run on. Implied by the lower bound
-            // above, and written out because "implied" is not something a future reader
-            // should have to re-derive before touching the divisor.
-            assert!(
-                est >= n / 4,
-                "and never below the chars/4 prose figure it replaced for {s:?}: {est} \
-                 < {}",
-                n / 4
-            );
-        }
-    }
-
-    /// The empty string costs nothing under either estimate.
-    ///
-    /// The boundary is worth its own test because the clamp subtracts this value:
-    /// rounding UP is right for every non-empty input and wrong for the empty one, so
-    /// a `div_ceil` on a length that had been nudged (a `+1`, a `max(1)`) would charge
-    /// a token for a system prompt that is not there.
-    #[test]
-    fn the_pessimistic_estimate_of_nothing_is_zero() {
-        assert_eq!(est_tokens_pessimistic(""), 0);
-    }
+    // Four tests of two token estimators were here: `est_tokens_is_chars_over_four` and
+    // `the_pessimistic_estimate_is_never_below_the_window_fit_one` (SP-7a, with
+    // `est_tokens`), then `the_pessimistic_estimate_is_chars_over_three_rounded_up` and
+    // `the_pessimistic_estimate_of_nothing_is_zero` (the serving-window review, with
+    // `est_tokens_pessimistic`). This module estimates nothing now — the tombstone
+    // between `render_context_section` and `over_budget`'s own says why — and
+    // `gateway::engine::util::the_estimate_is_ceil_of_utf8_bytes_over_three` holds the
+    // divisor, the rounding AND the empty-input boundary for the one estimator left.
 
     // `over_budget_true_when_estimate_exceeds_window_and_false_otherwise` was here. It
     // tested the deleted `over_budget` against a chain MINIMUM, which is the behaviour

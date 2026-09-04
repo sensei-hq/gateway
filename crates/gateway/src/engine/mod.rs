@@ -30,9 +30,14 @@ mod exhaustion;
 mod panel;
 mod stream;
 mod util;
+/// The window estimator, re-exported out of the crate for the orchestrator's budget
+/// clamp. Its own doc carries why the surface is worth it: the clamp bounds `max_tokens`
+/// by [`Gateway::min_serving_context_window`] on this figure, and a SECOND estimator
+/// computing "the same" number was a live defect for a day. One function, two callers.
+pub use util::estimate_input_tokens_pessimistic;
 use util::{
-    call_estimate, estimate_input_tokens, estimate_input_tokens_pessimistic, request_input_text,
-    stream_error_code, usage_value, window_start,
+    call_estimate, estimate_input_tokens, request_input_text, stream_error_code, usage_value,
+    window_start,
 };
 
 /// Core gateway orchestrator.
@@ -174,24 +179,37 @@ impl Gateway {
     /// chain's `ChainEntry`s against the model table). `None` if the chain is
     /// unknown or has no resolvable models.
     ///
-    /// **One production caller: the SP-DATA-5 budget clamp** (`executor/dispatch.rs`),
-    /// which subtracts its input estimate from this to get a `max_tokens` ceiling that
-    /// respects `prompt + max_tokens <= context_window`. A chain MINIMUM is the right
-    /// bound there for the reason [`Self::min_max_output_tokens`] takes one: the clamp
-    /// sets `max_tokens` BEFORE selection, and a request that fails over lands on a
-    /// different entry.
+    /// **It has NO production caller, and that is the point of the sibling below.** Its
+    /// last one was the SP-DATA-5 budget clamp (`executor/dispatch.rs`), which subtracted
+    /// its input estimate from this figure to get a `max_tokens` ceiling respecting
+    /// `prompt + max_tokens <= context_window`. That bound was safe and far too strong:
+    /// on a `[128k, 8k]` chain a 20k prompt gave `8192 − 20000`, saturated to 0, fell
+    /// under `MIN_OUTPUT_TOKENS`, and the run was refused inside the orchestrator BEFORE
+    /// `Gateway::execute` — so [`gates::context_window::ContextWindowGate`], which would
+    /// have admitted the 128k entry, never ran. The clamp now takes
+    /// [`Self::min_serving_context_window`] instead.
+    ///
+    /// [`gates::context_window::ContextWindowGate`]: crate::gates::context_window::ContextWindowGate
     ///
     /// **It is NOT how a candidate's window is judged, and this doc said the opposite
     /// until SP-7a's review.** It read "used by the agent runtime to budget a prompt to
     /// the model it might fall over to — selection is untouched": both halves are now
     /// false. SP-7a deleted the agent runtime's pre-dispatch check (this accessor is
     /// exactly the chain-minimum guess that slice exists to stop trusting), and selection
-    /// is emphatically no longer untouched — `gates::context_window::ContextWindowGate`
-    /// asks the window question per CANDIDATE, which is the only place it has a correct
-    /// answer. Reach for the gate, not for this.
+    /// is emphatically no longer untouched — the gate asks the window question per
+    /// CANDIDATE, which is the only place it has a correct answer. Reach for the gate.
     ///
-    /// Bounding the clamp by the SELECTED candidate instead is the clamp spec's own §8
-    /// item and is the remaining reason this fold still exists at all.
+    /// **Why it is still here with nothing calling it**, stated so the next reader does
+    /// not have to re-derive it: it is a `pub` read accessor on a library type, deleting
+    /// it is a breaking change to that surface for no gain, and it is the contrast the
+    /// sibling's argument is made against — its own test pins the chain-minimum answer, so
+    /// the suite holds both numbers for one chain and the difference between the two folds
+    /// stays legible. (What catches a CLAMP reverting to this fold is not that test but
+    /// `a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold` in the
+    /// orchestrator, which is where the consequence lives.) If a third accessor ever wants
+    /// this fold, that is the moment to reconsider; a new caller reaching for it should
+    /// read [`Self::min_serving_context_window`] first and say why the weaker bound is
+    /// right.
     pub async fn min_context_window(&self, chain: &str) -> Option<u32> {
         let cfg = self.config.read().await;
         let chain = cfg.chains.get(chain)?;
@@ -200,6 +218,106 @@ impl Gateway {
             .iter()
             .filter_map(|entry| cfg.models.get(&entry.model))
             .map(|m| m.context_window)
+            .min()
+    }
+
+    /// The smallest `context_window` among a chain's models that can **hold `est`** —
+    /// i.e. the minimum over `{ m in chain : m.context_window >= est }`. `None` when no
+    /// entry qualifies, and `None` if the chain is unknown or has no resolvable models.
+    ///
+    /// [`Self::min_context_window`] with one filter, and the filter is the whole slice.
+    ///
+    /// **One production caller: the SP-DATA-5 budget clamp** (`executor/dispatch.rs`),
+    /// which subtracts `est` from this to bound `max_tokens` so the provider's
+    /// `prompt + max_tokens <= context_window` rule holds. The clamp sets `max_tokens`
+    /// BEFORE selection, so it must pick a value safe for whichever candidate wins
+    /// without knowing which — and the set above is exactly the set
+    /// [`gates::context_window::ContextWindowGate`] admits.
+    ///
+    /// [`gates::context_window::ContextWindowGate`]: crate::gates::context_window::ContextWindowGate
+    ///
+    /// # Why the bound is sound
+    ///
+    /// Let `S = { m in chain : m.context_window >= est }`, **for the one `est` the caller
+    /// and the gate share** — see the section below, which is not a caveat but the
+    /// premise every bullet here rests on.
+    ///
+    /// - Selection can only return a member of `S` — the gate skips every non-member,
+    ///   on that same `est`.
+    /// - This returns `min { m.context_window : m in S }`.
+    /// - Every `m in S` has `m.context_window >= min(S)`, so bounding output by
+    ///   `min(S) − est` leaves at least that much room in EVERY admissible candidate,
+    ///   including the one that wins.
+    /// - Every member satisfies `context_window >= est`, so `min(S) − est >= 0`. The
+    ///   saturation that produced the original defect — `8192 − 20000 → 0`, under the
+    ///   output floor, refused — cannot occur.
+    ///
+    /// `S` empty ⇒ `None` ⇒ the caller contributes no window bound at all, and selection
+    /// will admit nothing, so the request is refused by the gate with per-candidate
+    /// diagnostics rather than by an upstream guess. That handover is deliberate: two
+    /// components refusing one condition in two vocabularies means the one that fires
+    /// first is the one that misdirects.
+    ///
+    /// # The premise: ONE `est`, and it shipped violated
+    ///
+    /// Every bullet above says `est`, and for a day the two halves computed two different
+    /// numbers. The clamp had its own estimator (`dispatch::est_input_tokens`) applying
+    /// `ceil` per string and summing over CHARACTERS; the gate judged on
+    /// [`crate::estimate_input_tokens_pessimistic`], summing BYTES and applying `ceil`
+    /// once. On ASCII `Σ ceil(Lᵢ/3) >= ceil(Σ Lᵢ/3)`, so the clamp's figure was the
+    /// LARGER one and `S_clamp` a strict SUBSET of the set selection drew from — which
+    /// falsifies the first bullet outright and, with it, the `S`-empty handover ("nothing
+    /// can serve it" was decided on a number the gate did not use). Both reachable
+    /// consequences ended at a provider 400 on a budgeted run: an empty `S_clamp` against
+    /// a non-empty `S_gate` dropped the window term entirely, and a `S_clamp` missing the
+    /// small candidate bound by a big model's window and sent it to the small one.
+    ///
+    /// It is closed structurally rather than by agreement: the clamp calls the gate's own
+    /// estimator, on the very `Payload` it is about to dispatch, so `est_clamp` and
+    /// `est_gate` are one value and cannot drift. That is what the `pub` on
+    /// [`crate::estimate_input_tokens_pessimistic`] is for, and it is why aligning the two
+    /// formulas by hand was rejected — the drift ran the OTHER way on multi-byte text
+    /// (bytes here, chars there), so neither figure bounded the other and no slack
+    /// constant could have covered it. Pinned across the crate boundary by the
+    /// orchestrator's `the_clamp_bounds_max_tokens_by_the_estimate_the_gate_will_judge_by`
+    /// and `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits`.
+    ///
+    /// # The coupling that remains, stated plainly
+    ///
+    /// Soundness still depends on the gate being REGISTERED. Remove it and this bound
+    /// could name a window belonging to a model selection would then return without it
+    /// fitting. That is a real dependency between two crates, and it is why "bound by the
+    /// chain's LARGEST window" — the other one-call change that fixes the reported
+    /// symptom — was rejected: this version degrades to OVER-bounding if the coupling
+    /// breaks, because `min(S) >= min(chain)`, where the largest would under-bound and
+    /// send a big model's `max_tokens` to a small one.
+    ///
+    /// The boundary is `>=`, mirroring the gate's `est > window` skip exactly. A request
+    /// of precisely `window` tokens is held by that model, so it belongs to `S`; the two
+    /// must agree on the edge or the set this reasons over stops being the set selection
+    /// draws from.
+    ///
+    /// **The one degenerate case, stated so it is not mistaken for a guarantee.** For any
+    /// `est > 0` a mis-configured `context_window: 0` entry is simply filtered out and no
+    /// longer drags the caller's bound down — a genuine improvement over the plain `min`,
+    /// which such an entry poisoned for every request on the chain. At `est == 0` (an
+    /// empty prompt) that entry qualifies, `0 >= 0`, and the bound is `Some(0)` again.
+    /// Not special-cased here: `collect_validation_errors`' Rule 6 rejects a zero
+    /// `context_window` outright, so this is narrowed to the documented unchecked
+    /// `Gateway::new` / `update_config` path rather than defended against per reader.
+    ///
+    /// Bounding by the SELECTED candidate instead — strictly more precise than any
+    /// chain-wide fold — remains the clamp spec's §8 item. It needs the run's budget
+    /// plumbed into the gateway, across a boundary the two crates keep clean.
+    pub async fn min_serving_context_window(&self, chain: &str, est: u32) -> Option<u32> {
+        let cfg = self.config.read().await;
+        let chain = cfg.chains.get(chain)?;
+        chain
+            .models
+            .iter()
+            .filter_map(|entry| cfg.models.get(&entry.model))
+            .map(|m| m.context_window)
+            .filter(|window| *window >= est)
             .min()
     }
 
@@ -217,10 +335,28 @@ impl Gateway {
     /// `openai_compat/mod.rs`). So the clamp bounds itself by this before emitting.
     ///
     /// `min` over the chain rather than the selected model's own figure, for exactly the
-    /// reason `min_context_window` takes a `min`: the caller sets `max_tokens` before
-    /// selection, a request that fails over lands on a DIFFERENT entry, and a value the
-    /// fallback model would reject turns a survivable failover into a hard 400. The
-    /// smallest limit in the chain is the only one safe for every entry in it.
+    /// reason [`Self::min_serving_context_window`] takes a `min`: the caller sets
+    /// `max_tokens` before selection, a request that fails over lands on a DIFFERENT
+    /// entry, and a value the fallback model would reject turns a survivable failover
+    /// into a hard 400. The smallest limit in the chain is the only one safe for every
+    /// entry in it.
+    ///
+    /// **But it is a `min` over the WHOLE chain, where its window sibling folds over a
+    /// SUBSET, and that asymmetry is forced rather than chosen.** The serving-window bound
+    /// can narrow to `{ m : m.context_window >= est }` only because
+    /// [`gates::context_window::ContextWindowGate`] skips exactly the complement on
+    /// exactly that `est` — so the fold and selection reason over one set. There is no
+    /// counterpart gate for the output limit: nothing skips a candidate for declaring a
+    /// small `max_output_tokens`, so every entry stays reachable and the plain chain
+    /// minimum is the only fold safe for all of them. Adding a filter here without adding
+    /// the gate that justifies it would send a value the surviving entries reject.
+    ///
+    /// [`gates::context_window::ContextWindowGate`]: crate::gates::context_window::ContextWindowGate
+    ///
+    /// (This paragraph named `min_context_window` until the serving-window follow-on. That
+    /// accessor is still the plain chain fold and still `pub`, but it has no production
+    /// caller: the clamp's window term is the serving one now, so citing it here pointed a
+    /// reader at the shape the clamp had stopped using.)
     ///
     /// **The cost of that `min` on a HETEROGENEOUS chain, stated plainly.** A budgeted
     /// run on `[gpt-4o 16384, small-fallback 4096]` has its replies capped at 4096 on the
@@ -631,12 +767,20 @@ mod min_window_tests {
         }
     }
 
-    /// The output twin of `min_context_window`, and the SP-DATA-5 clamp's ceiling.
+    /// The output half of the SP-DATA-5 clamp's ceiling — **one of two terms, not the
+    /// ceiling itself.** The clamp takes `min(this, min_serving_context_window − est)`,
+    /// so a test that pins only this number says nothing about which term binds; the
+    /// window half is pinned by
+    /// `min_serving_context_window_is_the_smallest_window_that_can_hold_the_estimate`
+    /// here and by the orchestrator's
+    /// `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits`.
     ///
     /// `min` over the chain rather than the selected model's own figure, for the same
     /// reason the window accessor takes a `min`: the caller does not know which entry
     /// the request will land on, and a fallback to the smaller model must not carry a
-    /// `max_tokens` that model would reject.
+    /// `max_tokens` that model would reject. Unlike the window accessor it cannot narrow
+    /// to a serving SUBSET — see the production doc for why the absent gate is what
+    /// forbids it.
     ///
     /// The unknown-chain leg is asserted too, because it is the leg the clamp treats as
     /// "no ceiling from here" — a `Some(0)` or a panic there would silently refuse or
@@ -666,5 +810,101 @@ mod min_window_tests {
 
         assert_eq!(gw.min_context_window("c").await, Some(8_000));
         assert_eq!(gw.min_context_window("nope").await, None);
+    }
+
+    /// **AC1 + AC2** — the smallest window at or above the estimate, `None` when nothing
+    /// qualifies, `None` for an unknown chain.
+    ///
+    /// The straddle case is the one that matters and the one
+    /// `min_context_window_is_the_smallest_model_in_the_chain` cannot express: on the
+    /// SAME chain and the SAME request the two accessors give 8 000 and 200 000, and the
+    /// gap between them is the whole defect. 8 000 is the number the SP-DATA-5 clamp
+    /// subtracted the estimate from, saturating to 0 and refusing a request the 200k
+    /// entry serves happily.
+    ///
+    /// **The `est == window` boundary is admitted**, matching
+    /// `ContextWindowGate`'s `est > window` skip. The two must agree exactly or the
+    /// bound stops being sound: admit one more candidate than the gate does and the
+    /// clamp can bound by a window belonging to a model selection will never return;
+    /// admit one fewer and a request the gate would serve is bounded by a larger window
+    /// than the winner's. Pinned here rather than left to the `>=` reading well, because
+    /// `>` compiles just as happily.
+    ///
+    /// **AC2's own claim — it never returns a window BELOW `est`** — is stated as a
+    /// property over every case rather than as another literal, so a future entry added
+    /// to the fixture is covered by it automatically.
+    #[tokio::test]
+    async fn min_serving_context_window_is_the_smallest_window_that_can_hold_the_estimate() {
+        let gw = Gateway::new(
+            two_model_chain(model("big", 200_000), model("small", 8_000)),
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+
+        // Straddling the two: only `big` qualifies, so `big`'s window is the answer —
+        // where the plain chain minimum answers 8 000.
+        assert_eq!(
+            gw.min_serving_context_window("c", 20_000).await,
+            Some(200_000)
+        );
+        // Under both: every entry qualifies and the answer collapses to the chain
+        // minimum. This is the no-regression case, AC7's shape at the accessor level.
+        assert_eq!(gw.min_serving_context_window("c", 1_000).await, Some(8_000));
+        // Exactly `small`'s window: admitted, because `ContextWindowGate` skips only on
+        // `est > window`. One token more and `small` drops out of the set.
+        assert_eq!(gw.min_serving_context_window("c", 8_000).await, Some(8_000));
+        assert_eq!(
+            gw.min_serving_context_window("c", 8_001).await,
+            Some(200_000)
+        );
+        // Over every entry: the empty set, reported as `None` rather than as some
+        // fallback figure. The clamp turns this into "no window term", which hands the
+        // refusal to the gate.
+        assert_eq!(gw.min_serving_context_window("c", 200_001).await, None);
+        // An unknown chain, exactly as the two `min` accessors treat it.
+        assert_eq!(gw.min_serving_context_window("nope", 1).await, None);
+
+        // AC2 as a property: whatever it returns, it can hold the estimate it was asked
+        // about. This is what makes `window − est` unable to saturate to 0 — the way the
+        // chain minimum failed.
+        for est in [0u32, 1, 7_999, 8_000, 8_001, 20_000, 199_999, 200_000] {
+            if let Some(w) = gw.min_serving_context_window("c", est).await {
+                assert!(
+                    w >= est,
+                    "a serving window must be able to hold the estimate it was chosen \
+                     for: {w} < {est}"
+                );
+            }
+        }
+    }
+
+    /// **AC7** — on a HOMOGENEOUS chain the serving bound is the chain minimum, for
+    /// every estimate that any entry can hold.
+    ///
+    /// `min(S) == min(chain)` whenever every entry qualifies, and this is the claim that
+    /// makes the change additive for the single-model and equal-window configs that make
+    /// up most of the fixtures in this repo. Asserted as the two accessors AGREEING
+    /// rather than as a literal, because the point is the relationship, not the number.
+    #[tokio::test]
+    async fn min_serving_context_window_matches_the_chain_minimum_on_a_homogeneous_chain() {
+        let gw = Gateway::new(
+            two_model_chain(model("a", 8_000), model("b", 8_000)),
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+
+        for est in [0u32, 1, 4_000, 7_999, 8_000] {
+            assert_eq!(
+                gw.min_serving_context_window("c", est).await,
+                gw.min_context_window("c").await,
+                "every entry holds {est}, so the serving set is the whole chain and the \
+                 two bounds must be the same number"
+            );
+        }
+        // Past the shared window the sets diverge — the serving set empties while the
+        // chain minimum keeps answering 8 000. Asserted so the agreement above reads as
+        // "when every entry qualifies" rather than as "always".
+        assert_eq!(gw.min_serving_context_window("c", 8_001).await, None);
+        assert_eq!(gw.min_context_window("c").await, Some(8_000));
     }
 }

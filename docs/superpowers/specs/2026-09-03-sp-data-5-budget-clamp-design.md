@@ -153,26 +153,72 @@ For a budgeted run with a `Payload::Chat` only:
 
 ```
 remaining  = cap − spent                       // cap > spent: the existing gate already refused otherwise
-est_input  = est_input_tokens_pessimistic(&payload)
+est_input  = gateway::estimate_input_tokens_pessimistic(&payload)   // the GATEWAY's — see §5.3
 allowance  = remaining.saturating_sub(est_input)
-ceiling    = gateway.min_max_output_tokens(chain)      // None ⇒ no ceiling from here
 
-if allowance < MIN_OUTPUT_TOKENS  →  Refusal::BudgetExhausted { .., cause: BelowFloor }
+out_limit  = gateway.min_max_output_tokens(chain)                   // None ⇒ no term from here
+window     = gateway.min_serving_context_window(chain, est_input)   // None ⇒ NO term from here
+                    .map(|w| w − est_input)
+ceiling    = the min over whichever of { out_limit, window } are Some   // None if neither
+
+if allowance < MIN_OUTPUT_TOKENS  →  BelowFloor { window: None }    // the BUDGET cannot buy a reply
+if ceiling   < MIN_OUTPUT_TOKENS  →  BelowFloor { window }          // the MODEL has no room for one
 else                              →  max_tokens = min(allowance, ceiling ?? ∞, caller's max_tokens ?? ∞)
 ```
 
 `saturating_sub` matters: `est_input` can exceed `remaining`, and the floor check must see `0`
 rather than wrap.
 
-**The `ceiling` term was added by the whole-slice review, and it is not optional.** `allowance` is
+**The `window` term and the second floor check are NOT in the version of §5.2 this slice's plan was
+written from — they arrived in its own whole-slice review, and their bound has since changed.**
+Recorded here because for a day this section described a rule the code did not implement, and five
+other files cite this spec for the residual in §8.
+
+- **Added by the review (A1, a real defect).** The ceiling was `min_max_output_tokens` alone, and a
+  provider enforces `prompt + max_tokens <= context_window` as well. The UNBUDGETED path never
+  trips that, because `max_tokens: None` is omitted from the wire and the sum is never formed — so
+  bounding by the output limit alone reintroduced by the WINDOW route the exact regression that
+  term was added to prevent: a long-prompt call that succeeds unbudgeted hard-FAILS once a budget
+  is set. Measured on the 4096-window / 1024-output fixture: a prompt estimating 3500 left the
+  window 596 and the clamp emitted 1024, asking for 4524 against 4096.
+- **The second floor check is why the term cannot simply be applied.** A window term of `0` would
+  otherwise emit `max_tokens: Some(0)` — "generate nothing" — which the paragraph below rules out
+  for the output limit and is no better here. Refusing beats ignoring a sub-floor ceiling, because
+  ignoring it sends the over-large `max_tokens` the block exists to prevent.
+- **The bound was the CHAIN MINIMUM for one day, and it is now the serving set**
+  (`2026-09-04-sp-7a-serving-window-bound-design.md`). `min_context_window(chain) − est` is safe
+  for whichever candidate wins, but it is safe by being far too small: on a `[128k, 8k]` chain a
+  20 k prompt gave `8192.saturating_sub(20000) = 0`, under the floor, refused **before
+  `Gateway::execute`** — so SP-7a's `ContextWindowGate`, which would have served that prompt from
+  the 128 k entry, never ran. `min_serving_context_window(chain, est)` folds the min over
+  `{ m : m.context_window >= est }` instead, which is exactly the set the gate admits: the minimum
+  over it is safe for every member, and every member satisfies `window >= est`, so the subtraction
+  cannot saturate. **An empty set contributes no term at all** — the call is dispatched and the gate
+  refuses it with per-candidate diagnostics, which is the deliberate handover, since no cap raise
+  has ever made a prompt fit a window.
+- **So `BelowFloor { window: Some(w) }` means something narrower than it did.** It no longer means
+  "the prompt is bigger than the chain's weakest entry", and it never means "the prompt fits
+  nothing": `w >= est_input` holds by construction, so the input FITS and the shortfall is OUTPUT
+  room. The remedy is less input or a larger-window model in the chain — not the "route to a chain
+  whose smallest model has a larger window" the first message offered, which on a heterogeneous
+  chain names an entry already filtered out of the decision.
+
+**The `out_limit` term was added by the whole-slice review, and it is not optional.** `allowance` is
 a pure budget figure that knows nothing about the model: for any realistic whole-run cap it exceeds
 every current model's maximum output, and the providers reject that — Anthropic with a 400
 `invalid_request_error` — while every adapter here forwards the value verbatim. Without it, setting
 a budget HARD-FAILED the first call of a run that succeeds unbudgeted (measured: a cap of 10240 sent
 `Some(10239)` and the node failed). It is a `min` over the CHAIN, not over the selected model,
 because the clamp runs before selection and a request that fails over lands on a different entry;
-`None` (unknown chain) means "no ceiling from here", matching `over_budget`'s treatment of an
-unknown context window.
+`None` (unknown chain) means "no term from here".
+
+*(This paragraph named `ceiling` when the output limit was the only model term. `ceiling` is now the
+min of two, and the sentences here are about the output half alone. The window half's `None` means
+something DIFFERENT and stronger — not "unknown" but "nothing in this chain can hold the request" —
+which is why it hands the refusal to the gate rather than merely declining to bound. The original
+also justified the `None` arm by matching `over_budget`'s treatment of an unknown context window;
+`over_budget` was deleted by SP-7a, so that comparison now points at nothing and the reason stands
+on its own.)*
 
 **The floor check is ordered before the ceiling deliberately.** The floor asks whether the BUDGET
 can buy a useful reply; a model whose own limit is below `MIN_OUTPUT_TOKENS` is not a budget problem
@@ -216,6 +262,38 @@ counts, and which are pure JSON — the worst case for `chars / 4`).
 window-fit asks "will this fit" and wants to avoid false alarms; the budget asks "what is the worst
 this costs" and wants to avoid under-counting. One function cannot serve both, and merging them
 would silently change the window-fit behaviour this slice has no business touching.
+
+#### Correction, 2026-09-04 — both functions named above are DELETED, and the merge this section forbids is what shipped
+
+The section stands as the reasoning of the day, but every noun in it is gone. `est_tokens` and its
+`over_budget` caller went with SP-7a. The clamp's own `dispatch::est_input_tokens` — the "new
+pessimistic estimator" — and its last dependency `agent::prompt::est_tokens_pessimistic` went with
+the serving-window follow-on. **The orchestrator now holds no token estimator at all**; the clamp
+calls the gateway's `estimate_input_tokens_pessimistic` on the very `Payload` it is about to
+dispatch.
+
+**Not a tidy-up: the merge is what makes the window term sound.** Once the window term folds over
+`{ m : m.context_window >= est }`, "exactly the set the gate admits" is a claim about ONE `est`, and
+the two halves computed two. `dispatch::est_input_tokens` applied `ceil` **per string** over
+CHARACTERS and summed; the gateway's sums BYTES and applies `ceil` **once**. On ASCII
+`Σ ceil(Lᵢ/3) >= ceil(Σ Lᵢ/3)`, so the clamp's serving set was a strict SUBSET of the set selection
+drew from, and both reachable gaps ended in the `prompt + max_tokens > context_window` provider 400
+this term exists to prevent — one of them (`S_clamp` empty, no window term, `3800 + 1024` against a
+4096 window) strictly worse than the defect the follow-on set out to fix.
+
+**"One function cannot serve both" turned out to be the wrong axis.** It is true of the COST
+estimate, which still divides by 4 and omits tool schemas, and that separation is untouched. It was
+never true of the budget figure against the window figure: those two want the same bias — the
+pessimistic one — and keeping them apart bought nothing while leaving an invariant between two
+crates that nothing enforced. Aligning the formulas by hand was rejected for the same reason the
+drift was not caught: it ran the OTHER way on multi-byte text (bytes there, chars here), so neither
+figure bounded the other and no slack constant could have covered it. See the follow-on spec's §4.1.
+
+One consequence for this section's own arithmetic: the clamp's `est` is over **bytes** now, so
+`chars / 3` no longer describes it. Bytes ≥ chars is strictly more margin, and much more where the
+old figure was weakest — CJK is 3 bytes/char and tokenizes near 1 token/char, which `chars/3`
+under-counted threefold. One `ceil` instead of one per string is strictly LESS margin, by up to 2/3
+of a token per payload part.
 
 ### 5.4 Observability
 
@@ -339,7 +417,15 @@ which can never dispatch a call belongs on the precondition side; the floor wide
 
 1. A budgeted `Chat` request reaches the provider with `max_tokens = Some(remaining − est_input)`,
    and **never above the chain's own smallest `max_output_tokens`** — asserted against a double
-   that REFUSES an over-large value the way a real provider does.
+   that REFUSES an over-large value the way a real provider does. **Amended:** the ceiling gained a
+   second term in this slice's own review, so the criterion also requires the emitted value to
+   leave the prompt room inside the window of the candidate that actually WON. Carried by
+   `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits`, which pins
+   `est + emitted == 4096` exactly on the run that lands on the smallest admitted candidate. The
+   obvious form of that assertion is VACUOUS and shipped that way once — on a `[128k, 8k]` fixture
+   the output limit binds by ~187x, so `emitted <= 191_808` sits one line above `emitted <= 1024`
+   and stays green when the `− est` term is dropped or the accessor is folded with `.max()`. The
+   window term has to be the BINDING ceiling for the criterion to be able to fail.
 2. An **unbudgeted** run's request is byte-identical to today, and the estimator is not called.
 3. A caller-supplied `max_tokens` is never widened — `min` is taken, proven with a caller value
    both above and below the allowance.
@@ -383,6 +469,34 @@ which can never dispatch a call belongs on the precondition side; the floor wide
     the agent leg took the mutation green while a comment claimed otherwise.
 
 ## 8. Deferred
+
+- **Bounding the clamp by the SELECTED model rather than by a fold over the chain.** *(Recorded
+  2026-09-04. Five other files already cite "the clamp spec's §8 item" for this residual — the
+  SP-7a selection spec's §8, the serving-window follow-on's §2/§3/§7, `orchestrator-overview.md`'s
+  SP-7a entry, `executor/agent.rs`'s tombstone and `engine/mod.rs`'s accessor doc — and until now
+  it was not in this list, so every one of those pointers went nowhere. It is the clamp's residual,
+  so it belongs here.)*
+
+  The clamp sets `max_tokens` **before** selection, so both model terms have to be safe for
+  whichever candidate wins, and both are folds over the chain rather than facts about the winner. On
+  a heterogeneous chain a budgeted reply is therefore capped by the smallest SERVING window and the
+  smallest declared output limit, not by the winner's own — over-bounding, never under-bounding, so
+  it costs reply length rather than correctness.
+
+  The 2026-09-04 follow-on made the gap much smaller without closing it. Its serving-set bound is
+  what stops the clamp pre-empting `ContextWindowGate` entirely (see §5.2), and that was the
+  user-visible defect; what is left is precision. Closing it needs the run's budget plumbed INTO the
+  gateway, which is the boundary that currently keeps orchestrator state out of the gateway
+  cleanly — so this is an optimisation with an architectural price, not a fix.
+
+- **A sub-floor `min_max_output_tokens` renders as the BUDGET arm.** `BelowFloor.window`
+  discriminates the window term, and there are two model terms: when the OUTPUT limit is what lands
+  under `MIN_OUTPUT_TOKENS`, `window` is `None` and the operator is told to raise a cap that term
+  does not read either. Reachable — Rule 5 rejects only `max_output_tokens == 0`, so an entry
+  declaring 200 is valid config. Left because closing it means a THIRD message arm with a third
+  remedy ("drop that entry, or raise its declared limit"), which no test pins and which the
+  serving-window review did not ask for. The field's doc names it as a known misdirection rather
+  than claiming to discriminate every model bound.
 
 - A real tokenizer for an exact clamp (needs per-model vocabs, a per-chain mapping, and this
   heuristic as its fallback regardless).

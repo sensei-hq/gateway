@@ -178,12 +178,55 @@ impl ChatModel for RecordingAdapter {
 /// an earlier version of this sentence listed gemini among the substituting three.
 pub const FIXTURE_MAX_OUTPUT_TOKENS: u32 = 1024;
 
+/// The fixture chain's model CONTEXT WINDOW — the other half of the pair
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`] names, and named for the same reason: a test that sizes
+/// a prompt against this window has to compute from it rather than repeat `4096`, or the
+/// two drift and the test passes for the wrong reason.
+///
+/// It was a bare literal in [`single_chain_config`] and again in [`TWO_WINDOW_SMALL`],
+/// whose doc asserted the two were equal — an equality nothing enforced. The
+/// serving-window tests compute `window − est` to a single token, so an unenforced
+/// equality between the number they compute from and the number the config declares is
+/// exactly the kind of drift that turns a tight assertion into a vacuous one.
+///
+/// 4096 is also the smaller of the shipped presets (`gateway/src/catalog/presets.rs` is
+/// `8192 / 4096`), so a prompt that crowds this window is a realistic prompt rather than
+/// a fixture contrivance.
+pub const FIXTURE_CONTEXT_WINDOW: u32 = 4096;
+
+/// An output limit UNDER [`orchestrator_core::MIN_OUTPUT_TOKENS`] — the only way to
+/// reach the clamp's TIE between its two model bounds.
+///
+/// `binding_window` is set when the window term IS the ceiling, and the clamp's comment
+/// states that a tie counts as window-bound: with both terms on the same figure the
+/// window is a true cause and it is the half a cap raise cannot move. That rule is only
+/// OBSERVABLE through the refusal's wording, and the refusal only happens when the
+/// ceiling lands under the floor — so a tie has to be a tie BELOW 256, which
+/// [`FIXTURE_MAX_OUTPUT_TOKENS`] (1024) can never produce.
+///
+/// 200 is legal config: `collect_validation_errors`' Rule 5 rejects only
+/// `max_output_tokens == 0`, so a chain entry declaring 200 is accepted, and
+/// `Gateway::new` validates nothing at all. Contrived as a production figure, and the
+/// point is not realism — it is that the tie arm has no other door.
+pub const SUB_FLOOR_MAX_OUTPUT_TOKENS: u32 = 200;
+
 /// The shared single-chain `GatewayConfig` for the test harness: chain `"c"`
-/// resolves `TextChat` to router `"r"` / model `"m"` (context window 4096,
-/// [`FIXTURE_MAX_OUTPUT_TOKENS`] of output).
+/// resolves `TextChat` to router `"r"` / model `"m"`
+/// ([`FIXTURE_CONTEXT_WINDOW`] of context, [`FIXTURE_MAX_OUTPUT_TOKENS`] of output).
 /// Factored out of `build_gateway` so `scripted_gateway` (a different adapter,
 /// same topology) doesn't duplicate the routers/models/chains assembly.
 fn single_chain_config() -> GatewayConfig {
+    single_chain_config_with_output_limit(FIXTURE_MAX_OUTPUT_TOKENS)
+}
+
+/// [`single_chain_config`] with the model's `max_output_tokens` chosen by the caller.
+///
+/// One parameter and one caller besides the default
+/// ([`sub_floor_output_clamp_observing_gateway`]), rather than a second copy of the
+/// routers/models/chains assembly: the tie the clamp documents is a relation BETWEEN the
+/// output limit and the window term, so a fixture that varies one while sharing
+/// everything else is what makes the relation the only difference.
+fn single_chain_config_with_output_limit(max_output_tokens: u32) -> GatewayConfig {
     let mut routers = HashMap::new();
     routers.insert(
         "r".to_string(),
@@ -206,8 +249,8 @@ fn single_chain_config() -> GatewayConfig {
             provider: "r".to_string(),
             family: None,
             capabilities: vec![Capability::TextChat],
-            context_window: 4096,
-            max_output_tokens: FIXTURE_MAX_OUTPUT_TOKENS,
+            context_window: FIXTURE_CONTEXT_WINDOW,
+            max_output_tokens,
             pricing: None,
             catalog: None,
         },
@@ -225,8 +268,8 @@ fn single_chain_config() -> GatewayConfig {
             provider: "r".to_string(),
             family: None,
             capabilities: vec![Capability::TextEmbed],
-            context_window: 4096,
-            max_output_tokens: FIXTURE_MAX_OUTPUT_TOKENS,
+            context_window: FIXTURE_CONTEXT_WINDOW,
+            max_output_tokens,
             pricing: None,
             catalog: None,
         },
@@ -275,9 +318,10 @@ fn single_chain_config() -> GatewayConfig {
 /// The two windows of [`two_window_chain_config`], named so a test can compute the
 /// prompt size it needs from them instead of repeating literals that could drift apart.
 ///
-/// `SMALL` matches [`single_chain_config`]'s only model, so a prompt sized against one
-/// fixture behaves the same way in the other.
-pub const TWO_WINDOW_SMALL: u32 = 4096;
+/// `SMALL` IS [`single_chain_config`]'s only model's window — the same constant, not a
+/// matching literal — so a prompt sized against one fixture behaves the same way in the
+/// other and cannot stop doing so silently.
+pub const TWO_WINDOW_SMALL: u32 = FIXTURE_CONTEXT_WINDOW;
 /// See [`TWO_WINDOW_SMALL`]. Large enough that no fixture prompt in this repo approaches
 /// it, so "over the small window" and "under the big one" is a wide target.
 pub const TWO_WINDOW_BIG: u32 = 200_000;
@@ -564,6 +608,34 @@ pub async fn metered_latency_gateway(
 /// See [`ClampObservingAdapter`].
 pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 
+/// One entry per call: the resolved model id selection dispatched to.
+///
+/// A SECOND log rather than a wider [`MaxTokensLog`] element. Every clamp test that
+/// predates it reads `Vec<Option<u32>>` directly (`seen.first().copied().flatten()`,
+/// `seen.iter().all(Option::is_some)`), and widening the element to a tuple would have
+/// churned all of them to buy something only the serving-window tests need: WHICH
+/// candidate the clamp's value reached. That is their whole claim — the bound has to be
+/// safe for the model selection actually picked, not merely for some model in the chain.
+pub type ModelLog = Arc<Mutex<Vec<Option<String>>>>;
+
+/// One entry per call: the gateway's OWN pessimistic window estimate of the request the
+/// provider received, recomputed at the adapter from the `ChatRequest` it was handed.
+///
+/// A THIRD log for the same reason [`ModelLog`] is a second, and it buys the one thing
+/// neither of the others can: the wire-level invariant
+/// `est + max_tokens <= context_window(model)` — the rule a real provider enforces with
+/// a 400 — measured against the request that ACTUALLY went out rather than against a
+/// payload the test rebuilt by hand.
+///
+/// Recomputed rather than plumbed through because `ChatRequest`'s fields are a verbatim
+/// clone of `Payload::Chat`'s (`gateway/src/dispatch.rs::to_chat_request` — `messages`,
+/// `system`, `tools` all `.clone()`), so `estimate_input_tokens_pessimistic` over a
+/// reconstructed payload yields exactly the figure `engine::execute` computed and put on
+/// `SelectionCriteria::input_tokens_pessimistic`. A test that re-derived the estimate
+/// from the agent's registry instead would be asserting against its own model of the
+/// prompt assembler, which is the thing most likely to drift.
+pub type WindowEstimateLog = Arc<Mutex<Vec<u32>>>;
+
 /// Records the `max_tokens` each call carried, and HONOURS it in the usage it reports
 /// — `output_tokens = min(scripted_output, max_tokens)`.
 ///
@@ -604,6 +676,12 @@ pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 /// the whole-slice review found.
 pub struct ClampObservingAdapter {
     seen: MaxTokensLog,
+    /// The resolved model id of each call, in the same order as `seen`. See
+    /// [`ModelLog`] for why this is a separate log rather than a wider `seen` entry.
+    models: ModelLog,
+    /// The gateway's own window estimate of each call's request, in the same order as
+    /// `seen`. See [`WindowEstimateLog`].
+    ests: WindowEstimateLog,
     input_tokens: u32,
     /// What the model WOULD emit unclamped; the reported output is capped by
     /// `max_tokens`.
@@ -630,6 +708,26 @@ impl ChatModel for ClampObservingAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(req.max_tokens);
+        // Pushed BEFORE the over-limit refusal below, and in lockstep with `seen`, so a
+        // rejected call is still attributed to the candidate that rejected it. The two
+        // logs are read positionally by the serving-window tests.
+        self.models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.model.clone());
+        // Third log, same lockstep: what the GATEWAY's own estimator makes of the
+        // request that actually arrived. `ChatRequest` carries verbatim clones of the
+        // `Payload::Chat` fields the estimator reads, so rebuilding one here recovers the
+        // exact figure `engine::execute` computed — see [`WindowEstimateLog`].
+        self.ests.lock().unwrap_or_else(|e| e.into_inner()).push(
+            gateway::estimate_input_tokens_pessimistic(&kernel::types::request::Payload::Chat {
+                messages: req.messages.clone(),
+                system: req.system.clone(),
+                max_tokens: req.max_tokens,
+                temperature: req.temperature,
+                tools: req.tools.clone(),
+            }),
+        );
         if req.max_tokens.is_some_and(|m| m > self.max_output) {
             return Err(GatewayError::ProviderError {
                 adapter: self.id().to_string(),
@@ -663,22 +761,107 @@ impl ChatModel for ClampObservingAdapter {
 /// refuses one above [`FIXTURE_MAX_OUTPUT_TOKENS`] the way a real provider does.
 /// Returns the shared log so a test can assert what actually reached the provider —
 /// see [`ClampObservingAdapter`] for why each half matters.
+///
+/// The HOMOGENEOUS chain: one chat model, window 4096. The clamp's serving-window bound
+/// and the old chain-minimum bound agree on every request here — `min(S) == min(chain)`
+/// whenever every entry qualifies — which is exactly why this fixture is the right one
+/// for the no-regression half of that change and the wrong one for the benefit half.
+/// Reach for [`two_window_clamp_observing_gateway`] when the two bounds must DISAGREE.
 pub async fn clamp_observing_gateway(
     input_tokens: u32,
     scripted_output: u32,
 ) -> (Gateway, MaxTokensLog) {
+    let (gateway, seen, _models, _ests) =
+        clamp_observing_gateway_on(single_chain_config(), input_tokens, scripted_output).await;
+    (gateway, seen)
+}
+
+/// [`clamp_observing_gateway`] with the model's output limit at
+/// [`SUB_FLOOR_MAX_OUTPUT_TOKENS`] — the fixture in which the clamp's two model bounds
+/// can TIE at a figure under the output floor.
+///
+/// The adapter still enforces [`FIXTURE_MAX_OUTPUT_TOKENS`], and that mismatch is
+/// harmless HERE for a reason worth stating: this fixture exists for a case the clamp
+/// refuses BEFORE dispatch, so no `max_tokens` ever reaches the adapter to be judged. A
+/// test that used this fixture to make a call that actually goes out would be relying on
+/// the adapter to model a 200-token provider, which it does not.
+pub async fn sub_floor_output_clamp_observing_gateway(
+    input_tokens: u32,
+    scripted_output: u32,
+) -> (Gateway, MaxTokensLog) {
+    let (gateway, seen, _models, _ests) = clamp_observing_gateway_on(
+        single_chain_config_with_output_limit(SUB_FLOOR_MAX_OUTPUT_TOKENS),
+        input_tokens,
+        scripted_output,
+    )
+    .await;
+    (gateway, seen)
+}
+
+/// [`clamp_observing_gateway`] plus the [`WindowEstimateLog`] — the homogeneous chain,
+/// with what the GATEWAY made of each dispatched request's size.
+///
+/// A separate constructor rather than a wider return from the one above because that one
+/// has some thirty callers that destructure a pair. What this buys is the only invariant
+/// that spans both crates: `est + max_tokens <= context_window`, with `est` measured by
+/// the gateway's estimator on the request the provider received rather than recomputed by
+/// the test. A clamp that bounds on its OWN estimate satisfies every assertion phrased in
+/// terms of its own arithmetic and still violates this one.
+pub async fn window_watching_clamp_gateway(
+    input_tokens: u32,
+    scripted_output: u32,
+) -> (Gateway, MaxTokensLog, WindowEstimateLog) {
+    let (gateway, seen, _models, ests) =
+        clamp_observing_gateway_on(single_chain_config(), input_tokens, scripted_output).await;
+    (gateway, seen, ests)
+}
+
+/// [`clamp_observing_gateway`] over [`two_window_chain_config`] — `small` (4096) at
+/// priority 1, `big` (200 000) at priority 2 — returning the [`ModelLog`] and the
+/// [`WindowEstimateLog`] as well. Which candidate WON is the point of this fixture, so
+/// unlike the homogeneous constructors it hands back every log rather than a chosen pair.
+///
+/// The smallest fixture in which the clamp's window bound has two different answers, and
+/// therefore the only one that can show the serving-window bound doing anything. On a
+/// prompt between the two windows the chain MINIMUM is 4096 and the smallest window that
+/// can SERVE the prompt is 200 000; the first refuses the call before the gateway is
+/// asked and the second lets it through to `big`.
+///
+/// Both models declare [`FIXTURE_MAX_OUTPUT_TOKENS`], so the adapter's single
+/// `max_output` still models each of them faithfully — a heterogeneous OUTPUT limit
+/// would need a per-model figure and is a different question from this one.
+pub async fn two_window_clamp_observing_gateway(
+    input_tokens: u32,
+    scripted_output: u32,
+) -> (Gateway, MaxTokensLog, ModelLog, WindowEstimateLog) {
+    clamp_observing_gateway_on(two_window_chain_config(), input_tokens, scripted_output).await
+}
+
+/// The shared body of every `*clamp_observing_gateway*` above: the same adapter over whichever
+/// `GatewayConfig` the caller wants, so the homogeneous and heterogeneous fixtures
+/// cannot drift apart on the adapter's behaviour and start disagreeing for a reason
+/// that has nothing to do with their chains.
+async fn clamp_observing_gateway_on(
+    config: GatewayConfig,
+    input_tokens: u32,
+    scripted_output: u32,
+) -> (Gateway, MaxTokensLog, ModelLog, WindowEstimateLog) {
     let seen: MaxTokensLog = Arc::new(Mutex::new(Vec::new()));
+    let models: ModelLog = Arc::new(Mutex::new(Vec::new()));
+    let ests: WindowEstimateLog = Arc::new(Mutex::new(Vec::new()));
     let adapters = AdapterRegistry::new();
     adapters
         .register_chat(Arc::new(ClampObservingAdapter {
             seen: seen.clone(),
+            models: models.clone(),
+            ests: ests.clone(),
             input_tokens,
             scripted_output,
             max_output: FIXTURE_MAX_OUTPUT_TOKENS,
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
-    (Gateway::new(single_chain_config(), adapters, cb), seen)
+    (Gateway::new(config, adapters, cb), seen, models, ests)
 }
 
 /// A metered EMBEDDING double for chain `"emb"`, counting the calls that reach it.
