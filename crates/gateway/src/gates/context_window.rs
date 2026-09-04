@@ -45,14 +45,28 @@ use crate::skip_reason::SkipReason;
 /// What this comment used to say, and what is NOT true: that bounding output is the
 /// SP-DATA-5 clamp's job, so the boundary is safe. The clamp bounds `max_tokens` by a
 /// window only on a BUDGETED run with a `Chat` payload (`executor/dispatch.rs`;
-/// `budget: None` — every unbudgeted run, which is the default — never clamps), and when
-/// it does run it bounds by `min_context_window(chain)`, the chain MINIMUM this gate
-/// exists to stop trusting. So on the default path nothing downstream bounds output by
-/// the window at all. The `>` stands on the narrow-question argument above, not on a
-/// downstream guard.
+/// `budget: None` — every unbudgeted run, which is the default — never clamps). So on the
+/// default path nothing downstream bounds output by the window at all, and the `>` stands
+/// on the narrow-question argument above rather than on a downstream guard.
 ///
 /// Changing this to `>=` is therefore a design change needing that floor figure and an
 /// argument for it — not a bug fix.
+///
+/// # This gate's admission rule is now load-bearing OUTSIDE the gateway
+///
+/// `Gateway::min_serving_context_window(chain, est)` folds the minimum over
+/// `{ m : m.context_window >= est }` — deliberately the complement of the skip above —
+/// and the SP-DATA-5 clamp bounds a budgeted request's `max_tokens` by it. That bound is
+/// sound only because selection cannot return a candidate this gate skipped: the minimum
+/// over the admitted set is safe for whichever member wins.
+///
+/// Two consequences for anyone editing this file. **The boundary must stay in step:** the
+/// accessor's `>=` is the exact complement of this `>`, so moving one without the other
+/// makes the clamp reason about a set selection does not draw from. And **de-registering
+/// this gate is no longer a local change** — it would leave the clamp bounding by a
+/// window belonging to a model that could then be selected without fitting. The
+/// accessor's doc states that coupling as the price of not moving the clamp downstream of
+/// selection, which is the real fix and is deferred.
 pub struct ContextWindowGate;
 
 impl AdmissionGate for ContextWindowGate {

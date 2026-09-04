@@ -356,17 +356,23 @@ impl Executor {
     /// "halts before spending" property the pre-check had is preserved rather than traded
     /// away.
     ///
-    /// **On a BUDGETED run none of that applies, and the qualification is not a footnote.**
-    /// `dispatch_metered`'s SP-DATA-5 clamp — the sibling module `executor/dispatch.rs` —
-    /// runs before `Gateway::execute` and bounds `max_tokens` by
-    /// `min_context_window(chain) − est`, the chain MINIMUM this slice exists to stop
-    /// trusting. When that lands under `MIN_OUTPUT_TOKENS` it refuses with
-    /// `Refusal::BudgetExhausted { cause: BelowFloor }` and the gate is never asked, so a
-    /// budgeted `[128k, 8k]` chain still refuses the 20k prompt — as a durable PAUSE now
-    /// rather than the node failure the deleted halt produced. See
-    /// `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`, which
-    /// asserts both arms, and the SP-7a spec's §8, which records bounding the clamp by the
-    /// SELECTED candidate as the fix.
+    /// **A BUDGETED run gets the same benefit, and it did not at first.** SP-DATA-5's
+    /// clamp — the sibling module `executor/dispatch.rs` — runs before `Gateway::execute`
+    /// and bounds `max_tokens` by a window term, and for one day that term was
+    /// `min_context_window(chain) − est`: the chain MINIMUM, the very figure SP-7a exists
+    /// to stop trusting. On the `[128k, 8k]` example it saturated to 0, fell under
+    /// `MIN_OUTPUT_TOKENS`, and refused inside the orchestrator before the gate ran at
+    /// all. The SP-7a follow-on made the term
+    /// `min_serving_context_window(chain, est) − est` — the smallest window that can
+    /// actually HOLD the request, which is exactly the set the gate admits — so the clamp
+    /// no longer pre-empts it. See
+    /// `a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold`.
+    ///
+    /// The residual, which is smaller but real: the bound is still chain-wide rather than
+    /// per-selected-candidate, so on a heterogeneous chain a budgeted reply is capped by
+    /// the smallest SERVING window rather than the winner's. Bounding by the SELECTED
+    /// candidate is the clamp spec's §8 item and needs the run's budget inside the
+    /// gateway.
     async fn agent_turn_output(
         &self,
         ar: &AgentRun<'_>,

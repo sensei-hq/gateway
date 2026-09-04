@@ -564,6 +564,16 @@ pub async fn metered_latency_gateway(
 /// See [`ClampObservingAdapter`].
 pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 
+/// One entry per call: the resolved model id selection dispatched to.
+///
+/// A SECOND log rather than a wider [`MaxTokensLog`] element. Every clamp test that
+/// predates it reads `Vec<Option<u32>>` directly (`seen.first().copied().flatten()`,
+/// `seen.iter().all(Option::is_some)`), and widening the element to a tuple would have
+/// churned all of them to buy something only the serving-window tests need: WHICH
+/// candidate the clamp's value reached. That is their whole claim — the bound has to be
+/// safe for the model selection actually picked, not merely for some model in the chain.
+pub type ModelLog = Arc<Mutex<Vec<Option<String>>>>;
+
 /// Records the `max_tokens` each call carried, and HONOURS it in the usage it reports
 /// — `output_tokens = min(scripted_output, max_tokens)`.
 ///
@@ -604,6 +614,9 @@ pub type MaxTokensLog = Arc<Mutex<Vec<Option<u32>>>>;
 /// the whole-slice review found.
 pub struct ClampObservingAdapter {
     seen: MaxTokensLog,
+    /// The resolved model id of each call, in the same order as `seen`. See
+    /// [`ModelLog`] for why this is a separate log rather than a wider `seen` entry.
+    models: ModelLog,
     input_tokens: u32,
     /// What the model WOULD emit unclamped; the reported output is capped by
     /// `max_tokens`.
@@ -630,6 +643,13 @@ impl ChatModel for ClampObservingAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(req.max_tokens);
+        // Pushed BEFORE the over-limit refusal below, and in lockstep with `seen`, so a
+        // rejected call is still attributed to the candidate that rejected it. The two
+        // logs are read positionally by the serving-window tests.
+        self.models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.model.clone());
         if req.max_tokens.is_some_and(|m| m > self.max_output) {
             return Err(GatewayError::ProviderError {
                 adapter: self.id().to_string(),
@@ -663,22 +683,63 @@ impl ChatModel for ClampObservingAdapter {
 /// refuses one above [`FIXTURE_MAX_OUTPUT_TOKENS`] the way a real provider does.
 /// Returns the shared log so a test can assert what actually reached the provider —
 /// see [`ClampObservingAdapter`] for why each half matters.
+///
+/// The HOMOGENEOUS chain: one chat model, window 4096. The clamp's serving-window bound
+/// and the old chain-minimum bound agree on every request here — `min(S) == min(chain)`
+/// whenever every entry qualifies — which is exactly why this fixture is the right one
+/// for the no-regression half of that change and the wrong one for the benefit half.
+/// Reach for [`two_window_clamp_observing_gateway`] when the two bounds must DISAGREE.
 pub async fn clamp_observing_gateway(
     input_tokens: u32,
     scripted_output: u32,
 ) -> (Gateway, MaxTokensLog) {
+    let (gateway, seen, _models) =
+        clamp_observing_gateway_on(single_chain_config(), input_tokens, scripted_output).await;
+    (gateway, seen)
+}
+
+/// [`clamp_observing_gateway`] over [`two_window_chain_config`] — `small` (4096) at
+/// priority 1, `big` (200 000) at priority 2 — returning the model log as well.
+///
+/// The smallest fixture in which the clamp's window bound has two different answers, and
+/// therefore the only one that can show the serving-window bound doing anything. On a
+/// prompt between the two windows the chain MINIMUM is 4096 and the smallest window that
+/// can SERVE the prompt is 200 000; the first refuses the call before the gateway is
+/// asked and the second lets it through to `big`.
+///
+/// Both models declare [`FIXTURE_MAX_OUTPUT_TOKENS`], so the adapter's single
+/// `max_output` still models each of them faithfully — a heterogeneous OUTPUT limit
+/// would need a per-model figure and is a different question from this one.
+pub async fn two_window_clamp_observing_gateway(
+    input_tokens: u32,
+    scripted_output: u32,
+) -> (Gateway, MaxTokensLog, ModelLog) {
+    clamp_observing_gateway_on(two_window_chain_config(), input_tokens, scripted_output).await
+}
+
+/// The shared body of the two constructors above: the same adapter over whichever
+/// `GatewayConfig` the caller wants, so the homogeneous and heterogeneous fixtures
+/// cannot drift apart on the adapter's behaviour and start disagreeing for a reason
+/// that has nothing to do with their chains.
+async fn clamp_observing_gateway_on(
+    config: GatewayConfig,
+    input_tokens: u32,
+    scripted_output: u32,
+) -> (Gateway, MaxTokensLog, ModelLog) {
     let seen: MaxTokensLog = Arc::new(Mutex::new(Vec::new()));
+    let models: ModelLog = Arc::new(Mutex::new(Vec::new()));
     let adapters = AdapterRegistry::new();
     adapters
         .register_chat(Arc::new(ClampObservingAdapter {
             seen: seen.clone(),
+            models: models.clone(),
             input_tokens,
             scripted_output,
             max_output: FIXTURE_MAX_OUTPUT_TOKENS,
         }))
         .await;
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
-    (Gateway::new(single_chain_config(), adapters, cb), seen)
+    (Gateway::new(config, adapters, cb), seen, models)
 }
 
 /// A metered EMBEDDING double for chain `"emb"`, counting the calls that reach it.

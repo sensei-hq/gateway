@@ -4,7 +4,8 @@ use crate::test_support::{
     content_gated_gateway, demo_reference_gateway, demo_reference_tool_gateway,
     echo_system_gateway, failing_after_gateway, final_response, metered_embed_gateway,
     metered_gateway, metered_latency_gateway, prompt_recording_gateway, recording_gateway,
-    scripted_gateway, tool_call_response, two_window_chain_gateway, two_window_scripted_gateway,
+    scripted_gateway, tool_call_response, two_window_chain_gateway,
+    two_window_clamp_observing_gateway, two_window_scripted_gateway,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -14321,6 +14322,11 @@ async fn a_budgeted_call_reaches_the_provider_clamped() {
 /// An UNBUDGETED run is byte-identical: no clamp reaches the provider. This is
 /// SP-DATA-5's standing additivity guarantee and the cheapest regression test in the
 /// slice.
+///
+/// It is also **AC6 of the serving-window follow-on**, unchanged and untouched by it.
+/// That slice edited only the window term INSIDE the clamp, and this test's whole claim
+/// is that an unbudgeted run never enters the clamp at all — so the guarantee holds for
+/// the same reason it always did, not for a new one.
 #[tokio::test]
 async fn an_unbudgeted_call_is_not_clamped() {
     let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
@@ -14409,6 +14415,13 @@ async fn a_budgeted_call_is_never_clamped_above_the_models_output_limit() {
 /// (`gateway/src/catalog/presets.rs`), so any prompt over ~4096 tokens is in this
 /// territory, and SP-6 s4 bounds a single `## Context` section at 32 KiB — ~10.9k tokens
 /// on its own under `chars/3`.
+///
+/// **It is also AC7 of the serving-window follow-on: a HOMOGENEOUS chain is unchanged.**
+/// The fixture has one chat model, so every entry qualifies for any estimate it can hold
+/// and `min(serving) == min(chain)` — the bound moved from one to the other and this test
+/// did not shift by a token. Kept as it was, deliberately: an assertion that still reads
+/// `4096 − est` after the change is the evidence, and rewriting it in terms of the new
+/// accessor would have destroyed exactly that.
 #[tokio::test]
 async fn a_budgeted_call_is_never_clamped_past_the_context_window() {
     // 10_500 chars ⇒ est 3500 ⇒ the window allows 596, under the 1024 output limit.
@@ -14452,6 +14465,121 @@ async fn a_budgeted_call_is_never_clamped_past_the_context_window() {
         "the clamp must leave room for the prompt inside the context window: emitted \
          {emitted} + est {est} exceeds the 4096 window (window allows {window_allows}, \
          and the {FIXTURE_MAX_OUTPUT_TOKENS} output limit is NOT the binding term here)"
+    );
+}
+
+// ------------------------------------------------------------------------------------
+// SP-7a follow-on — the SERVING-window bound.
+//
+// The clamp above sets `max_tokens` BEFORE selection, so its window term has to be safe
+// for whichever candidate selection eventually picks. It used to take the smallest
+// window in the WHOLE chain, which is safe but far too strong: on a `[big, small]` chain
+// a prompt over `small`'s window drove the term to `min_context_window − est`, saturated
+// to 0, under `MIN_OUTPUT_TOKENS`, and the run was refused INSIDE the orchestrator —
+// before `Gateway::execute`, so SP-7a's `ContextWindowGate` never ran and its whole
+// benefit stopped at the boundary of a budgeted run.
+//
+// The bound is now the smallest window that can actually SERVE the request
+// (`Gateway::min_serving_context_window(chain, est)`) — exactly the candidate set the
+// gate admits, so the two components finally reason over the same set. `None` (nothing
+// can serve it) contributes NO window term at all: the call proceeds and the GATE
+// refuses it, with per-candidate diagnostics the clamp could never produce.
+// ------------------------------------------------------------------------------------
+
+/// **AC3 + AC4 + AC9 — a BUDGETED run serves a prompt only the chain's larger model can
+/// hold.** This is SP-7a's own AC1, which passed unbudgeted and failed budgeted, and it
+/// is the entire reason this follow-on exists.
+///
+/// `a_prompt_over_the_chain_minimum_is_served_by_the_larger_model` (near the top of this
+/// file) is the same claim on an UNBUDGETED run and passed the day SP-7a landed. It
+/// cannot catch this: it drives `two_window_chain_gateway`, whose adapter reports no
+/// usage at all, which a budgeted run refuses as `Unmetered` before anything about the
+/// window is decided. So the budgeted arm needed the clamp-observing double over the
+/// two-window chain, and until it existed nothing in the suite could tell that the
+/// benefit stopped short of exactly the runs an operator puts a cap on.
+///
+/// Three claims, and the second and third do not follow from the first:
+///
+/// - **AC3** the run completes and the dispatch goes to `big`. `small` is the priority-1
+///   entry, so landing on `big` is only possible because the gate removed it — which
+///   requires the request to have reached the gateway at all.
+/// - **AC4** the emitted `max_tokens` leaves the prompt room inside `big`'s window. The
+///   bound is only sound if it is safe for the candidate that actually won.
+/// - **AC9** it is also at or under the model's own `max_output_tokens`. A serving window
+///   of 200 000 is enormously wider than the 1024-token output limit, so this pins that
+///   widening the window term did not delete the OTHER term — the failure mode would be
+///   a `max_tokens` of ~192 000 that a real provider answers with a 400.
+#[tokio::test]
+async fn a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold() {
+    // Between the two windows: twice `small`'s in tokens, a factor of ~24 under `big`'s.
+    // Sized from the fixture's own constants so a change to either window, or to the
+    // estimator's divisor, moves the fixture with it instead of silently landing on the
+    // wrong side of a literal.
+    let prompt = "x".repeat((TWO_WINDOW_SMALL as usize) * 3 * 2);
+    let est = u32::try_from(prompt.len().div_ceil(3)).expect("fixture prompt fits a u32");
+    assert!(
+        est > TWO_WINDOW_SMALL && est < TWO_WINDOW_BIG,
+        "the prompt must sit BETWEEN the two windows or it proves nothing: {est} against \
+         {TWO_WINDOW_SMALL} / {TWO_WINDOW_BIG}"
+    );
+
+    // A cap far above anything in play, so the BUDGET is provably not what holds the
+    // emitted value down and cannot be confused with the window term.
+    const CAP: u64 = 1_000_000;
+    let (gateway, seen, models) = two_window_clamp_observing_gateway(10, 5_000).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(CAP))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", &prompt),
+            deps: vec![],
+        }],
+    };
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    assert!(
+        out.paused.is_none(),
+        "the 200k model can hold this prompt, so a budgeted run must not be refused \
+         before selection is even asked — this is the clamp bounding by the chain \
+         MINIMUM: {:?}",
+        out.paused
+    );
+    assert!(
+        out.failed.is_none(),
+        "and it must not fail either: {:?}",
+        out.failed
+    );
+
+    let models = models.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        models,
+        vec![Some("big".to_string())],
+        "exactly one dispatch, to `big` — `small` is the priority-1 entry, so this is \
+         only true because the request reached the gateway and the window gate removed it"
+    );
+
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let emitted = seen
+        .first()
+        .copied()
+        .flatten()
+        .expect("the budgeted call still carries a clamp");
+    assert!(
+        emitted <= TWO_WINDOW_BIG - est,
+        "AC4 — the clamp must leave the prompt room inside the window of the model it \
+         actually reached: emitted {emitted} + est {est} exceeds {TWO_WINDOW_BIG}"
+    );
+    assert!(
+        emitted <= FIXTURE_MAX_OUTPUT_TOKENS,
+        "AC9 — the output-limit term still applies independently. A {TWO_WINDOW_BIG}-token \
+         serving window leaves room for far more than the model can emit, and widening \
+         the window term must not widen the clamp past `max_output_tokens`: {emitted}"
     );
 }
 
@@ -24286,51 +24414,53 @@ fn over_window_agent_registry() -> Arc<Registry> {
     }))
 }
 
-/// SP-7a's benefit has a BOUNDARY, and this test is where it lies.
+/// **AC5 — an over-EVERY-window prompt is refused by the GATE, budgeted or not.**
 ///
-/// On an UNBUDGETED run — every pre-SP-DATA-5 run, and the default — an over-window
-/// agent prompt now reaches `Gateway::execute`, where the `ContextWindowGate` answers
-/// PER CANDIDATE and the node's failure names each model's own window and the remedy.
-/// That is the whole of what this slice buys, and it is a better-diagnosed terminal
-/// failure rather than a recoverable one (`AllGated` with no timed gate does not pause).
+/// This test used to record SP-7a's BOUNDARY, and the serving-window bound removed the
+/// boundary: it is now a convergence test. Both halves are kept, and the reason they are
+/// still two halves is that they travel completely different code before arriving at the
+/// same answer — (a) never enters the clamp at all (`budget: None`), while (b) enters it,
+/// finds `min_serving_context_window` empty, drops the window term, and dispatches.
 ///
-/// On a BUDGETED run it does NOT reach the gate. The SP-DATA-5 clamp runs first
-/// (`executor/dispatch.rs`) and bounds `max_tokens` by `min_context_window(chain) − est`
-/// — the chain MINIMUM, the very figure this slice exists to stop trusting — then
-/// refuses with `Refusal::BudgetExhausted { cause: BelowFloor }` when the resulting
-/// ceiling falls under `MIN_OUTPUT_TOKENS`.
+/// # What it asserted before, and why that is now the wrong answer
 ///
-/// # Deleting the pre-check DID change this arm, and an earlier version of this comment
-/// # said it did not
+/// A budgeted run PAUSED here, with `Refusal::BudgetExhausted { cause: BelowFloor }`:
+/// the clamp bounded by `min_context_window(chain) − est`, the 4096-token chain minimum
+/// against a ~33 334-token estimate, saturated to 0, under `MIN_OUTPUT_TOKENS`. That
+/// refusal fired before `Gateway::execute`, so the same request produced a budget-shaped
+/// pause with a chain-wide number when budgeted and a window-shaped node failure with
+/// per-candidate numbers when not. One condition, two components, two vocabularies — and
+/// the one that fired first was the one that misdirected.
 ///
-/// The halt ran in `agent_turn_output` BEFORE `dispatch_metered`, so on a budgeted run it
-/// fired first and the outcome was a terminal `NodeFailed` ("prompt over budget at node
-/// n1 turn 0: est 25000 > window 4096"). With it gone the clamp gets there first and the
-/// run PAUSES instead — a different outcome class, and one that cannot be cleared by the
-/// lever the pause used to name: the window term never reads the cap, so the same refusal
-/// arrives at a cap of 1e6, 1e8 or `i64::MAX`, and an operator who does what a budget
-/// pause asks re-pauses forever.
+/// Now the serving set is EMPTY (nothing in the chain holds 33 334 tokens), the clamp
+/// contributes no window term, and the call goes through to selection, which gates every
+/// candidate and returns `AllGated`. So the operator gets the same diagnosis either way.
 ///
-/// The refusal's WORDING is fixed rather than the flip: when the window is the binding
-/// term the message now says so and says a raise will not help, which is asserted below.
-/// The pause CLASS is deliberately kept — `RunPaused { resume_after: None }` is SP-DATA-3's
-/// HOTL class, and it preserves the run for an operator who widens the chain, where a
-/// `NodeFailed` destroys it. Moving the clamp's window term to the SELECTED candidate is
-/// the real fix and is the clamp spec's own §8 item; it needs selection to have happened
-/// first, so it is not this slice's.
+/// # The outcome CLASS changes for budgeted runs, and that is the deliberate part
 ///
-/// Both halves are asserted here so the boundary is a fact in the suite rather than a
-/// paragraph in a spec, and so the pause/fail split cannot drift without a red test. The
-/// unbudgeted arm asserts only the OUTCOME KIND, because
-/// [`an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis`] already
-/// pins the message; what is under test here is that the two runs end differently at all.
+/// It was a durable `RunPaused { resume_after: None }` and is now a terminal
+/// `NodeFailed`. That is a real loss — the pause preserved the run for an operator who
+/// widens the chain — and it is accepted because the pause was preserving the run against
+/// a remedy it could not name: a `BudgetExhausted` pause is cleared by
+/// `torii run wake --budget-tokens N`, and no cap raise has ever made a prompt fit a
+/// window. The unbudgeted path has always failed terminally on this condition, and one
+/// answer for one condition is worth more than a recoverable pause pointing at the wrong
+/// lever. `AllGated` carries `HumanAction::UseLargerContextWindow`, which names the real
+/// one.
+///
+/// The cap-irrelevance experiment the old version ran (drive the same graph at
+/// `u64::MAX / 2` and get the identical refusal) is kept and now proves something
+/// stronger: an astronomical cap produces the same GATE failure, so the outcome does not
+/// depend on the budget in either direction.
 #[tokio::test]
-async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked() {
+async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
     let graph = Graph {
         nodes: vec![agent_node("n1", "a", "hi")],
     };
 
-    // (a) UNBUDGETED: the request reaches the gateway, which gates on the window.
+    // (a) UNBUDGETED: the request reaches the gateway, which gates on the window. This
+    // arm is unchanged by the serving-window bound — `budget: None` never clamps — and
+    // is here as the reference answer the budgeted arm now has to match.
     let (gateway, calls) = clamp_observing_gateway(10, 100).await;
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
@@ -24346,8 +24476,7 @@ async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked(
     assert_eq!(node.0, "n1");
     assert!(
         msg.contains("context window"),
-        "the failure must carry the GATEWAY's diagnosis, which is the only way to tell \
-         it apart from the budgeted arm below: {msg}"
+        "the failure must carry the GATEWAY's diagnosis: {msg}"
     );
     assert!(
         out.paused.is_none(),
@@ -24357,12 +24486,12 @@ async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked(
     assert!(
         calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
         "and still no provider call — selection refuses before any dispatch, so the \
-         'halts before spending' property the pre-check had is preserved"
+         'halts before spending' property the deleted pre-check had is preserved"
     );
 
-    // (b) BUDGETED, with a cap far above anything in play: the clamp refuses first and
-    // the gate is never asked. A PAUSE, not a failure — a different outcome, a different
-    // remedy, and neither of them the window.
+    // (b) BUDGETED, cap far above anything in play. The clamp runs, finds that nothing
+    // in the chain can serve the request, and contributes NO window term — so the call
+    // reaches the same gate and gets the same answer.
     let (gateway_b, calls_b) = clamp_observing_gateway(10, 100).await;
     let journal_b = InMemoryJournal::new();
     let run_b = RunId(uuid::Uuid::new_v4());
@@ -24375,44 +24504,40 @@ async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked(
         .start(run_b, &graph)
         .await
         .expect("drives");
-    let pause = out_b
-        .paused
-        .as_ref()
-        .expect("the budgeted run pauses on the clamp rather than failing on the window");
-    assert_eq!(pause.node.0, "n1");
     assert!(
-        pause.reason.starts_with("context window: "),
-        "the WINDOW is the binding term here — the cap is 1 000 000 and the run has \
-         spent nothing — so the refusal must say so rather than reading as a budget \
-         problem: {}",
-        pause.reason
+        out_b.paused.is_none(),
+        "the clamp must NOT refuse this: nothing in the chain can serve the prompt, so \
+         its window term is absent rather than zero, and an absent term must not trip \
+         the output floor: {:?}",
+        out_b.paused
+    );
+    let (node_b, msg_b) = out_b.failed.as_ref().expect(
+        "a budgeted over-every-window run now fails on the gate, as an \
+                 unbudgeted one always did",
+    );
+    assert_eq!(node_b.0, "n1");
+    assert_eq!(
+        msg_b, msg,
+        "and the message is IDENTICAL to the unbudgeted arm's — the point of the \
+         handover is one failure with one owner, not a budget-flavoured paraphrase"
     );
     assert!(
-        pause.reason.contains("4096"),
-        "and name the window that bound it, which is the number an operator has to \
-         change: {}",
-        pause.reason
+        msg_b.contains("4096"),
+        "which means it names the candidate's own window, the number the operator has \
+         to change: {msg_b}"
     );
     assert!(
-        !pause.reason.contains("--budget-tokens"),
-        "and it must NOT point at a cap raise: the window term never reads the cap, so \
-         the identical refusal arrives at any cap whatever and an operator who raises \
-         it re-pauses on the same node forever: {}",
-        pause.reason
-    );
-    assert!(
-        out_b.failed.is_none(),
-        "a budgeted over-window run does not reach the gate at all: {:?}",
-        out_b.failed
+        !msg_b.contains("--budget-tokens"),
+        "and never points at a cap raise: no cap makes a prompt fit a window: {msg_b}"
     );
     assert!(
         calls_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
-        "neither path spends"
+        "neither path spends — the gate refuses before any dispatch"
     );
 
-    // The claim that the cap is irrelevant, as an experiment rather than an assertion
-    // about one number: an astronomically larger budget produces the SAME refusal. This
-    // is what makes "raising the cap cannot help" a measurement.
+    // The cap is irrelevant, as an experiment rather than an assertion about one number:
+    // an astronomically larger budget produces the SAME failure. Without this, "the
+    // budget plays no part" would rest on a single cap value.
     let (gateway_c, _calls_c) = clamp_observing_gateway(10, 100).await;
     let journal_c = InMemoryJournal::new();
     let run_c = RunId(uuid::Uuid::new_v4());
@@ -24425,16 +24550,119 @@ async fn a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked(
         .start(run_c, &graph)
         .await
         .expect("drives");
-    let pause_c = out_c
+    assert!(
+        out_c.paused.is_none(),
+        "a colossal cap does not change the outcome either: {:?}",
+        out_c.paused
+    );
+    assert_eq!(
+        out_c.failed.as_ref().map(|(_, m)| m.as_str()),
+        Some(msg.as_str()),
+        "the same gate failure at a cap of {} — the window question never reads the \
+         budget, in either direction",
+        u64::MAX / 2
+    );
+}
+
+/// **The surviving `BelowFloor { window: Some(_) }` arm, and its rewritten wording.**
+///
+/// AC5 above moved the "nothing fits" case out of this arm entirely, which raises the
+/// question of whether the arm is still reachable at all. It is, and it now means
+/// something narrower and strictly more useful: the prompt FITS — `window >= est` holds
+/// by construction of `min_serving_context_window` — but the smallest model that can
+/// hold it has under `MIN_OUTPUT_TOKENS` of room left beside it, so the reply would
+/// arrive truncated mid-sentence and flow downstream as work product.
+///
+/// The fixture is the homogeneous 4096-window chain and a prompt estimating at 4000
+/// tokens, leaving 96. Under the OLD chain-minimum bound this test would have passed for
+/// the wrong reason on any chain — the number was the same because there is only one
+/// model — which is exactly why the assertions below are about the message's CONTENT and
+/// the AC3 test is about a heterogeneous chain.
+///
+/// # What the message may no longer say
+///
+/// The old wording ended "no cap raise clears this: send less, or route to a chain whose
+/// smallest model has a larger window". Both halves of that remedy were written for a
+/// refusal that meant "your prompt does not fit", and this arm no longer means that: the
+/// prompt fits, and pointing at the chain's SMALLEST model is now pointing at a model
+/// that may have been filtered out of the decision altogether. The replacement says what
+/// bound it — the smallest window that can hold the prompt — and both remedies that
+/// actually move it.
+#[tokio::test]
+async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_window() {
+    // 12 000 chars ⇒ est 4000 against the fixture's 4096 window: it FITS (so the serving
+    // set is non-empty and the gate would admit it), leaving 96 for output — under the
+    // 256-token floor. One assertion of the arithmetic so a fixture change moves it.
+    let prompt = "x".repeat(12_000);
+    let est = prompt.len().div_ceil(3) as u64;
+    assert!(
+        est <= 4096 && 4096 - est < orchestrator_core::MIN_OUTPUT_TOKENS,
+        "the prompt must FIT the window and still leave under the floor: est {est} \
+         against 4096"
+    );
+
+    let (gateway, calls) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .start(
+            run,
+            &Graph {
+                nodes: vec![Node {
+                    id: NodeId("n1".into()),
+                    kind: model_call("c", &prompt),
+                    deps: vec![],
+                }],
+            },
+        )
+        .await
+        .expect("drives");
+
+    let pause = out
         .paused
         .as_ref()
-        .expect("a colossal cap does not help either");
+        .expect("a reply that cannot clear the output floor is refused before it is paid for");
+    assert_eq!(pause.node.0, "n1");
     assert!(
-        pause_c.reason.starts_with("context window: "),
-        "the same refusal at a cap of {} — the window term subtracts the estimate from \
-         the chain's smallest window and never looks at the budget: {}",
-        u64::MAX / 2,
-        pause_c.reason
+        pause.reason.starts_with("context window: "),
+        "the WINDOW is the binding term — the cap is 1 000 000 and nothing has been \
+         spent — so the prefix must not say `budget`: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("4096"),
+        "and it must name the serving window that bound it: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains("--budget-tokens"),
+        "and must not point at a cap raise, which cannot move a term that never reads \
+         the cap: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains("the chain's smallest context window"),
+        "and it must NOT describe the bound as the CHAIN's smallest window any more — \
+         that is the number this slice stopped using, and on a heterogeneous chain it \
+         names a model that was filtered out of the decision: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("can hold"),
+        "and it must say the input FITS the window it names. That is what a serving \
+         window certifies (`w >= est` by construction) and it is what tells an operator \
+         the shortfall is OUTPUT room rather than input room — the opposite diagnosis \
+         from the one the old chain-minimum wording gave: {}",
+        pause.reason
+    );
+    assert!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and it refuses BEFORE the call, so no input tokens are paid for a reply too \
+         short to use"
     );
 }
 

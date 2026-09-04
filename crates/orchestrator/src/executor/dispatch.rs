@@ -279,14 +279,46 @@ pub(super) enum BudgetRefusal {
     /// agrees everywhere else and understates it by exactly that difference here, which
     /// is the arm nothing else can observe.
     ///
-    /// `window` is `Some(w)` when the CHAIN's smallest context window — not the budget —
-    /// is what pushed the ceiling under the floor, and `w` is that raw window. It exists
-    /// because the two situations have opposite remedies and were reported identically:
-    /// the budget arm is cleared by `torii run wake --budget-tokens N`, and the window
-    /// arm cannot be cleared by any cap at all (the window term is
-    /// `min_context_window(chain) − est`, which never reads the cap, so the same refusal
-    /// arrives at 1e6 and at `u64::MAX`). Telling an operator to raise a cap that is
-    /// already astronomical is a round trip that ends where it started.
+    /// `window` is `Some(w)` when a MODEL bound — not the budget — pushed the ceiling
+    /// under the floor, and `w` is the raw window that did it: the smallest context
+    /// window in the chain that **can actually hold this call's input**. It exists
+    /// because the two situations have different remedies and were once reported
+    /// identically, in budget wording naming a cap raise.
+    ///
+    /// # What a `Some` MEANS changed with the serving-window bound
+    ///
+    /// The term used to be `min_context_window(chain) − est`, so a `Some(w)` meant "your
+    /// prompt is bigger than the chain's SMALLEST model" — a claim about a model the
+    /// request might never have been routed to, and one that swept up the genuinely
+    /// different "fits nothing at all" case with it. That case no longer arrives here.
+    /// An empty serving set yields NO window term, the call is dispatched, and the
+    /// gateway's `ContextWindowGate` refuses it as an `AllGated` naming each candidate's
+    /// own window and a `UseLargerContextWindow` remedy
+    /// (`an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not`).
+    ///
+    /// So a `Some(w)` now certifies something narrower and strictly true: **the input
+    /// FITS.** `w >= est_input` holds by construction of
+    /// `Gateway::min_serving_context_window`, and the refusal is about the room left
+    /// BESIDE the input. `w − est_input` is under [`orchestrator_core::MIN_OUTPUT_TOKENS`],
+    /// so the reply would arrive truncated mid-sentence and travel downstream as work
+    /// product — worse than not making the call.
+    ///
+    /// The remedies follow from that, and they are not the ones the old message named.
+    /// "Route to a chain whose smallest model has a larger window" was advice about the
+    /// wrong model: on a heterogeneous chain the smallest entry may already have been
+    /// filtered out of the decision, and widening it changes nothing. What moves this
+    /// refusal is sending less input, or putting a model with a larger window into the
+    /// chain.
+    ///
+    /// What has NOT changed is that the cap is not one of them, and the message still
+    /// says so. The window term reads no budget figure, so the identical refusal arrives
+    /// at a cap of 1e6 and at `u64::MAX`; and every round trip on this pause is a manual
+    /// `BudgetRaised` plus a `force_wake` by a human, so pointing at a cap that is
+    /// already astronomical costs an operator one of those and ends where it started.
+    /// (The slice design's §5 predicted this sentence would become false too. It did not
+    /// — the arithmetic is unchanged — and the design has been corrected rather than the
+    /// code made to match it; a comment that told an operator to try the cap here would
+    /// be a new false claim, not a repaired one.)
     BelowFloor {
         allowance: u64,
         est_input: u64,
@@ -573,21 +605,77 @@ impl Executor {
                 // for less. Same `None` handling as the output limit — an unknown chain
                 // yields no bound from here rather than a silent truncation.
                 //
-                // `binding_window` carries the chain's RAW smallest window when the
-                // window term is what produced the ceiling, and it exists purely so the
-                // refusal below can be truthful. Without it the two very different
-                // situations — "your cap is too small" and "your prompt does not fit any
-                // model in this chain" — reach the operator in identical budget wording,
-                // and only one of them is fixed by the `torii run wake --budget-tokens N`
-                // that wording names. A tie counts as window-bound: when both terms land
-                // on the same figure the window is a true cause of the refusal, and the
-                // window is the half a cap raise cannot move.
+                // **The window it subtracts from is the smallest one that can SERVE this
+                // request, not the chain's smallest — and the difference is a whole
+                // slice.** `min_context_window(chain)` was safe, because a value fitting
+                // the weakest entry fits every entry, and far too strong: on a
+                // `[128k, 8k]` chain a 20k prompt gave `8192 − 20000`, `saturating_sub`
+                // floored it at 0, the floor check below refused — and it refused HERE,
+                // inside the orchestrator, before `Gateway::execute` was called at all.
+                // So SP-7a's `ContextWindowGate`, which admits the 128k entry and serves
+                // the request, never ran on any budgeted run. Two components disagreed
+                // about one request and the upstream one won.
+                //
+                // `min_serving_context_window(chain, est)` folds the min over exactly the
+                // candidates the gate admits (`window >= est`). Selection can only return
+                // a member of that set, and every member is at least the minimum over it,
+                // so the bound is safe for whichever candidate wins WITHOUT knowing which
+                // — the property the chain minimum bought by being needlessly pessimistic.
+                // The accessor's own doc carries the full argument, including why
+                // bounding by the chain's LARGEST window was rejected.
+                //
+                // **`None` here means nothing in the chain can serve the request, and it
+                // must contribute NO window term** — not a zero, which would trip the
+                // floor below and re-create the early refusal this change exists to
+                // remove. The `(a, b) => a.or(b)` arm is what delivers that: with the
+                // output limit `Some` and the window `None` the ceiling is the output
+                // limit alone, the call proceeds, and the GATE refuses it — naming each
+                // candidate's own window, which is a diagnosis the clamp cannot produce.
+                // That handover is the design's choice, not a fallback: the clamp's
+                // `BelowFloor` is budget-flavoured and names a cap raise, and a cap raise
+                // has never been able to make a prompt fit a window.
+                //
+                // `est` is a `u64` (`est_input_tokens` widens each `usize` char count and
+                // sums them) and the accessor takes a `u32`, so the conversion SATURATES
+                // to `u32::MAX`. Deliberate, and safe in the only direction that matters:
+                // saturating can only ASK FOR A LARGER window than the true estimate
+                // needs, which shrinks the serving set and shrinks the bound. Truncating
+                // would do the opposite — wrap an astronomical estimate to a small one and
+                // bound by a window that cannot hold the prompt.
+                //
+                // Reaching it takes an estimate past 4.29 billion tokens, i.e. a prompt of
+                // some 12.9 billion characters, at which point the serving set is empty
+                // for every `context_window` short of `u32::MAX` itself and the refusal is
+                // the gate's. A config that literally declared `u32::MAX` would keep that
+                // entry in the set with a window term of 0 and refuse on the floor below,
+                // which is also correct — nothing is dispatched either way.
+                //
+                // `saturating_sub` on the next line is now UNREACHABLE saturation: every
+                // window in the serving set satisfies `w >= est_u32` by construction, so
+                // the subtraction is always exact. Kept rather than swapped for `-`
+                // because a plain subtraction would panic in debug and WRAP in release
+                // (the workspace profile sets no `overflow-checks`) if the accessor's
+                // filter were ever loosened, and a wrapped window term is an enormous
+                // `max_tokens` sent at a model that cannot take it.
+                //
+                // `binding_window` carries the RAW serving window when the window term is
+                // what produced the ceiling, and it exists purely so the refusal below can
+                // be truthful. Without it the two very different situations — "your cap is
+                // too small" and "the smallest model that can hold this prompt has no room
+                // left for a reply" — reach the operator in identical budget wording, and
+                // only one of them is fixed by the `torii run wake --budget-tokens N` that
+                // wording names. A tie counts as window-bound: when both terms land on the
+                // same figure the window is a true cause of the refusal, and the window is
+                // the half a cap raise cannot move.
                 let (ceiling, binding_window) = match request.chain.as_deref() {
                     Some(chain) => {
                         let out = self.gateway.min_max_output_tokens(chain).await;
-                        let min_win = self.gateway.min_context_window(chain).await;
-                        let window = min_win
-                            .map(|w| w.saturating_sub(u32::try_from(est).unwrap_or(u32::MAX)));
+                        let est_u32 = u32::try_from(est).unwrap_or(u32::MAX);
+                        let min_win = self
+                            .gateway
+                            .min_serving_context_window(chain, est_u32)
+                            .await;
+                        let window = min_win.map(|w| w.saturating_sub(est_u32));
                         let ceiling = match (out, window) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
@@ -831,13 +919,27 @@ impl Executor {
                     //
                     // **And when the WINDOW is what bound the ceiling, none of that
                     // arithmetic applies and the message says something else entirely.**
-                    // The window term is `min_context_window(chain) − est`, which never
-                    // reads the cap, so every figure above — headroom, needed, "raise it
-                    // with `torii run wake --budget-tokens N`" — names a lever that
-                    // cannot move this refusal: the identical pause arrives at a cap of
-                    // 1e6 and at one of `u64::MAX`. An operator who follows the budget
-                    // wording raises the cap, wakes the run, and re-pauses on the same
-                    // node having spent a manual round trip on nothing.
+                    // The window term is `min_serving_context_window(chain, est) − est`,
+                    // which never reads the cap, so every figure above — headroom,
+                    // needed, "raise it with `torii run wake --budget-tokens N`" — names
+                    // a lever that cannot move this refusal: the identical pause arrives
+                    // at a cap of 1e6 and at one of `u64::MAX`. An operator who follows
+                    // the budget wording raises the cap, wakes the run, and re-pauses on
+                    // the same node having spent a manual round trip on nothing.
+                    //
+                    // **What this arm MEANS is not what it meant before the serving-window
+                    // bound, and the wording is rewritten rather than rewired.** The term
+                    // was the chain MINIMUM, so this message used to fire on a prompt too
+                    // big for the chain's weakest entry — including one too big for every
+                    // entry — and named "the chain's smallest context window", a model the
+                    // request may never have been routed to. Now the window is the
+                    // smallest that CAN HOLD the input, so reaching this arm proves the
+                    // input fits and the shortfall is output room; and the fits-nothing
+                    // case does not reach it at all (empty serving set ⇒ no window term ⇒
+                    // the gate refuses, naming every candidate). The old remedy — "route
+                    // to a chain whose smallest model has a larger window" — was therefore
+                    // pointing at a model that may already have been filtered out of the
+                    // decision, where widening it changes nothing.
                     //
                     // The prefix differs too (`context window: ` rather than `budget: `),
                     // which is deliberate: that prefix is the operator- and test-visible
@@ -854,11 +956,13 @@ impl Executor {
                         let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
                         format!(
                             "context window: this call's input is estimated at {est_input} \
-                             tokens against the chain's smallest context window of {window}, \
-                             leaving {allowance} for output — below the {floor}-token floor. \
-                             The budget is not the binding term ({spent} of {budget} spent) \
-                             and no cap raise clears this: send less, or route to a chain \
-                             whose smallest model has a larger window."
+                             tokens; the smallest model in this chain that can hold it has \
+                             a {window}-token context window, leaving {allowance} for \
+                             output — below the {floor}-token floor, so the reply would be \
+                             cut off mid-sentence. The budget is not the binding term \
+                             ({spent} of {budget} spent) and raising the cap does not move \
+                             this: send less input, or put a model with a larger window in \
+                             this chain."
                         )
                     }
                     BudgetRefusal::BelowFloor {

@@ -220,16 +220,18 @@ pub fn truncate_prompt_to_bound(text: String, max: usize) -> String {
 ///
 /// This is the human path's answer to the same problem, and it differs because the failure
 /// modes differ: an over-window model call falls through to a LARGER candidate in the same
-/// chain — true since SP-7a on an UNBUDGETED run, and the reason that slice exists; before
-/// it, the orchestrator refused such a call outright against the chain's smallest window —
-/// whereas a human-backed node that fails takes the whole run terminal AFTER the upstream
-/// tokens have been spent.
+/// chain — true since SP-7a, and the reason that slice exists; before it, the orchestrator
+/// refused such a call outright against the chain's smallest window — whereas a
+/// human-backed node that fails takes the whole run terminal AFTER the upstream tokens
+/// have been spent.
 ///
-/// The unbudgeted qualifier is load-bearing rather than pedantic: on a run with a token
-/// cap the SP-DATA-5 clamp (`executor/dispatch.rs`) still bounds by
-/// `min_context_window(chain)` BEFORE selection happens and refuses with a durable pause,
-/// so the fall-through never occurs there. See the SP-7a spec's §8 and
-/// `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`.
+/// This paragraph used to carry an "on an UNBUDGETED run" qualifier, because SP-DATA-5's
+/// clamp (`executor/dispatch.rs`) bounded by `min_context_window(chain)` BEFORE selection
+/// and refused a budgeted run with a durable pause, so the fall-through never happened
+/// there. The SP-7a follow-on bounds by the smallest window that can SERVE the request
+/// instead, which is the set the gate admits, so the qualifier is gone: budgeted and
+/// unbudgeted runs both fall through. See
+/// `a_budgeted_run_serves_a_prompt_only_the_larger_model_can_hold`.
 ///
 /// The budget is split EVENLY across dependencies rather than first-come-first-served, so
 /// one verbose upstream cannot crowd the others out of the question entirely — the human is
