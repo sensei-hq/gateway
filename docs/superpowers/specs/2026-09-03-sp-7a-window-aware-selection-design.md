@@ -109,6 +109,16 @@ The two want opposite biases for the same reason `est_tokens` and `est_tokens_pe
 functions in the orchestrator: window-fit asks "what is the worst this could be", cost asks "what
 will this probably run to".
 
+> **Correction, 2026-09-04** — the analogy has expired; the conclusion has not. Both orchestrator
+> functions are now DELETED (`est_tokens` with its callers in this slice, `est_tokens_pessimistic`
+> in the serving-window follow-on), and the pair was cost-vs-window rather than a live illustration
+> of opposite biases: a BUDGET estimate wants pessimism for the same reason a window estimate does
+> — an over-count refuses early, and an under-count overspends. That is why the follow-on could
+> hand the budget clamp the window estimator with no bias conflict. What stands unchanged is the
+> reason `estimate_input_tokens` and `estimate_input_tokens_pessimistic` are still two functions in
+> the GATEWAY: the cost gate prices, the window gate fits, and on `Embed` they do not even measure
+> the same quantity (sum vs max).
+
 The accepted cost, stated plainly: a pessimistic estimate can **skip a model the prompt would
 actually have fitted**, sending the request to a larger, likely costlier candidate. That is the
 cheaper error — the alternative is a provider 400 — and it is visible, because the skip is recorded
@@ -172,6 +182,12 @@ not carry one.
 `executor/agent.rs`'s `over_budget` call, its `PromptOverBudget` append, and the `min_win` field
 threaded through `AgentRun` all go. `min_context_window` itself stays — the SP-DATA-5 clamp uses it,
 and §8 records why it is still the right bound there for now.
+
+> **Correction, 2026-09-04** — the clamp no longer uses it. The serving-window follow-on
+> (`2026-09-04-sp-7a-serving-window-bound-design.md`) moved the clamp's window term to
+> `min_serving_context_window(chain, est)`, so `min_context_window` has NO production caller; it is
+> kept as a `pub` read accessor and as the contrast the sibling's argument is made against, and its
+> own doc says so. See that spec's §7 for the standing decision not to delete it.
 
 `OrchestratorError::PromptOverBudget` becomes unconstructed. It is **removed**, not left dangling: a
 variant no code can produce is a claim the type makes and the code does not honour, and the whole
@@ -301,6 +317,29 @@ journaled into `RunPaused` and read back by `torii status`.
   failure destroys it. Asserted in
   `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`, including the
   cap-independence.
+
+  > **Correction, 2026-09-04 — this whole item is CLOSED, and not the way it predicted.** The
+  > follow-on slice (`2026-09-04-sp-7a-serving-window-bound-design.md`) made the clamp's window
+  > term `min_serving_context_window(chain, est) − est`: the minimum over exactly the candidate set
+  > the gate admits. So **AC1 now holds on a BUDGETED run too**, and it holds *without* moving the
+  > clamp downstream of selection — the paragraph above says that move is what it would take, and
+  > that turned out to be one way rather than the only way. A pre-selection fold over the admitted
+  > set is safe for whichever candidate wins, because every member of the set is at least the
+  > minimum over it.
+  >
+  > Two things the follow-on changed that this text still describes in the old terms: the term is
+  > no longer `min_context_window(chain) − est`, and the `[128k, 8k]` / 20 k example no longer
+  > refuses at all — it dispatches to `big`. What remains deferred is the strictly more precise
+  > post-selection bound (the clamp spec's §8), which is now an optimisation rather than the fix.
+  >
+  > The refusal that survives means something narrower: the prompt FITS the smallest window that
+  > can hold it, and the shortfall is OUTPUT room. The "nothing fits anything" case is the gate's
+  > now, and that hands a budgeted run a terminal `NodeFailed` where it used to get a durable
+  > pause — the one user-visible regression, recorded in the follow-on's §8.
+  >
+  > Also corrected there: the clamp and the gate were computing `est` with two different functions,
+  > which broke the soundness argument in a narrow but reachable band. They are one function now
+  > (follow-on §4.1).
 - **A per-attachment token term for the pessimistic estimate** (§4). Owed by the first caller that
   attaches media; the term belongs in tokens, added after the divide, and must not be derived from
   the base64 length.

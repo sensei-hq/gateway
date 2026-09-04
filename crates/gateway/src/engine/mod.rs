@@ -30,9 +30,14 @@ mod exhaustion;
 mod panel;
 mod stream;
 mod util;
+/// The window estimator, re-exported out of the crate for the orchestrator's budget
+/// clamp. Its own doc carries why the surface is worth it: the clamp bounds `max_tokens`
+/// by [`Gateway::min_serving_context_window`] on this figure, and a SECOND estimator
+/// computing "the same" number was a live defect for a day. One function, two callers.
+pub use util::estimate_input_tokens_pessimistic;
 use util::{
-    call_estimate, estimate_input_tokens, estimate_input_tokens_pessimistic, request_input_text,
-    stream_error_code, usage_value, window_start,
+    call_estimate, estimate_input_tokens, request_input_text, stream_error_code, usage_value,
+    window_start,
 };
 
 /// Core gateway orchestrator.
@@ -233,9 +238,12 @@ impl Gateway {
     ///
     /// # Why the bound is sound
     ///
-    /// Let `S = { m in chain : m.context_window >= est }`.
+    /// Let `S = { m in chain : m.context_window >= est }`, **for the one `est` the caller
+    /// and the gate share** — see the section below, which is not a caveat but the
+    /// premise every bullet here rests on.
     ///
-    /// - Selection can only return a member of `S` — the gate skips every non-member.
+    /// - Selection can only return a member of `S` — the gate skips every non-member,
+    ///   on that same `est`.
     /// - This returns `min { m.context_window : m in S }`.
     /// - Every `m in S` has `m.context_window >= min(S)`, so bounding output by
     ///   `min(S) − est` leaves at least that much room in EVERY admissible candidate,
@@ -250,15 +258,39 @@ impl Gateway {
     /// components refusing one condition in two vocabularies means the one that fires
     /// first is the one that misdirects.
     ///
-    /// # The coupling this creates, stated plainly
+    /// # The premise: ONE `est`, and it shipped violated
     ///
-    /// Soundness depends on the gate being REGISTERED and judging on the same estimate.
-    /// Remove the gate and this bound could name a window belonging to a model selection
-    /// would then return without it fitting. That is a real dependency between two
-    /// crates, and it is why "bound by the chain's LARGEST window" — the other one-call
-    /// change that fixes the reported symptom — was rejected: this version degrades to
-    /// OVER-bounding if the coupling breaks, because `min(S) >= min(chain)`, where the
-    /// largest would under-bound and send a big model's `max_tokens` to a small one.
+    /// Every bullet above says `est`, and for a day the two halves computed two different
+    /// numbers. The clamp had its own estimator (`dispatch::est_input_tokens`) applying
+    /// `ceil` per string and summing over CHARACTERS; the gate judged on
+    /// [`crate::estimate_input_tokens_pessimistic`], summing BYTES and applying `ceil`
+    /// once. On ASCII `Σ ceil(Lᵢ/3) >= ceil(Σ Lᵢ/3)`, so the clamp's figure was the
+    /// LARGER one and `S_clamp` a strict SUBSET of the set selection drew from — which
+    /// falsifies the first bullet outright and, with it, the `S`-empty handover ("nothing
+    /// can serve it" was decided on a number the gate did not use). Both reachable
+    /// consequences ended at a provider 400 on a budgeted run: an empty `S_clamp` against
+    /// a non-empty `S_gate` dropped the window term entirely, and a `S_clamp` missing the
+    /// small candidate bound by a big model's window and sent it to the small one.
+    ///
+    /// It is closed structurally rather than by agreement: the clamp calls the gate's own
+    /// estimator, on the very `Payload` it is about to dispatch, so `est_clamp` and
+    /// `est_gate` are one value and cannot drift. That is what the `pub` on
+    /// [`crate::estimate_input_tokens_pessimistic`] is for, and it is why aligning the two
+    /// formulas by hand was rejected — the drift ran the OTHER way on multi-byte text
+    /// (bytes here, chars there), so neither figure bounded the other and no slack
+    /// constant could have covered it. Pinned across the crate boundary by the
+    /// orchestrator's `the_clamp_bounds_max_tokens_by_the_estimate_the_gate_will_judge_by`
+    /// and `the_serving_window_bound_is_safe_for_the_smallest_candidate_the_gate_admits`.
+    ///
+    /// # The coupling that remains, stated plainly
+    ///
+    /// Soundness still depends on the gate being REGISTERED. Remove it and this bound
+    /// could name a window belonging to a model selection would then return without it
+    /// fitting. That is a real dependency between two crates, and it is why "bound by the
+    /// chain's LARGEST window" — the other one-call change that fixes the reported
+    /// symptom — was rejected: this version degrades to OVER-bounding if the coupling
+    /// breaks, because `min(S) >= min(chain)`, where the largest would under-bound and
+    /// send a big model's `max_tokens` to a small one.
     ///
     /// The boundary is `>=`, mirroring the gate's `est > window` skip exactly. A request
     /// of precisely `window` tokens is held by that model, so it belongs to `S`; the two
