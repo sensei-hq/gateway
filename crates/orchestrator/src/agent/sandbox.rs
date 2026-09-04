@@ -38,6 +38,16 @@ pub enum KillReason {
 ///
 /// Note: on Darwin `setrlimit(RLIMIT_AS)` returns EINVAL, so a `mem_bytes: Some(_)` cap makes the
 /// child fail-closed (spawn `Err` — it refuses rather than running uncapped); Linux enforces it.
+/// The TOTAL grace `spawn_capped` gives its two reader threads to drain after the process
+/// group has been killed — shared by stdout and stderr, not granted to each.
+///
+/// Module-scope so the tests that assert a wall bound derive it from this rather than
+/// hardcoding a number. They used to hardcode: the capture path's real worst case was
+/// `2 × CAPTURE_GRACE` while one test asserted a 5s bound, leaving under a second of margin
+/// and failing about one full-suite run in six. A bound and the constant it must clear
+/// cannot be allowed to drift apart when they live in two files.
+pub(crate) const CAPTURE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 // The thin wrapper is reached by tests + `MacosSandbox`; on Linux the only in-crate caller is
 // `LinuxSandbox`, which uses `spawn_capped_with` directly, so allow dead_code for it there.
 #[allow(dead_code)]
@@ -188,9 +198,27 @@ pub(crate) fn spawn_capped_with(
     // past the group kill; don't block the caller forever on EOF. Give the readers a short grace
     // to drain, then return with whatever was captured. The escapee stays OS-alive but
     // Seatbelt-confined; the wall cap's caller-return guarantee is preserved.
-    const CAPTURE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+    //
+    // ONE deadline shared by both streams, not one grace each. `CAPTURE_GRACE` is documented
+    // above as "a short grace to drain" — that is a property of the CALL, and two sequential
+    // `recv_timeout(CAPTURE_GRACE)` calls silently made the real bound `2 × CAPTURE_GRACE`,
+    // because a stdout that never EOFs consumes its whole grace before stderr's even starts.
+    //
+    // That doubling is what made `a_backgrounded_straggler_is_reaped_on_clean_exit` flaky: its
+    // 5s assertion sat barely above the fixed path's own 4s worst case, so under full-suite
+    // load — where process spawn and scheduling eat the difference — it failed roughly one run
+    // in six while passing every time in isolation. The bound was not too tight; the path was
+    // twice as slow as its own comment claimed. Fixing the test's number instead would have
+    // preserved a 4s stall on every escaped-descendant capture in production.
+    //
+    // `saturating_sub` on the remainder: if stdout used the entire grace, stderr gets a
+    // zero-length wait, which `recv_timeout` treats as a single non-blocking poll — still
+    // correct (a reader that has already sent is picked up), and it cannot extend the total.
+    let deadline = std::time::Instant::now() + CAPTURE_GRACE;
     let stdout = out_rx.recv_timeout(CAPTURE_GRACE).unwrap_or_default();
-    let stderr = err_rx.recv_timeout(CAPTURE_GRACE).unwrap_or_default();
+    let stderr = err_rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or_default();
 
     let killed = if wall_killed {
         Some(KillReason::Wall)
@@ -577,9 +605,16 @@ mod tests {
             Some(KillReason::Wall),
             "expected a wall-timeout kill"
         );
+        // Derived, for the same reason as the two below: the killed `sleep` holds both pipes,
+        // so this path pays the capture grace in full. At `2 × CAPTURE_GRACE` it was
+        // 150ms + 4s against a hardcoded 5s — the same sub-second margin that made
+        // `a_backgrounded_straggler_is_reaped_on_clean_exit` fail one full-suite run in six.
+        // It had not failed yet; it was the same defect waiting for a slower machine.
+        let bound = Duration::from_millis(150) + CAPTURE_GRACE + Duration::from_secs(3);
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "took too long: the wall timer did not kill it"
+            start.elapsed() < bound,
+            "took too long: the wall timer did not kill it (elapsed {:?}, bound {bound:?})",
+            start.elapsed()
         );
     }
 
@@ -596,9 +631,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.killed, Some(KillReason::Wall));
+        // Derived — same exposure as its sibling above.
+        let bound = Duration::from_millis(150) + CAPTURE_GRACE + Duration::from_secs(3);
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "process-group kill did not reap the forked child"
+            start.elapsed() < bound,
+            "process-group kill did not reap the forked child (elapsed {:?}, bound {bound:?})",
+            start.elapsed()
         );
     }
 
@@ -615,9 +653,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.exit_code, Some(0));
+        // Derived from CAPTURE_GRACE, not hardcoded. This assertion used to read `< 5s`
+        // against a capture path whose own worst case was `2 × CAPTURE_GRACE` = 4s, so it
+        // carried under a second of margin and failed roughly one full-suite run in six
+        // (never in isolation — the load is what ate the margin). The capture now shares ONE
+        // deadline across both streams, so the fixed path is bounded by CAPTURE_GRACE, and
+        // this bound is that plus a generous allowance for spawn and scheduling under load.
+        let bound = CAPTURE_GRACE + Duration::from_secs(3);
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "straggler not reaped — spawn_capped hung on the pipe"
+            start.elapsed() < bound,
+            "straggler not reaped — spawn_capped hung on the pipe (elapsed {:?}, bound {bound:?})",
+            start.elapsed()
         );
     }
 
@@ -628,9 +674,14 @@ mod tests {
         // EOF). The grandchild syncs on a pipe so it has provably setsid()'d BEFORE the direct
         // child (its parent) exits — otherwise the straggler-reap would race and kill it first,
         // making this test only intermittently exercise the escape. The stray grandchild sleeps 8s
-        // (self-cleans): longer than the fixed path's ~4s (2×CAPTURE_GRACE), so a regression to a
-        // blocking capture would wait the full 8s and blow the 6s bound; short enough not to bloat
+        // (self-cleans): longer than the fixed path's CAPTURE_GRACE, so a regression to a
+        // blocking capture would wait the full 8s and blow the bound; short enough not to bloat
         // the parallel test run or destabilize sibling wall-timer tests.
+        //
+        // The fixed path used to be ~4s here (`2 × CAPTURE_GRACE`, one grace per stream) and
+        // this comment said so. Both streams now share one deadline, so it is CAPTURE_GRACE —
+        // which is why the 8s straggler still separates a working capture from a blocking one
+        // with room to spare.
         let start = std::time::Instant::now();
         let out = spawn_capped(
             &argv(&[
@@ -645,9 +696,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.exit_code, Some(0));
+        // Also derived. The escapee holds BOTH pipes, so this is the path that actually
+        // consumes the whole grace — and the one the shared deadline halves.
+        let bound = CAPTURE_GRACE + Duration::from_secs(4);
         assert!(
-            start.elapsed() < Duration::from_secs(6),
-            "capture blocked on a session-escaped descendant holding the pipe (elapsed {:?})",
+            start.elapsed() < bound,
+            "capture blocked on a session-escaped descendant holding the pipe (elapsed {:?}, \
+             bound {bound:?})",
             start.elapsed()
         );
     }

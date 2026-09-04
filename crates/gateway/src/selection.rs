@@ -24,6 +24,16 @@ pub struct SelectionCriteria {
     pub chain: Option<String>,
     pub budget: Option<f64>,
     pub input_tokens: Option<u32>,
+    /// The pessimistic input estimate, read only by the
+    /// [`crate::gates::context_window::ContextWindowGate`].
+    ///
+    /// A SECOND field beside `input_tokens` rather than a replacement for it, for the
+    /// reason argued in `engine::util::estimate_input_tokens_pessimistic`: the cost gate
+    /// and the window gate want opposite biases over the same payload, so collapsing
+    /// them to one number is precisely what that argument rules out. `None` admits every
+    /// candidate — a caller that reaches selection without an estimate is not making a
+    /// claim about size, and refusing it would be a filter on missing data.
+    pub input_tokens_pessimistic: Option<u32>,
 }
 
 /// A model that passed all validation checks and is ready for execution.
@@ -58,11 +68,14 @@ pub struct SelectionResult {
 /// Resolves which model(s) to use for a given request via 3-tier resolution
 /// (direct, named chain, capability). Structural resolution (router/model
 /// lookup) happens per path; the shared admission pipeline then runs the
-/// ordered [`AdmissionGate`]s (capability, connection cooldown, circuit breaker, budget) and the
-/// [`RoutingStrategy`] orders the admitted candidates.
+/// ordered [`AdmissionGate`]s (capability, connection cooldown, circuit breaker,
+/// model lockout, budget, context window) and the [`RoutingStrategy`] orders the
+/// admitted candidates. The list below is the one place these are registered — keep
+/// every enumeration in this file in step with it.
 pub struct ModelSelectionService<'a> {
     config: &'a GatewayConfig,
-    /// Ordered admission gates: capability, connection cooldown, circuit breaker, budget.
+    /// Ordered admission gates: capability, connection cooldown, circuit breaker,
+    /// model lockout, budget, context window.
     gates: Vec<Box<dyn AdmissionGate>>,
     /// Endpoint health read port (the circuit breaker implements it).
     health: &'a dyn EndpointHealthRead,
@@ -89,6 +102,37 @@ impl<'a> ModelSelectionService<'a> {
                 Box::new(CircuitBreakerGate),
                 Box::new(crate::gates::lockout::ModelLockoutGate),
                 Box::new(BudgetGate),
+                // LAST. The vector is ordered and `admit` returns the FIRST skip, so this
+                // position decides which reason a multiply-gated candidate reports — and
+                // that is a behaviour, not a presentation detail: `gate_status()` makes
+                // `CircuitOpen`/`Cooling`/a timed lockout `Timed`, which becomes
+                // `AllGated { resume_after: Some(t) }` and a durable PAUSE at the
+                // orchestrator's `classify_gateway_error`, while `OverContextWindow` is
+                // `Terminal` — `resume_after: None`, a `NodeFailed`.
+                //
+                // **After the three HEALTH gates (cooldown, breaker, lockout), and that
+                // is the load-bearing half.** A candidate that is both over-window and
+                // circuit-open must report the BREAKER, because that one clears by
+                // itself; reporting the window instead turns a transient provider outage
+                // into a permanently dead run. Pinned by
+                // `a_health_skip_is_reported_ahead_of_the_window_for_the_same_candidate`
+                // and, at the engine boundary where the pause/fail split is visible, by
+                // `engine::tests::an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause`.
+                //
+                // **After `BudgetGate` too, and that half is a JUDGEMENT with a cost.**
+                // An earlier version of this comment claimed every gate ahead of this one
+                // is "either structural or health", and that is simply false: `OverBudget`
+                // is `Terminal(RaiseBudget)` and a `CreditsExhausted`/auth lockout is
+                // `Terminal(TopUpCredits/RotateCredential)`. `all_gated_error` keeps the
+                // FIRST terminal remedy it meets, so a request that is over budget AND
+                // over every window is reported as `RaiseBudget` and says nothing about
+                // the window: the operator raises the cap, retries, and only then learns
+                // the prompt does not fit. Accepted deliberately — money is the
+                // irreversible lever, and a caller that has set a cap wants to hear about
+                // the cap first — but it is a two-step diagnosis, not a free ordering,
+                // and `a_budget_skip_is_reported_ahead_of_the_window` pins it so the
+                // choice cannot drift by accident.
+                Box::new(crate::gates::context_window::ContextWindowGate),
             ],
             health: circuit_breaker,
             router_health,
@@ -149,6 +193,7 @@ impl<'a> ModelSelectionService<'a> {
             capability: criteria.capability.clone(),
             budget: criteria.budget,
             input_tokens: criteria.input_tokens,
+            input_tokens_pessimistic: criteria.input_tokens_pessimistic,
             health: self.health,
             now: Instant::now(),
             config: self.config,
@@ -228,7 +273,8 @@ impl<'a> ModelSelectionService<'a> {
     /// `RouterDisabled`), then the model (missing → `ModelNotFound`). No
     /// provider fallback. `priority = 1`; `api_model_id` is 2-level
     /// (model_config override else model id). The shared gate pipeline
-    /// (capability, connection cooldown, circuit breaker, budget) runs in [`Self::admit`].
+    /// (capability, connection cooldown, circuit breaker, model lockout, budget,
+    /// context window) runs in [`Self::admit`].
     fn validate_direct(
         &self,
         router_name: &str,
@@ -301,8 +347,8 @@ impl<'a> ModelSelectionService<'a> {
     /// (falling back to the model's provider), then validate it (missing →
     /// `RouterNotFound`, disabled → `RouterDisabled`). `priority = entry.priority`;
     /// `api_model_id` is 3-level (entry override → model_config → model id). The
-    /// shared gate pipeline (capability, connection cooldown, circuit breaker, budget) runs in
-    /// [`Self::admit`].
+    /// shared gate pipeline (capability, connection cooldown, circuit breaker, model
+    /// lockout, budget, context window) runs in [`Self::admit`].
     fn validate_chain_entry(
         &self,
         entry: &ChainEntry,
@@ -552,6 +598,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_some());
@@ -575,6 +622,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -600,6 +648,7 @@ mod tests {
             chain: Some("chat_chain".to_string()),
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert_eq!(result.all_candidates.len(), 2);
@@ -625,6 +674,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_some());
@@ -665,6 +715,7 @@ mod tests {
                 chain: None,
                 budget: None,
                 input_tokens: None,
+                input_tokens_pessimistic: None,
             });
             assert_eq!(result.chain.as_ref().unwrap().id, "aaa_chain");
         }
@@ -686,6 +737,7 @@ mod tests {
             chain: Some("chat_chain".to_string()),
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_some());
@@ -714,6 +766,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -748,6 +801,7 @@ mod tests {
             chain: Some("chat_chain".to_string()),
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_some());
@@ -777,6 +831,7 @@ mod tests {
             chain: Some("chat_chain".to_string()),
             budget: Some(0.001),
             input_tokens: Some(1000),
+            input_tokens_pessimistic: None,
         });
 
         // gemma3:27b has no pricing -> passes budget (free)
@@ -808,6 +863,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_some());
@@ -830,6 +886,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -851,6 +908,7 @@ mod tests {
             chain: Some("nonexistent_chain".to_string()),
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -873,6 +931,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -899,6 +958,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -933,6 +993,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -959,6 +1020,7 @@ mod tests {
             chain: None,
             budget: Some(0.0001),
             input_tokens: Some(1000),
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -985,6 +1047,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert!(result.selected.is_none());
@@ -1012,6 +1075,7 @@ mod tests {
             chain: Some("embed_chain".to_string()),
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         assert_eq!(result.all_candidates.len(), 1);
@@ -1057,6 +1121,7 @@ mod tests {
             chain: Some("bad_chain".to_string()),
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         // ghost_model should be skipped, gemma3:27b should be selected
@@ -1107,6 +1172,7 @@ mod tests {
             chain: Some("bad_router_chain".to_string()),
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
 
         // gemma3:27b with nonexistent router should be skipped
@@ -1135,6 +1201,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
         // Current behavior: direct validates the router first.
         assert!(matches!(
@@ -1157,6 +1224,7 @@ mod tests {
             chain: None,
             budget: None,
             input_tokens: None,
+            input_tokens_pessimistic: None,
         });
         // Direct does NOT provider-fallback today → empty router → "router not found".
         assert!(result.selected.is_none());
@@ -1164,5 +1232,316 @@ mod tests {
             result.skipped[0].reason,
             SkipReason::RouterNotFound
         ));
+    }
+
+    // -----------------------------------------------------------------------------
+    // SP-7a — the `ContextWindowGate` seen through the whole selection service.
+    //
+    // The gate's own unit tests (`gates/context_window.rs`) call `evaluate` directly, so
+    // they pass whether or not the gate is in `ModelSelectionService::new`'s vector.
+    // These do not: they go through `select_all`, which is the only place registration
+    // is observable.
+    // -----------------------------------------------------------------------------
+
+    /// A `TextChat` chain of two models differing ONLY in context window — AC1's chain,
+    /// and the smallest config in which the window question has two different answers.
+    ///
+    /// `small` is deliberately given priority **1** and `big` priority 2, so the model
+    /// that CANNOT hold a large request is the one selection would otherwise return
+    /// first. A test that ordered them the other way would still pass with the gate
+    /// deleted.
+    fn two_model_chain_windows(big: u32, small: u32) -> GatewayConfig {
+        let mut routers = HashMap::new();
+        routers.insert(
+            "r".to_string(),
+            RouterConfig {
+                url: "http://localhost".to_string(),
+                api_key_env: None,
+                api_key: None,
+                enabled: true,
+                timeout_ms: None,
+                headers: HashMap::new(),
+            },
+        );
+
+        let mut models = HashMap::new();
+        for (id, context_window) in [("big", big), ("small", small)] {
+            models.insert(
+                id.to_string(),
+                ModelConfig {
+                    id: id.to_string(),
+                    api_model_id: None,
+                    provider: "r".to_string(),
+                    family: None,
+                    capabilities: vec![Capability::TextChat],
+                    context_window,
+                    max_output_tokens: 4096,
+                    // No pricing, so the `BudgetGate` admits both unconditionally and
+                    // the only gate that can separate these two is the window one.
+                    pricing: None,
+                    catalog: None,
+                },
+            );
+        }
+
+        let mut chains = HashMap::new();
+        chains.insert(
+            "win_chain".to_string(),
+            FallbackChainConfig {
+                id: "win_chain".to_string(),
+                capability: Capability::TextChat,
+                models: vec![
+                    ChainEntry {
+                        model: "small".to_string(),
+                        router: Some("r".to_string()),
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                    ChainEntry {
+                        model: "big".to_string(),
+                        router: Some("r".to_string()),
+                        api_model_id: None,
+                        priority: 2,
+                    },
+                ],
+                fallback_triggers: vec![],
+            },
+        );
+
+        GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        }
+    }
+
+    /// Criteria over `win_chain` carrying only the PESSIMISTIC estimate.
+    ///
+    /// `input_tokens` (the cost figure) stays `None` on purpose: with no pricing in the
+    /// fixture the `BudgetGate` ignores it anyway, and leaving it empty means a wiring
+    /// that fed the window gate the cost field would admit everything and redden these
+    /// tests instead of quietly agreeing with them.
+    fn criteria_with_pessimistic(est: Option<u32>) -> SelectionCriteria {
+        SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("win_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: est,
+        }
+    }
+
+    /// AC1 — a heterogeneous chain serves a prompt only its larger model can hold.
+    ///
+    /// This is the whole slice in one assertion. Before it, the orchestrator refused
+    /// this request outright against the chain's 8k MINIMUM and never asked the 128k
+    /// model. The gate has to be REGISTERED for this to hold; calling it directly, as
+    /// its own unit tests do, cannot tell whether it runs.
+    #[test]
+    fn a_chain_serves_a_prompt_only_its_larger_model_can_hold() {
+        let config = two_model_chain_windows(128_000, 8_192);
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&criteria_with_pessimistic(Some(20_000)));
+        let admitted: Vec<String> = result
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect();
+        assert!(
+            admitted.contains(&"big".to_string()),
+            "the 128k model holds 20k and must be admitted: {admitted:?}"
+        );
+        assert!(
+            !admitted.contains(&"small".to_string()),
+            "the 8k model cannot hold 20k and must be skipped: {admitted:?}"
+        );
+        assert_eq!(
+            result.selected.map(|s| s.model),
+            Some("big".to_string()),
+            "and the request must actually be routed to it — `small` is the \
+             priority-1 entry, so this is only true because the gate removed it"
+        );
+    }
+
+    /// AC3 — over EVERY window is an all-gated selection, recorded with a typed reason
+    /// per candidate rather than degrading to a bare `NoCandidates`.
+    ///
+    /// What the CALLER then receives is asserted at the engine boundary
+    /// (`engine::tests::a_request_over_every_window_is_all_gated_with_the_numbers`),
+    /// because `all_gated_error` lives there — and it is a terminal failure, not a
+    /// pause. Here the claim is narrower and is the one selection owns: every candidate
+    /// is skipped, and each skip says which window it lost to.
+    #[test]
+    fn a_prompt_over_every_window_gates_every_candidate() {
+        let config = two_model_chain_windows(128_000, 8_192);
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&criteria_with_pessimistic(Some(200_000)));
+        assert!(
+            result.all_candidates.is_empty(),
+            "nothing in the chain can hold 200k: {:?}",
+            result
+                .all_candidates
+                .iter()
+                .map(|c| &c.model)
+                .collect::<Vec<_>>()
+        );
+        let windows: Vec<u32> = result
+            .skipped
+            .iter()
+            .filter_map(|s| match s.reason {
+                SkipReason::OverContextWindow { window, .. } => Some(window),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            windows,
+            vec![8_192, 128_000],
+            "BOTH candidates must be skipped for the window, each naming its OWN — a \
+             single chain-wide figure is exactly what this slice replaced: {:?}",
+            result.skipped
+        );
+    }
+
+    /// The gate's POSITION in the vector, pinned by its consequence.
+    ///
+    /// `admit` returns the FIRST skip, so where `ContextWindowGate` sits decides which
+    /// reason a multiply-gated candidate reports — and that is not cosmetic. A skip
+    /// reason's `gate_status()` is what `all_gated_error` aggregates: `CircuitOpen` is
+    /// `Timed`, which becomes `AllGated { resume_after: Some(t) }` and a durable PAUSE at
+    /// `classify_gateway_error`; `OverContextWindow` is `Terminal`, which becomes
+    /// `resume_after: None` and a `NodeFailed`. So a candidate that is both over-window
+    /// and circuit-open must surface the BREAKER, or a transient provider outage
+    /// permanently kills every run whose prompt is also too large for that entry.
+    ///
+    /// Nothing enforced this before: moving `Box::new(ContextWindowGate)` from last to
+    /// FIRST in `ModelSelectionService::new` left the whole workspace green, while
+    /// changing this candidate's reported reason from `CircuitOpen` to
+    /// `OverContextWindow`. The engine-level consequence is asserted in
+    /// `engine::tests::an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause`;
+    /// this is the same claim where the ordering actually lives.
+    #[test]
+    fn a_health_skip_is_reported_ahead_of_the_window_for_the_same_candidate() {
+        let config = two_model_chain_windows(128_000, 8_192);
+        let cb = test_cb();
+        // Trip `small`'s breaker Open. It is ALSO the candidate that cannot hold the
+        // request below, which is the whole point: two gates fire on one candidate.
+        cb.can_execute("r:small");
+        for _ in 0..5 {
+            cb.record_failure("r:small");
+        }
+        assert!(
+            !cb.can_execute("r:small"),
+            "the fixture needs the breaker genuinely open"
+        );
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&criteria_with_pessimistic(Some(20_000)));
+        let small = result
+            .skipped
+            .iter()
+            .find(|s| s.model == "small")
+            .expect("`small` is skipped twice over and must be recorded");
+        assert!(
+            matches!(small.reason, SkipReason::CircuitOpen { .. }),
+            "the BREAKER must win: it is `Timed`, so the caller can pause and retry, \
+             where `OverContextWindow` is `Terminal` and kills the run. Registering the \
+             window gate ahead of the health gates inverts this: {:?}",
+            small.reason
+        );
+    }
+
+    /// The budget half of the same ordering, pinned because it is a JUDGEMENT rather
+    /// than a forced move.
+    ///
+    /// Both `OverBudget` and `OverContextWindow` are `Terminal`, so unlike the breaker
+    /// case neither ordering costs a pause — what it costs is a round trip. Reporting
+    /// budget first means an operator whose request is over budget AND over every window
+    /// raises the cap, retries, and only then learns the prompt does not fit; reporting
+    /// the window first means the mirror image. Money-first is the shipped choice (see
+    /// the registration comment), and this test is what makes reversing it a deliberate
+    /// edit instead of an accident of vector order.
+    #[test]
+    fn a_budget_skip_is_reported_ahead_of_the_window() {
+        let mut config = two_model_chain_windows(128_000, 8_192);
+        // Price both models so the `BudgetGate` has an estimate to judge. The figures
+        // only have to exceed the caller's budget; `max_output_tokens` alone (4096 at
+        // $1/1k) puts every candidate over a $0.01 cap.
+        for m in config.models.values_mut() {
+            m.pricing = Some(crate::types::config::ModelPricing {
+                input_per_1k: 1.0,
+                output_per_1k: 1.0,
+                per_request: None,
+            });
+        }
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&SelectionCriteria {
+            budget: Some(0.01),
+            // The COST gate reads this one; the window gate reads the other. Both
+            // candidates are over both.
+            input_tokens: Some(20_000),
+            ..criteria_with_pessimistic(Some(200_000))
+        });
+        assert!(result.all_candidates.is_empty(), "everything is gated");
+        for s in &result.skipped {
+            assert!(
+                matches!(s.reason, SkipReason::OverBudget { .. }),
+                "money is reported first, deliberately — see the registration comment \
+                 in `ModelSelectionService::new` for the accepted cost: {} reported {:?}",
+                s.model,
+                s.reason
+            );
+        }
+    }
+
+    /// AC4 — an in-window request selects byte-identically to one carrying no estimate.
+    /// The additivity guarantee: registering a sixth gate must not perturb any request
+    /// that fits.
+    #[test]
+    fn an_in_window_request_selects_unchanged() {
+        let config = two_model_chain_windows(128_000, 8_192);
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let names = |r: &SelectionResult| -> Vec<String> {
+            r.all_candidates.iter().map(|c| c.model.clone()).collect()
+        };
+        let with = svc.select_all(&criteria_with_pessimistic(Some(1_000)));
+        let without = svc.select_all(&criteria_with_pessimistic(None));
+        assert_eq!(
+            names(&with),
+            names(&without),
+            "a request that fits every window must select the same candidates, in the \
+             same order, as one carrying no estimate at all"
+        );
+        assert_eq!(
+            names(&with),
+            vec!["small".to_string(), "big".to_string()],
+            "and that order is the chain's own priority order, unchanged"
+        );
+        assert!(
+            with.skipped.is_empty() && without.skipped.is_empty(),
+            "an in-window request records no skips at all"
+        );
     }
 }

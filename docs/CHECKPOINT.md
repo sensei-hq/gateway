@@ -1,48 +1,39 @@
 # Checkpoint
 
-**Slice: SP-DATA-5 follow-on — the budget clamp. COMPLETE, reviewed, pushed.** PR #51 is open
-against `main` and awaiting the mandatory human review. Next action: merge it.
+**SP-7a (window-aware selection) — COMPLETE. All seven tasks done, on `develop`, unpushed.**
 
-## Done
+## What shipped
 
-A budgeted `Chat` carries `max_tokens = min(remaining − est_input, the chain's smallest
-max_output_tokens, the chain's context window − est_input, the caller's own)`, set at the single
-`dispatch_metered` chokepoint, so the PROVIDER enforces the cap rather than our arithmetic. Below a
-`MIN_OUTPUT_TOKENS` (256) allowance the run refuses through the existing durable pause and makes
-**no call at all**. Unbudgeted runs byte-identical. **The claim this slice does NOT make:** the
-overshoot is **bounded by the input-estimate error, biased toward refusing early — NOT eliminated**.
+`ContextWindowGate` — the sixth `AdmissionGate`, registered LAST — asks the window question PER
+CANDIDATE, so `[128k, 8k]` serves a 20k prompt instead of refusing it against the chain minimum. Over
+EVERY window is an `AllGated` naming each candidate's window, the estimate and
+`HumanAction::UseLargerContextWindow`: refused, never truncated. `PromptOverBudget`, `over_budget`,
+`est_prompt_tokens`, `est_tokens` gone; when BUDGETED the clamp still refuses before selection.
 
-## The whole-slice review (`/sensei:review`) — 4 HIGH, 6 MEDIUM, all fixed
+**Task 7 = the gate + the sweep.** `orchestrator-overview.md` now records SP-7a shipped and SP-7 as
+three slices (a selection / b context budgeting / c semantic activation), split because 7a changes
+WHICH MODEL serves a prompt and not one byte of it while `agent_input_hash` hashes
+`{chain, system, messages, tools}` — 7b's truncation moves that key, 7a does not. Plus 3 slice-table
+rows and 2 stale claims (`README.md`'s "per-turn window budget"; the Gherkin "smallest model").
 
-Five parallel adversarial lenses. Security returned NO FINDINGS; the sensei daemon was down so every
-MCP check was NOT RUN and fell back to git/grep.
+## Verified — real exit codes
 
-- `b22cce2` **A** — the ceiling bounded OUTPUT but not the CONTEXT WINDOW, so a long-prompt call that
-  succeeds unbudgeted hard-FAILED once a budget was set, as `NodeFailed` (unrecoverable by `wake`).
-  Plus two coverage holes: the clamp was unobserved on the AGENT and SELECTOR paths, and the
-  estimate's `system`/`tools` terms were unwired at the call site — both mutations reddened nothing.
-- `210d098` **B** — the floor's recommended raise went stale (a sibling spends after the pause, since
-  `drive` does not stop at one), and the follow-up `Spent` message named no figure at all. Now stated
-  as headroom above FINAL spend.
-- `d19f2bf` **C** — six doc surfaces still describing the pre-clamp contract, incl. a config
-  reference claiming to list "all" validation rules while listing 4 of 5, and the fence census
-  saying 3 `input_hash` call sites where there are 5.
+`cargo test --workspace` **1714 passed / 0 failed / 56 ignored, exit 0** (35 suites) · `clippy
+--workspace --all-targets -- -D warnings` **0** · `fmt --all --check` **0** · `cargo doc` unresolved
+links **16 = baseline**. No container started; `$DATABASE_URL` never read.
 
-## Verified at `d19f2bf` — real exit codes
+## Known-broken — one PRE-EXISTING flake, not this slice
 
-`cargo test --workspace` **1686 passed / 0 failed / 56 ignored, exit 0** · `clippy --workspace
---all-targets -- -D warnings` **exit 0** · `fmt --all --check` **exit 0** · `cargo doc` unresolved
-links **16**, the baseline. No database started; `$DATABASE_URL` never read.
+`executor::tests::both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` failed 1 of 4
+full-workspace runs (`under-estimated` warn uncaptured; the `clamp bit` info beside it captured).
+Only a doc comment changed in Rust this round. ~17 tests hit that `tracing::warn!` callsite with no
+subscriber on their thread and one asserts it ⇒ thread-local `set_default` racing the global
+callsite-`Interest` cache. Green 6/6 isolated, 20/20 loaded, 1-threaded — no red-first repro, so
+reported not patched; likely fix `rebuild_interest_cache()` after `set_default`.
 
 ## Next command
 
-`gh pr merge 51 --merge`, then `git merge origin/main && git push origin develop`.
-
-## Known-broken / open
-
-Nothing broken. **One PRE-EXISTING flake, NOT a regression:**
-`a_backgrounded_straggler_is_reaped_on_clean_exit` (SP-4 sandbox) failed 1 of 6 runs on its 5s wall
-bound, 0 of 10 in isolation, 0 in CI; wants a wider bound or an injected clock, not a retry wrapper.
-Known gap written into the new code rather than hidden: when the WINDOW is the binding term, the
-refusal still reads as a budget problem and names a raise that cannot help. **The sensei daemon is
-not running, so this file is the only durable record.**
+`git push origin develop` (the coordinator pushes), then the `develop` → `main` PR — merge
+`origin/main` into `develop` FIRST or the strict ruleset leaves it BEHIND. Deferred (spec §8): bound
+the clamp by the SELECTED candidate's window (AC1 when budgeted); TTS/image/video input bounds; an
+`Embed` AGGREGATE limit. **Sensei daemon is down, so this file is the only durable record.**

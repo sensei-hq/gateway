@@ -91,10 +91,27 @@ pub(super) fn all_gated_error(
         return None;
     }
     let resume_after = timed.into_iter().min().map(instant_to_utc);
-    let human_action = if resume_after.is_some() { None } else { human };
+    // BOTH, when both are known. `resume_after` decides whether the caller pauses
+    // (`classify_gateway_error` pauses on `Some(t)` and fails on `None`) and is taken
+    // from the TIMED gates alone, which is unchanged; `human_action` is diagnosis, and it
+    // used to be nulled out whenever a wake had been scheduled — "a timed retry wins over
+    // the terminal remedy".
+    //
+    // That discarded information the caller cannot recover, and SP-7a is what made the
+    // loss bite. `OverContextWindow` is the first terminal reason no elapsed time can
+    // EVER clear: a chain whose one healthy model is too small and whose other model is
+    // breaker-open now pauses for the breaker's five minutes, wakes, finds the request
+    // still does not fit, and only then fails — never having said that the prompt was
+    // always too large. Carrying both says "we will retry at t, AND here is the thing
+    // that will still be true then".
+    //
+    // Not a change to the pause/fail split: the caller keys on `resume_after`, and a
+    // remedy beside it is strictly more to read. The one thing it must not do is make an
+    // all-TIMED exhaustion claim a remedy it does not have, and it cannot: `human` is
+    // only ever set from a `Terminal` status.
     Some(GatewayError::AllGated {
         resume_after,
         skipped: diagnostics,
-        human_action,
+        human_action: human,
     })
 }

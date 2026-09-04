@@ -3891,11 +3891,22 @@ async fn all_gated_all_terminal_returns_none_resume_with_human_action() {
 }
 
 /// (3) Mixed terminal (A, credits) + timed (B, quota) → `resume_after` is the
-/// min over the TIMED gates only (B ~1800s); the terminal A is excluded, and a
-/// timed retry wins over the human action.
+/// min over the TIMED gates only (B ~1800s), so the terminal A is excluded from the
+/// wake; A's remedy is still REPORTED beside it.
+///
+/// This test asserted `human_action.is_none()` here — "a timed retry wins over the
+/// terminal remedy" — until SP-7a's review. The two fields answer different questions:
+/// `resume_after` decides whether the caller pauses (and only the timed gates can
+/// contribute to it, which is the half this test has always been about), while
+/// `human_action` is the diagnosis of what will STILL be wrong after the wake. Nulling
+/// the second because the first exists loses information no caller can recover, and it
+/// bites hardest on the reason SP-7a introduced: no deadline makes a context window
+/// bigger, so an over-window candidate beside a timed one produced a wake, a retry, and
+/// only then the truth.
 #[tokio::test]
 async fn all_gated_mixed_terminal_and_timed_uses_min_over_timed_only() {
     use crate::gates::lockout::LockReason;
+    use crate::types::error::HumanAction;
 
     let gw = ab_gateway(ab_chain_config(vec![]));
     gw.apply_lockout("A:a-model", LockReason::CreditsExhausted, None); // terminal
@@ -3912,9 +3923,11 @@ async fn all_gated_mixed_terminal_and_timed_uses_min_over_timed_only() {
             ..
         } => {
             assert_resume_near(resume_after, 1800, 150); // terminal A excluded from the min
-            assert!(
-                human_action.is_none(),
-                "a timed retry wins over the terminal remedy"
+            assert_eq!(
+                human_action,
+                Some(HumanAction::TopUpCredits),
+                "and A's remedy travels with the wake rather than being discarded by \
+                 it — B's quota clears in 30 minutes, A's credits never do"
             );
         }
         other => panic!("expected AllGated, got: {other}"),
@@ -4286,5 +4299,403 @@ async fn all_gated_resume_after_is_a_future_pause_instant() {
             );
         }
         other => panic!("expected AllGated, got: {other}"),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SP-7a — the engine boundary: `engine::execute` computing the pessimistic
+// estimate and putting it on `SelectionCriteria`.
+//
+// This is the one link neither `gates/context_window.rs` (which hand-sets the
+// number) nor `engine/util.rs` (which builds a `SelectionCtx` by hand) can see.
+// Both of those pass unchanged if `execute` never computes the figure at all, or
+// computes it and assigns the COST one instead — which compiles, because the two
+// fields have the same type.
+// -----------------------------------------------------------------------------
+
+/// A `TextChat` chain of two `noop`-served models differing only in context window,
+/// with the SMALL one at priority 1.
+///
+/// The priority order is the point: with the window gate absent or misfed, selection
+/// returns `small` and the assertions below fail on the model name rather than on some
+/// derived property.
+fn window_chain_config(big: u32, small: u32) -> GatewayConfig {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "noop".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    for (id, context_window) in [("big", big), ("small", small)] {
+        models.insert(
+            id.to_string(),
+            ModelConfig {
+                id: id.to_string(),
+                api_model_id: None,
+                provider: "noop".to_string(),
+                family: None,
+                capabilities: vec![Capability::TextChat],
+                context_window,
+                max_output_tokens: 1024,
+                pricing: None,
+                catalog: None,
+            },
+        );
+    }
+    let mut chains = HashMap::new();
+    chains.insert(
+        "win_chain".to_string(),
+        FallbackChainConfig {
+            id: "win_chain".to_string(),
+            capability: Capability::TextChat,
+            models: vec![
+                ChainEntry {
+                    model: "small".to_string(),
+                    router: Some("noop".to_string()),
+                    api_model_id: None,
+                    priority: 1,
+                },
+                ChainEntry {
+                    model: "big".to_string(),
+                    router: Some("noop".to_string()),
+                    api_model_id: None,
+                    priority: 2,
+                },
+            ],
+            fallback_triggers: vec![],
+        },
+    );
+    GatewayConfig {
+        routers,
+        models,
+        chains,
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
+}
+
+/// A chat payload whose bulk is entirely TOOL SCHEMAS: 80 tools at ~410 bytes of
+/// serialized schema each, ~35 KB of JSON, against 14 bytes of prose. The same shape as
+/// `util::tool_schemas_alone_push_a_request_over_a_small_candidates_window`.
+///
+/// This is the payload that separates the two estimates, and the assertions here are
+/// the fixture's own contract: the COST figure fits an 8192-token window and the
+/// PESSIMISTIC one does not. Every test below that claims to tell the two apart depends
+/// on both halves holding, so they are asserted once, here, rather than assumed at three
+/// call sites. If a future change to either estimator collapses the gap, these fire and
+/// name the reason instead of the callers silently losing their discriminating power.
+fn schema_heavy_chat_payload() -> Payload {
+    use crate::types::request::ToolDefinition;
+
+    let tools: Vec<ToolDefinition> = (0..80)
+        .map(|i| ToolDefinition {
+            name: format!("tool_{i}"),
+            description: Some("does a thing".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "an absolute path to the file this tool should operate on, which must exist" },
+                    "contents": { "type": "string", "description": "the bytes to write, encoded as UTF-8 text, with no length limit imposed here" },
+                    "mode": { "type": "string", "enum": ["append", "overwrite", "create"], "description": "how an existing file is treated" }
+                },
+                "required": ["path", "contents"]
+            }),
+        })
+        .collect();
+    let payload = Payload::Chat {
+        messages: vec![Message::text(MessageRole::User, "write the file")],
+        system: None,
+        max_tokens: None,
+        temperature: None,
+        tools,
+    };
+    assert!(
+        estimate_input_tokens(&payload) < 8_192,
+        "the COST estimate must FIT the small model, or no test built on this fixture \
+         can tell the two estimates apart: {}",
+        estimate_input_tokens(&payload)
+    );
+    assert!(
+        super::util::estimate_input_tokens_pessimistic(&payload) > 8_192,
+        "and the PESSIMISTIC one must not: {}",
+        super::util::estimate_input_tokens_pessimistic(&payload)
+    );
+    payload
+}
+
+/// A `TextChat` request over `win_chain` whose sole user message is `bytes` long.
+///
+/// Bytes rather than tokens because bytes are what the estimator divides; the tests
+/// that care about the token figure assert it explicitly rather than trusting the name.
+fn chat_request_of_length(bytes: usize) -> InferenceRequest {
+    InferenceRequest {
+        chain: Some("win_chain".to_string()),
+        payload: Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, "x".repeat(bytes))],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        ..chat_request()
+    }
+}
+
+/// The engine passes the PESSIMISTIC estimate to selection, not the cost one.
+///
+/// The mutation this exists to catch is one character wide: `input_tokens_pessimistic:
+/// Some(input_tokens)` in `engine/execute.rs` compiles, keeps every other test in the
+/// workspace green, and silently admits exactly the over-window requests the slice was
+/// written to catch — because the cost estimate omits tool schemas and divides by 4.
+///
+/// So the fixture is a payload whose TOOL SCHEMAS are all of its bulk and whose prose is
+/// negligible. The two `assert!`s below the payload state the trap as arithmetic: the
+/// cost figure fits the small model, the pessimistic one does not. Whichever the engine
+/// forwards decides which model answers, and the model that answers is what is asserted.
+#[tokio::test]
+async fn the_engine_selects_on_the_pessimistic_estimate_not_the_cost_one() {
+    let payload = schema_heavy_chat_payload();
+    let gw = ab_gateway(window_chain_config(128_000, 8_192));
+    register_noop(&gw).await;
+    let response = gw
+        .execute(&InferenceRequest {
+            payload,
+            ..chat_request_of_length(0)
+        })
+        .await
+        .expect("the 128k candidate can serve this request");
+    assert_eq!(
+        response.model,
+        Some("big".to_string()),
+        "`small` is the priority-1 entry and the cost estimate fits it, so it is \
+         selected unless the engine forwarded the PESSIMISTIC figure"
+    );
+}
+
+/// A candidate that is BOTH over-window and circuit-open still lets the run PAUSE — and
+/// the terminal remedy travels with the pause instead of being discarded.
+///
+/// Two properties, in the one place their consequence is visible.
+///
+/// **(a) The gate's registration position.** `ContextWindowGate` is registered after the
+/// health gates, so `small` — over-window AND breaker-open — reports `CircuitOpen`, which
+/// is `Timed`, which is what puts a `resume_after` on the `AllGated`. The orchestrator's
+/// `classify_gateway_error` pauses only on `Some(t)`; reporting the window instead would
+/// make this a terminal `NodeFailed`, so a transient provider outage would permanently
+/// kill every run whose prompt is also too big for that entry. Moving the gate to the
+/// front of `ModelSelectionService::new`'s vector left the whole workspace green before
+/// this test existed.
+///
+/// **(b) `human_action` survives a `resume_after`.** `all_gated_error` used to null the
+/// remedy whenever any timed gate set a wake, on the reasoning that "a timed retry wins
+/// over the terminal remedy". SP-7a is what makes that lossy: the window is the first
+/// terminal reason no elapsed time can EVER clear, so this run wakes in five minutes,
+/// finds `big` still too small, and only then fails — having never told the operator the
+/// one thing that was true from the start. The wake is still scheduled (waking can help;
+/// `small`'s breaker may close onto a request that fits), but the message now carries
+/// both halves.
+#[tokio::test]
+async fn an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause() {
+    use crate::types::error::HumanAction;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default()); // threshold 5, timeout 300s
+    cb.can_execute("noop:small");
+    for _ in 0..5 {
+        cb.record_failure("noop:small");
+    }
+    assert!(
+        !cb.can_execute("noop:small"),
+        "the fixture needs `small`'s breaker genuinely open"
+    );
+    let gw = Gateway::new(
+        window_chain_config(128_000, 8_192),
+        AdapterRegistry::new(),
+        cb,
+    );
+
+    // 600 KB ⇒ 200 000 tokens: over BOTH windows, so `big` is terminal-gated and
+    // `small` is gated twice over.
+    let err = gw
+        .execute(&chat_request_of_length(600_000))
+        .await
+        .expect_err("nothing in the chain can hold 200k tokens");
+    let GatewayError::AllGated {
+        skipped,
+        human_action,
+        resume_after,
+    } = &err
+    else {
+        panic!("expected AllGated, got: {err:?}");
+    };
+
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.contains("small") && s.contains("circuit breaker open")),
+        "`small` must report the BREAKER, not the window — the breaker clears by \
+         itself and the window never does: {skipped:?}"
+    );
+    assert_resume_near(*resume_after, 300, 120);
+    assert_eq!(
+        *human_action,
+        Some(HumanAction::UseLargerContextWindow),
+        "and the unclearable half must not be thrown away just because a wake was \
+         scheduled: waking cannot make `big` bigger, and the operator needs to know \
+         that now rather than in five minutes"
+    );
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("resume after") && rendered.contains("larger context window"),
+        "both must survive Display, which is the only channel that reaches a \
+         NodeFailed: {rendered}"
+    );
+}
+
+/// AC3, the half the selection-level test cannot see: an all-gated selection must reach
+/// the caller as an `AllGated` naming the cause and the remedy, not as a bare
+/// `NoCandidates`. Asserted at the engine boundary, because `all_gated_error` is what
+/// makes the distinction and it lives here.
+///
+/// Both the typed variant AND the rendered string, deliberately. The typed check is the
+/// contract; the rendered one is what an operator actually gets, because the
+/// orchestrator's `classify_gateway_error` builds its `NodeFailed` reason from
+/// `err.to_string()` and nothing downstream destructures the error.
+///
+/// This is the improvement over the deleted `OrchestratorError::PromptOverBudget`, and
+/// the only place it is visible: that halt named ONE number, the chain minimum, which
+/// may belong to a model the request never wanted. This names each candidate's own.
+#[tokio::test]
+async fn a_request_over_every_window_is_all_gated_with_the_numbers() {
+    use crate::types::error::HumanAction;
+
+    let gw = ab_gateway(window_chain_config(128_000, 8_192));
+    register_noop(&gw).await;
+    // 600 KB of prose ⇒ 200 000 tokens at ceil(bytes/3), over both windows.
+    let req = chat_request_of_length(600_000);
+    let err = gw
+        .execute(&req)
+        .await
+        .expect_err("nothing in the chain can hold 200k tokens");
+
+    let GatewayError::AllGated {
+        skipped,
+        human_action,
+        resume_after,
+    } = &err
+    else {
+        panic!(
+            "an all-gated selection must not degrade to another error — NoCandidates is \
+             the structural 'nothing is configured' case and tells an operator nothing \
+             about what to do: {err:?}"
+        );
+    };
+    assert_eq!(
+        *human_action,
+        Some(HumanAction::UseLargerContextWindow),
+        "the remedy is the window, not money and not a credential"
+    );
+    assert!(
+        resume_after.is_none(),
+        "no deadline makes a window bigger, so there is nothing to pause until: \
+         {resume_after:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.contains("8192-token context window")),
+        "the diagnostics must name a candidate's OWN window: {skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.contains("128000-token context window")),
+        "including the large one — an operator widening the chain needs to know 128k \
+         was tried too: {skipped:?}"
+    );
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("8192-token context window"),
+        "and it must survive Display, which is the only channel that reaches a \
+         NodeFailed: {rendered}"
+    );
+    assert!(
+        rendered.contains("route to a model with a larger context window"),
+        "as must the remedy: {rendered}"
+    );
+}
+
+/// The STREAMING path gates on the window too, on the same estimate.
+///
+/// `execute_stream` builds its own `SelectionCriteria` from the same payload, in its own
+/// copy of the block `execute` uses. Nothing makes the two agree — a slice that wires
+/// only `execute` leaves streaming callers exactly as unprotected as before, and the
+/// duplicated prose in `stream.rs`'s selection-empty comment (which names the gates that
+/// can cause an `AllGated`) becomes false. So parity is asserted rather than assumed,
+/// mirroring `execute_stream_all_gated_at_selection_returns_allgated`.
+///
+/// Streaming is where an unfit candidate costs most: `execute` can still return an error,
+/// but a stream that has begun has already committed the caller, and the provider's 400
+/// arrives mid-flight.
+///
+/// Two claims, because one of them is weak alone. The `Done` model is the discriminating
+/// half — the schema-heavy payload FITS the small model on the cost estimate, so
+/// forwarding the wrong figure streams from `small` — while the over-everything half
+/// pins the terminal shape a caller receives, which a `Done` assertion cannot show.
+#[tokio::test]
+async fn execute_stream_gates_on_the_context_window_like_execute() {
+    use crate::types::error::HumanAction;
+
+    let gw = ab_gateway(window_chain_config(128_000, 8_192));
+    register_noop(&gw).await;
+
+    // (a) A request the LARGE model can hold streams from the large model, though
+    // `small` is the priority-1 entry and the cost estimate fits it.
+    let events = collect_stream(
+        &gw,
+        &InferenceRequest {
+            payload: schema_heavy_chat_payload(),
+            ..chat_request_of_length(0)
+        },
+    )
+    .await;
+    let done_model = events.iter().find_map(|e| match e {
+        StreamEvent::Done { model, .. } => Some(model.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        done_model,
+        Some("big".to_string()),
+        "the stream must come from the 128k candidate — streaming from `small` means \
+         `execute_stream` forwarded the COST estimate: {events:?}"
+    );
+
+    // (b) A request NO candidate can hold never starts a stream at all.
+    match gw.execute_stream(&chat_request_of_length(600_000)).await {
+        Err(GatewayError::AllGated {
+            human_action,
+            skipped,
+            ..
+        }) => {
+            assert_eq!(human_action, Some(HumanAction::UseLargerContextWindow));
+            assert!(
+                skipped
+                    .iter()
+                    .any(|s| s.contains("8192-token context window")),
+                "with the same per-candidate diagnostics `execute` gets: {skipped:?}"
+            );
+        }
+        Err(other) => panic!("expected Err(AllGated) before any stream, got: {other}"),
+        Ok(_) => panic!(
+            "a request no candidate's window can hold must not start streaming — the \
+             provider would answer 400 mid-stream, after the caller has committed"
+        ),
     }
 }

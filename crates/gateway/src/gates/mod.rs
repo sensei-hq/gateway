@@ -7,6 +7,7 @@ use std::time::Instant;
 pub mod budget;
 pub mod capability;
 pub mod circuit_breaker_gate;
+pub mod context_window;
 pub mod cooldown;
 pub mod lockout;
 
@@ -36,6 +37,14 @@ pub struct SelectionCtx<'a> {
     pub capability: Capability,
     pub budget: Option<f64>,
     pub input_tokens: Option<u32>,
+    /// The pessimistic estimate, for [`context_window::ContextWindowGate`] only.
+    ///
+    /// A SECOND field rather than a replacement for `input_tokens`: the cost gate and the
+    /// window gate want opposite biases over the same payload (an under-count is
+    /// optimistic pricing for one and an admitted-but-doesn't-fit candidate for the
+    /// other — see `engine::util::estimate_input_tokens_pessimistic`), and collapsing
+    /// them to one number is exactly what that reasoning rules out.
+    pub input_tokens_pessimistic: Option<u32>,
     pub health: &'a dyn EndpointHealthRead,
     pub now: Instant,
     pub config: &'a GatewayConfig,

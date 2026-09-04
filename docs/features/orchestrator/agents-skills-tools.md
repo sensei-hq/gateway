@@ -59,7 +59,9 @@ source: crates/orchestrator*
 > a skill body / tool schema only when `activation.is_active(query)` for the agent's
 > rendered input (matched once per run, case-insensitive substring ANY-of) —
 > progressive disclosure to fit the prompt budget. `Always` is byte-identical to the
-> old behavior; over-budget still halts loud (no silent truncation). Determinism-safe
+> old behavior; an over-window turn is still refused rather than truncated — SP-7a moved
+> that refusal to the gateway's `ContextWindowGate`, which asks it per candidate.
+> Determinism-safe
 > (the query is the node input, already in `agent_input_hash`). Activation gates prompt
 > **disclosure**, not execution: a tool gated out of a run's prompt simply isn't offered
 > to the model that run — the permission grants (slice 3), validated at load, remain the
@@ -214,8 +216,11 @@ source: crates/orchestrator*
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable
 instruction modules), and **tools** (executable capabilities with an effect
-class + permissions). The agent runtime assembles a budgeted prompt, resolves
-the role→chain, calls the gateway, and runs a ReAct/tool loop.
+class + permissions). The agent runtime assembles the prompt, resolves the
+role→chain, calls the gateway, and runs a ReAct/tool loop. It does **not**
+budget that prompt to a window any more — since SP-7a the fit question belongs
+to the gateway's selection pipeline, which can ask it of a real candidate
+instead of guessing against the chain's smallest member.
 
 ## Scenarios
 
@@ -233,9 +238,24 @@ Feature: Agent runtime
     Given the model returns a tool call for "fs.read"
     Then the orchestrator executes fs.read (the gateway does not) and feeds the result back
 
-  Scenario: Prompt is budgeted to the smallest model in the chain
-    Given a chain whose smallest model has a 32k context window
-    Then prompt assembly fits within 32k (summarize/select, never silent truncation)
+  # Rewritten by SP-7a. It used to read "Prompt is budgeted to the smallest model in
+  # the chain / Given a chain whose smallest model has a 32k context window / Then
+  # prompt assembly fits within 32k". That scenario described the behaviour SP-7a
+  # DELETED: the chain minimum is not a fact about any candidate, so budgeting to it
+  # refused prompts the chain's larger models could serve. Both replacements below are
+  # executable, unlike the line they replace — see
+  # gateway::selection::a_chain_serves_a_prompt_only_its_larger_model_can_hold and
+  # gateway::engine::tests::a_request_over_every_window_is_all_gated_with_the_numbers.
+  Scenario: A chain serves a prompt only its larger model can hold
+    Given a chain [big 128k, small 8k] and a request estimated at 20k input tokens
+    Then the gateway's ContextWindowGate skips "small" and selects "big"
+
+  Scenario: A prompt over EVERY candidate's window is refused, never truncated
+    Given the same chain and a request estimated at 200k input tokens
+    Then selection admits nothing and the caller gets an AllGated naming each
+      candidate's own window, the estimate that exceeded it, and the remedy
+      UseLargerContextWindow — distinct from RaiseBudget, because spending more
+      at the same model cannot make its window bigger
 ```
 
 ## Slice 2 (implemented)
@@ -244,9 +264,13 @@ Feature: Agent runtime
   md+frontmatter-subset parser (`from_frontmatter`) and `Registry::validate`
   (dangling agent/skill/tool refs are a loud load-time error).
 - **Prompt assembly** (`assemble_prompt`: system-prompt body + each listed
-  skill's body, in order) with **per-turn window budgeting** (`over_budget`) —
-  halt-loud when a turn's estimate exceeds the chain's smallest context window;
-  no silent truncation.
+  skill's body, in order). As shipped in this slice it carried **per-turn window
+  budgeting** (`over_budget`) — halt-loud when a turn's estimate exceeded the chain's
+  SMALLEST context window. **SP-7a removed that**: the chain minimum is not a fact about
+  any candidate, so a `[128k, 8k]` chain refused prompts the primary would have served.
+  The question is now asked per candidate by the gateway's `ContextWindowGate`
+  (`crates/gateway/src/gates/context_window.rs`), which skips the candidates that cannot
+  hold the request and only fails when none can. Still no silent truncation.
 - A **Pure-only tool runtime** (`Tool` / `ToolRegistry` + the demo `calc` tool);
   Observation/Mutation tools are rejected loud (`ToolEffectDeferred`), never
   silently skipped or run early.
@@ -257,7 +281,8 @@ Feature: Agent runtime
 
 **Deferred:** Observation/Mutation tools + TTL/two-phase/reconcile (slice 4);
 a filesystem directory loader for the registry; a summarize/select budgeting
-strategy (today's over-budget turn halts rather than compacting);
+strategy (SP-7b — today an over-window turn is refused at selection rather than
+compacted);
 blackboard/shared-context, `Map` fan-out, subagents, per-phase chains, and
 streaming (slice 3+).
 
