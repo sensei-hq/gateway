@@ -106,17 +106,22 @@ impl<'a> ModelSelectionService<'a> {
                 // position decides which reason a multiply-gated candidate reports — and
                 // that is a behaviour, not a presentation detail: `gate_status()` makes
                 // `CircuitOpen`/`Cooling`/a timed lockout `Timed`, which becomes
-                // `AllGated { resume_after: Some(t) }` and a durable PAUSE at the
+                // `AllGated { resume_after: Some(t) }` and a TIMED pause at the
                 // orchestrator's `classify_gateway_error`, while `OverContextWindow` is
-                // `Terminal` — `resume_after: None`, a `NodeFailed`.
+                // `Terminal` — `resume_after: None`, which since the M1 reversal is the
+                // indefinite HOTL pause rather than a `NodeFailed`.
                 //
                 // **After the three HEALTH gates (cooldown, breaker, lockout), and that
                 // is the load-bearing half.** A candidate that is both over-window and
-                // circuit-open must report the BREAKER, because that one clears by
-                // itself; reporting the window instead turns a transient provider outage
-                // into a permanently dead run. Pinned by
+                // circuit-open must report the BREAKER, because that one clears BY
+                // ITSELF. Reporting the window instead swaps a pause the scheduler wakes
+                // on its own for one that waits on a human who has nothing to do — the
+                // breaker would have closed unaided — so a transient provider outage
+                // stalls the run until somebody notices. (Before the M1 reversal the same
+                // mistake killed the run outright, which is why this comment used to say
+                // "permanently dead". The ordering is load-bearing either way.) Pinned by
                 // `a_health_skip_is_reported_ahead_of_the_window_for_the_same_candidate`
-                // and, at the engine boundary where the pause/fail split is visible, by
+                // and, at the engine boundary where the two pause KINDS are visible, by
                 // `engine::tests::an_over_window_candidate_whose_breaker_is_open_still_lets_the_run_pause`.
                 //
                 // **After `BudgetGate` too, and that half is a JUDGEMENT with a cost.**
@@ -1420,11 +1425,12 @@ mod tests {
     /// `admit` returns the FIRST skip, so where `ContextWindowGate` sits decides which
     /// reason a multiply-gated candidate reports — and that is not cosmetic. A skip
     /// reason's `gate_status()` is what `all_gated_error` aggregates: `CircuitOpen` is
-    /// `Timed`, which becomes `AllGated { resume_after: Some(t) }` and a durable PAUSE at
-    /// `classify_gateway_error`; `OverContextWindow` is `Terminal`, which becomes
-    /// `resume_after: None` and a `NodeFailed`. So a candidate that is both over-window
-    /// and circuit-open must surface the BREAKER, or a transient provider outage
-    /// permanently kills every run whose prompt is also too large for that entry.
+    /// `Timed`, which becomes `AllGated { resume_after: Some(t) }` and a self-healing
+    /// TIMED pause at `classify_gateway_error`; `OverContextWindow` is `Terminal`, which
+    /// becomes `resume_after: None` — the indefinite HOTL pause since the M1 reversal, and
+    /// a `NodeFailed` before it. So a candidate that is both over-window and circuit-open
+    /// must surface the BREAKER, or a transient provider outage leaves every run whose
+    /// prompt is also too large for that entry waiting on a human who has nothing to fix.
     ///
     /// Nothing enforced this before: moving `Box::new(ContextWindowGate)` from last to
     /// FIRST in `ModelSelectionService::new` left the whole workspace green, while

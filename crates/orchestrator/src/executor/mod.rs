@@ -1426,9 +1426,13 @@ impl Executor {
                         }),
                     },
                     Err(error) => match classify_gateway_error(&error) {
-                        // A fully-gated chain with a timed re-eligibility (§11.2):
+                        // A fully-gated chain that something can still clear (§11.2):
                         // durable pause (resumable), never a bare fail. On resume
                         // the node re-attempts (no `EffectRecorded` was journaled).
+                        // `resume_after` is passed THROUGH rather than wrapped in
+                        // `Some`: a timed gate carries its deadline, and a terminal
+                        // gate naming a human action carries `None` — the HOTL class,
+                        // woken by an operator's `force_wake` and never by the clock.
                         GatewayDisposition::Pause {
                             resume_after,
                             reason,
@@ -1437,7 +1441,7 @@ impl Executor {
                                 run,
                                 JournalEvent::RunPaused {
                                     reason: reason.clone(),
-                                    resume_after: Some(resume_after),
+                                    resume_after,
                                 },
                             )
                             .await?;

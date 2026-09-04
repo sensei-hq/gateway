@@ -124,11 +124,20 @@ pub enum GatewayError {
     /// suppression was removed.
     ///
     /// **`Display` renders all three fields**, and that is load-bearing rather than
-    /// cosmetic: the orchestrator's `classify_gateway_error` turns this error into a
-    /// `NodeFailed` whose reason is `err.to_string()`, so anything `Display` drops
-    /// never reaches the operator who has to act. It rendered only the first field
-    /// for several slices, which silently discarded every per-candidate reason and
-    /// the remedy alike — the caller was told "human action required" and not which.
+    /// cosmetic: the orchestrator's `classify_gateway_error` builds its journaled reason
+    /// from `err.to_string()`, so anything `Display` drops never reaches the operator who
+    /// has to act. It rendered only the first field for several slices, which silently
+    /// discarded every per-candidate reason and the remedy alike — the caller was told
+    /// "human action required" and not which.
+    ///
+    /// **A `human_action` makes this PAUSABLE, and a bare gating does not.** The
+    /// orchestrator maps `resume_after: Some(t)` to a timed pause, `resume_after: None`
+    /// with a `human_action` to the indefinite HOTL pause class (never auto-woken;
+    /// cleared by an operator's `force_wake` once they have acted on the remedy), and
+    /// `None` with no action at all to a node failure. So the caller does not pause
+    /// forever on nothing — it pauses only where a named party can end the pause. Earlier
+    /// revisions of this doc said a caller must never pause on this variant, which was
+    /// the pre-2026-09-04 rule (risk M1) and is no longer true.
     #[error("all candidates gated{}{}{}",
         resume_after
             .map(|t| format!(", resume after {t}"))
@@ -262,8 +271,10 @@ mod tests {
     /// The `AllGated` message names every candidate's reason AND the remedy.
     ///
     /// This string is the only channel that survives to an operator on the orchestrator
-    /// path: `classify_gateway_error` builds its `NodeFailed` reason from
-    /// `err.to_string()`, so a field that `Display` drops is a field nobody reads. The
+    /// path: `classify_gateway_error` builds its journaled `RunPaused` / `NodeFailed`
+    /// reason from `err.to_string()`, so a field that `Display` drops is a field nobody
+    /// reads — and on the pause path it is what `list_paused` shows the operator who has
+    /// to act before `force_wake` will help. The
     /// variant carried `skipped` and `human_action` for a whole slice while rendering
     /// neither, which made every doc comment claiming "`AllGated` renders these strings
     /// verbatim" false.
