@@ -727,17 +727,22 @@ mod tests {
     ///
     /// `the_first_context_budget_wins` above feeds ONE effect id twice, so every record it
     /// folds is a duplicate. That leaves "FIRST record wins" readable as a run-global latch,
-    /// which is a misreading the phrase invites and which compiles. An agent node WILL journal
-    /// one `ContextBudgeted` per TURN once the executor is wired (SP-7b Task 5 — the key is
-    /// `effect_id(node, turn, 0)`, see `Fold::context_budgets`), so under the latch reading turn 2
-    /// of a two-turn agent would find no budget of its own, on the first drive as well as on
-    /// resume.
+    /// which is a misreading the phrase invites and which compiles. The map is keyed by
+    /// `EffectId`, so the latch is PER KEY.
     ///
-    /// **Future tense deliberately: as of this commit NO production path emits this event**, so
-    /// the per-turn keying is a property of the fold and of `effect_id`, not yet an observed one.
-    /// Written in the present tense first, which review caught — a doc that describes unbuilt
-    /// behaviour as current is the same defect class as a doc that describes behaviour the code
-    /// does not have, and this slice has now produced four of those.
+    /// **What the key will be, once the executor is wired (SP-7b Task 5): `effect_id(node, 0, 0)`
+    /// — ONE budget per agent NODE, not one per turn.** The `system` half is assembled once,
+    /// before the ReAct turn loop, and is turn-INVARIANT by construction; only `messages` grows
+    /// across turns, and the transcript is explicitly out of this slice's scope (spec §2). So
+    /// re-budgeting per turn would make `system` a function of the transcript and couple the two
+    /// halves the design deliberately separates. The `0` in the key is that decision, not a
+    /// placeholder.
+    ///
+    /// **Future tense deliberately: as of this commit NO production path emits this event.** An
+    /// earlier revision of this paragraph said an agent node "journals one per TURN" — wrong in
+    /// both tense and substance, and it was mine. A doc describing unbuilt behaviour as current is
+    /// the same defect class as one describing behaviour the code lacks, and this slice has now
+    /// produced five of those.
     ///
     /// Mutation-verified, and the two guards are complementary rather than nested:
     /// - `if fold.context_budgets.is_empty() { insert(..) }` — a run-global latch — leaves
