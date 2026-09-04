@@ -183,12 +183,42 @@ new false comment in place of an old one, and would have cost an operator a manu
    true, and the message keeps it. Both negatives are asserted: the review found the remedy clause
    unpinned (the two forbidden strings share no substring, so restoring the old remedy verbatim
    left the suite green) and it now has its own assertion, mutation-proven.
+
+   > **Corrected again, 2026-09-04, by this slice's own whole-slice review — the REPLACEMENT remedy
+   > was false in the same way as the remedy it replaced.** It read "send less input, or put a
+   > model with a larger window in this chain". The term is `min { w ∈ chain : w >= est }`, and
+   > **adding an element to a set cannot raise its minimum**: a larger entry leaves the bound
+   > exactly where it was, and a smaller one that still holds the input LOWERS it. Demonstrated
+   > rather than argued by
+   > `adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal`, which drives one
+   > prompt down the `{4096}` chain and the `{4096, 200 000}` chain and gets **byte-identical**
+   > refusals. The message now names the guaranteed remedy — remove or replace the entry it names,
+   > which strictly raises the minimum of the serving set (or empties it, handing the refusal to
+   > the gate with per-candidate diagnostics) — states that adding a larger model alongside cannot
+   > help, and qualifies "send less input" as conditional on that same entry staying the smallest
+   > that can hold the prompt.
+   >
+   > The cap-independence sentence this AC chose to KEEP was itself unpinned by the same move:
+   > shifting the two-cap drive onto the gate path left the surviving `BelowFloor` arm at one cap,
+   > and a mutation gating the refusal on `remaining` passed all 427 orchestrator tests, as did
+   > deleting the clause. Now pinned by `a_serving_window_refusal_is_unmoved_by_the_cap` (1e6 and
+   > `u64::MAX / 2`, compared with the ledger clause stripped), which is the only test of the 427
+   > that catches either mutation.
 9. The output-limit term (`min_max_output_tokens`) still applies independently — a serving window
    larger than the model's output limit does not widen `max_tokens`. A TIE between the two terms
    counts as window-bound, so the refusal keeps the window's wording; that rule is stated in the
    clamp's comment and was unguarded, and is now pinned by
    `a_tie_between_the_output_limit_and_the_window_term_names_the_window` (which needs a fixture
    whose output limit is under the floor, since a tie only becomes observable through a refusal).
+
+   > **Corrected by review, 2026-09-04:** naming the window is the right CLASSIFICATION and was not
+   > a sufficient MESSAGE. With both terms on the same sub-floor figure, clearing the window half
+   > leaves the output half binding — so on a tie *both* of the remedies the window arm offers fail,
+   > and this AC's own justification ("it tells the operator the two things that do move it") was
+   > wrong twice over. The tie now additionally names the chain's smallest declared
+   > `max_output_tokens` as a co-cause, carried by `output_limit_ties` on `BelowFloor` and asserted
+   > in the same test. The deferred THIRD arm — a refusal where the output limit binds alone — is
+   > unchanged and still reaches the operator in budget wording.
 10. **The clamp and the gate judge one request by one `est`.** Added by §4.1's correction. Asserted
     across the crate boundary rather than as an equality between two functions, because there is
     only one function now: for a dispatched call,
