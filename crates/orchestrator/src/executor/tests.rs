@@ -15889,6 +15889,25 @@ impl CapturingSubscriber {
             .cloned()
             .collect()
     }
+
+    /// Everything captured so far whose message names SP-7b's context budget — the
+    /// fourth disclosure channel.
+    ///
+    /// A second filter for the same reason there is a first one: a drive emits unrelated
+    /// records, and the two diagnostics answer different questions (the clamp bounds an
+    /// OUTPUT allowance against a token budget; this one reports that an INPUT was cut to
+    /// fit a window). Filtering both on one substring would let either stand in for the
+    /// other, and the AC11 half of this slice asserts an ABSENCE — which is exactly the
+    /// assertion a too-wide filter turns green for the wrong reason.
+    fn context_budget_signals(&self) -> Vec<CapturedEvent> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|e| e.message.contains("context budgeted"))
+            .cloned()
+            .collect()
+    }
 }
 
 impl tracing::Subscriber for CapturingSubscriber {
@@ -25703,7 +25722,7 @@ async fn an_over_window_agent_turn_is_budgeted_and_dispatched() {
 
     let content = Arc::new(InMemoryContentStore::new());
     let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
-    let (gateway, calls, ests) = two_window_scripted_window_watching_gateway(vec![
+    let (gateway, calls, ests, _systems) = two_window_scripted_window_watching_gateway(vec![
         final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
         final_response("budgeted-answer"),
     ])
@@ -25802,8 +25821,10 @@ async fn an_over_window_agent_turn_is_budgeted_and_dispatched() {
     );
     assert_eq!(
         *dropped_deps, 0,
-        "the one dependency was TRUNCATED, not dropped — the marker and the `N of M` tail \
-         are the model's own channel for that (AC10)"
+        "the one dependency was TRUNCATED, not dropped — so the model-facing channel here is \
+         the per-entry marker, and the `N of M dependencies shown` tail (which announces \
+         DROPS) correctly stays silent. `a_degraded_turn_discloses_on_every_channel` asserts \
+         the marker reached the wire (AC10)"
     );
     assert!(
         dropped_tools.is_empty(),
@@ -25819,9 +25840,15 @@ async fn an_over_window_agent_turn_is_budgeted_and_dispatched() {
          against {section_budget}"
     );
     // Measured at 66 bytes, and it decomposes exactly: `"\n\n## Context"` (12) + `"\n\n### A\n"`
-    // (8) + `"\n… (truncated: 499160 of 700030 bytes shown)"` (46, the `…` being three UTF-8
+    // (8) + `"\n… (truncated: 499160 of 700027 bytes shown)"` (46, the `…` being three UTF-8
     // bytes). Bounded rather than pinned at 66 so a re-worded marker is not a regression, since
     // what this assertion is for is a renderer that started charging BODIES for structure.
+    //
+    // The `of N` figure read `700030` until AC10's test dumped the real warn beside the real
+    // journal row. A's stored context is its whole output VALUE — `{"model":"small","text":…}`,
+    // an envelope of `22 + "small".len()` around the body — so the number is 700 027. The 46-byte
+    // decomposition is unaffected (both figures are six digits), which is exactly why nothing
+    // caught it: no assertion in this file consumed the literal.
     assert!(
         section_budget - *retained_bytes < 128,
         "and they are nearly all of it — the gap is the section head, one heading and one \
@@ -25903,7 +25930,7 @@ async fn an_unbudgeted_turn_replays_after_the_window_shrinks_under_it() {
     // comfortably under `big` (200 000) — so `big` serves it UN-budgeted and nothing durable
     // records a budget. Turn 0 is a `calc` tool call; turn 1 exhausts the script and the node
     // dies mid-loop, so no `RunCompleted` is written and drive 2 must re-enter the loop.
-    let (gw1, calls1, _ests) = two_window_scripted_window_watching_gateway(vec![
+    let (gw1, calls1, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
         final_response(&"x".repeat(IN_WINDOW_DEP_BYTES)),
         tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}"),
     ])
@@ -26197,7 +26224,7 @@ async fn a_budgeted_turn_replays_after_the_window_changes_underneath_it() {
     // Drive 1: A's 700 000-byte output makes B's prompt ~233k tokens, over BOTH windows, so
     // it is cut to fit `big` (200 000) and dispatched. Turn 0 calls `calc`; turn 1 exhausts
     // the script and the node dies mid-loop.
-    let (gw1, calls1, _ests) = two_window_scripted_window_watching_gateway(vec![
+    let (gw1, calls1, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
         final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
         tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}"),
     ])
@@ -26398,9 +26425,13 @@ async fn the_context_floor_pause_is_recoverable_and_spends_nothing() {
 
 /// **A budgeted node is effectively SINGLE-TURN, and this is where that is written down.**
 ///
-/// `available_context_bytes` spends the window down to exactly `MIN_OUTPUT_TOKENS`, so a
-/// budgeted turn 0 is dispatched at `window − 256` tokens and the whole remaining headroom
-/// for the GROWING transcript is 256 tokens — 768 bytes. A ReAct agent that then calls a tool
+/// `available_context_bytes` spends the window down to `MIN_OUTPUT_TOKENS`, so a budgeted turn 0
+/// is dispatched at AT MOST `window − 256` tokens and the transcript's guaranteed headroom is 256
+/// tokens — 768 bytes. The bound is tight HERE, and the assertion below states the equality only
+/// for this fixture: one dependency cannot be split unevenly, so the renderer's even split leaves
+/// nothing unspent. A node with a 10-byte dependency beside a 10-KiB one dispatches strictly
+/// under the bound, because the even split never redistributes the small entry's unused share.
+/// A ReAct agent that then calls a tool
 /// re-sends `system` plus the assistant turn (whose `tool_calls.name + arguments` the
 /// estimator counts) plus the tool result, and anything over that headroom puts turn 1 over
 /// every candidate's window: the gate skips them all and the run takes the `AllGated` HOTL
@@ -26429,7 +26460,7 @@ async fn a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn() 
         "{{\"op\":\"add\",\"a\":2,\"b\":3,\"note\":\"{}\"}}",
         "z".repeat(2_000)
     );
-    let (gw, calls, ests) = two_window_scripted_window_watching_gateway(vec![
+    let (gw, calls, ests, _systems) = two_window_scripted_window_watching_gateway(vec![
         final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
         tool_call_response("t1", "calc", &padded_args),
         final_response("never reached"),
@@ -26460,7 +26491,9 @@ async fn a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn() 
         TWO_WINDOW_BIG - orchestrator_core::MIN_OUTPUT_TOKENS as u32,
         "and turn 0 was dispatched at exactly `window − MIN_OUTPUT_TOKENS`, which is the \
          measurement this whole test exists to record: the reserve is ALL the room the \
-         transcript has left"
+         transcript has left. The equality is this FIXTURE's — one dependency, so the \
+         renderer's even split leaves nothing unspent; in general the budget is an upper \
+         bound and an unevenly-split node dispatches under it"
     );
     assert_eq!(
         calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
@@ -26487,5 +26520,327 @@ async fn a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn() 
         out.failed.is_none(),
         "and it is a pause, not a failure — the run keeps turn 0's spend reachable: {:?}",
         out.failed
+    );
+}
+
+/// **AC10 — all four disclosure channels fire on ONE degraded turn.**
+///
+/// The hazard the pre-SP-7b docs name is a degraded answer flowing downstream as work product
+/// indistinguishable from a full one. Four channels answer it, and this is the only place their
+/// COMPOSITION is asserted: each is individually cheap to break without the others noticing, and
+/// they are produced at three separate points — the renderer (`prompt.rs`), the arm that decides
+/// to cut, and `finish_agent`, a whole ReAct loop later.
+///
+/// - **The model** reads the per-entry truncation marker in the dispatched `system` half. That the
+///   RENDERER emits one is `prompt::tests`' subject; that the marked bytes are what reached the
+///   provider is only observable here, and it is the channel the floor's whole argument rests on
+///   (a model shown a clipped document with no sign it was clipped answers about the part it was
+///   given as though it were the whole). The `(N of M dependencies shown)` tail is the OTHER
+///   model-facing signal and it is deliberately not asserted here: it announces DROPPED entries,
+///   and this cut truncated its one dependency instead — `dropped_deps` below is 0, asserted.
+///   `a_context_section_that_drops_dependencies_says_how_many` is where that half lives.
+/// - **The journal** carries `ContextBudgeted` (AC3).
+/// - **Downstream** gets an ADDITIVE `context_budgeted` key beside an untouched `text`.
+/// - **The operator** gets a `warn!`, and its figures are asserted AGAINST THE JOURNAL ROW rather
+///   than re-derived here, so a warn that reports the wrong field (retained where requested
+///   belongs, say) reddens instead of agreeing with a copy of its own arithmetic.
+///
+/// The fixture is AC2's: `A (model_call) → B (agent)`, A's `OVERSIZED_DEP_BYTES` output busting
+/// both windows. The content and context stores are wired because `resolve_context` returns EMPTY
+/// without a `ContextStore`, which would give B no dependency context, no over-window prompt and
+/// a green test proving nothing.
+#[tokio::test]
+async fn a_degraded_turn_discloses_on_every_channel() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let capture = CapturingSubscriber::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gateway, _calls, _ests, systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        final_response("budgeted-answer"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    // Channel 3 — downstream. ADDITIVE: `text` must survive untouched beside the new key, so an
+    // unmodified `BranchCond::TextContains` consumes a degraded answer exactly as before. Same
+    // discipline SP-6 s3 used when it added `actor` to a human-backed agent's output.
+    let b = out
+        .outputs
+        .get(&NodeId("B".into()))
+        .expect("the budgeted node completed");
+    assert_eq!(
+        b.get("context_budgeted").and_then(|v| v.as_bool()),
+        Some(true),
+        "the output must say the context was degraded: {b}"
+    );
+    assert_eq!(
+        b.get("text").and_then(|t| t.as_str()),
+        Some("budgeted-answer"),
+        "and `text` is untouched beside it — the key is added, not substituted for: {b}"
+    );
+
+    // Channel 2 — the journal. Read first because channel 4's figures are asserted against it.
+    let rows = budget_rows(&journal, run).await;
+    let JournalEvent::ContextBudgeted {
+        source_window,
+        retained_bytes,
+        dropped_deps,
+        dropped_tools,
+        ..
+    } = rows.first().expect("exactly one ContextBudgeted (AC3)")
+    else {
+        unreachable!("filtered by `budget_rows`")
+    };
+    assert_eq!(rows.len(), 1, "and only one: {rows:?}");
+    assert_eq!(
+        *dropped_deps, 0,
+        "this cut TRUNCATED its one dependency rather than dropping it — which is why the \
+         `N of M dependencies shown` tail is not among the signals asserted below, and why \
+         saying so in this test's doc is a claim and not a hedge"
+    );
+
+    // What B was actually given to read: A's whole output value, serialized — the `{"model":…,
+    // "text":…}` envelope included, since that is what `ContextWrite` carries and what
+    // `resolve_context` hands back. Taken from the run rather than written as a literal: the
+    // envelope's width depends on which model selection picked for A, and a hand-computed
+    // constant here would be a quantified claim with nothing behind it.
+    let requested = out
+        .outputs
+        .get(&NodeId("A".into()))
+        .expect("A completed")
+        .to_string()
+        .len();
+    assert!(
+        requested > OVERSIZED_DEP_BYTES,
+        "the envelope only ever ADDS to the body: {requested}"
+    );
+
+    // Channel 1 — the model. The system half that actually reached the provider.
+    let dispatched = systems.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let budgeted: Vec<&String> = dispatched
+        .iter()
+        .flatten()
+        .filter(|s| s.contains("## Context"))
+        .collect();
+    assert_eq!(
+        budgeted.len(),
+        1,
+        "exactly one dispatched prompt carried a `## Context` section — B's turn 0. A's is a \
+         `ModelCall` and has no system half at all: {dispatched:?}"
+    );
+    assert!(
+        budgeted[0].contains(" bytes shown)"),
+        "and it admits to having been cut, in the model's own channel — without the marker the \
+         model answers about a clipped document as though it were whole"
+    );
+    assert!(
+        budgeted[0].contains(&format!("of {requested} bytes shown")),
+        "naming the FULL size it was cut from, so the model can size its own ignorance"
+    );
+
+    // Channel 4 — the operator, and the instrument that is meant to replace
+    // `CONTEXT_FLOOR_FRACTION`'s guess with a measurement.
+    let signals = capture.context_budget_signals();
+    let warn = match &signals[..] {
+        [one] => one,
+        other => panic!("exactly one context-budget warn, for the one budgeted turn: {other:?}"),
+    };
+    assert_eq!(
+        (
+            warn.field("window"),
+            warn.field("retained_bytes"),
+            warn.field("dropped_deps"),
+            warn.field("dropped_tools"),
+        ),
+        (
+            Some(u64::from(*source_window)),
+            Some(*retained_bytes),
+            Some(u64::from(*dropped_deps)),
+            Some(dropped_tools.len() as u64),
+        ),
+        "and it reports the SAME cut the journal recorded — asserted against the row rather \
+         than re-derived, so a warn wired to the wrong field cannot agree with a copy of its \
+         own arithmetic: {warn:?} against {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        warn.field("requested_bytes"),
+        Some(requested as u64),
+        "with the figure the journal row does NOT carry — what was ASKED for. Without it the \
+         retained byte count is a number with no denominator, and the whole point of this \
+         channel is to measure the ratio the floor is a guess at"
+    );
+    assert!(
+        warn.field("requested_bytes") > warn.field("retained_bytes"),
+        "which is strictly more than what survived, or nothing was degraded: {warn:?}"
+    );
+}
+
+/// **AC11 — an IN-WINDOW turn is unchanged where it matters.**
+///
+/// Deliberately NOT claiming "nothing new runs". Deciding whether a prompt is over-window
+/// requires knowing the window, so `max_context_window` is read on every agent turn that has
+/// never been dispatched, in-window ones included. That read is a `config.read().await`
+/// returning a `u32` — no allocation, no I/O — and it is the honest cost of the feature. An
+/// earlier draft of this AC claimed the accessor is not called at all, which is false by
+/// construction.
+///
+/// What IS claimed, and asserted here: nothing durable changes, no disclosure channel fires,
+/// and the prompt that goes out carries none of the budgeting scaffolding.
+///
+/// The absence assertions are the whole test, and a no-regression test passes on arrival — so
+/// each was mutation-verified rather than assumed. Dropping `ar.context_cut.is_some()` from
+/// `finish_agent` reddens the output-key assertion; relaxing the budget arm's guard from
+/// `unbounded > w` to `unbounded > 0` reddens the journal assertion; moving the `warn!` up beside
+/// the `max_context_window` read — warning wherever the window is READ rather than where a cut is
+/// TAKEN — reddens the warn assertion. Each reddens exactly one.
+#[tokio::test]
+async fn an_in_window_agent_turn_is_unchanged() {
+    let capture = CapturingSubscriber::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    let (gateway, calls, ests, systems) =
+        two_window_scripted_window_watching_gateway(vec![final_response("in-window answer")]).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .start(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("drives");
+
+    let seen = ests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        seen.iter().all(|e| *e < TWO_WINDOW_SMALL),
+        "the premise: this prompt fits even the SMALLEST window, so no cut can be needed and \
+         every assertion below is about the un-budgeted path: {seen:?}"
+    );
+    assert!(
+        budget_rows(&journal, run).await.is_empty(),
+        "no budget is journaled for a prompt that fits — which is what makes the MEMO the \
+         fence for this half (spec §4.1) rather than a row"
+    );
+    let n1 = out.outputs.get(&NodeId("n1".into())).expect("completed");
+    assert_eq!(
+        n1.get("text").and_then(|t| t.as_str()),
+        Some("in-window answer"),
+        "the node answered: {n1}"
+    );
+    assert!(
+        n1.get("context_budgeted").is_none(),
+        "and NO disclosure key — a key emitted unconditionally would make every consumer's \
+         degradation check meaningless: {n1}"
+    );
+    assert!(
+        capture.context_budget_signals().is_empty(),
+        "and no operator warn: the instrument measures cuts, so one per agent turn would \
+         drown the signal it exists to carry: {:?}",
+        capture.context_budget_signals()
+    );
+    let dispatched = systems.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(dispatched.len(), 1, "exactly one provider call, as before");
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "counted on both logs, since they are appended by different lines of the adapter"
+    );
+    let system = dispatched[0]
+        .as_ref()
+        .expect("an agent turn has a system half");
+    assert!(
+        !system.contains(" bytes shown)") && !system.contains("dependencies shown)"),
+        "and the prompt carries neither truncation marker: nothing was cut, so nothing may \
+         claim to have been: {system:?}"
+    );
+}
+
+/// **Carry-forward — the floor refusal must not report a retained figure it never measured.**
+///
+/// The two floor refusals reach `pause_context_floor` from opposite sides. The MEASURED one has
+/// rendered the section and hands over `ContextCut::retained_bytes`. The PLANNER one
+/// (`BudgetRefusal::FloorUnreachable`) refuses before `render_context_section_measured` is ever
+/// called, and it used to pass the literal `0` — a claim that nothing at all would survive.
+///
+/// That claim is wrong by most of the budget on this very fixture. A 100 023-byte dependency
+/// against the 4096-token chain leaves `3 × (4096 − 256 − 2) = 11 514` bytes to render into, and
+/// the refusal is that even ALL of them are under the 25 006 the 25% floor demands. The bound is
+/// what this doc asserts, deliberately, rather than a survivor count — a survivor count is
+/// exactly the thing the planner arm cannot know, which is the whole finding. An operator told
+/// "0 of 100 023 survive" reads a total loss and sizes the remedy — how much to shorten the
+/// upstream output by — against a number nothing measured.
+///
+/// So the planner arm reports what it KNOWS (no cut of the ones that fit clears the floor) rather
+/// than a measurement it never took. Mutation-verified: the RED run of this test showed the old
+/// message in full — `only 0 survive` — so restoring the literal reddens the second assertion,
+/// and dropping the replacement clause reddens the third.
+#[tokio::test]
+async fn the_planner_floor_refusal_reports_no_retained_figure_it_never_measured() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (gw, _calls) = scripted_gateway(vec![final_response(&"x".repeat(100_000))]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    let pause = out.paused.as_ref().expect("the floor refuses this turn");
+    assert!(
+        pause.reason.starts_with("context budget: "),
+        "the premise — this is SP-7b's own refusal, not the gate's: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains(" 0 "),
+        "and it states no retained figure, because it rendered nothing to measure. 11 514 \
+         bytes were available to render into here; the refusal is that even all of them are \
+         under the floor, not that nothing at all survives: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("no cut of it that fits"),
+        "saying instead what the planner actually established — that of the cuts which FIT, \
+         none clears the floor: {}",
+        pause.reason
+    );
+    // A's whole output value, serialized — the envelope `ContextWrite` carries, derived from
+    // the run rather than written as a literal for the reason the AC10 test gives.
+    let requested = out
+        .outputs
+        .get(&NodeId("A".into()))
+        .expect("A completed")
+        .to_string()
+        .len();
+    assert!(
+        pause.reason.contains(&format!("{requested} bytes")),
+        "while still naming what was asked for, which is the number the remedy is sized \
+         against: {}",
+        pause.reason
     );
 }

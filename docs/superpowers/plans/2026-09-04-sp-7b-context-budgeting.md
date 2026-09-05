@@ -1403,6 +1403,41 @@ and per the M1-reversal work it is unrecoverable.
 
 ### Task 7: Disclosure — the output key and the operator warn (AC10)
 
+> **SHIPPED, and here is how it deviates — read this before trusting the steps below.**
+>
+> - **Step 1's test fixture does not work.** It reaches for
+>   `two_window_clamp_observing_gateway` and wires neither a `ContentStore` nor a
+>   `ContextStore`. `ClampObservingAdapter` answers every call with one fixed short body, so A
+>   never produces an oversized output; and `resolve_context` returns EMPTY without a
+>   `ContextStore` (`executor/mod.rs`), so B would get no dependency context either way. The
+>   shipped test uses AC2's fixture instead — `two_window_scripted_window_watching_gateway`
+>   plus both stores — which is the only combination in the harness that can produce a
+>   degraded turn at all.
+> - **Channel 1 IS asserted, contrary to step 1's note.** The plan deferred it to
+>   `prompt::tests`, which proves the RENDERER emits a marker but not that the marked bytes
+>   reached the provider — and "the model was told" is the channel the floor's whole argument
+>   rests on. `ScriptedAdapter` gained a `SystemLog`, and
+>   `two_window_scripted_window_watching_gateway` returns it (a wider return rather than a
+>   fourth constructor: the sibling's own "thirty callers" argument for splitting does not
+>   apply to a function with three).
+> - **The `N of M dependencies shown` tail is NOT asserted, and cannot be here.** It announces
+>   DROPPED entries; a one-dependency fixture truncates rather than drops (`dropped_deps == 0`).
+>   AC10 and §5.5 were amended to stop conflating the two model-facing signals.
+> - **Step 4's warn is asserted against the JOURNAL ROW**, not against re-derived arithmetic, so
+>   a warn wired to the wrong field cannot agree with a copy of its own numbers. Mutation:
+>   swapping `requested_bytes` and `retained_bytes` reddens it.
+> - **Step 6's AC11 test passed on arrival**, as a no-regression test should. Mutation-verified
+>   two ways: emitting the output key unconditionally, and warning wherever the window is READ
+>   rather than where a cut is TAKEN, each redden exactly one of its absence assertions.
+> - **Carry-forward (a) changed the CODE, not just a comment.** `pause_context_floor` takes
+>   `retained: Option<usize>`; the pre-render `FloorUnreachable` arm passes `None`. See AC9.
+>
+> **A false literal found while doing this**, recorded because that is now the fourth in this
+> slice: the AC2 test's comment decomposing the 66-byte section overhead said the marker read
+> `of 700030 bytes shown`. It is 700 027 — A's stored context is its whole output VALUE, so the
+> envelope is `22 + "small".len()`. No assertion consumed the literal, which is why nothing
+> caught it.
+
 **Files:**
 - Modify: `crates/orchestrator/src/executor/agent.rs:460` (the output shape) and the budget site
 - Test: `crates/orchestrator/src/executor/tests.rs`

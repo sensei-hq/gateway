@@ -48,6 +48,18 @@ struct AgentRun<'a> {
     // call against these: the tool must be LISTED and its grant must COVER the need.
     agent_tools: Vec<String>,
     agent_grants: std::collections::HashMap<String, orchestrator_core::Permissions>,
+    /// SP-7b: the MEASURED cut this node's `system` half was rendered under, or `None` when
+    /// the prompt was dispatched whole.
+    ///
+    /// Carried on the run rather than recomputed at the finish because the two are separated
+    /// by the entire ReAct loop, and the only other way to answer "was this node degraded?"
+    /// down there would be a second fold lookup — which can disagree with the arm that
+    /// actually rendered, since `Fold` is built once per drive and never refreshed.
+    ///
+    /// It is an `Option` rather than a bool because the disclosure needs the FIGURES, not
+    /// just the fact. `None` is what makes AC11 true by construction: an in-window turn has
+    /// no cut, so `finish_agent` adds no key and there is nothing to warn about.
+    context_cut: Option<crate::agent::prompt::ContextCut>,
 }
 
 impl Executor {
@@ -322,15 +334,20 @@ impl Executor {
         // node, which is the common case, though that is a side effect rather than the point.
         let dispatched_unbudgeted = journaled.is_none() && fold.memo.contains_key(&budget_eid);
 
-        // `_context_cut` is the MEASURED cut, and it has no reader in this task. The plan
-        // called for threading it into `AgentRun` here "so task 7 can read it", but a private
-        // field nothing reads is a `dead_code` warning and the pre-commit hook is
-        // `clippy -D warnings`, so that cannot be committed on its own. The disclosure
-        // channels (the output key and the operator warn) are task 7's, and they are what
-        // turn this binding into a field. The one consumer this task owes it — the
-        // `ContextBudgeted` row's `retained_bytes`/`dropped_deps` — reads the cut inside the
-        // arm that produced it, where a stale fold cannot get between the two.
-        let (system, tools, _context_cut) = match journaled {
+        // `context_cut` is the MEASURED cut — `Some` on both budgeted arms (the journaled
+        // replay and the fresh budget), `None` when the prompt went out whole. It rides on
+        // `AgentRun` to the one disclosure channel that fires at the END of the node, the
+        // output key, which is the whole ReAct loop away from here. The operator warn does
+        // NOT ride: it fires inside the arm that produced the cut, beside the journal append,
+        // because `Fold` is built once per drive and never refreshed — anything read back off
+        // it here would be a stale answer on the very drive that decided.
+        //
+        // Only the WRITING drive warns, deliberately. A replay of a budgeted turn re-derives
+        // the same cut from the journal, and warning again would report a degradation that
+        // is not happening now — the same reasoning that keeps `ContextBudgeted` to one row
+        // per node (AC3). The output key does NOT follow that rule and must not: it
+        // describes the ANSWER, which is degraded on every drive that returns it.
+        let (system, tools, context_cut) = match journaled {
             Some(record) => {
                 let available = usize::try_from(record.budget_bytes).unwrap_or(usize::MAX);
                 // The schemas the WRITING drive dropped, read back rather than re-decided —
@@ -440,9 +457,23 @@ impl Executor {
                                 (s, t, None)
                             }
                             // A fitting cut exists and none of them reaches the floor. Refusing
-                            // is SP-7b's own, and "0 survive" is honest: `FloorUnreachable`
-                            // implies a floor above zero, which implies `requested > 0`, so this
-                            // message can no longer describe a context of 0 bytes.
+                            // is SP-7b's own — and `None` for the retained figure, because
+                            // this arm has RENDERED NOTHING to measure.
+                            //
+                            // It passed the literal `0` until review, defended by an argument
+                            // on the wrong axis: `FloorUnreachable` does imply a floor above
+                            // zero and therefore `requested > 0`, but that is a claim about
+                            // the OTHER number and says nothing about how much would have
+                            // survived. On this slice's own fixture it is wrong by most of the
+                            // budget — a 100 023-byte dependency against a 4096-token window
+                            // leaves `3 × (4096 − 256 − 2) = 11 514` bytes to render into, and
+                            // the refusal is that even ALL of them are under the 25 006 the
+                            // 25% floor demands. Stated as that bound rather than as a survivor
+                            // count, since a survivor count is the thing this arm cannot know.
+                            // "0 of 100 023 survive" reads as a total loss and puts the
+                            // operator's remedy — shorten the upstream output by how much? — on
+                            // a number nothing measured. Pinned by
+                            // `the_planner_floor_refusal_reports_no_retained_figure_it_never_measured`.
                             Some(Err(BudgetRefusal::FloorUnreachable)) => {
                                 return self
                                     .pause_context_floor(
@@ -450,7 +481,7 @@ impl Executor {
                                         node_id,
                                         w,
                                         requested_context_bytes,
-                                        0,
+                                        None,
                                     )
                                     .await;
                             }
@@ -465,7 +496,7 @@ impl Executor {
                                             node_id,
                                             w,
                                             c.requested_bytes,
-                                            c.retained_bytes,
+                                            Some(c.retained_bytes),
                                         )
                                         .await;
                                 }
@@ -488,6 +519,33 @@ impl Executor {
                                     },
                                 )
                                 .await?;
+                                // SP-7b channel 4 — the operator, and the INSTRUMENT.
+                                // `CONTEXT_FLOOR_FRACTION` is a judgment call with no evidence
+                                // behind it; this is what is meant to replace the guess with a
+                                // measurement, so it carries `requested` beside `retained` —
+                                // the ratio, not just the survivor — which is the one figure
+                                // the durable row does not.
+                                //
+                                // WARN rather than INFO: a degraded answer is a real reduction
+                                // in the work product's quality, and an operator who never
+                                // sees one cannot know it is happening. It is emitted once per
+                                // budgeted NODE (this arm runs only on the writing drive), so
+                                // it cannot become per-turn noise.
+                                //
+                                // In SP-DATA-5's clamp-warn style, and the fields are named to
+                                // match: bare event, integers, the node as the correlation key
+                                // — `RunPaused` carries no node, so a log line that omitted it
+                                // could not be tied to anything in the journal.
+                                tracing::warn!(
+                                    node = %node_id.0,
+                                    window = w,
+                                    requested_bytes = c.requested_bytes,
+                                    retained_bytes = c.retained_bytes,
+                                    dropped_deps = c.deps_total - c.deps_shown,
+                                    dropped_tools = plan.dropped_tools.len(),
+                                    "SP-7b: agent context budgeted — this turn answers on a \
+                                     reduced context"
+                                );
                                 (s, t, Some(c))
                             }
                         }
@@ -515,6 +573,7 @@ impl Executor {
             fold,
             agent_tools: agent.tools.clone(),
             agent_grants: agent.grants.clone(),
+            context_cut,
         };
 
         let mut messages: Vec<Message> = vec![Message::text(MessageRole::User, query)];
@@ -603,15 +662,38 @@ impl Executor {
     /// `pause_awaiting` (`signal.rs`) is the same six lines and could not be reused: it
     /// returns `NodeExec` and `drive_agent` returns `AgentStep`. The `NodeFailed`-free shape
     /// is the part worth watching when editing either.
+    ///
+    /// **`retained` is an `Option` because only ONE of the two callers measured anything.**
+    /// The post-render check hands over a real `ContextCut::retained_bytes`; the planner's
+    /// `FloorUnreachable` refuses before the section is rendered at all, and it used to pass
+    /// the literal `0` — an operator-facing claim that nothing would survive, which on this
+    /// slice's own fixture is wrong by most of the budget (the arm's own comment does the
+    /// arithmetic). Whichever number this function is given, it must be one somebody
+    /// measured, so the un-measured caller says so instead.
     async fn pause_context_floor(
         &self,
         run: RunId,
         node_id: &NodeId,
         window: u32,
         requested: usize,
-        retained: usize,
+        retained: Option<usize>,
     ) -> Result<AgentStep, OrchestratorError> {
         let pct = (orchestrator_core::CONTEXT_FLOOR_FRACTION * 100.0).round() as u32;
+        // What survived, or — when nothing was rendered — what the planner DID establish: of
+        // the cuts that fit this window, none clears the floor. Both verdicts name the same
+        // window and the same floor and are followed by the same remedies, so the two
+        // refusals stay ONE message with one shape rather than diverging into two — including
+        // the `{window}-token context window` substring the guard tests key on.
+        let verdict = match retained {
+            Some(bytes) => format!(
+                "only {bytes} of them survive a budget for the largest model in this chain \
+                 ({window}-token context window) — under the {pct}% floor"
+            ),
+            None => format!(
+                "there is no cut of it that fits a budget for the largest model in this \
+                 chain ({window}-token context window) and still clears the {pct}% floor"
+            ),
+        };
         // The node is NAMED in the reason, which the plan's draft of this message did not do.
         // It is not decoration: `JournalEvent::RunPaused` carries only `{reason,
         // resume_after}` and no node, so the durable row an operator reads back — through
@@ -620,11 +702,10 @@ impl Executor {
         // gone by the time anyone runs a command.) The `context budget: ` prefix stays at the
         // front, since that is the wording the guard tests key on.
         let reason = format!(
-            "context budget: node {node}'s dependency context is {requested} bytes and only \
-             {retained} survive a budget for the largest model in this chain \
-             ({window}-token context window) — under the {pct}% floor, so the reply would \
-             be built on almost nothing. Waiting does not move this: shorten the upstream \
-             output, split the node, or put a model with a larger window in this chain.",
+            "context budget: node {node}'s dependency context is {requested} bytes and \
+             {verdict}, so the reply would be built on almost nothing. Waiting does not move \
+             this: shorten the upstream output, split the node, or put a model with a larger \
+             window in this chain.",
             node = node_id.0
         );
         self.append(
@@ -735,7 +816,20 @@ impl Executor {
     }
 
     /// Finalize a completed agent node: journal `NodeCompleted` once (guarded on
-    /// resume) and return the canonical `{model, text}` output.
+    /// resume) and return the canonical `{model, text}` output — plus SP-7b's
+    /// `context_budgeted: true` when this node's context was cut to fit the window.
+    ///
+    /// **The third key is ADDITIVE and that is load-bearing.** The output stays
+    /// `{"model", "text"}` plus one key, so an unmodified `BranchCond::TextContains`
+    /// consumes a degraded answer exactly as before — the same discipline SP-6 s3 used
+    /// when it added `actor` to a human-backed agent's output. A consumer that wants to
+    /// treat a degraded answer differently opts IN by reading the key; one that does not
+    /// is not broken by its arrival.
+    ///
+    /// **Emitted only when the turn was degraded**, so an in-window turn's output is
+    /// byte-identical to the pre-SP-7b one (AC11). Emitting `false` on every turn would be
+    /// tidier to consume and would break that, and it would also make the key useless as a
+    /// signal in a graph whose nodes predate the slice.
     async fn finish_agent(
         &self,
         ar: &AgentRun<'_>,
@@ -755,9 +849,19 @@ impl Executor {
             .get("model")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        Ok(AgentStep::Completed(
-            serde_json::json!({ "model": model, "text": text }),
-        ))
+        let mut out = serde_json::json!({ "model": model, "text": text });
+        // SP-7b channel 3. `insert` on the object rather than a second `json!` literal, so the
+        // two shapes cannot drift apart: there is exactly ONE place the canonical output is
+        // built, and this adds to it.
+        if ar.context_cut.is_some()
+            && let Some(obj) = out.as_object_mut()
+        {
+            obj.insert(
+                "context_budgeted".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        Ok(AgentStep::Completed(out))
     }
 
     /// Execute (or replay) one ReAct turn's tool calls and return the transcript
