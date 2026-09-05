@@ -25,10 +25,22 @@ pub struct PromptParts {
 
 impl PromptParts {
     /// Re-join the two halves into the system prompt the MODEL receives, using the
-    /// unbounded [`render_context_section`] — the model's own context window is the bound
-    /// that applies on that path, and it is applied by the GATEWAY's `ContextWindowGate`
-    /// (SP-7a) rather than truncated here, so a model is never silently asked about half
-    /// a document.
+    /// unbounded [`render_context_section`]: nothing here is cut, whatever its size.
+    ///
+    /// **This doc used to end "so a model is never silently asked about half a document",
+    /// offered as the reason the model path truncates NOWHERE. SP-7b made the second half of
+    /// that false and the first half its design goal.** The model path now has two joins, and
+    /// the model's own context window still decides which: this one when the assembled prompt
+    /// fits a candidate — the ordinary case, byte-identical to every slice before SP-7b — and
+    /// [`Self::join_bounded`] when it fits none. The operative word was always SILENTLY, and
+    /// the answer is the four disclosure channels of the spec's §5.5, not the absence of a cut.
+    ///
+    /// This function is also still what an UNCUTTABLE over-window prompt goes out through, and
+    /// that is not a leftover. When no cut can fit — the authored half alone overruns the
+    /// budget ([`BudgetRefusal::AuthoredOverBudget`]) — `drive_agent` joins here and lets the
+    /// gateway's per-candidate `ContextWindowGate` (SP-7a) refuse, because that refusal names
+    /// each candidate's own window, the estimate and a remedy, and nothing is dispatched
+    /// either way.
     ///
     /// **The model path calls THIS**, and so does [`assemble_prompt`]. That is the whole
     /// reason it exists as a method rather than three lines inlined at each site. Before
@@ -47,9 +59,9 @@ impl PromptParts {
     /// [`Self::join`]'s budgeted sibling: the model path's answer to a prompt no candidate can
     /// hold.
     ///
-    /// [`Self::join`]'s doc argues the model path must never truncate, "so a model is never
-    /// silently asked about half a document". The operative word is SILENTLY, and SP-7b answers it
-    /// on four channels rather than by keeping the refusal: the per-entry marker and the
+    /// [`Self::join`]'s doc argued, until this function existed, that the model path must never
+    /// truncate — "so a model is never silently asked about half a document". The operative word
+    /// was SILENTLY, and SP-7b answers it on four channels rather than by keeping the refusal: the per-entry marker and the
     /// `(N of M dependencies shown)` tail [`render_context_section_measured`] already emits, the
     /// `ContextBudgeted` journal record, an additive `context_budgeted` key on the node's output,
     /// and an operator warn. See the spec's §5.5. Only the first of those is this function's own
@@ -311,17 +323,24 @@ fn context_entry_heading(key: &str) -> String {
 /// Render the `## Context` section for a HUMAN-backed node's question, bounded to `budget`
 /// bytes in total.
 ///
-/// The model path must NOT use this — [`render_context_section`] is its renderer, and a
-/// model's own context window is the bound that applies there. That bound is enforced by
-/// the gateway's `ContextWindowGate` (SP-7a), which SKIPS a candidate the prompt does not
-/// fit rather than truncating, so a model is never silently asked about half a document.
+/// The model path must not call THIS FUNCTION, and the reason has changed. It used to be
+/// that the model path never truncated at all: [`render_context_section`] was its only
+/// renderer, the gateway's `ContextWindowGate` (SP-7a) SKIPPED a candidate the prompt did not
+/// fit, and so "a model is never silently asked about half a document". **SP-7b ended that.**
+/// A prompt no candidate can hold is now cut — by [`PromptParts::join_bounded`], through
+/// [`render_context_section_measured`], which is this function's own body — and what keeps it
+/// from being SILENT is the four disclosure channels of the spec's §5.5, not the absence of a
+/// cut. What is left of the rule is narrow and mechanical: the budgeted model path needs the
+/// [`ContextCut`] to decide the floor on, so it takes the measured variant; this name is the
+/// human path's, which needs only the string.
 ///
-/// This is the human path's answer to the same problem, and it differs because the failure
-/// modes differ: an over-window model call falls through to a LARGER candidate in the same
-/// chain — true since SP-7a, and the reason that slice exists; before it, the orchestrator
-/// refused such a call outright against the chain's smallest window — whereas a
-/// human-backed node that fails takes the whole run terminal AFTER the upstream tokens
-/// have been spent.
+/// The two paths still bound themselves for different reasons, and that has NOT changed. A
+/// model path bound is per-turn and recoverable: an over-window model call falls through to a
+/// LARGER candidate in the same chain (true since SP-7a; before it the orchestrator refused
+/// such a call outright against the chain's smallest window), and when even the largest cannot
+/// hold it SP-7b cuts to fit or refuses at the floor with a durable, force-wakeable pause.
+/// A human-backed node that fails takes the whole run terminal AFTER the upstream tokens have
+/// been spent, which is why its bound is a fixed byte cap rather than a window.
 ///
 /// This paragraph used to carry an "on an UNBUDGETED run" qualifier, because SP-DATA-5's
 /// clamp (`executor/dispatch.rs`) bounded by `min_context_window(chain)` BEFORE selection
@@ -346,6 +365,15 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
 /// [`render_context_section_bounded`] (the human path, which needs only the string) and
 /// [`PromptParts::join_bounded`] (SP-7b's budgeted model path, which must then check the cut
 /// against the context floor). The bound itself is applied identically for both.
+///
+/// **The two signals documented below are also §5.5's channel 1**, the one that tells the
+/// MODEL its context was cut. They were designed for the human path and SP-7b reuses them
+/// verbatim, which is why its cut is disclosed rather than silent: whoever is being asked is
+/// told, whether that is a person or a model. They are not interchangeable, and a reader
+/// looking for "the disclosure" will find only one of them on any given turn — the per-entry
+/// marker says an entry was TRUNCATED, the tail says whole entries were DROPPED, and a
+/// one-dependency section that is merely truncated carries the marker with no tail at all
+/// (`deps_shown == deps_total`).
 ///
 /// The counts cannot be recovered from the returned string: dependency bodies are arbitrary run
 /// data and are free to contain the very `### ` headings and truncation markers a parser would key

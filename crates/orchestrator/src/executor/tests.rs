@@ -476,6 +476,29 @@ async fn phase_override_wins_over_base_route_through_from_config() {
 /// distinction is the whole recovery story: `list_paused` finds a `RunPaused` row and
 /// `force_wake` can move it, where a `NodeFailed` left the run terminal and reachable
 /// only by hand-written SQL.
+///
+/// # SP-7b looked at this test and changed NOTHING, which is the claim worth writing down
+///
+/// SP-7b degrades an over-window agent turn instead of refusing it, so the expectation on
+/// arrival was that this fixture now completes and the name would have to go. It does not,
+/// and the fixture is the whole reason: `over_window_agent_registry` is a 100 000-byte
+/// `system_prompt` with NO dependencies, and the authored half is never cut (spec §5.2).
+/// `plan_budget` therefore answers `BudgetRefusal::AuthoredOverBudget` — no cut this planner
+/// can make brings the prompt inside any window — and `drive_agent` hands the UN-cut prompt
+/// to selection exactly as before. So this is AC5 seen from the agent side, and the pause,
+/// the diagnosis and the zero spend below are all still the gateway's.
+///
+/// What SP-7b did change is that a run now has TWO refusals that both name the window, so
+/// this test says which one it is observing rather than leaving it to be inferred. Honestly
+/// stated: the prefix assertion is not the only net. Routing `AuthoredOverBudget` to
+/// `pause_context_floor` — the mutation this guard was verified with — also reddens the
+/// estimate substring, because the floor message carries neither the estimate nor the
+/// `route to a model…` remedy. What the prefix buys is the DIAGNOSIS: asserted first, as the
+/// premise, it fails with "wrong component" and prints the absurdity itself — *node n1's
+/// dependency context is 0 bytes* — where the estimate assertion fails with "missing
+/// number" about a message that was never going to have one. Its sibling
+/// `oversized_dependency_context_halts_over_budget_never_truncates` keys on the same prefix
+/// from the other side.
 #[tokio::test]
 async fn an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis() {
     let (gateway, calls) = recording_gateway().await;
@@ -495,6 +518,13 @@ async fn an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis(
         Some(pause) => {
             assert_eq!(pause.node.0, "n1");
             let msg = &pause.reason;
+            assert!(
+                !msg.starts_with("context budget: "),
+                "the premise — it is the GATE's refusal, not SP-7b's floor: this agent has \
+                 no dependency context to cut and its authored half is never cut, so no \
+                 budget changes the outcome and blaming a context budget would be accurate \
+                 about nothing: {msg}"
+            );
             assert!(
                 msg.contains("4096-token context window"),
                 "the pause names the CANDIDATE's own window, not a chain-wide \
@@ -4888,6 +4918,14 @@ async fn tampered_upstream_context_on_resume_halts_with_determinism_violation() 
 /// nothing dispatched — is asserted by
 /// `the_context_floor_pause_is_recoverable_and_spends_nothing`, because the window substring
 /// this test keys on is carried by BOTH refusals and so cannot tell them apart.
+///
+/// **The NAME was re-read against all of that and kept, deliberately.** Every clause is still
+/// literally true of what runs here: the dependency context is oversized, the node halts, the
+/// halt is over a BUDGET — the message opens `context budget: ` — and nothing is truncated,
+/// because `BudgetRefusal::FloorUnreachable` refuses before the section is rendered at all.
+/// The one thing the name must not be read as is a claim about the model path in GENERAL,
+/// which SP-7b made false: an over-window turn whose cut clears the floor is truncated and
+/// dispatched, and `an_over_window_agent_turn_is_budgeted_and_dispatched` is that case.
 #[tokio::test]
 async fn oversized_dependency_context_halts_over_budget_never_truncates() {
     use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
