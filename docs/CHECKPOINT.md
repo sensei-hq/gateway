@@ -1,39 +1,40 @@
 # Checkpoint
 
-**SP-7b context budgeting: ALL EIGHT TASKS LANDED (`be89e7d`). Build phase COMPLETE; the
-whole-slice review is what remains.** Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12 ACs) +
-its plan, whose Task 8 note records what shipped. SP-7a DONE (`864a8dd`).
+**SP-7b context budgeting: COMPLETE, whole-slice reviewed, pushed (`f489fbc`).** Eight tasks plus
+the final review's three confirmed findings. Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12
+ACs) + its plan, whose Task 8 note records what shipped. SP-7a DONE (`864a8dd`).
 
 ## Done
 
 T1-T4 (`fedb8ac`..`daeee45`) `max_context_window`, the pure planner + `CONTEXT_FLOOR_FRACTION`, the
-measured renderer, `ContextBudgeted` folded FIRST-wins. `cdea80d`+`16a344e` T5/T6 `drive_agent`
-wiring plus two CRITICALs (an unfenced UN-budgeted turn; the replay arm re-running `plan_budget`).
-`5781e3e`+`03204bf` T7 disclosure on all four channels, including the read-back path
-(`project_agent_outputs` re-attaches the key from the durable row — no new event).
-`be89e7d` T8: T8's own steps 1-2 were ALREADY discharged by `16a344e`, so neither was re-done —
-what shipped is the NAME judgment on the floor guard, a premise assertion on the SP-7a pause test
-that the refusal is the GATE's (mutation: route `AuthoredOverBudget` to `pause_context_floor`),
-the `join`/`render_context_section_bounded` rewrites (the word was SILENTLY; four channels), and
-the doc sweep + a `ContextBudgeted` section `durable-journal.md` never had.
+measured renderer, `ContextBudgeted` folded FIRST-wins. `cdea80d`+`16a344e` T5/T6 wiring plus two
+CRITICALs (an unfenced UN-budgeted turn — and restoring the config did NOT help, since the spurious
+row is appended before the hash check; and a replay arm re-running `plan_budget`, which folds in the
+one constant the spec says exists to be RE-TUNED). `5781e3e`+`03204bf` T7 four channels including
+the read-back path. `be89e7d` T8 the name judgment, doc rewrites and sweep. `f489fbc` closes the
+final review: a tool-only degradation was INVISIBLE to the model (schemas dropped silently, agent
+never told a configured capability was gone); `dropped_tools` was documented as disclosure when it
+is a folded REPLAY INPUT; and AC9's measured-floor arm had no test — now mutation-verified.
 
 **The one idea: journal the BUDGET, not the cut.** The window-derived integer was the only unfenced
 input (`GatewayConfig` has NO version field); a `DeterminismViolation` on resume is unrevivable.
 
 ## Verified
 
-`cargo test --workspace` **1752 passed / 0 failed / 56 ignored, real exit 0** · `clippy --workspace
---all-targets -D warnings` 0 · `fmt --check` 0 · CLEAN `cargo doc --document-private-items` at the
-**16** unresolved-link baseline, none new. 1752 is also HEAD's pre-change count (stash-verified) —
-the 1747 in T8's brief was stale.
+`cargo test --workspace` **1754 passed / 0 failed / 56 ignored, real exit 0** · `clippy
+--all-targets -D warnings` 0 · `fmt --check` 0 · `cargo doc --document-private-items` at the **16**
+unresolved-link baseline. Final review: 17 raw findings, **7 REFUTED** by adversarial verification
+(including an overstated CRITICAL), 3 confirmed and fixed, 7 minors open.
 
-## Next / Open
+## Next
 
-Run the whole-slice review (`/sensei:review`) over SP-7b, then merge to `develop`'s upstream. Carry
-into it: nine plan errors and seven false doc claims so far, three introduced by commits FIXING
-something else — every quantified claim in this slice needs deriving, not repeating. Deliberately
-untouched: the dated SP-7a spec/plan docs that call SP-7b a follow-on (true when written); the
-`min_context_window` doc (correct — `min_context_window_is_the_smallest_model_in_the_chain`).
-Known pre-existing flake, NOT this slice:
-`both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low` (did not fire this pass).
-**Sensei daemon NOT running — this file is the only record.**
+A develop→main PR carrying SP-7a, the M1 reversal and SP-7b. Then SP-7c, or the minors.
+
+## Open
+
+7 MINORs, none blocking: duplicate tool NAMES drop the wrong schema; `dropped_deps` can be
+hard-wired to 0 with the suite green; `torii` has NO `ContextBudgeted` arm, so that operator surface
+is unbuilt; spec §5.2/§5.3 cite retracted rules. A budgeted node is effectively SINGLE-TURN, pinned
+by a two-turn test. Pre-existing flake, NOT this slice:
+`both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low`. **Sensei daemon NOT running —
+this file is the only record.**
