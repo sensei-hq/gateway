@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use kernel::types::capability::Capability;
 use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload, ToolDefinition};
 use orchestrator_core::{
-    ChildStatus, ContentRef, ContextRef, EdgeKind, EffectOutput, Graph, JournalEvent, MapBody,
-    Node, NodeId, NodeKind, OrchestratorError, Seq, effect_id,
+    ChildStatus, ContentRef, ContextRef, EdgeKind, EffectId, EffectOutput, Graph, JournalEvent,
+    MapBody, Node, NodeId, NodeKind, OrchestratorError, Seq, effect_id,
 };
 use sha2::{Digest, Sha256};
 
@@ -428,9 +428,23 @@ pub(crate) fn fold_journal(
 
 /// Project each Agent node's raw final model-turn output (`{model, text,
 /// tool_calls}`) down to the canonical `{model, text}` a fresh `run` returns from
-/// `AgentStep::Completed` (design §4) — so a completed Agent node yields an
-/// identical shape on every completion path. Pure over already-materialized
-/// outputs; `ModelCall` nodes already store the canonical shape and are untouched.
+/// `AgentStep::Completed` (design §4) — plus SP-7b's `context_budgeted: true` for a node
+/// this run cut the context of — so a completed Agent node yields an identical shape on
+/// every completion path. Pure over already-materialized outputs and the folded budgets;
+/// `ModelCall` nodes already store the canonical shape and are untouched.
+///
+/// **SP-7b's key is re-attached from `context_budgets`, not carried through the rebuild**,
+/// because it is not IN the value being rebuilt and never was: `finish_agent` synthesizes it
+/// from `AgentRun::context_cut` and journals nothing, while `node_last_output` is populated
+/// only from `EffectRecorded` — the raw `{model, text, tool_calls}` turn. So "preserve the
+/// extra key when present" would compile, read as a fix, and change nothing. The durable
+/// `ContextBudgeted` row is the only carrier, and its key `effect_id(node, 0, 0)` is exactly
+/// what `context_cut.is_some()` tracks on the writing drive: the one arm that appends a row
+/// is the one arm that sets `Some`, and the replay arm re-sets `Some` off that same row
+/// (`agent.rs`). Review found this silently reporting a degraded node as un-degraded on every
+/// read-back — the same flattening the `actor` exemption below exists for, on the channel
+/// whose entire purpose is that a degraded answer is distinguishable from a full one. Pinned
+/// by `a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back`.
 ///
 /// **A HUMAN-answered node (SP-6 s3) is passed through unchanged**, because its
 /// canonical shape is a different one: `{text, actor}` (design §4 / AC2), and forcing
@@ -470,6 +484,7 @@ pub(crate) fn fold_journal(
 /// carries.
 pub(crate) fn project_agent_outputs(
     graph: &Graph,
+    context_budgets: &HashMap<EffectId, ContextBudget>,
     outputs: &mut HashMap<NodeId, serde_json::Value>,
 ) {
     for node in &graph.nodes {
@@ -484,10 +499,19 @@ pub(crate) fn project_agent_outputs(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             let text = output.get("text").cloned().unwrap_or_default();
-            outputs.insert(
-                node.id.clone(),
-                serde_json::json!({ "model": model, "text": text }),
-            );
+            let mut projected = serde_json::json!({ "model": model, "text": text });
+            // Mirrors `finish_agent`'s own `insert`-on-the-object, deliberately: the key is
+            // ADDITIVE there and must be additive here, or the two shapes disagree in the
+            // opposite direction from the one review caught.
+            if context_budgets.contains_key(&effect_id(&node.id.0, 0, 0))
+                && let Some(obj) = projected.as_object_mut()
+            {
+                obj.insert(
+                    "context_budgeted".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            outputs.insert(node.id.clone(), projected);
         }
     }
 }

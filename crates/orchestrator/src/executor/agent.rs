@@ -346,7 +346,13 @@ impl Executor {
         // the same cut from the journal, and warning again would report a degradation that
         // is not happening now — the same reasoning that keeps `ContextBudgeted` to one row
         // per node (AC3). The output key does NOT follow that rule and must not: it
-        // describes the ANSWER, which is degraded on every drive that returns it.
+        // describes the ANSWER, which is degraded on every drive that returns it — and that
+        // is now asserted rather than argued. Until review it was not: `Some(c)` on the
+        // journaled-replay arm below could be flipped to `None` with the whole suite green,
+        // silently un-disclosing every RESUMED budgeted node.
+        // `a_budgeted_turn_replays_after_the_window_changes_underneath_it` pins the mid-run
+        // resume; `a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back` pins
+        // the terminal one, which does not come through here at all.
         let (system, tools, context_cut) = match journaled {
             Some(record) => {
                 let available = usize::try_from(record.budget_bytes).unwrap_or(usize::MAX);
@@ -851,8 +857,16 @@ impl Executor {
             .unwrap_or(serde_json::Value::Null);
         let mut out = serde_json::json!({ "model": model, "text": text });
         // SP-7b channel 3. `insert` on the object rather than a second `json!` literal, so the
-        // two shapes cannot drift apart: there is exactly ONE place the canonical output is
-        // built, and this adds to it.
+        // budgeted and un-budgeted shapes here cannot drift apart: one literal, one optional
+        // key added to it.
+        //
+        // That keeps THIS function's two shapes in step; it does NOT make this the only place
+        // a completed Agent node's output is built. `project_agent_outputs`
+        // (`executor/support.rs`) rebuilds it on the terminal-resume path, and review caught
+        // the first cut of this slice shipping the key here and not there — so a completed
+        // degraded node read back through `start()` reported as un-degraded. The two sites are
+        // held in step by argument, not by construction, so a change to either belongs in both:
+        // `a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back` is the guard.
         if ar.context_cut.is_some()
             && let Some(obj) = out.as_object_mut()
         {
