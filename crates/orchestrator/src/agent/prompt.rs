@@ -369,11 +369,24 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
 /// **The two signals documented below are also §5.5's channel 1**, the one that tells the
 /// MODEL its context was cut. They were designed for the human path and SP-7b reuses them
 /// verbatim, which is why its cut is disclosed rather than silent: whoever is being asked is
-/// told, whether that is a person or a model. They are not interchangeable, and a reader
-/// looking for "the disclosure" will find only one of them on any given turn — the per-entry
-/// marker says an entry was TRUNCATED, the tail says whole entries were DROPPED, and a
-/// one-dependency section that is merely truncated carries the marker with no tail at all
-/// (`deps_shown == deps_total`).
+/// told, whether that is a person or a model. They are not interchangeable and they report
+/// different things — the per-entry marker says an entry was TRUNCATED, the tail says whole
+/// entries were DROPPED — so a reader looking for "the disclosure" must look for BOTH: a turn
+/// can carry either, or both at once.
+///
+/// **An earlier revision of this paragraph said a reader "will find only one of them on any
+/// given turn". That is false**, and the both-case is not exotic: it is what the drop path
+/// below is normally reached THROUGH. The n shares sum to at most `budget - CONTEXT_HEAD.len()`,
+/// so (for any budget big enough to hold the heading at all) overrunning takes some entry
+/// exceeding its OWN share, and for an entry with a
+/// non-empty body the only way to do that is [`truncate_with_marker`] running out of room for
+/// its marker — the escape hatch documented below — which is to say emitting one. So the tail
+/// is typically appended to a body already carrying markers. On this module's own fixture of
+/// 200 × 500-byte dependencies into a 1 024-byte budget the render carries 19 markers AND a
+/// `(19 of 200 dependencies shown)` tail, pinned by
+/// `a_cut_section_can_carry_the_marker_and_the_dropped_tail_at_once`. The converse case is
+/// real too and is the one AC10 names: a one-dependency section that is merely truncated
+/// carries the marker with no tail at all (`deps_shown == deps_total`).
 ///
 /// The counts cannot be recovered from the returned string: dependency bodies are arbitrary run
 /// data and are free to contain the very `### ` headings and truncation markers a parser would key
@@ -1258,6 +1271,69 @@ mod tests {
              they were all of them: {out:?}",
             entries.len() - shown,
             entries.len()
+        );
+    }
+
+    /// The two channel-1 signals are NOT mutually exclusive, and this pins the case that
+    /// proves it — because a doc rewrite in this slice claimed they were.
+    ///
+    /// The claim was that "a reader looking for the disclosure will find only one of them on
+    /// any given turn". It is false, and mechanically so: the drop path is reached only when
+    /// the section overruns its budget, and since the n shares sum to at most
+    /// `budget - CONTEXT_HEAD.len()`, overrunning takes some entry exceeding its OWN share
+    /// (for any budget big enough to hold the heading at all). For an entry
+    /// with a non-empty body the only way to do that is `truncate_with_marker` finding `room`
+    /// under the marker's own width — which is to say emitting a marker. So whenever a
+    /// non-empty body is what overran, the tail is appended to a body already carrying
+    /// markers.
+    ///
+    /// This fixture is the repo's own — the same 200 × 500 bytes into 1 024 that
+    /// `a_context_section_that_drops_dependencies_says_how_many` and the
+    /// `"share smaller than the marker"` table row use — so the both-case is not contrived;
+    /// it is what the existing coverage was already walking through without naming.
+    ///
+    /// The second half is the case AC10 names: one dependency, merely truncated, marker and
+    /// no tail. Together they say the honest thing — either signal, or both.
+    ///
+    /// Not claimed, because it is not true: that a drop always implies a marker. An entry
+    /// with an EMPTY body and a long key overruns its share on the heading alone and
+    /// `truncate_with_marker` returns it untouched, so a tail with no marker is constructible.
+    /// It just is not what this fixture does — measured, 19 markers.
+    #[test]
+    fn a_cut_section_can_carry_the_marker_and_the_dropped_tail_at_once() {
+        let entries: Vec<(String, String)> = (0..200)
+            .map(|i| (format!("dep{i}"), "X".repeat(500)))
+            .collect();
+        let out = render_context_section_bounded(&entries, 1_024);
+
+        let markers = out.matches("(truncated:").count();
+        let shown = (0..200)
+            .filter(|i| out.contains(&format!("### dep{i}\n")))
+            .count();
+        assert_eq!(
+            (markers, shown),
+            (19, 19),
+            "every RETAINED entry carries a marker of its own — 19 of them here, one per \
+             surviving heading — so the tail below lands on a body that is already marked: \
+             {out:?}"
+        );
+        assert!(
+            out.ends_with("… (19 of 200 dependencies shown)"),
+            "…and the drop tail is there TOO, on the same render: {out:?}"
+        );
+
+        // The other side of "either or both": one dependency, merely truncated. The marker
+        // fires, the tail does not, and `deps_shown == deps_total` is why.
+        let solo = vec![("solo".to_string(), "z".repeat(1_000))];
+        let (out, cut) = render_context_section_measured(&solo, 200);
+        assert!(
+            out.contains("(truncated:") && !out.contains("dependencies shown"),
+            "a truncated one-dependency section carries the marker and NO tail: {out:?}"
+        );
+        assert_eq!(
+            (cut.deps_shown, cut.deps_total),
+            (1, 1),
+            "nothing was dropped, which is what makes the tail wrong to emit here"
         );
     }
 

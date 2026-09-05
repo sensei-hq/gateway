@@ -1636,11 +1636,20 @@ claimed otherwise and was false by construction.
 > **SHIPPED. What was actually left to do, and what was already done — steps 1 and 2 were BOTH
 > already discharged, and re-doing either would have produced a second version of one claim.**
 >
-> - **Step 1 was fully discharged by Task 5's fix commit `16a344e`**, not merely "largely moot".
+> - **Step 1 was fully discharged by `5781e3e`**, not merely "largely moot".
 >   `oversized_dependency_context_halts_over_budget_never_truncates` already halts below the
 >   floor, its doc already attributes the halt to SP-7b's floor rather than the gateway, AND the
->   `context budget: ` prefix assertion was already there — `git log -S 'context budget: '` on
->   `tests.rs` names `16a344e` and `5781e3e`, no third commit. What this task added is the one
+>   `context budget: ` prefix assertion was already there.
+>   **The commit id in this bullet was wrong until task 8's review round, and the method that
+>   produced it is the lesson.** It read `16a344e` — Task 5's fix commit — off a
+>   `git log -S 'context budget: '` over the whole of `tests.rs`, which names every commit that
+>   changed that substring's COUNT anywhere in a 26 000-line file. `16a344e` added the same
+>   assertion to OTHER tests and left this one byte-for-byte alone; the substring search cannot
+>   tell those apart. Extracting THIS test's text at each commit and diffing it names `5781e3e`
+>   (Task 7's feature commit) for both the doc rewrite and the premise assertion, `be89e7d` for
+>   task 8's name judgment, and nothing else since the spec was written. The same false
+>   attribution reached the spec's §7.1 draft and is corrected in both places.
+>   What this task added is the one
 >   thing the amendment left open: the NAME judgment, recorded in the doc (every clause still
 >   holds literally for this fixture; what it must not be read as is a claim about the model path
 >   in general, and the sibling that IS that case is named).
