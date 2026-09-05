@@ -1633,6 +1633,45 @@ claimed otherwise and was false by construction.
 
 ### Task 8: Split the guard test, and the doc sweep
 
+> **SHIPPED. What was actually left to do, and what was already done — steps 1 and 2 were BOTH
+> already discharged, and re-doing either would have produced a second version of one claim.**
+>
+> - **Step 1 was fully discharged by Task 5's fix commit `16a344e`**, not merely "largely moot".
+>   `oversized_dependency_context_halts_over_budget_never_truncates` already halts below the
+>   floor, its doc already attributes the halt to SP-7b's floor rather than the gateway, AND the
+>   `context budget: ` prefix assertion was already there — `git log -S 'context budget: '` on
+>   `tests.rs` names `16a344e` and `5781e3e`, no third commit. What this task added is the one
+>   thing the amendment left open: the NAME judgment, recorded in the doc (every clause still
+>   holds literally for this fixture; what it must not be read as is a claim about the model path
+>   in general, and the sibling that IS that case is named).
+> - **Step 2's either/or resolves to "it still pauses, unchanged", and the fixture says why.**
+>   `over_window_agent_registry` is a 100 000-byte `system_prompt` with NO dependencies, so
+>   `plan_budget` answers `AuthoredOverBudget`, the un-cut prompt goes to the gate, and the
+>   name `an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis` is still exact.
+>   It gained the SP-7b paragraph the step asked for, plus a `!starts_with("context budget: ")`
+>   PREMISE assertion, since the run now has two refusals that both name the window.
+>   Mutation-verified by routing the `AuthoredOverBudget` arm to `pause_context_floor`: the
+>   premise reddens first, printing the absurdity itself — *node n1's dependency context is 0
+>   bytes*. **Stated honestly, it is not the only net:** that mutation also reddens the estimate
+>   substring, because the floor message carries neither the estimate nor the `route to a model…`
+>   remedy. What the premise buys is a failure that says "wrong component" rather than "missing
+>   number", and the test's doc says exactly that rather than claiming a guard it does not have.
+> - **Carry-forwards (a) and (b) were ALREADY CLOSED before this task started** — (a) in Task 7's
+>   round (`pause_context_floor` takes `retained: Option<usize>`, pinned by
+>   `the_planner_floor_refusal_reports_no_retained_figure_it_never_measured`), (b) in both places
+>   it lived (`available_context_bytes`'s doc and the spec's §2 bullet both now say **at most**
+>   and both record that an earlier revision said "exactly"). Re-verified by reading, not
+>   re-written.
+> - **Beyond the brief:** `durable-journal.md` had no `ContextBudgeted` section at all. The sweep
+>   pattern could not find that, because a missing page is not a false sentence — but this slice
+>   added a journal variant and a fold discipline to the page whose entire subject is journal
+>   variants and fold disciplines. Added, with the three tests that pin it.
+> - **Deliberately NOT touched:** the dated SP-7a spec/plan documents that describe SP-7b as a
+>   follow-on (`2026-09-03-…-design.md:43,141,290`, `2026-09-04-sp-7a-serving-window-bound-…:48,240`).
+>   They were true when written and they are the record of a decision, not a live status page;
+>   `orchestrator-overview.md`'s §4 index and §5 SP-7 entry are the live surface and both now say
+>   SHIPPED. `min_context_window`'s doc was left alone per the standing instruction.
+
 > **Amended after Task 5's review round — read this before step 1.**
 >
 > Task 5 shipped work this task's steps assumed it would inherit, and moved two decisions:
