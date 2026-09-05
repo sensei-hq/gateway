@@ -487,12 +487,19 @@ had made invisible.
 So the first resolution bullet — "the existing name and fixture **are resized** so the retained
 context falls BELOW the floor" — describes work that was never done and never needed doing. **The
 fixture is byte-for-byte the one this section was written against.** What the step actually needed
-was a way to tell the two refusals apart, and that was discharged by **`5781e3e`** — Task 7's
-feature commit — which added the `starts_with("context budget: ")` premise assertion alongside the
-pre-existing window substring and rewrote the doc to attribute the halt to the floor. (The plan's
-Task 8 note credits `16a344e`; that is wrong and is corrected there too. `16a344e` added the same
-substring assertion to OTHER tests, which is why a `git log -S` search names it, but it left this
-test byte-for-byte alone.) Task 8's own commit `be89e7d` added only the judgment the amendment left
+was a way to tell the two refusals apart, and that was discharged by **`16a344e`** — Task 5's fix
+commit — which added the `starts_with("context budget: ")` premise assertion alongside the
+pre-existing window substring and rewrote the doc to attribute the halt to the floor.
+
+> **This attribution was inverted once and then "corrected" to the wrong answer, which is the more
+> useful half of the story.** A task-8 fix replaced `16a344e` with `5781e3e` and attached a
+> confident methodology note claiming an extract-the-test-at-each-commit check had proved it. The
+> check is the right method and the conclusion was backwards: `git show 16a344e -- …/tests.rs`
+> carries the hunk `@@ … async fn oversized_dependency_context_halts_over_budget_never_truncates()`
+> adding the prefix assertion, while `git show 5781e3e -- …/tests.rs` does not mention that test at
+> all. Verified both ways before restoring it. A wrong answer wearing a derivation is harder to
+> catch than a bare one, and this slice's recheck agents exist because a fix commit has now
+> introduced a fresh defect four times. Task 8's own commit `be89e7d` added only the judgment the amendment left
 open — that the NAME still reads right, every clause of it still literally true of what runs
 (`FloorUnreachable` refuses before `render_context_section_bounded` is called at all), so long as it
 is not read as a claim about the model path in general.
