@@ -352,7 +352,7 @@ the transcript. What the `EffectId` key buys is separation of distinct nodes, `M
 
 | Channel | Mechanism |
 |---|---|
-| The model | The existing `truncate_with_marker` per-entry marker, when an entry is TRUNCATED; the `(N of M dependencies shown)` tail, when whole entries are DROPPED. Two signals for two degradations — a turn exhibits whichever it suffered, and a one-dependency cut exhibits only the first (AC10) |
+| The model | The existing `truncate_with_marker` per-entry marker, when an entry is TRUNCATED; the `(N of M dependencies shown)` tail, when whole entries are DROPPED. Two signals for two degradations, and they are NOT mutually exclusive: a turn exhibits either or BOTH. A one-dependency cut exhibits only the first (AC10); a cut that drops entries normally exhibits both, because what pushes a section past its budget in the first place is a marker's own overrun on an entry that therefore carries one. **An earlier revision of this cell said "a turn exhibits whichever it suffered", which reads as exclusive and is not** — the slice's own 200 × 500-into-1 024 fixture renders 19 markers and a `(19 of 200 dependencies shown)` tail together (`a_cut_section_can_carry_the_marker_and_the_dropped_tail_at_once`) |
 | The journal | `ContextBudgeted`, above |
 | Downstream | An additive `context_budgeted: true` key on the agent node's output. ADDITIVE is load-bearing: the output stays `{"text": …}` plus a key, so an unmodified `BranchCond::TextContains` keeps working — the same discipline SP-6 s3 used for `actor` |
 | The operator | A `tracing::warn!` naming the window, requested and retained bytes and the dropped counts, in the style of SP-DATA-5's AC11 clamp warn — the instrument that turns `CONTEXT_FLOOR_FRACTION` from a guess into a measurement |
@@ -440,8 +440,13 @@ the transcript. What the `EffectId` key buys is separation of distinct nodes, `M
 
 ## 7. The guard test this slice must change, and why that is honest
 
+> **Read the amendment at the end of this section first. The premise below did not hold, and it
+> is left standing only because it was the strongest recorded objection to the design and the
+> record of how it was answered is worth more than a tidy section.**
+
 `oversized_dependency_context_halts_over_budget_never_truncates`
-(`executor/tests.rs:4817-4872`) asserts, unqualified:
+(`executor/tests.rs:4894-4982`, the doc comment through the closing brace; it was cited as
+`4817-4872` when this section was written) asserts, unqualified:
 
 ```rust
 assert!(
@@ -464,6 +469,43 @@ Resolution: **split the test rather than relax it.** Its invariant survives wher
 never truncate ("a model is never silently asked about half a document"). The operative word is
 **silently**, and §5.5 is the answer to it: four channels, one of them durable. Both docs must be
 rewritten to say so rather than left contradicting the code.
+
+### 7.1 Amendment — the objection did not apply to this fixture, and no resize happened
+
+**"Under this slice that node completes" is false of THIS test, and "the assertion inverts" never
+happened.** The assertion above is in the shipped tree unchanged and un-inverted, and it passes.
+The reason is arithmetic this section did not do: A's output is 100 000 bytes and reaches the
+renderer as **100 023 bytes** of dependency context (the figure the shipped refusal prints), while
+the 4096-token window leaves `3 × (4096 − 256 − 2) = 11 514` bytes to render into. §5.3's 25 %
+floor demands just over 25 000 of those 100 023 (AC9 quotes 25 006), so even rendering every one
+of the 11 514 available bytes clears less than half of what the floor asks — **this fixture was
+already below the floor on the day this section was written.** So the node does not complete; it
+halts, and what changed is only the halt's OWNER (SP-7b's `BudgetRefusal::FloorUnreachable`
+instead of the gateway's per-candidate gate), which both refusals' messages naming the same window
+had made invisible.
+
+So the first resolution bullet — "the existing name and fixture **are resized** so the retained
+context falls BELOW the floor" — describes work that was never done and never needed doing. **The
+fixture is byte-for-byte the one this section was written against.** What the step actually needed
+was a way to tell the two refusals apart, and that was discharged by **`5781e3e`** — Task 7's
+feature commit — which added the `starts_with("context budget: ")` premise assertion alongside the
+pre-existing window substring and rewrote the doc to attribute the halt to the floor. (The plan's
+Task 8 note credits `16a344e`; that is wrong and is corrected there too. `16a344e` added the same
+substring assertion to OTHER tests, which is why a `git log -S` search names it, but it left this
+test byte-for-byte alone.) Task 8's own commit `be89e7d` added only the judgment the amendment left
+open — that the NAME still reads right, every clause of it still literally true of what runs
+(`FloorUnreachable` refuses before `render_context_section_bounded` is called at all), so long as it
+is not read as a claim about the model path in general.
+
+The second resolution bullet DID happen, and is the case the name must not be read against:
+`an_over_window_agent_turn_is_budgeted_and_dispatched` (a moderately over-window prompt completes)
+and `a_degraded_turn_discloses_on_every_channel` (AC10's four channels together).
+
+The general worry this section raised — that SP-7b turns a halt into a completion and inverts a
+guard — is sound, and is why the objection was recorded. It simply had no instance: the one test
+that looked like it would invert was already below the floor. The plan's Task 8 note records the
+same correction; this section carries it too because a reader who stops at the spec would otherwise
+take the false premise, and the resize, at face value.
 
 ## 8. What changes for an operator
 
