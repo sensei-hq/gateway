@@ -59,8 +59,8 @@ machinery.
   summarized checkpoint", `2026-08-06-sensei-orchestrator-design.md:202`).
 
   **A consequence review made explicit: a budgeted node is effectively SINGLE-TURN.** §5.1 spends
-  the window down to exactly `MIN_OUTPUT_TOKENS`, so a budgeted turn 0 is dispatched at
-  `window − 256` tokens and the transcript's whole remaining headroom is 256 tokens = 768 bytes. An
+  the window down to `MIN_OUTPUT_TOKENS`, so a budgeted turn 0 is dispatched at **at most**
+  `window − 256` tokens and the transcript's GUARANTEED headroom is 256 tokens = 768 bytes. An
   agent that then calls a tool re-sends `system` plus the assistant turn (whose
   `tool_calls.name + arguments` the estimator counts) plus the tool result; past 768 bytes of that,
   every candidate is gated and the run takes the `AllGated` HOTL pause — after paying for turn 0.
@@ -69,6 +69,15 @@ machinery.
   evidence for, so the behaviour is pinned by a two-turn test instead
   (`a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn`) and a later change to it
   is a visible one.
+
+  **A BOUND, not an equality — an earlier revision of this bullet said "exactly".** The budget is
+  handed out by `available_context_bytes`; whether the render SPENDS it is
+  `render_context_section_measured`'s business, and it splits the budget evenly across the entries
+  and never redistributes an unused share (§5.2 records the same limitation from the planning
+  side). A node with unevenly sized dependencies — a 10-byte one beside a 10-KiB one — dispatches
+  strictly UNDER the bound with correspondingly more transcript room. The pinning test's fixture
+  has ONE dependency, which cannot be split unevenly, so the equality is tight there and is
+  asserted there rather than claimed here for every shape.
 - **Model-call summarization.** No summarizer effect, at produce time or consume time. §9 records
   both shapes and why neither is needed to deliver this slice's promise.
 - **`Message.attachments`.** Counted by neither the estimator nor any truncator. Pre-existing.
@@ -343,7 +352,7 @@ the transcript. What the `EffectId` key buys is separation of distinct nodes, `M
 
 | Channel | Mechanism |
 |---|---|
-| The model | The existing `truncate_with_marker` per-entry marker and the `(N of M dependencies shown)` tail |
+| The model | The existing `truncate_with_marker` per-entry marker, when an entry is TRUNCATED; the `(N of M dependencies shown)` tail, when whole entries are DROPPED. Two signals for two degradations — a turn exhibits whichever it suffered, and a one-dependency cut exhibits only the first (AC10) |
 | The journal | `ContextBudgeted`, above |
 | Downstream | An additive `context_budgeted: true` key on the agent node's output. ADDITIVE is load-bearing: the output stays `{"text": …}` plus a key, so an unmodified `BranchCond::TextContains` keeps working — the same discipline SP-6 s3 used for `actor` |
 | The operator | A `tracing::warn!` naming the window, requested and retained bytes and the dropped counts, in the style of SP-DATA-5's AC11 clamp warn — the instrument that turns `CONTEXT_FLOOR_FRACTION` from a guess into a measurement |
@@ -359,7 +368,11 @@ the transcript. What the `EffectId` key buys is separation of distinct nodes, `M
    orchestrator's arithmetic. A budget that satisfies every assertion phrased in its own terms and
    still overflows the real window is the failure mode this AC exists to exclude, and it is the one
    SP-DATA-5's AC10 was added for after review found exactly it.
-3. The budget is journaled as `ContextBudgeted` BEFORE the model call, exactly once per turn.
+3. The budget is journaled as `ContextBudgeted` BEFORE the model call, exactly once per agent
+   NODE — keyed `effect_id(node, 0, 0)`, per §5.4. This read "once per turn" until AC10's work
+   noticed it; §5.4 already said the opposite in bold, and the shipped assertion is
+   `rows.len() == 1` for a node, so only this line was wrong. The two coincide on a
+   single-turn node, which is every fixture in the slice, so nothing caught it.
 4. **The replay property.** A run whose turn was budgeted on drive 1, resumed on drive 2 with
    `max_context_window` returning a DIFFERENT value, replays from its memo: no
    `DeterminismViolation`, no second provider call. This is the slice's central claim, and the
@@ -375,17 +388,41 @@ the transcript. What the `EffectId` key buys is separation of distinct nodes, `M
 9. **The floor halts, recoverably.** A prompt whose retained context would fall below
    `CONTEXT_FLOOR_FRACTION` — measured, or unreachable at every tool-schema count while the
    authored half DOES fit — produces `RunPaused { resume_after: None }` with a reason prefixed
-   `context budget: ` and naming the node, the window and both byte counts, and **no**
-   `NodeFailed`. Exactly one durable pause row, and no provider call for that node.
+   `context budget: ` and naming the node, the window and every byte count it actually
+   MEASURED, and **no** `NodeFailed`. Exactly one durable pause row, and no provider call for
+   that node.
+
+   **Only the measured arm reports a retained figure, and the wording earlier in this AC's life
+   ("both byte counts") was what licensed the bug.** The planner arm (`FloorUnreachable`)
+   refuses before `render_context_section_measured` runs, so it has nothing to report and used
+   to pass a literal `0`. That is wrong by most of the budget on this slice's own fixture — a
+   100 023-byte dependency against a 4096-token window leaves `3 × (4096 − 256 − 2) = 11 514`
+   bytes to render into, and the refusal is that even ALL of them are under the 25 006 the 25%
+   floor demands. (Stated as that bound rather than as a survivor count: a survivor count is
+   precisely what this arm cannot know.) "0 of 100 023 survive" reads as a total loss and sizes
+   the operator's remedy against a number nothing measured. The planner arm now states what it
+   established instead: of the cuts that FIT, none clears the floor.
 
    **A non-positive budget and an over-budget authored half are the GATE's refusal, not this
    one** (§5.3, AC5): no cut fits, so the un-cut prompt goes to selection and the operator gets
    the per-candidate diagnosis instead of a false floor report. A test for this AC must key on
    the `context budget: ` prefix, not on the window figure, which BOTH refusals carry — that
    substring is why the pre-existing guard test kept passing when its refusal changed owner.
-10. All four disclosure channels fire on a degraded turn: the prompt carries the marker and the
-    `N of M` tail, `ContextBudgeted` is journaled, the node output carries `context_budgeted: true`
-    alongside an unchanged `text` key, and the warn is emitted.
+10. All four disclosure channels fire on a degraded turn: the DISPATCHED prompt carries the
+    truncation marker, `ContextBudgeted` is journaled, the node output carries
+    `context_budgeted: true` alongside an unchanged `text` key, and the warn is emitted — its
+    figures agreeing with the journal row, plus `requested_bytes`, which the row does not carry
+    and which is what makes the warn a measurement of the RATIO the floor is a guess at.
+    Asserted together in one test (`a_degraded_turn_discloses_on_every_channel`), because each
+    channel is individually cheap to break without the others noticing.
+
+    **The `N of M dependencies shown` tail is a FIFTH signal on the same channel, not part of
+    this one, and an earlier wording of this AC conflated them.** The marker announces that an
+    entry was TRUNCATED; the tail announces that whole entries were DROPPED. They fire on
+    different degradations and a one-dependency fixture cannot produce the second at all
+    (`dropped_deps == 0`), so demanding both in one test would be demanding something no single
+    turn need exhibit. The tail is pinned by
+    `a_context_section_that_drops_dependencies_says_how_many`.
 11. An in-window turn's PROMPT is **byte-identical** to today, and nothing durable changes: no
     `ContextBudgeted` journaled, no `context_budgeted` key on the output, no warn, and the same
     number of provider calls carrying the same bytes. **And it stays byte-identical on every
@@ -432,7 +469,9 @@ rewritten to say so rather than left contradicting the code.
 
 An over-window agent turn that used to pause now answers, and says so — in the prompt, in the
 journal, on the node's output, and in the log. A turn degraded past the floor still pauses, still
-force-wakeable, with a reason naming the window and how much context survived.
+force-wakeable, with a reason naming the window and, when the section was actually rendered, how
+much context survived; when the floor was unreachable before any render, the reason says that
+instead of inventing a survivor count (AC9).
 
 The new risk is the one the four channels exist to manage: a degraded answer is still an answer, and
 a consumer that ignores `context_budgeted` will treat it as a full one.

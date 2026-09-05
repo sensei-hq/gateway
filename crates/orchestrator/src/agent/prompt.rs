@@ -552,15 +552,25 @@ pub enum BudgetRefusal {
 /// over the parts that estimator counts. `MIN_OUTPUT_TOKENS` is reserved so a degraded turn still
 /// has room for a usable reply rather than being cut off mid-sentence.
 ///
-/// **The reserve is the ONLY headroom the growing transcript gets, and that is a real limit
-/// rather than an oversight.** A budgeted turn 0 is dispatched at exactly
+/// **The reserve is the ONLY headroom the growing transcript is GUARANTEED, and that is a real
+/// limit rather than an oversight.** A budgeted turn 0 is dispatched at **at most**
 /// `window - MIN_OUTPUT_TOKENS` tokens, so a ReAct agent that then calls a tool re-sends
-/// `system` plus an assistant turn plus the tool result and has 256 tokens — 768 bytes — of room
-/// for all of it. Past that every candidate is gated and the run takes the `AllGated` HOTL pause,
-/// AFTER paying for turn 0. Spec §2 excludes the TRANSCRIPT from being budgeted; it does not
-/// promise the transcript any room, and this is where those two facts meet. Pinned by
+/// `system` plus an assistant turn plus the tool result with as little as 256 tokens — 768 bytes
+/// — of room for all of it. Past that every candidate is gated and the run takes the `AllGated`
+/// HOTL pause, AFTER paying for turn 0. Spec §2 excludes the TRANSCRIPT from being budgeted; it
+/// does not promise the transcript any room, and this is where those two facts meet. Pinned by
 /// `a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn` so a change here is a
 /// visible one; a growth allowance is the fix and it needs a number nobody has evidence for yet.
+///
+/// **A BOUND, not an equality, and an earlier revision of this paragraph said "exactly".** This
+/// function hands out the budget; whether the render SPENDS it is
+/// [`render_context_section_measured`]'s business, and it splits the budget evenly across the
+/// entries and never redistributes an unused share (see [`plan_budget`], which records the same
+/// limitation from the planning side). A node with unevenly sized dependencies — a 10-byte one
+/// beside a 10-KiB one — leaves part of the budget unspent and dispatches strictly UNDER the
+/// bound, with correspondingly more room for its transcript. The equality holds for the shape
+/// the pinning test uses (one dependency, which cannot be split unevenly) and it is asserted
+/// there, on that fixture, rather than claimed here for all of them.
 ///
 /// `None` when the transcript plus the reserve already fills the window — no cut can fit, so per
 /// [`BudgetRefusal`] the caller hands the un-cut prompt to the gate rather than refusing here.
