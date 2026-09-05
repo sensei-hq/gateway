@@ -16000,7 +16000,7 @@ impl CapturingSubscriber {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|e| e.message.contains("context budgeted"))
+            .filter(|e| e.message.contains("agent prompt context budgeted"))
             .cloned()
             .collect()
     }
@@ -27086,5 +27086,107 @@ async fn the_planner_floor_refusal_reports_no_retained_figure_it_never_measured(
         "while still naming what was asked for, which is the number the remedy is sized \
          against: {}",
         pause.reason
+    );
+}
+
+/// **AC9's MEASURED floor arm** — the check that catches the renderer under-spending a budget
+/// the planner already approved. The whole-slice review found it had no test anywhere:
+/// disabling the arm left all 1753 tests green.
+///
+/// # Why the two floors can disagree at all
+///
+/// `plan_budget` approves against the WHOLE section budget; the renderer splits that budget
+/// EVENLY across dependencies and never redistributes an unused share (spec §5.2's inherited
+/// limitation). So an unevenly-sized dependency set wastes most of the budget on the small
+/// entry, and the retained total lands under a floor the arithmetic had reserved for. That is
+/// exactly the case `plan_budget`'s own doc says a caller must handle rather than treat a plan
+/// as proof of fit — and until this test, nothing checked that the caller did.
+///
+/// The fixture is sized from the inequality rather than guessed: with `R` requested bytes and
+/// `B` available, the planner approves when `B >= 0.25R` and the render misses when
+/// `B/2 < 0.25R` — so any `B` in `[0.25R, 0.5R)` separates them. `R ≈ 1.5 MB` against the
+/// 200 000-token window's `B ≈ 599 000` sits inside that band.
+#[tokio::test]
+async fn a_budget_the_renderer_under_spends_is_refused_on_the_measured_cut() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    const BIG_DEP: usize = 1_500_000;
+    const TINY_DEP: usize = 10;
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gateway, _calls, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(BIG_DEP)),
+        final_response(&"y".repeat(TINY_DEP)),
+        final_response("must-not-be-reached"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("A".into()),
+                kind: model_call("c", "big"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("A2".into()),
+                kind: model_call("c", "tiny"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("A"), Dep::hard("A2")]),
+        ],
+    };
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &graph)
+        .await
+        .expect("drives");
+
+    let pause = out.paused.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the MEASURED cut must be refused even though the planner approved the budget: \
+             failed={:?} outputs={:?}",
+            out.failed,
+            out.outputs.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(pause.node.0, "B");
+    assert!(
+        pause.reason.starts_with("context budget: "),
+        "and it is SP-7b's floor that refused, not the gateway's window gate — the two used to \
+         be indistinguishable to an assertion: {}",
+        pause.reason
+    );
+    assert!(
+        out.failed.is_none(),
+        "never a NodeFailed — a failed run is unrevivable here: {:?}",
+        out.failed
+    );
+
+    // The HOTL shape (AC9), on the arm that had no test at all.
+    let events = journal.load(run).await.unwrap();
+    let pauses: Vec<&Option<chrono::DateTime<chrono::Utc>>> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::RunPaused { resume_after, .. } => Some(resume_after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pauses.len(), 1, "exactly one durable pause row");
+    assert!(
+        pauses[0].is_none(),
+        "with a NULL resume_after — nothing about waiting redistributes an even split"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::ContextBudgeted { .. })),
+        "and NO budget is journaled: the turn was refused before dispatch, so a later drive \
+         must re-decide rather than replay a budget that was never used"
     );
 }

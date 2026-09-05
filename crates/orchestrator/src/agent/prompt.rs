@@ -84,8 +84,10 @@ impl PromptParts {
     pub fn join_bounded(self, plan: &BudgetPlan) -> (String, Vec<ToolDefinition>, ContextCut) {
         let (section, cut) =
             render_context_section_measured(&self.context, plan.context_budget_bytes);
+        let total_tools = self.tools.len();
         let mut system = self.authored;
         system.push_str(&section);
+        system.push_str(&dropped_tools_note(&plan.dropped_tools, total_tools));
         let tools = self
             .tools
             .into_iter()
@@ -93,6 +95,37 @@ impl PromptParts {
             .collect();
         (system, tools, cut)
     }
+}
+
+/// The model-facing disclosure for the TOOL half of a budget, and the empty string when no
+/// schema was dropped.
+///
+/// **Why this exists: without it, a degradation made entirely of dropped tool schemas was
+/// INVISIBLE to the model.** SP-7b's channel 1 was the `## Context` section's per-entry
+/// truncation marker and its `(N of M dependencies shown)` tail — both of which describe the
+/// CONTEXT half only. A turn whose context fitted whole but whose schemas were dropped to make
+/// room was dispatched with its tools silently removed, and the agent had no way to know that a
+/// capability it was configured with was gone. It would simply fail to use it, successfully, and
+/// the answer would flow downstream as work product.
+///
+/// The whole-slice review found this; it is the one confirmed gap in the four-channel disclosure
+/// the slice was built to provide.
+///
+/// Deterministic by construction, which it must be — this string lands in `system` and is
+/// therefore hashed into `agent_input_hash`. `plan.dropped_tools` is journaled and replayed
+/// verbatim, and it is already ordered (reverse activation), so the note is byte-identical on
+/// every drive of the same turn.
+fn dropped_tools_note(dropped: &[String], total: usize) -> String {
+    if dropped.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n(Context budget: {} of {} tool schemas were omitted from this turn — {}. \
+         They remain configured for this agent; they are not available on THIS turn.)",
+        dropped.len(),
+        total,
+        dropped.join(", ")
+    )
 }
 
 /// [`assemble_prompt`]'s work, stopping one step short of joining the halves — see
@@ -1990,10 +2023,26 @@ mod tests {
             "the budget bounds the SECTION, not the joined prompt, which is {} bytes",
             system.len()
         );
+        // What follows `authored` is the measured section AND the dropped-schema note, in that
+        // order and with nothing else between them. The note is part of the model's channel-1
+        // disclosure (see `dropped_tools_note`): without it a degradation made only of dropped
+        // schemas reaches the model invisibly. Asserting the concatenation rather than just a
+        // `contains` keeps the original property — a dropped push, a swapped order or an added
+        // separator still fails.
         assert_eq!(
             &system[authored.len()..],
-            render_context_section_measured(&context, plan.context_budget_bytes).0,
-            "and what follows the authored bytes is exactly the measured section"
+            format!(
+                "{}{}",
+                render_context_section_measured(&context, plan.context_budget_bytes).0,
+                dropped_tools_note(&plan.dropped_tools, 2)
+            ),
+            "and what follows the authored bytes is exactly the measured section then the \
+             dropped-schema note"
+        );
+        assert!(
+            system.contains("1 of 2 tool schemas were omitted"),
+            "and that note NAMES the loss, because the section's own marker describes only the \
+             CONTEXT half: {system:?}"
         );
         assert_eq!(
             tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),

@@ -675,23 +675,36 @@ pub enum JournalEvent {
     /// NOT like `PlanExpanded`/`PlannerSelected`, which are both `insert`. A budget a later
     /// record could move is not a fence.
     ///
-    /// Of the SEVEN fields, exactly TWO are replay inputs, and `fold_journal`
-    /// (`orchestrator::executor::support`) destructures precisely those two: `budget_bytes` is
-    /// the replayed VALUE, and `effect_id` is the KEY it is filed under — FIRST-wins, into
-    /// `Fold::context_budgets`. So `effect_id` is as load-bearing as the integer beside it:
-    /// change which turn it names and a journaled budget replays for the wrong turn, or for
-    /// none. It is a replay input, NOT disclosure, and must not be treated as free to change.
+    /// Of the SEVEN fields, THREE are replay inputs, and `fold_journal`
+    /// (`orchestrator::executor::support`) destructures precisely those three: `budget_bytes`
+    /// and `dropped_tools` are the replayed VALUES, and `effect_id` is the KEY they are filed
+    /// under — FIRST-wins, into `Fold::context_budgets`. So `effect_id` is as load-bearing as
+    /// the values beside it: change which turn it names and a journaled budget replays for the
+    /// wrong turn, or for none.
     ///
-    /// The other FIVE — `node`, `source_window`, `retained_bytes`, `dropped_deps`,
-    /// `dropped_tools` — are DISCLOSURE, not inputs: they are what `torii` and an audit read
-    /// to learn that a turn answered on a degraded prompt. Nothing reconstructs the cut from
-    /// them, and no code path reads any of the five back OFF THIS EVENT — the sole reader of
-    /// any of the five is the exhaustive `label` test helper in
-    /// `crates/orchestrator/src/executor/tests.rs`, which prints `node`. (Two of the five
-    /// names — `retained_bytes` and `dropped_tools` — are ALSO fields of `ContextCut` and
-    /// `BudgetPlan` in `orchestrator::agent::prompt`, which the pure cutter both writes and
-    /// reads. Those are other structs entirely, not this event; a grep for either bare name
-    /// hits them, so search by field granularity, not by name.)
+    /// **`dropped_tools` is a replay input and this paragraph said the opposite until the
+    /// whole-slice review.** It is fed to `prompt::replayed_plan`, which reproduces the cut
+    /// from the journal rather than re-deciding it — deliberately, because re-running
+    /// `plan_budget` on a resume would make every in-flight budgeted run's prompt a function of
+    /// `CONTEXT_FLOOR_FRACTION`, a constant the spec says exists to be RE-TUNED once the
+    /// operator warn produces data. `replayed_plan` is also order-sensitive
+    /// (`dropped_tools[i]` must equal `tools[n-1-i]`), so reordering the vector is as breaking
+    /// as emptying it. The false version of this sentence was introduced by the fix commit that
+    /// added the fold and the read, and it is the more dangerous half of the two: a doc at the
+    /// definition site telling a maintainer that a load-bearing field is free to change.
+    ///
+    /// The other FOUR — `node`, `source_window`, `retained_bytes`, `dropped_deps` — are
+    /// DISCLOSURE: what an audit reads to learn that a turn answered on a degraded prompt.
+    /// Nothing reconstructs the cut from them. **No `torii` command reads any of them today**
+    /// (`rg 'JournalEvent::' crates/torii/src` has no `ContextBudgeted` arm), so the operator
+    /// surface for this event is still outstanding — an earlier version of this paragraph
+    /// claimed `torii` reads them, which was aspirational rather than true. The only reader is
+    /// the exhaustive `label` test helper in `crates/orchestrator/src/executor/tests.rs`.
+    ///
+    /// (Two of these names — `retained_bytes` and `dropped_tools` — are ALSO fields of
+    /// `ContextCut` and `BudgetPlan` in `orchestrator::agent::prompt`, which the pure cutter
+    /// both writes and reads. Those are other structs entirely, not this event; a grep for
+    /// either bare name hits them, so search by field granularity, not by name.)
     ContextBudgeted {
         node: NodeId,
         effect_id: EffectId,

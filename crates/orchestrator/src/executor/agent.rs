@@ -542,6 +542,32 @@ impl Executor {
                                 // match: bare event, integers, the node as the correlation key
                                 // — `RunPaused` carries no node, so a log line that omitted it
                                 // could not be tied to anything in the journal.
+                                // The MESSAGE is conditional because "reduced context" was a
+                                // false report on the tool-only case: a turn whose context
+                                // fitted whole and whose SCHEMAS were dropped reduced no
+                                // context at all, and an operator reading the log — or an
+                                // audit reading the row beside it — was told the wrong thing
+                                // about which half was cut. Found by the whole-slice review.
+                                // WHICH HALF was cut is a structured FIELD, not part of the
+                                // message. The message stays static so it remains a stable
+                                // filter (the capture helper and any log query match on it,
+                                // and it must not collide with SP-DATA-5's clamp warn), while
+                                // `cut` carries the discrimination. Interpolating the
+                                // discrimination INTO the message was the first attempt and it
+                                // silently broke the capture filter — a formatted message is
+                                // not a stable key.
+                                let cut = match (
+                                    c.retained_bytes < c.requested_bytes,
+                                    !plan.dropped_tools.is_empty(),
+                                ) {
+                                    (true, true) => "context+tools",
+                                    (true, false) => "context",
+                                    (false, true) => "tools",
+                                    // Reachable: the budget bound the prompt without either
+                                    // half losing bytes — the section fitted its share whole
+                                    // and no schema was dropped.
+                                    (false, false) => "neither",
+                                };
                                 tracing::warn!(
                                     node = %node_id.0,
                                     window = w,
@@ -549,8 +575,8 @@ impl Executor {
                                     retained_bytes = c.retained_bytes,
                                     dropped_deps = c.deps_total - c.deps_shown,
                                     dropped_tools = plan.dropped_tools.len(),
-                                    "SP-7b: agent context budgeted — this turn answers on a \
-                                     reduced context"
+                                    cut,
+                                    "SP-7b: agent prompt context budgeted"
                                 );
                                 (s, t, Some(c))
                             }
