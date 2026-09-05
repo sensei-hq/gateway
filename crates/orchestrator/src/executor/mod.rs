@@ -1082,7 +1082,12 @@ impl Executor {
             // output lazily from its folded ref (inline value, or a CAS blob) —
             // the only place the terminal fold touches content, bounded to one
             // read per node — then project each Agent node's raw output down to its
-            // canonical `{model, text}` shape.
+            // canonical `{model, text}` shape, re-attaching SP-7b's `context_budgeted`
+            // from the folded budget rows. This branch never re-enters `finish_agent`,
+            // which is where the key is synthesized, and it is not in `node_last_output`
+            // either (nothing journals it with the output) — so the projection is the only
+            // thing on THIS path that can restore it, and without it a completed degraded
+            // node reads back as un-degraded (`project_agent_outputs` owns the reasoning).
             let mut outcome = RunOutcome {
                 completed,
                 ..RunOutcome::default()
@@ -1092,7 +1097,7 @@ impl Executor {
                     .outputs
                     .insert(node.clone(), self.materialize(output).await?);
             }
-            project_agent_outputs(graph, &mut outcome.outputs);
+            project_agent_outputs(graph, &fold.context_budgets, &mut outcome.outputs);
             return Ok(outcome);
         }
 

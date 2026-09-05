@@ -729,7 +729,10 @@ fn the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical() 
         serde_json::json!({ "model": "m", "text": "drafted", "tool_calls": [] }),
     );
 
-    project_agent_outputs(&graph, &mut outputs);
+    // No budget rows: this test's subject is the `actor` exemption, and SP-7b's key is
+    // additive over the same rebuild — `a_completed_budgeted_run_discloses_the_same_way_
+    // when_it_is_read_back` is where the budgeted arm is exercised end-to-end.
+    project_agent_outputs(&graph, &HashMap::new(), &mut outputs);
 
     assert_eq!(
         outputs[&human],
@@ -742,6 +745,61 @@ fn the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical() 
         outputs[&model],
         serde_json::json!({ "model": "m", "text": "drafted" }),
         "the model-backed projection still drops `tool_calls` and keeps `{{model, text}}`"
+    );
+}
+
+/// SP-7b review fix: the read-back key is PER NODE, and it is keyed on the effect id the
+/// writing drive used — `effect_id(node, 0, 0)`.
+///
+/// A unit test because the two failure modes it excludes are both invisible to the end-to-end
+/// guard (`a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back`), whose graph
+/// has exactly ONE agent node and it is the budgeted one:
+///
+/// - a run-global latch (`!context_budgets.is_empty()` for `contains_key`) would mark an
+///   un-degraded node degraded whenever any OTHER node in the run was cut — turning the
+///   disclosure into noise in exactly the graphs it matters most in. That mutation leaves the
+///   e2e test green; it reddens `whole` here.
+/// - a wrong turn coordinate (`effect_id(node, 1, 0)`) would find nothing and disclose nothing,
+///   since a budget is journaled ONCE per node at turn 0. That reddens `cut` here — and it
+///   reddens the e2e too, which is why the first bullet is the one this test is really for.
+#[test]
+fn the_projection_marks_only_the_nodes_whose_context_was_cut() {
+    use super::support::project_agent_outputs;
+
+    let cut = NodeId("cut".into());
+    let whole = NodeId("whole".into());
+    let graph = Graph {
+        nodes: vec![
+            agent_node("cut", "a", "summarize the 700kB doc"),
+            agent_node("whole", "a", "hi"),
+        ],
+    };
+
+    // Exactly one budget row, for `cut`, at the turn-0 key `agent.rs` journals on.
+    let budgets = HashMap::from([(
+        effect_id("cut", 0, 0),
+        ContextBudget {
+            budget_bytes: 11_514,
+            dropped_tools: Vec::new(),
+        },
+    )]);
+
+    let raw = serde_json::json!({ "model": "m", "text": "answered", "tool_calls": [] });
+    let mut outputs: HashMap<NodeId, serde_json::Value> =
+        HashMap::from([(cut.clone(), raw.clone()), (whole.clone(), raw)]);
+
+    project_agent_outputs(&graph, &budgets, &mut outputs);
+
+    assert_eq!(
+        outputs[&cut],
+        serde_json::json!({ "model": "m", "text": "answered", "context_budgeted": true }),
+        "the budgeted node discloses, additively over the canonical two keys"
+    );
+    assert_eq!(
+        outputs[&whole],
+        serde_json::json!({ "model": "m", "text": "answered" }),
+        "and its neighbour, which was never cut, is byte-identical to the pre-SP-7b shape \
+         (AC11) — the key is per NODE, not per run"
     );
 }
 
@@ -26289,6 +26347,23 @@ async fn a_budgeted_turn_replays_after_the_window_changes_underneath_it() {
         "B finished on the resume: {:?}",
         out2.outputs.get(&NodeId("B".into()))
     );
+    // Channel 3 on a RESUMED node, which is the one drive this arm produces and nothing else
+    // asserted. `a_degraded_turn_discloses_on_every_channel` exercises only the FRESH-budget
+    // arm, so `(s, t, Some(c))` on the journaled-replay arm could be flipped to `None` with
+    // the whole suite green — silently removing disclosure from every resumed budgeted node.
+    // The key does NOT follow the once-per-node rule the `warn!` and the journal row follow:
+    // those describe an EVENT that happened once, this describes the ANSWER, which is degraded
+    // on every drive that returns it.
+    assert_eq!(
+        out2.outputs
+            .get(&NodeId("B".into()))
+            .and_then(|b| b.get("context_budgeted"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "and it still says the context was cut, on the drive that REPLAYED the cut rather \
+         than deciding it: {:?}",
+        out2.outputs.get(&NodeId("B".into()))
+    );
     assert_eq!(
         calls2.lock().unwrap_or_else(|e| e.into_inner()).len(),
         1,
@@ -26686,6 +26761,137 @@ async fn a_degraded_turn_discloses_on_every_channel() {
     assert!(
         warn.field("requested_bytes") > warn.field("retained_bytes"),
         "which is strictly more than what survived, or nothing was degraded: {warn:?}"
+    );
+}
+
+/// **Review Important — channel 3 must survive a READ-BACK, not just the drive that wrote it.**
+///
+/// Every other `context_budgeted` assertion in this file — AC10's, AC11's absence check, and
+/// the resumed one in `a_budgeted_turn_replays_after_the_window_changes_underneath_it` — reads
+/// `outputs` off a drive that came through `finish_agent`, where the key is synthesized. A
+/// completed run has a SECOND read path that does not: `start()` on an already-terminal journal
+/// short-circuits (`start_inner`'s `terminal` branch) and rebuilds each node's output from
+/// `fold_journal`'s `node_last_output`, which is populated only from `EffectRecorded` — the raw
+/// `{model, text, tool_calls}` model turn, a value that never carried the key, since nothing
+/// journals it with the output. `project_agent_outputs` then rebuilt exactly `{model, text}`.
+///
+/// So the same run reported a degraded node as degraded when read on the writing drive and as
+/// UN-degraded when read afterwards. `start` is the public resume entry point and that branch is
+/// a shipped, tested path (`agent_node_terminal_resume_yields_canonical_output_shape`); in-tree
+/// its one caller is `Scheduler::tick` (`scheduler.rs:115`), which re-drives a claimed run, and
+/// a run whose journal already carries `RunCompleted` lands on exactly this branch — a crash
+/// between the journal's `RunCompleted` and the store's terminal record leaves the `'waking'`
+/// row for the lease to reclaim and re-drive. Channel 3's entire purpose is that a degraded
+/// answer is not consumed as work product indistinguishable from a full one, so a read path that
+/// silently drops it is the hazard AC10 exists to close, arriving through the door nobody was
+/// watching. It is the same flattening SP-6 s3 had to exempt `actor` from
+/// (`the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical`); SP-7b's key
+/// got the precedent cited and not applied.
+///
+/// The key is NOT recoverable from the projected output — it was never there — so the
+/// projection reads the durable row instead: `fold.context_budgets` is keyed
+/// `effect_id(node, 0, 0)`, which is exactly what the writing drive's `context_cut.is_some()`
+/// tracks (a budget row is appended on the one arm that sets it, and read back on the replay
+/// arm that re-sets it). No new event is needed.
+///
+/// Asserted as byte-identity against the writing drive's own output rather than on the key
+/// alone, so a projection that added the key but dropped `text`, invented `model: null`, or
+/// leaked `tool_calls` back in reddens here too.
+#[tokio::test]
+async fn a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = oversized_context_graph();
+    let b = NodeId("B".into());
+
+    // Drive 1: AC2's fixture, driven to completion. A's 700 000-byte output busts both
+    // windows, B's context is cut, B answers.
+    let (gw1, _calls1, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        final_response("budgeted-answer"),
+    ])
+    .await;
+    let first = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content.clone())
+        .with_context_store(ctx.clone())
+        .start(run, &graph)
+        .await
+        .expect("drive 1 drives");
+    assert!(first.failed.is_none(), "no failure: {:?}", first.failed);
+    assert!(first.paused.is_none(), "no pause: {:?}", first.paused);
+
+    // The two premises, or drive 2 below proves nothing. (a) The run really is TERMINAL, so
+    // drive 2 takes the short-circuit branch rather than re-driving into `finish_agent` — which
+    // would re-synthesize the key and make this test pass with the projection untouched.
+    let before = journal.load(run).await.expect("loads");
+    assert!(
+        before
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "drive 1 journaled `RunCompleted`"
+    );
+    // (b) It really was BUDGETED, so there is something to disclose.
+    assert_eq!(
+        budget_rows(&journal, run).await.len(),
+        1,
+        "and B's context really was cut"
+    );
+    assert_eq!(
+        first.outputs[&b]
+            .get("context_budgeted")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "which the writing drive discloses (AC10, restated here as this test's baseline): {}",
+        first.outputs[&b]
+    );
+
+    // Drive 2: the read-back, on a gateway with an EMPTY script so a live turn cannot happen.
+    let (gw2, calls2, _e2, _s2) = two_window_scripted_window_watching_gateway(vec![]).await;
+    let second = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &graph)
+        .await
+        .expect("read-back of a completed run");
+    assert_eq!(
+        calls2.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        0,
+        "nothing was re-dispatched"
+    );
+    // THE assertion that makes this test about the terminal branch, and it is not the call
+    // count above: every node is memoized, so a re-DRIVE would also make zero gateway calls —
+    // and would re-enter `finish_agent` and re-synthesize the key, passing the disclosure
+    // assertion below with the projection untouched. What a re-drive cannot do is stay silent
+    // in the journal: `finalize_run` appends `RunCompleted` on every clean drive, which is
+    // exactly what the terminal branch exists to avoid. So a growing journal here means the
+    // short-circuit was not taken and everything below proves nothing.
+    assert_eq!(
+        journal.load(run).await.expect("loads").len(),
+        before.len(),
+        "the terminal read appends nothing — no second `RunCompleted`, so the outputs below \
+         really did come from the fold and not from a re-drive"
+    );
+
+    assert_eq!(
+        second.outputs[&b]
+            .get("context_budgeted")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "a degraded answer must still say so when the finished run is read back: {}",
+        second.outputs[&b]
+    );
+    assert_eq!(
+        second.outputs[&b], first.outputs[&b],
+        "and byte-identically to the drive that produced it — same `text`, same `model`, no \
+         `tool_calls` leaked back in"
     );
 }
 
