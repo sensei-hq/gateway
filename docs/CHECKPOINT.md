@@ -1,40 +1,40 @@
 # Checkpoint
 
-**SP-7b context budgeting: IN BUILD, subagent-driven. Tasks 1-4 landed and REVIEWED (both
-rechecks PASS); task 5 next.** Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12 ACs), plan
+**SP-7b context budgeting: IN BUILD, subagent-driven. Tasks 1-7 landed; 1-6 REVIEWED, task 7 NOT
+yet. Task 8 (split the guard test + doc sweep) next.** Spec
+`2026-09-04-sp-7b-context-budgeting-design.md` (12 ACs), plan
 `2026-09-04-sp-7b-context-budgeting.md` (8 tasks). SP-7a is DONE and pushed (`864a8dd`).
 
 ## Done
 
-`fedb8ac` T1 `Gateway::max_context_window` — the budget target, the only window accessor folding
-`max` rather than `min`. `7c7d286` T2 `CONTEXT_FLOOR_FRACTION = 0.25` + the pure planner.
-`6ada19d` T2 fix: `plan_budget` compared a SECTION-byte budget against a BODY-byte floor, so a plan
-approved AT the floor rendered BELOW it and the schema-drop loop stopped early — **turning
-degradable turns into refusals**. `ee13ddd` closed three FALSE CLAIMS, one introduced by that fix.
-`0f618e1`+`2e844d6` T3 measured renderer; the fix put the bound IN PLAY — AC8 was unpinned and two
-mutations of `join_bounded` left all 442 tests green. `42446e3`+`daeee45` T4 `ContextBudgeted`,
-folded FIRST-wins via `entry().or_insert`, `label` arm added (`cargo build --workspace` cannot see
-it), `FORMAT_VERSION` still 1.
+T1-T4 (`fedb8ac`..`daeee45`) `max_context_window`, the pure planner + `CONTEXT_FLOOR_FRACTION`, the
+measured renderer, and `ContextBudgeted` folded FIRST-wins — all reviewed, detail in the plan.
+`cdea80d`+`16a344e` T5/T6 `drive_agent` wiring, plus two CRITICALs: an UN-budgeted turn was
+unfenced, so a window shrink between drives cut a turn already on the wire and killed the run
+terminally; and the replay arm re-ran `plan_budget` instead of reading its own journaled
+`dropped_tools`. `5781e3e` T7 disclosure — the additive `context_budgeted` output key, the operator
+`warn!`, `AgentRun.context_cut`, and the executor-level proof that the truncation MARKER reached
+the provider (`ScriptedAdapter` gained a `SystemLog`).
 
-**The design's one idea: journal the BUDGET, not the cut.** The truncator is pure and every other
-input is replay-stable, so the window-derived integer was the only unfenced one (`GatewayConfig` has
-NO version field). Mandatory, not defensive: every past turn's hash is recomputed on every partial
-resume forever, and a `DeterminismViolation` leaves the run unrevivable.
+**The one idea: journal the BUDGET, not the cut.** The window-derived integer was the only unfenced
+input (`GatewayConfig` has NO version field); a `DeterminismViolation` on resume is unrevivable.
 
 ## Verified
 
-`cargo test --workspace` **1739 passed / 0 failed / 56 ignored, exit 0** · `--all-targets` 0 · `clippy -D warnings` 0 ·
-`fmt --check` 0. Every new arithmetic term mutation-pinned, including the zero-floor saturation the
-fix had left unguarded while claiming otherwise.
+`cargo test --workspace` **1750 passed / 0 failed / 56 ignored, real exit 0** · `clippy -D warnings`
+0 · `fmt --check` 0. T7's three tests were RED first; AC11's passed on arrival, so all three of its
+absence assertions were mutation-verified instead.
 
 ## Next
 
-T5 ALONE next (the `drive_agent` wiring — the risky integration: the `resolve_chain` reorder, the
-stale-fold trap, the floor's pause path), then T6-8. Passes are split so review lands inside one.
+`/sensei:review` T7, then T8: judge whether the name
+`oversized_dependency_context_halts_over_budget_never_truncates` still reads right (its resize is
+MOOT — T5 established the fixture already halts at the floor), and sweep `PromptParts::join`'s and
+`render_context_section_bounded`'s docs, which still argue the model path must NEVER truncate.
 
 ## Open
 
-**Do NOT "fix" `min_context_window`'s doc.** A T1 agent called its "its own test" claim false; both
-reviewers refuted that (the test is at `engine/mod.rs:835`; the grep was read at file granularity).
-Plan amended: `plan_budget` takes entries, not a byte total; T5 passes `&parts.context`.
-**Sensei daemon NOT running — this file is the only record.**
+Nine plan errors and SEVEN false doc claims so far, three introduced by commits FIXING something
+else. T7 fixed four: AC3's "once per turn" (§5.4 says per NODE), AC9's "both byte counts" (the
+pre-render arm measured nothing and reported `0`), AC10 conflating the marker with the `N of M`
+tail, and a `700030` that is `700027`. **Sensei daemon NOT running — this file is the only record.**
