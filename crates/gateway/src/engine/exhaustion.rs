@@ -91,9 +91,14 @@ pub(super) fn all_gated_error(
         return None;
     }
     let resume_after = timed.into_iter().min().map(instant_to_utc);
-    // BOTH, when both are known. `resume_after` decides whether the caller pauses
-    // (`classify_gateway_error` pauses on `Some(t)` and fails on `None`) and is taken
-    // from the TIMED gates alone, which is unchanged; `human_action` is diagnosis, and it
+    // BOTH, when both are known. `resume_after` decides WHICH KIND of pause the caller
+    // takes — `classify_gateway_error` pauses to `t` on `Some(t)` and pauses indefinitely
+    // (the HOTL class) on `None` beside a `human_action`, failing only when neither is
+    // present — and it is taken from the TIMED gates alone, which is unchanged. Note that
+    // this makes `human_action` load-bearing for RECOVERABILITY as of the M1 reversal,
+    // not diagnosis alone: an `AllGated` that drops it is a run that dies instead of
+    // pausing. `human_action` is still diagnosis in the sense that it names WHAT to do,
+    // and it
     // used to be nulled out whenever a wake had been scheduled — "a timed retry wins over
     // the terminal remedy".
     //

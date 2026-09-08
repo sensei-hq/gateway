@@ -53,7 +53,7 @@ pre-check.
 |---|---|---|
 | Mechanism | **A sixth `AdmissionGate`** | The pattern exists and fits exactly: `SelectionCtx` already carries `input_tokens`, `GateVerdict::Skip(SkipReason)` already carries a typed reason, and `all_gated_error` already aggregates an all-skipped selection into one `AllGated` carrying every reason and a remedy (a durable pause when a gate is timed; see the row below for the terminal case). A bespoke filter would duplicate all three. |
 | Where the check lives | **Gateway, not orchestrator** | Selection is the gateway's job and the orchestrator was guessing ahead of it. Every gateway caller benefits, and the duplicate `min_context_window` read disappears rather than being kept in sync. |
-| Over-everything outcome | **`AllGated`, terminal, with per-candidate diagnostics** | **Corrected after review — the first draft of this row said "durable pause", and that was wrong.** `all_gated_error` takes `resume_after` from the TIMED skips alone, so an all-over-window selection is `AllGated { resume_after: None }`, and the orchestrator's `classify_gateway_error` pauses only on `Some(t)`; everything else is `Fail` → `NodeFailed`. That is a deliberate prior decision, not an oversight: risk **M1** in `docs/design/selection-policy-pipeline.md` resolved terminal-only exhaustion as "fail-fast human-action, never pause", and `GatewayError::AllGated`'s own doc says the caller must not pause forever. So the outcome is still terminal; what changes is the DIAGNOSIS (see §6.3), and the improvement is real but smaller than the draft claimed. Reversing M1 is out of scope here — see §8. |
+| Over-everything outcome | **`AllGated`, terminal, with per-candidate diagnostics** | **Corrected after review — the first draft of this row said "durable pause", and that was wrong.** `all_gated_error` takes `resume_after` from the TIMED skips alone, so an all-over-window selection is `AllGated { resume_after: None }`, and the orchestrator's `classify_gateway_error` pauses only on `Some(t)`; everything else is `Fail` → `NodeFailed`. That is a deliberate prior decision, not an oversight: risk **M1** in `docs/design/selection-policy-pipeline.md` resolved terminal-only exhaustion as "fail-fast human-action, never pause", and `GatewayError::AllGated`'s own doc says the caller must not pause forever. So the outcome is still terminal; what changes is the DIAGNOSIS (see §6.3), and the improvement is real but smaller than the draft claimed. Reversing M1 is out of scope here — see §8. **Corrected AGAIN 2026-09-04: M1 WAS reversed, one slice later.** The draft's instinct was right and its reasoning was not — a durable pause is the correct outcome, but because the run must stay REACHABLE (`force_wake` matches `status = 'paused'` and nothing revives a terminal run), not because waiting helps. `classify_gateway_error` now pauses indefinitely on a `resume_after: None` that carries a `human_action`, so an all-over-window selection is a HOTL pause naming `UseLargerContextWindow`. See M1 in `docs/design/selection-policy-pipeline.md`. |
 | The estimate | **A pessimistic one, including tool schemas** | See §4. The existing `estimate_input_tokens` is `chars/4` over messages + system ONLY, so it silently omits tool schemas — and for a window gate an under-count admits a model the prompt does not fit, which is the failure the gate exists to prevent. |
 
 ## 4. The estimate, and the bias that matters
@@ -314,9 +314,10 @@ journaled into `RunPaused` and read back by `torii status`.
   window is the binding term the refusal now says so, names the window, and does NOT offer
   `torii run wake --budget-tokens N`. The pause CLASS is kept deliberately — `resume_after: None`
   is SP-DATA-3's HOTL class and preserves a run an operator can widen the chain for, where a node
-  failure destroys it. Asserted in
+  failure destroys it. Asserted at the time in
   `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked`, including the
-  cap-independence.
+  cap-independence — **both that test and that pause class moved in the follow-on; see the
+  correction below.**
 
   > **Correction, 2026-09-04 — this whole item is CLOSED, and not the way it predicted.** The
   > follow-on slice (`2026-09-04-sp-7a-serving-window-bound-design.md`) made the clamp's window
@@ -334,12 +335,32 @@ journaled into `RunPaused` and read back by `torii status`.
   >
   > The refusal that survives means something narrower: the prompt FITS the smallest window that
   > can hold it, and the shortfall is OUTPUT room. The "nothing fits anything" case is the gate's
-  > now, and that hands a budgeted run a terminal `NodeFailed` where it used to get a durable
-  > pause — the one user-visible regression, recorded in the follow-on's §8.
+  > now, and that handed a budgeted run a terminal `NodeFailed` where it used to get a durable
+  > pause — recorded as the one user-visible regression in the follow-on's §8, **and CLOSED there
+  > on 2026-09-04 by reversing M1**: an `AllGated` naming a `human_action` is now the indefinite
+  > HOTL pause, so both arms halt recoverably with the gate's per-candidate remedy.
   >
   > Also corrected there: the clamp and the gate were computing `est` with two different functions,
   > which broke the soundness argument in a narrow but reachable band. They are one function now
   > (follow-on §4.1).
+  >
+  > **The identifier this item cites is gone, and the property it cited went unguarded for a
+  > commit.** `a_budgeted_run_is_refused_by_the_clamp_before_the_window_gate_is_asked` was renamed
+  > `an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not`, and it changed meaning
+  > with its name: the fits-nothing scenario now lands on the GATE at both caps rather than on the
+  > clamp. The surviving `BelowFloor { window: Some(_) }` arm is
+  > `a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_window`, which drove ONE
+  > cap — so the cap-independence this sentence claims was asserted became unpinned in the move.
+  > The follow-on's review caught it (a mutation gating the refusal on `remaining` passed the whole
+  > workspace) and closed it with `a_serving_window_refusal_is_unmoved_by_the_cap`, which drives
+  > 1e6 and `u64::MAX / 2` and compares the two refusals with the ledger clause stripped.
+  >
+  > Corrected at the same time: the message's remedy. It read "send less input, or put a model with
+  > a larger window in this chain", and the second clause could never work — the term is
+  > `min { w ∈ chain : w >= est }` and **adding to a set cannot raise its minimum**. It now says to
+  > remove or replace the entry it names, says outright that adding a larger model alongside cannot
+  > help, and qualifies "send less input" as conditional on that same entry staying the smallest
+  > one that can hold the prompt.
 - **A per-attachment token term for the pessimistic estimate** (§4). Owed by the first caller that
   attaches media; the term belongs in tokens, added after the divide, and must not be derived from
   the base64 length.

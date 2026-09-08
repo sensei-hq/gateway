@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1
+spec: SP-1, SP-7b
 source: crates/orchestrator*
 ---
 
 # Shared Context
 
-> **Status: Partial (Phase 3 · SP-1).** Design §8; blackboard-wiring design
+> **Status: Partial (Phase 3 · SP-1 · SP-7b).** Design §8; blackboard-wiring design
 > [`../../superpowers/specs/2026-08-10-sp1-blackboard-wiring-design.md`](../../superpowers/specs/2026-08-10-sp1-blackboard-wiring-design.md).
 > The scoped `ContextStore` blackboard is now **wired into the executor**
 > (executor-managed / implicit): a completed node's output publishes to `Run`
@@ -27,10 +27,24 @@ source: crates/orchestrator*
 > the turn hash (an edited upstream output halts loud with `DeterminismViolation`
 > rather than mixing).
 >
-> **Deferred:** agent-facing `read_context`/`write_context` tools; active
-> summarize/select budgeting (SP-7b — an over-window prompt is currently refused at
-> SELECTION by the gateway's `ContextWindowGate`, never truncated; the orchestrator's
-> own `PromptOverBudget` halt was deleted by SP-7a); `Scope::Node`/`Plan` reads + per-agent
+> **Budgeting (SP-7b, shipped):** when an agent's assembled prompt exceeds EVERY
+> candidate's window, the `## Context` section this page describes is the half that
+> gets cut — bounded to `max_context_window(chain)` less a 256-token output reserve,
+> the turn-0 transcript, the authored half and whichever tool schemas survive (whole
+> schemas are dropped from the end of the activation order to make room), then split
+> evenly across the dependencies, and dispatched. Selecting or summarizing what to
+> keep is still deferred: the cut is positional (each dependency's own prefix, marked),
+> not semantic. A cut retaining
+> less than 25% of the requested dependency bytes is refused instead, as a
+> force-wakeable pause. The determinism rule above is unaffected, and that is the
+> slice's central claim rather than an aside: the BYTE BUDGET is journaled
+> (`ContextBudgeted`) before dispatch and read back on every later drive, so the cut
+> stays a function of journaled state even if a model's `context_window` is edited
+> underneath a running run.
+>
+> **Deferred:** agent-facing `read_context`/`write_context` tools; SEMANTIC
+> summarize/select budgeting (SP-7b cuts positionally, per the note above; SP-7c is
+> retrieval-ranked activation); `Scope::Node`/`Plan` reads + per-agent
 > private scratch; TTL/as-of freshness; unifying `Consolidate`'s `prior_outputs`
 > threading onto the blackboard; concurrent-write policies beyond reject.
 

@@ -60,6 +60,20 @@ pub struct TokenUsage {
 /// the clamp design's §8), not for tuning this number without data.
 pub const MIN_OUTPUT_TOKENS: u64 = 256;
 
+/// The fraction of an agent's requested dependency context that must SURVIVE budgeting for the
+/// turn to be worth dispatching. Below it, SP-7b refuses instead of degrading.
+///
+/// **This number is a judgment call and there is no evidence behind it yet.** The argument for
+/// having a floor at all is sound: unbounded degradation answers a 200 000-token question from 4%
+/// of its context, confidently, and the model has no way to know it is unqualified — it will
+/// answer anyway, and that answer flows downstream as work product. The argument for `0.25`
+/// specifically is only that a quarter of what the graph decided the agent needed is the point
+/// where "answering" starts to look like guessing.
+///
+/// The AC10 `tracing::warn!` exists to replace this guess with a measurement. When there is
+/// fleet data on real degradation ratios, set it from that and delete this paragraph.
+pub const CONTEXT_FLOOR_FRACTION: f64 = 0.25;
+
 #[cfg(test)]
 mod tests {
     use super::*;

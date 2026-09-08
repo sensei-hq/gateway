@@ -241,7 +241,7 @@ Every error takes exactly one path — nothing dropped:
 |---|---|
 | success (`attempts` trail) | record `ModelCall` effect; bubble attempts to hooks |
 | `AllAttemptsFailed` (chain exhausted by real errors) | node fails → cascade-skip (hard edges) **or** caught by an enclosing `Loop` to replan |
-| `AllGated { resume_after, human_action }` (whole chain gated, §12) | `resume_after = Some(t)` → **durable pause** to that wall-clock time; `None` (all terminal) → **fail-fast** with the human-action hint (never pause forever) |
+| `AllGated { resume_after, human_action }` (whole chain gated, §12) | `resume_after = Some(t)` → **durable pause** to that wall-clock time; `None` **with** a `human_action` → the **indefinite HOTL pause** (never auto-woken; `force_wake` after the operator acts) — *M1 reversed 2026-09-04, was "fail-fast, never pause forever"*; `None` with **no** action at all → fail |
 | `RateLimit{retry_after_ms}` surfaced at tool level | orchestrator owns backoff: **journaled `Timer`** (jittered) then retry, else pause |
 
 ### 11.3 Tools get their own taxonomy

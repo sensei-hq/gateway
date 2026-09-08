@@ -323,9 +323,29 @@ pub(super) enum BudgetRefusal {
     /// The remedies follow from that, and they are not the ones the old message named.
     /// "Route to a chain whose smallest model has a larger window" was advice about the
     /// wrong model: on a heterogeneous chain the smallest entry may already have been
-    /// filtered out of the decision, and widening it changes nothing. What moves this
-    /// refusal is sending less input, or putting a model with a larger window into the
-    /// chain.
+    /// filtered out of the decision, and widening it changes nothing.
+    ///
+    /// # Its FIRST replacement was wrong in the same way, which is worth keeping written down
+    ///
+    /// That replacement read "send less input, or put a model with a larger window in
+    /// this chain", and the second clause cannot clear this refusal either. The term is
+    /// `min { w ∈ chain : w >= est }`, and **adding an element to a set cannot raise its
+    /// minimum** — a larger entry leaves the bound exactly where it was, and a smaller
+    /// one that still holds the input LOWERS it. Demonstrated rather than argued by
+    /// `adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal`, which
+    /// drives one prompt down the 4096 chain and the `{4096, 200 000}` chain and gets
+    /// byte-identical refusals.
+    ///
+    /// What actually moves it is **raising the smallest serving window**: remove or
+    /// replace the entry the message names. That is guaranteed — dropping the minimum
+    /// element of the serving set leaves a strictly larger minimum, or empties the set,
+    /// in which case the gate refuses with per-candidate diagnostics instead.
+    ///
+    /// Sending less input helps too, but only conditionally, and the message says so
+    /// rather than promising it: a smaller `est` widens `w − est` while `w` holds, and it
+    /// can also pull a SMALLER window into the serving set and become the new minimum. On
+    /// a chain containing a model too small to leave floor room at any input size, no
+    /// amount of shortening clears it.
     ///
     /// What has NOT changed is that the cap is not one of them, and the message still
     /// says so. The window term reads no budget figure, so the identical refusal arrives
@@ -340,6 +360,22 @@ pub(super) enum BudgetRefusal {
         allowance: u64,
         est_input: u64,
         window: Option<u32>,
+        /// `true` when the chain's smallest declared `max_output_tokens` lands on the
+        /// SAME figure as the window term, so both bound the ceiling.
+        ///
+        /// Only meaningful beside a `window: Some(_)`, because a tie is precisely the
+        /// case where the window is the ceiling AND so is the output limit; when the
+        /// output limit binds alone `window` is `None` and this is `false`.
+        ///
+        /// It exists because the classification the tie gets right does not make the
+        /// REMEDY right. A tie is genuinely window-bound and the window arm is the only
+        /// one that tells an operator the cap is irrelevant — but with both terms on the
+        /// same sub-floor figure, clearing the window half leaves the output half binding
+        /// and the refusal exactly where it was. So the message names the output limit as
+        /// a co-cause rather than sending an operator to spend a `BudgetRaised` and a
+        /// `force_wake` on a round trip that cannot succeed. Pinned by
+        /// `a_tie_between_the_output_limit_and_the_window_term_names_the_window`.
+        output_limit_ties: bool,
     },
 }
 
@@ -574,6 +610,9 @@ impl Executor {
                             // bound was consulted to reach this point, so there is no
                             // window to blame and a cap raise genuinely is the remedy.
                             window: None,
+                            // Same reason: neither model bound has been read yet, so
+                            // there is nothing here that could tie.
+                            output_limit_ties: false,
                         },
                     }));
                 }
@@ -709,7 +748,7 @@ impl Executor {
                 // wording names. A tie counts as window-bound: when both terms land on the
                 // same figure the window is a true cause of the refusal, and the window is
                 // the half a cap raise cannot move.
-                let (ceiling, binding_window) = match request.chain.as_deref() {
+                let (ceiling, binding_window, output_limit_ties) = match request.chain.as_deref() {
                     Some(chain) => {
                         let out = self.gateway.min_max_output_tokens(chain).await;
                         let min_win = self
@@ -725,9 +764,16 @@ impl Executor {
                             (Some(c), Some(term), Some(raw)) if term == c => Some(raw),
                             _ => None,
                         };
-                        (ceiling, binding)
+                        // A tie is the window binding AND the output limit landing on the
+                        // same figure. Recorded separately from `binding` because the tie
+                        // does not change WHICH arm reports the refusal — the window arm
+                        // is still the least-misdirecting one — only what that arm has to
+                        // say about the remedy, since clearing the window half of a tie
+                        // leaves the output half binding.
+                        let ties = binding.is_some() && out == ceiling;
+                        (ceiling, binding, ties)
                     }
-                    None => (None, None),
+                    None => (None, None, false),
                 };
                 // The floor again, now against the bound that will ACTUALLY be emitted.
                 // The check above tests the budget allowance alone, which is the right
@@ -758,6 +804,7 @@ impl Executor {
                             allowance: ceiling.map_or(allowance, u64::from),
                             est_input: est,
                             window: binding_window,
+                            output_limit_ties,
                         },
                     }));
                 }
@@ -993,8 +1040,23 @@ impl Executor {
                         allowance,
                         est_input,
                         window: Some(window),
+                        output_limit_ties,
                     } => {
                         let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+                        // On a TIE the output limit sits on the same figure as the window
+                        // term — which `allowance` already is — so naming the co-cause
+                        // needs no extra number, only the sentence that stops an operator
+                        // clearing one term and hitting the other.
+                        let also_bound = if output_limit_ties {
+                            format!(
+                                " This chain's smallest declared `max_output_tokens` is \
+                                 the same {allowance} tokens, so it binds too: clearing \
+                                 the window alone will not release this call — raise that \
+                                 entry's declared limit, or drop the entry, as well."
+                            )
+                        } else {
+                            String::new()
+                        };
                         format!(
                             "context window: this call's input is estimated at {est_input} \
                              tokens; the smallest model in this chain that can hold it has \
@@ -1002,14 +1064,23 @@ impl Executor {
                              output — below the {floor}-token floor, so the reply would be \
                              cut off mid-sentence. The budget is not the binding term \
                              ({spent} of {budget} spent) and raising the cap does not move \
-                             this: send less input, or put a model with a larger window in \
-                             this chain."
+                             this. What does: remove the {window}-token model from this \
+                             chain, or replace it with a wider one. Adding a larger model \
+                             ALONGSIDE it cannot help — this bound is the smallest window \
+                             that can hold the input, and adding to that set cannot raise \
+                             its minimum. Sending less input helps only while that same \
+                             model stays the smallest one that can hold it.{also_bound}"
                         )
                     }
                     BudgetRefusal::BelowFloor {
                         allowance,
                         est_input,
                         window: None,
+                        // The deferred pure-output-limit misdirection lands here too (see
+                        // `BelowFloor`'s doc): with the output limit binding alone there
+                        // is no window and nothing to tie WITH, so this arm cannot
+                        // distinguish that case and still reports it in budget wording.
+                        output_limit_ties: _,
                     } => {
                         let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
                         let headroom = est_input.saturating_add(floor);

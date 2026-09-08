@@ -321,6 +321,37 @@ impl Gateway {
             .min()
     }
 
+    /// The LARGEST `context_window` among a chain's models. `None` if the chain is unknown or
+    /// has no resolvable models.
+    ///
+    /// The SP-7b context budget's target, and the fold is `max` for a reason worth stating
+    /// because every sibling accessor here folds `min`. Those bound a value that must be safe
+    /// for whichever candidate selection eventually returns, so they take the worst case. This
+    /// one answers a different question — "how much prompt could ANY model on this chain hold?"
+    /// — and shrinking a prompt to that figure is the LEAST cutting that still fits somebody.
+    ///
+    /// Safe despite being the most permissive fold, because it does not decide admission:
+    /// [`gates::context_window::ContextWindowGate`] still asks per candidate afterwards, so a
+    /// prompt budgeted to 128k on a `[128k, 8k]` chain simply gets the 8k entry skipped and
+    /// lands on the 128k one — which is exactly SP-7a's designed behaviour. This is NOT the
+    /// "bound by the chain's largest" alternative the SP-7a follow-on spec rejected for the
+    /// CLAMP (§3): that one was rejected because `max_tokens` must be safe for the SELECTED
+    /// candidate and nothing re-checks it after selection, so a `max` fold there would hand a
+    /// big model's output allowance to a small one. Here the input is being shrunk so that at
+    /// least one candidate can hold it, and the per-candidate check still runs.
+    ///
+    /// [`gates::context_window::ContextWindowGate`]: crate::gates::context_window::ContextWindowGate
+    pub async fn max_context_window(&self, chain: &str) -> Option<u32> {
+        let cfg = self.config.read().await;
+        let chain = cfg.chains.get(chain)?;
+        chain
+            .models
+            .iter()
+            .filter_map(|entry| cfg.models.get(&entry.model))
+            .map(|m| m.context_window)
+            .max()
+    }
+
     /// The smallest `max_output_tokens` among a chain's models (read-only; the output
     /// twin of [`Self::min_context_window`], folded the same way). `None` if the chain
     /// is unknown or has no resolvable models.
@@ -714,9 +745,10 @@ mod min_window_tests {
         }
     }
 
-    /// Build a two-model chain `"c"` from a pair of `ModelConfig`s, for the two
-    /// chain-wide `min` accessors below. Factored out so they cannot drift apart on
-    /// topology and disagree for a reason that has nothing to do with what they read.
+    /// Build a two-model chain `"c"` from a pair of `ModelConfig`s, for the chain-wide
+    /// accessor tests below — the three `min` folds and, since SP-7b, the `max` one.
+    /// Factored out so they cannot drift apart on topology and disagree for a reason that
+    /// has nothing to do with what they read.
     fn two_model_chain(a: ModelConfig, b: ModelConfig) -> GatewayConfig {
         let mut routers = HashMap::new();
         routers.insert(
@@ -810,6 +842,65 @@ mod min_window_tests {
 
         assert_eq!(gw.min_context_window("c").await, Some(8_000));
         assert_eq!(gw.min_context_window("nope").await, None);
+    }
+
+    /// **AC1** — the SP-7b context budget's target is the chain's LARGEST window.
+    ///
+    /// Shrinking a prompt to the largest window is the least cutting that still fits something,
+    /// and it stays safe because this fold does not decide admission: `ContextWindowGate` asks
+    /// the window question per CANDIDATE afterwards, so a smaller entry is skipped rather than
+    /// handed a prompt it cannot hold.
+    ///
+    /// The heterogeneous fixture is load-bearing: on a homogeneous chain `max` and `min` agree,
+    /// so a `min` fold would pass the first assertion for the wrong reason. The `assert_ne!`
+    /// pins that property of the fixture rather than trusting the two literals to stay apart.
+    ///
+    /// Filed beside `min_context_window_is_the_smallest_model_in_the_chain` on the SAME
+    /// `two_model_chain` topology, so the two folds answer 200 000 and 8 000 for ONE chain —
+    /// the max-vs-min contrast the accessor's own doc argues for, legible in one place, on the
+    /// shared fixture that exists to stop these tests drifting apart on topology.
+    #[tokio::test]
+    async fn max_context_window_is_the_largest_window_in_the_chain() {
+        let gw = Gateway::new(
+            two_model_chain(model("big", 200_000), model("small", 8_000)),
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+
+        assert_eq!(
+            gw.max_context_window("c").await,
+            Some(200_000),
+            "the LARGEST window, not the smallest — the smallest is what min_context_window answers"
+        );
+        assert_ne!(
+            gw.max_context_window("c").await,
+            gw.min_context_window("c").await,
+            "and the fixture must stay heterogeneous or this test cannot distinguish the folds"
+        );
+        assert_eq!(
+            gw.max_context_window("nope").await,
+            None,
+            "an unknown chain has no answer"
+        );
+
+        // AC1's second `None` leg, and the reason it is asserted separately: the
+        // unknown-chain case above returns at `chains.get(chain)?`, BEFORE the fold, so it
+        // says nothing about what the fold does with nothing to fold. Only a chain whose
+        // entries resolve to no `ModelConfig` reaches `max()` on an empty iterator. The
+        // doc's "or has no resolvable models" is a claim about this path alone.
+        let mut orphaned = two_model_chain(model("big", 200_000), model("small", 8_000));
+        orphaned.models.clear();
+        let gw_orphaned = Gateway::new(
+            orphaned,
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+
+        assert_eq!(
+            gw_orphaned.max_context_window("c").await,
+            None,
+            "a registered chain whose entries resolve to no model has no answer either"
+        );
     }
 
     /// **AC1 + AC2** — the smallest window at or above the estimate, `None` when nothing

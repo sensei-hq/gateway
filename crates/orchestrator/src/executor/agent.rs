@@ -15,7 +15,10 @@ use super::support::{
     tool_input_hash,
 };
 use super::{AgentStep, Executor, Fold};
-use crate::agent::prompt::assemble_prompt_parts;
+use crate::agent::prompt::{
+    BudgetRefusal, assemble_prompt_parts, available_context_bytes, plan_budget,
+    render_unbounded_system, replayed_plan, retained_meets_floor, transcript_estimate,
+};
 
 /// The 3-way outcome of one tool effect (or one ReAct turn's tools, §7.3): a
 /// value/transcript, a node failure (already journaled `NodeFailed`), or a durable
@@ -45,6 +48,18 @@ struct AgentRun<'a> {
     // call against these: the tool must be LISTED and its grant must COVER the need.
     agent_tools: Vec<String>,
     agent_grants: std::collections::HashMap<String, orchestrator_core::Permissions>,
+    /// SP-7b: the MEASURED cut this node's `system` half was rendered under, or `None` when
+    /// the prompt was dispatched whole.
+    ///
+    /// Carried on the run rather than recomputed at the finish because the two are separated
+    /// by the entire ReAct loop, and the only other way to answer "was this node degraded?"
+    /// down there would be a second fold lookup — which can disagree with the arm that
+    /// actually rendered, since `Fold` is built once per drive and never refreshed.
+    ///
+    /// It is an `Option` rather than a bool because the disclosure needs the FIGURES, not
+    /// just the fact. `None` is what makes AC11 true by construction: an in-window turn has
+    /// no cut, so `finish_agent` adds no key and there is nothing to warn about.
+    context_cut: Option<crate::agent::prompt::ContextCut>,
 }
 
 impl Executor {
@@ -261,16 +276,326 @@ impl Executor {
             ));
         }
 
-        // The model path re-joins what `assemble_prompt_parts` split, through the SAME
-        // `PromptParts::join` that `assemble_prompt` calls — so the string is byte-identical
-        // to the pre-s3-review one AND provably so: the drift guard
-        // `the_model_context_section_is_unbounded_and_joins_exactly_as_before` now pins the
-        // code this line runs. It used to concatenate the halves here instead, which left
-        // `assemble_prompt` with zero production callers and that guard pinning nothing that
-        // shipped. The `## Context` truncation above is unreachable from here.
-        let (system, tools) = parts.join();
-
+        // `resolve_chain` moved ABOVE the join for SP-7b: the budget is derived from the
+        // chain's largest context window, so the chain must be resolved before the
+        // `## Context` section is rendered. It is still BELOW the human-backed `return`
+        // above, which is the placement that matters — that arm resolves no chain at all, so
+        // a human-backed role's zero token spend stays STRUCTURAL rather than measured.
+        // Moving this line above that return would destroy the property this function's SP-6
+        // s3 comment claims — and it does NOT do so silently, which was worth checking rather
+        // than asserting. Hoisting it above the human branch reddens 19 tests in
+        // `executor::tests::human_agent`, all with `UnknownChainRef { agent: "reviewer" }`:
+        // a human-backed role is declared `chain: None` with no `(area, kind)` binding, so
+        // `resolve_chain`'s `?` aborts the whole run before the branch can ask anybody
+        // anything. So the guard here is the fixtures' own shape, not this paragraph. What is
+        // NOT covered is a human-backed role that happens to HAVE a resolvable chain: for that
+        // one the hoist would resolve a chain it must not, and only this comment would notice.
         let chain = self.registry.resolve_chain(agent, phase)?.to_string();
+
+        // SP-7b. The turn's effect id for turn 0 — the same coordinates `agent_turn_output`
+        // recomputes below, so the budget is keyed identically on every drive.
+        //
+        // ONE budget per agent NODE, not one per turn, and the key says so by pinning the
+        // turn coordinate at 0. This half of the prompt — `system` — is assembled ONCE, here,
+        // above the turn loop, and is turn-invariant; only `messages` grows, and the
+        // transcript is out of scope (spec §2). Journaling inside the loop would make
+        // `system` a function of the transcript and defeat the invariance the replay argument
+        // rests on. See `Fold::context_budgets`.
+        let budget_eid = effect_id(&node_id.0, 0, 0);
+        let requested_context_bytes: usize = parts.context.iter().map(|(_, b)| b.len()).sum();
+
+        // REPLAY FIRST. A journaled budget is read back and used verbatim, which is what makes
+        // the cut a function of journaled state: on that path the window is never read at all,
+        // so an operator editing a model's `context_window` between two drives of one run
+        // cannot disturb a turn already BUDGETED. `GatewayConfig` carries no version field, so
+        // nothing else would catch that edit.
+        let journaled = fold.context_budgets.get(&budget_eid);
+
+        // **And the same protection for a turn already dispatched UN-budgeted**, which the
+        // integer alone cannot give. AC11 makes an in-window turn journal nothing durable, so
+        // the absence of a budget row is indistinguishable from "not budgeted yet" — and this
+        // slice made `max_context_window(chain)` an input to the prompt for the FIRST time, so
+        // a window that shrinks between drives would retroactively CUT a turn already on the
+        // wire: `agent_input_hash` stops matching the memo, `DeterminismViolation` comes back
+        // terminal, and `force_wake` matches only `status = 'paused'`. That is the exact
+        // unrecoverable class the M1 reversal was done to remove, and restoring the config
+        // would not undo it — the spurious `ContextBudgeted` row is appended BEFORE the hash
+        // is checked, so every later drive replays the poison.
+        //
+        // So the DECISION is fenced, not just the integer, and the journal already carries it:
+        // the append at the bottom of this match always precedes the turn's `EffectRecorded`,
+        // so `memo.contains(budget_eid) && !budgets.contains(budget_eid)` proves turn 0 was
+        // dispatched un-budgeted and `parts.join()` is what must be reproduced. The key is the
+        // memo's own — `agent_turn_output` computes `effect_id(node, turn, 0)` and this is that
+        // id at `turn == 0`. Pinned by
+        // `an_unbudgeted_turn_replays_after_the_window_shrinks_under_it`.
+        //
+        // It also removes the window read and the probe from every replay of an un-budgeted
+        // node, which is the common case, though that is a side effect rather than the point.
+        let dispatched_unbudgeted = journaled.is_none() && fold.memo.contains_key(&budget_eid);
+
+        // `context_cut` is the MEASURED cut — `Some` on both budgeted arms (the journaled
+        // replay and the fresh budget), `None` when the prompt went out whole. It rides on
+        // `AgentRun` to the one disclosure channel that fires at the END of the node, the
+        // output key, which is the whole ReAct loop away from here. The operator warn does
+        // NOT ride: it fires inside the arm that produced the cut, beside the journal append,
+        // because `Fold` is built once per drive and never refreshed — anything read back off
+        // it here would be a stale answer on the very drive that decided.
+        //
+        // Only the WRITING drive warns, deliberately. A replay of a budgeted turn re-derives
+        // the same cut from the journal, and warning again would report a degradation that
+        // is not happening now — the same reasoning that keeps `ContextBudgeted` to one row
+        // per node (AC3). The output key does NOT follow that rule and must not: it
+        // describes the ANSWER, which is degraded on every drive that returns it — and that
+        // is now asserted rather than argued. Until review it was not: `Some(c)` on the
+        // journaled-replay arm below could be flipped to `None` with the whole suite green,
+        // silently un-disclosing every RESUMED budgeted node.
+        // `a_budgeted_turn_replays_after_the_window_changes_underneath_it` pins the mid-run
+        // resume; `a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back` pins
+        // the terminal one, which does not come through here at all.
+        let (system, tools, context_cut) = match journaled {
+            Some(record) => {
+                let available = usize::try_from(record.budget_bytes).unwrap_or(usize::MAX);
+                // The schemas the WRITING drive dropped, read back rather than re-decided —
+                // see `replayed_plan`, which owns the reasoning. Re-running `plan_budget` here
+                // made the replayed prompt a function of `CONTEXT_FLOOR_FRACTION`, a constant
+                // the spec says exists to be re-tuned.
+                let plan = replayed_plan(
+                    available,
+                    parts.authored.len(),
+                    &parts.tools,
+                    &record.dropped_tools,
+                )
+                .ok_or_else(|| {
+                    // The plan called for an `OrchestratorError::Internal` here; there is no
+                    // such variant. `DeterminismViolation` is the right one on the merits, not
+                    // merely the available one: a journaled record that no longer describes
+                    // this activation list means an input drifted (the authored text or the
+                    // activated schemas), and drifted inputs change the prompt bytes — so
+                    // `agent_turn_output` would raise this very error against this very effect
+                    // id one step later, off the memo hash. Naming it here makes the two paths
+                    // agree instead of inventing a second vocabulary for one condition.
+                    OrchestratorError::DeterminismViolation {
+                        node: node_id.clone(),
+                        effect_id: budget_eid.clone(),
+                    }
+                })?;
+                let (s, t, c) = parts.join_bounded(&plan);
+                (s, t, Some(c))
+            }
+            // Turn 0 is already on the wire and was NOT budgeted, so `join()` is not "today's
+            // path" here — it is the reproduction of a decision already taken, and the window
+            // must not be read. See `dispatched_unbudgeted` above for why the two conditions
+            // together prove it.
+            None if dispatched_unbudgeted => {
+                let (s, t) = parts.join();
+                (s, t, None)
+            }
+            None => {
+                // The window is read ONLY here — on a turn that has never been dispatched at
+                // all. Every later drive takes one of the two arms above and never asks the
+                // gateway.
+                let window = self.gateway.max_context_window(&chain).await;
+                // The un-budgeted prompt, priced by the SAME estimator selection will use,
+                // over the joined form because that is what would be dispatched.
+                // `join` consumes `parts`, so this measures a clone.
+                let probe = build_chat_request(
+                    &chain,
+                    &render_unbounded_system(&parts),
+                    vec![Message::text(MessageRole::User, query.as_str())],
+                    parts.tools.clone(),
+                );
+                let unbounded = gateway::estimate_input_tokens_pessimistic(&probe.payload);
+                match window {
+                    Some(w) if unbounded > w => {
+                        // The transcript's own weight comes off the budget rather than being
+                        // budgeted: turn 0's transcript is the node input alone, and it is the
+                        // one term of `messages` that IS turn-invariant, so charging it here
+                        // keeps the reserve honest without making the budget a function of the
+                        // growing transcript. What it does NOT buy is room for the transcript
+                        // to GROW — see `available_context_bytes`, which records that limit and
+                        // names the test that pins it.
+                        let transcript = transcript_estimate(&[Message::text(
+                            MessageRole::User,
+                            query.as_str(),
+                        )]);
+                        // Can this turn be cut to fit at all, and if not, WHOSE refusal is it?
+                        // `available_context_bytes` returning `None` and
+                        // `BudgetRefusal::AuthoredOverBudget` are the same answer — no cut fits
+                        // — and `FloorUnreachable` is the opposite one: a fitting cut exists at
+                        // every context size, and none of them retains enough.
+                        let budget = available_context_bytes(w, transcript).map(|available| {
+                            plan_budget(
+                                available,
+                                parts.authored.len(),
+                                &parts.tools,
+                                &parts.context,
+                            )
+                            .map(|plan| (available, plan))
+                        });
+                        match budget {
+                            // **No cut fits ⇒ the GATE's refusal, not SP-7b's.** This arm is why
+                            // `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying`
+                            // and `an_over_every_window_prompt_is_refused_by_the_gate_budgeted_
+                            // or_not` still pass unchanged: their fixture is the `authored` ≈
+                            // 100% one (spec §3), a 100 000-byte system prompt, and `authored`
+                            // is never cut, so no budget SP-7b can compute changes the outcome
+                            // — which is what AC5 says.
+                            //
+                            // Falling through hands the unbounded prompt to selection, which
+                            // skips every candidate and pauses with the SAME HOTL class naming
+                            // each candidate's own window, its estimate and the remedy. Taking
+                            // the floor pause here instead replaces that diagnosis with a
+                            // strictly worse one that is also FALSE — it blames the dependency
+                            // context and the 25% floor for a refusal neither caused, and names
+                            // remedies (shorten the upstream output, split the node) that cannot
+                            // work. Review found the first cut of this guard closing that hole
+                            // only for `requested_context_bytes == 0`, which left it OPEN for
+                            // the same agent plus one 100-byte dependency and made the
+                            // diagnosis non-monotonic in the dependency size; keying on the
+                            // CAUSE rather than on the context size closes both.
+                            //
+                            // Nothing is dispatched either way: the prompt is over the LARGEST
+                            // window by this arm's own guard, which is the same predicate
+                            // `ContextWindowGate` skips a candidate on.
+                            None | Some(Err(BudgetRefusal::AuthoredOverBudget)) => {
+                                let (s, t) = parts.join();
+                                (s, t, None)
+                            }
+                            // A fitting cut exists and none of them reaches the floor. Refusing
+                            // is SP-7b's own — and `None` for the retained figure, because
+                            // this arm has RENDERED NOTHING to measure.
+                            //
+                            // It passed the literal `0` until review, defended by an argument
+                            // on the wrong axis: `FloorUnreachable` does imply a floor above
+                            // zero and therefore `requested > 0`, but that is a claim about
+                            // the OTHER number and says nothing about how much would have
+                            // survived. On this slice's own fixture it is wrong by most of the
+                            // budget — a 100 023-byte dependency against a 4096-token window
+                            // leaves `3 × (4096 − 256 − 2) = 11 514` bytes to render into, and
+                            // the refusal is that even ALL of them are under the 25 006 the
+                            // 25% floor demands. Stated as that bound rather than as a survivor
+                            // count, since a survivor count is the thing this arm cannot know.
+                            // "0 of 100 023 survive" reads as a total loss and puts the
+                            // operator's remedy — shorten the upstream output by how much? — on
+                            // a number nothing measured. Pinned by
+                            // `the_planner_floor_refusal_reports_no_retained_figure_it_never_measured`.
+                            Some(Err(BudgetRefusal::FloorUnreachable)) => {
+                                return self
+                                    .pause_context_floor(
+                                        run,
+                                        node_id,
+                                        w,
+                                        requested_context_bytes,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                            Some(Ok((available, plan))) => {
+                                let (s, t, c) = parts.join_bounded(&plan);
+                                // A plan is not proof of fit — `plan_budget`'s own doc says so
+                                // — so the floor is decided on the MEASURED cut, and only here.
+                                if !retained_meets_floor(c.requested_bytes, c.retained_bytes) {
+                                    return self
+                                        .pause_context_floor(
+                                            run,
+                                            node_id,
+                                            w,
+                                            c.requested_bytes,
+                                            Some(c.retained_bytes),
+                                        )
+                                        .await;
+                                }
+                                // Journal BEFORE the model call, and use the LOCAL plan on this
+                                // drive. `Fold` is built once per drive from one `journal.load`
+                                // and is never refreshed, so reading this back off the fold here
+                                // would read a STALE fold and recompute on the writing drive.
+                                // This is `drive_expand_with`'s shipped shape: append, then use
+                                // the local value.
+                                self.append(
+                                    run,
+                                    JournalEvent::ContextBudgeted {
+                                        node: node_id.clone(),
+                                        effect_id: budget_eid.clone(),
+                                        budget_bytes: available as u64,
+                                        source_window: w,
+                                        retained_bytes: c.retained_bytes as u64,
+                                        dropped_deps: (c.deps_total - c.deps_shown) as u32,
+                                        dropped_tools: plan.dropped_tools.clone(),
+                                    },
+                                )
+                                .await?;
+                                // SP-7b channel 4 — the operator, and the INSTRUMENT.
+                                // `CONTEXT_FLOOR_FRACTION` is a judgment call with no evidence
+                                // behind it; this is what is meant to replace the guess with a
+                                // measurement, so it carries `requested` beside `retained` —
+                                // the ratio, not just the survivor — which is the one figure
+                                // the durable row does not.
+                                //
+                                // WARN rather than INFO: a degraded answer is a real reduction
+                                // in the work product's quality, and an operator who never
+                                // sees one cannot know it is happening. It is emitted once per
+                                // budgeted NODE (this arm runs only on the writing drive), so
+                                // it cannot become per-turn noise.
+                                //
+                                // In SP-DATA-5's clamp-warn style, and the fields are named to
+                                // match: bare event, integers, the node as the correlation key
+                                // — `RunPaused` carries no node, so a log line that omitted it
+                                // could not be tied to anything in the journal.
+                                // The MESSAGE is conditional because "reduced context" was a
+                                // false report on the tool-only case: a turn whose context
+                                // fitted whole and whose SCHEMAS were dropped reduced no
+                                // context at all, and an operator reading the log — or an
+                                // audit reading the row beside it — was told the wrong thing
+                                // about which half was cut. Found by the whole-slice review.
+                                // WHICH HALF was cut is a structured FIELD, not part of the
+                                // message. The message stays static so it remains a stable
+                                // filter (the capture helper and any log query match on it,
+                                // and it must not collide with SP-DATA-5's clamp warn), while
+                                // `cut` carries the discrimination. Interpolating the
+                                // discrimination INTO the message was the first attempt and it
+                                // silently broke the capture filter — a formatted message is
+                                // not a stable key.
+                                let cut = match (
+                                    c.retained_bytes < c.requested_bytes,
+                                    !plan.dropped_tools.is_empty(),
+                                ) {
+                                    (true, true) => "context+tools",
+                                    (true, false) => "context",
+                                    (false, true) => "tools",
+                                    // Reachable: the budget bound the prompt without either
+                                    // half losing bytes — the section fitted its share whole
+                                    // and no schema was dropped.
+                                    (false, false) => "neither",
+                                };
+                                tracing::warn!(
+                                    node = %node_id.0,
+                                    window = w,
+                                    requested_bytes = c.requested_bytes,
+                                    retained_bytes = c.retained_bytes,
+                                    dropped_deps = c.deps_total - c.deps_shown,
+                                    dropped_tools = plan.dropped_tools.len(),
+                                    cut,
+                                    "SP-7b: agent prompt context budgeted"
+                                );
+                                (s, t, Some(c))
+                            }
+                        }
+                    }
+                    // Fits, or an unknown chain: today's path exactly, through the SAME
+                    // `PromptParts::join` that `assemble_prompt` calls — so an in-window
+                    // prompt is byte-identical to the pre-SP-7b one AND provably so, since the
+                    // drift guard
+                    // `the_model_context_section_is_unbounded_and_joins_exactly_as_before`
+                    // pins the code this line runs.
+                    _ => {
+                        let (s, t) = parts.join();
+                        (s, t, None)
+                    }
+                }
+            }
+        };
+
         let ar = AgentRun {
             run,
             node_id,
@@ -280,6 +605,7 @@ impl Executor {
             fold,
             agent_tools: agent.tools.clone(),
             agent_grants: agent.grants.clone(),
+            context_cut,
         };
 
         let mut messages: Vec<Message> = vec![Message::text(MessageRole::User, query)];
@@ -337,6 +663,92 @@ impl Executor {
         )
         .await?;
         Ok(AgentStep::Failed(message))
+    }
+
+    /// SP-7b's floor: refuse rather than answer from almost nothing.
+    ///
+    /// **Which refusal this is, since the run has two and both name the window.** This one
+    /// fires only when a cut that FITS exists and no such cut retains enough of the dependency
+    /// bodies (`BudgetRefusal::FloorUnreachable`, or the measured post-render check). When no
+    /// cut can fit — the authored half alone overruns the budget, or the transcript plus the
+    /// output reserve already fills the window — the un-cut prompt goes to selection and the
+    /// per-candidate `ContextWindowGate` refuses it instead, which is strictly better
+    /// information. The `context budget: ` prefix is how a reader (and a test) tells the two
+    /// apart; `the_context_floor_pause_is_recoverable_and_spends_nothing` asserts this one's
+    /// whole shape.
+    ///
+    /// `resume_after: None` is the HOTL pause class, and it is the SAME class the M1 reversal
+    /// established for an over-window run — deliberately, because the alternative was just
+    /// removed for being unrecoverable: `force_wake` matches only `status = 'paused'`,
+    /// `torii run wake` reports "not queued", and `submit` refuses a used id, so a
+    /// `NodeFailed` here would leave every completed node's memo and spend durable and
+    /// unreachable. That property was shipped on prose until the test above existed: the only
+    /// test that reached this function keyed on a window substring the GATE's message carries
+    /// too, so flipping `resume_after` to `Some(t)` or adding a `NodeFailed` beside the pause
+    /// left the whole suite green.
+    ///
+    /// The remedy this names is a config change, so no deadline is carried: nothing about
+    /// waiting makes a model's window bigger, and a timed wake would return the run to the
+    /// identical refusal forever.
+    ///
+    /// `pause_awaiting` (`signal.rs`) is the same six lines and could not be reused: it
+    /// returns `NodeExec` and `drive_agent` returns `AgentStep`. The `NodeFailed`-free shape
+    /// is the part worth watching when editing either.
+    ///
+    /// **`retained` is an `Option` because only ONE of the two callers measured anything.**
+    /// The post-render check hands over a real `ContextCut::retained_bytes`; the planner's
+    /// `FloorUnreachable` refuses before the section is rendered at all, and it used to pass
+    /// the literal `0` — an operator-facing claim that nothing would survive, which on this
+    /// slice's own fixture is wrong by most of the budget (the arm's own comment does the
+    /// arithmetic). Whichever number this function is given, it must be one somebody
+    /// measured, so the un-measured caller says so instead.
+    async fn pause_context_floor(
+        &self,
+        run: RunId,
+        node_id: &NodeId,
+        window: u32,
+        requested: usize,
+        retained: Option<usize>,
+    ) -> Result<AgentStep, OrchestratorError> {
+        let pct = (orchestrator_core::CONTEXT_FLOOR_FRACTION * 100.0).round() as u32;
+        // What survived, or — when nothing was rendered — what the planner DID establish: of
+        // the cuts that fit this window, none clears the floor. Both verdicts name the same
+        // window and the same floor and are followed by the same remedies, so the two
+        // refusals stay ONE message with one shape rather than diverging into two — including
+        // the `{window}-token context window` substring the guard tests key on.
+        let verdict = match retained {
+            Some(bytes) => format!(
+                "only {bytes} of them survive a budget for the largest model in this chain \
+                 ({window}-token context window) — under the {pct}% floor"
+            ),
+            None => format!(
+                "there is no cut of it that fits a budget for the largest model in this \
+                 chain ({window}-token context window) and still clears the {pct}% floor"
+            ),
+        };
+        // The node is NAMED in the reason, which the plan's draft of this message did not do.
+        // It is not decoration: `JournalEvent::RunPaused` carries only `{reason,
+        // resume_after}` and no node, so the durable row an operator reads back — through
+        // `torii run status` or `list_paused` — has nothing else to say WHICH node's context
+        // busted. (`RunOutcome`'s `PauseInfo` does carry the node, but that is in-process and
+        // gone by the time anyone runs a command.) The `context budget: ` prefix stays at the
+        // front, since that is the wording the guard tests key on.
+        let reason = format!(
+            "context budget: node {node}'s dependency context is {requested} bytes and \
+             {verdict}, so the reply would be built on almost nothing. Waiting does not move \
+             this: shorten the upstream output, split the node, or put a model with a larger \
+             window in this chain.",
+            node = node_id.0
+        );
+        self.append(
+            run,
+            JournalEvent::RunPaused {
+                reason: reason.clone(),
+                resume_after: None,
+            },
+        )
+        .await?;
+        Ok(AgentStep::Paused(reason))
     }
 
     /// Produce one ReAct turn's model output: a memoized turn replays from the
@@ -436,7 +848,20 @@ impl Executor {
     }
 
     /// Finalize a completed agent node: journal `NodeCompleted` once (guarded on
-    /// resume) and return the canonical `{model, text}` output.
+    /// resume) and return the canonical `{model, text}` output — plus SP-7b's
+    /// `context_budgeted: true` when this node's context was cut to fit the window.
+    ///
+    /// **The third key is ADDITIVE and that is load-bearing.** The output stays
+    /// `{"model", "text"}` plus one key, so an unmodified `BranchCond::TextContains`
+    /// consumes a degraded answer exactly as before — the same discipline SP-6 s3 used
+    /// when it added `actor` to a human-backed agent's output. A consumer that wants to
+    /// treat a degraded answer differently opts IN by reading the key; one that does not
+    /// is not broken by its arrival.
+    ///
+    /// **Emitted only when the turn was degraded**, so an in-window turn's output is
+    /// byte-identical to the pre-SP-7b one (AC11). Emitting `false` on every turn would be
+    /// tidier to consume and would break that, and it would also make the key useless as a
+    /// signal in a graph whose nodes predate the slice.
     async fn finish_agent(
         &self,
         ar: &AgentRun<'_>,
@@ -456,9 +881,27 @@ impl Executor {
             .get("model")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        Ok(AgentStep::Completed(
-            serde_json::json!({ "model": model, "text": text }),
-        ))
+        let mut out = serde_json::json!({ "model": model, "text": text });
+        // SP-7b channel 3. `insert` on the object rather than a second `json!` literal, so the
+        // budgeted and un-budgeted shapes here cannot drift apart: one literal, one optional
+        // key added to it.
+        //
+        // That keeps THIS function's two shapes in step; it does NOT make this the only place
+        // a completed Agent node's output is built. `project_agent_outputs`
+        // (`executor/support.rs`) rebuilds it on the terminal-resume path, and review caught
+        // the first cut of this slice shipping the key here and not there — so a completed
+        // degraded node read back through `start()` reported as un-degraded. The two sites are
+        // held in step by argument, not by construction, so a change to either belongs in both:
+        // `a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back` is the guard.
+        if ar.context_cut.is_some()
+            && let Some(obj) = out.as_object_mut()
+        {
+            obj.insert(
+                "context_budgeted".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        Ok(AgentStep::Completed(out))
     }
 
     /// Execute (or replay) one ReAct turn's tool calls and return the transcript
@@ -1068,9 +1511,11 @@ impl Executor {
                 super::dispatch::RefusalKind::Paused(reason) => Ok(ToolOutcome::Paused(reason)),
                 super::dispatch::RefusalKind::Failed(message) => Ok(ToolOutcome::Failed(message)),
             },
-            // A fully-gated chain with a timed re-eligibility (§11.2) is a durable
-            // pause (resumable) — on resume the turn re-attempts (no `EffectRecorded`
-            // was journaled). Every other gateway error fails the node.
+            // A fully-gated chain is a durable pause (resumable) whenever something can
+            // clear it — a deadline, or a human action the reason names — and on resume
+            // the turn re-attempts (no `EffectRecorded` was journaled). `resume_after`
+            // passes through unwrapped: `None` is the HOTL class, not a missing value.
+            // Every other gateway error fails the node.
             Err(error) => match classify_gateway_error(&error) {
                 GatewayDisposition::Pause {
                     resume_after,
@@ -1080,7 +1525,7 @@ impl Executor {
                         run,
                         JournalEvent::RunPaused {
                             reason: reason.clone(),
-                            resume_after: Some(resume_after),
+                            resume_after,
                         },
                     )
                     .await?;

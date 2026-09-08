@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet};
 use kernel::types::capability::Capability;
 use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload, ToolDefinition};
 use orchestrator_core::{
-    ChildStatus, ContentRef, ContextRef, EdgeKind, EffectOutput, Graph, JournalEvent, MapBody,
-    Node, NodeId, NodeKind, OrchestratorError, Seq, effect_id,
+    ChildStatus, ContentRef, ContextRef, EdgeKind, EffectId, EffectOutput, Graph, JournalEvent,
+    MapBody, Node, NodeId, NodeKind, OrchestratorError, Seq, effect_id,
 };
 use sha2::{Digest, Sha256};
 
-use super::{AgentAnswer, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
+use super::{AgentAnswer, ContextBudget, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -395,6 +395,31 @@ pub(crate) fn fold_journal(
             JournalEvent::BudgetRaised { new_total_tokens } => {
                 fold.budget = Some(*new_total_tokens);
             }
+            // SP-7b: the `## Context` byte budget a turn was cut to. FIRST wins —
+            // `entry().or_insert()`, NOT `insert`. A budget a later record could move is not
+            // a fence: the determinism argument is that drive 2 reproduces drive 1's cut, and
+            // LAST-wins would let a second record shift a cut a completed turn was already
+            // hashed against. The two nearest templates in this same function — `expansions`
+            // (`PlanExpanded`) and `selections` (`PlannerSelected`) — are both LAST-wins, so
+            // this one token is the whole difference from the code most likely to be copied
+            // here, and both spellings compile.
+            //
+            // Also an EXPLICIT arm rather than the `_` catch-all below, for the same reason as
+            // the two SP-DATA-5 arms above: an unfolded budget compiles, runs, and silently
+            // makes every resume recompute the cut from a live window.
+            JournalEvent::ContextBudgeted {
+                effect_id,
+                budget_bytes,
+                dropped_tools,
+                ..
+            } => {
+                fold.context_budgets
+                    .entry(effect_id.clone())
+                    .or_insert_with(|| ContextBudget {
+                        budget_bytes: *budget_bytes,
+                        dropped_tools: dropped_tools.clone(),
+                    });
+            }
             _ => {}
         }
     }
@@ -403,9 +428,23 @@ pub(crate) fn fold_journal(
 
 /// Project each Agent node's raw final model-turn output (`{model, text,
 /// tool_calls}`) down to the canonical `{model, text}` a fresh `run` returns from
-/// `AgentStep::Completed` (design §4) — so a completed Agent node yields an
-/// identical shape on every completion path. Pure over already-materialized
-/// outputs; `ModelCall` nodes already store the canonical shape and are untouched.
+/// `AgentStep::Completed` (design §4) — plus SP-7b's `context_budgeted: true` for a node
+/// this run cut the context of — so a completed Agent node yields an identical shape on
+/// every completion path. Pure over already-materialized outputs and the folded budgets;
+/// `ModelCall` nodes already store the canonical shape and are untouched.
+///
+/// **SP-7b's key is re-attached from `context_budgets`, not carried through the rebuild**,
+/// because it is not IN the value being rebuilt and never was: `finish_agent` synthesizes it
+/// from `AgentRun::context_cut` and journals nothing, while `node_last_output` is populated
+/// only from `EffectRecorded` — the raw `{model, text, tool_calls}` turn. So "preserve the
+/// extra key when present" would compile, read as a fix, and change nothing. The durable
+/// `ContextBudgeted` row is the only carrier, and its key `effect_id(node, 0, 0)` is exactly
+/// what `context_cut.is_some()` tracks on the writing drive: the one arm that appends a row
+/// is the one arm that sets `Some`, and the replay arm re-sets `Some` off that same row
+/// (`agent.rs`). Review found this silently reporting a degraded node as un-degraded on every
+/// read-back — the same flattening the `actor` exemption below exists for, on the channel
+/// whose entire purpose is that a degraded answer is distinguishable from a full one. Pinned
+/// by `a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back`.
 ///
 /// **A HUMAN-answered node (SP-6 s3) is passed through unchanged**, because its
 /// canonical shape is a different one: `{text, actor}` (design §4 / AC2), and forcing
@@ -445,6 +484,7 @@ pub(crate) fn fold_journal(
 /// carries.
 pub(crate) fn project_agent_outputs(
     graph: &Graph,
+    context_budgets: &HashMap<EffectId, ContextBudget>,
     outputs: &mut HashMap<NodeId, serde_json::Value>,
 ) {
     for node in &graph.nodes {
@@ -459,10 +499,19 @@ pub(crate) fn project_agent_outputs(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             let text = output.get("text").cloned().unwrap_or_default();
-            outputs.insert(
-                node.id.clone(),
-                serde_json::json!({ "model": model, "text": text }),
-            );
+            let mut projected = serde_json::json!({ "model": model, "text": text });
+            // Mirrors `finish_agent`'s own `insert`-on-the-object, deliberately: the key is
+            // ADDITIVE there and must be additive here, or the two shapes disagree in the
+            // opposite direction from the one review caught.
+            if context_budgets.contains_key(&effect_id(&node.id.0, 0, 0))
+                && let Some(obj) = projected.as_object_mut()
+            {
+                obj.insert(
+                    "context_budgeted".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            outputs.insert(node.id.clone(), projected);
         }
     }
 }
@@ -569,22 +618,52 @@ pub(crate) fn tool_input_hash(name: &str, arguments: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// How the executor should treat a gateway error (§11.2): a timed chain-gate is a
-/// durable pause; everything else fails (a terminal gate carries its human-action
-/// hint in the message).
+/// How the executor should treat a gateway error (§11.2): a fully-gated chain is a
+/// durable pause when *something* can clear it — a deadline, or a named human action;
+/// everything else fails.
+///
+/// `Pause.resume_after` is an `Option` because the two pause classes differ in exactly
+/// that field, and the difference is the whole point. `Some(t)` is the scheduler's timed
+/// wake (SP-DATA-3): the run comes back by itself at `t`. `None` is the HOTL class: a
+/// NULL `next_wake`, never auto-woken, cleared by an operator running `force_wake` after
+/// acting on the remedy the reason names.
 #[derive(Debug)]
 pub(crate) enum GatewayDisposition {
     Pause {
-        resume_after: chrono::DateTime<chrono::Utc>,
+        resume_after: Option<chrono::DateTime<chrono::Utc>>,
         reason: String,
     },
     Fail(String),
 }
 
-/// Classify a gateway error: only `AllGated{resume_after: Some(t)}` (every
-/// candidate gated, with a timed re-eligibility) pauses — to `t`. Every other
-/// error, including `AllGated{None}` (all gates terminal), fails; its `Display`
-/// carries the reason / human-action hint.
+/// Classify a gateway error. `AllGated` pauses when it carries something that can clear
+/// it: `resume_after: Some(t)` (a timed re-eligibility) pauses until `t`, and a
+/// `human_action` with no deadline pauses INDEFINITELY as the HOTL class. Every other
+/// error fails, and so does an `AllGated` carrying neither — a pause nobody and nothing
+/// can clear is strictly worse than a failure.
+///
+/// # The human-action arm REVERSES risk M1, on a decision recorded 2026-09-04
+///
+/// M1 in `docs/design/selection-policy-pipeline.md` resolved terminal-only exhaustion as
+/// "fail-fast human-action, never pause", and this function implemented it: only a timed
+/// gate paused. Review of the serving-window slice showed what that costs once the
+/// orchestrator's own pre-dispatch window halt is gone. A budgeted over-every-window run
+/// reaches `AllGated { resume_after: None, human_action: Some(UseLargerContextWindow) }`,
+/// which failed the node and made the run terminal — and no supported command revives a
+/// terminal run. `SchedulerStore::force_wake` is `… where run_id = $1 and status =
+/// 'paused'`; `torii run wake` reports "not queued"; `run submit` refuses a used id.
+/// Recovery required hand-written SQL, while every completed node's memo, journaled
+/// mutation and spent token stayed durable and unreachable.
+///
+/// The argument that overturned M1: `human_action: Some(_)` IS the statement that a
+/// person rather than a deadline is the remedy, which is the definition of the HOTL pause
+/// class. A terminal state that names a human remedy no command can act on is incoherent
+/// — and incoherent for every gate that produces one (auth lockout, capability, budget),
+/// not just the window. M1's fail-fast instinct is honoured by the `human_action: None`
+/// arm, which still fails.
+///
+/// What this does NOT do is make waiting the remedy. The pause carries no deadline
+/// precisely so nothing wakes it on a timer into the identical refusal forever.
 pub(crate) fn classify_gateway_error(
     err: &kernel::types::error::GatewayError,
 ) -> GatewayDisposition {
@@ -593,7 +672,7 @@ pub(crate) fn classify_gateway_error(
             resume_after: Some(t),
             ..
         } => GatewayDisposition::Pause {
-            resume_after: *t,
+            resume_after: Some(*t),
             // `err.to_string()`, exactly as the `Fail` arm below does, and NOT a
             // hand-built sentence naming only the deadline. `AllGated`'s `Display`
             // renders the per-candidate skips and the remedy, and this string is what
@@ -605,6 +684,21 @@ pub(crate) fn classify_gateway_error(
             // yields both), and the whole point of keeping it is that waiting will not
             // fix the second half. Dropping it here would have made that change invisible
             // on the one path it was made for.
+            reason: err.to_string(),
+        },
+        // No deadline, but a named human action: the HOTL class. `resume_after: None`
+        // is load-bearing rather than incidental — the scheduler stores a NULL
+        // `next_wake` for it, so `tick()` never claims the run and only `force_wake`
+        // moves it. `err.to_string()` for the same reason as the arm above: this string
+        // is what `list_paused` renders and what the operator reads to learn WHICH
+        // remedy, and `AllGated`'s `Display` carries every candidate's own diagnosis
+        // beside the action.
+        kernel::types::error::GatewayError::AllGated {
+            resume_after: None,
+            human_action: Some(_),
+            ..
+        } => GatewayDisposition::Pause {
+            resume_after: None,
             reason: err.to_string(),
         },
         other => GatewayDisposition::Fail(other.to_string()),
@@ -623,6 +717,115 @@ pub(crate) fn classify_gateway_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SP-7b AC6 — `ContextBudgeted` folds FIRST-wins.
+    ///
+    /// A budget a later event can rewrite is not a fence. The whole determinism argument is
+    /// that drive 2 reproduces drive 1's cut, and LAST-wins would let a second record move a
+    /// cut a completed turn was already hashed against — which surfaces as a
+    /// `DeterminismViolation` on a resume, not as a wrong answer here.
+    ///
+    /// The hazard this guard exists for is that the two nearest templates in `fold_journal`
+    /// itself — `fold.expansions` (`PlanExpanded`) and `fold.selections` (`PlannerSelected`)
+    /// — are both LAST-wins `insert`, so the correct discipline is ONE TOKEN away from the
+    /// code most likely to be copied, and both spellings compile. Mutation-verified: with
+    /// `.entry(..).or_insert_with(..)` replaced by `.insert(..)` this fails, reporting the
+    /// second record's `9999`/`["b"]`.
+    ///
+    /// The latch covers the WHOLE record, not only the integer. `dropped_tools` is a replay
+    /// input too (see [`super::ContextBudget`]), so a second record moving the dropped set
+    /// while the budget held would change `system` and `tools` just as surely — and an
+    /// `or_insert` that folded only the budget would leave that half LAST-wins in a way the
+    /// integer assertion could not see.
+    #[test]
+    fn the_first_context_budget_wins() {
+        use orchestrator_core::{EffectId, JournalEvent, NodeId};
+        let eid = EffectId("eid-1".into());
+        let ev = |budget_bytes: u64, dropped: &str| JournalEvent::ContextBudgeted {
+            node: NodeId("n1".into()),
+            effect_id: eid.clone(),
+            budget_bytes,
+            source_window: 4096,
+            retained_bytes: 0,
+            dropped_deps: 0,
+            dropped_tools: vec![dropped.to_string()],
+        };
+        let (fold, _last, _completed) = fold_journal(&[(0, ev(1000, "a")), (1, ev(9999, "b"))]);
+        assert_eq!(
+            fold.context_budgets.get(&eid),
+            Some(&ContextBudget {
+                budget_bytes: 1000,
+                dropped_tools: vec!["a".to_string()],
+            }),
+            "the FIRST record wins WHOLE — a later one must not move a cut already hashed \
+             against, in either of the two fields a replay reproduces it from"
+        );
+    }
+
+    /// SP-7b AC6, the other half — FIRST-wins is PER EFFECT ID, not per run.
+    ///
+    /// `the_first_context_budget_wins` above feeds ONE effect id twice, so every record it
+    /// folds is a duplicate. That leaves "FIRST record wins" readable as a run-global latch,
+    /// which is a misreading the phrase invites and which compiles. The map is keyed by
+    /// `EffectId`, so the latch is PER KEY.
+    ///
+    /// **The key the production emitter uses is `effect_id(node, 0, 0)` — ONE budget per agent
+    /// NODE, not one per turn** (`drive_agent`, `agent.rs`). The `system` half is assembled
+    /// once, above the ReAct turn loop, and is turn-INVARIANT by construction; only `messages`
+    /// grows across turns, and the transcript is explicitly out of this slice's scope (spec §2).
+    /// So re-budgeting per turn would make `system` a function of the transcript and couple the
+    /// two halves the design deliberately separates. The `0` in the key is that decision, not a
+    /// placeholder.
+    ///
+    /// This test's own two keys are therefore SIBLING NODES rather than two turns of one node —
+    /// what the per-key latch keeps apart in production is distinct nodes, a `Map`'s children
+    /// and a `Loop`'s iterations. It was named `each_turn_of_one_node_…` before the emitter
+    /// existed, which asserted the design was the opposite of what shipped; renamed rather than
+    /// annotated, since a test name is read far more often than its doc.
+    ///
+    /// Mutation-verified, and the two guards are complementary rather than nested:
+    /// - `if fold.context_budgets.is_empty() { insert(..) }` — a run-global latch — leaves
+    ///   `the_first_context_budget_wins` GREEN and fails this test's second assertion with
+    ///   `left: None, right: Some(9999)`.
+    /// - `.insert(..)` for `.entry(..).or_insert(..)` — LAST-wins — fails that test with
+    ///   `Some(9999)` and leaves THIS one green, because its two events carry different keys.
+    ///
+    /// Keying by `node` instead of `effect_id` — `.entry(EffectId(node.0.clone()))`, the
+    /// mutation `Fold::context_budgets`' doc warns about — is caught by BOTH tests rather
+    /// than by either alone, because each looks up by the effect id it wrote and so gets
+    /// `None`. Neither is uniquely the guard for it.
+    #[test]
+    fn each_effect_id_keeps_its_own_context_budget() {
+        use orchestrator_core::{EffectId, JournalEvent, NodeId};
+        let row = |node: &str, effect_id: &str, budget_bytes: u64| JournalEvent::ContextBudgeted {
+            node: NodeId(node.into()),
+            effect_id: EffectId(effect_id.into()),
+            budget_bytes,
+            source_window: 4096,
+            retained_bytes: 0,
+            dropped_deps: 0,
+            dropped_tools: vec![],
+        };
+        let (fold, _last, _completed) = fold_journal(&[
+            (0, row("n1", "eid-node-1", 1000)),
+            (1, row("n2", "eid-node-2", 9999)),
+        ]);
+        assert_eq!(
+            fold.context_budgets
+                .get(&EffectId("eid-node-1".into()))
+                .map(|b| b.budget_bytes),
+            Some(1000),
+            "the first node's budget, keyed by ITS effect id"
+        );
+        assert_eq!(
+            fold.context_budgets
+                .get(&EffectId("eid-node-2".into()))
+                .map(|b| b.budget_bytes),
+            Some(9999),
+            "the second is a different effect id, so FIRST-wins must not hand it the first's \
+             budget"
+        );
+    }
 
     #[test]
     fn fold_journal_captures_plan_expansions() {
@@ -1432,8 +1635,15 @@ mod tests {
         );
     }
 
+    /// The classifier's whole rule, one case per arm: a deadline pauses to it, a named
+    /// human action pauses INDEFINITELY, and neither fails.
+    ///
+    /// Renamed from `classify_gateway_error_pauses_only_on_timed_allgated`, whose name
+    /// asserted the pre-M1-reversal rule — "only" became false the moment the
+    /// human-action arm existed, and a test name that states the old rule is worse than
+    /// no name at all for the next reader.
     #[test]
-    fn classify_gateway_error_pauses_only_on_timed_allgated() {
+    fn classify_gateway_error_pauses_on_a_deadline_or_a_human_action_and_fails_on_neither() {
         use kernel::types::error::{GatewayError, HumanAction};
         let t = chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap();
         // Timed AllGated → Pause (reason names the instant).
@@ -1446,11 +1656,57 @@ mod tests {
                 resume_after,
                 reason,
             } => {
-                assert_eq!(resume_after, t);
+                assert_eq!(resume_after, Some(t));
                 assert!(reason.contains(&t.to_string()), "reason names t: {reason}");
             }
             d => panic!("expected Pause, got {d:?}"),
         }
+        // No deadline but a HUMAN action → the HOTL pause: `resume_after: None`, so the
+        // scheduler stores a NULL `next_wake` and only `force_wake` moves it. This arm
+        // is the M1 reversal (see the function's doc): it used to fail, and a failed run
+        // is unreachable by every supported command — `force_wake` matches only
+        // `status = 'paused'`.
+        match classify_gateway_error(&GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec![
+                "r:m — estimated 20000 input tokens exceeds the model's 8192-token \
+                 context window"
+                    .to_string(),
+            ],
+            human_action: Some(HumanAction::UseLargerContextWindow),
+        }) {
+            GatewayDisposition::Pause {
+                resume_after,
+                reason,
+            } => {
+                assert!(
+                    resume_after.is_none(),
+                    "a human action is not a deadline: waking this on a timer returns it \
+                     to the identical refusal forever, so the pause must carry no instant"
+                );
+                assert!(
+                    reason.contains("8192-token context window")
+                        && reason.contains("larger context window"),
+                    "and the durable reason carries the candidate's diagnosis AND the \
+                     remedy — it is the only thing telling the operator what to change \
+                     before they `force_wake`: {reason}"
+                );
+            }
+            d => panic!("expected the HOTL Pause, got {d:?}"),
+        }
+        // Neither a deadline nor an action → still a FAIL, which is M1's fail-fast
+        // instinct kept rather than discarded: a pause no one and nothing can clear is
+        // strictly worse than a failure, because it stalls silently instead of reporting.
+        let blind = GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec!["r:m — gated".to_string()],
+            human_action: None,
+        };
+        let blind_msg = blind.to_string();
+        assert!(
+            matches!(classify_gateway_error(&blind), GatewayDisposition::Fail(m) if m == blind_msg),
+            "an AllGated naming no remedy at all must fail"
+        );
         // A PAUSE carries the per-candidate diagnostics and the remedy too, and this is
         // what makes SP-7a's `all_gated_error` change reach anybody. That function now
         // keeps `human_action` beside a `resume_after` — a chain with one breaker-open
@@ -1483,16 +1739,28 @@ mod tests {
             }
             d => panic!("expected Pause, got {d:?}"),
         }
-        // Terminal AllGated → Fail (message carries the human-action hint).
-        let none = GatewayError::AllGated {
+        // The reversal is NOT window-specific, and this case is why the narrow fix was
+        // rejected: `TopUpCredits` is a credit/auth remedy, and a run gated on it was
+        // just as terminal and just as unrecoverable. Any named human action pauses.
+        let credits = GatewayError::AllGated {
             resume_after: None,
-            skipped: vec![],
+            skipped: vec!["r:m — model locked out (Auth)".to_string()],
             human_action: Some(HumanAction::TopUpCredits),
         };
-        let none_msg = none.to_string();
-        assert!(
-            matches!(classify_gateway_error(&none), GatewayDisposition::Fail(m) if m == none_msg)
-        );
+        let credits_msg = credits.to_string();
+        match classify_gateway_error(&credits) {
+            GatewayDisposition::Pause {
+                resume_after,
+                reason,
+            } => {
+                assert!(resume_after.is_none(), "the HOTL class, here too");
+                assert_eq!(
+                    reason, credits_msg,
+                    "and the reason is the error's own `Display`, not a paraphrase"
+                );
+            }
+            d => panic!("expected the HOTL Pause for a credits remedy, got {d:?}"),
+        }
         // Other errors → Fail.
         let budget = GatewayError::BudgetExceeded {
             estimated: 1.0,

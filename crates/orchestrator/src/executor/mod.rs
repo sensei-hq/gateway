@@ -356,6 +356,49 @@ struct Fold {
     /// Taken ONLY when `budget.is_some()` — see [`dispatch::Meter`] for the trade
     /// this makes and why an unbudgeted run must never touch it.
     serial_gate: Arc<tokio::sync::Mutex<()>>,
+    /// SP-7b: the journaled context cut per effect id, folded FIRST-wins from
+    /// `JournalEvent::ContextBudgeted`. See that variant for why the budget is the durable
+    /// value and why a later record must not move it.
+    ///
+    /// **ONE budget per agent NODE, not one per turn.** The key is an `EffectId` with the
+    /// turn coordinate pinned at `0` (`effect_id(node, 0, 0)`, `agent.rs`), because the half
+    /// of the prompt a budget shapes — `system` — is assembled ONCE above the ReAct turn loop
+    /// and is turn-INVARIANT; only `messages` grows, and the transcript is out of this
+    /// slice's scope (spec §2). Re-budgeting per turn would make `system` a function of the
+    /// transcript and defeat the invariance the replay argument rests on.
+    ///
+    /// So what the `EffectId` key buys is not turns: it is that distinct NODES, a `Map`'s
+    /// children and a `Loop`'s iterations stay apart, since `effect_id` is taken over
+    /// `{parent_path, loop_iteration, local_index}` and a bare `NodeId` would collide across
+    /// iterations of the same body.
+    ///
+    /// Readable strictly before any prompt bytes exist, which is the ordering the whole
+    /// design depends on: `effect_id` takes no prompt input, and `agent_turn_output`
+    /// (`agent.rs`) computes it on the line before `agent_input_hash` — so the budget that
+    /// shapes the prompt can be looked up by a key that does not depend on the prompt.
+    context_budgets: HashMap<EffectId, ContextBudget>,
+}
+
+/// SP-7b: a folded `ContextBudgeted` — the two fields a later drive must REPRODUCE a cut
+/// from, as opposed to the three it only discloses.
+///
+/// `dropped_tools` is here because reproducing the cut and DECIDING it are different
+/// questions with different inputs. Deciding is `plan_budget`, which folds in
+/// `CONTEXT_FLOOR_FRACTION` — a constant the spec says exists to be re-tuned once AC10's warn
+/// supplies a measurement — so a resume that re-decided would change the prompt of every
+/// in-flight budgeted run the day that constant moved, and land each of them terminally
+/// `Failed` on a `DeterminismViolation`. Reading back which schemas DID go keeps the tunable
+/// arithmetic out of the replay path entirely; see `prompt::replayed_plan`.
+///
+/// `source_window`, `retained_bytes` and `dropped_deps` are NOT folded: they are the audit
+/// channel (spec §5.5) and no replay reads them, so folding them would invite a reader to
+/// treat a disclosure figure as a replay input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextBudget {
+    budget_bytes: u64,
+    /// Tool names in the order the writing drive dropped them (reverse activation order) —
+    /// the order `replayed_plan` checks against the tail of the activation list.
+    dropped_tools: Vec<String>,
 }
 
 /// SP-6 s3: a folded `AgentAnswered`.
@@ -1039,7 +1082,12 @@ impl Executor {
             // output lazily from its folded ref (inline value, or a CAS blob) —
             // the only place the terminal fold touches content, bounded to one
             // read per node — then project each Agent node's raw output down to its
-            // canonical `{model, text}` shape.
+            // canonical `{model, text}` shape, re-attaching SP-7b's `context_budgeted`
+            // from the folded budget rows. This branch never re-enters `finish_agent`,
+            // which is where the key is synthesized, and it is not in `node_last_output`
+            // either (nothing journals it with the output) — so the projection is the only
+            // thing on THIS path that can restore it, and without it a completed degraded
+            // node reads back as un-degraded (`project_agent_outputs` owns the reasoning).
             let mut outcome = RunOutcome {
                 completed,
                 ..RunOutcome::default()
@@ -1049,7 +1097,7 @@ impl Executor {
                     .outputs
                     .insert(node.clone(), self.materialize(output).await?);
             }
-            project_agent_outputs(graph, &mut outcome.outputs);
+            project_agent_outputs(graph, &fold.context_budgets, &mut outcome.outputs);
             return Ok(outcome);
         }
 
@@ -1426,9 +1474,13 @@ impl Executor {
                         }),
                     },
                     Err(error) => match classify_gateway_error(&error) {
-                        // A fully-gated chain with a timed re-eligibility (§11.2):
+                        // A fully-gated chain that something can still clear (§11.2):
                         // durable pause (resumable), never a bare fail. On resume
                         // the node re-attempts (no `EffectRecorded` was journaled).
+                        // `resume_after` is passed THROUGH rather than wrapped in
+                        // `Some`: a timed gate carries its deadline, and a terminal
+                        // gate naming a human action carries `None` — the HOTL class,
+                        // woken by an operator's `force_wake` and never by the clock.
                         GatewayDisposition::Pause {
                             resume_after,
                             reason,
@@ -1437,7 +1489,7 @@ impl Executor {
                                 run,
                                 JournalEvent::RunPaused {
                                     reason: reason.clone(),
-                                    resume_after: Some(resume_after),
+                                    resume_after,
                                 },
                             )
                             .await?;
