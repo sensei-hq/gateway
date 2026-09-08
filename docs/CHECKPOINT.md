@@ -12,12 +12,11 @@ CRITICALs (an unfenced UN-budgeted turn; a replay arm re-running `plan_budget`).
 T7 four channels. `be89e7d` T8 names/docs/sweep. `f489fbc` the review's three confirmed findings.
 
 `c177a72` **the clamp-signal flake, root-caused not retried.** `tracing` caches a callsite's
-`Interest` on the static at first execution, and while only ONE `Dispatch` is registered — a lone
-capture test — it resolves that from the EMITTING thread's subscriber. Any subscriber-less test
-reaching `dispatch.rs`'s `warn!` first cached `Interest::never()`, permanently blinding the capture
-to that line. `CapturingSubscriber::install()` keeps one extra `Dispatch` registered so the fast
-path is disarmed. The previously recorded diagnosis was marked DISPROVEN wrongly: its probes
-poisoned BEFORE `set_default`, which self-repairs.
+`Interest` at first execution, and with only ONE `Dispatch` registered — a lone capture test — it
+reads that from the EMITTING thread's subscriber, so a subscriber-less test reaching `dispatch.rs`'s
+`warn!` first cached `Interest::never()` and blinded the capture for good. `install()` now keeps a
+second `Dispatch` registered, disarming the fast path. (The old DISPROVEN note probed the
+self-repairing ordering.)
 
 **The one idea: journal the BUDGET, not the cut.** The window-derived integer was the only unfenced
 input (`GatewayConfig` has NO version field); a `DeterminismViolation` on resume is unrevivable.
@@ -30,8 +29,8 @@ flake fix is mutation-proven both ways (keepalive removed → red; restored → 
 
 ## Next
 
-`gh pr create --base main --head develop` — 37 commits carrying SP-7a, the M1 reversal, SP-7b and
-the flake fix. Then SP-7c (no spec yet) or the minors.
+`gh pr create --base main --head develop` — 40 commits: SP-7a, the M1 reversal, SP-7b, the flake
+fix. Then SP-7c (no spec yet) or the minors.
 
 ## Open
 
