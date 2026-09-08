@@ -21,9 +21,8 @@ Every minor the SP-7b whole-slice review left open, red-first and mutation-verif
   and claimed a test gap that a 1.5 MB-vs-10-byte fixture had already closed. §5.3 was re-derived
   and HOLDS — left alone.
 
-The fifth minor needs no action: a budgeted node being effectively SINGLE-TURN is already explicit
-in spec §2's consequence note and deliberately pinned by
-`a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn`.
+The fifth needs no action: a budgeted node being effectively SINGLE-TURN is already explicit in
+spec §2 and pinned by `a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn`.
 
 ## Verified
 
@@ -33,12 +32,11 @@ mutation; the `dropped_deps` and duplicate-name mutants were each run both ways.
 
 ## Next
 
-`develop` is 4 commits ahead of `main` with no PR. Either open one, or start SP-7c (no spec yet —
-begins at `/sensei:design`), or take up spec §9's deferred list (transcript compaction;
-summarization; blackboard design D5 is FALSE in code — nothing populates or reads
-`ContextWrite.summary`).
+`develop` is 5 ahead of `main` with no PR. Either open one, start SP-7c (no spec — begins at
+`/sensei:design`), or take up spec §9's deferred list (transcript compaction; summarization;
+blackboard design D5 is FALSE in code — nothing populates or reads `ContextWrite.summary`).
 
 ## Open
 
-The review counted SEVEN minors; five were written down and are now closed. The other two were
-never recorded durably and are lost — treat the list as closed. **Sensei daemon NOT running.**
+The review counted SEVEN minors; five were written down and are closed. The other two were never
+recorded durably — treat the list as closed. **Sensei daemon NOT running.**
