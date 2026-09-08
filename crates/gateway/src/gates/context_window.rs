@@ -231,6 +231,98 @@ mod tests {
     /// `8_192` admitting and `8_193` skipping pins the boundary as `est > window`, not
     /// `est >= window` — see the type's doc for why that is the narrow question and what
     /// does NOT bound the output half.
+    /// **SP-7c AC5 — the gate refuses a multimodal request it used to admit.**
+    ///
+    /// The defect this slice fixes is not in the gate's comparison, which was always
+    /// right; it is that the number handed to it was an upper bound on the request's TEXT
+    /// only, so a request whose images push it past the window was declared to fit and
+    /// went to the provider, which rejected it. Asserting on the estimator alone would
+    /// miss that, because the estimator was never *wrong* about text — it was answering a
+    /// narrower question than its caller was asking.
+    ///
+    /// So this drives the real composition, wired as production wires it
+    /// (`engine/execute.rs` and `engine/stream.rs` both call the estimator on
+    /// `request.payload` and hand the result to selection): one payload, estimated by
+    /// `estimate_input_tokens_pessimistic`, evaluated by the real `ContextWindowGate`.
+    ///
+    /// The text-only twin is asserted too, and it is the half that makes this a
+    /// regression test rather than a tautology: the same prose against the same window is
+    /// still ADMITTED, so the skip below is attributable to the images and to nothing else
+    /// — not to a window that was too small for the text all along.
+    #[test]
+    fn a_multimodal_request_over_the_window_is_skipped_though_its_text_fits() {
+        use crate::estimate_input_tokens_pessimistic;
+        use crate::types::request::{MediaAttachment, Message, MessageRole, Payload};
+
+        let chat = |messages| Payload::Chat {
+            messages,
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        };
+        let prose = "x".repeat(300); // 100 tokens of text
+        let text_only = chat(vec![Message::text(MessageRole::User, &prose)]);
+        let with_image = chat(vec![
+            Message::text(MessageRole::User, &prose)
+                .with_attachment(MediaAttachment::image_url("https://ex.com/a.png")),
+        ]);
+
+        // A window the prose fits with room to spare, and that one image overruns.
+        let window = 2_000;
+        assert!(
+            estimate_input_tokens_pessimistic(&text_only) < window,
+            "premise: the TEXT must fit, or the skip below proves nothing about images"
+        );
+        assert!(
+            estimate_input_tokens_pessimistic(&with_image) > window,
+            "premise: the image must take it over — if the ceiling ever drops below the \
+             gap this fixture leaves, this assertion fails loudly rather than the test \
+             passing for the wrong reason"
+        );
+
+        let mc = model_with_window(window);
+        let rc = test_router_config();
+        let cfg = GatewayConfig::default();
+        let health = NeverOpen;
+
+        assert!(
+            matches!(
+                ContextWindowGate.evaluate(
+                    &cand(&mc, &rc),
+                    &ctx(
+                        &cfg,
+                        &health,
+                        None,
+                        Some(estimate_input_tokens_pessimistic(&text_only))
+                    )
+                ),
+                GateVerdict::Admit
+            ),
+            "the same prose without the image is still admitted"
+        );
+
+        match ContextWindowGate.evaluate(
+            &cand(&mc, &rc),
+            &ctx(
+                &cfg,
+                &health,
+                None,
+                Some(estimate_input_tokens_pessimistic(&with_image)),
+            ),
+        ) {
+            GateVerdict::Skip(SkipReason::OverContextWindow { window: w, .. }) => {
+                assert_eq!(w, window, "and the skip names THIS candidate's window");
+            }
+            GateVerdict::Skip(other) => panic!("expected an OverContextWindow skip, got {other}"),
+            GateVerdict::Admit => panic!(
+                "a request whose images overrun the window must not be admitted — this is \
+                 the defect SP-7c closes, and an admitted candidate here means the \
+                 attachment term is not reaching the gate"
+            ),
+        }
+    }
+
     #[test]
     fn over_window_skips_and_under_window_admits() {
         let mc = model_with_window(8_192);
