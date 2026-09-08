@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Map the gateway's terminal chain-gated result to a durable pause — `GatewayError::AllGated{resume_after: Some(t)}` → `RunPaused`/`RunOutcome.paused` (resumable); `AllGated{None}` (all gates terminal) → fail-fast with the human-action hint.
+**Goal:** Map the gateway's terminal chain-gated result to a durable pause — `GatewayError::AllGated{resume_after: Some(t)}` → `RunPaused`/`RunOutcome.paused` (resumable); `AllGated{None}` (all gates terminal) → fail-fast with the human-action hint. *(**Superseded 2026-09-04:** risk M1 was reversed. `AllGated { resume_after: None, human_action: Some(_) }` now PAUSES indefinitely — the HOTL class — and only an `AllGated` carrying NEITHER a deadline nor an action still fails. See Task 2's amendment below, and M1 in `docs/design/selection-policy-pipeline.md`.)*
 
 **Architecture:** A pure `classify_gateway_error(&GatewayError) -> GatewayDisposition{Pause{resume_after,reason}|Fail(String)}`. The executor's gateway-`Err` sites (top-level `ModelCall` in `run_node`; agent turns in `dispatch_model_turn`) route `Pause` into the EXISTING pause channels (`NodeExec::Paused` / `ToolOutcome::Paused → AgentStep::Paused`, `RunPaused`, `RunOutcome.paused`), and `Fail` into today's `NodeFailed`. A gated call records no `EffectRecorded`, so a resume simply re-attempts the node (quota may have reset).
 
@@ -97,6 +97,34 @@ git add -A && git commit -m "test(orchestrator): timeout_gateway warm-up fixture
 ---
 
 ## Task 2: `classify_gateway_error` (pure policy)
+
+> ⚠️ **SUPERSEDED 2026-09-04 — risk M1 was reversed; this task's rule is no longer the shipped one.**
+> As prescribed below: "only `AllGated{resume_after: Some(t)}` pauses (to `t`); every other error —
+> including `AllGated{None}` (all gates terminal) — fails", with the Step-1 guard test
+> `classify_gateway_error_pauses_only_on_timed_allgated` asserting that.
+>
+> **What the function does today** (`crates/orchestrator/src/executor/support.rs`): a SECOND pause arm
+> matches `GatewayError::AllGated { resume_after: None, human_action: Some(_), .. }` and returns
+> `GatewayDisposition::Pause { resume_after: None, reason: err.to_string() }` — the HOTL class, pausing
+> indefinitely. Only an `AllGated` carrying neither a deadline nor an action still `Fail`s. Three
+> consequences for the sketches below:
+> - `GatewayDisposition::Pause.resume_after` is `Option<chrono::DateTime<chrono::Utc>>`, not the bare
+>   `DateTime<Utc>` Step 3 declares — the two pause classes differ in exactly that field. `None` means the
+>   scheduler stores a NULL `next_wake` (`SchedulerStore::record_paused`), which `claim_due` never selects
+>   — the Postgres impl's predicate is `status='paused' and next_wake is not null and next_wake <= $1`
+>   (`crates/orchestrator-store/src/postgres.rs`) — so only an operator's `force_wake` moves the run.
+> - both pause arms use `reason: err.to_string()`, not Step 3's `format!("all candidates gated; resume
+>   after {t}")` — `AllGated`'s `Display` carries the per-candidate skips and the remedy, and that string
+>   is what is journaled into `RunPaused` and read back by `torii status`/`list_paused`.
+> - the Step-1 guard test was renamed to
+>   `classify_gateway_error_pauses_on_a_deadline_or_a_human_action_and_fails_on_neither`; its
+>   human-action case now asserts `Pause` with `resume_after.is_none()`.
+>
+> The reversal's reasoning is recorded on the function itself (the "# The human-action arm REVERSES risk
+> M1" doc block) and in M1 in `docs/design/selection-policy-pipeline.md`: a terminal run is unreachable by
+> every supported command, so failing a state that names a human remedy left recovery to hand-written SQL.
+> Task 3 Step 4's "`AllGated{None}` → `Fail` → the same `NodeFailed` path" now describes only the
+> action-less case.
 
 **Files:**
 - Modify: `crates/orchestrator/src/executor/support.rs`

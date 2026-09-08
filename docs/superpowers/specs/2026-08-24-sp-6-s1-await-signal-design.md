@@ -74,6 +74,32 @@ torii
   run list-paused   — shows the awaiting node and its deadline
 ```
 
+> **⚠️ AMENDED — the `deadlines` value type above is not what shipped.** As written:
+> `deadlines: HashMap<NodeId, DateTime<Utc>>`. It shipped as
+> `deadlines: HashMap<NodeId, Option<chrono::DateTime<chrono::Utc>>>`
+> (`crates/orchestrator/src/executor/mod.rs:214`), widened by review fix `5c57726` ("SP-6 s1 review
+> I1 — a deadline-less gate records itself ONCE").
+> - **Both layers are load-bearing.** *Key absent* = this node has never begun waiting;
+>   `Some(None)` = it began waiting with **no deadline** (the indefinite gate); `Some(Some(t))` = it
+>   began waiting with the absolute deadline `t`. That is why `Fold::deadline_for` returns
+>   `Option<Option<DateTime<Utc>>>` (`executor/mod.rs:509`).
+> - **The `None` is folded FIRST-wins as a REAL value, not dropped** — both `SignalAwaited` fold arms
+>   are `entry().or_insert(...)` (`executor/support.rs:215-233`). That is what makes the
+>   deadline-less arm of `run_await_signal` (`executor/signal.rs:315`) node-keyed idempotent rather
+>   than deadline-keyed. Without it the node re-journals `SignalAwaited` on every drive, and a
+>   re-drive is NOT human-bounded: `drive` runs every ready node in a round even after one pauses, so
+>   a dep-free sibling that pauses WITH a deadline gives the run a non-NULL `next_wake`
+>   (`Scheduler::earliest_resume_after`, `crates/orchestrator/src/scheduler.rs:218`) and it is
+>   auto-woken for the whole human-approval window with no human involved. `5c57726`'s regression
+>   test drives five automatic `Scheduler::tick` wakes and asserts `SignalAwaited` is journaled
+>   exactly once.
+> - **Since s2/s3/s4 this map is SHARED by four waiting kinds**, not one: `SignalAwaited`,
+>   `GateAwaited`, `AgentAwaited` and `LoopGateAwaited` all write it, each pairing it with its own
+>   per-kind record (`signal_asks`, `menus`, `agent_prompts`, `loop_gate_asks`) — see `Fold`'s doc
+>   at `executor/mod.rs:181-214`. §9's "`Fold` gains two maps" was accurate for the s1 build:
+>   `b5bce0e` added exactly `signals` and `deadlines`, and `signal_asks` arrived later, in s3's
+>   re-review fix `98b83e7`.
+
 Both events are keyed by `NodeId` and folded exactly as `PlannerSelected` is
 (`fold.selections`), so the mechanism is not new — only the oracle is slower.
 

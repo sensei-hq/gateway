@@ -16,7 +16,10 @@ Add the **permission declaration** layer of the tool model: a tool declares the
 capabilities it *needs* (path/command/network allowlists + resource caps, §132),
 an agent declares the per-tool scope it *grants* (§287, "pinned in the
 `AgentDefinition`"), and `Registry::validate` statically checks that every agent's
-grant **covers** its tools' declared needs. This is a **two-sided capability
+grant **covers** its tools' declared needs (**⚠️ SUPERSEDED by SP-4 s1 — the
+load-time grant check was REMOVED; a grant narrower than a tool's declared surface
+is legal now and is enforced per call at runtime as a ceiling. See §4.5's
+amendment.**). This is a **two-sided capability
 model**: tool needs → agent grant → (SP-4) executor-enforced effective = grant ∩
 need. This slice ships the **declarations + the static coverage check only** —
 runtime enforcement, sandboxing, and workspace isolation are **SP-4** (§340),
@@ -111,9 +114,28 @@ impl Permissions {
 
 - **paths:** ∀ needed path `p`, ∃ granted path `g` with `p.starts_with(g)`
   (grant `/workspace` covers need `/workspace/src/main.rs`).
+  - **⚠️ AMENDED — hardened by SP-4 s1 (`b42f40a`); it is no longer a byte
+    `starts_with`.** `covers` delegates paths to `path_covers(g, p)`
+    (`crates/orchestrator-core/src/registry.rs:146`, defined at :193-209), a
+    **component-aware** prefix: both sides are split on `/` (empty and `.`
+    segments dropped) and the grant's segments must be a prefix of the need's. So
+    `/workspace` still covers `/workspace/src/main.rs` but does NOT cover
+    `/workspace-secret`; an **empty** grant path covers nothing; and a need
+    containing a `..` segment is rejected outright. Guarded by
+    `covers_paths_are_component_aware` (registry.rs:1722). Still lexical only —
+    symlink/realpath confinement is the SP-4 s3/s4 jail's job.
 - **commands:** every needed command is in the grant's `commands` (needed ⊆ granted).
 - **network:** `Any` covers everything; `Hosts(G)` covers `Hosts(N)` iff N ⊆ G, and
   covers `Deny`; `Deny` covers only `Deny`.
+  - **⚠️ AMENDED — `Hosts(G) ⊇ Hosts(N)` is not set containment.** Each `n ∈ N`
+    must be matched by some `g ∈ G` under `host_covers`
+    (`crates/orchestrator-core/src/registry.rs:161`, defined at :214-222):
+    case-insensitive exact match, **or** a `*.suffix` wildcard grant matching any
+    strict SUBdomain of `suffix`. So `Hosts(["*.example.com"])` covers
+    `Hosts(["api.example.com"])` but not `Hosts(["example.com"])` (the bare
+    domain) and not `Hosts(["example.evil.com"])`. Guarded by
+    `covers_hosts_support_wildcards` (registry.rs:1765). The `Any`/`Deny` arms are
+    as written.
 - **caps:** per dimension, covered iff `need ≤ grant`, where **grant `None` =
   unlimited** (agent isn't restricting that dimension → covers any need) and **need
   `None` = no requirement** (trivially covered). (Approved decision (b).)
@@ -152,14 +174,53 @@ non-empty (declares needs), require `agent.grants.get(tool)` to exist and
 `UnknownToolRef`). A tool with empty needs requires no grant. This is a
 **declaration-time** check, not runtime enforcement.
 
+> **⚠️ SUPERSEDED by SP-4 s1 — this load-time check no longer exists.** As shipped
+> in SP-2 s3 it was as written above; SP-4 s1 removed it in favour of a per-call
+> runtime ceiling.
+>
+> - **`Registry::validate` performs no grant check.**
+>   `crates/orchestrator-core/src/registry.rs:493-622` checks skill refs, tool refs,
+>   chain routability and (SP-6 s3) human-backing coherence only; its doc comment at
+>   :489-492 states "Grants are otherwise NOT checked — a grant narrower than a
+>   tool's declared permission surface is legal and is enforced per-call at runtime
+>   (ceiling model, SP-4 s1)", and
+>   `validate_accepts_a_grant_narrower_than_the_tool_surface` (registry.rs:1428)
+>   asserts exactly that. The one grant rule that remains is unrelated: a
+>   *human-backed* agent may declare no grants, because it runs no tool loop.
+> - **`OrchestratorError::PermissionNotGranted` is never constructed.** The only
+>   occurrence anywhere under `crates/` is the variant itself
+>   (`crates/orchestrator-core/src/error.rs:50`), whose doc comment reads "Reserved
+>   for a future strict/opt-in load-time grant check (SP-4). Not currently
+>   produced".
+> - **Authorization happens per call instead**, in `execute_tool_effect`
+>   (`crates/orchestrator/src/executor/agent.rs:1007-1029`): deny unless the tool is
+>   LISTED in `agent.tools` **and** `agent.grants[tool].covers(need)`, where `need =
+>   ToolRegistry::required_of(&call.name, &args)` is the **concrete** permissions
+>   THIS call asks for (`crates/orchestrator/src/agent/tools.rs:166`, defaulting to
+>   the tool's static surface via `Tool::required`, tools.rs:99). A denial is a terse
+>   tool-result error recorded as a Pure effect — the tool never runs, and the grant
+>   is never enumerated back to the model.
+> - **What it means for a later slice:** the grant is a runtime **ceiling**, not a
+>   load-time equality, so a deliberately narrow grant is the intended authoring
+>   style. The dead variant is kept as the seam for a future opt-in strict load-time
+>   mode.
+
 ### 4.6 Decisions
 
 - **D1 — two-sided model, declarations only.** Tool declares needs; agent grants
   scope; `validate` checks grant⊇need statically. Runtime effective-permission
-  computation + sandbox = SP-4.
+  computation + sandbox = SP-4. (The `validate` clause is **superseded** — see
+  §4.5's amendment; the two-sided model itself stands, resolved per call.)
 - **D2 — secure defaults.** `Permissions::default` = deny/empty; `NetworkPolicy`
   default = `Deny`. Absence of a grant for a tool that needs something = load
-  failure (least privilege, fail-loud).
+  failure (least privilege, fail-loud). (**⚠️ SUPERSEDED by SP-4 s1 for the second
+  sentence only** — the secure defaults stand, but absence of a grant is **not** a
+  load failure: `Registry::validate` accepts it and the missing grant becomes an
+  empty `Permissions` at call time, which covers no declared path, command or
+  network need (a caps-ONLY need is still covered — D3), so the call is
+  DENIED at runtime instead —
+  `crates/orchestrator/src/executor/agent.rs:1008-1011`. Least
+  privilege is preserved; the failure moved from load to call.)
 - **D3 — caps `None` = unlimited on the grant side** (approved (b)); need `None` =
   no requirement. Keeps the common case (agent doesn't cap) frictionless; SP-4 may
   tighten runtime defaults.
@@ -201,7 +262,9 @@ at execution.
    fails), commands (subset covers; extra needed fails), network (`Any`⊇all,
    `Hosts`⊇subset & ⊇`Deny`, `Deny` only ⊇`Deny`), caps (need ≤ grant covers; need >
    grant fails; grant `None` covers any; need `None` trivially covered). Empty needs
-   → covered by anything.
+   → covered by anything. (The paths and `Hosts` clauses were **tightened by SP-4
+   s1** — component-aware prefix, and wildcard host matching rather than set
+   containment; see §4.3's two amendments.)
 2. **Serde defaults.** A `ToolSpec` JSON without `permissions` → empty `Permissions`;
    a `Permissions` JSON omitting sub-fields → each defaults (network `Deny`, caps
    `None`); an `AgentDefinition` JSON without `grants` → empty map.
@@ -209,6 +272,11 @@ at execution.
    covering grant → `PermissionNotGranted { agent, tool }`; with a covering grant →
    ok; a tool with empty needs → ok with no grant. Well-formedness: `from_config`
    surfaces the error.
+   (**⚠️ SUPERSEDED by SP-4 s1 — this AC no longer holds.** The first clause is now
+   inverted: `validate_accepts_a_grant_narrower_than_the_tool_surface`
+   (`crates/orchestrator-core/src/registry.rs:1428`) asserts that a declared-need
+   tool with NO covering grant validates OK. The other two clauses still hold, for
+   the trivial reason that nothing is checked. See §4.5's amendment.)
 4. **Filesystem `grants.json`.** `FilesystemConfigSource` merges `grants.json` into the
    right `AgentDefinition.grants`; missing file ⇒ empty; malformed ⇒ loud
    `RegistryLoad` naming the file; a grant for an unknown agent ⇒ loud `RegistryLoad`.
@@ -221,3 +289,7 @@ at execution.
    through the test gateway (proving declarations are inert — the tool still runs as
    a Pure tool with no enforcement); removing the covering grant makes `from_config`
    fail `PermissionNotGranted` (mutation-verified).
+   (**⚠️ The second half is SUPERSEDED by SP-4 s1**: removing the covering grant no
+   longer fails `from_config` at all — `PermissionNotGranted` has no constructor in
+   the workspace (`crates/orchestrator-core/src/error.rs:44-50`). The grant-less
+   config loads, and the tool CALL is denied instead. See §4.5's amendment.)

@@ -39,6 +39,29 @@ deferred (they need SP-3 / SP-7).
   `system`/`tools` are reused across all ReAct turns and fed to
   `agent_input_hash`. `over_budget` (same file) **halts loud** when the estimate
   exceeds the chain's min window — there is no compaction or selection today.
+  - **⚠️ SUPERSEDED — `over_budget` no longer exists, and the model path now DOES
+    cut.** `rg 'fn over_budget' crates/` matches nothing; SP-7a deleted both the
+    function and `OrchestratorError::PromptOverBudget`, each leaving a tombstone
+    comment that states why (`crates/orchestrator/src/agent/prompt.rs:575-587`,
+    `crates/orchestrator-core/src/error.rs:75-85`): it asked window fit against the
+    chain's SMALLEST window, which refused prompts a larger candidate in the same
+    chain could serve. Window fit is now the gateway's `ContextWindowGate`, asked
+    **per candidate** (`crates/gateway/src/selection.rs:140`); a request over every
+    candidate's window surfaces as `GatewayError::AllGated` carrying each
+    candidate's own window and a remedy. SP-7b then added the context budget:
+    `PromptParts::join_bounded` (`prompt.rs:97-119`) truncates dependency bodies
+    and drops whole tool schemas to fit, disclosed rather than silent (per-entry
+    marker + `(N of M dependencies shown)` tail, the `dropped_tools_note` at
+    `prompt.rs:140`, a `ContextBudgeted` journal record, a `context_budgeted` key
+    on the node output, and an operator `warn!` at
+    `crates/orchestrator/src/executor/agent.rs:571`). An UNCUTTABLE prompt still
+    goes out through the plain `join` and is refused by the gate. **One loud stop
+    does survive, in a new form:** when every cut that fits the largest window would
+    retain less than `CONTEXT_FLOOR_FRACTION` (`0.25`, `crates/orchestrator-core/src/budget.rs:75`)
+    of the requested context, nothing is dispatched — `pause_context_floor`
+    (`crates/orchestrator/src/executor/agent.rs:705`) journals
+    `RunPaused { resume_after: None }` with a reason naming the node, the window and
+    the floor.
 - **Reference-by-name is fixed** (D-agent-runtime, §129). `AgentDefinition.skills`
   and `.tools` stay `Vec<String>`. Activation therefore lives on the **definition**
   (`SkillDef`/`ToolSpec`), not the reference — the approved design decision.
@@ -129,11 +152,20 @@ pub fn assemble_prompt(
 - **Budget.** Activation is a first-class way to fit the window (progressive
   disclosure). If the *activated* prompt still exceeds the min window, the existing
   `over_budget` **halt-loud** stands — no silent truncation. Summarize/compaction
-  remains SP-7.
+  remains SP-7. (**⚠️ SUPERSEDED by SP-7a/SP-7b** — SP-7 arrived: there is no
+  `over_budget` halt and no chain-minimum any more. An activated prompt that fits no
+  candidate is CUT to fit by `PromptParts::join_bounded`, on four disclosure
+  channels; an uncuttable one is refused by the gateway's per-candidate
+  `ContextWindowGate`, and a cut that would retain under the 25% context floor pauses
+  the run loudly instead of dispatching. See §3's amendment.)
 - **Orthogonal to slice 3.** Permission `validate` checks **all** listed tools at
   load, independent of activation (load-time vs runtime assembly). A tool gated out
   of a given run's prompt is simply not offered to the model that run; its grant is
-  still validated.
+  still validated. (**⚠️ The `validate` half is SUPERSEDED by SP-4 s1** — there is no
+  load-time grant check any more; authorization is per call in `execute_tool_effect`.
+  The orthogonality still holds, and more simply: a tool gated out of the prompt is
+  never called, so the runtime gate never sees it. See §4.5 of
+  `2026-08-12-sp2-tool-permissions-design.md`.)
 
 ### 4.5 Decisions
 
@@ -149,6 +181,11 @@ pub fn assemble_prompt(
 - **D5 — `#[serde(default)] = Always`** so existing config and DB/HTTP backends
   deserialize to today's behavior (the slice-2/3 serde-default lesson).
 - **D6 — over-budget still halts loud** after activation; no silent truncation.
+  (**⚠️ SUPERSEDED by SP-7a/SP-7b:** the `over_budget` halt is gone — the prompt is
+  refused per candidate by the gateway, cut by `join_bounded` and disclosed, or (under
+  the 25% context floor) paused loudly. "No SILENT truncation" is
+  the half that survived, and it is now the design goal of SP-7b's disclosure
+  channels rather than a consequence of refusing. See §3's amendment.)
 
 ## 5. File formats
 

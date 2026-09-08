@@ -400,6 +400,39 @@ anticipate from these docs. The AC11 `budget clamp under-estimated the input` wa
 mitigation and a non-Latin prompt is exactly the case it is expected to fire on; the real tokenizer
 (§8) is the fix, and this paragraph is the honest cost of deferring it.
 
+> **⚠️ SUPERSEDED in its arithmetic — the estimate is over BYTES, not characters.** §5.3 above
+> already carries this correction for its own numbers ("the clamp's `est` is over **bytes** now, so
+> `chars / 3` no longer describes it"); this paragraph was missed, so its "`chars / 3` over-counts
+> only where a token is worth three or more **characters**" still reads as the shipped rule. It is
+> not. The conclusion survives for some scripts and dies for others, and which is which changes:
+>
+> - **The formula is `ceil(UTF-8 bytes / 3)`.** `estimate_input_tokens_pessimistic`
+>   (`crates/gateway/src/engine/util.rs`) sums `.len()` over every part — message bodies, each tool
+>   call's `name` + `arguments`, the system prompt, each tool's `name` + `description` +
+>   `input_schema.to_string()` — and `str::len()` in Rust is the UTF-8 BYTE length, not a character
+>   count (the local it accumulates into is *named* `chars`, which is what made this easy to
+>   misread). The final line is `chars.div_ceil(3)`. Pinned by
+>   `the_estimate_is_ceil_of_utf8_bytes_over_three`, which feeds 9 CJK characters / 27 bytes and
+>   asserts the estimate is **9**, noting that counting characters would have said 3.
+> - **So the break-even is three BYTES per token, and CJK no longer sits on the wrong side of it.**
+>   CJK is 3 UTF-8 bytes per character, so `bytes / 3` lands at ~1 estimated token per CJK
+>   character — and §5.3 records CJK as tokenizing near 1 token/char. The threefold under-count this
+>   paragraph warns about is closed. Emoji move the same way *arithmetically* — an astral-plane code
+>   point is 4 UTF-8 bytes, further above the break-even than CJK — but that is not the same as
+>   closed: 4 bytes buys ~1.33 estimated tokens, and this paragraph puts emoji at up to 3 tokens per
+>   character, which no byte count establishes either way.
+> - **But "bytes ≥ chars" is not the property that matters, and §5.3's "strictly more margin" should
+>   be read narrowly.** It proves the new estimate beats the OLD one; what the clamp needs is that
+>   the estimate is ≥ the TRUE token count, and byte length establishes no such thing. On CJK the
+>   margin is now ~0 rather than negative — break-even, not safety. Cyrillic is 2 bytes per
+>   character, so the estimate is ~0.67 tokens per character and still under-counts any text
+>   tokenizing above two-thirds of a token per character. This paragraph's concern therefore stands
+>   for the 2-byte scripts — Cyrillic, Greek — where at 1 token/char the shortfall is a factor of
+>   ~1.5 rather than the "multiple" the paragraph names.
+> - **The mitigation and the fix are unchanged.** AC11's `budget clamp under-estimated the input`
+>   warning (`crates/orchestrator/src/executor/dispatch.rs`) still fires on exactly this, and the
+>   real tokenizer (§8) is still what removes the guess.
+
 **A model with `max_output_tokens: 0` is now rejected at config validation.** `min` over the chain
 means one such entry gives `ceiling = Some(0)` and the clamp would emit `max_tokens: Some(0)` —
 "generate nothing" — on every budgeted `Chat` call, and the floor cannot catch it because the floor

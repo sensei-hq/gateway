@@ -169,7 +169,15 @@ over-budget, with a min wall-clock retry) becomes a **durable pause**: journal
 have reset → it succeeds and records; still gated → it pauses again) — no memo, no
 determinism fence. `AllGated { resume_after: None }` (all gates terminal) and every
 other gateway error **fail-fast** (the `Display` carries the human-action hint:
-top-up credits / rotate credential / raise budget) — never a pause-forever. Wired
+top-up credits / rotate credential / raise budget) — never a pause-forever.
+**⚠️ Superseded 2026-09-04 — risk M1 was reversed, and the sentence above now
+describes only half the rule.** An `AllGated { resume_after: None }` carrying a
+`human_action: Some(_)` PAUSES indefinitely — the HOTL class — because a named
+human action is precisely the statement that a person can unblock this run, and a
+terminal `Failed` run is unreachable by `force_wake` and every other supported
+command. Only an `AllGated` with NO remedy, and every other gateway error, still
+fails. See `classify_gateway_error`'s second pause arm
+(`crates/orchestrator/src/executor/support.rs`) and its doc for the argument. Wired
 at the top-level `ModelCall` node and every agent turn (`dispatch_model_turn`);
 agent children of a `Map`/`Loop` pause the whole Map/Loop via `MapChildPaused`.
 **Deferred:** ModelCall *bodies* inside `Map`/`Consolidate`/`Loop` pausing on a

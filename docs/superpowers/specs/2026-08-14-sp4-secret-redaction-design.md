@@ -114,6 +114,34 @@ evidence of the key that introduces it. The default set (extensible;
   shaped pass on top — §4.4's determinism argument requires live == journaled == replayed
   to be the SAME pure pass.
 
+**⚠️ AMENDED — the default set is NOT extensible, and the shipped census differs.** Two
+corrections to the paragraph and bullets above, both against
+`crates/orchestrator-core/src/redact.rs:31-92`:
+
+- **"The default set (extensible; `PatternRedactor::new(patterns)` + a `PatternRedactor::default()`
+  with the built-ins)" — there is no `new`.** `PatternRedactor` exposes only `Default`
+  (`redact.rs:44`) and the `Redactor` impl (`redact.rs:146`); `redact.rs` declares no `pub fn` at
+  all, and the `whole`/`whole_set`/`assignment`/`secret_key` fields are private, so the built-in
+  shapes cannot be extended without editing `orchestrator-core`. Every call site in the workspace
+  is `PatternRedactor::default()` (e.g. `crates/torii/src/boot.rs:423`). **The supported extension
+  point is the injected `Redactor` trait** — a deployment needing site-specific secret shapes
+  supplies its own `impl Redactor` via `Executor::with_redactor`, which is what §4.2 wires.
+- **The provider-prefix bullet's census is stale.** As written: `sk-ant-[A-Za-z0-9_-]{20,}`,
+  `sk-[A-Za-z0-9]{20,}`, `AKIA[0-9A-Z]{16}`, `ghp_[A-Za-z0-9]{36}`, `xox[baprs]-…`,
+  `AIza[0-9A-Za-z_-]{35}`. The shipped `whole_patterns` array (`redact.rs:47-72`) is:
+  `sk-[A-Za-z0-9_-]{20,}` — **one pattern covers OpenAI and Anthropic** (`sk-ant-…` is `sk-`
+  followed by class members), so there is no separate `sk-ant-` entry;
+  `sk_live_[A-Za-z0-9]{20,}` and `rk_live_[A-Za-z0-9]{20,}` (Stripe, not in the spec);
+  `AKIA[0-9A-Z]{16}` (AWS, unchanged); `gh[opsru]_[A-Za-z0-9]{30,}` (GitHub classic
+  PAT/OAuth/server/refresh/user — broader than `ghp_…{36}`); `github_pat_[A-Za-z0-9_]{22,}`
+  (GitHub fine-grained PAT, not in the spec); `xox[baprs]-[A-Za-z0-9-]{10,}` (Slack, unchanged);
+  `AIza[0-9A-Za-z_-]{30,}` (Google — `{30,}`, not `{35}`); then the bearer, PEM and URL-userinfo
+  patterns the bullets below already describe. The lower bounds are deliberately open —
+  "recall over precision for a security scrub" (`redact.rs:46`).
+- **The assignment form's value class is `([^\s"',&;]{6,})`** (`redact.rs:80`), not
+  `([^\s"',]{6,})`: `&` and `;` are also excluded, so a match stops at those delimiters —
+  `token=abc123def&foo=bar` redacts only the token value and leaves `&foo=bar` intact.
+
 **No generic entropy/length heuristic** in slice 2 (false-positive risk — would redact hashes,
 digests, base64 payloads); deferred. **ReDoS-safe by construction:** Rust's `regex` crate uses
 finite automata (no backtracking), so linear-time matching on adversarial tool output is
