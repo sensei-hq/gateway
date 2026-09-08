@@ -473,6 +473,29 @@ guard the line they appeared to, and every one was caught by asking that questio
 | **AC17** The journaled prompt is `assemble_prompt`'s output PLUS the node's input, with `## Context` truncated rather than fatal | The prompt contains an activated skill's body, the `## Context` section and the node input; a verbose upstream truncates with a marker instead of failing the node | Compose `system_prompt` alone → the skill text is absent; drop the input → the reviewer is asked about an unnamed contract; charge `MAX_HUMAN_TEXT_BYTES` against `## Context` → an ordinary upstream kills the node |
 | **AC14** Additivity | No human-backed agent ⇒ byte-identical; suite stays **1505** + new | — (the baseline guard) |
 
+> **⚠️ SUPERSEDED by `171ccf5` (2026-08-28, "test: a skipped Postgres test is IGNORED, not counted
+> as passed").** As written: "It returns early without one and is therefore **counted as passed while
+> having exercised nothing**; the raw-stderr `SKIP` line is the only signal. … `#[ignore]` cannot be
+> conditioned on an env var."
+> - **It CAN be, and now is — through a build script.** `crates/torii/build.rs` turns a set, non-blank
+>   `DATABASE_URL` into `cfg(have_database_url)`, and AC13's test
+>   `a_human_backed_agent_answered_in_another_process_completes_the_run`
+>   (`crates/torii/tests/e2e_pg.rs:1764-1769`) carries
+>   `#[cfg_attr(not(have_database_url), ignore = "needs a Postgres at $DATABASE_URL; see README,
+>   Postgres-backed tests")]`, as does every other test in that file.
+> - **So with no database AC13 is reported IGNORED, not passed.** `env -u DATABASE_URL cargo test
+>   -p sensei-torii --test e2e_pg` gives `0 passed; 0 failed; 8 ignored`; the ignored count, not a
+>   raw-stderr line, is the signal. The `let Some(url) = db_url() else { return };` line survives only
+>   as a second layer, for the variable-set-at-build-time-gone-at-run-time case.
+> - **HALF the paragraph's swipe at s2 was correct when written; the other half never was.** Correct:
+>   s2's spec at `c33dce5` (2026-08-26) did claim AC12 "is `#[ignore]`d without `DATABASE_URL`", and
+>   no conditional ignore existed until `171ccf5` (2026-08-28) — `have_database_url` appears in no
+>   earlier commit, and this spec landed between the two, at `0949279` (2026-08-27). NOT correct,
+>   then or now: "`#[ignore]` cannot be conditioned on an env var". What changed on 2026-08-28 was
+>   this repo, not what Rust permits — `171ccf5` adds a `build.rs` and touches no toolchain pin.
+>   s2's spec now carries the matching amendment.
+>   The test's own doc comment (`e2e_pg.rs:1758-1763`) still repeats the superseded claim in code.
+
 **AC13 is `DATABASE_URL`-gated.** It returns early without one and is therefore **counted as passed
 while having exercised nothing**; the raw-stderr `SKIP` line is the only signal. Stated because s2's
 spec claimed the test was `#[ignore]`d, which was false — `#[ignore]` cannot be conditioned on an

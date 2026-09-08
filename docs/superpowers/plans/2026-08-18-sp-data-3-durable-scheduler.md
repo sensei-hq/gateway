@@ -4,7 +4,7 @@
 
 **Goal:** A durable scheduler that wakes a paused run at its `resume_after` deadline — in any process, exactly-once, with zero token re-spend — turning `RunPaused{resume_after}` from a dead-end into a self-healing pause.
 
-**Architecture:** A `Scheduler` driver (holds an injected `Executor` + `Arc<dyn ExecutionJournal>` + `Clock`) over a durable `SchedulerStore` (a `scheduled_runs` table that owns each run's original graph + wake-schedule). The Scheduler `submit`s runs, records their pauses, and on `tick()` atomically claims due wakes and re-drives `Executor::start`. The **Executor is unchanged** (the Scheduler reads the pause deadline from the journal's last `RunPaused` event). Layering mirrors SP-DATA-1/2: trait + DTOs in `orchestrator-core`, `InMemory`/`Postgres` stores in `orchestrator-store`, driver in `orchestrator`. Verified on Docker Postgres; feature-off ⇒ byte-identical.
+**Architecture:** A `Scheduler` driver (holds an injected `Executor` + `Arc<dyn ExecutionJournal>` + `Clock`) over a durable `SchedulerStore` (a `scheduled_runs` table that owns each run's original graph + wake-schedule). The Scheduler `submit`s runs, records their pauses, and on `tick()` atomically claims due wakes and re-drives `Executor::start`. The **Executor is unchanged** (the Scheduler reads the pause deadline from the journal's last `RunPaused` event). **⚠️ Shipped differently: it takes the EARLIEST, not the last** — `Scheduler::earliest_resume_after` (`crates/orchestrator/src/scheduler.rs`) folds `RunPaused.resume_after` over `load_since(run, watermark)` and returns `.min()`, so a run with several pauses recorded since the watermark wakes at the soonest of them rather than at whichever was journaled last. Layering mirrors SP-DATA-1/2: trait + DTOs in `orchestrator-core`, `InMemory`/`Postgres` stores in `orchestrator-store`, driver in `orchestrator`. Verified on Docker Postgres; feature-off ⇒ byte-identical.
 
 **Tech Stack:** Rust, sqlx 0.8 (postgres, **runtime** `sqlx::query`/`query_as`), dbd (schema), Docker Postgres, `chrono` (already a dep).
 
@@ -558,6 +558,8 @@ impl Scheduler {
     }
 
     /// The last journaled `RunPaused.resume_after` — the deadline the executor recorded.
+    /// (Shipped as the EARLIEST: `earliest_resume_after` returns `.min()` over the
+    /// `RunPaused` events since a watermark. See the Architecture note at the top.)
     async fn last_resume_after(&self, run: RunId) -> Result<Option<chrono::DateTime<chrono::Utc>>, OrchestratorError> {
         let events = self.journal.load(run).await.map_err(OrchestratorError::Journal)?;
         Ok(events.iter().rev().find_map(|(_, e)| match e {

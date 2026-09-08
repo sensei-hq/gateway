@@ -38,6 +38,14 @@ resolution seam: **no tiers, no mid-loop phase transitions, no tenant dimension.
   `gateway.min_context_window(&chain)`, `agent_input_hash(&chain, …)`,
   `build_chat_request(&chain, …)`, and the `on_agent_started(…, &chain)` hook.
   There is **no indirection** — every agent hardcodes a concrete gateway chain.
+  (**⚠️ One of the four sinks is gone as of SP-7a:** `gateway.min_context_window(&chain)`
+  was removed with the agent path's window pre-check. `AgentRun` no longer carries the
+  `min_win` it read — see the tombstone at
+  `crates/orchestrator/src/executor/agent.rs:36-38` — and `min_context_window` now has
+  no call site in `crates/orchestrator` at all; its only remaining callers are unit
+  tests in `crates/gateway/src/engine/mod.rs`. Window fit is decided per CANDIDATE by
+  the gateway's `ContextWindowGate`. The other three sinks, and this bullet's point
+  about the missing indirection, are unchanged.)
 - **The gateway is config-parameterized and tenant-agnostic.**
   `GatewayConfig { routers, models, chains: HashMap<String, FallbackChainConfig> }`
   is *handed to* the gateway (`GatewayBuilder::from_config` / `Gateway::new`); an
@@ -147,7 +155,8 @@ that contract:
   — `executor/agent.rs:65` becomes
   `let chain = self.registry.resolve_chain(agent, phase)?.to_string();`.
   Everything downstream (`min_win`, `agent_input_hash`, `build_chat_request`, the
-  `on_agent_started` hook) uses the resolved chain unchanged. `run_node` passes the
+  `on_agent_started` hook) uses the resolved chain unchanged. (`min_win` is no longer
+  among them — SP-7a deleted it from `AgentRun`; see §3's amendment.) `run_node` passes the
   Agent node's `phase.as_deref()`; `run_map` / `run_consolidate` pass `None`.
 - **Determinism / resume-safety (D5-fence untouched).** `resolve_chain` is a pure
   function of `(registry, agent, phase)`. Registry *content* is already fenced by
@@ -232,6 +241,10 @@ that contract:
    `(area,kind)` table (observable: the gateway/`min_context_window` receives the
    bound chain-id, and a real turn is driven); an `Agent` node with `phase=Some("plan")`
    routes via `chains["plan"]`.
+   (**⚠️ The named observable is stale** — SP-7a removed the `min_context_window` call
+   from the orchestrator, so the criterion is now observed through the served turn
+   alone: `agent_routes_via_area_kind_binding_end_to_end`,
+   `crates/orchestrator/src/executor/tests.rs:337`. The criterion itself still holds.)
 7. **Additive behavior.** Existing explicit-chain agents + all current tests route
    byte-identically (same resolved chain, same journal); the only diff is the
    mechanical `Option`/`phase`/`chains` field updates.

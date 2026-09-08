@@ -65,6 +65,18 @@ declared path surface, honestly leaving bypass-proof confinement to the (future)
   The **canonical** per-run root (`canonicalize` after mkdir) is what gets injected and
   jailed against. **Durable, no auto-delete:** the directory survives a crash so a resume's
   memo-replay is consistent with the files still on disk; cleanup/GC is out of scope (§6).
+  - **⚠️ AMENDED — it is resolved LAZILY on the tool-effect path, not at `run`/`start` entry.**
+    The mkdir+canonicalize live in `Executor::workspace_root_for(run)`
+    (`crates/orchestrator/src/executor/agent.rs:1272-1289`), whose only non-test callers are the
+    jail pre-check inside `execute_tool_effect` (`agent.rs:1039`) and `record_tool_effect`
+    (`agent.rs:1397`) — neither `run` nor `start` calls it, and the fn's own doc says "Called on
+    the LIVE path only (a memo hit replays without it)". Everything else in the bullet holds:
+    `create_dir_all` then `canonicalize`, both idempotent and safe on resume, injected as the
+    canonical root, durable with no auto-delete.
+  - **Consequence:** a run that never makes a live tool call creates **no directory at all**, and
+    a run whose tool calls all replay from the memo does not re-create one. Any cleanup/GC, quota
+    accounting or operator "show me this run's workspace" path must treat `base/<run_id>/` as
+    possibly absent rather than assuming one directory per run.
 - The concrete per-run root is threaded into every tool call via
   **`ToolContext.workspace_root: Option<Arc<PathBuf>>`** (Arc so `ToolContext`'s existing
   `Clone`/`Debug` derives are cheap; `None` when no base is wired).

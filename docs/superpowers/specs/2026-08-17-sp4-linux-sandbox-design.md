@@ -93,6 +93,26 @@ ABI compatibility** for forward rights (REFER/TRUNCATE/IOCTL_DEV added in later 
 confinement can't be enforced). The workspace path is executor-derived (canonical `base/<run_id>`),
 not model-controlled.
 
+**⚠️ SUPERSEDED as built — "require at least the ABI-1 write handling" is NOT sufficient, and
+treating the forward rights as merely nice-to-have was a write-escape.** As written: "Use the
+crate's **best-effort ABI compatibility** for forward rights (REFER/TRUNCATE/IOCTL_DEV added in
+later ABIs), but **require at least the ABI-1 write handling**".
+- **The shipped ruleset HANDLES the ABI V5 access set** — `let abi = ABI::V5;`
+  (`crates/orchestrator/src/agent/sandbox.rs:437`), with `CompatLevel::BestEffort` left in place to
+  degrade on older kernels. Landlock mediates only the rights it HANDLES, so an ABI-1 handled set
+  leaves `truncate(2)`/`ftruncate(2)` (the ABI-3 TRUNCATE right) unmediated: a confined command
+  could zero any writable file OUTSIDE the workspace. Caught by the whole-slice review and guarded
+  by `linux_denies_truncate_outside_the_workspace` (`sandbox.rs:1090`), whose doc records that the
+  test fails under an `ABI::V1` pin.
+- **Consequence for the /dev carve-out** — a third grant this section never described, shipped for
+  parity with the macOS profile's `(allow file-write-data (literal "/dev/null") …)`
+  (`macos_profile`, `sandbox.rs:354`): because TRUNCATE is now handled, the pseudo-device carve-out
+  needs `AccessFs::WriteFile | AccessFs::Truncate` on `/dev/null` &c (`sandbox.rs:450-482`), or
+  `>/dev/null` (`O_WRONLY|O_TRUNC`) would regress.
+- **For a future backend:** the rule to carry forward is that the HANDLED set, not the granted set,
+  is the security boundary — handle the forward rights too (the shipped pin is `ABI::V5`) and let
+  `BestEffort` shed what a kernel lacks.
+
 ### 4.3 network — seccomp (deny IP egress)
 
 `seccompiler`. For `NetworkPolicy::Deny`, compile a BPF filter: **default action Allow**, with

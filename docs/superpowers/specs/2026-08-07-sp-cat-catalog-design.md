@@ -155,6 +155,23 @@ pub fn assemble(catalog: CatalogConfig) -> Result<GatewayConfig, AssembleError>;
 
 **"Refresh" in SP-CAT = re-audit/validation**, NOT an external fetch: a `catalog::audit(catalog)` pass recomputes totals, validates pool-dedup consistency, and a **test/CI gate** fails the build if a documented headline (in the feature doc / a checked-in fixture) drifts from `free_tier_totals` (the `free-tier-catalog.md` "docs-counts" scenario). External catalog fetch/import is SP-DATA.
 
+> ⚠️ **AMENDED — there is no `catalog::audit`.** As written: "a `catalog::audit(catalog)` pass recomputes
+> totals, validates pool-dedup consistency". No such function shipped: `audit` matches nothing in
+> `crates/gateway/src/`, and the catalog module's public free functions are `cost_band` (`mod.rs`),
+> `assemble` (`assemble.rs`), `free_tier_totals` (`totals.rs`), `tier_members`/`order_members`
+> (`tiers.rs`) and the `presets.rs` builders — nothing named `audit`, and no alias of it.
+>
+> **The re-audit is `free_tier_totals` plus the gate, with no wrapper between them.** `free_tier_totals`
+> IS the recompute-with-pool-dedup (it counts each `pool_key` once at the MAX declared budget, so an
+> under-declared duplicate cannot shrink the headline); the gate is the unit test
+> `example_catalog_totals_match_documented_headline` in `totals.rs`'s `#[cfg(test)] mod tests`, which
+> recomputes over the checked-in `crates/gateway/src/catalog/testdata/example_free_catalog.json` and
+> asserts every field against the `EXAMPLE_STEADY_TOKENS` / `EXAMPLE_ONE_TIME_TOKENS` /
+> `EXAMPLE_UNCAPPED_PROVIDERS` / `EXAMPLE_POOLS` constants beside it. Editing the fixture without
+> updating the constants (or vice-versa) fails the build — the `free-tier-catalog.md` scenario "A unit
+> test fails if docs drift from computed totals", at unit granularity, no network. The rest of the
+> paragraph holds: this is validation, and external catalog fetch/import is SP-DATA.
+
 ## 8. Persistence stance + what SP-CAT deliberately does NOT do
 
 **The app stays config-driven — no persistence.** DB persistence is a **separate layer, deliberately held off** (user directive, 2026-08-07). SP-CAT and every near-term slice (reference chains, the orchestrator) run purely on config in memory: a hand-authored (or programmatically built) `CatalogConfig` → `assemble` → `GatewayConfig`, hot-swapped via `update_config`. The pre-existing optional seams (`GatewayStore`/`VaultStore`) stay **default-off** and are not a dependency of this work. SP-DATA (the DB `config_loader` + tracking) remains a distinct, later, optional layer — **not** a near-term follow-up — and, when it lands, it targets this same `assemble` seam without changing the pure core.

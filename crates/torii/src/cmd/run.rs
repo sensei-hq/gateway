@@ -42,44 +42,114 @@ pub async fn status(
                 .await
                 .map_err(OrchestratorError::Journal)?;
             let (spent, budget) = orchestrator::spend_of(&events);
+            let budgeted = budgeted_turns(&events);
 
             if json {
                 let base = render::json(&[r]).map_err(|e| CliError::error(e.to_string()))?;
-                match budget {
-                    // No budget ⇒ return `render::json`'s own string UNTOUCHED — no
-                    // parse/re-serialize round trip at all. That round trip is not
-                    // idempotent: `serde_json::Value`'s object map does not preserve
-                    // insertion order the way `ScheduledRun`'s derived `Serialize`
-                    // does, so re-serializing would silently reorder every key. Only
-                    // taking that detour when there is something to splice in is what
-                    // keeps the unbudgeted case byte-identical.
-                    None => Ok(Outcome::ok(base)),
-                    Some(cap) => {
-                        // Reuse `render::json` for the row shape + redaction, then
-                        // splice spent/budget in — rather than hand-building the
-                        // object here, which would duplicate `render::json`'s
-                        // redaction of `reason`.
-                        let mut rows: serde_json::Value = serde_json::from_str(&base)
-                            .map_err(|e| CliError::error(e.to_string()))?;
-                        rows[0]["spent"] = serde_json::json!(spent);
-                        rows[0]["budget"] = serde_json::json!(cap);
-                        Ok(Outcome::ok(
-                            serde_json::to_string_pretty(&rows)
-                                .map_err(|e| CliError::error(e.to_string()))?,
-                        ))
-                    }
+                // Nothing to splice ⇒ return `render::json`'s own string UNTOUCHED — no
+                // parse/re-serialize round trip at all. That round trip is not
+                // idempotent: `serde_json::Value`'s object map does not preserve
+                // insertion order the way `ScheduledRun`'s derived `Serialize`
+                // does, so re-serializing would silently reorder every key. Only
+                // taking that detour when there is something to splice in is what
+                // keeps the unbudgeted, undegraded case byte-identical.
+                if budget.is_none() && budgeted.is_empty() {
+                    return Ok(Outcome::ok(base));
                 }
+                // Reuse `render::json` for the row shape + redaction, then splice
+                // in — rather than hand-building the object here, which would
+                // duplicate `render::json`'s redaction of `reason`.
+                let mut rows: serde_json::Value =
+                    serde_json::from_str(&base).map_err(|e| CliError::error(e.to_string()))?;
+                if let Some(cap) = budget {
+                    rows[0]["spent"] = serde_json::json!(spent);
+                    rows[0]["budget"] = serde_json::json!(cap);
+                }
+                if !budgeted.is_empty() {
+                    rows[0]["context_budgeted"] = serde_json::to_value(&budgeted)
+                        .map_err(|e| CliError::error(e.to_string()))?;
+                }
+                Ok(Outcome::ok(
+                    serde_json::to_string_pretty(&rows)
+                        .map_err(|e| CliError::error(e.to_string()))?,
+                ))
             } else {
                 let mut text = render::table(&[r]);
-                // Same additivity: nothing appended when unbudgeted, so the table
-                // stays byte-identical to the pre-SP-DATA-5 output.
+                // Same additivity: nothing appended when unbudgeted and undegraded, so
+                // the table stays byte-identical to the pre-SP-DATA-5 output.
                 if let Some(cap) = budget {
                     text.push_str(&format!("spent: {spent} / budget: {cap} tokens\n"));
+                }
+                if !budgeted.is_empty() {
+                    let deps: u32 = budgeted.iter().map(|t| t.dropped_deps).sum();
+                    let schemas: usize = budgeted.iter().map(|t| t.dropped_tools.len()).sum();
+                    let nodes = budgeted
+                        .iter()
+                        .map(|t| t.node)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    text.push_str(&format!(
+                        "context budgeted: {} turn(s), {deps} dependency and {schemas} tool \
+                         schema(s) dropped; nodes: {nodes}\n",
+                        budgeted.len()
+                    ));
                 }
                 Ok(Outcome::ok(text))
             }
         }
     }
+}
+
+/// One SP-7b `ContextBudgeted` row in the shape `status` reports it.
+///
+/// Borrowed rather than owned: the caller already holds the loaded journal, and this is a
+/// read-only projection of it that lives no longer than the render.
+#[derive(serde::Serialize)]
+struct BudgetedTurn<'a> {
+    node: &'a str,
+    budget_bytes: u64,
+    source_window: u32,
+    retained_bytes: u64,
+    dropped_deps: u32,
+    /// In the order the writing drive dropped them, which is the order the journal holds —
+    /// reverse activation order. Reported verbatim rather than sorted for legibility: an
+    /// operator asking WHICH capability the model lost is best served by the same order the
+    /// replay path checks.
+    dropped_tools: &'a [String],
+}
+
+/// Every budgeted — that is, DEGRADED — turn in a run's journal, in order.
+///
+/// A straight filter here rather than a fold in `orchestrator`, and the contrast with
+/// `spend_of` is the reason: spend is ARITHMETIC that the executor's own gate also performs,
+/// so a second torii-side sum would drift from it silently. This has no arithmetic to drift —
+/// the row is the answer — and no executor path needs the list.
+///
+/// `effect_id` is deliberately not projected. It is the replay KEY, not an operator-facing
+/// figure, and surfacing it beside the audit fields invites a reader to treat it as one.
+fn budgeted_turns(events: &[(Seq, JournalEvent)]) -> Vec<BudgetedTurn<'_>> {
+    events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::ContextBudgeted {
+                node,
+                budget_bytes,
+                source_window,
+                retained_bytes,
+                dropped_deps,
+                dropped_tools,
+                ..
+            } => Some(BudgetedTurn {
+                node: &node.0,
+                budget_bytes: *budget_bytes,
+                source_window: *source_window,
+                retained_bytes: *retained_bytes,
+                dropped_deps: *dropped_deps,
+                dropped_tools,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every run awaiting a wake, plus — SP-6 s1 — which node inside each is awaiting a
@@ -1876,6 +1946,80 @@ pub(crate) mod tests {
         let v: serde_json::Value = serde_json::from_str(&out.text).expect("valid json");
         assert_eq!(v[0]["spent"], serde_json::json!(200));
         assert_eq!(v[0]["budget"], serde_json::json!(50_000));
+    }
+
+    /// A journal carrying one SP-7b `ContextBudgeted` row — a turn that was DEGRADED.
+    async fn journal_with_a_budgeted_turn(run: RunId) -> InMemoryJournal {
+        let journal = empty_journal();
+        journal
+            .append(
+                run,
+                JournalEvent::ContextBudgeted {
+                    node: NodeId("B".into()),
+                    effect_id: EffectId("B#0".into()),
+                    budget_bytes: 11_232,
+                    source_window: 4096,
+                    retained_bytes: 900,
+                    dropped_deps: 1,
+                    dropped_tools: vec!["search".into(), "calc".into()],
+                },
+            )
+            .await
+            .unwrap();
+        journal
+    }
+
+    /// SP-7b's operator surface: `status` says a turn was budgeted.
+    ///
+    /// Without this the fourth disclosure channel stopped at a `tracing` warn on the worker's
+    /// stdout. An operator asking the control plane what happened to a run got a complete-looking
+    /// answer that never mentioned the answer had been produced from a CUT prompt — and a
+    /// degraded work product that nothing admits to is indistinguishable from a good one.
+    #[tokio::test]
+    async fn status_reports_a_budgeted_turn_as_a_degradation() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let journal = journal_with_a_budgeted_turn(run).await;
+
+        let out = status(&s, &journal, run, false).await.expect("status");
+        assert_eq!(out.code, EXIT_OK);
+        assert!(
+            out.text.contains('B'),
+            "the degraded NODE is named — a count alone cannot be acted on: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains('1') && out.text.contains('2'),
+            "with both quantities: 1 dependency dropped and 2 tool schemas: {}",
+            out.text
+        );
+    }
+
+    /// The `--json` counterpart, asserted structurally rather than on prose.
+    #[tokio::test]
+    async fn status_json_includes_the_context_budgeted_rows() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let s = paused_store(run, Some(now())).await;
+        let journal = journal_with_a_budgeted_turn(run).await;
+
+        let out = status(&s, &journal, run, true).await.expect("status");
+        assert_eq!(out.code, EXIT_OK);
+        let v: serde_json::Value = serde_json::from_str(&out.text).expect("valid json");
+        let turns = &v[0]["context_budgeted"];
+        assert_eq!(turns[0]["node"], serde_json::json!("B"));
+        assert_eq!(turns[0]["dropped_deps"], serde_json::json!(1));
+        assert_eq!(
+            turns[0]["dropped_tools"],
+            serde_json::json!(["search", "calc"]),
+            "the schemas are NAMED, and in the order they were dropped — which is what tells an \
+             operator WHICH capability the model was missing on that turn"
+        );
+        assert_eq!(
+            turns[0]["retained_bytes"],
+            serde_json::json!(900),
+            "and the size of the cut is legible beside the budget it was cut to"
+        );
+        assert_eq!(turns[0]["source_window"], serde_json::json!(4096));
     }
 
     /// Additivity, at the command level: an UNBUDGETED run's `status` table must be

@@ -106,6 +106,25 @@ let result = self.redact(&result);                       // s2 pattern (unchange
 let result = scrub_secret_values(&result, ctx.secret_values()); // s4 known-value, THIS call's creds
 // split_output(&result) journaled; Ok(result) returned — both the scrubbed value
 ```
+**⚠️ SUPERSEDED — the two passes shipped in the OPPOSITE order, and the accessor was renamed.**
+As written, in the block above: "`let result = self.redact(&result);` // s2 pattern (unchanged)"
+THEN "`let result = scrub_secret_values(&result, ctx.secret_values());` // s4 known-value".
+- **The shipped order is scrub FIRST, then redact** — `crates/orchestrator/src/executor/agent.rs`
+  runs `super::content::scrub_secret_values(&result, &ctx.exposed_secret_values())` at :1417-1418
+  and `self.redact(&result)` at :1422. The reason (recorded in the code comment there): the s2
+  pattern pass rewrites part of a wrapped/composite secret, fragmenting its high-entropy span, and
+  the whole-value match then no longer fires — so a prefix such as `wrap-…` would survive into the
+  journal and the agent's transcript. Reversing the order was a whole-slice-review fix, guarded by
+  `echoed_composite_credential_no_fragment_leak`
+  (`crates/orchestrator/src/executor/tests.rs:11376`), which first asserts the premise that the
+  pattern redactor alone turns `wrap-sk-…` into `wrap-[REDACTED]`.
+- **The accessor is `ToolContext::exposed_secret_values()`**, not `secret_values()`
+  (`crates/orchestrator/src/agent/tools.rs:42`) — named to self-document the plaintext exposure at
+  the call site, matching the `Secret::expose` convention. Read every `secret_values()` in this
+  spec and in the SP-4 broker plan as `exposed_secret_values()`.
+- **Both passes stay pure**, so the determinism argument below is unaffected by the swap: live ==
+  journaled == replayed either way.
+
 **Why per-call, not a run-wide known-value set:** a run-wide accumulating set would be mutable
 state whose contents differ between a live run and a resume (a memoized cred-injecting tool is
 not re-run, so its value would be absent from the set on resume) — redacting a *later* tool's

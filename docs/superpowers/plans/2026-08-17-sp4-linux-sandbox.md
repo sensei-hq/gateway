@@ -211,6 +211,26 @@ Run the Docker harness (top of plan). Expected: FAIL to COMPILE — `cannot find
 
 Add to `sandbox.rs` (module scope), `#[cfg(target_os = "linux")]`. The landlock calls are reference shape — adapt method/type names to the resolved `landlock` version:
 
+> **⚠️ SUPERSEDED AS BUILT — do not copy the `build_landlock_ruleset` sketch below verbatim; its ABI
+> pin is a write-escape.** As prescribed: `/// Best-effort forward-ABI; the ABI-1 write handling is
+> the security core.` and `let abi = ABI::V1;`
+> - **It shipped as `let abi = ABI::V5;`** (`crates/orchestrator/src/agent/sandbox.rs:437`). Landlock
+>   mediates only the rights it HANDLES, so handling only the ABI-1 set leaves
+>   `truncate(2)`/`ftruncate(2)` (the ABI-3 TRUNCATE right) UNMEDIATED — a confined command could
+>   zero any writable file OUTSIDE the workspace. Caught by the whole-slice review; guarded by
+>   `linux_denies_truncate_outside_the_workspace` (`sandbox.rs:1090`), whose doc records that the
+>   test fails under an `ABI::V1` pin (the outside file becomes size 0). `CompatLevel::BestEffort`
+>   still degrades the extra rights on older kernels.
+> - **One further delta, plus one thing this sketch got right and the shipped fn kept.** Kept: the
+>   workspace `PathFd` is opened EXPLICITLY and a failed open fails the build (`sandbox.rs:443`),
+>   exactly as the `PathFd::new(workspace).map_err(..)?` below has it — the shipped comment records
+>   WHY that matters, since routing the workspace through `path_beneath_rules` (which the shipped
+>   fn does use for `/` and for the /dev nodes) would swallow a failed `PathFd::new` as a
+>   silently-skipped rule, i.e. a ruleset quietly missing its workspace-write rule. The delta: a
+>   WriteFile+Truncate carve-out on the safe pseudo-devices that exist (`/dev/null` &c,
+>   `sandbox.rs:450-482`), which this sketch has no equivalent of, keeps `2>/dev/null` working now
+>   that TRUNCATE is handled.
+
 ```rust
 /// SP-4 Linux backend: landlock fs-write confinement to the workspace + (Task 3) seccomp egress
 /// deny + the portable cap-killing. Unprivileged (landlock ≥5.13). Parity with `MacosSandbox`.

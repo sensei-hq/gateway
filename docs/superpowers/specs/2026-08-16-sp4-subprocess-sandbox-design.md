@@ -90,6 +90,19 @@ pub(crate) fn spawn_capped(argv: &[String], caps: &ResourceCaps, stdin: Option<&
   then reaps. Killed-vs-exited is read from the `WaitStatus` (signaled → `killed`).
 - **Empty argv / spawn failure** → loud `OrchestratorError::Tool`.
 
+**⚠️ SUPERSEDED — the mem cap is NOT all-unix.** As written, in the sketch's doc comment above:
+"`RLIMIT_AS` => alloc fails. A `None` cap = unlimited for that dimension. All-unix (macOS +
+Linux)."
+- **`RLIMIT_AS` is effective on Linux only.** Darwin's `setrlimit(RLIMIT_AS)` returns EINVAL
+  (re-tested on this host: `setrlimit(RLIMIT_AS=5) -> -1 errno 22`), and the `pre_exec` hook
+  propagates that errno (`crates/orchestrator/src/agent/sandbox.rs:100-103`), so on macOS a
+  `mem_bytes: Some(_)` cap makes the child's hook fail and `spawn` return `Err` — the call
+  **refuses fail-closed rather than running uncapped**. The shipped code records exactly this in
+  the doc comment at `sandbox.rs:39-40`. `RLIMIT_CPU` (POSIX and implemented on Darwin, unlike
+  `RLIMIT_AS` — `cpu_cap_kills_a_busy_loop`, `sandbox.rs:711`, is un-`cfg`'d and runs on both
+  platforms), the process group, the wall kill and the bounded capture are all-unix; a `None` mem
+  cap remains unlimited and is unaffected on both platforms.
+
 ### 4.2 The `Sandbox` seam + `MacosSandbox`
 
 ```rust
@@ -205,6 +218,12 @@ Linux/BSD have no backend yet (refuse). A cap-kill is best-effort against a dete
 blocks in SIGKILL-immune states (uninterruptible I/O) — `SIGKILL` to the group is the strongest
 portable tool.
 
+**⚠️ Amended — "cpu/mem/wall kill on all unix" overstates the mem dimension.** Read it as
+"**cpu/wall kill on all unix; mem (`RLIMIT_AS`) enforced on Linux and fail-closed-REFUSED on
+macOS**" — see the §4.1 amendment. (The "Linux/BSD have no backend yet (refuse)" limit was closed
+for Linux by the s4 follow-on `LinuxSandbox`, `crates/orchestrator/src/agent/sandbox.rs:363`; BSD
+still refuses.)
+
 ## 5. Decisions
 
 - **D1 — sandbox EXTERNAL commands, not in-process Rust tools** [approved]: a Rust `call_ctx`
@@ -241,6 +260,13 @@ portable tool.
    `killed: Some(Wall)` within ~a second, NOT after 100s. (Runs on Linux CI + macOS.)
 2. **Cap-kill: mem (portable).** A child allocating >`mem_bytes` (`RLIMIT_AS`) fails/dies →
    `killed: Some(Mem)` or a nonzero exit (allocation aborted); a child within the cap succeeds.
+   **⚠️ AMENDED as shipped — the "a child within the cap succeeds" half cannot hold on macOS.**
+   The shipped assertion is the platform-independent invariant "a `mem_bytes` cap yields NO clean
+   success": on Linux the applied `RLIMIT_AS` aborts/kills the over-allocating child, on macOS
+   `spawn_capped` refuses at spawn with `Err` (EINVAL from `setrlimit`, §4.1 amendment), so the cap
+   is never silently dropped. Test: `mem_cap_prevents_a_clean_success`
+   (`crates/orchestrator/src/agent/sandbox.rs:740`), which asserts
+   `!matches!(&result, Ok(o) if o.killed.is_none() && o.exit_code == Some(0))`.
 3. **Cap-kill: process group (portable).** A command that forks a child (`sh -c 'sleep 100 & wait'`)
    capped at `wall_ms` kills BOTH (the group) — no orphaned `sleep` survives.
 4. **Normal run (portable).** `spawn_capped(["sh","-c","echo hi"])` → `exit_code: Some(0)`,

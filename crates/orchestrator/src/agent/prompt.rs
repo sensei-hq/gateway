@@ -75,12 +75,25 @@ impl PromptParts {
     /// truncated mid-JSON is an invalid tool definition a provider rejects with a 400: a
     /// degradation turned into a hard failure.
     ///
-    /// Filtering by NAME rather than by index is deliberate. `dropped_tools` carries the names
-    /// [`plan_budget`] read off this same activation order, so a name it holds that no longer
-    /// matches drops nothing and the prompt stays over-window — which the per-candidate
-    /// `ContextWindowGate` then refuses, loudly, rather than putting an over-window request on the
-    /// wire. An index into a list that had shifted would drop the WRONG schema and dispatch
-    /// happily.
+    /// The schemas are dropped by POSITION — the last `dropped_tools.len()` of them — and not by
+    /// matching `dropped_tools` against each name.
+    ///
+    /// Both producers of a [`BudgetPlan`] guarantee the dropped set is exactly the TAIL of this
+    /// same list: [`plan_budget`] builds it by walking `kept` down from the end, and
+    /// [`replayed_plan`] refuses (`None`, which its caller treats as drift) unless the journaled
+    /// names match the tail entry-for-entry. `self` owns the very list both were handed, so
+    /// position and name identify the same schemas — except when two of them share a name, where
+    /// only position is right.
+    ///
+    /// Filtering by name was the original choice, for a reason that turned out to be answered
+    /// elsewhere: a stale name matches nothing, so the prompt stays over-window and the
+    /// per-candidate `ContextWindowGate` refuses loudly rather than putting an over-window
+    /// request on the wire. That is a real property, but drift is already caught one step earlier
+    /// by `replayed_plan`'s tail check, and the name filter cost more than it bought — a
+    /// duplicated name dropped EVERY copy, so the plan said "one of three" and the join took two.
+    /// The prompt only gets smaller that way, so nothing refused it: the model just lost a tool
+    /// it had room for while `dropped_tools_note` told it otherwise. See
+    /// `a_duplicated_tool_name_drops_only_the_planned_schema`.
     pub fn join_bounded(self, plan: &BudgetPlan) -> (String, Vec<ToolDefinition>, ContextCut) {
         let (section, cut) =
             render_context_section_measured(&self.context, plan.context_budget_bytes);
@@ -88,11 +101,20 @@ impl PromptParts {
         let mut system = self.authored;
         system.push_str(&section);
         system.push_str(&dropped_tools_note(&plan.dropped_tools, total_tools));
-        let tools = self
-            .tools
-            .into_iter()
-            .filter(|t| !plan.dropped_tools.contains(&t.name))
-            .collect();
+        let kept = total_tools.saturating_sub(plan.dropped_tools.len());
+        debug_assert!(
+            self.tools[kept..]
+                .iter()
+                .rev()
+                .map(|t| &t.name)
+                .eq(plan.dropped_tools.iter()),
+            "the tail invariant both plan producers establish: dropped_tools names the last \
+             schemas of this exact list, in REVERSE activation order — `plan_budget` pushes as it \
+             walks `kept` down, so `dropped_tools[i]` is `tools[n-1-i]`. A caller that planned \
+             against a DIFFERENT list would silently drop the wrong schemas here"
+        );
+        let mut tools = self.tools;
+        tools.truncate(kept);
         (system, tools, cut)
     }
 }
@@ -2053,6 +2075,112 @@ mod tests {
         assert!(
             cut.retained_bytes < cut.requested_bytes,
             "and the context really was cut"
+        );
+    }
+
+    /// A repeated tool name drops the one schema the plan named, not every copy of it.
+    ///
+    /// # Why this is reachable
+    ///
+    /// [`assemble_prompt_parts`] walks `agent.tools` — a list of NAMES — and pushes one
+    /// [`ToolDefinition`] per entry with no dedupe, so an agent whose config lists a tool twice
+    /// arrives here with two identically-named schemas. Nothing upstream rejects that.
+    ///
+    /// # What went wrong
+    ///
+    /// [`plan_budget`] drops from the END of the activation order and records the NAME it
+    /// dropped, and `join_bounded` removed every schema carrying that name. So the plan said
+    /// "drop one of three" and the join dropped two — the model silently lost a capability the
+    /// budget had room for, while `dropped_tools_note` went on telling it "1 of 3 tool schemas
+    /// were omitted". A false disclosure is worse than a loud refusal: the turn dispatches, the
+    /// model fails to use a tool it was told it still had, and the answer flows downstream as
+    /// work product.
+    ///
+    /// It cannot push the prompt back OVER the window — dropping extra schemas only makes it
+    /// smaller — which is why this is a correctness and disclosure defect rather than a 400.
+    ///
+    /// The plan here comes from the real [`plan_budget`] rather than being hand-written, so the
+    /// test also pins the invariant the fix relies on: what the planner records for a duplicated
+    /// list is the TAIL entry's name.
+    #[test]
+    fn a_duplicated_tool_name_drops_only_the_planned_schema() {
+        // `tool_def(name, n)` is exactly `n` bytes to `tool_bytes`, so the arithmetic below is
+        // the planner's own: 250 bytes of room fits two 100-byte schemas and not three.
+        let tools = vec![
+            tool_def("dup", 100),
+            tool_def("solo", 100),
+            tool_def("dup", 100),
+        ];
+        let authored = "AUTHORED";
+        let plan = plan_budget(authored.len() + 250, authored.len(), &tools, &[])
+            .expect("250 bytes of room fits two of the three schemas");
+        assert_eq!(
+            plan.dropped_tools,
+            vec!["dup".to_string()],
+            "the planner drops from the END of the activation order, so the name it records for \
+             this list is the LAST entry's — which happens to collide with the first's"
+        );
+
+        let parts = PromptParts {
+            authored: authored.to_string(),
+            context: vec![],
+            tools,
+        };
+        let (system, kept, _cut) = parts.join_bounded(&plan);
+
+        assert_eq!(
+            kept.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["dup", "solo"],
+            "ONE schema goes, and it is the tail copy the plan named. Dropping both copies \
+             removes a capability the budget had room for"
+        );
+        assert!(
+            system.contains("1 of 3 tool schemas were omitted"),
+            "and the note the model reads matches what actually happened: {system:?}"
+        );
+    }
+
+    /// Two schemas dropped: the TAIL goes, and `dropped_tools` records it in REVERSE activation
+    /// order.
+    ///
+    /// The single-drop case above cannot see the ordering — one element reversed is itself — and
+    /// every other test in this file drops at most one, so before this test the reverse-order
+    /// claim held by [`plan_budget`], [`replayed_plan`]'s tail check and `join_bounded`'s own
+    /// `debug_assert` was pinned by nothing. Measured: flipping that `debug_assert` to compare
+    /// forward left the whole suite green, which is the definition of an unguarded claim.
+    #[test]
+    fn a_multi_schema_drop_takes_the_tail_and_records_it_in_reverse() {
+        let tools = vec![
+            tool_def("a", 100),
+            tool_def("b", 100),
+            tool_def("c", 100),
+            tool_def("d", 100),
+        ];
+        let authored = "AUTHORED";
+        let plan = plan_budget(authored.len() + 250, authored.len(), &tools, &[])
+            .expect("250 bytes of room fits two of the four schemas");
+        assert_eq!(
+            plan.dropped_tools,
+            vec!["d".to_string(), "c".to_string()],
+            "the planner walks `kept` DOWN from the end, so the first name it records is the LAST \
+             schema. `replayed_plan` reads the same order back when it checks the tail"
+        );
+
+        let parts = PromptParts {
+            authored: authored.to_string(),
+            context: vec![],
+            tools,
+        };
+        let (system, kept, _cut) = parts.join_bounded(&plan);
+
+        assert_eq!(
+            kept.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "the survivors are the HEAD of the activation order, in order"
+        );
+        assert!(
+            system.contains("2 of 4 tool schemas were omitted"),
+            "and the note counts both: {system:?}"
         );
     }
 

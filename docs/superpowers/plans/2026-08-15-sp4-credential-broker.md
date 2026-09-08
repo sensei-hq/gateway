@@ -351,6 +351,10 @@ In `record_tool_effect` (agent.rs), BEFORE building the `ToolContext`, resolve t
 ```
 (Adapt the `super::content::scrub_secret_values` path to how `agent.rs` reaches `content.rs` — if `content`'s items are already in scope via `use super::content::...` or `impl Executor`, call accordingly. The gate is: redact THEN scrub, both before `split_output` and the returned `result`.)
 
+> **⚠️ SHIPPED DIFFERENTLY — the two passes run in the opposite order.** As prescribed above: "The gate is: **redact THEN scrub**", with the sketch's `self.redact(&result)` preceding `scrub_secret_values(...)`.
+> - **As built the gate is: scrub THEN redact** — `crates/orchestrator/src/executor/agent.rs:1417-1418` (`super::content::scrub_secret_values(&result, &ctx.exposed_secret_values())`) then `:1422` (`self.redact(&result)`), both still before `split_output` and the returned `result`. The whole-slice review found that pattern-redacting first fragments the high-entropy span of a wrapped/composite secret, after which the exact whole-value match no longer fires and a prefix such as `wrap-…` survives into the journal. Guarded by `echoed_composite_credential_no_fragment_leak` (`crates/orchestrator/src/executor/tests.rs:11376`), an extra test beyond this plan's Task-3 list.
+> - **The accessor shipped as `ToolContext::exposed_secret_values()`** (`crates/orchestrator/src/agent/tools.rs:42`), not `secret_values()` — read every `secret_values()` METHOD reference in this plan (the File Structure line, Task 2's Step 1 assertion and Step 3, the Step 3 sketch above, the self-review type list) as `exposed_secret_values()`. The TEST name `tool_context_secret_values_lists_injected` shipped unchanged (`crates/orchestrator/src/agent/tools.rs:1155`).
+
 - [ ] **Step 4: Run + regressions**
 
 Run: `cargo test -p sensei-orchestrator` → the 4 new tests pass + the FULL suite green. CRITICAL: existing tool/reconcile/redaction tests are byte-identical (tools with no `credentials` → empty map → `scrub_secret_values` over `[]` is identity → unchanged). Read the real `test result:` line, exit 0. `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` exit 0.

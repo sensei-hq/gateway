@@ -6,6 +6,8 @@
 
 **Architecture:** An `Activation` enum + pure `is_active(query)` predicate in `orchestrator-core`, attached as a `#[serde(default)] = Always` field on `SkillDef`/`ToolSpec`. `assemble_prompt` gains a `query` arg (the agent's rendered input) and filters listed skills/tools by `is_active`. Activation is a pure function of the node input (already in `agent_input_hash`), so it's determinism-safe; over-budget still halts loud.
 
+> **⚠️ Superseded 2026-09-04 (docs-only note; this plan shipped as written).** The final clause "over-budget still halts loud" was true when this plan ran and is not true now. SP-7a deleted `over_budget` and `OrchestratorError::PromptOverBudget` — `rg 'fn over_budget' crates/` matches nothing; the tombstones at `crates/orchestrator/src/agent/prompt.rs:575-587` and `crates/orchestrator-core/src/error.rs:75-85` say why (it measured fit against the chain's SMALLEST window). Window fit is now the gateway's per-candidate `ContextWindowGate`, and SP-7b's `PromptParts::join_bounded` (`prompt.rs:97-119`) cuts an over-window prompt with disclosure instead of refusing it. Everything else here — the `Activation` enum, `is_active`, the `assemble_prompt` filter — is unchanged. See §3 of the companion spec's amendment.
+
 **Tech Stack:** Rust workspace (`orchestrator-core`, `orchestrator`, `orchestrator-store`); `serde`/`serde_json`; `cargo test`/`clippy`. Spec: `docs/superpowers/specs/2026-08-12-sp2-activation-policy-design.md`.
 
 **House rules (every task):**
@@ -466,6 +468,8 @@ In `docs/features/orchestrator/agents-skills-tools.md`, add a slice-4 paragraph 
 > override, planner-selected activation (SP-3), retrieval-ranked / semantic match (SP-7),
 > per-turn re-activation, prompt compaction (SP-7).
 ```
+
+> **⚠️ Superseded 2026-09-04 (docs-only note).** The prescribed blockquote's clause "over-budget still halts loud (no silent truncation)" was accurate when this step ran; SP-7a removed that halt and SP-7b added the cut-with-disclosure path. See the note under **Architecture** above. The prescribed text is left as written — it is the record of what this step did.
 
 - [ ] **Step 5: Run green + commit**
 

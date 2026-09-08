@@ -396,6 +396,39 @@ until that tick returns. What bounds the worst case is the second-signal path pl
 kill is safe by construction. Interrupting a tick would abandon a partial drive for no correctness
 gain.
 
+> **⚠️ SUPERSEDED by SP-DATA-4.1 Task 4 (`530ccf9`, "a second signal abandons an in-flight tick").
+> The second and third paragraphs above are kept verbatim as the record of what was believed at
+> design time; the path they call absent now exists, and the mid-tick claim is false. The section's
+> opening line — "SIGINT and SIGTERM both finish the in-flight tick, then exit" — holds for the
+> FIRST signal only; a second does not wait for the tick.** §10 below already records this
+> carry-forward as CLOSED — §7.3 is the half of that edit that never landed. What is true in code:
+>
+> - **`shutdown_signal()` does not yield a one-shot future.** It returns
+>   `Result<tokio::sync::watch::Receiver<u64>, CliError>` — a LEVEL, incremented once per received
+>   signal by a spawned task (`crates/torii/src/main.rs`, in both the `#[cfg(unix)]` and
+>   `#[cfg(not(unix))]` definitions). A level is what lets one signal source be observed TWICE: a
+>   plain `Future` fires once by construction, and `Notify` holds at most one permit, so two signals
+>   landing back-to-back before the loop is first polled would coalesce into one. `serve` reads
+>   `*shutdown.borrow()` rather than counting `changed()` events, so even that case already reads
+>   `>= 2` the first time it is checked.
+> - **The tick itself is raced, not only the sleep between ticks.** `serve`
+>   (`crates/torii/src/cmd/worker.rs`) holds a single `tick_fut` across repeated `select!`s against
+>   `shutdown.changed()`. The FIRST signal is noted and deliberately *not* acted on — the in-flight
+>   tick is allowed to finish, so a partial drive is not wasted (the intent the paragraphs above
+>   describe is preserved) — and is honored the moment that tick returns. The SECOND drops `tick_fut`
+>   at its next await point, mid-`claim_due` or mid-`Executor::start`, whichever the tick was in.
+> - **An abandoned tick returns `Ok`, not an error.** The outcome carries `EXIT_OK` and text
+>   containing "abandoned", so it reads differently from a clean shutdown; an operator who signals
+>   twice asked for exactly this. It names no row count on purpose — `tick()` claims a whole batch
+>   before driving any of it, and `serve` only ever sees the final `Ok(n)`/`Err`, never how far a
+>   dropped attempt got. Guarded by `a_second_signal_abandons_an_in_flight_tick`, which asserts
+>   `serve` is still running after one signal and returns after the second with the tick never
+>   completing.
+> - **What this means for an operator.** The worst case is bounded by the second signal *and* the
+>   lease, not by the lease alone; escalating to SIGKILL is no longer the only way out of a wedged
+>   tick. Safety is unchanged either way — rows the abandoned tick had claimed stay `waking` and the
+>   lease reclaims them, which is what the reclaim was built for.
+
 ### 7.4 Errors are mapped, never flattened
 
 Every loud error the stack already produces gets an actionable message plus its full chain on
@@ -510,7 +543,10 @@ exposure — it is the first thing that *displays* it. Carry-forward for the red
   run can crash-loop a worker (§7.2).
 - ~~**A second-signal fast path for `worker serve`**~~ — **CLOSED in SP-DATA-4.1.** A second signal now abandons the in-flight tick; the abandoned run's row stays `waking` and the lease reclaims it. §7.3 describes what exists again. (§7.3). Signals arriving during a tick are consumed
   and discarded, so a worker blocked mid-`claim_due` survives repeated SIGTERM/SIGINT until SIGKILL.
-  Safe, but the worst case is bounded by the lease alone.
+  Safe, but the worst case is bounded by the lease alone. **(Those last two sentences are the
+  pre-closure text, left dangling by the strikethrough edit and false since `530ccf9`: `serve` races
+  the tick future itself against a `watch::Receiver<u64>` level, so a second signal abandons the
+  tick. See §7.3's amendment.)**
 - **Resuming a run whose config generation moved.** A push strands every paused run terminally (§5.2);
   the operator is now warned and must confirm, but there is no recovery path short of re-submitting.
   Carrying the generation forward so a re-pin could *offer* to resume a stale run under new config is
