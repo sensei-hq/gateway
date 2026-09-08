@@ -212,10 +212,10 @@ read the fold — which is exactly `drive_expand_with`'s shipped shape (`expand.
 Journaling the budget fixes **budget drift**. It does not fix **input drift**, and one instance
 already exists in the codebase: `execute_tool_effect` computes
 `let stale = class == EffectClass::Observation && !self.observation_fresh(ar, teid);`
-(`agent.rs:549`) and on `stale` falls through the memo-replay return to a live tool call;
-`observation_fresh` reads `self.clock.now()` (`agent.rs:781`). So a re-fetched Observation can change
-the transcript by wall-clock, and applying an identical cut to different bytes yields different
-bytes.
+(`agent.rs:992`) and on `stale` falls through the memo-replay return to a live tool call;
+`observation_fresh` reads `self.clock.now()` (`agent.rs:1220`). So a re-fetched Observation can
+change the transcript by wall-clock, and applying an identical cut to different bytes yields
+different bytes.
 
 This is pre-existing and is NOT SP-7b's to fix. It is, however, a direct argument for §2's exclusion
 of `messages`: budgeting the transcript would build a determinism claim on top of an input that
