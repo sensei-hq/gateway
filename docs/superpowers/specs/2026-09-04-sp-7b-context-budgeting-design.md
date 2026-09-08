@@ -212,10 +212,10 @@ read the fold — which is exactly `drive_expand_with`'s shipped shape (`expand.
 Journaling the budget fixes **budget drift**. It does not fix **input drift**, and one instance
 already exists in the codebase: `execute_tool_effect` computes
 `let stale = class == EffectClass::Observation && !self.observation_fresh(ar, teid);`
-(`agent.rs:549`) and on `stale` falls through the memo-replay return to a live tool call;
-`observation_fresh` reads `self.clock.now()` (`agent.rs:781`). So a re-fetched Observation can change
-the transcript by wall-clock, and applying an identical cut to different bytes yields different
-bytes.
+(`agent.rs:992`) and on `stale` falls through the memo-replay return to a live tool call;
+`observation_fresh` reads `self.clock.now()` (`agent.rs:1220`). So a re-fetched Observation can
+change the transcript by wall-clock, and applying an identical cut to different bytes yields
+different bytes.
 
 This is pre-existing and is NOT SP-7b's to fix. It is, however, a direct argument for §2's exclusion
 of `messages`: budgeting the transcript would build a determinism claim on top of an input that
@@ -252,20 +252,37 @@ tokens, ~33% OVER the entire 8192-token shipped preset window (`gateway/src/cata
 
 ### 5.2 The cutting order
 
-1. `context` entries via `render_context_section_bounded(entries, budget)` — unchanged, reused.
+1. `context` entries via `render_context_section_measured(entries, budget)`.
 2. If still over, drop whole tool schemas until it fits. **"Reverse activation order" means the
    reverse of the order the schemas appear in `PromptParts.tools`**, which is the order
    `assemble_prompt_parts` produced them in and therefore a pure function of the pinned registry and
    the activation policy — not a size-based or alphabetical order, either of which would be stable
-   too but would discard the policy's own ranking.
+   too but would discard the policy's own ranking. `join_bounded` applies the plan by POSITION —
+   the last `dropped_tools.len()` schemas — because both plan producers guarantee that set is
+   exactly the tail of the same list, and matching by NAME dropped every copy when an agent's
+   config listed a tool twice.
 3. `authored` is never cut.
 
-A known limitation of step 1, inherited rather than introduced: `render_context_section_bounded`
-splits the budget EVENLY and never redistributes an unused share, so a mixed-size dependency set
-wastes most of the budget (three 10-byte entries and one 10-KiB entry give each a quarter). No
-shipped test covers a mixed-size set. This slice reuses the truncator as-is and records the gap;
-redistribution is a behaviour change to a function the human path also calls, and it belongs in its
-own change with its own test rather than riding along here.
+**Step 1 was drafted as `render_context_section_bounded(entries, budget)` — "unchanged, reused" —
+and both halves of that need correcting.** The truncator IS reused: its body was renamed to
+`render_context_section_measured`, and `render_context_section_bounded` remains as a one-line
+wrapper (`.0`) for the human path. But it is not UNCHANGED — it gained a return value — and the
+model path must not call the wrapper, as that function's own doc says. The floor is decided on the
+MEASURED cut and three of the four disclosure channels report figures taken from it, so this path
+needs the `ContextCut` back: the requested and retained byte counts, and the shown/total dependency
+counts.
+
+A known limitation of step 1, inherited rather than introduced and shared by both renderers: the
+budget is split EVENLY across entries and an unused share is never redistributed, so a mixed-size
+dependency set wastes most of the budget (three 10-byte entries and one 10-KiB entry give each a
+quarter). Redistribution is a behaviour change to an algorithm the human path also uses, and it
+belongs in its own change with its own test rather than riding along here.
+
+This section also said no shipped test covered a mixed-size set, which is no longer true:
+`a_budget_the_renderer_under_spends_is_refused_on_the_measured_cut` drives a 1.5 MB dependency
+beside a 10-byte one, which is precisely the shape where the planner's whole-budget approval and
+the renderer's even split disagree — and it is the test that proves the caller checks the measured
+cut rather than treating a plan as proof of fit.
 
 ### 5.3 The floor
 
@@ -501,8 +518,8 @@ pre-existing window substring and rewrote the doc to attribute the halt to the f
 > catch than a bare one, and this slice's recheck agents exist because a fix commit has now
 > introduced a fresh defect four times. Task 8's own commit `be89e7d` added only the judgment the amendment left
 open — that the NAME still reads right, every clause of it still literally true of what runs
-(`FloorUnreachable` refuses before `render_context_section_bounded` is called at all), so long as it
-is not read as a claim about the model path in general.
+(`FloorUnreachable` refuses before `render_context_section_measured` is called at all), so long as
+it is not read as a claim about the model path in general.
 
 The second resolution bullet DID happen, and is the case the name must not be read against:
 `an_over_window_agent_turn_is_budgeted_and_dispatched` (a moderately over-window prompt completes)
@@ -521,6 +538,15 @@ journal, on the node's output, and in the log. A turn degraded past the floor st
 force-wakeable, with a reason naming the window and, when the section was actually rendered, how
 much context survived; when the floor was unreachable before any render, the reason says that
 instead of inventing a survivor count (AC9).
+
+**And in the control plane.** `torii run status` reports every budgeted turn on a run: the nodes,
+how many dependencies and which tool schemas were dropped, and the retained size beside the window
+it was cut to (`context_budgeted` under `--json`). This closes the §5.4 trap above — torii's
+readers end in `_ => {}`, so the arm had to be widened deliberately rather than when a compiler
+complained, and until it was, the fourth channel stopped at a `tracing` warn on the worker's
+stdout: an operator asking the control plane what happened to a run got a complete-looking answer
+that never mentioned the answer came from a CUT prompt. Additive — a run with no budgeted turn
+renders byte-identically, pinned both ways.
 
 The new risk is the one the four channels exist to manage: a degraded answer is still an answer, and
 a consumer that ignores `context_budgeted` will treat it as a full one.

@@ -1,40 +1,40 @@
 # Checkpoint
 
-**SP-7b context budgeting: COMPLETE, whole-slice reviewed. The one known-broken thing is now
-FIXED — no known-broken state remains.** Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12
-ACs) + its plan, whose Task 8 note records what shipped. SP-7a DONE (`864a8dd`).
+**Slice: SP-DOC-1 — doc-truth pass. COMPLETE.** Plan
+`docs/superpowers/plans/2026-09-08-sp-doc-1-doc-truth.md`, Tasks 1–6, 31 items + 2 coverage gaps, all
+closed (`d5b88cd`). After SP-7b.1 (Tasks 1–5) and SP-7b, on `main` via PR #54 — `main` = `24d1868`.
 
-## Done
+## Done — `SP-DOC-1 Task N`, not any implementation slice's `Task N`
 
-T1-T4 (`fedb8ac`..`daeee45`) `max_context_window`, the pure planner + `CONTEXT_FLOOR_FRACTION`, the
-measured renderer, `ContextBudgeted` folded FIRST-wins. `cdea80d`+`16a344e` T5/T6 wiring plus two
-CRITICALs (an unfenced UN-budgeted turn; a replay arm re-running `plan_budget`). `5781e3e`+`03204bf`
-T7 four channels. `be89e7d` T8 names/docs/sweep. `f489fbc` the review's three confirmed findings.
+A 13-agent audit swept every superpowers spec/plan for claims about EXISTING CODE that the code
+falsifies: 36 candidates → an adversarial verifier refuted 5 → **31 confirmed**, 3 re-derived by
+hand. A second 13-agent pass applied them, each diff adversarially re-reviewed. The two biggest:
 
-`c177a72` **the clamp-signal flake, root-caused not retried.** `tracing` caches a callsite's
-`Interest` at first execution, and with only ONE `Dispatch` registered — a lone capture test — it
-reads that from the EMITTING thread's subscriber, so a subscriber-less test reaching `dispatch.rs`'s
-`warn!` first cached `Interest::never()` and blinded the capture for good. `install()` now keeps a
-second `Dispatch` registered, disarming the fast path. (The old DISPROVEN note probed the
-self-repairing ordering.)
+- **The executor is not a concurrent DAG scheduler.** `drive` is `for node in ready { .await }` —
+  sequential. `Executor.concurrency` caps `Map` CHILDREN; the only `Semaphore` is in `fanout.rs`.
+- **Snapshot-seeded resume was never wired.** `start_inner` folds the WHOLE journal, `latest_snapshot`
+  has no non-test caller, and the spec's `SnapshotWritten` variant never existed in `crates/`.
 
-**The one idea: journal the BUDGET, not the cut.** The window-derived integer was the only unfenced
-input (`GatewayConfig` has NO version field); a `DeterminismViolation` on resume is unrevivable.
+Security-relevant: the Linux-sandbox plan prescribed `ABI::V1` (leaves `truncate(2)` unmediated;
+shipped is V5), the subprocess spec claimed a portable mem cap macOS fails closed on, and the
+broker docs recorded redact-then-scrub when the shipped order is scrub-then-redact.
+
+**The re-review earned the pass its trust:** 13 defects caught, 11 fixed, overwhelmingly NEW
+falsehoods the corrections introduced (an invented `torii config status`; an amendment negating a
+halt that still exists as `pause_context_floor`). Without it: one set of false claims for another.
 
 ## Verified
 
-`cargo test --workspace` **1755 passed / 0 failed, real exit 0** · `clippy --all-targets -D
-warnings` 0 · `fmt --check` 0 · 40 consecutive runs of the orchestrator binary, 0 failures. The
-flake fix is mutation-proven both ways (keepalive removed → red; restored → green).
+`cargo test --workspace` **1760 / 0 failed, real exit 0** — UNCHANGED from baseline, the required
+property for a docs-only pass, not merely green · clippy `-D warnings` 0 · `fmt --check` 0 · **zero
+files under `crates/` in the diff** (30 files, +947/−17, all docs).
 
 ## Next
 
-`gh pr create --base main --head develop` — 40 commits: SP-7a, the M1 reversal, SP-7b, the flake
-fix. Then SP-7c (no spec yet) or the minors.
+1. **Open the develop→main PR.** `develop` is 12 ahead, clean, pushed; it contains main's merge
+   commits so it will not sit BEHIND. The natural batch boundary.
+2. **SP-7c** — no spec, named nowhere; begins at `/sensei:design`. Two verified gaps for it:
+   `Message::attachments` uncounted by the estimator (so the gate can admit what a call's images
+   push over the window), and §4.5's wall-clock input drift.
 
-## Open
-
-7 MINORs, none blocking: duplicate tool NAMES drop the wrong schema; `dropped_deps` can be
-hard-wired to 0 with the suite green; `torii` has NO `ContextBudgeted` arm, so that operator surface
-is unbuilt; spec §5.2/§5.3 cite retracted rules. A budgeted node is effectively SINGLE-TURN, pinned
-by a two-turn test. **Sensei daemon NOT running — this file is the only record.**
+**Sensei daemon NOT running — this file is the record.**

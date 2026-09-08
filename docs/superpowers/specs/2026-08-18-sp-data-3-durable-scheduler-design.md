@@ -45,6 +45,11 @@ determinism is the safety net beneath the claim mechanism.
 - Exactly-once wake under a fleet / crash via an atomic status-CAS claim + a lease (crash-reclaim).
 - Basic HOTL control plane: observe (`status`, `list_paused`) + intervene (`cancel`, `force_wake`).
 - Additive: default-off ⇒ byte-identical; the `Executor` unchanged (one tiny additive `PauseInfo` field).
+  - **⚠️ SUPERSEDED — no `PauseInfo` field was added.** As shipped, the `Executor` and core are
+    entirely unchanged: `PauseInfo` is still exactly `{ node: NodeId, reason: String }`
+    (`crates/orchestrator/src/executor/mod.rs:124`, unmodified since SP-1 slice 4), and no
+    `NodeExec` variant changed either. The Scheduler reads the pause deadline from the durable
+    journal instead — see §7 and AC9, which already state this correctly.
 
 **Non-goals (deferred, §9)**
 - Rich scheduling policy (backoff/jitter/max-attempts/dead-letter).
@@ -179,6 +184,24 @@ through every `NodeExec::Paused` producer, the Scheduler reads it from the **dur
 drive it `journal.load(run)`s and takes the **last** `RunPaused { resume_after }` event. Hence the Scheduler
 holds the same `Arc<dyn ExecutionJournal>` the Executor does (the embedding app already constructs both). Zero
 executor/core change — consistent with SP-DATA-1/2.
+
+> **⚠️ SUPERSEDED — not the last event, and not over the whole journal.** As written: "on a paused
+> drive it `journal.load(run)`s and takes the **last** `RunPaused { resume_after }` event." The
+> surrounding claim (the deadline comes from the durable journal, zero executor change) is correct
+> and unchanged; the selection rule is not.
+>
+> - **EARLIEST, not last.** `earliest_resume_after` (`crates/orchestrator/src/scheduler.rs:218`)
+>   `filter_map`s the `RunPaused { resume_after }` events and takes `.min()`. `drive` runs every
+>   ready node in a round even after one pauses, so a single drive can journal several `RunPaused`
+>   events; taking the last and `flatten()`ing it let a deadline-less pause (`resume_after: None`)
+>   declared after a timed one null out the timed gate's wake entirely. Waking early is free (a
+>   resume with nothing to do re-pauses, zero re-spend); waking late means a missed deadline.
+> - **THIS drive's window, not the whole journal.** The Scheduler takes a journal watermark BEFORE
+>   the drive (`Scheduler::watermark`, `scheduler.rs:185` — `max` of the seqs, not `last()`) and
+>   reads with `journal.load_since(run, watermark)`, so only events this drive appended are
+>   considered. An earlier drive's deadline is by definition one the run was already woken for and
+>   is almost always in the past; re-adopting it would set a `next_wake` that every `tick()` claims
+>   — a hot loop re-driving the run forever.
 
 ## 8. The two wake classes + fence composition (design fallout)
 

@@ -510,6 +510,11 @@ Add the helper method (near `record_tool_effect`, ~448):
     }
 ```
 
+> **⚠️ SHIPPED DIFFERENTLY — the `detail` string, and where it is built.** As prescribed above:
+> `record_denied_effect(.., need, grant, listed)` computes `format!("call needs {:?} which the grant {:?} does not cover", need, grant)` (and `tool '{}' is not in the agent's declared tools`).
+> - **As built the helper takes a ready-made `detail: String`** (`crates/orchestrator/src/executor/agent.rs:1235-1242`) and the gate builds it (`agent.rs:1017-1023`). The two shipped forms are `tool '<name>' is not available to this agent` and `the requested access for tool '<name>' is not permitted by its grant` — TERSE by design: the prescribed `{:?}` of `need`/`grant` would have printed the agent's whole allowlist into a model-visible transcript AND into the journal, which is a confused-deputy / prompt-injection surface (the denied party is the model). Operators get `?need`/`?grant` out-of-band via `tracing::debug!` at `agent.rs:1025`.
+> - The `{"error":"permission_denied","tool":…,"detail":…}` envelope, the Pure `EffectRecorded`, and the no-`EffectIntent`-for-a-denied-Mutation behaviour all shipped exactly as prescribed, so the three tests below are unaffected except for the `detail` text they may assert.
+
 Then in `crates/orchestrator/src/executor/tests.rs`, add the three gate tests. **Study the existing slice-4 tool tests first** (grep `RecordNote`, `scripted_gateway`, `tool_call_response`, `final_response`, and how an agent that CALLS a tool is registered + driven — mirror that harness exactly). The three tests, with an agent `writer` that lists `fs.write` and a `ScopedWriter` in the `ToolRegistry`:
 
 - `granted_tool_call_executes` (AC4): agent grants `fs.write` `{paths:["/workspace"]}`; scripted gateway emits a tool_call `fs.write {path:"/workspace/a.txt", content:"x"}` then a final answer. Assert the run completes, the sink contains `/workspace/a.txt` (the tool ran), and the journal has the Mutation's `EffectIntent`+`EffectRecorded`.
