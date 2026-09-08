@@ -26081,6 +26081,169 @@ async fn an_over_window_agent_turn_is_budgeted_and_dispatched() {
     );
 }
 
+/// The agent of [`over_window_agent_registry`], with the authored size chosen by the caller.
+///
+/// The fixed 100 000 there is enough for "make the prompt over-window"; the test below needs
+/// the SECTION budget itself at a particular size, and the section budget is
+/// `available - authored`.
+fn sized_authored_agent_registry(authored_bytes: usize) -> Arc<Registry> {
+    Arc::new(Registry::default().with_agent(AgentDefinition {
+        system_prompt: "x".repeat(authored_bytes),
+        ..agent_def("c")
+    }))
+}
+
+/// `P → B ← {a 400-character node id}` — two dependencies whose KEYS differ enormously.
+fn two_dep_long_key_graph(long_id: &str) -> Graph {
+    Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("P".into()),
+                kind: model_call("c", "plan"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId(long_id.into()),
+                kind: model_call("c", "plan"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("P"), Dep::hard(long_id)]),
+        ],
+    }
+}
+
+/// A DROPPED dependency is counted, and the journal says so.
+///
+/// # The hole this closes
+///
+/// `dropped_deps` is the audit field for the half of a cut that removes whole dependencies,
+/// and before this test it could be hard-wired to `0` in `agent.rs` with the ENTIRE workspace
+/// still green — measured, not assumed. Every other budgeted-turn test drives the one-dependency
+/// fixture, which is TRUNCATED rather than dropped, so all of them assert `dropped_deps == 0`
+/// and a constant `0` satisfies every one.
+///
+/// # Why it takes this shape
+///
+/// A dependency is only dropped when the section's STRUCTURE overflows the budget. Equal keys
+/// cannot do it: `render_context_section_measured` gives every entry the same `share` and caps
+/// each at it, so the total lands on the budget by construction and only bodies get truncated.
+/// Nor can an oversized body — `context_section_overhead` reserves each entry's widest marker,
+/// so the planner refuses any budget too small for the markers before the renderer ever sees it.
+///
+/// What overflows is a HEADING wider than its share, which needs one key much longer than its
+/// sibling's — and a key is a dependency's node id (`resolve_context`: `ContextKey(dep.on.0)`).
+/// Hence the 400-character id. Both bodies are the SAME size so the result cannot depend on
+/// which of the two independent upstream nodes dispatches first.
+///
+/// The numbers are derived here rather than written down, and each premise is asserted, so a
+/// change to a window, the reserve or the estimator's divisor fails with the arithmetic on
+/// screen instead of quietly rendering a section that no longer drops anything.
+#[tokio::test]
+async fn a_dropped_dependency_is_counted_in_the_journaled_budget_row() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    const LONG_ID_BYTES: usize = 1_200;
+    const SECTION_BUDGET: usize = 2_000;
+    // `{"model":"small","text":"…"}` — the stored context value is the whole node OUTPUT, an
+    // envelope of `22 + "small".len()` around the text (see the AC3 test's marker decomposition).
+    const ENVELOPE: usize = 27;
+    // One entry's share of the section, and the room the short-keyed entry's body gets inside
+    // it: `share − len("\n\n### P\n")`.
+    const SHARE: usize = (SECTION_BUDGET - 12) / 2;
+    const BODY: usize = 880;
+
+    let long_id = "L".repeat(LONG_ID_BYTES);
+    // The budget the executor will compute, in the same arithmetic the AC3 test pins:
+    // `3 × (window − output reserve − transcript)`, the transcript being the node input alone.
+    let transcript_tokens = "refine".len().div_ceil(3) as u64;
+    let available =
+        3 * (TWO_WINDOW_BIG as u64 - orchestrator_core::MIN_OUTPUT_TOKENS - transcript_tokens);
+    let authored = available as usize - SECTION_BUDGET;
+
+    // The four premises, stated before anything is driven. Each is a different way for this
+    // fixture to stop testing what it claims, and three of them fail SILENTLY — as a turn that
+    // simply fits, or a pause, or a section that truncates instead of dropping.
+    let heading = |k: &str| format!("\n\n### {k}\n").len();
+    let section_full = 12 + heading("P") + BODY + heading(&long_id) + BODY;
+    assert!(
+        authored + section_full > 3 * TWO_WINDOW_BIG as usize,
+        "the UNBUDGETED prompt must exceed the largest window, or the turn simply fits and no \
+         budget row is ever written: {} against {}",
+        authored + section_full,
+        3 * TWO_WINDOW_BIG as usize
+    );
+    assert!(
+        heading(&long_id) > SHARE,
+        "the long key's heading must exceed one entry's share or nothing overflows and \
+         nothing is dropped: {} against {SHARE}",
+        heading(&long_id)
+    );
+    assert!(
+        heading("P") + BODY <= SHARE,
+        "while the short-keyed entry fits its share whole, so it is RETAINED and the measured \
+         floor is cleared by it alone"
+    );
+    // The floor is a quarter of what was REQUESTED, and both bodies are requested: `2 × BODY / 4`.
+    // The 80 is the two widest markers the overhead reserves, one per entry.
+    assert!(
+        SECTION_BUDGET - (13 + heading(&long_id) + heading("P") + 80) >= BODY / 2,
+        "and the PLANNER's own approximate fit must pass — it reserves each entry's widest \
+         marker, so a budget too small for the structure is refused as FloorUnreachable before \
+         the renderer ever runs, and the run pauses instead of dispatching"
+    );
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let text = "y".repeat(BODY - ENVELOPE);
+    let (gateway, _calls, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&text),
+        final_response(&text),
+        final_response("budgeted-answer"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(sized_authored_agent_registry(authored))
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &two_dep_long_key_graph(&long_id))
+        .await
+        .expect("drives");
+
+    assert!(
+        out.paused.is_none(),
+        "the turn must DISPATCH, not pause: a budget that trips either floor never reaches \
+         the `ContextBudgeted` append at all, and this test would then be asserting on a row \
+         that does not exist: {:?}",
+        out.paused
+    );
+    assert!(out.failed.is_none(), "nor fail: {:?}", out.failed);
+
+    let rows = budget_rows(&journal, run).await;
+    assert_eq!(rows.len(), 1, "exactly one budget row: {rows:?}");
+    let JournalEvent::ContextBudgeted {
+        retained_bytes,
+        dropped_deps,
+        ..
+    } = &rows[0]
+    else {
+        unreachable!("filtered above")
+    };
+    assert_eq!(
+        *dropped_deps, 1,
+        "one of the two dependencies was dropped WHOLE, and the audit row says so. A constant \
+         `0` here is the mutation this test exists to redden: {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        *retained_bytes, BODY as u64,
+        "and what survived is the short-keyed entry's body, entire — which is also what \
+         clears the measured floor, so the drop is a real degradation rather than a refusal"
+    );
+}
+
 /// A `RunStarted` with no cap — the row every pre-seeded journal needs before any other
 /// event, since `fold_journal` reads the version fence off it.
 fn run_started_unbudgeted() -> JournalEvent {
