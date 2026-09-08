@@ -522,6 +522,15 @@ force-wakeable, with a reason naming the window and, when the section was actual
 much context survived; when the floor was unreachable before any render, the reason says that
 instead of inventing a survivor count (AC9).
 
+**And in the control plane.** `torii run status` reports every budgeted turn on a run: the nodes,
+how many dependencies and which tool schemas were dropped, and the retained size beside the window
+it was cut to (`context_budgeted` under `--json`). This closes the §5.4 trap above — torii's
+readers end in `_ => {}`, so the arm had to be widened deliberately rather than when a compiler
+complained, and until it was, the fourth channel stopped at a `tracing` warn on the worker's
+stdout: an operator asking the control plane what happened to a run got a complete-looking answer
+that never mentioned the answer came from a CUT prompt. Additive — a run with no budgeted turn
+renders byte-identically, pinned both ways.
+
 The new risk is the one the four channels exist to manage: a degraded answer is still an answer, and
 a consumer that ignores `context_budgeted` will treat it as a full one.
 
