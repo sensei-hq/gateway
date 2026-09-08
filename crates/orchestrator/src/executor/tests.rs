@@ -5,8 +5,10 @@ use crate::test_support::{
     demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
     failing_after_gateway, final_response, metered_embed_gateway, metered_gateway,
     metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
-    sub_floor_output_clamp_observing_gateway, tool_call_response, two_window_chain_gateway,
-    two_window_clamp_observing_gateway, two_window_scripted_gateway, window_watching_clamp_gateway,
+    scripted_tool_watching_gateway, sub_floor_output_clamp_observing_gateway, tool_call_response,
+    two_window_chain_gateway, two_window_clamp_observing_gateway, two_window_scripted_gateway,
+    two_window_scripted_window_watching_gateway, wide_window_scripted_gateway,
+    window_watching_clamp_gateway,
 };
 use orchestrator_core::{
     Aggregation, ChildStatus, Dep, EdgeKind, GateSpec, Graph, JournalError, LoopBody, LoopGate,
@@ -433,22 +435,25 @@ async fn phase_override_wins_over_base_route_through_from_config() {
     assert!(outcome.outputs.contains_key(&n1));
 }
 
-/// An agent prompt no candidate's window can hold fails the node, before any spend —
-/// and says which window, and what to do about it.
+/// An agent prompt no candidate's window can hold PAUSES the run recoverably, before any
+/// spend — and says which window, and what to do about it.
 ///
 /// This test was `agent_node_halts_over_budget_before_any_gateway_call` and asserted the
 /// orchestrator's own `PromptOverBudget` halt. SP-7a deleted that halt, so the test's
-/// wording had to change; its two CLAIMS did not, and neither did its fixture. That is
-/// why it was updated rather than removed:
+/// wording had to change; its fixture never did. Its claims have now changed twice:
 ///
-/// - **"an over-window prompt fails the node"** still holds. The gateway's
-///   `ContextWindowGate` skips every candidate, `all_gated_error` aggregates that into an
-///   `AllGated` with no timed gate, and `classify_gateway_error` fails on anything that
-///   is not a timed pause. Terminal before, terminal now.
-/// - **"before any gateway call"** still holds, and is worth keeping precisely because it
-///   is the property a reader would expect the move to have cost. It did not: the refusal
-///   happens during SELECTION, so no adapter is reached and no tokens are spent. The call
-///   log is asserted for exactly that reason.
+/// - **"an over-window prompt HALTS the node before any spend"** has held throughout, and
+///   is worth keeping precisely because it is the property a reader would expect these
+///   moves to have cost. They did not: the refusal happens during SELECTION, so no
+///   adapter is reached and no tokens are spent. The call log is asserted for that reason.
+/// - **"...terminally"** held for exactly one slice and is now GONE. The gateway's
+///   `ContextWindowGate` skips every candidate and `all_gated_error` aggregates that into
+///   an `AllGated { resume_after: None, human_action: Some(UseLargerContextWindow) }` —
+///   and since the M1 reversal `classify_gateway_error` treats a named human action as
+///   the HOTL pause class rather than a failure, because a failed run is unreachable by
+///   `force_wake` and every other supported command. See
+///   `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying` for the property
+///   and the classifier's own doc for the argument.
 ///
 /// What changed is the DIAGNOSIS, which is the slice's whole benefit: the old message
 /// named one number — the chain's smallest window, possibly belonging to a model this
@@ -460,14 +465,42 @@ async fn phase_override_wins_over_base_route_through_from_config() {
 /// The old halt returned before the `if !*node_started` block in `agent_turn_output`, so
 /// an over-window node journaled `[RunStarted, NodeFailed]` and fired neither
 /// `on_node_started` nor `on_agent_turn`. Now the turn reaches dispatch, so the shape is
-/// `[RunStarted, NodeStarted, NodeFailed]` and both hooks fire for a turn that never
+/// `[RunStarted, NodeStarted, RunPaused]` and both hooks fire for a turn that never
 /// reaches a provider. That is a real change to what every observer sees — `torii status`
 /// and `list_paused` read the journal, and any hook that counts or bills turns now counts
 /// this one — and it is the intended shape: a node that reached dispatch IS started, and
 /// a turn that was attempted IS a turn. Pinning it here means re-introducing any
 /// pre-dispatch halt reddens on the property rather than only on message wording.
+///
+/// The third event is `RunPaused` rather than `NodeFailed` as of the M1 reversal, and the
+/// distinction is the whole recovery story: `list_paused` finds a `RunPaused` row and
+/// `force_wake` can move it, where a `NodeFailed` left the run terminal and reachable
+/// only by hand-written SQL.
+///
+/// # SP-7b looked at this test and changed NOTHING, which is the claim worth writing down
+///
+/// SP-7b degrades an over-window agent turn instead of refusing it, so the expectation on
+/// arrival was that this fixture now completes and the name would have to go. It does not,
+/// and the fixture is the whole reason: `over_window_agent_registry` is a 100 000-byte
+/// `system_prompt` with NO dependencies, and the authored half is never cut (spec §5.2).
+/// `plan_budget` therefore answers `BudgetRefusal::AuthoredOverBudget` — no cut this planner
+/// can make brings the prompt inside any window — and `drive_agent` hands the UN-cut prompt
+/// to selection exactly as before. So this is AC5 seen from the agent side, and the pause,
+/// the diagnosis and the zero spend below are all still the gateway's.
+///
+/// What SP-7b did change is that a run now has TWO refusals that both name the window, so
+/// this test says which one it is observing rather than leaving it to be inferred. Honestly
+/// stated: the prefix assertion is not the only net. Routing `AuthoredOverBudget` to
+/// `pause_context_floor` — the mutation this guard was verified with — also reddens the
+/// estimate substring, because the floor message carries neither the estimate nor the
+/// `route to a model…` remedy. What the prefix buys is the DIAGNOSIS: asserted first, as the
+/// premise, it fails with "wrong component" and prints the absurdity itself — *node n1's
+/// dependency context is 0 bytes* — where the estimate assertion fails with "missing
+/// number" about a message that was never going to have one. Its sibling
+/// `oversized_dependency_context_halts_over_budget_never_truncates` keys on the same prefix
+/// from the other side.
 #[tokio::test]
-async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis() {
+async fn an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis() {
     let (gateway, calls) = recording_gateway().await;
     let journal = InMemoryJournal::new();
     let hooks = RecordingHooks::default();
@@ -481,12 +514,20 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
     };
     let run = RunId(uuid::Uuid::new_v4());
     let outcome = exec.run(run, &graph).await.expect("run yields an outcome");
-    match &outcome.failed {
-        Some((node, msg)) => {
-            assert_eq!(node.0, "n1");
+    match &outcome.paused {
+        Some(pause) => {
+            assert_eq!(pause.node.0, "n1");
+            let msg = &pause.reason;
+            assert!(
+                !msg.starts_with("context budget: "),
+                "the premise — it is the GATE's refusal, not SP-7b's floor: this agent has \
+                 no dependency context to cut and its authored half is never cut, so no \
+                 budget changes the outcome and blaming a context budget would be accurate \
+                 about nothing: {msg}"
+            );
             assert!(
                 msg.contains("4096-token context window"),
-                "the failure names the CANDIDATE's own window, not a chain-wide \
+                "the pause names the CANDIDATE's own window, not a chain-wide \
                  figure: {msg}"
             );
             assert!(
@@ -500,7 +541,11 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
                  could not tell it apart from a money problem: {msg}"
             );
         }
-        None => panic!("an over-every-window prompt is still a terminal node failure"),
+        None => panic!(
+            "an over-every-window prompt pauses recoverably as of the M1 reversal: \
+             {:?}",
+            outcome.failed
+        ),
     }
     assert_eq!(
         calls.lock().unwrap().len(),
@@ -509,8 +554,9 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
          adapter is reached"
     );
 
-    // The journal shape the deletion changed: the node is STARTED and then fails, where
-    // the pre-dispatch halt produced a `NodeFailed` with no `NodeStarted` before it.
+    // The journal shape both moves changed: the node is STARTED and then the run PAUSES,
+    // where the pre-dispatch halt produced a `NodeFailed` with no `NodeStarted` before
+    // it, and the one slice in between produced `NodeStarted` then `NodeFailed`.
     let kinds: Vec<&'static str> = journal
         .load(run)
         .await
@@ -520,14 +566,16 @@ async fn an_over_window_agent_prompt_fails_the_node_with_the_gateways_diagnosis(
             JournalEvent::RunStarted { .. } => "RunStarted",
             JournalEvent::NodeStarted { .. } => "NodeStarted",
             JournalEvent::NodeFailed { .. } => "NodeFailed",
+            JournalEvent::RunPaused { .. } => "RunPaused",
             _ => "other",
         })
         .collect();
     assert_eq!(
         kinds,
-        vec!["RunStarted", "NodeStarted", "NodeFailed"],
+        vec!["RunStarted", "NodeStarted", "RunPaused"],
         "a node that reaches dispatch is STARTED first — this is the shape a resume and \
-         a `torii status` see, and the pre-dispatch halt used to skip the middle event"
+         a `torii status` see — and the run then PAUSES rather than failing, which is \
+         what leaves it visible to `list_paused` and movable by `force_wake`"
     );
 
     // And the hook contract: both fire for a turn that never reaches a provider.
@@ -711,7 +759,10 @@ fn the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical() 
         serde_json::json!({ "model": "m", "text": "drafted", "tool_calls": [] }),
     );
 
-    project_agent_outputs(&graph, &mut outputs);
+    // No budget rows: this test's subject is the `actor` exemption, and SP-7b's key is
+    // additive over the same rebuild — `a_completed_budgeted_run_discloses_the_same_way_
+    // when_it_is_read_back` is where the budgeted arm is exercised end-to-end.
+    project_agent_outputs(&graph, &HashMap::new(), &mut outputs);
 
     assert_eq!(
         outputs[&human],
@@ -724,6 +775,61 @@ fn the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical() 
         outputs[&model],
         serde_json::json!({ "model": "m", "text": "drafted" }),
         "the model-backed projection still drops `tool_calls` and keeps `{{model, text}}`"
+    );
+}
+
+/// SP-7b review fix: the read-back key is PER NODE, and it is keyed on the effect id the
+/// writing drive used — `effect_id(node, 0, 0)`.
+///
+/// A unit test because the two failure modes it excludes are both invisible to the end-to-end
+/// guard (`a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back`), whose graph
+/// has exactly ONE agent node and it is the budgeted one:
+///
+/// - a run-global latch (`!context_budgets.is_empty()` for `contains_key`) would mark an
+///   un-degraded node degraded whenever any OTHER node in the run was cut — turning the
+///   disclosure into noise in exactly the graphs it matters most in. That mutation leaves the
+///   e2e test green; it reddens `whole` here.
+/// - a wrong turn coordinate (`effect_id(node, 1, 0)`) would find nothing and disclose nothing,
+///   since a budget is journaled ONCE per node at turn 0. That reddens `cut` here — and it
+///   reddens the e2e too, which is why the first bullet is the one this test is really for.
+#[test]
+fn the_projection_marks_only_the_nodes_whose_context_was_cut() {
+    use super::support::project_agent_outputs;
+
+    let cut = NodeId("cut".into());
+    let whole = NodeId("whole".into());
+    let graph = Graph {
+        nodes: vec![
+            agent_node("cut", "a", "summarize the 700kB doc"),
+            agent_node("whole", "a", "hi"),
+        ],
+    };
+
+    // Exactly one budget row, for `cut`, at the turn-0 key `agent.rs` journals on.
+    let budgets = HashMap::from([(
+        effect_id("cut", 0, 0),
+        ContextBudget {
+            budget_bytes: 11_514,
+            dropped_tools: Vec::new(),
+        },
+    )]);
+
+    let raw = serde_json::json!({ "model": "m", "text": "answered", "tool_calls": [] });
+    let mut outputs: HashMap<NodeId, serde_json::Value> =
+        HashMap::from([(cut.clone(), raw.clone()), (whole.clone(), raw)]);
+
+    project_agent_outputs(&graph, &budgets, &mut outputs);
+
+    assert_eq!(
+        outputs[&cut],
+        serde_json::json!({ "model": "m", "text": "answered", "context_budgeted": true }),
+        "the budgeted node discloses, additively over the canonical two keys"
+    );
+    assert_eq!(
+        outputs[&whole],
+        serde_json::json!({ "model": "m", "text": "answered" }),
+        "and its neighbour, which was never cut, is byte-identical to the pre-SP-7b shape \
+         (AC11) — the key is per NODE, not per run"
     );
 }
 
@@ -2686,6 +2792,16 @@ fn label(event: &JournalEvent) -> String {
         // workspace — `fold_journal`'s included — carries a `_` catch-all and would have
         // absorbed it silently.
         JournalEvent::LoopGateSettled { node, .. } => format!("LoopGateSettled({})", node.0),
+        // A fifth time, and this one was found DELIBERATELY rather than by the compiler
+        // complaining, because `cargo build --workspace` compiles neither this file nor this
+        // arm: SP-7b's `ContextBudgeted` was added, `cargo build --workspace` exited 0, and
+        // `cargo check --workspace --all-targets` exited 101 with this single `E0004`. The
+        // Node only, no `budget_bytes`: this helper's contract is "kind + node, without
+        // matching payloads", and a label carrying the budget would make every exact-sequence
+        // assertion in the slice depend on the cut arithmetic. What a sequence needs to show
+        // is that the event is there and WHERE — a test that cares about the number reads the
+        // event itself.
+        JournalEvent::ContextBudgeted { node, .. } => format!("ContextBudgeted({})", node.0),
     }
 }
 
@@ -4775,22 +4891,41 @@ async fn tampered_upstream_context_on_resume_halts_with_determinism_violation() 
     );
 }
 
-/// Acceptance §8.7 — an oversized dependency context busts the window and halts LOUD,
-/// never silently truncated.
+/// Acceptance §8.7 — an oversized dependency context halts LOUD, never silently truncated.
 ///
-/// The invariant this test exists for is "never silently truncated", and it is untouched
-/// by SP-7a: `PromptParts::join` renders the model path's `## Context` section unbounded,
-/// so an oversized upstream output reaches the request whole and the run halts rather
-/// than quietly asking the model about half a document.
+/// The invariant this test exists for is "never silently **truncated**", and every slice
+/// since has moved WHO enforces it while leaving it intact. The history is the point, so it
+/// is recorded rather than rewritten:
 ///
-/// What SP-7a moved is WHO notices. Before it, the orchestrator compared the assembled
-/// prompt against the chain's smallest window and raised `PromptOverBudget` — hence the
-/// old `msg.contains("over budget")`. Now selection notices, per candidate, and the halt
-/// carries the gateway's diagnosis instead. The assertion below therefore checks the
-/// same property through its new wording rather than being relaxed: it still requires a
-/// LOUD failure at B, and it now also requires the failure to name the window that was
-/// busted — which the old one did not, since "over budget" alone reads as a money
-/// problem.
+/// - Before SP-7a the orchestrator compared the assembled prompt against the chain's
+///   SMALLEST window and raised `PromptOverBudget` — hence the original
+///   `msg.contains("over budget")`.
+/// - SP-7a moved the question to the gateway's per-candidate `ContextWindowGate`, so the
+///   halt carried each candidate's own window instead. The assertion was re-keyed on the
+///   window rather than relaxed.
+/// - The M1 reversal changed the halt's CLASS from a node failure to a durable
+///   `RunPaused { resume_after: None }`, which for this scenario is strictly better: the
+///   remedy is a config change and A's completed output is expensive to recompute.
+/// - **SP-7b changed its OWNER, and that is why this doc no longer describes the gateway's
+///   diagnosis.** The prompt is now cut to fit the chain's largest window — except that
+///   this fixture's cut cannot clear the 25% context floor (a 100 000-byte dependency
+///   against a 4096-token window leaves 11 514 bytes to render into), so it is SP-7b's own
+///   floor refusal that halts B. `render_context_section_bounded` never runs on this path.
+///
+/// So the invariant survives with a NUMBER attached to "half a document": B stops rather
+/// than answering from under a quarter of A's output, and it still produces no work product.
+/// The refusal's own shape — one durable pause row, `resume_after: None`, no `NodeFailed`,
+/// nothing dispatched — is asserted by
+/// `the_context_floor_pause_is_recoverable_and_spends_nothing`, because the window substring
+/// this test keys on is carried by BOTH refusals and so cannot tell them apart.
+///
+/// **The NAME was re-read against all of that and kept, deliberately.** Every clause is still
+/// literally true of what runs here: the dependency context is oversized, the node halts, the
+/// halt is over a BUDGET — the message opens `context budget: ` — and nothing is truncated,
+/// because `BudgetRefusal::FloorUnreachable` refuses before the section is rendered at all.
+/// The one thing the name must not be read as is a claim about the model path in GENERAL,
+/// which SP-7b made false: an over-window turn whose cut clears the floor is truncated and
+/// dispatched, and `an_over_window_agent_turn_is_budgeted_and_dispatched` is that case.
 #[tokio::test]
 async fn oversized_dependency_context_halts_over_budget_never_truncates() {
     use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
@@ -4816,19 +4951,34 @@ async fn oversized_dependency_context_halts_over_budget_never_truncates() {
         .run(RunId(uuid::Uuid::new_v4()), &graph)
         .await
         .expect("run yields an outcome");
-    match &out.failed {
-        Some((node, msg)) => {
-            assert_eq!(node.0, "B");
+    match &out.paused {
+        Some(pause) => {
+            assert_eq!(pause.node.0, "B");
             assert!(
-                msg.contains("4096-token context window"),
-                "B must halt naming the window its context busted: {msg}"
+                pause.reason.contains("4096-token context window"),
+                "B must halt naming the window its context busted: {}",
+                pause.reason
+            );
+            assert!(
+                pause.reason.starts_with("context budget: "),
+                "and since SP-7b the halt is the FLOOR's, not the gate's — the window \
+                 substring above is carried by both, so without this the test cannot say \
+                 which refusal it is observing: {}",
+                pause.reason
             );
         }
         None => panic!(
             "expected B to halt loud — a truncated `## Context` would let it succeed \
-             silently on half of A's output, which is the failure this test exists for"
+             silently on half of A's output, which is the failure this test exists for. \
+             Since the M1 reversal the halt is a durable pause, not a failure: {:?}",
+            out.failed
         ),
     }
+    assert!(
+        !out.outputs.contains_key(&NodeId("B".into())),
+        "and B produced NO output — the point of halting is that half a document never \
+         becomes work product, whichever class the halt has"
+    );
 }
 
 /// Regression (determinism, review Finding 1): a SOFT dependency is NOT read into
@@ -15835,6 +15985,69 @@ impl CapturingSubscriber {
             .cloned()
             .collect()
     }
+
+    /// Everything captured so far whose message names SP-7b's context budget — the
+    /// fourth disclosure channel.
+    ///
+    /// A second filter for the same reason there is a first one: a drive emits unrelated
+    /// records, and the two diagnostics answer different questions (the clamp bounds an
+    /// OUTPUT allowance against a token budget; this one reports that an INPUT was cut to
+    /// fit a window). Filtering both on one substring would let either stand in for the
+    /// other, and the AC11 half of this slice asserts an ABSENCE — which is exactly the
+    /// assertion a too-wide filter turns green for the wrong reason.
+    fn context_budget_signals(&self) -> Vec<CapturedEvent> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|e| e.message.contains("agent prompt context budgeted"))
+            .cloned()
+            .collect()
+    }
+
+    /// Install a fresh capture as this thread's default subscriber, and return it with
+    /// the guard that uninstalls it.
+    ///
+    /// The one constructor every capture test uses, so the thing that makes installation
+    /// safe in a threaded test binary has exactly one home. See
+    /// [`a_subscriberless_thread_touching_a_callsite_first_does_not_blind_the_capture`]
+    /// for what that is and why a bare `set_default` is not enough.
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        // One extra `Dispatch`, registered once and never dropped. This is the fix, and it
+        // is aimed at a single branch in `tracing`.
+        //
+        // `callsite::Dispatchers::rebuilder()` takes its `JustOne` fast path while at most
+        // one `Dispatch` is registered process-wide, and that path resolves a callsite's
+        // interest from `dispatcher::get_default()` — the CURRENT THREAD's subscriber —
+        // rather than from the registry. A callsite first executed by a subscriber-less
+        // thread therefore caches `Interest::never()` for the life of the process, and a
+        // thread that does hold a capture goes blind to that line. A lone capture test is
+        // exactly the one-registered-`Dispatch` case, which is why the window was open.
+        //
+        // `has_just_one` is recomputed as `len <= 1` on every registration, counting only
+        // still-live entries. With this one always alive, the capture's own registration
+        // immediately below brings the count to two, so the fast path is disarmed for the
+        // whole time a capture is installed — which is the only window whose emissions any
+        // test here reads. That is measured, not reasoned: with this line removed the guard
+        // test fails with an empty capture, and with it present the guard test passes.
+        //
+        // A callsite first touched BETWEEN capture tests can still be poisoned, and does
+        // not need preventing: `Dispatch::new` calls `register_dispatch`, which rebuilds
+        // the interest of every registered callsite against the live dispatcher list, so
+        // the next `install()` repairs it before the test that would read it runs.
+        //
+        // Cost is confined to this test binary: callsites resolve to `Interest::always`, so
+        // events are built and handed to whatever dispatcher the emitting thread has —
+        // `NoSubscriber`, and a no-op, for every thread but the installed one. This one
+        // receives nothing ever, since a registered `Dispatch` is not any thread's default,
+        // so its buffer stays empty.
+        static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEPALIVE.get_or_init(|| tracing::Dispatch::new(Self::default()));
+
+        let capture = Self::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        (capture, guard)
+    }
 }
 
 impl tracing::Subscriber for CapturingSubscriber {
@@ -15867,6 +16080,82 @@ impl tracing::Subscriber for CapturingSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+/// A thread with no subscriber must not be able to blind a thread that has one.
+///
+/// # The defect this pins
+///
+/// `tracing` caches a callsite's [`Interest`] on the static ITSELF, once, the first time
+/// that line of code executes anywhere in the process — and the cached value is what the
+/// macro consults before it dispatches. Registration reads the dispatchers through
+/// `callsite::Dispatchers::rebuilder()`, which has a fast path: when only ONE `Dispatch`
+/// is registered process-wide it skips the registry and asks
+/// `dispatcher::get_default()` — **the current thread's** subscriber. One registered
+/// `Dispatch` is precisely the state while a single capture test runs.
+///
+/// So if some other, subscriber-less test is the first in the process to execute a given
+/// `tracing` line, `NoSubscriber::register_callsite` returns `Interest::never()` and that
+/// verdict is cached for the life of the process. Every later emission from that line is
+/// then skipped by the macro BEFORE dispatch — including one made on a thread that does
+/// have a capture installed.
+///
+/// That is not hypothetical: it is the root cause of the one-in-many-runs failure of
+/// [`both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low`], where the
+/// `info!` clamp-bit record was captured and the `warn!` under-estimate record from the
+/// SAME `if let` block, three lines later, was not. They are separate statics registered
+/// at separate moments, so one can be poisoned while the other is not — which is also why
+/// no level filter can explain it, WARN being the more severe of the two.
+///
+/// # Why the earlier probe found nothing
+///
+/// The disproven note this test replaces probed poisoning that happened BEFORE
+/// `set_default`, which is self-repairing: `Dispatch::new` calls `register_dispatch`,
+/// which rebuilds the interest of every registered callsite against the live dispatcher
+/// list — the capture included. Only poisoning that lands AFTER the subscriber is
+/// installed sticks, and that is the ordering reproduced here.
+///
+/// # Reading a failure
+///
+/// Red means an emission on the installed thread was dropped, so every capture test in
+/// this file is only as trustworthy as the race it happened to win. The two that assert
+/// an ABSENCE are the dangerous ones: a poisoned callsite makes them pass for the wrong
+/// reason.
+#[test]
+fn a_subscriberless_thread_touching_a_callsite_first_does_not_blind_the_capture() {
+    // ONE callsite, reached from two threads. Two separate `warn!` invocations would be
+    // two separate statics with independent interest, and could not collide at all.
+    fn emit(probe: u64) {
+        tracing::warn!(probe, "interest poisoning probe");
+    }
+
+    let (capture, _guard) = CapturingSubscriber::install();
+
+    // The first execution of that line in this process happens on a thread with NO
+    // subscriber, and AFTER ours is installed — the ordering `set_default`'s own rebuild
+    // has already run past and cannot repair.
+    std::thread::spawn(|| emit(1))
+        .join()
+        .expect("the probe thread joins");
+
+    // Same line, this time on the thread holding the capture.
+    emit(2);
+
+    let seen: Vec<Option<u64>> = capture
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|e| e.message.contains("interest poisoning probe"))
+        .map(|e| e.field("probe"))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![Some(2)],
+        "the emission made on the installed thread must arrive. Exactly one: the probe \
+         thread's own emission has nowhere to go, so an entry for `probe = 1` would mean \
+         this test stopped isolating what it claims to"
+    );
+}
+
 /// Both clamp diagnostics fire, on a call where both conditions really hold.
 ///
 /// The fixture makes each one true for a DIFFERENT reason, so neither rides on the
@@ -15883,8 +16172,7 @@ impl tracing::Subscriber for CapturingSubscriber {
 #[tokio::test]
 async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
     const CAP: u64 = 1_000;
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
     let journal = InMemoryJournal::new();
@@ -15930,23 +16218,30 @@ async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
     // same thread (`dispatch.rs`, the two signals). The captured bit reported
     // `allowance: 999` against a 1000 cap and zero spend, which forces `est_input == 1`,
     // and `clamp_observing_gateway(10, …)` hardcodes `input_tokens: 10`. So `10 > 1` held
-    // and the `warn!` ran.
+    // and the `warn!` ran. The record was emitted; the capture never saw it.
     //
-    // **The diagnosis first recorded for this — that `set_default` is thread-local while
-    // tracing's callsite `Interest` cache is global, so a subscriber-less thread can cache
-    // `Interest::never()` — is DISPROVEN.** Three probes, all green where the theory
-    // predicts red: a subscriber-less drive on the same thread first; the same from a
-    // separate `std::thread`; and a synthetic unique callsite emitted under
-    // `Dispatch::none()` before installing the capture, which was still captured
-    // (`poisoned_capture=1`). `rebuild_interest_cache()` was therefore NOT applied — it
-    // would have been a fix for a mechanism that does not occur here.
+    // **Root cause found, and it is fixed in [`CapturingSubscriber::install`]:** a
+    // callsite's `Interest` is cached on the static the first time that line runs anywhere
+    // in the process, and while only one `Dispatch` is registered — a lone capture test —
+    // `tracing` resolves it from the EMITTING thread's subscriber. Any other
+    // subscriber-less test reaching `dispatch.rs`'s `warn!` first cached
+    // `Interest::never()`, and this thread's later emission was then dropped by the macro
+    // before dispatch. The `info!` on line 893 and the `warn!` on line 908 are separate
+    // statics registered at separate moments, which is why one survived and its neighbour
+    // did not — and why no level filter could be the culprit, WARN being the severer of
+    // the two.
     //
-    // What is left is the difference between "the record was never emitted" and "the
-    // capture did not see it", and the filtered view could not tell them apart. This dump
-    // can: an unfiltered record present here but missing from `signals` is a filter or
-    // capture problem, and its absence from both means the predicate did not hold and the
-    // arithmetic above is wrong somewhere. Recorded rather than guessed at, so the next
-    // occurrence produces evidence instead of another theory.
+    // The diagnosis first recorded here named the Interest cache but was marked DISPROVEN
+    // by three probes. The probes were sound and the conclusion was wrong: each poisoned
+    // the callsite BEFORE installing the capture, and that ordering repairs itself, since
+    // `Dispatch::new` rebuilds the interest of every registered callsite against the live
+    // dispatcher list. Only poisoning that lands after installation sticks.
+    // `a_subscriberless_thread_touching_a_callsite_first_does_not_blind_the_capture`
+    // reproduces that ordering deterministically and now guards the fix.
+    //
+    // The dump stays. It is what distinguished "never emitted" from "not seen" — an
+    // unfiltered record present here but missing from `signals` is a filter problem, and
+    // absence from both is a delivery problem, which is what this turned out to be.
     let low = signals
         .iter()
         .find(|e| e.message.contains("under-estimated"))
@@ -15956,8 +16251,9 @@ async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
                 "the estimate-wrong signal did NOT fire.\n  clamp-filtered: {signals:?}\n  \
                  ALL captured records: {all:?}\n  (est_input is forced to 1 by the \
                  allowance of 999, and the fixture's input_tokens is 10, so the `10 > 1` \
-                 predicate held and this record should exist — see the comment above for \
-                 the disproven diagnosis and what this dump distinguishes)"
+                 predicate held and this record should exist. Absent from BOTH lists means \
+                 delivery, not arithmetic — see the comment above and the interest-poisoning \
+                 guard test)"
             )
         });
     assert_eq!(
@@ -15997,8 +16293,7 @@ async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
 async fn the_clamp_bit_signal_fires_against_the_value_sent_not_the_allowance() {
     // Ten times the model's own output limit, so the budget is nowhere near binding.
     const CAP: u64 = FIXTURE_MAX_OUTPUT_TOKENS as u64 * 10;
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     // A scripted reply far larger than the ceiling, so the provider really does stop AT
     // the emitted limit rather than finishing under it.
@@ -16082,8 +16377,7 @@ async fn the_clamp_bit_signal_fires_against_the_value_sent_not_the_allowance() {
 /// path establishes the first half.
 #[tokio::test]
 async fn neither_clamp_signal_fires_when_its_condition_does_not_hold() {
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     // Phase 1: budgeted, clamped, and the clamp did not bite.
     let (gateway, seen) = clamp_observing_gateway(1, 5).await;
@@ -24729,22 +25023,27 @@ fn over_window_agent_registry() -> Arc<Registry> {
 /// contributes no window term, and the call goes through to selection, which gates every
 /// candidate and returns `AllGated`. So the operator gets the same diagnosis either way.
 ///
-/// # The outcome CLASS changes for budgeted runs, and that is the deliberate part
+/// # The outcome CLASS moved twice, and the second move undid the loss the first caused
 ///
-/// It was a durable `RunPaused { resume_after: None }` and is now a terminal
-/// `NodeFailed`. That is a real loss — the pause preserved the run for an operator who
-/// widens the chain — and it is accepted because the pause was preserving the run against
-/// a remedy it could not name: a `BudgetExhausted` pause is cleared by
-/// `torii run wake --budget-tokens N`, and no cap raise has ever made a prompt fit a
-/// window. The unbudgeted path has always failed terminally on this condition, and one
-/// answer for one condition is worth more than a recoverable pause pointing at the wrong
-/// lever. `AllGated` carries `HumanAction::UseLargerContextWindow`, which names the real
-/// one.
+/// A budgeted run's refusal here was a durable `RunPaused { resume_after: None }`; this
+/// slice made it a terminal `NodeFailed`, on the argument that the pause pointed at the
+/// wrong lever (`torii run wake --budget-tokens N` cannot make a prompt fit a window) and
+/// that one answer for one condition beats a misleading pause.
 ///
-/// The cap-irrelevance experiment the old version ran (drive the same graph at
-/// `u64::MAX / 2` and get the identical refusal) is kept and now proves something
-/// stronger: an astronomical cap produces the same GATE failure, so the outcome does not
-/// depend on the budget in either direction.
+/// **Review found that argument traded away the wrong half.** The pause's value was never
+/// the lever it named — it was that a paused run is REACHABLE. `force_wake` matches only
+/// `status = 'paused'`, `torii run wake` answers "not queued" for anything else, and
+/// `submit` refuses a used id, so the terminal version left every completed node's memo
+/// and spent token durable and unreachable behind hand-written SQL. The lever complaint
+/// was answered instead by the `human_action` the gate already carries. So both arms now
+/// PAUSE, indefinitely, with `UseLargerContextWindow` as the remedy — see
+/// `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying`, which asserts the
+/// journal row, and `classify_gateway_error`'s doc for why this reverses risk M1.
+///
+/// What survives unchanged is this test's actual subject: **the gate owns the refusal,
+/// budgeted or not, and gives the same answer either way**. The cap-irrelevance
+/// experiment (drive the same graph at `u64::MAX / 2`) is kept and still proves the
+/// outcome does not depend on the budget in either direction.
 #[tokio::test]
 async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
     let graph = Graph {
@@ -24753,7 +25052,7 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
 
     // (a) UNBUDGETED: the request reaches the gateway, which gates on the window. This
     // arm is unchanged by the serving-window bound — `budget: None` never clamps — and
-    // is here as the reference answer the budgeted arm now has to match.
+    // is here as the reference answer the budgeted arm has to match.
     let (gateway, calls) = clamp_observing_gateway(10, 100).await;
     let journal = InMemoryJournal::new();
     let run = RunId(uuid::Uuid::new_v4());
@@ -24762,19 +25061,20 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
         .start(run, &graph)
         .await
         .expect("drives");
-    let (node, msg) = out
-        .failed
+    let pause = out
+        .paused
         .as_ref()
-        .expect("an over-window prompt still fails the node — see the spec's §3 row");
-    assert_eq!(node.0, "n1");
+        .expect("an over-window prompt halts the node — see the spec's §3 row");
+    let msg = pause.reason.clone();
+    assert_eq!(pause.node.0, "n1");
     assert!(
         msg.contains("context window"),
-        "the failure must carry the GATEWAY's diagnosis: {msg}"
+        "the halt must carry the GATEWAY's diagnosis: {msg}"
     );
     assert!(
-        out.paused.is_none(),
-        "and it FAILS rather than pausing — an all-terminal AllGated has no deadline \
-         to wait for: {out:?}"
+        out.failed.is_none(),
+        "and it PAUSES rather than failing — the remedy is a human action, and a failed \
+         run is not reachable by the command that acts on one: {out:?}"
     );
     assert!(
         calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
@@ -24798,21 +25098,22 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
         .await
         .expect("drives");
     assert!(
-        out_b.paused.is_none(),
-        "the clamp must NOT refuse this: nothing in the chain can serve the prompt, so \
-         its window term is absent rather than zero, and an absent term must not trip \
-         the output floor: {:?}",
-        out_b.paused
+        out_b.failed.is_none(),
+        "the clamp must NOT refuse this, and nothing must fail: nothing in the chain can \
+         serve the prompt, so the clamp's window term is absent rather than zero, and an \
+         absent term must not trip the output floor: {:?}",
+        out_b.failed
     );
-    let (node_b, msg_b) = out_b.failed.as_ref().expect(
-        "a budgeted over-every-window run now fails on the gate, as an \
-                 unbudgeted one always did",
+    let pause_b = out_b.paused.as_ref().expect(
+        "a budgeted over-every-window run halts on the gate, as an unbudgeted one \
+         always did",
     );
-    assert_eq!(node_b.0, "n1");
+    let msg_b = &pause_b.reason;
+    assert_eq!(pause_b.node.0, "n1");
     assert_eq!(
-        msg_b, msg,
+        msg_b, &msg,
         "and the message is IDENTICAL to the unbudgeted arm's — the point of the \
-         handover is one failure with one owner, not a budget-flavoured paraphrase"
+         handover is one halt with one owner, not a budget-flavoured paraphrase"
     );
     assert!(
         msg_b.contains("4096"),
@@ -24844,16 +25145,126 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
         .await
         .expect("drives");
     assert!(
-        out_c.paused.is_none(),
+        out_c.failed.is_none(),
         "a colossal cap does not change the outcome either: {:?}",
-        out_c.paused
+        out_c.failed
     );
     assert_eq!(
-        out_c.failed.as_ref().map(|(_, m)| m.as_str()),
+        out_c.paused.as_ref().map(|p| p.reason.as_str()),
         Some(msg.as_str()),
-        "the same gate failure at a cap of {} — the window question never reads the \
+        "the same gate refusal at a cap of {} — the window question never reads the \
          budget, in either direction",
         u64::MAX / 2
+    );
+}
+
+/// **An all-gated run whose remedy is a HUMAN pauses recoverably instead of dying** —
+/// the M1 reversal, and the finding that forced it.
+///
+/// `AllGated` carries `human_action: Option<HumanAction>`, and
+/// `classify_gateway_error` used to pause only on `resume_after: Some(t)`. So an
+/// over-every-window run ended `Failed`, and NOTHING could revive it:
+/// `SchedulerStore::force_wake` is `… where run_id = $1 and status = 'paused'`,
+/// `torii run wake` answers "not queued", and `run submit` refuses a used id. Recovery
+/// meant hand-written SQL against `scheduled_runs`, while every completed node's memo,
+/// journaled mutation and spent token stayed durable and unreachable.
+///
+/// The rule now: **a `resume_after: None` with a `human_action` is the HOTL pause class**
+/// (SP-DATA-3) — the scheduler records a NULL `next_wake`, never auto-wakes it, and an
+/// operator who acts on the named remedy clears it with `force_wake`. A
+/// `human_action: None` still fails, because there is nothing for a human to do and a
+/// pause nobody can clear is worse than a failure.
+///
+/// # This reverses risk M1, deliberately and with Jerry's decision
+///
+/// `docs/design/selection-policy-pipeline.md`'s M1 resolved terminal-only exhaustion as
+/// "fail-fast human-action, never pause", and SP-7a's spec put reversing it out of scope.
+/// The argument that overturned it: `human_action: Some(_)` IS the statement that a person
+/// rather than a deadline is the remedy, so a terminal state that names a human remedy no
+/// command can act on is incoherent — and it is incoherent for every gate that produces
+/// one (auth lockout, capability, budget), not only the window.
+///
+/// Asserted on the JOURNAL, not just on the return: `NodeExec::Paused` without a
+/// `RunPaused { resume_after: None }` row would leave nothing for `list_paused` to show
+/// or `force_wake` to find, which is precisely the state this test exists to rule out.
+#[tokio::test]
+async fn a_budgeted_over_window_run_pauses_recoverably_rather_than_dying() {
+    let graph = Graph {
+        nodes: vec![agent_node("n1", "a", "hi")],
+    };
+    let (gateway, calls) = clamp_observing_gateway(10, 100).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .start(run, &graph)
+        .await
+        .expect("drives");
+
+    let pause = out.paused.as_ref().unwrap_or_else(|| {
+        panic!(
+            "an over-window run names a HUMAN remedy, so it must survive for that human: \
+             {out:?}"
+        )
+    });
+    assert_eq!(pause.node.0, "n1");
+    assert!(
+        out.failed.is_none(),
+        "and it must not ALSO report a failure — one outcome, and it is the recoverable \
+         one: {:?}",
+        out.failed
+    );
+
+    let events = journal.load(run).await.unwrap();
+    let paused_rows: Vec<&Option<chrono::DateTime<chrono::Utc>>> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::RunPaused { resume_after, .. } => Some(resume_after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        paused_rows.len(),
+        1,
+        "exactly one durable pause row — `list_paused` and `force_wake` both key on it"
+    );
+    assert!(
+        paused_rows[0].is_none(),
+        "and its `resume_after` must be NULL: this is the HOTL class, not a deadline. A \
+         `Some(t)` here would have the scheduler auto-wake the run at `t` into the \
+         identical refusal, forever, since no passage of time makes a prompt fit a window"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::NodeFailed { .. })),
+        "and no `NodeFailed` is journaled — a node failure is what destroyed the run"
+    );
+    assert!(
+        pause.reason.contains("4096"),
+        "the durable reason carries each candidate's own window, the number the operator \
+         has to change: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("larger context window"),
+        "and the remedy that no amount of waiting supplies — which is the whole reason \
+         this pause is honest rather than a stall: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains("--budget-tokens"),
+        "and not a cap raise: no cap makes a prompt fit a window: {}",
+        pause.reason
+    );
+    assert!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and nothing was dispatched — the gate refuses before any provider call, so the \
+         run pauses having spent nothing on this node"
     );
 }
 
@@ -24879,8 +25290,17 @@ async fn an_over_every_window_prompt_is_refused_by_the_gate_budgeted_or_not() {
 /// refusal that meant "your prompt does not fit", and this arm no longer means that: the
 /// prompt fits, and pointing at the chain's SMALLEST model is now pointing at a model
 /// that may have been filtered out of the decision altogether. The replacement says what
-/// bound it — the smallest window that can hold the prompt — and both remedies that
+/// bound it — the smallest window that can hold the prompt — and a remedy that can
 /// actually move it.
+///
+/// The first replacement wording did not manage that second half. It read "send less
+/// input, or put a model with a larger window in this chain", and review showed the
+/// second clause cannot clear the refusal for the same reason the FIRST wording could
+/// not: the term is a minimum over the models that can serve the request, and adding to a
+/// set cannot raise its minimum. See
+/// `adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal`, which
+/// drives this same prompt down a chain with and without a 200 000-window model and gets
+/// byte-identical refusals.
 #[tokio::test]
 async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_window() {
     // 12 000 chars ⇒ est 4000 against the fixture's 4096 window: it FITS (so the serving
@@ -24977,6 +25397,206 @@ async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_wind
     );
 }
 
+/// **Adding a larger model to the chain cannot clear this refusal** — so the message must
+/// not offer that as a remedy.
+///
+/// The review finding this pins is an arithmetic one, and it is decisive. The window term
+/// is a MINIMUM over `{ w ∈ chain : w >= est }`, and adding an element to a set cannot
+/// RAISE its minimum. So "put a model with a larger window in this chain" — which the
+/// message said, and which the field's own doc comment said before it — is at best a
+/// no-op and at worst harmful: a larger entry leaves the minimum where it was, and a
+/// SMALLER one that still holds the input LOWERS it.
+///
+/// # The demonstration, not the assertion
+///
+/// A wording assertion alone would pin the string without proving the claim, so this
+/// drives the SAME prompt down two chains that differ by exactly the recommended change:
+/// the homogeneous 4096 chain, and the two-window chain that adds a 200 000-window model
+/// beside it. The prompt fits BOTH windows (est 4000), so the serving set genuinely gains
+/// the large entry rather than being filtered back to one — and the refusals come out
+/// BYTE-IDENTICAL. That is the finding, in the form a future author cannot read past.
+///
+/// The old remedy is then asserted absent, because the equality above passes whether or
+/// not the message recommends the thing it just proved useless.
+#[tokio::test]
+async fn adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal() {
+    // The same 12 000 chars as the arm's own test ⇒ est 4000, which FITS 4096 (so the
+    // serving set is `{4096}` on the homogeneous chain) and fits 200 000 as well (so on
+    // the two-window chain the set is `{4096, 200 000}` and the minimum is unmoved).
+    let prompt = "x".repeat(12_000);
+    let est = prompt.len().div_ceil(3) as u64;
+    assert!(
+        est <= u64::from(TWO_WINDOW_SMALL) && est <= u64::from(TWO_WINDOW_BIG),
+        "the prompt must fit BOTH windows or the larger model is not ADDED to the serving \
+         set and this test proves nothing about a minimum: est {est}"
+    );
+    assert!(
+        u64::from(TWO_WINDOW_SMALL) - est < orchestrator_core::MIN_OUTPUT_TOKENS,
+        "and the smaller window must still leave under the floor, or neither chain refuses"
+    );
+
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("n1".into()),
+            kind: model_call("c", &prompt),
+            deps: vec![],
+        }],
+    };
+
+    // Chain `{4096}`.
+    let (one_model, one_calls) = clamp_observing_gateway(10, 100).await;
+    let journal_a = InMemoryJournal::new();
+    let run_a = RunId(uuid::Uuid::new_v4());
+    journal_a
+        .append(run_a, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out_a = Executor::new(Arc::new(one_model), Arc::new(journal_a), "v1")
+        .start(run_a, &graph)
+        .await
+        .expect("drives");
+
+    // Chain `{4096, 200 000}` — the same chain plus exactly the model the old remedy
+    // told the operator to add.
+    let (two_models, two_calls, _models, _ests) = two_window_clamp_observing_gateway(10, 100).await;
+    let journal_b = InMemoryJournal::new();
+    let run_b = RunId(uuid::Uuid::new_v4());
+    journal_b
+        .append(run_b, run_started_with_budget(1_000_000))
+        .await
+        .unwrap();
+    let out_b = Executor::new(Arc::new(two_models), Arc::new(journal_b), "v1")
+        .start(run_b, &graph)
+        .await
+        .expect("drives");
+
+    let pause_a = out_a.paused.as_ref().expect("the one-model chain refuses");
+    let pause_b = out_b
+        .paused
+        .as_ref()
+        .expect("and so does the chain with a 200 000-window model added — that is the point");
+    assert_eq!(
+        pause_b.reason, pause_a.reason,
+        "adding a larger model changed NOTHING: the window term is a minimum over the \
+         models that can serve the request, and adding to a set cannot raise its minimum. \
+         Both refusals name the same {TWO_WINDOW_SMALL}-token window."
+    );
+    assert!(
+        !pause_a
+            .reason
+            .contains("put a model with a larger window in this chain"),
+        "so the message must not recommend it. Each round trip on this pause costs the \
+         operator a manual `BudgetRaised` plus a `force_wake`, and this advice buys one \
+         of those and an unchanged refusal: {}",
+        pause_a.reason
+    );
+    assert!(
+        pause_a.reason.contains("cannot help"),
+        "and it should say so outright rather than merely omitting it — an operator \
+         staring at a {TWO_WINDOW_SMALL}-token window will reach for a bigger model \
+         unprompted: {}",
+        pause_a.reason
+    );
+    assert!(
+        one_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            && two_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+        "and neither chain paid for a truncated reply"
+    );
+}
+
+/// **The serving-window refusal is CAP-INDEPENDENT, and the message says so** — pinned at
+/// two caps five orders of magnitude apart.
+///
+/// The arm's message ends "raising the cap does not move this", which is a claim about the
+/// arithmetic: the ceiling is `min(min_max_output_tokens, window − est)` and neither term
+/// reads `cap` or `spent`. The claim was true and unguarded. The parent commit's test drove
+/// this scenario at `1e6` and at `u64::MAX / 2`, but the serving-window bound moved that
+/// scenario onto the GATE path, and the replacement test of this arm uses one cap — so a
+/// review mutation that gated the refusal on the cap (`&& remaining < 10_000_000`, letting
+/// a large cap dispatch) left the whole workspace green, and so did deleting the clause.
+///
+/// # Why the comparison strips one clause rather than asserting the whole string
+///
+/// The message names the ledger — "(0 of 1000000 spent)" — precisely so an operator can
+/// see the budget is NOT the cause, so a raw equality across two caps would fail on the
+/// one clause that is supposed to differ. Removing exactly that clause and demanding
+/// equality of the remainder is the strong form: it pins that NOTHING else about the
+/// refusal — the binding window, the allowance, the remedies — moves with the cap.
+#[tokio::test]
+async fn a_serving_window_refusal_is_unmoved_by_the_cap() {
+    let prompt = "x".repeat(12_000);
+    // Two caps that cannot both be near a boundary: one an ordinary operator figure, one
+    // so large that `remaining` is effectively unbounded.
+    let caps = [1_000_000_u64, u64::MAX / 2];
+    let mut stripped: Vec<String> = Vec::new();
+
+    for cap in caps {
+        let (gateway, calls) = clamp_observing_gateway(10, 100).await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        journal
+            .append(run, run_started_with_budget(cap))
+            .await
+            .unwrap();
+        let out = Executor::new(Arc::new(gateway), Arc::new(journal), "v1")
+            .start(
+                run,
+                &Graph {
+                    nodes: vec![Node {
+                        id: NodeId("n1".into()),
+                        kind: model_call("c", &prompt),
+                        deps: vec![],
+                    }],
+                },
+            )
+            .await
+            .expect("drives");
+
+        let pause = out.paused.as_ref().unwrap_or_else(|| {
+            panic!(
+                "a cap of {cap} must not change WHETHER the window refuses — the \
+                    ceiling reads neither `cap` nor `spent`"
+            )
+        });
+        assert!(
+            pause.reason.starts_with("context window: "),
+            "nor which term it blames, at cap {cap}: {}",
+            pause.reason
+        );
+        assert!(
+            pause.reason.contains("raising the cap does not move"),
+            "and the message must SAY the cap cannot move it, at cap {cap} — an operator \
+             who is not told spends a `BudgetRaised` and a `force_wake` to find out: {}",
+            pause.reason
+        );
+        assert!(
+            calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "and nothing was dispatched at cap {cap}"
+        );
+        // The one clause that is MEANT to vary with the cap.
+        let ledger = format!("(0 of {cap} spent)");
+        assert!(
+            pause.reason.contains(&ledger),
+            "the message must name the ledger so the operator can see the budget is not \
+             the cause, at cap {cap}: {}",
+            pause.reason
+        );
+        stripped.push(pause.reason.replace(&ledger, ""));
+    }
+
+    assert_eq!(
+        stripped[1], stripped[0],
+        "and with that clause removed the two refusals are identical: the binding window, \
+         the allowance and both remedies are all cap-blind"
+    );
+}
+
 /// **A TIE between the clamp's two model bounds counts as window-bound**, so the refusal
 /// keeps the window's wording rather than the budget's.
 ///
@@ -25007,8 +25627,23 @@ async fn a_prompt_that_fits_but_leaves_no_room_for_output_names_the_serving_wind
 ///
 /// Both terms are cap-blind, so on a tie neither wording could sell a cap raise honestly
 /// — but only the window arm SAYS so. Naming the window is therefore the answer that
-/// misdirects least: it tells the operator the two things that do move it (send less
-/// input, widen the chain) instead of the one that cannot.
+/// misdirects least.
+///
+/// # But naming the window ALONE is not enough on a tie, and that took a review to see
+///
+/// This doc used to justify the tie by saying the window arm "tells the operator the two
+/// things that do move it (send less input, widen the chain)". Both halves were wrong.
+/// Widening the chain never moved this refusal —
+/// `adding_a_larger_model_to_the_chain_cannot_clear_a_serving_window_refusal` demonstrates
+/// that a minimum over the serving set cannot be raised by adding to it — and on a TIE
+/// even the correct window remedies are INSUFFICIENT: the ceiling is
+/// `min(min_max_output_tokens, window_term)` with both terms on the same sub-floor figure,
+/// so clearing the window half leaves the output half binding and the refusal standing.
+///
+/// So the tie keeps the window's classification (it is a true cause, and the only arm that
+/// says the cap is irrelevant) and the message additionally names the output limit as a
+/// co-cause. Asserted below, because a message that classified correctly and still sent
+/// the operator on a round trip that cannot succeed is the same defect in a new place.
 #[tokio::test]
 async fn a_tie_between_the_output_limit_and_the_window_term_names_the_window() {
     // `est` chosen so `window_term == FIXTURE_CONTEXT_WINDOW − est == 200`, the same
@@ -25071,6 +25706,21 @@ async fn a_tie_between_the_output_limit_and_the_window_term_names_the_window() {
     assert!(
         !pause.reason.contains("--budget-tokens"),
         "and it must not name the cap, which neither term reads: {}",
+        pause.reason
+    );
+    // The tie's own assertion, and the one the classification does not give for free.
+    assert!(
+        pause.reason.contains("max_output_tokens"),
+        "on a TIE the output limit binds too, so the message must name it. Without this \
+         the operator is told to send less input or drop the {window_term}-token-window \
+         model, does one of them at the cost of a `BudgetRaised` and a `force_wake`, and \
+         hits the identical refusal from the other term: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("binds too"),
+        "and must say it BINDS, not merely mention the figure — the operator needs to \
+         know the window remedies alone will not clear this: {}",
         pause.reason
     );
     assert!(
@@ -25219,4 +25869,1447 @@ async fn an_agent_turn_replays_from_its_memo_though_selection_may_differ() {
 /// `effect_id(node, turn, 0)` that `agent_turn_output` memoizes on.
 fn effect_id_of_turn0() -> EffectId {
     effect_id("n1", 0, 0)
+}
+
+// =============================================================================
+// SP-7b — an over-window agent turn is BUDGETED and dispatched, not refused.
+// =============================================================================
+
+/// A dependency output big enough that the dependent agent's UNBUDGETED prompt busts the
+/// chain's LARGEST window, which is the only shape SP-7b's budget can act on.
+///
+/// Stated as arithmetic rather than a round literal because both sides matter and they pull
+/// in opposite directions. It must be over `3 × TWO_WINDOW_BIG` bytes (the estimator is
+/// `ceil(bytes / 3)`, so that is the window in bytes) or the prompt fits and SP-7a's
+/// fall-through serves it with no budget at all — the test would then pass without any of
+/// this slice. And the FLOOR must still be reachable: `0.25 × requested` has to fit in the
+/// budget left after the agent's own 100 000 authored bytes, which caps it near 2 MiB. The
+/// margin over the window is deliberately wide so a change to the estimator's divisor does
+/// not silently move the fixture to the wrong side of either bound.
+const OVERSIZED_DEP_BYTES: usize = 700_000;
+
+/// `A (model_call) → B (agent, hard-dep A)` — the shape of
+/// `oversized_dependency_context_halts_over_budget_never_truncates`, which is the test SP-7b
+/// changes the outcome of, so AC2 is asserted against the same graph rather than a new one.
+fn oversized_context_graph() -> Graph {
+    Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("A".into()),
+                kind: model_call("c", "plan"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("A")]),
+        ],
+    }
+}
+
+/// AC2 — an over-window agent turn is DEGRADED and dispatched, not refused.
+///
+/// The fixture is the two-window chain and a prompt whose dependency context pushes it past
+/// BOTH windows. Before SP-7b this halted: the gate skipped every candidate and the run
+/// paused with `UseLargerContextWindow`. Now the context is cut to fit the LARGEST window and
+/// the turn completes.
+///
+/// Asserted on what reached the PROVIDER, not on the orchestrator's arithmetic — a budget
+/// that satisfies every assertion phrased in its own terms and still overflows the real
+/// window is the failure this AC exists to exclude, and SP-DATA-5's AC10 was added after
+/// review found exactly that. So the size is the GATEWAY's own estimate, recomputed at the
+/// adapter from the `ChatRequest` that arrived.
+///
+/// # Why it cannot pass without a cut
+///
+/// The premise is asserted first: the unbudgeted prompt estimates OVER `TWO_WINDOW_BIG`. So
+/// "every dispatched request fits `TWO_WINDOW_BIG`" is not a property of the fixture — it can
+/// only hold because bytes were removed between assembly and dispatch. Without the assertion
+/// on the premise this test would pass on a prompt that simply fitted, which is how the AC5
+/// fall-through case already behaves and is not what this AC claims.
+///
+/// The content and context stores are wired because `resolve_context` returns EMPTY without a
+/// `ContextStore` (`executor/mod.rs:1652`) — an unwired fixture gives B no dependency context
+/// at all, no over-window prompt, and a green test that proves nothing.
+#[tokio::test]
+async fn an_over_window_agent_turn_is_budgeted_and_dispatched() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    // The premise, in the estimator's own unit. `over_window_agent_registry`'s agent carries
+    // 100 000 authored bytes and the dependency adds `OVERSIZED_DEP_BYTES` more.
+    let unbudgeted_est = (100_000 + OVERSIZED_DEP_BYTES).div_ceil(3) as u32;
+    assert!(
+        unbudgeted_est > TWO_WINDOW_BIG,
+        "the fixture must be over the LARGEST window or a cut is not needed to dispatch \
+         it: {unbudgeted_est} against {TWO_WINDOW_BIG}"
+    );
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gateway, calls, ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        final_response("budgeted-answer"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    assert!(
+        out.paused.is_none(),
+        "it must not halt any more: {:?}",
+        out.paused
+    );
+    assert!(out.failed.is_none(), "nor fail: {:?}", out.failed);
+    assert_eq!(
+        out.outputs
+            .get(&NodeId("B".into()))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str()),
+        Some("budgeted-answer"),
+        "and B really answered — a dispatched turn that produced nothing would satisfy \
+         the two assertions above: {:?}",
+        out.outputs.get(&NodeId("B".into()))
+    );
+    let dispatched = calls.lock().unwrap_or_else(|e| e.into_inner()).len();
+    assert_eq!(
+        dispatched, 2,
+        "A's model call and B's budgeted turn both reached the provider"
+    );
+
+    let seen = ests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        seen.iter().all(|e| *e <= TWO_WINDOW_BIG),
+        "and every dispatched request fits the largest window, measured by the GATEWAY's \
+         own estimator on what the provider received: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|e| *e > TWO_WINDOW_SMALL),
+        "with B's turn still over the SMALL window — the cut takes the prompt to the \
+         largest window, not to the smallest, so `small` is skipped and `big` serves it: \
+         {seen:?}"
+    );
+
+    // AC3, and the four disclosure figures with it. Everything above is produced from the
+    // LOCAL plan on the writing drive by design, so before these assertions existed the
+    // production `ContextBudgeted` append could be DELETED with the whole suite still green
+    // — the effect-id key (the load-bearing replay input) and every audited field included.
+    let rows = budget_rows(&journal, run).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one budget row: one per agent NODE, appended before the model call, and \
+         `dropped_deps`/`dropped_tools` are what an audit reads back: {rows:?}"
+    );
+    let JournalEvent::ContextBudgeted {
+        node,
+        effect_id: eid,
+        budget_bytes,
+        source_window,
+        retained_bytes,
+        dropped_deps,
+        dropped_tools,
+    } = &rows[0]
+    else {
+        unreachable!("filtered above")
+    };
+    assert_eq!(node.0, "B");
+    assert_eq!(
+        eid,
+        &effect_id("B", 0, 0),
+        "keyed on turn 0's effect id — the SAME id `agent_turn_output` memoizes turn 0 \
+         under, which is what lets a later drive read the budget back before any prompt \
+         bytes exist, and what keeps sibling nodes and loop iterations apart"
+    );
+    // `3 × (window − output reserve − transcript)`. Turn 0's transcript is the node input
+    // alone: `"refine"`, 6 bytes ⇒ 2 tokens at the estimator's `ceil(bytes/3)`.
+    let transcript_tokens = "refine".len().div_ceil(3) as u64;
+    let reserve = orchestrator_core::MIN_OUTPUT_TOKENS;
+    assert_eq!(
+        *budget_bytes,
+        3 * (TWO_WINDOW_BIG as u64 - reserve - transcript_tokens),
+        "the budget is the LARGEST window's spare, in bytes — the one field a later drive \
+         reproduces the cut FROM, so it is pinned as arithmetic over the constants rather \
+         than as a literal"
+    );
+    assert_eq!(
+        *source_window, TWO_WINDOW_BIG,
+        "disclosed as the window it came from: `big`'s, not `small`'s"
+    );
+    assert_eq!(
+        *dropped_deps, 0,
+        "the one dependency was TRUNCATED, not dropped — so the model-facing channel here is \
+         the per-entry marker, and the `N of M dependencies shown` tail (which announces \
+         DROPS) correctly stays silent. `a_degraded_turn_discloses_on_every_channel` asserts \
+         the marker reached the wire (AC10)"
+    );
+    assert!(
+        dropped_tools.is_empty(),
+        "and this agent activates no schemas, so none went: {dropped_tools:?}"
+    );
+    // The section budget is the whole budget less the 100 000 authored bytes, which are never
+    // cut; what separates it from `retained_bytes` is the section's own scaffolding for ONE
+    // entry — `"\n\n## Context"`, one `"\n\n### {key}\n"` heading and one truncation marker.
+    let section_budget = *budget_bytes - 100_000;
+    assert!(
+        *retained_bytes > 0 && *retained_bytes <= section_budget,
+        "retained body bytes are real and inside the section budget: {retained_bytes} \
+         against {section_budget}"
+    );
+    // Measured at 66 bytes, and it decomposes exactly: `"\n\n## Context"` (12) + `"\n\n### A\n"`
+    // (8) + `"\n… (truncated: 499160 of 700027 bytes shown)"` (46, the `…` being three UTF-8
+    // bytes). Bounded rather than pinned at 66 so a re-worded marker is not a regression, since
+    // what this assertion is for is a renderer that started charging BODIES for structure.
+    //
+    // The `of N` figure read `700030` until AC10's test dumped the real warn beside the real
+    // journal row. A's stored context is its whole output VALUE — `{"model":"small","text":…}`,
+    // an envelope of `22 + "small".len()` around the body — so the number is 700 027. The 46-byte
+    // decomposition is unaffected (both figures are six digits), which is exactly why nothing
+    // caught it: no assertion in this file consumed the literal.
+    assert!(
+        section_budget - *retained_bytes < 128,
+        "and they are nearly all of it — the gap is the section head, one heading and one \
+         truncation marker: {retained_bytes} against {section_budget}"
+    );
+    assert!(
+        *retained_bytes < OVERSIZED_DEP_BYTES as u64,
+        "while still being strictly less than what was asked for — this WAS a cut"
+    );
+}
+
+/// A `RunStarted` with no cap — the row every pre-seeded journal needs before any other
+/// event, since `fold_journal` reads the version fence off it.
+fn run_started_unbudgeted() -> JournalEvent {
+    JournalEvent::RunStarted {
+        version: "v1".into(),
+        budget: None,
+    }
+}
+
+/// Every `ContextBudgeted` row in a journal, whole — the caller destructures the fields it
+/// is asserting on, so a test that cares about `dropped_tools` and one that only cares
+/// whether a row exists at all share one reader.
+async fn budget_rows(journal: &InMemoryJournal, run: RunId) -> Vec<JournalEvent> {
+    journal
+        .load(run)
+        .await
+        .expect("loads")
+        .iter()
+        .filter(|(_, e)| matches!(e, JournalEvent::ContextBudgeted { .. }))
+        .map(|(_, e)| e.clone())
+        .collect()
+}
+
+/// **Review Critical — an UN-budgeted turn survives a window that shrinks under it.**
+///
+/// The complement of AC4, and the case the design did not consider. AC11 makes an
+/// in-window turn journal nothing durable, so the ABSENCE of a `ContextBudgeted` row is
+/// indistinguishable from "not budgeted yet". Before this slice `system` did not depend on
+/// the window at all, so an operator's config edit could not disturb a memoized turn; the
+/// budget made `max_context_window(chain)` an input to the prompt for the first time, and
+/// fencing only the BUDGETED decision left the un-budgeted majority exposed in the
+/// opposite direction:
+///
+/// drive 1 dispatches turn 0 in-window (memo written, no budget row) → the window shrinks
+/// → drive 2 finds no budget row, reads the smaller window, CUTS, and `agent_input_hash`
+/// no longer matches the memo → `DeterminismViolation` → `Err` out of `start` →
+/// `Scheduler::record` files the run terminal `Failed` → `force_wake` matches only
+/// `status = 'paused'`, so **no supported command revives it**. Restoring the config does
+/// not help either: the spurious `ContextBudgeted` row is appended BEFORE the memo hash is
+/// checked, so drive 3 takes the replay arm and mismatches forever.
+///
+/// The fix is to fence the DECISION rather than the integer: a memo at
+/// `effect_id(node, 0, 0)` with no budget row for that key proves turn 0 was dispatched
+/// un-budgeted, so the window is not read at all and `parts.join()` is reproduced verbatim.
+///
+/// # Why the run has to die MID-node, and why drive 2 pauses
+///
+/// A completed run short-circuits (`agent_node_terminal_resume_yields_canonical_output_shape`),
+/// so turn 0's hash would never be recomputed. B therefore dies at turn 1 with turn 0
+/// journaled.
+///
+/// Drive 2 then PAUSES rather than completing, and that is arithmetic rather than a
+/// concession: the drift needs the new window to be under turn 0's estimate, and turn 1's
+/// prompt strictly contains turn 0's — so any window that would re-budget turn 0 also gates
+/// turn 1. The recoverable gate pause is the correct outcome; the terminal
+/// `DeterminismViolation` is the one this test exists to rule out.
+#[tokio::test]
+async fn an_unbudgeted_turn_replays_after_the_window_shrinks_under_it() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = oversized_context_graph();
+
+    // Drive 1, on the TWO-WINDOW chain: B's prompt is ~10k tokens — over `small` (4096) and
+    // comfortably under `big` (200 000) — so `big` serves it UN-budgeted and nothing durable
+    // records a budget. Turn 0 is a `calc` tool call; turn 1 exhausts the script and the node
+    // dies mid-loop, so no `RunCompleted` is written and drive 2 must re-enter the loop.
+    let (gw1, calls1, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(IN_WINDOW_DEP_BYTES)),
+        tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}"),
+    ])
+    .await;
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content.clone())
+        .with_context_store(ctx.clone())
+        .run(run, &graph)
+        .await
+        .expect("drive 1 yields an outcome");
+    assert!(
+        out1.failed.is_some(),
+        "drive 1 dies at turn 1 with turn 0 journaled — a completed run would short-circuit \
+         the resume and never recompute the hash: {out1:?}"
+    );
+    assert_eq!(
+        calls1.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        3,
+        "A's call, B's turn 0, and B's failing turn 1"
+    );
+    assert!(
+        budget_rows(&journal, run).await.is_empty(),
+        "and drive 1 budgeted NOTHING — the prompt fitted the largest window, which is the \
+         premise of this whole scenario (AC11)"
+    );
+
+    // The operator edits the catalog: chain `"c"` now resolves to ONE model with a
+    // 4096-token window. This is invisible to every fence — `GatewayConfig` carries no
+    // version field — and it is what a worker restart against an edited config looks like.
+    let (gw2, calls2) = scripted_gateway(vec![final_response("would be turn 1")]).await;
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &graph)
+        .await
+        .expect(
+            "drive 2 must NOT die: a DeterminismViolation here is terminal and no supported \
+             command revives the run",
+        );
+    assert!(
+        out2.failed.is_none(),
+        "and it must not fail the node either: {:?}",
+        out2.failed
+    );
+    assert!(
+        budget_rows(&journal, run).await.is_empty(),
+        "and STILL no budget row: drive 2 must not retroactively budget a turn that was \
+         already dispatched un-budgeted. A row here is the durable poison that makes the \
+         damage survive restoring the config"
+    );
+    let events = journal.load(run).await.expect("loads");
+    let turn0 = effect_id("B", 0, 0);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, e)| matches!(
+                e,
+                JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &turn0
+            ))
+            .count(),
+        1,
+        "turn 0's model call is recorded ONCE across both drives — it replayed from its memo \
+         rather than being re-dispatched against a budget recomputed from the new window"
+    );
+    assert!(
+        calls2.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "and drive 2 spent nothing: turn 0 replayed, and turn 1 is over the new 4096 window so \
+         the gate refuses it before any dispatch"
+    );
+    let pause = out2.paused.as_ref().expect(
+        "drive 2 pauses on the gate — turn 1's prompt strictly contains turn 0's, so a window \
+         small enough to re-budget turn 0 cannot serve turn 1",
+    );
+    assert!(
+        pause.reason.contains("context window"),
+        "with the gateway's own per-candidate diagnosis, not a budget-flavoured paraphrase: {}",
+        pause.reason
+    );
+}
+
+/// A dependency body that busts the SMALL window but fits the BIG one, so the dependent's
+/// turn is served UN-budgeted — the premise of
+/// `an_unbudgeted_turn_replays_after_the_window_shrinks_under_it`.
+///
+/// Both bounds matter. Over `3 × TWO_WINDOW_SMALL` bytes (the estimator is `ceil(bytes/3)`)
+/// or the prompt fits 4096 in drive 2 as well and drive 2 never budgets — the test would
+/// then pass without the fence. Under `3 × TWO_WINDOW_BIG` or drive 1 budgets, which is
+/// AC4's scenario rather than this one.
+const IN_WINDOW_DEP_BYTES: usize = 30_000;
+
+/// **Review Important — the floor pause must not fire when the UNCUTTABLE half is what does
+/// not fit.**
+///
+/// `plan_budget` returns `None` from `available.checked_sub(authored_bytes)` long before the
+/// floor is consulted, and treating every `None` as a floor failure blames the dependency
+/// context and the 25% floor for a refusal neither caused. The remedies it names — shorten
+/// the upstream output, split the node — cannot work: the agent's own authored bytes are
+/// what overran the window, and they are never cut (spec §5.2). It was also non-monotonic:
+/// the same agent with ZERO dependency bytes fell through to the accurate gate diagnosis,
+/// and adding one 100-byte dependency replaced it with a worse and false one.
+///
+/// So the rule is: **SP-7b refuses only when a cut that FITS exists and retains too little.**
+/// When no cut can fit — the authored half alone overruns the budget, or the transcript plus
+/// the output reserve already fills the window — the prompt goes to selection unbounded and
+/// the GATE refuses it, per candidate, with its own window figures and remedy. Nothing is
+/// dispatched either way: this arm's own guard has already established the un-cut prompt is
+/// over the LARGEST window, which is exactly the predicate `ContextWindowGate` skips on.
+///
+/// The fixture is the authored-dominant one (spec §3: a 100 000-byte system prompt) plus ONE
+/// small dependency, which is the combination no existing test covered —
+/// `oversized_dependency_context_halts_over_budget_never_truncates` has a tiny authored half
+/// where the floor genuinely IS the binding constraint, and
+/// `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying` has no dependency at
+/// all, so it was covered by the `requested == 0` guard that this arm replaces and never
+/// exercised the authored-versus-floor distinction at all.
+#[tokio::test]
+async fn an_authored_dominant_prompt_is_refused_by_the_gate_not_by_the_floor() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // A produces a SMALL body, so B's `requested_context_bytes` is non-zero but nowhere near
+    // the binding constraint: 100 000 authored bytes against a 4096-token window is.
+    let (gw, calls) = scripted_gateway(vec![final_response("tiny")]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    let pause = out
+        .paused
+        .as_ref()
+        .expect("the prompt is over every window, so it still halts");
+    assert_eq!(pause.node.0, "B");
+    assert!(
+        !pause.reason.starts_with("context budget: "),
+        "and the halt is the GATE's, not SP-7b's floor: a 25% floor on a 100-byte dependency \
+         was never the binding constraint, and shortening the upstream output cannot fix a \
+         100 000-byte system prompt: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("larger context window"),
+        "so the operator gets the per-candidate diagnosis and the remedy that works: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("4096"),
+        "naming the candidate's own window — the number to change: {}",
+        pause.reason
+    );
+    assert!(
+        out.failed.is_none(),
+        "and it pauses recoverably rather than failing: {:?}",
+        out.failed
+    );
+    assert!(
+        budget_rows(&journal, run).await.is_empty(),
+        "nothing was budgeted, so nothing is journaled"
+    );
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "and only A was dispatched — the gate refuses B before any spend"
+    );
+}
+
+/// **Review Important — a replayed cut drops the JOURNALED schemas, not a recomputed set.**
+///
+/// `ContextBudgeted` records `dropped_tools`, and the replay arm ignored it: it re-ran
+/// `plan_budget`, so the replayed prompt was a function of THIS BINARY's budgeting
+/// arithmetic — `CONTEXT_FLOOR_FRACTION` (which the spec says exists to be re-tuned once
+/// AC10's warn supplies a measurement), `context_section_overhead`'s reservation, and
+/// `tool_bytes`. Any edit to any of them changes which schemas are dropped, which changes
+/// both `system` and `tools`, which changes `agent_input_hash` — a `DeterminismViolation` on
+/// the next resume of every in-flight budgeted run, filed terminal-`Failed` and unrevivable.
+/// The executor version fence cannot catch it: it compares the hand-set string `"v1"`.
+///
+/// The journal already holds the answer, so the replay reads it. This test seeds a budget
+/// whose `dropped_tools` names `calc` while `budget_bytes` is far too large for any
+/// recomputation to drop anything — so the two answers differ, and the dispatched request
+/// says which one was used.
+///
+/// Mutation: restore `plan_budget(available, authored, tools, entries)` on the replay arm
+/// and `calc`'s schema comes back, because 100 000 bytes has room for it.
+#[tokio::test]
+async fn a_replayed_cut_drops_the_journaled_schemas_not_a_recomputed_set() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(run, run_started_unbudgeted())
+        .await
+        .expect("appends");
+    journal
+        .append(
+            run,
+            JournalEvent::ContextBudgeted {
+                node: NodeId("n1".into()),
+                effect_id: effect_id("n1", 0, 0),
+                // Room for everything: a recomputed plan drops NOTHING at this size, which is
+                // what makes the assertion below discriminate.
+                budget_bytes: 100_000,
+                source_window: FIXTURE_CONTEXT_WINDOW,
+                retained_bytes: 0,
+                dropped_deps: 0,
+                dropped_tools: vec!["calc".into()],
+            },
+        )
+        .await
+        .expect("appends");
+
+    let (gw, calls, tool_names) =
+        scripted_tool_watching_gateway(vec![final_response("done")]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .start(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("drives");
+
+    assert!(out.failed.is_none(), "no failure: {:?}", out.failed);
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "one turn was dispatched"
+    );
+    assert_eq!(
+        tool_names.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec![Vec::<String>::new()],
+        "and it carried NO schemas — the journal says `calc` was dropped on the writing \
+         drive, and the replay reproduces that rather than re-deciding it from this binary's \
+         floor and overhead arithmetic"
+    );
+}
+
+/// **AC4 — the slice's central claim.** A budgeted turn replays its cut even though the
+/// window CHANGED underneath it.
+///
+/// The changed window is what makes this non-vacuous. Pinning a replay with an unchanged
+/// window passes without any of the journaling, because the recomputed budget happens to
+/// match. So drive 1 budgets against `TWO_WINDOW_BIG`, the catalog then says 300 000, and
+/// drive 2 must still dispatch drive 1's cut — because it reads `budget_bytes` out of the
+/// journal and never asks the gateway at all.
+///
+/// Without the journaling this is not a soft failure. The recomputed cut is BIGGER (a bigger
+/// window buys more context), so `system` differs, `agent_input_hash` differs from turn 0's
+/// memo, and `agent_turn_output` returns `DeterminismViolation` — which `Scheduler::record`
+/// files as terminal `Failed`, and `force_wake` matches only `status = 'paused'`. No
+/// supported command revives it.
+///
+/// # Why the run has to die MID-node
+///
+/// A completed agent node resumes from its folded outcome without re-entering the ReAct loop
+/// (`agent_node_terminal_resume_yields_canonical_output_shape`), so the hash would never be
+/// recomputed and this test would pass with the whole mechanism deleted. Drive 1 therefore
+/// dies at turn 1 with turn 0 journaled.
+///
+/// # Mutation-verified three ways
+///
+/// - `let journaled = None` — drive 2 recomputes from the 300 000 window, the cut differs,
+///   and drive 2 dies `DeterminismViolation`. This is the mutation that proves the design.
+/// - deleting the `ContextBudgeted` append — same failure, one drive later: with nothing
+///   journaled drive 2 recomputes for the same reason.
+/// - folding LAST-wins (`.insert` for `.entry().or_insert_with()`) — covered by
+///   `the_first_context_budget_wins`, and this test's single row leaves it green, which is
+///   why that guard is a separate one.
+#[tokio::test]
+async fn a_budgeted_turn_replays_after_the_window_changes_underneath_it() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = oversized_context_graph();
+
+    // Drive 1: A's 700 000-byte output makes B's prompt ~233k tokens, over BOTH windows, so
+    // it is cut to fit `big` (200 000) and dispatched. Turn 0 calls `calc`; turn 1 exhausts
+    // the script and the node dies mid-loop.
+    let (gw1, calls1, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}"),
+    ])
+    .await;
+    let out1 = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content.clone())
+        .with_context_store(ctx.clone())
+        .run(run, &graph)
+        .await
+        .expect("drive 1 yields an outcome");
+    assert!(
+        out1.failed.is_some(),
+        "drive 1 dies at turn 1, with turn 0 and its budget journaled: {out1:?}"
+    );
+    let turn0_eid = effect_id("B", 0, 0);
+    let drive1_budget = match &budget_rows(&journal, run).await[..] {
+        [
+            JournalEvent::ContextBudgeted {
+                effect_id,
+                budget_bytes,
+                source_window,
+                ..
+            },
+        ] => {
+            assert_eq!(effect_id, &turn0_eid);
+            assert_eq!(
+                *source_window, TWO_WINDOW_BIG,
+                "drive 1 budgeted against the chain's LARGEST window"
+            );
+            *budget_bytes
+        }
+        other => panic!("exactly one budget row after drive 1: {other:?}"),
+    };
+    let calls_after_1 = calls1.lock().unwrap_or_else(|e| e.into_inner()).len();
+    assert_eq!(calls_after_1, 3, "A, B's turn 0, and B's failing turn 1");
+
+    // The catalog now says 300 000 — enough to serve drive 1's cut, and DIFFERENT, which is
+    // the whole point. `update_config` validates nothing and no fence sees it
+    // (`GatewayConfig` has no version field), so this is exactly the drift the journaling
+    // exists to survive.
+    let (gw2, calls2) =
+        wide_window_scripted_gateway(300_000, vec![final_response("budgeted-answer")]).await;
+    let out2 = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &graph)
+        .await
+        .expect("drive 2 must NOT return DeterminismViolation");
+
+    assert!(out2.failed.is_none(), "no failure: {:?}", out2.failed);
+    assert!(out2.paused.is_none(), "and no pause: {:?}", out2.paused);
+    assert_eq!(
+        out2.outputs
+            .get(&NodeId("B".into()))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str()),
+        Some("budgeted-answer"),
+        "B finished on the resume: {:?}",
+        out2.outputs.get(&NodeId("B".into()))
+    );
+    // Channel 3 on a RESUMED node, which is the one drive this arm produces and nothing else
+    // asserted. `a_degraded_turn_discloses_on_every_channel` exercises only the FRESH-budget
+    // arm, so `(s, t, Some(c))` on the journaled-replay arm could be flipped to `None` with
+    // the whole suite green — silently removing disclosure from every resumed budgeted node.
+    // The key does NOT follow the once-per-node rule the `warn!` and the journal row follow:
+    // those describe an EVENT that happened once, this describes the ANSWER, which is degraded
+    // on every drive that returns it.
+    assert_eq!(
+        out2.outputs
+            .get(&NodeId("B".into()))
+            .and_then(|b| b.get("context_budgeted"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "and it still says the context was cut, on the drive that REPLAYED the cut rather \
+         than deciding it: {:?}",
+        out2.outputs.get(&NodeId("B".into()))
+    );
+    assert_eq!(
+        calls2.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "and ZERO re-spend on turn 0 — the single call is turn 1's. A recomputed budget \
+         would have re-dispatched nothing either (it would have died first), so this is \
+         asserted beside the row count below rather than alone"
+    );
+    let rows = budget_rows(&journal, run).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "still exactly ONE budget row across BOTH drives (AC3): the replay reads, it does \
+         not re-record: {rows:?}"
+    );
+    assert!(
+        matches!(
+            &rows[0],
+            JournalEvent::ContextBudgeted { budget_bytes, source_window, .. }
+                if *budget_bytes == drive1_budget && *source_window == TWO_WINDOW_BIG
+        ),
+        "and it is drive 1's row, unmoved — a 300 000-token window would have budgeted \
+         {} bytes: {:?}",
+        3 * (300_000 - orchestrator_core::MIN_OUTPUT_TOKENS - 2),
+        rows[0]
+    );
+    assert_eq!(
+        journal
+            .load(run)
+            .await
+            .expect("loads")
+            .iter()
+            .filter(|(_, e)| matches!(
+                e,
+                JournalEvent::EffectRecorded { effect_id, .. } if effect_id == &turn0_eid
+            ))
+            .count(),
+        1,
+        "turn 0's model effect is recorded ONCE across both drives — it replayed from its \
+         memo rather than being re-run. `calls2 == 1` alone cannot show this: a wrongly \
+         re-run turn 0 would consume that one scripted response and finalize"
+    );
+}
+
+/// **AC9's SHAPE — the floor pause is recoverable, and nothing else asserts that.**
+///
+/// `oversized_dependency_context_halts_over_budget_never_truncates` is the only other test
+/// that reaches this refusal, and it keys on a substring (`"4096-token context window"`) that
+/// the old GATE message and the new FLOOR message both happen to carry. So every property
+/// that makes this pause survivable was shipped on prose:
+///
+/// - `resume_after: None` is the HOTL class. A `Some(t)` would have the scheduler auto-wake
+///   the run at `t` into the identical refusal, forever, since no passage of time makes a
+///   model's window bigger.
+/// - No `NodeFailed`. A node failure is what the M1 reversal was done to remove:
+///   `force_wake` matches only `status = 'paused'`, `torii run wake` answers "not queued",
+///   and `submit` refuses a used id, so a failed run leaves every completed node's memo and
+///   spend durable and unreachable.
+/// - Exactly ONE durable pause row, which is what `list_paused` and `force_wake` key on.
+/// - Nothing budgeted and nothing dispatched: a refusal that had already paid for the turn
+///   would be the worst of both.
+///
+/// Mutation-verified: flipping `resume_after` to `Some(now)` and adding a `NodeFailed` beside
+/// the pause each redden this test alone, and each leaves the whole rest of the suite green.
+#[tokio::test]
+async fn the_context_floor_pause_is_recoverable_and_spends_nothing() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // The 4096-token chain: `available` is 3 × (4096 − 256 − 2) = 11 514 bytes, and a
+    // 100 000-byte dependency puts the 25% floor at 25 000+ — unreachable however many
+    // schemas are dropped, which is `BudgetRefusal::FloorUnreachable`, SP-7b's own refusal.
+    let (gw, calls) = scripted_gateway(vec![final_response(&"x".repeat(100_000))]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    let pause = out.paused.as_ref().expect("the floor refuses this turn");
+    assert_eq!(pause.node.0, "B");
+    assert!(
+        pause.reason.starts_with("context budget: "),
+        "and it is SP-7b's own refusal rather than the gate's — the prefix is what tells the \
+         two apart, since both name the window: {}",
+        pause.reason
+    );
+
+    let events = journal.load(run).await.expect("loads");
+    let pauses: Vec<&Option<chrono::DateTime<chrono::Utc>>> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::RunPaused { resume_after, .. } => Some(resume_after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pauses.len(),
+        1,
+        "exactly one durable pause row — `list_paused` and `force_wake` both key on it"
+    );
+    assert!(
+        pauses[0].is_none(),
+        "and its `resume_after` is NULL: the HOTL class. A deadline here would auto-wake the \
+         run into the identical refusal forever, because the remedy is a config change and \
+         nothing about waiting makes a window bigger"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::NodeFailed { .. })),
+        "and NO `NodeFailed`: a failed run is unreachable by `force_wake`, which is the \
+         unrecoverable state the M1 reversal was done to remove"
+    );
+    assert!(
+        budget_rows(&journal, run).await.is_empty(),
+        "nothing was budgeted — the refusal is the alternative to a cut, not a record of one"
+    );
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "and only A was dispatched: the floor halts B before any spend"
+    );
+    assert!(
+        !out.outputs.contains_key(&NodeId("B".into())),
+        "and B produced no output — half a document never becomes work product"
+    );
+}
+
+/// **A budgeted node is effectively SINGLE-TURN, and this is where that is written down.**
+///
+/// `available_context_bytes` spends the window down to `MIN_OUTPUT_TOKENS`, so a budgeted turn 0
+/// is dispatched at AT MOST `window − 256` tokens and the transcript's guaranteed headroom is 256
+/// tokens — 768 bytes. The bound is tight HERE, and the assertion below states the equality only
+/// for this fixture: one dependency cannot be split unevenly, so the renderer's even split leaves
+/// nothing unspent. A node with a 10-byte dependency beside a 10-KiB one dispatches strictly
+/// under the bound, because the even split never redistributes the small entry's unused share.
+/// A ReAct agent that then calls a tool
+/// re-sends `system` plus the assistant turn (whose `tool_calls.name + arguments` the
+/// estimator counts) plus the tool result, and anything over that headroom puts turn 1 over
+/// every candidate's window: the gate skips them all and the run takes the `AllGated` HOTL
+/// pause — AFTER paying for turn 0, on a prompt the slice had just declared to fit.
+///
+/// Spec §2 excludes the TRANSCRIPT from being budgeted; it never promised the transcript any
+/// room, and this test is where those two facts meet. It asserts the pause rather than
+/// wishing it away, so that reserving real growth headroom later is a VISIBLE change with a
+/// number attached, rather than an invisible improvement to behaviour nobody had pinned.
+///
+/// The padding rides in the tool call's `arguments`, which is not a contrivance: those bytes
+/// are authored by the MODEL, are unbounded, and are counted by the estimator for exactly the
+/// reason its own comment gives (an assistant turn carries everything there and nothing in
+/// its text body). `Calc` reads `op`/`a`/`b` by key and ignores the rest.
+#[tokio::test]
+async fn a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    // 2 000 bytes of arguments ⇒ ~667 tokens of transcript growth against 256 tokens of
+    // headroom. Comfortably over, so the case is the RULE rather than a rounding boundary.
+    let padded_args = format!(
+        "{{\"op\":\"add\",\"a\":2,\"b\":3,\"note\":\"{}\"}}",
+        "z".repeat(2_000)
+    );
+    let (gw, calls, ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        tool_call_response("t1", "calc", &padded_args),
+        final_response("never reached"),
+    ])
+    .await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    assert_eq!(
+        budget_rows(&journal, run).await.len(),
+        1,
+        "turn 0 was budgeted — the premise"
+    );
+    let seen = ests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        seen.len(),
+        2,
+        "A's call and B's turn 0 reached the provider, and turn 1 did NOT: {seen:?}"
+    );
+    assert_eq!(
+        seen[1],
+        TWO_WINDOW_BIG - orchestrator_core::MIN_OUTPUT_TOKENS as u32,
+        "and turn 0 was dispatched at exactly `window − MIN_OUTPUT_TOKENS`, which is the \
+         measurement this whole test exists to record: the reserve is ALL the room the \
+         transcript has left. The equality is this FIXTURE's — one dependency, so the \
+         renderer's even split leaves nothing unspent; in general the budget is an upper \
+         bound and an unevenly-split node dispatches under it"
+    );
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        2,
+        "so the turn-0 spend happened and turn 1 never dispatched"
+    );
+    let pause = out.paused.as_ref().expect(
+        "turn 1 is over every candidate's window, so the gate refuses it and the run pauses \
+         recoverably",
+    );
+    assert_eq!(pause.node.0, "B");
+    assert!(
+        !pause.reason.starts_with("context budget: "),
+        "it is the GATE's refusal, not a second SP-7b cut: `system` was budgeted once, above \
+         the turn loop, and the transcript is out of scope (spec §2): {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("larger context window"),
+        "with the remedy that actually applies to a transcript nobody is budgeting: {}",
+        pause.reason
+    );
+    assert!(
+        out.failed.is_none(),
+        "and it is a pause, not a failure — the run keeps turn 0's spend reachable: {:?}",
+        out.failed
+    );
+}
+
+/// **AC10 — all four disclosure channels fire on ONE degraded turn.**
+///
+/// The hazard the pre-SP-7b docs name is a degraded answer flowing downstream as work product
+/// indistinguishable from a full one. Four channels answer it, and this is the only place their
+/// COMPOSITION is asserted: each is individually cheap to break without the others noticing, and
+/// they are produced at three separate points — the renderer (`prompt.rs`), the arm that decides
+/// to cut, and `finish_agent`, a whole ReAct loop later.
+///
+/// - **The model** reads the per-entry truncation marker in the dispatched `system` half. That the
+///   RENDERER emits one is `prompt::tests`' subject; that the marked bytes are what reached the
+///   provider is only observable here, and it is the channel the floor's whole argument rests on
+///   (a model shown a clipped document with no sign it was clipped answers about the part it was
+///   given as though it were the whole). The `(N of M dependencies shown)` tail is the OTHER
+///   model-facing signal and it is deliberately not asserted here: it announces DROPPED entries,
+///   and this cut truncated its one dependency instead — `dropped_deps` below is 0, asserted.
+///   `a_context_section_that_drops_dependencies_says_how_many` is where that half lives.
+/// - **The journal** carries `ContextBudgeted` (AC3).
+/// - **Downstream** gets an ADDITIVE `context_budgeted` key beside an untouched `text`.
+/// - **The operator** gets a `warn!`, and its figures are asserted AGAINST THE JOURNAL ROW rather
+///   than re-derived here, so a warn that reports the wrong field (retained where requested
+///   belongs, say) reddens instead of agreeing with a copy of its own arithmetic.
+///
+/// The fixture is AC2's: `A (model_call) → B (agent)`, A's `OVERSIZED_DEP_BYTES` output busting
+/// both windows. The content and context stores are wired because `resolve_context` returns EMPTY
+/// without a `ContextStore`, which would give B no dependency context, no over-window prompt and
+/// a green test proving nothing.
+#[tokio::test]
+async fn a_degraded_turn_discloses_on_every_channel() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let (capture, _guard) = CapturingSubscriber::install();
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gateway, _calls, _ests, systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        final_response("budgeted-answer"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    // Channel 3 — downstream. ADDITIVE: `text` must survive untouched beside the new key, so an
+    // unmodified `BranchCond::TextContains` consumes a degraded answer exactly as before. Same
+    // discipline SP-6 s3 used when it added `actor` to a human-backed agent's output.
+    let b = out
+        .outputs
+        .get(&NodeId("B".into()))
+        .expect("the budgeted node completed");
+    assert_eq!(
+        b.get("context_budgeted").and_then(|v| v.as_bool()),
+        Some(true),
+        "the output must say the context was degraded: {b}"
+    );
+    assert_eq!(
+        b.get("text").and_then(|t| t.as_str()),
+        Some("budgeted-answer"),
+        "and `text` is untouched beside it — the key is added, not substituted for: {b}"
+    );
+
+    // Channel 2 — the journal. Read first because channel 4's figures are asserted against it.
+    let rows = budget_rows(&journal, run).await;
+    let JournalEvent::ContextBudgeted {
+        source_window,
+        retained_bytes,
+        dropped_deps,
+        dropped_tools,
+        ..
+    } = rows.first().expect("exactly one ContextBudgeted (AC3)")
+    else {
+        unreachable!("filtered by `budget_rows`")
+    };
+    assert_eq!(rows.len(), 1, "and only one: {rows:?}");
+    assert_eq!(
+        *dropped_deps, 0,
+        "this cut TRUNCATED its one dependency rather than dropping it — which is why the \
+         `N of M dependencies shown` tail is not among the signals asserted below, and why \
+         saying so in this test's doc is a claim and not a hedge"
+    );
+
+    // What B was actually given to read: A's whole output value, serialized — the `{"model":…,
+    // "text":…}` envelope included, since that is what `ContextWrite` carries and what
+    // `resolve_context` hands back. Taken from the run rather than written as a literal: the
+    // envelope's width depends on which model selection picked for A, and a hand-computed
+    // constant here would be a quantified claim with nothing behind it.
+    let requested = out
+        .outputs
+        .get(&NodeId("A".into()))
+        .expect("A completed")
+        .to_string()
+        .len();
+    assert!(
+        requested > OVERSIZED_DEP_BYTES,
+        "the envelope only ever ADDS to the body: {requested}"
+    );
+
+    // Channel 1 — the model. The system half that actually reached the provider.
+    let dispatched = systems.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let budgeted: Vec<&String> = dispatched
+        .iter()
+        .flatten()
+        .filter(|s| s.contains("## Context"))
+        .collect();
+    assert_eq!(
+        budgeted.len(),
+        1,
+        "exactly one dispatched prompt carried a `## Context` section — B's turn 0. A's is a \
+         `ModelCall` and has no system half at all: {dispatched:?}"
+    );
+    assert!(
+        budgeted[0].contains(" bytes shown)"),
+        "and it admits to having been cut, in the model's own channel — without the marker the \
+         model answers about a clipped document as though it were whole"
+    );
+    assert!(
+        budgeted[0].contains(&format!("of {requested} bytes shown")),
+        "naming the FULL size it was cut from, so the model can size its own ignorance"
+    );
+
+    // Channel 4 — the operator, and the instrument that is meant to replace
+    // `CONTEXT_FLOOR_FRACTION`'s guess with a measurement.
+    let signals = capture.context_budget_signals();
+    let warn = match &signals[..] {
+        [one] => one,
+        other => panic!("exactly one context-budget warn, for the one budgeted turn: {other:?}"),
+    };
+    assert_eq!(
+        (
+            warn.field("window"),
+            warn.field("retained_bytes"),
+            warn.field("dropped_deps"),
+            warn.field("dropped_tools"),
+        ),
+        (
+            Some(u64::from(*source_window)),
+            Some(*retained_bytes),
+            Some(u64::from(*dropped_deps)),
+            Some(dropped_tools.len() as u64),
+        ),
+        "and it reports the SAME cut the journal recorded — asserted against the row rather \
+         than re-derived, so a warn wired to the wrong field cannot agree with a copy of its \
+         own arithmetic: {warn:?} against {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        warn.field("requested_bytes"),
+        Some(requested as u64),
+        "with the figure the journal row does NOT carry — what was ASKED for. Without it the \
+         retained byte count is a number with no denominator, and the whole point of this \
+         channel is to measure the ratio the floor is a guess at"
+    );
+    assert!(
+        warn.field("requested_bytes") > warn.field("retained_bytes"),
+        "which is strictly more than what survived, or nothing was degraded: {warn:?}"
+    );
+}
+
+/// **Review Important — channel 3 must survive a READ-BACK, not just the drive that wrote it.**
+///
+/// Every other `context_budgeted` assertion in this file — AC10's, AC11's absence check, and
+/// the resumed one in `a_budgeted_turn_replays_after_the_window_changes_underneath_it` — reads
+/// `outputs` off a drive that came through `finish_agent`, where the key is synthesized. A
+/// completed run has a SECOND read path that does not: `start()` on an already-terminal journal
+/// short-circuits (`start_inner`'s `terminal` branch) and rebuilds each node's output from
+/// `fold_journal`'s `node_last_output`, which is populated only from `EffectRecorded` — the raw
+/// `{model, text, tool_calls}` model turn, a value that never carried the key, since nothing
+/// journals it with the output. `project_agent_outputs` then rebuilt exactly `{model, text}`.
+///
+/// So the same run reported a degraded node as degraded when read on the writing drive and as
+/// UN-degraded when read afterwards. `start` is the public resume entry point and that branch is
+/// a shipped, tested path (`agent_node_terminal_resume_yields_canonical_output_shape`); in-tree
+/// its one caller is `Scheduler::tick` (`scheduler.rs:115`), which re-drives a claimed run, and
+/// a run whose journal already carries `RunCompleted` lands on exactly this branch — a crash
+/// between the journal's `RunCompleted` and the store's terminal record leaves the `'waking'`
+/// row for the lease to reclaim and re-drive. Channel 3's entire purpose is that a degraded
+/// answer is not consumed as work product indistinguishable from a full one, so a read path that
+/// silently drops it is the hazard AC10 exists to close, arriving through the door nobody was
+/// watching. It is the same flattening SP-6 s3 had to exempt `actor` from
+/// (`the_projection_preserves_a_human_answer_and_leaves_model_outputs_canonical`); SP-7b's key
+/// got the precedent cited and not applied.
+///
+/// The key is NOT recoverable from the projected output — it was never there — so the
+/// projection reads the durable row instead: `fold.context_budgets` is keyed
+/// `effect_id(node, 0, 0)`, which is exactly what the writing drive's `context_cut.is_some()`
+/// tracks (a budget row is appended on the one arm that sets it, and read back on the replay
+/// arm that re-sets it). No new event is needed.
+///
+/// Asserted as byte-identity against the writing drive's own output rather than on the key
+/// alone, so a projection that added the key but dropped `text`, invented `model: null`, or
+/// leaked `tool_calls` back in reddens here too.
+#[tokio::test]
+async fn a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = oversized_context_graph();
+    let b = NodeId("B".into());
+
+    // Drive 1: AC2's fixture, driven to completion. A's 700 000-byte output busts both
+    // windows, B's context is cut, B answers.
+    let (gw1, _calls1, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(OVERSIZED_DEP_BYTES)),
+        final_response("budgeted-answer"),
+    ])
+    .await;
+    let first = Executor::new(Arc::new(gw1), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content.clone())
+        .with_context_store(ctx.clone())
+        .start(run, &graph)
+        .await
+        .expect("drive 1 drives");
+    assert!(first.failed.is_none(), "no failure: {:?}", first.failed);
+    assert!(first.paused.is_none(), "no pause: {:?}", first.paused);
+
+    // The two premises, or drive 2 below proves nothing. (a) The run really is TERMINAL, so
+    // drive 2 takes the short-circuit branch rather than re-driving into `finish_agent` — which
+    // would re-synthesize the key and make this test pass with the projection untouched.
+    let before = journal.load(run).await.expect("loads");
+    assert!(
+        before
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "drive 1 journaled `RunCompleted`"
+    );
+    // (b) It really was BUDGETED, so there is something to disclose.
+    assert_eq!(
+        budget_rows(&journal, run).await.len(),
+        1,
+        "and B's context really was cut"
+    );
+    assert_eq!(
+        first.outputs[&b]
+            .get("context_budgeted")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "which the writing drive discloses (AC10, restated here as this test's baseline): {}",
+        first.outputs[&b]
+    );
+
+    // Drive 2: the read-back, on a gateway with an EMPTY script so a live turn cannot happen.
+    let (gw2, calls2, _e2, _s2) = two_window_scripted_window_watching_gateway(vec![]).await;
+    let second = Executor::new(Arc::new(gw2), Arc::new(journal.clone()), "v1")
+        .with_registry(over_window_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &graph)
+        .await
+        .expect("read-back of a completed run");
+    assert_eq!(
+        calls2.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        0,
+        "nothing was re-dispatched"
+    );
+    // THE assertion that makes this test about the terminal branch, and it is not the call
+    // count above: every node is memoized, so a re-DRIVE would also make zero gateway calls —
+    // and would re-enter `finish_agent` and re-synthesize the key, passing the disclosure
+    // assertion below with the projection untouched. What a re-drive cannot do is stay silent
+    // in the journal: `finalize_run` appends `RunCompleted` on every clean drive, which is
+    // exactly what the terminal branch exists to avoid. So a growing journal here means the
+    // short-circuit was not taken and everything below proves nothing.
+    assert_eq!(
+        journal.load(run).await.expect("loads").len(),
+        before.len(),
+        "the terminal read appends nothing — no second `RunCompleted`, so the outputs below \
+         really did come from the fold and not from a re-drive"
+    );
+
+    assert_eq!(
+        second.outputs[&b]
+            .get("context_budgeted")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "a degraded answer must still say so when the finished run is read back: {}",
+        second.outputs[&b]
+    );
+    assert_eq!(
+        second.outputs[&b], first.outputs[&b],
+        "and byte-identically to the drive that produced it — same `text`, same `model`, no \
+         `tool_calls` leaked back in"
+    );
+}
+
+/// **AC11 — an IN-WINDOW turn is unchanged where it matters.**
+///
+/// Deliberately NOT claiming "nothing new runs". Deciding whether a prompt is over-window
+/// requires knowing the window, so `max_context_window` is read on every agent turn that has
+/// never been dispatched, in-window ones included. That read is a `config.read().await`
+/// returning a `u32` — no allocation, no I/O — and it is the honest cost of the feature. An
+/// earlier draft of this AC claimed the accessor is not called at all, which is false by
+/// construction.
+///
+/// What IS claimed, and asserted here: nothing durable changes, no disclosure channel fires,
+/// and the prompt that goes out carries none of the budgeting scaffolding.
+///
+/// The absence assertions are the whole test, and a no-regression test passes on arrival — so
+/// each was mutation-verified rather than assumed. Dropping `ar.context_cut.is_some()` from
+/// `finish_agent` reddens the output-key assertion; relaxing the budget arm's guard from
+/// `unbounded > w` to `unbounded > 0` reddens the journal assertion; moving the `warn!` up beside
+/// the `max_context_window` read — warning wherever the window is READ rather than where a cut is
+/// TAKEN — reddens the warn assertion. Each reddens exactly one.
+#[tokio::test]
+async fn an_in_window_agent_turn_is_unchanged() {
+    let (capture, _guard) = CapturingSubscriber::install();
+
+    let (gateway, calls, ests, systems) =
+        two_window_scripted_window_watching_gateway(vec![final_response("in-window answer")]).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .start(
+            run,
+            &Graph {
+                nodes: vec![agent_node("n1", "a", "hi")],
+            },
+        )
+        .await
+        .expect("drives");
+
+    let seen = ests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        seen.iter().all(|e| *e < TWO_WINDOW_SMALL),
+        "the premise: this prompt fits even the SMALLEST window, so no cut can be needed and \
+         every assertion below is about the un-budgeted path: {seen:?}"
+    );
+    assert!(
+        budget_rows(&journal, run).await.is_empty(),
+        "no budget is journaled for a prompt that fits — which is what makes the MEMO the \
+         fence for this half (spec §4.1) rather than a row"
+    );
+    let n1 = out.outputs.get(&NodeId("n1".into())).expect("completed");
+    assert_eq!(
+        n1.get("text").and_then(|t| t.as_str()),
+        Some("in-window answer"),
+        "the node answered: {n1}"
+    );
+    assert!(
+        n1.get("context_budgeted").is_none(),
+        "and NO disclosure key — a key emitted unconditionally would make every consumer's \
+         degradation check meaningless: {n1}"
+    );
+    assert!(
+        capture.context_budget_signals().is_empty(),
+        "and no operator warn: the instrument measures cuts, so one per agent turn would \
+         drown the signal it exists to carry: {:?}",
+        capture.context_budget_signals()
+    );
+    let dispatched = systems.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(dispatched.len(), 1, "exactly one provider call, as before");
+    assert_eq!(
+        calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        1,
+        "counted on both logs, since they are appended by different lines of the adapter"
+    );
+    let system = dispatched[0]
+        .as_ref()
+        .expect("an agent turn has a system half");
+    assert!(
+        !system.contains(" bytes shown)") && !system.contains("dependencies shown)"),
+        "and the prompt carries neither truncation marker: nothing was cut, so nothing may \
+         claim to have been: {system:?}"
+    );
+}
+
+/// **Carry-forward — the floor refusal must not report a retained figure it never measured.**
+///
+/// The two floor refusals reach `pause_context_floor` from opposite sides. The MEASURED one has
+/// rendered the section and hands over `ContextCut::retained_bytes`. The PLANNER one
+/// (`BudgetRefusal::FloorUnreachable`) refuses before `render_context_section_measured` is ever
+/// called, and it used to pass the literal `0` — a claim that nothing at all would survive.
+///
+/// That claim is wrong by most of the budget on this very fixture. A 100 023-byte dependency
+/// against the 4096-token chain leaves `3 × (4096 − 256 − 2) = 11 514` bytes to render into, and
+/// the refusal is that even ALL of them are under the 25 006 the 25% floor demands. The bound is
+/// what this doc asserts, deliberately, rather than a survivor count — a survivor count is
+/// exactly the thing the planner arm cannot know, which is the whole finding. An operator told
+/// "0 of 100 023 survive" reads a total loss and sizes the remedy — how much to shorten the
+/// upstream output by — against a number nothing measured.
+///
+/// So the planner arm reports what it KNOWS (no cut of the ones that fit clears the floor) rather
+/// than a measurement it never took. Mutation-verified: the RED run of this test showed the old
+/// message in full — `only 0 survive` — so restoring the literal reddens the second assertion,
+/// and dropping the replacement clause reddens the third.
+#[tokio::test]
+async fn the_planner_floor_refusal_reports_no_retained_figure_it_never_measured() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (gw, _calls) = scripted_gateway(vec![final_response(&"x".repeat(100_000))]).await;
+    let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools())
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &oversized_context_graph())
+        .await
+        .expect("drives");
+
+    let pause = out.paused.as_ref().expect("the floor refuses this turn");
+    assert!(
+        pause.reason.starts_with("context budget: "),
+        "the premise — this is SP-7b's own refusal, not the gate's: {}",
+        pause.reason
+    );
+    assert!(
+        !pause.reason.contains(" 0 "),
+        "and it states no retained figure, because it rendered nothing to measure. 11 514 \
+         bytes were available to render into here; the refusal is that even all of them are \
+         under the floor, not that nothing at all survives: {}",
+        pause.reason
+    );
+    assert!(
+        pause.reason.contains("no cut of it that fits"),
+        "saying instead what the planner actually established — that of the cuts which FIT, \
+         none clears the floor: {}",
+        pause.reason
+    );
+    // A's whole output value, serialized — the envelope `ContextWrite` carries, derived from
+    // the run rather than written as a literal for the reason the AC10 test gives.
+    let requested = out
+        .outputs
+        .get(&NodeId("A".into()))
+        .expect("A completed")
+        .to_string()
+        .len();
+    assert!(
+        pause.reason.contains(&format!("{requested} bytes")),
+        "while still naming what was asked for, which is the number the remedy is sized \
+         against: {}",
+        pause.reason
+    );
+}
+
+/// **AC9's MEASURED floor arm** — the check that catches the renderer under-spending a budget
+/// the planner already approved. The whole-slice review found it had no test anywhere:
+/// disabling the arm left all 1753 tests green.
+///
+/// # Why the two floors can disagree at all
+///
+/// `plan_budget` approves against the WHOLE section budget; the renderer splits that budget
+/// EVENLY across dependencies and never redistributes an unused share (spec §5.2's inherited
+/// limitation). So an unevenly-sized dependency set wastes most of the budget on the small
+/// entry, and the retained total lands under a floor the arithmetic had reserved for. That is
+/// exactly the case `plan_budget`'s own doc says a caller must handle rather than treat a plan
+/// as proof of fit — and until this test, nothing checked that the caller did.
+///
+/// The fixture is sized from the inequality rather than guessed: with `R` requested bytes and
+/// `B` available, the planner approves when `B >= 0.25R` and the render misses when
+/// `B/2 < 0.25R` — so any `B` in `[0.25R, 0.5R)` separates them. `R ≈ 1.5 MB` against the
+/// 200 000-token window's `B ≈ 599 000` sits inside that band.
+#[tokio::test]
+async fn a_budget_the_renderer_under_spends_is_refused_on_the_measured_cut() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+
+    const BIG_DEP: usize = 1_500_000;
+    const TINY_DEP: usize = 10;
+
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gateway, _calls, _ests, _systems) = two_window_scripted_window_watching_gateway(vec![
+        final_response(&"x".repeat(BIG_DEP)),
+        final_response(&"y".repeat(TINY_DEP)),
+        final_response("must-not-be-reached"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("A".into()),
+                kind: model_call("c", "big"),
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("A2".into()),
+                kind: model_call("c", "tiny"),
+                deps: vec![],
+            },
+            agent_node_with_deps("B", "a", "refine", vec![Dep::hard("A"), Dep::hard("A2")]),
+        ],
+    };
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(Arc::new(ToolRegistry::default()))
+        .with_content_store(content)
+        .with_context_store(ctx)
+        .start(run, &graph)
+        .await
+        .expect("drives");
+
+    let pause = out.paused.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the MEASURED cut must be refused even though the planner approved the budget: \
+             failed={:?} outputs={:?}",
+            out.failed,
+            out.outputs.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(pause.node.0, "B");
+    assert!(
+        pause.reason.starts_with("context budget: "),
+        "and it is SP-7b's floor that refused, not the gateway's window gate — the two used to \
+         be indistinguishable to an assertion: {}",
+        pause.reason
+    );
+    assert!(
+        out.failed.is_none(),
+        "never a NodeFailed — a failed run is unrevivable here: {:?}",
+        out.failed
+    );
+
+    // The HOTL shape (AC9), on the arm that had no test at all.
+    let events = journal.load(run).await.unwrap();
+    let pauses: Vec<&Option<chrono::DateTime<chrono::Utc>>> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            JournalEvent::RunPaused { resume_after, .. } => Some(resume_after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pauses.len(), 1, "exactly one durable pause row");
+    assert!(
+        pauses[0].is_none(),
+        "with a NULL resume_after — nothing about waiting redistributes an even split"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::ContextBudgeted { .. })),
+        "and NO budget is journaled: the turn was refused before dispatch, so a later drive \
+         must re-decide rather than replay a budget that was never used"
+    );
 }

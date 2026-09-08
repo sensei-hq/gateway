@@ -642,6 +642,78 @@ pub enum JournalEvent {
         node: NodeId,
         option: String,
     },
+    /// SP-7b: the byte budget an over-window agent turn's `## Context` half was cut to.
+    ///
+    /// **`budget_bytes` is the load-bearing field, and it is the BUDGET that is recorded
+    /// rather than the CUT.** The cut is produced by `plan_budget` and
+    /// `render_context_section_measured` (`orchestrator::agent::prompt`), which are pure over
+    /// four inputs: the available bytes, the authored bytes, the activated tool schemas and the
+    /// context entries. Three of those four are already replay-stable — the entries come from
+    /// CAS by digest, and the authored text and tool activation come from the `Registry` a run
+    /// PINS, which SP-DATA-2's `"{base}#cfg{gen}"` fence covers. The available-bytes figure is
+    /// the exception: it derives from a model's `context_window`, and `GatewayConfig`
+    /// (`kernel::types::config`) carries no version field at all, so nothing fences an operator
+    /// who edits a window between two drives of one run. Recording this integer is what makes
+    /// the cut a function of journaled values on the FIRST drive as well as on resume.
+    ///
+    /// Recording the CUT instead would mean carrying prompt-sized text inline in the event,
+    /// because replaying a cut means REPRODUCING those bytes, not checking them. The integer
+    /// is sufficient precisely because the cutter is pure.
+    ///
+    /// It is mandatory rather than defensive, and the reason is visible in the drive loop:
+    /// `Executor::drive` builds a fresh `DriveState::default()` and asks `ready_nodes` for the
+    /// ready set off THAT state — never off the fold — so every node of a resumed run is
+    /// re-driven, and `agent_turn_output` recomputes `agent_input_hash` before it consults the
+    /// memo, on every partial resume, forever. A mismatch is an
+    /// [`OrchestratorError::DeterminismViolation`](crate::error::OrchestratorError), which
+    /// `drive` propagates with `?`; `Scheduler::record` maps any drive `Err` to
+    /// `record_terminal(RunStatus::Failed)`, and `SchedulerStore::force_wake` is conditional on
+    /// `paused`. So a drifted budget would convert a verbose prompt into a run no supported
+    /// command can revive.
+    ///
+    /// FIRST record wins when folded — `entry().or_insert()`, like the `*Awaited` family and
+    /// NOT like `PlanExpanded`/`PlannerSelected`, which are both `insert`. A budget a later
+    /// record could move is not a fence.
+    ///
+    /// Of the SEVEN fields, THREE are replay inputs, and `fold_journal`
+    /// (`orchestrator::executor::support`) destructures precisely those three: `budget_bytes`
+    /// and `dropped_tools` are the replayed VALUES, and `effect_id` is the KEY they are filed
+    /// under — FIRST-wins, into `Fold::context_budgets`. So `effect_id` is as load-bearing as
+    /// the values beside it: change which turn it names and a journaled budget replays for the
+    /// wrong turn, or for none.
+    ///
+    /// **`dropped_tools` is a replay input and this paragraph said the opposite until the
+    /// whole-slice review.** It is fed to `prompt::replayed_plan`, which reproduces the cut
+    /// from the journal rather than re-deciding it — deliberately, because re-running
+    /// `plan_budget` on a resume would make every in-flight budgeted run's prompt a function of
+    /// `CONTEXT_FLOOR_FRACTION`, a constant the spec says exists to be RE-TUNED once the
+    /// operator warn produces data. `replayed_plan` is also order-sensitive
+    /// (`dropped_tools[i]` must equal `tools[n-1-i]`), so reordering the vector is as breaking
+    /// as emptying it. The false version of this sentence was introduced by the fix commit that
+    /// added the fold and the read, and it is the more dangerous half of the two: a doc at the
+    /// definition site telling a maintainer that a load-bearing field is free to change.
+    ///
+    /// The other FOUR — `node`, `source_window`, `retained_bytes`, `dropped_deps` — are
+    /// DISCLOSURE: what an audit reads to learn that a turn answered on a degraded prompt.
+    /// Nothing reconstructs the cut from them. **No `torii` command reads any of them today**
+    /// (`rg 'JournalEvent::' crates/torii/src` has no `ContextBudgeted` arm), so the operator
+    /// surface for this event is still outstanding — an earlier version of this paragraph
+    /// claimed `torii` reads them, which was aspirational rather than true. The only reader is
+    /// the exhaustive `label` test helper in `crates/orchestrator/src/executor/tests.rs`.
+    ///
+    /// (Two of these names — `retained_bytes` and `dropped_tools` — are ALSO fields of
+    /// `ContextCut` and `BudgetPlan` in `orchestrator::agent::prompt`, which the pure cutter
+    /// both writes and reads. Those are other structs entirely, not this event; a grep for
+    /// either bare name hits them, so search by field granularity, not by name.)
+    ContextBudgeted {
+        node: NodeId,
+        effect_id: EffectId,
+        budget_bytes: u64,
+        source_window: u32,
+        retained_bytes: u64,
+        dropped_deps: u32,
+        dropped_tools: Vec<String>,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
@@ -747,7 +819,7 @@ pub trait ExecutionJournal: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{FORMAT_VERSION, ObservationMeta};
-    use crate::{EffectClass, EffectOutput, JournalEvent, NodeId, effect_id};
+    use crate::{EffectClass, EffectId, EffectOutput, JournalEvent, NodeId, effect_id};
 
     /// An OLD journal — serialized before this slice — must still deserialize, with
     /// the new fields absent rather than erroring. If this fails, the change is a
@@ -1085,8 +1157,11 @@ mod tests {
     /// `an_old_journal_event_deserializes_with_the_new_fields_absent` and
     /// `adding_the_signal_events_does_not_break_old_event_loading` decode genuine
     /// pre-slice JSON literals, and those are the two that redden on that mutation.
-    /// Nothing else in the workspace asserts `FORMAT_VERSION`; the only other readers
-    /// are `PostgresJournal`'s resume fence and its `IncompatibleFormat` error.
+    /// The only other assertion in the workspace is in
+    /// `the_context_budgeted_event_round_trips`, which restates this same pin for SP-7b's
+    /// AC12 at the variant that slice added, and is equally blind to a variant being added.
+    /// The only non-test readers are `PostgresJournal`'s resume fence and its
+    /// `IncompatibleFormat` error.
     ///
     /// **Nothing in this crate notices that a variant was ADDED.** An earlier version of
     /// this doc claimed "the existing variant-count assertion in this module" did; there
@@ -1250,6 +1325,54 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// SP-7b AC12 — the `ContextBudgeted` variant round-trips and the fence stays at 1.
+    ///
+    /// The round-trip is compared as a whole `Debug` rendering rather than field by field,
+    /// because only TWO of the seven fields are read back — `budget_bytes`, the value, and
+    /// `effect_id`, the key it folds under — while the other five are disclosure, and a
+    /// disclosure field silently lost on the wire would leave `fold_journal`, the only
+    /// executor code that reads this event at all, entirely unaffected. Comparing the whole
+    /// rendering covers all seven, and any field added later, without naming them.
+    ///
+    /// The `FORMAT_VERSION` assertion here is a deliberate restatement of
+    /// `the_durable_journal_format_version_is_pinned_at_1`, not an independent guard: it is
+    /// what makes "additive variant ⇒ the fence does not move" checkable at the variant
+    /// rather than only in a test three hundred lines away. It CANNOT detect the added
+    /// variant, for the reason that test's own doc gives at length. What detects an added
+    /// variant is the exhaustive `label` helper in
+    /// `crates/orchestrator/src/executor/tests.rs`, and only under `--all-targets`.
+    ///
+    /// The other half of AC12 — "a journal written before this slice loads and folds
+    /// unchanged" — is already proven by the two tests that decode genuine pre-slice JSON
+    /// literals and now do so against the grown enum:
+    /// `an_old_journal_event_deserializes_with_the_new_fields_absent` and
+    /// `adding_the_signal_events_does_not_break_old_event_loading`. Adding a VARIANT cannot
+    /// change how an externally-tagged enum decodes a tag it already knew, so this test
+    /// deliberately does not restate that.
+    #[test]
+    fn the_context_budgeted_event_round_trips() {
+        let ev = JournalEvent::ContextBudgeted {
+            node: NodeId("n1".into()),
+            effect_id: EffectId("eid-1".into()),
+            budget_bytes: 11_232,
+            source_window: 4096,
+            retained_bytes: 900,
+            dropped_deps: 2,
+            dropped_tools: vec!["gamma".into()],
+        };
+        let json = serde_json::to_string(&ev).expect("serialises");
+        assert!(
+            json.contains("ContextBudgeted"),
+            "externally tagged: {json}"
+        );
+        let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(format!("{back:?}"), format!("{ev:?}"));
+        assert_eq!(
+            FORMAT_VERSION, 1,
+            "an additive variant must not bump the format fence"
+        );
     }
 
     /// No doc comment in this file may link a `JournalEvent` variant by its BARE name.

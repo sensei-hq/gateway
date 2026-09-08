@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4
+spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4, SP-7b
 source: orchestrator-core · orchestrator-store
 ---
 
 # Durable Journal
 
-> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4).** Design §7.
+> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4 · SP-7b).** Design §7.
 > This header said "Planned (SP-1)" long after the Postgres backend, the spend ledger
 > and the HITL waiting kinds had shipped; the [module README](README.md) row was
 > the only place that stayed current. It then said SP-6-3 through the whole of s4, while
@@ -161,6 +161,56 @@ Feature: The human loop gate's journal (SP-6 s4)
   Scenario: An option nobody was offered fails the gate loudly
     Given a LoopGateDecided naming an option absent from the journaled menu
     Then the gate fails the Loop — it neither continues nor stops
+```
+
+## SP-7b — the context-budget event
+
+- **`ContextBudgeted { node, effect_id, budget_bytes, source_window, retained_bytes,
+  dropped_deps, dropped_tools }`** — folded **FIRST-wins**, keyed by `EffectId`. One row per
+  budgeted agent NODE, written BEFORE the model call.
+
+**`budget_bytes` is the load-bearing field, and journaling the BUDGET rather than the CUT is
+the whole design.** The truncator is pure and every other input to the cut is already
+replay-stable — dependency context comes from CAS by digest, the authored half and the tool
+activation from the pinned registry — so this integer was the only unfenced one, because it
+derives from a model's `context_window` and `GatewayConfig` carries **no version field at
+all**, which puts an operator's config edit outside the config fence entirely. Journaling it
+makes the cut a pure function of journaled state on the FIRST drive as much as on a resume.
+Journaling the cut itself would have to be rich enough to RECONSTRUCT bytes rather than verify
+them, landing dependency text inline in the event.
+
+It is **mandatory rather than defensive**: `drive` builds a fresh `DriveState::default()` and
+`ready_nodes` never consults the fold, so every past turn's `agent_input_hash` is recomputed on
+every partial resume, forever. A drifted budget means a drifted hash, a `DeterminismViolation`,
+and a run left terminally `Failed` where `force_wake` — which matches only `status = 'paused'`
+— cannot revive it. The **un-budgeted** turn needs the same fence and cannot get it from this
+row's presence, since an in-window turn journals nothing: `memo.contains(eid) &&
+!budgets.contains(eid)` is what proves turn 0 went out UN-cut and must be reproduced that way.
+
+FIRST-wins is `entry().or_insert()`, and the hazard is proximity: the two nearest templates in
+`fold_journal` — `expansions` and `selections` — are both LAST-wins `insert`, so the correct
+discipline is one token away from the code most likely to be copied. A budget a later record
+could move is not a fence. The remaining fields are **disclosure, not inputs**: `torii` and an
+audit read them to learn a turn answered on a degraded prompt, and nothing reconstructs the cut
+from them.
+
+A new variant of an existing enum, so `FORMAT_VERSION` stays **1**.
+
+```gherkin
+Feature: The context budget's journal (SP-7b)
+  Scenario: A budgeted turn replays after the window changes underneath it
+    Given a turn budgeted and journaled against a 128k window
+    When the gateway config is swapped for one with a different window and the run resumes
+    Then the cut is reproduced from budget_bytes, the memo matches, and nothing is re-spent
+
+  Scenario: An un-budgeted turn replays after the window shrinks under it
+    Given a turn dispatched in-window, so no ContextBudgeted row exists
+    When the window shrinks and the run resumes
+    Then the memo without a budget row proves it went out un-cut, and it is joined un-cut again
+
+  Scenario: The first budget wins
+    Given two ContextBudgeted records for one effect id
+    Then the fold keeps the FIRST — a later record cannot move a cut already hashed against
 ```
 
 ## Notes

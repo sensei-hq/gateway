@@ -17,7 +17,7 @@ pause: a run whose model chain is fully gated (quota/health-exhausted) **pauses*
 (resumable) instead of failing. Design §11.2:
 `GatewayError::AllGated { resume_after: Some(t) }` → **durable pause** to `t`;
 `resume_after: None` (all gates terminal) → **fail-fast** with the `human_action`
-hint (never pause forever). This is the last SP-1 walking-skeleton gap.
+hint (never pause forever — *reversed 2026-09-04: a named `human_action` now pauses indefinitely as the HOTL class; see M1 in `docs/design/selection-policy-pipeline.md`*). This is the last SP-1 walking-skeleton gap.
 
 ## 2. Background
 

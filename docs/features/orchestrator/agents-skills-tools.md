@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-2, SP-4, SP-6-3, SP-6-4
+spec: SP-1, SP-2, SP-4, SP-6-3, SP-6-4, SP-7a, SP-7b
 source: crates/orchestrator*
 ---
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete) + SP-4 s1/s3/s4 + credential broker + SP-6-3 + SP-6-4).** Design §6/§9;
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete) + SP-4 s1/s3/s4 + credential broker + SP-6-3 + SP-6-4 + SP-7a + SP-7b).** Design §6/§9;
 > config-source design
 > [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
 > **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
@@ -59,9 +59,12 @@ source: crates/orchestrator*
 > a skill body / tool schema only when `activation.is_active(query)` for the agent's
 > rendered input (matched once per run, case-insensitive substring ANY-of) —
 > progressive disclosure to fit the prompt budget. `Always` is byte-identical to the
-> old behavior; an over-window turn is still refused rather than truncated — SP-7a moved
-> that refusal to the gateway's `ContextWindowGate`, which asks it per candidate.
-> Determinism-safe
+> old behavior. An over-window turn used to be refused rather than truncated — SP-7a
+> moved that refusal to the gateway's `ContextWindowGate`, which asks it per candidate —
+> and since **SP-7b** it is CUT to fit the chain's largest window and dispatched, which
+> is where activation and budgeting meet: `plan_budget` drops whole tool schemas from
+> the END of the activation order (the activation policy's own ranking, reversed) when
+> the context floor will not otherwise fit. Determinism-safe
 > (the query is the node input, already in `agent_input_hash`). Activation gates prompt
 > **disclosure**, not execution: a tool gated out of a run's prompt simply isn't offered
 > to the model that run — the permission grants (slice 3), validated at load, remain the
@@ -250,12 +253,38 @@ Feature: Agent runtime
     Given a chain [big 128k, small 8k] and a request estimated at 20k input tokens
     Then the gateway's ContextWindowGate skips "small" and selects "big"
 
-  Scenario: A prompt over EVERY candidate's window is refused, never truncated
+  Scenario: A prompt over EVERY candidate's window is refused by the GATEWAY
     Given the same chain and a request estimated at 200k input tokens
     Then selection admits nothing and the caller gets an AllGated naming each
       candidate's own window, the estimate that exceeded it, and the remedy
       UseLargerContextWindow — distinct from RaiseBudget, because spending more
       at the same model cannot make its window bigger
+
+  # Added by SP-7b. The scenario above is still exactly what the GATEWAY does with a
+  # request no candidate can hold; what changed is that an agent turn no longer arrives
+  # there. The orchestrator cuts first, and only hands the gateway a prompt it could not
+  # cut. See executor::tests::an_over_window_agent_turn_is_budgeted_and_dispatched,
+  # ::oversized_dependency_context_halts_over_budget_never_truncates and
+  # ::an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis — one test
+  # per branch below.
+  Scenario: An over-window AGENT turn is cut to fit and dispatched
+    Given an agent whose dependency context pushes its prompt past every window
+    Then the "## Context" half is bounded to max_context_window(chain), whole tool
+      schemas are dropped from the end of the activation order to make room, and the
+      turn is DISPATCHED — disclosed by a truncation marker in the prompt, a
+      ContextBudgeted journal row, an additive context_budgeted key on the output,
+      and an operator warn
+
+  Scenario: A cut that would retain almost nothing is refused instead
+    Given the same agent and a dependency context so large that no cut fitting the
+      window retains 25% of it
+    Then the run PAUSES recoverably with a reason prefixed "context budget: ", no
+      provider is called, and the node produces no output
+
+  Scenario: A prompt no cut can fit is still the gateway's refusal
+    Given an agent whose own system_prompt alone exceeds every candidate's window
+    Then the orchestrator budgets nothing — the authored half is never cut — and the
+      un-cut prompt goes to selection for the AllGated diagnosis above
 ```
 
 ## Slice 2 (implemented)
@@ -270,7 +299,13 @@ Feature: Agent runtime
   any candidate, so a `[128k, 8k]` chain refused prompts the primary would have served.
   The question is now asked per candidate by the gateway's `ContextWindowGate`
   (`crates/gateway/src/gates/context_window.rs`), which skips the candidates that cannot
-  hold the request and only fails when none can. Still no silent truncation.
+  hold the request and only fails when none can. **SP-7b then made the none-can case a
+  DEGRADATION rather than a refusal** (`plan_budget` + `PromptParts::join_bounded`): the
+  `## Context` half is cut to fit `max_context_window(chain)` and the turn is dispatched,
+  with the byte budget journaled before dispatch so every later drive reproduces the same
+  cut. Still no *silent* truncation — the cut is disclosed on four channels, the authored
+  half is never cut, and a cut retaining under 25% of the requested dependency bytes is
+  refused as a force-wakeable pause instead.
 - A **Pure-only tool runtime** (`Tool` / `ToolRegistry` + the demo `calc` tool);
   Observation/Mutation tools are rejected loud (`ToolEffectDeferred`), never
   silently skipped or run early.
@@ -280,9 +315,11 @@ Feature: Agent runtime
   extends into the loop, not just the top-level graph.
 
 **Deferred:** Observation/Mutation tools + TTL/two-phase/reconcile (slice 4);
-a filesystem directory loader for the registry; a summarize/select budgeting
-strategy (SP-7b — today an over-window turn is refused at selection rather than
-compacted);
+a filesystem directory loader for the registry; a SEMANTIC summarize/select
+budgeting strategy (SP-7b shipped the positional one — an over-window turn's
+context is cut to fit the chain's largest window, per-dependency prefixes with
+markers; choosing or summarizing what to keep, and compacting the TRANSCRIPT
+rather than the `## Context` half, are still open);
 blackboard/shared-context, `Map` fan-out, subagents, per-phase chains, and
 streaming (slice 3+).
 
