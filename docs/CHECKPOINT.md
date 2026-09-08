@@ -1,40 +1,44 @@
 # Checkpoint
 
-**SP-7b context budgeting: COMPLETE, whole-slice reviewed. The one known-broken thing is now
-FIXED — no known-broken state remains.** Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12
-ACs) + its plan, whose Task 8 note records what shipped. SP-7a DONE (`864a8dd`).
+**SP-7 is ON MAIN (PR #54, merged 2026-09-08) and the SP-7b minors are CLOSED on `develop`.**
+`main` = `24d1868`. Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12 ACs).
 
-## Done
+## Done since the merge
 
-T1-T4 (`fedb8ac`..`daeee45`) `max_context_window`, the pure planner + `CONTEXT_FLOOR_FRACTION`, the
-measured renderer, `ContextBudgeted` folded FIRST-wins. `cdea80d`+`16a344e` T5/T6 wiring plus two
-CRITICALs (an unfenced UN-budgeted turn; a replay arm re-running `plan_budget`). `5781e3e`+`03204bf`
-T7 four channels. `be89e7d` T8 names/docs/sweep. `f489fbc` the review's three confirmed findings.
+Every minor the SP-7b whole-slice review left open, red-first and mutation-verified:
 
-`c177a72` **the clamp-signal flake, root-caused not retried.** `tracing` caches a callsite's
-`Interest` at first execution, and with only ONE `Dispatch` registered — a lone capture test — it
-reads that from the EMITTING thread's subscriber, so a subscriber-less test reaching `dispatch.rs`'s
-`warn!` first cached `Interest::never()` and blinded the capture for good. `install()` now keeps a
-second `Dispatch` registered, disarming the fast path. (The old DISPROVEN note probed the
-self-repairing ordering.)
+- `4901bef` **duplicate tool names dropped every copy of the schema.** `join_bounded` matched
+  `dropped_tools` by NAME, so an agent listing a tool twice lost both copies while the note said
+  "1 of 3 omitted" — a false disclosure, and silent, since dropping extra schemas only makes the
+  prompt smaller. Dropped by POSITION now; both producers guarantee the tail.
+- `3f88cb7` **`dropped_deps` guard.** It could be hard-wired to `0` with the whole workspace green.
+  A real drop needs a HEADING wider than its share — equal keys and oversized bodies both cannot
+  do it — so the fixture uses a 1200-character node id.
+- `194da8c` **`torii run status` reports a budgeted turn.** The fourth channel stopped at a worker
+  `warn`; an operator got a complete-looking answer that never said the answer came from a CUT
+  prompt. Additive, byte-identity pinned both ways.
+- `4a45f2c` **spec §5.2 corrected.** Named the human path's wrapper as the model path's renderer,
+  and claimed a test gap that a 1.5 MB-vs-10-byte fixture had already closed. §5.3 was re-derived
+  and HOLDS — left alone.
 
-**The one idea: journal the BUDGET, not the cut.** The window-derived integer was the only unfenced
-input (`GatewayConfig` has NO version field); a `DeterminismViolation` on resume is unrevivable.
+The fifth minor needs no action: a budgeted node being effectively SINGLE-TURN is already explicit
+in spec §2's consequence note and deliberately pinned by
+`a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn`.
 
 ## Verified
 
-`cargo test --workspace` **1755 passed / 0 failed, real exit 0** · `clippy --all-targets -D
-warnings` 0 · `fmt --check` 0 · 40 consecutive runs of the orchestrator binary, 0 failures. The
-flake fix is mutation-proven both ways (keepalive removed → red; restored → green).
+`cargo test --workspace` **1760 passed / 0 failed, real exit 0** across 35 suites · `clippy
+--all-targets -D warnings` 0 · `fmt --check` 0. Every fix reddens its own test alone under
+mutation; the `dropped_deps` and duplicate-name mutants were each run both ways.
 
 ## Next
 
-`gh pr create --base main --head develop` — 40 commits: SP-7a, the M1 reversal, SP-7b, the flake
-fix. Then SP-7c (no spec yet) or the minors.
+`develop` is 4 commits ahead of `main` with no PR. Either open one, or start SP-7c (no spec yet —
+begins at `/sensei:design`), or take up spec §9's deferred list (transcript compaction;
+summarization; blackboard design D5 is FALSE in code — nothing populates or reads
+`ContextWrite.summary`).
 
 ## Open
 
-7 MINORs, none blocking: duplicate tool NAMES drop the wrong schema; `dropped_deps` can be
-hard-wired to 0 with the suite green; `torii` has NO `ContextBudgeted` arm, so that operator surface
-is unbuilt; spec §5.2/§5.3 cite retracted rules. A budgeted node is effectively SINGLE-TURN, pinned
-by a two-turn test. **Sensei daemon NOT running — this file is the only record.**
+The review counted SEVEN minors; five were written down and are now closed. The other two were
+never recorded durably and are lost — treat the list as closed. **Sensei daemon NOT running.**
