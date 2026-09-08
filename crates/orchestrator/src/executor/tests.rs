@@ -16004,6 +16004,50 @@ impl CapturingSubscriber {
             .cloned()
             .collect()
     }
+
+    /// Install a fresh capture as this thread's default subscriber, and return it with
+    /// the guard that uninstalls it.
+    ///
+    /// The one constructor every capture test uses, so the thing that makes installation
+    /// safe in a threaded test binary has exactly one home. See
+    /// [`a_subscriberless_thread_touching_a_callsite_first_does_not_blind_the_capture`]
+    /// for what that is and why a bare `set_default` is not enough.
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        // One extra `Dispatch`, registered once and never dropped. This is the fix, and it
+        // is aimed at a single branch in `tracing`.
+        //
+        // `callsite::Dispatchers::rebuilder()` takes its `JustOne` fast path while at most
+        // one `Dispatch` is registered process-wide, and that path resolves a callsite's
+        // interest from `dispatcher::get_default()` — the CURRENT THREAD's subscriber —
+        // rather than from the registry. A callsite first executed by a subscriber-less
+        // thread therefore caches `Interest::never()` for the life of the process, and a
+        // thread that does hold a capture goes blind to that line. A lone capture test is
+        // exactly the one-registered-`Dispatch` case, which is why the window was open.
+        //
+        // `has_just_one` is recomputed as `len <= 1` on every registration, counting only
+        // still-live entries. With this one always alive, the capture's own registration
+        // immediately below brings the count to two, so the fast path is disarmed for the
+        // whole time a capture is installed — which is the only window whose emissions any
+        // test here reads. That is measured, not reasoned: with this line removed the guard
+        // test fails with an empty capture, and with it present the guard test passes.
+        //
+        // A callsite first touched BETWEEN capture tests can still be poisoned, and does
+        // not need preventing: `Dispatch::new` calls `register_dispatch`, which rebuilds
+        // the interest of every registered callsite against the live dispatcher list, so
+        // the next `install()` repairs it before the test that would read it runs.
+        //
+        // Cost is confined to this test binary: callsites resolve to `Interest::always`, so
+        // events are built and handed to whatever dispatcher the emitting thread has —
+        // `NoSubscriber`, and a no-op, for every thread but the installed one. This one
+        // receives nothing ever, since a registered `Dispatch` is not any thread's default,
+        // so its buffer stays empty.
+        static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEPALIVE.get_or_init(|| tracing::Dispatch::new(Self::default()));
+
+        let capture = Self::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        (capture, guard)
+    }
 }
 
 impl tracing::Subscriber for CapturingSubscriber {
@@ -16036,6 +16080,82 @@ impl tracing::Subscriber for CapturingSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+/// A thread with no subscriber must not be able to blind a thread that has one.
+///
+/// # The defect this pins
+///
+/// `tracing` caches a callsite's [`Interest`] on the static ITSELF, once, the first time
+/// that line of code executes anywhere in the process — and the cached value is what the
+/// macro consults before it dispatches. Registration reads the dispatchers through
+/// `callsite::Dispatchers::rebuilder()`, which has a fast path: when only ONE `Dispatch`
+/// is registered process-wide it skips the registry and asks
+/// `dispatcher::get_default()` — **the current thread's** subscriber. One registered
+/// `Dispatch` is precisely the state while a single capture test runs.
+///
+/// So if some other, subscriber-less test is the first in the process to execute a given
+/// `tracing` line, `NoSubscriber::register_callsite` returns `Interest::never()` and that
+/// verdict is cached for the life of the process. Every later emission from that line is
+/// then skipped by the macro BEFORE dispatch — including one made on a thread that does
+/// have a capture installed.
+///
+/// That is not hypothetical: it is the root cause of the one-in-many-runs failure of
+/// [`both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low`], where the
+/// `info!` clamp-bit record was captured and the `warn!` under-estimate record from the
+/// SAME `if let` block, three lines later, was not. They are separate statics registered
+/// at separate moments, so one can be poisoned while the other is not — which is also why
+/// no level filter can explain it, WARN being the more severe of the two.
+///
+/// # Why the earlier probe found nothing
+///
+/// The disproven note this test replaces probed poisoning that happened BEFORE
+/// `set_default`, which is self-repairing: `Dispatch::new` calls `register_dispatch`,
+/// which rebuilds the interest of every registered callsite against the live dispatcher
+/// list — the capture included. Only poisoning that lands AFTER the subscriber is
+/// installed sticks, and that is the ordering reproduced here.
+///
+/// # Reading a failure
+///
+/// Red means an emission on the installed thread was dropped, so every capture test in
+/// this file is only as trustworthy as the race it happened to win. The two that assert
+/// an ABSENCE are the dangerous ones: a poisoned callsite makes them pass for the wrong
+/// reason.
+#[test]
+fn a_subscriberless_thread_touching_a_callsite_first_does_not_blind_the_capture() {
+    // ONE callsite, reached from two threads. Two separate `warn!` invocations would be
+    // two separate statics with independent interest, and could not collide at all.
+    fn emit(probe: u64) {
+        tracing::warn!(probe, "interest poisoning probe");
+    }
+
+    let (capture, _guard) = CapturingSubscriber::install();
+
+    // The first execution of that line in this process happens on a thread with NO
+    // subscriber, and AFTER ours is installed — the ordering `set_default`'s own rebuild
+    // has already run past and cannot repair.
+    std::thread::spawn(|| emit(1))
+        .join()
+        .expect("the probe thread joins");
+
+    // Same line, this time on the thread holding the capture.
+    emit(2);
+
+    let seen: Vec<Option<u64>> = capture
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|e| e.message.contains("interest poisoning probe"))
+        .map(|e| e.field("probe"))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![Some(2)],
+        "the emission made on the installed thread must arrive. Exactly one: the probe \
+         thread's own emission has nowhere to go, so an entry for `probe = 1` would mean \
+         this test stopped isolating what it claims to"
+    );
+}
+
 /// Both clamp diagnostics fire, on a call where both conditions really hold.
 ///
 /// The fixture makes each one true for a DIFFERENT reason, so neither rides on the
@@ -16052,8 +16172,7 @@ impl tracing::Subscriber for CapturingSubscriber {
 #[tokio::test]
 async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
     const CAP: u64 = 1_000;
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     let (gateway, seen) = clamp_observing_gateway(10, 5_000).await;
     let journal = InMemoryJournal::new();
@@ -16099,23 +16218,30 @@ async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
     // same thread (`dispatch.rs`, the two signals). The captured bit reported
     // `allowance: 999` against a 1000 cap and zero spend, which forces `est_input == 1`,
     // and `clamp_observing_gateway(10, …)` hardcodes `input_tokens: 10`. So `10 > 1` held
-    // and the `warn!` ran.
+    // and the `warn!` ran. The record was emitted; the capture never saw it.
     //
-    // **The diagnosis first recorded for this — that `set_default` is thread-local while
-    // tracing's callsite `Interest` cache is global, so a subscriber-less thread can cache
-    // `Interest::never()` — is DISPROVEN.** Three probes, all green where the theory
-    // predicts red: a subscriber-less drive on the same thread first; the same from a
-    // separate `std::thread`; and a synthetic unique callsite emitted under
-    // `Dispatch::none()` before installing the capture, which was still captured
-    // (`poisoned_capture=1`). `rebuild_interest_cache()` was therefore NOT applied — it
-    // would have been a fix for a mechanism that does not occur here.
+    // **Root cause found, and it is fixed in [`CapturingSubscriber::install`]:** a
+    // callsite's `Interest` is cached on the static the first time that line runs anywhere
+    // in the process, and while only one `Dispatch` is registered — a lone capture test —
+    // `tracing` resolves it from the EMITTING thread's subscriber. Any other
+    // subscriber-less test reaching `dispatch.rs`'s `warn!` first cached
+    // `Interest::never()`, and this thread's later emission was then dropped by the macro
+    // before dispatch. The `info!` on line 893 and the `warn!` on line 908 are separate
+    // statics registered at separate moments, which is why one survived and its neighbour
+    // did not — and why no level filter could be the culprit, WARN being the severer of
+    // the two.
     //
-    // What is left is the difference between "the record was never emitted" and "the
-    // capture did not see it", and the filtered view could not tell them apart. This dump
-    // can: an unfiltered record present here but missing from `signals` is a filter or
-    // capture problem, and its absence from both means the predicate did not hold and the
-    // arithmetic above is wrong somewhere. Recorded rather than guessed at, so the next
-    // occurrence produces evidence instead of another theory.
+    // The diagnosis first recorded here named the Interest cache but was marked DISPROVEN
+    // by three probes. The probes were sound and the conclusion was wrong: each poisoned
+    // the callsite BEFORE installing the capture, and that ordering repairs itself, since
+    // `Dispatch::new` rebuilds the interest of every registered callsite against the live
+    // dispatcher list. Only poisoning that lands after installation sticks.
+    // `a_subscriberless_thread_touching_a_callsite_first_does_not_blind_the_capture`
+    // reproduces that ordering deterministically and now guards the fix.
+    //
+    // The dump stays. It is what distinguished "never emitted" from "not seen" — an
+    // unfiltered record present here but missing from `signals` is a filter problem, and
+    // absence from both is a delivery problem, which is what this turned out to be.
     let low = signals
         .iter()
         .find(|e| e.message.contains("under-estimated"))
@@ -16125,8 +16251,9 @@ async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
                 "the estimate-wrong signal did NOT fire.\n  clamp-filtered: {signals:?}\n  \
                  ALL captured records: {all:?}\n  (est_input is forced to 1 by the \
                  allowance of 999, and the fixture's input_tokens is 10, so the `10 > 1` \
-                 predicate held and this record should exist — see the comment above for \
-                 the disproven diagnosis and what this dump distinguishes)"
+                 predicate held and this record should exist. Absent from BOTH lists means \
+                 delivery, not arithmetic — see the comment above and the interest-poisoning \
+                 guard test)"
             )
         });
     assert_eq!(
@@ -16166,8 +16293,7 @@ async fn both_clamp_signals_fire_when_the_clamp_bit_and_the_estimate_was_low() {
 async fn the_clamp_bit_signal_fires_against_the_value_sent_not_the_allowance() {
     // Ten times the model's own output limit, so the budget is nowhere near binding.
     const CAP: u64 = FIXTURE_MAX_OUTPUT_TOKENS as u64 * 10;
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     // A scripted reply far larger than the ceiling, so the provider really does stop AT
     // the emitted limit rather than finishing under it.
@@ -16251,8 +16377,7 @@ async fn the_clamp_bit_signal_fires_against_the_value_sent_not_the_allowance() {
 /// path establishes the first half.
 #[tokio::test]
 async fn neither_clamp_signal_fires_when_its_condition_does_not_hold() {
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     // Phase 1: budgeted, clamped, and the clamp did not bite.
     let (gateway, seen) = clamp_observing_gateway(1, 5).await;
@@ -26666,8 +26791,7 @@ async fn a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn() 
 async fn a_degraded_turn_discloses_on_every_channel() {
     use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
 
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     let content = Arc::new(InMemoryContentStore::new());
     let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
@@ -26953,8 +27077,7 @@ async fn a_completed_budgeted_run_discloses_the_same_way_when_it_is_read_back() 
 /// TAKEN — reddens the warn assertion. Each reddens exactly one.
 #[tokio::test]
 async fn an_in_window_agent_turn_is_unchanged() {
-    let capture = CapturingSubscriber::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let (capture, _guard) = CapturingSubscriber::install();
 
     let (gateway, calls, ests, systems) =
         two_window_scripted_window_watching_gateway(vec![final_response("in-window answer")]).await;
