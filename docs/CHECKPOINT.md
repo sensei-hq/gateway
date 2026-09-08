@@ -1,40 +1,40 @@
 # Checkpoint
 
-**SP-7 is ON MAIN (PR #54, merged 2026-09-08) and the SP-7b minors are CLOSED on `develop`.**
-`main` = `24d1868`. Spec `2026-09-04-sp-7b-context-budgeting-design.md` (12 ACs).
+**Slice: SP-7b.1 — minors pass.** Tasks 1–4 done, **Task 5 open and next**. Plan
+`docs/superpowers/plans/2026-09-08-sp-7b-1-minors.md`. Parent SP-7b (its own `Task 1–8`,
+`AC1–AC12`) is ON MAIN via PR #54, merged 2026-09-08 — `main` = `24d1868`.
 
-## Done since the merge
+## Done — `SP-7b.1 Task N`, not the parent slice's `Task 1–8`
 
-Every minor the review left open, red-first and mutation-verified:
+- **Task 1** `4901bef` a duplicated tool name dropped every copy of the schema — matched by NAME,
+  so a tool listed twice lost both while the note still said "1 of 3 omitted". Drops by POSITION
+  now.
+- **Task 2** `3f88cb7` guard the journaled `dropped_deps` — hard-wiring it to `0` left the whole
+  workspace green. A real drop needs a HEADING wider than its share: a 1200-character node id.
+- **Task 3** `194da8c` `torii run status` reports a budgeted turn. The fourth disclosure channel
+  stopped at a worker `warn`. Additive, byte-identity pinned both ways.
+- **Task 4** `4a45f2c` spec §5.2 corrected — it named the human path's wrapper as the model path's
+  renderer, and claimed a test gap a 1.5 MB-vs-10-byte fixture had closed. §5.3 re-derived, HOLDS.
 
-- `4901bef` **duplicate tool names dropped every copy of the schema.** `join_bounded` matched
-  `dropped_tools` by NAME, so an agent listing a tool twice lost both copies while the note said
-  "1 of 3 omitted" — a false disclosure, and silent, since dropping extra schemas only makes the
-  prompt smaller. Dropped by POSITION now; both producers guarantee the tail.
-- `3f88cb7` **`dropped_deps` guard.** It could be hard-wired to `0` with the workspace green. A real
-  drop needs a HEADING wider than its share, so the fixture uses a 1200-character node id.
-- `194da8c` **`torii run status` reports a budgeted turn.** The fourth channel stopped at a worker
-  `warn`; an operator got a complete-looking answer that never said the answer came from a CUT
-  prompt. Additive, byte-identity pinned both ways.
-- `4a45f2c` **spec §5.2 corrected.** Named the human path's wrapper as the model path's renderer,
-  and claimed a test gap a 1.5 MB-vs-10-byte fixture had closed. §5.3 re-derived and HOLDS.
-
-The fifth needs no action: a budgeted node being effectively SINGLE-TURN is already explicit in
-spec §2 and pinned by `a_budgeted_agent_that_calls_a_tool_busts_the_window_on_the_next_turn`.
+Before this pass, in neither slice's numbering: `c177a72` the SP-DATA-5 clamp-signal flake — a
+poisoned `tracing` callsite, fixed so the branch was not sent to review red-capable.
 
 ## Verified
 
-`cargo test --workspace` **1760 passed / 0 failed, real exit 0** across 35 suites · `clippy
---all-targets -D warnings` 0 · `fmt --check` 0. Every fix reddens its own test alone under
-mutation; the `dropped_deps` and duplicate-name mutants were each run both ways.
+`cargo test --workspace` **1760 passed / 0 failed, real exit 0** across 35 suites (baseline 1755 at
+`main` + this pass's five tests) · `clippy --all-targets -D warnings` 0 · `fmt --check` 0. Every
+fix reddens its own test alone under mutation.
 
 ## Next
 
-`develop` is 6 ahead of `main` with no PR. Either open one, start SP-7c (no spec — begins at
-`/sensei:design`), or take up spec §9's deferred list (transcript compaction; summarization;
-blackboard design D5 is FALSE in code — nothing populates or reads `ContextWrite.summary`).
+**SP-7b.1 Task 5** — blackboard design D5 is false in both halves, and the load-bearing half is
+that it defers summarization because `PromptOverBudget`'s loud halt "covers overflow": SP-7a deleted
+that variant and SP-7b reversed the invariant. Three spots, docs only, no behaviour change.
+
+Then SP-7c: no spec, named nowhere in the repo, so it begins at `/sensei:design`. The plan's closing
+section carries the two verified findings for that conversation (the multimodal window blind spot;
+compaction's §4.5 drift precondition).
 
 ## Open
 
-Of SEVEN minors the review counted, the five written down are closed; the other two were never
-recorded durably. **Sensei daemon NOT running — this file is the only record.**
+`develop` is ahead of `main` with no PR. **Sensei daemon NOT running — this file is the record.**
