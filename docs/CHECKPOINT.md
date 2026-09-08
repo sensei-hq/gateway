@@ -9,8 +9,7 @@ ACs) + its plan, whose Task 8 note records what shipped. SP-7a DONE (`864a8dd`).
 T1-T4 (`fedb8ac`..`daeee45`) `max_context_window`, the pure planner + `CONTEXT_FLOOR_FRACTION`, the
 measured renderer, `ContextBudgeted` folded FIRST-wins. `cdea80d`+`16a344e` T5/T6 wiring plus two
 CRITICALs (an unfenced UN-budgeted turn; a replay arm re-running `plan_budget`). `5781e3e`+`03204bf`
-T7 four channels including the read-back path. `be89e7d` T8 the name judgment, doc rewrites and
-sweep. `f489fbc` closed the final review's three confirmed findings.
+T7 four channels. `be89e7d` T8 names/docs/sweep. `f489fbc` the review's three confirmed findings.
 
 `c177a72` **the clamp-signal flake, root-caused not retried.** `tracing` caches a callsite's
 `Interest` on the static at first execution, and while only ONE `Dispatch` is registered — a lone
