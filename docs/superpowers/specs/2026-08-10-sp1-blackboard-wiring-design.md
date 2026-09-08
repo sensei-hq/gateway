@@ -68,11 +68,39 @@ types and in-memory store shipped in slice 3 but the executor never called them
   materialization** (the CAS persists across the crash seam; blobs load lazily on
   read). Matches design §8 "the fold rebuilds the store from journaled writes
   without materializing payloads".
-- **D5 — Budgeting via the existing halt.** Each dependency contributes its
-  `summary` if present, else its full value, rendered into the prompt's context
-  section. The **existing** per-turn window budget (`PromptOverBudget`, a loud
-  halt) covers overflow — never silent truncation, consistent with the
-  no-silent-failures invariant. Active summarize/select is deferred.
+- **D5 — Budgeting via the existing halt. ⚠️ SUPERSEDED — both halves of this are
+  now false in code. Kept, with the correction beside it, because it is the
+  decision anything touching summaries or context overflow inherits.** As
+  written: "Each dependency contributes its `summary` if present, else its full
+  value, rendered into the prompt's context section. The **existing** per-turn
+  window budget (`PromptOverBudget`, a loud halt) covers overflow — never silent
+  truncation, consistent with the no-silent-failures invariant. Active
+  summarize/select is deferred."
+  - **The summary branch cannot be entered.** `ContextRef.summary` /
+    `ContextWrite.summary` exist and round-trip journal→fold→store
+    (`executor/support.rs`, the `ContextWrite` fold arm), but **nothing ever sets
+    one**: `summary: Some` has zero producers in the workspace, every construction
+    site is `summary: None`, and the read path never consults it —
+    `resolve_context` (`executor/mod.rs`, the `Hard`-dep loop) calls
+    `ctx.load(&r)` unconditionally. So the field is a **seam, not a behaviour**:
+    the plumbing a producer would need already works, and no producer exists.
+  - **The halt this deferral rested on is gone.** `PromptOverBudget` was DELETED
+    by SP-7a (see the tombstone in `orchestrator-core/src/error.rs`), and SP-7b
+    then reversed the invariant itself: an over-window agent turn is now CUT and
+    dispatched. The honest rule is no longer "never truncate" but "never truncate
+    SILENTLY" — SP-7b discloses a cut on four channels (the in-prompt marker and
+    `(N of M dependencies shown)` tail, the `ContextBudgeted` journal row, the
+    node output's `context_budgeted` key, and an operator warn; `torii run status`
+    reports it too). A cut that would retain less than
+    `CONTEXT_FLOOR_FRACTION` pauses recoverably instead.
+  - **What this means for a future summarization slice:** the deferral is no
+    longer *justified* by an existing safety net, because the net was removed. It
+    is simply still deferred. See
+    `docs/superpowers/specs/2026-09-04-sp-7b-context-budgeting-design.md` §9,
+    which maps the two shapes (produce-time on `ContextWrite.summary`,
+    consume-time as a sixth `dispatch_metered` producer) and the constraints on
+    each — including that `ContextStore::put` is a loud `ContextKeyCollision` on
+    re-write, so a produce-time summary is one-shot and cannot be revised.
 - **D6 — Scope this slice = `Run`, key = `node.id`.** Uniform: any completed node
   publishes to `Scope::Run` under `key = node.id`, so any downstream node reads
   any upstream dependency uniformly by its id. `Scope::Node` stays typed but
@@ -117,7 +145,9 @@ like every control append), the executor:
 
 When driving an `Agent` node, before the first turn the executor resolves its
 context: for each **`Hard`** dependency `dep` of the node, `ctx.get(Run, dep.on)` →
-if `Some(ref)`, `ctx.load(&ref)` (or use `ref.summary` when present per D5) →
+if `Some(ref)`, `ctx.load(&ref)` (the "or use `ref.summary` when present per D5"
+this line carried is **dead** — nothing populates `summary` and this call is
+unconditional; see D5's amendment) →
 collect `(key, value)`. These are passed to `assemble_prompt` and rendered into
 the `## Context` section. Reads are ordered by the node's declared dependency
 order (deterministic).
@@ -188,6 +218,9 @@ dependency-scoping is a correctness requirement, not a convenience.
   the prompt.
 - Agent-facing `read_context` / `write_context` tools (explicit info-needs).
 - Active summarize/select budgeting (beyond the existing over-budget halt).
+  **Still deferred, but the parenthetical no longer describes anything:** the
+  over-budget halt was deleted by SP-7a, and SP-7b shipped PASSIVE budgeting (cut
+  the context to fit, disclose on four channels) in its place. See D5's amendment.
 - `Scope::Node` / `Scope::Plan` reads and writes; per-agent private scratch.
 - TTL / as-of freshness stamps on entries (design §8 freshness).
 - Replacing `prior_outputs` threading with blackboard reads.
@@ -216,3 +249,27 @@ dependency-scoping is a correctness requirement, not a convenience.
    loud with `DeterminismViolation` — never a silent mix.
 7. **Over-budget is loud.** A dependency output large enough to bust the per-turn
    window halts with `PromptOverBudget`, never silent truncation.
+   **⚠️ SUPERSEDED — this criterion no longer describes the system, in both its
+   mechanism and its outcome. It was true when written and is recorded here
+   rather than deleted, because the property it was protecting still matters.**
+   - *Mechanism:* `PromptOverBudget` was deleted by SP-7a. Window fit is now the
+     gateway's per-candidate `ContextWindowGate`.
+   - *Outcome, which moved twice:* the over-window case became a terminal
+     `NodeFailed` for one slice, and is now a RECOVERABLE pause — the M1 reversal
+     made an `AllGated` carrying a `human_action` the HOTL pause class, because a
+     failed run is unreachable by `force_wake` and every other supported command.
+   - *And "never silent truncation" is now the wrong half of the promise.* SP-7b
+     cuts an over-window turn and dispatches it. What is preserved is that the cut
+     is never SILENT: four disclosure channels plus `torii run status`, and a cut
+     retaining less than `CONTEXT_FLOOR_FRACTION` of what was asked for pauses
+     rather than dispatching.
+   - *Still true, and the part worth keeping:* the refusal costs NOTHING. It
+     happens during selection, so no adapter is reached and no tokens are spent —
+     which is what the surviving test asserts its call log for. The fixture never
+     changed; only the wording did.
+   - *The three tests that now hold this ground:*
+     `an_over_window_agent_prompt_pauses_the_run_with_the_gateways_diagnosis`
+     (the descendant of this criterion's original test, same fixture),
+     `a_budgeted_over_window_run_pauses_recoverably_rather_than_dying` (the M1
+     reversal), and `an_over_window_agent_turn_is_budgeted_and_dispatched`
+     (SP-7b's AC2 — the cut that replaced the halt).
