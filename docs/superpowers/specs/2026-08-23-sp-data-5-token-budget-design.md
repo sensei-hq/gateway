@@ -214,6 +214,45 @@ calling it a hard cap would be a lie.
 > refusal: below a `MIN_OUTPUT_TOKENS` floor a budgeted run pauses with `spent < cap`, possibly at
 > `spent == 0`, through this same durable pause. Anyone debugging a budgeted run that paused having
 > spent nothing wants the clamp spec, not this section.
+>
+> **⚠️ Corrected against the shipped clamp — the formula above names THREE terms and there are
+> FOUR.** As written: "`max_tokens = min(remaining − est_input, the chain's smallest
+> max_output_tokens, the caller's own)`". The window term is missing.
+> `Executor::dispatch_metered`'s clamp (`crates/orchestrator/src/executor/dispatch.rs`) builds
+> `ceiling = min(min_max_output_tokens(chain), min_serving_context_window(chain, est) − est)` — a
+> `min` over TWO model-derived bounds, folded by `(Some(a), Some(b)) => Some(a.min(b)), (a, b) =>
+> a.or(b)` — and then emits `min(caller's own, min(allowance, ceiling))`. So the shipped rule is
+> `max_tokens = min(remaining − est_input, the chain's smallest max_output_tokens,
+> min_serving_context_window(chain, est_input) − est_input, the caller's own)`.
+>
+> - **The added term is a WINDOW bound, not a second output bound.** A provider enforces
+>   `prompt + max_tokens <= context_window` as well as its output limit, so a figure that satisfies
+>   the budget and the output limit can still be a 400.
+> - **It is the smallest window that can SERVE the request, not the chain-wide minimum.**
+>   `Gateway::min_serving_context_window(chain, est)` (`crates/gateway/src/engine/mod.rs`) folds the
+>   min over `{ m : m.context_window >= est }` — exactly the candidate set `ContextWindowGate`
+>   (`crates/gateway/src/gates/context_window.rs`) admits on the same `est`. Selection can only
+>   return a member of that set, so the bound is safe for whichever candidate wins without knowing
+>   which. The chain-wide minimum was the earlier shape and was wrong in a way worth recording: on a
+>   `[128k, 8k]` chain a 20k prompt refused inside the orchestrator, so SP-7a's gate — which admits
+>   the 128k entry and serves the request — never ran on a budgeted run at all.
+> - **An empty serving set contributes NO term.** `None` there means nothing in the chain can hold
+>   the prompt; the clamp deliberately passes it through so the GATE refuses, because the gate can
+>   name each candidate's own window and the clamp cannot. A zero would have tripped the floor and
+>   re-created the early refusal.
+>
+> **And the floor is checked TWICE, not once.** `BudgetRefusal::BelowFloor` is returned from two
+> sites and both reach the same durable pause: once against the budget allowance alone (`remaining −
+> est_input`, before any model bound is read) and again against the model-derived `ceiling`, which catches
+> a run with budget to spare whose chain cannot fit a useful reply beside the prompt. The `window`
+> field is what the operator-facing message keys on. `window: Some(_)` is the case this block does
+> not describe: the WINDOW term bound the ceiling, so the refusal is prefixed `context window: `
+> rather than `budget: `, says outright that the budget is not the binding term, and names widening
+> or removing the offending chain entry — raising the cap cannot move it. `window: None` covers the
+> other two, and `dispatch.rs` records the imprecision rather than hiding it: the budget-allowance
+> case, where a cap raise genuinely is the remedy, and the case where the OUTPUT limit alone bound
+> the ceiling, which this arm cannot distinguish and still reports in budget wording — a deferred
+> misdirection noted at `BelowFloor`'s own doc.
 
 #### 6.5a A budgeted run serialises its model calls — the price of the "one call" bound
 

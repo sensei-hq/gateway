@@ -315,6 +315,35 @@ the line they appeared to, and every one was caught by asking that question.
 **Placement.** `graph.rs` for AC1/AC6 · `executor/tests.rs` for AC2–AC5, AC11, AC14 · `cmd/run.rs` +
 `tests/cli.rs` for AC7/AC8/AC10 · `redact.rs` + executor for AC9 · `e2e_pg.rs` for AC12.
 
+> **⚠️ SUPERSEDED by `171ccf5` (2026-08-28, "test: a skipped Postgres test is IGNORED, not counted
+> as passed") — the paragraph below is the design-time record of a defect that has since been CLOSED,
+> and its central claim is now false in code.** As written: "There is no `#[ignore]` anywhere in
+> `crates/torii` (`rg '#\[ignore' crates/torii` returns nothing), and there could not be: `#[ignore]`
+> is a compile-time attribute and cannot be conditioned on an environment variable."
+> - **The gate is now a CONDITIONAL `#[ignore]`, not a runtime early return.** `crates/torii/build.rs`
+>   (added by `171ccf5`) emits `cargo::rustc-cfg=have_database_url` when `DATABASE_URL` is set and
+>   non-blank, plus `rerun-if-env-changed=DATABASE_URL` so setting the variable rebuilds the test
+>   target with the cfg on. Every test in `crates/torii/tests/e2e_pg.rs` — AC12's
+>   `a_human_gate_decided_in_another_process_completes_the_run` (`e2e_pg.rs:1467-1472`) among them —
+>   carries `#[cfg_attr(not(have_database_url), ignore = "needs a Postgres at $DATABASE_URL; see
+>   README, Postgres-backed tests")]`. The spec's own regex is the wrong probe for that — the shipped
+>   form contains no `#[ignore` token — so `rg --no-ignore -g '!target' -n '#\[ignore' crates/torii`
+>   now exits 0 only on PROSE: three lines of `build.rs`'s header and the two `e2e_pg.rs`
+>   doc-comment lines that still repeat this superseded claim. The probe that shows the gate is
+>   `rg --no-ignore -g '!target' -n 'cfg_attr' crates/torii/tests/e2e_pg.rs` — the attribute on each
+>   of that file's 8 tests, plus those two prose mentions.
+> - **So AC12 is reported IGNORED, not passed.** `env -u DATABASE_URL cargo test -p sensei-torii
+>   --test e2e_pg` prints `0 passed; 0 failed; 8 ignored`. The ignored count, not a raw-stderr line,
+>   is now the signal. A build-time cfg is the mechanism because the two static alternatives break
+>   the command a developer with a live database runs: a plain `#[ignore]` needs `-- --ignored`, and
+>   a `required-features` target makes `cargo test -p sensei-torii --test e2e_pg` fail outright —
+>   `build.rs`'s own header records this reasoning.
+> - **The `let Some(url) = db_url() else { return };` line survives as a SECOND layer only**, for the
+>   case the cfg cannot see: the variable present at build time and gone at run time (`e2e_pg.rs:40-52`).
+> - **Note** the doc comment on `a_human_backed_agent_answered_in_another_process_completes_the_run`
+>   (`e2e_pg.rs:1758-1763`) still repeats the superseded claim in code; s3's spec carries the same
+>   amendment as this one.
+
 **AC12 is dev/CI-gated, and the mechanism is WEAKER than `#[ignore]` — worth stating precisely,
 because an earlier revision of this paragraph named a mechanism that does not exist.** It requires
 Docker Postgres. There is no `#[ignore]` anywhere in `crates/torii` (`rg '#\[ignore' crates/torii`

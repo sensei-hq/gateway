@@ -135,9 +135,37 @@ torii uses a `CREATE FUNCTION` because its SQL-layer RPCs call `bump` directly; 
 so a one-statement upsert is equally atomic and keeps the schema **tables-only** (matching SP-DATA-1). A
 SQL-callable function is a SP-DATA-4 nicety if a non-Rust caller ever needs it.
 
+(The statement above survives verbatim as the private `bump_on` helper
+(`crates/orchestrator-store/src/postgres.rs:563`) — but it is not what a production push runs.
+`bump_on` is reached from the coupled `store_and_bump`, whose FIRST act it is (`postgres.rs:670`),
+and from `bump_config_version` (`:807`), now `test-support`/`test`-gated; neither has a production
+caller. The production write is `store_and_bump_if` (`:743`), which folds the increment into a
+different, CONDITIONAL statement — an insert-if-absent guarded by `where $1::bigint = 0`, union'd
+with an `update … where id = true and version = $1` — so the bump lands only at the expected
+generation. See §7's amendment.)
+
 ## 6. Trait extension (additive, default-preserving)
 
 `ConfigSource` gains one defaulted method so existing impls compile unchanged:
+
+> **⚠️ SUPERSEDED — the trait carries TWO defaulted methods, and the `reload`/`from_source` bodies
+> below are the TOCTOU this slice deferred, not the code that runs.** As written: "`ConfigSource`
+> gains one defaulted method so existing impls compile unchanged", with `reload`/`from_source`
+> shown doing `source.load().await?` and then `source.version().await?` as two separate reads.
+>
+> - **`ConfigSource` carries TWO defaulted methods.** `version()`
+>   (`crates/orchestrator-core/src/registry.rs:285`, this slice) **and** `load_versioned()`
+>   (`registry.rs:306`), added by SP-DATA-4 §6.1 to close this slice's TOCTOU carry-forward
+>   (SP-DATA-4 §6, "The two SP-DATA-2 carry-forwards" — this spec's §9 never listed it).
+>   Both are defaulted, so existing impls still compile unchanged — the additivity
+>   claim survives; the count does not.
+> - **`reload` and `from_source` read the pair atomically.** Both bodies are
+>   `let (cfg, ver) = source.load_versioned().await?;` (`registry.rs:673` and `registry.rs:692`).
+>   The two separate `load()`/`version()` reads written below ARE the TOCTOU, and they are now
+>   forbidden by a guard test — `reload_reads_config_and_version_through_the_atomic_pair_method`
+>   (`registry.rs:2070`) asserts the source's `load` and `version` counters are both `0` after a
+>   `reload`, and `from_source_also_uses_the_atomic_pair_method` (`registry.rs:2085`) does the
+>   same for the boot path.
 
 ```rust
 #[async_trait::async_trait]
@@ -209,6 +237,44 @@ impl ConfigSource for PostgresConfigSource {
 }
 ```
 
+> **⚠️ SUPERSEDED — `store` / `bump_config_version` are NOT the public write API; they are test-only.**
+> As written: `store` "Does NOT bump the version (the caller bumps explicitly after committing a
+> change) … SP-DATA-4's CLI grows granular edits on top", with the pair presented as the ordinary
+> public surface.
+>
+> - **The un-coupled pair is gated `#[cfg(any(feature = "test-support", test))]`**
+>   (`crates/orchestrator-store/src/postgres.rs:796` for `store`, `:806` for `bump_config_version`)
+>   and is unreachable from a production build. "The caller bumps explicitly after committing a
+>   change" is exactly the footgun: even a disciplined caller doing `store()` then `bump()` has a
+>   crash window that durably leaves new content under an old generation — the SP-DATA-2
+>   store-without-bump carry-forward, closed by SP-DATA-4.
+> - **The production write path is coupled and single-transaction**: `store_and_bump`
+>   (`postgres.rs:668` — bump FIRST, then replace-all, so concurrent writers serialize on the
+>   `config_versions` row) and `store_and_bump_if(cfg, expected)` (`postgres.rs:743`, a CAS on the
+>   generation, added by SP-DATA-4.1). `torii config push` writes through `store_and_bump_if`
+>   (`write_and_report`, `crates/torii/src/cmd/config.rs:163`); `store_and_bump` is the
+>   unconditional form and today has no production caller (tests only).
+> - **"SP-DATA-4's CLI grows granular edits on top" did not happen.** SP-DATA-4 shipped
+>   replace-all `push` with a pure diff; per-entity edits remain deferred (§9).
+
+> **⚠️ SUPERSEDED — a versioned backend implements THREE methods, not two.** As written, the `impl`
+> block above shows only `load` + `version`.
+>
+> - **`PostgresConfigSource` also overrides `async fn load_versioned(&self) -> Result<(RegistryConfig,
+>   Option<u64>), OrchestratorError>`** (`crates/orchestrator-store/src/postgres.rs:835`) with ONE
+>   `set transaction isolation level repeatable read` transaction spanning the four config tables and
+>   `config_versions`, so the pair can never be torn. That is the method `RegistryHandle` actually
+>   calls; `load`/`version` remain as the trait's single-value contract. The production callers of
+>   `version()` are both CLI generation reads — `torii config version`
+>   (`crates/torii/src/cmd/config.rs:118`) and the CAS-refusal message in `write_and_report`
+>   (`:169`). `PostgresConfigSource::load()` has no production caller at all: `torii config push`
+>   reads the durable side through `load_versioned` (`config.rs:211`), and the `load()` at
+>   `config.rs:197` is a `FilesystemConfigSource` reading the incoming directory.
+> - **A versioned source MUST override `load_versioned`.** Reaching the trait default with a `Some(_)`
+>   version is a hard `OrchestratorError::RegistryLoad` (`crates/orchestrator-core/src/registry.rs:312`),
+>   not a silent fallback — a versioned backend that forgot the override otherwise fails silently and
+>   reopens the torn-read hazard.
+
 - **`load()`** reads the four config tables and deserializes the jsonb payloads into
   `AgentDefinition`/`SkillDef`/`ToolSpec` plus the `(area,kind,chain)` rows into `ChainBinding`,
   assembling a `RegistryConfig`. A read/deser failure → `OrchestratorError::RegistryLoad` naming the
@@ -242,6 +308,12 @@ impl ConfigSource for PostgresConfigSource {
 - **AC7 — mutation-check (version() is load-bearing):** forcing Postgres `version()` to return `None` makes B
   fall back to the local counter, so AC6's mismatch no longer fires deterministically — proving the durable
   version is what carries the fence.
+  - **⚠️ SUPERSEDED — this mutation is now a no-op.** The durable generation reaches the handle through
+    `load_versioned()`, which `PostgresConfigSource` overrides
+    (`crates/orchestrator-store/src/postgres.rs:835`) and which never calls `version()`;
+    `RegistryHandle::reload`/`from_source` call only `load_versioned` (`registry.rs:673`, `:692`).
+    Forcing `version()` to `None` therefore no longer changes the handle's generation. The equivalent
+    mutation is to break the `config_versions` read INSIDE the `load_versioned` override.
 - **AC8 — additivity:** with no Postgres source wired, `version()` is `None`, the local counter is used, and
   `cargo test --workspace` (feature-off) is **byte-identical** to today (same count). The defaulted trait
   method leaves `FilesystemConfigSource`/`InMemoryConfigSource` unchanged.
@@ -257,6 +329,10 @@ impl ConfigSource for PostgresConfigSource {
 - **Per-component sub-versioning** (`components` jsonb) if delta-sync ever matters.
 - **Granular per-entity edits** (`put_agent`/`delete_tool`/…) + a **SQL-callable `bump` function** — the
   SP-DATA-4 management CLI/API surface (`store` replace-all is this slice's only writer).
+  (Still deferred after SP-DATA-4: there is no `put_agent`/`delete_tool` anywhere in `crates/`, and
+  `torii config push` is replace-all over a pure `diff` (`crates/torii/src/diff.rs:124`). The writer
+  changed, though — see §7's amendment: `store` is now test-only and `store_and_bump_if` is the
+  production write.)
 - **Multi-tenant config scoping** — a wrapper concern; the core stays tenant-agnostic.
 - **Config-content redaction / secret handling in stored config** — config secrets remain a broker concern
   (SP-4); this slice stores config as authored.

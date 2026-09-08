@@ -195,6 +195,19 @@ the pattern end-to-end:
 4. **Fold `intents` map.** `EffectIntent.idempotency_key` is folded into `fold.intents`
    (teid→key); a matching `EffectRecorded` removes the entry (no longer in-doubt), exactly as the
    old set did. Existing in-doubt/reconcile tests pass unchanged.
+   **⚠️ AMENDED — nothing removes the entry, and nothing did in the old set either.** The clause
+   "a matching `EffectRecorded` removes the entry (no longer in-doubt), exactly as the old set
+   did" is false in both halves. The ONLY `fold.intents` write is the `insert` in the
+   `JournalEvent::EffectIntent` fold arm (`crates/orchestrator/src/executor/support.rs:138-145`);
+   there is no `remove` anywhere in the workspace, so a completed Mutation's teid stays in
+   `intents` for the life of the fold. In-doubt-vs-completed is decided instead by the
+   **memo-first short-circuit** in `execute_tool_effect`
+   (`crates/orchestrator/src/executor/agent.rs:985-996`): a completed Mutation replays from
+   `fold.memo` and returns before the class dispatch at `:1059` ever reaches
+   `mutation_tool_effect`'s `ar.fold.intents.contains_key(teid)` (`:1095`). **For a future slice:**
+   any new reconcile/in-doubt branch MUST sit behind that memo short-circuit — reading `intents`
+   alone cannot tell a standing intent from a completed one. The rest of the AC (the map itself,
+   and the unchanged in-doubt/reconcile tests) holds.
 5. **Exactly-once via status-query (the headline).** A demo keyed-dedup Mutation tool +
    `StatusQueryReconciler`: a run applies the effect (store[key]=output), crashes in-doubt (Intent
    journaled, no Recorded), resumes → the reconciler `store.get(key)` → **Confirmed** → records the

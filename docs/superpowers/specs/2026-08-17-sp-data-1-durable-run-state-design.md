@@ -74,6 +74,14 @@ the `dbd-pattern-verifier` agent):
   upsert for `snapshot`/`latest_snapshot`.
 - **`runs`** (or a column on the first `RunStarted`) — carries the durable **`format_version`**
   (see §4.3) + `run_id`, `created_at`, terminal status (for later slices' queries).
+  - **⚠️ SUPERSEDED — there is no terminal-status column.** As shipped, `runs` is exactly three
+    columns: `run_id uuid primary key`, `format_version integer not null`,
+    `created_at timestamptz not null default now()` (`database/ddl/table/orchestrator/runs.sql`,
+    and identically in `database/_apply_all.sql`, so the applied schema has not drifted from the
+    DDL). Beyond those three it carries nothing — in particular no status column. Run lifecycle status
+    landed instead as `orchestrator.scheduled_runs.status`
+    (`'waking' | 'paused' | 'completed' | 'failed' | 'cancelled'`), added by SP-DATA-3 —
+    the "for later slices' queries" hint was right about the need and wrong about the table.
 
 All DDL idempotent; enums as Postgres enums (not string CHECKs) per dbd conventions; secrets never
 in `design.yaml`.

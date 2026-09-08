@@ -139,6 +139,24 @@ its `tools` + `grants` are threaded to `execute_tool_effect` (or re-looked-up fr
   granted paths [/workspace]"}` — placed into the ReAct transcript as that call's result, so
   the agent's next turn sees it and can retry with an allowed argument. This mirrors how tool
   execution errors already surface to the agent.
+  - **⚠️ AMENDED — the envelope shipped verbatim, the `detail` deliberately did NOT.** The
+    `{"error": "permission_denied", "tool": …, "detail": …}` value is exactly what
+    `record_denied_effect` builds (`crates/orchestrator/src/executor/agent.rs:1243-1247`), but the
+    example `detail` above names the offending path AND enumerates the grant. **The shipped
+    `detail` is TERSE** — it names the tool and the fact of denial and nothing else. The two s1
+    forms are `tool '<name>' is not available to this agent` (not listed) and `the requested
+    access for tool '<name>' is not permitted by its grant` (listed, grant does not cover), both
+    built at the gate in `execute_tool_effect` (`agent.rs:1017-1023`) and passed in as a
+    `detail: String` parameter rather than derived inside `record_denied_effect` from
+    `need`/`grant`.
+  - **Why:** the denied party IS the model, so disclosing the path or the allowlist invites a
+    redirect to another granted resource (confused-deputy / prompt-injection surface). Operators
+    still get the full picture out-of-band — `tracing::debug!(tool = %call.name, ?need, ?grant,
+    listed, "tool permission denied")` at `agent.rs:1025`. The retry-with-an-allowed-argument
+    story above is therefore weaker than written: the agent learns THAT it was denied, not what
+    would be allowed.
+  - The s3 workspace jail added a third terse form on the same path, `the requested path for tool
+    '<name>' is outside its workspace` (`agent.rs:1044-1047`), recorded Pure identically.
 - **Journaling / determinism.** The denial is recorded as the call's `EffectRecorded` output
   (a denied **Mutation records no `EffectIntent`** — denial precedes two-phase). Because
   `required(args)` is pure and the grant is config, the decision is a deterministic function of

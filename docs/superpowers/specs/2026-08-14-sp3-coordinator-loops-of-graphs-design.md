@@ -187,6 +187,20 @@ agents · loops-of-graphs."
   `"{loop}/{i}/__gate__"` cannot collide with a body node (a Subgraph body node named
   `__gate__` would; `feasible` already rejects `__plan__` — the Loop does not run `feasible`
   on a `Subgraph` body, so this is a stated authoring constraint, not enforced this slice).
+  - **⚠️ AMENDED — no longer an authoring constraint; the guard is ENFORCED, at both
+    intakes.** True as shipped in this slice; closed later (SP-6 s4's whole-slice
+    review). `Graph::validate_dag` block 1c refuses any node id — or any dep naming
+    one — equal to `__plan__`/`__gate__`/`__select__`, and recurses into a
+    `LoopBody::Subgraph` body as well as `Subgraph`/`Branch`
+    (`crates/orchestrator-core/src/graph.rs:573-598` and the 2c/2d recursion at
+    :894-908, :928-931). Both executor intakes run it before any node runs —
+    `run_inner` and `start_inner`, `crates/orchestrator/src/executor/mod.rs:980` and
+    `:1039`. For an untrusted planner's graph, `plan::feasible` runs
+    `check_reserved_ids` over the same nesting set and returns the typed
+    `PlanError::ReservedNodeId(id)` a planner can act on
+    (`crates/orchestrator-core/src/plan.rs:175-198`, called at :224). Guarded by
+    `validate_dag_rejects_a_reserved_gate_segment_in_an_author_supplied_node_id`
+    (graph.rs:1110), whose "nested in a Loop body" case is the live collision vector.
 
 ## 6. Deferred (stated)
 
@@ -198,6 +212,13 @@ agents · loops-of-graphs."
 - **Subgraph-body cross-iteration state** (plan-scope blackboard threading); **tier-downgrade-
   on-resume replan** (§202); a `feasible`/reserved-id guard on `Subgraph`/`Expand` **loop
   bodies** (authoring constraint only this slice).
+  - **✅ The reserved-id guard SHIPPED later** (SP-6 s4) and is no longer deferred: a
+    `Subgraph` loop body is refused structurally by `Graph::validate_dag` — block 2c
+    recurses into the `LoopBody::Subgraph` graph and block 1c's reserved-segment rule
+    fires inside it — and an `Expand` body's runtime plan is
+    refused by the `feasible` call the executor makes before journaling it
+    (`crates/orchestrator/src/executor/expand.rs:272-282`). See D6's amendment. The
+    other two items in this bullet remain deferred.
 
 ## 7. Acceptance criteria (TDD)
 
