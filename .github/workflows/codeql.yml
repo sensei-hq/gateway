@@ -1,0 +1,65 @@
+name: CodeQL
+
+# Advanced setup rather than code scanning's "default setup", for one concrete
+# reason: default setup CANNOT analyse Rust. Its API rejects the value outright —
+#
+#   Invalid property /languages/0: `rust` is not a possible value. Must be one of
+#   actions, c-cpp, csharp, go, java-kotlin, javascript-typescript, python, ruby, swift
+#
+# — so with default setup the crates in this workspace, which are the bulk of the
+# repo, were not scanned at all. Only a committed workflow can cover them.
+#
+# `actions` is included deliberately: this repo pins actions to commit SHAs and
+# sets persist-credentials by hand, and that pack checks the posture
+# mechanically rather than relying on a reviewer noticing a drifted ref.
+#
+# Note the Rust extractor is buildless — it reads the crate graph via cargo
+# metadata instead of compiling — so this needs no database, no system packages
+# and none of the setup ci.yml does for the test suite.
+#
+# This workflow has no `run:` steps and interpolates no github.event.* values;
+# the only expression is matrix.language, defined immediately below.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a newly published query reaches existing code without waiting
+    # for the next push. Offset off the hour to miss the :00 scheduling spike.
+    - cron: '37 4 * * 2'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # Upload SARIF to the Security tab.
+      security-events: write
+      # Required by the `actions` pack to read workflow definitions.
+      actions: read
+      contents: read
+    strategy:
+      # One language failing must not hide the other two results.
+      fail-fast: false
+      matrix:
+        language: [rust, javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Nothing here needs git auth after checkout, so persisting the token
+          # only risks leaking it into artifacts.
+          persist-credentials: false
+      - name: initialize CodeQL
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          languages: ${{ matrix.language }}
+      - name: autobuild
+        uses: github/codeql-action/autobuild@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+      - name: analyze
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          category: /language:${{ matrix.language }}
