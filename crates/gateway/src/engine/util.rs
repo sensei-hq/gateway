@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use crate::store::UsageTotals;
 use crate::types::config::{MeterUnit, Window};
 use crate::types::error::GatewayError;
-use crate::types::request::Payload;
+use crate::types::request::{MediaAttachment, Payload};
 
 /// Map a [`GatewayError`] to a short, stable `code` string for a
 /// [`StreamEvent::Error`]. `ProviderError` reports its HTTP status when
@@ -92,13 +92,58 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
     }
 }
 
+/// What one [`MediaAttachment`] is charged against a candidate's context window.
+///
+/// A declared ceiling rather than a measurement, because the only quantity available in
+/// process is the `MediaSource` string and neither shape carries the cost: a `Base64`
+/// source over-counts by two to three orders of magnitude (a 1 MB image is ~1.4 M base64
+/// bytes), and a `Url`'s length has no relationship to the cost at all — the provider
+/// fetches it. Real dimensions would need image decoding on a pure, sync, hot-path
+/// function, and would still answer nothing for the `Url` case.
+///
+/// The value is the largest per-image figure the providers publish, because this estimate
+/// must not under-count for ANY candidate and a chain routinely mixes vision tiers:
+///
+/// | Tier | Long edge | Max tokens/image |
+/// |---|---|---|
+/// | Opus 4.6 and earlier, Sonnet 4.6 | 1568 px | ~1600 |
+/// | Opus 4.7 / 4.8 / 5, Sonnet 5 (high-res) | 2576 px | **4784** |
+///
+/// It is deliberately a CEILING and not an average. The defect this fixes is admitting a
+/// candidate whose window the images push past, and only a ceiling prevents that. The
+/// residual error is stated plainly: a small image on a low-res-tier model is over-counted
+/// by roughly 3×, which biases toward routing to a larger-window candidate — the safe
+/// direction for a gate whose job is to keep an over-window request off the wire.
+///
+/// Bounded per image, unlike the byte-length shapes it replaces — but bounded is not
+/// free, and the limit is sharper than it looks. A candidate is skipped at
+/// `floor(window / MAX_TOKENS_PER_ATTACHMENT) + 1` attachments: **2 against the 8192-token
+/// window `presets::tagged` gives every shipped demo model**, 27 against 128 k, 42 against
+/// 200 k. `the_ceiling_caps_how_many_attachments_a_window_can_hold` pins all three.
+///
+/// So this CAN reproduce the `Stt` arm's failure — an estimate so large that every
+/// candidate is skipped and a serviceable request becomes a terminal `AllGated` — just at
+/// a count rather than at one image. An earlier version of this paragraph claimed the
+/// opposite ("ten images cost ~48 k tokens, well inside every current window"); against an
+/// 8192-token window ten images cost nearly six times it.
+///
+/// The "over-counting is the safe direction" argument above has an unstated precondition
+/// that belongs here: it is safe only while a LARGER-window candidate exists to route to.
+/// A 2576px-tier image on a real 8192-window vision model costs ~1600 and would genuinely
+/// have fitted; the ceiling refuses it anyway, and when every candidate is 8192 there is
+/// nothing left to bias toward. That is the price of a ceiling and it is accepted here —
+/// under-counting admits a request the provider then rejects, which is worse — but it is
+/// the reason the tier-aware charge is the first item in the spec's deferred list.
+pub const MAX_TOKENS_PER_ATTACHMENT: u32 = 4784;
+
 /// A deliberately pessimistic input estimate, for the CONTEXT-WINDOW gate only.
 ///
 /// # What it counts that `estimate_input_tokens` does not, on a `Chat` payload
 ///
-/// (Its sibling is named in backticks rather than linked throughout this doc: this
-/// function is `pub` and that one is private to `engine`, so an intra-doc link from here
-/// to there is a rustdoc warning. The private one is in this same file.)
+/// (Its sibling and `MAX_TOKENS_PER_ATTACHMENT` are named in backticks rather than
+/// linked throughout this doc: this function is `pub` and both of those are private to
+/// `engine`, so an intra-doc link from here to there is a rustdoc warning. Both are in
+/// this same file.)
 ///
 /// The other payload kinds are answered in a different unit or not at all; see "The unit
 /// is ONE inference the model's window has to hold" below, which is where the arms that
@@ -121,28 +166,52 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 ///    and therefore in the safe direction. Rounding is up (`div_ceil`) rather than
 ///    truncating, so a payload with any content at all estimates at least one token.
 ///
-/// # What it does NOT count, which "pessimistic" must not be read to imply
+/// # Media IS counted, at a declared ceiling (SP-7a.1)
 ///
-/// **`Message::attachments` are not counted at all**, and that is a decision rather than
-/// an oversight. There is no honest token model for media here: the only quantity this
-/// crate can measure is the `MediaSource` string, and for a `Base64` source that
-/// over-counts by two to three orders of magnitude (a 1 MB image is ~1.4 M base64 bytes,
-/// so ~466 k "tokens" at `/3`, against a per-image cost providers publish in the low
-/// thousands), while for a `Url` source its length has no relationship to the cost at
-/// all. Either would reproduce the failure the
-/// `Stt` arm below refuses — an estimate so large that every candidate is skipped and a
-/// perfectly serviceable request becomes a terminal `AllGated`.
+/// Each `Message::attachments` entry is charged `MAX_TOKENS_PER_ATTACHMENT`, so on a
+/// `Chat` payload this is an upper bound on the REQUEST, not merely on its text.
 ///
-/// So the honest statement is narrower than "pessimistic": on a `Chat` payload this is an
-/// upper bound on the TEXT of a request, not on the request. A multimodal call is
-/// estimated on its text alone, so the gate can still admit a candidate that its images
-/// push over. That was the status quo for every caller before SP-7a — nothing gated on the
-/// window at all — but it is not what the word "pessimistic" would lead a reader to assume,
-/// and a caller that starts attaching media owes this function a per-attachment token term
-/// (providers publish the maxima; the term belongs in tokens, added after the divide, not
-/// in bytes before it). No producer in this workspace attaches media today:
-/// `executor/agent.rs` and `executor/dispatch.rs` both pass `Vec::new()`, and the adapters
-/// only translate what they are handed.
+/// **This paragraph used to say the opposite, and the superseded text is worth keeping**
+/// because its reasoning still holds and is what picks the shape of the fix. As written:
+/// "`Message::attachments` are not counted at all, and that is a decision rather than an
+/// oversight. There is no honest token model for media here: the only quantity this crate
+/// can measure is the `MediaSource` string, and for a `Base64` source that over-counts by
+/// two to three orders of magnitude (a 1 MB image is ~1.4 M base64 bytes, so ~466 k
+/// 'tokens' at `/3`, against a per-image cost providers publish in the low thousands),
+/// while for a `Url` source its length has no relationship to the cost at all. … on a
+/// `Chat` payload this is an upper bound on the TEXT of a request, not on the request. A
+/// multimodal call is estimated on its text alone, so the gate can still admit a candidate
+/// that its images push over. … a caller that starts attaching media owes this function a
+/// per-attachment token term (providers publish the maxima; the term belongs in tokens,
+/// added after the divide, not in bytes before it)."
+///
+/// Every clause of that is still true except the conclusion. Both string shapes are ruled
+/// out for exactly the stated reasons, so the term is a declared constant rather than a
+/// measurement — and it is charged in tokens after the divide, precisely as that last
+/// parenthesis prescribed. What changed is that "the gate can still admit a candidate that
+/// its images push over" was a live defect rather than an acceptable narrowing, so it is
+/// closed instead of documented.
+///
+/// The `Stt` failure it warned about — an estimate so large that every candidate is
+/// skipped and a serviceable request becomes a terminal `AllGated` — is INHERITED at a
+/// count, not escaped. A candidate is skipped at `floor(window / 4784) + 1` attachments,
+/// which is **2** against the 8192-token window every shipped demo model carries. An
+/// earlier version of this paragraph claimed ten images were "inside every current
+/// window"; they are nearly six times the smallest one. See
+/// `MAX_TOKENS_PER_ATTACHMENT` for the ceiling's provenance, the full threshold table and
+/// the precondition its residual-error argument depends on.
+///
+/// **Still true, and still worth stating: no producer in this workspace attaches media.**
+/// All 18 `with_attachment` invocations are inside `#[cfg(test)]` modules;
+/// `executor/agent.rs:936` passes `attachments: Vec::new()` and every other orchestrator
+/// message is built by `Message::text`, `Message::tool_result` or `build_chat_request`,
+/// which leave the field empty. (`dispatch.rs` carries only a comment saying so — an
+/// earlier version of this paragraph credited it with a `Vec::new()` it does not have,
+/// and counted 20 call sites rather than 18.) The adapters
+/// only translate what they are handed — so the term above changes no orchestrator run.
+/// It is not dead code: four adapters put attachments on the wire, so any consumer of this
+/// `[lib]` crate can construct one, and before SP-7a.1 the first caller to do so inherited
+/// a request the gate had declared to fit.
 ///
 /// # Why a third estimator rather than a call to one of the two that exist
 ///
@@ -323,11 +392,34 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
         | Payload::ImageGenerate { .. }
         | Payload::VideoGenerate { .. } => 0,
     };
+    // SP-7a.1: media is priced in TOKENS, so it is added AFTER the divide below — running a
+    // published per-image token figure back through the `/3` bytes heuristic would
+    // silently charge a third of the ceiling.
+    //
+    // An exhaustive match, not `attachments.len() * K`: adding an `Audio` or `Document`
+    // variant must fail to compile here rather than inherit a silent 0. Pricing a new
+    // media kind at zero by omission is exactly the defect this term removes, and the same
+    // argument the `Payload` arms below are written out for.
+    let attachment_tokens: u32 =
+        match payload {
+            Payload::Chat { messages, .. } => messages
+                .iter()
+                .flat_map(|m| m.attachments.iter())
+                .fold(0u32, |acc, attachment| match attachment {
+                    MediaAttachment::Image { .. } => acc.saturating_add(MAX_TOKENS_PER_ATTACHMENT),
+                }),
+            // No other payload kind carries `attachments` today. Left as 0 rather than folded
+            // into the arms above so this term reads as "what media costs", independent of
+            // which payloads happen to have a media field.
+            _ => 0,
+        };
     // Saturate rather than wrap. `estimate_input_tokens` uses `as u32`, which is harmless
     // there because an overflowed cost estimate only mis-prices; here a wrap would turn a
     // 4-GiB payload into a tiny number and ADMIT it, which is precisely the failure this
     // estimate exists to prevent. `u32::MAX` skips every candidate instead, loudly.
-    u32::try_from(chars.div_ceil(3)).unwrap_or(u32::MAX)
+    u32::try_from(chars.div_ceil(3))
+        .unwrap_or(u32::MAX)
+        .saturating_add(attachment_tokens)
 }
 
 /// Extract the user-facing prompt text from a request payload, for addressing a
@@ -380,6 +472,179 @@ mod tests {
             temperature: None,
             tools: Vec::new(),
         }
+    }
+
+    /// SP-7a.1 — a user message carrying `n` image attachments beside its text.
+    fn with_images(text: &str, n: usize) -> Message {
+        let mut m = Message::text(MessageRole::User, text);
+        for _ in 0..n {
+            m = m.with_attachment(MediaAttachment::image_url("https://ex.com/a.png"));
+        }
+        m
+    }
+
+    /// **SP-7a.1 AC1 — an attachment costs the declared ceiling, on top of the text.**
+    ///
+    /// Before this slice `attachments` was not counted at all, so this payload and its
+    /// text-only twin priced identically and the window gate judged a multimodal request
+    /// on its prose alone.
+    #[test]
+    fn an_attachment_is_charged_the_per_image_ceiling() {
+        let text = "0123456789"; // 10 bytes ⇒ 4 tokens at ceil(/3)
+        let bare = estimate_input_tokens_pessimistic(&chat_of(vec![Message::text(
+            MessageRole::User,
+            text,
+        )]));
+        let one = estimate_input_tokens_pessimistic(&chat_of(vec![with_images(text, 1)]));
+        assert_eq!(
+            one, 4_788,
+            "ceil(10/3) = 4 text tokens, plus the declared 4784 ceiling. Pinned as an \
+             ABSOLUTE figure and not as `bare + MAX_TOKENS_PER_ATTACHMENT`: stating the \
+             expectation in terms of the constant asserts it against itself, so halving \
+             the ceiling moves both sides and ships green — and the ceiling's VALUE is \
+             the whole content of spec D2, `must not under-count for ANY candidate`"
+        );
+        assert_eq!(
+            one - bare,
+            MAX_TOKENS_PER_ATTACHMENT,
+            "and the charge lands ON TOP of the text estimate — not instead of it, and \
+             not folded into the byte count"
+        );
+    }
+
+    /// **SP-7a.1 AC2 — charged per ATTACHMENT, not per message that has any.**
+    #[test]
+    fn attachments_are_charged_per_entry_across_messages() {
+        let bare = estimate_input_tokens_pessimistic(&chat_of(vec![
+            Message::text(MessageRole::User, "a"),
+            Message::text(MessageRole::User, "b"),
+        ]));
+        let five = estimate_input_tokens_pessimistic(&chat_of(vec![
+            with_images("a", 2),
+            with_images("b", 3),
+        ]));
+        assert_eq!(
+            five,
+            bare + 5 * MAX_TOKENS_PER_ATTACHMENT,
+            "five images cost five ceilings. Charging per MESSAGE would price this at two, \
+             and under-counting is the one direction this estimate may not err in"
+        );
+    }
+
+    /// **SP-7a.1 AC3 — the source SHAPE does not change the charge.**
+    ///
+    /// This is the failure mode the slice removes, so it is pinned directly rather than
+    /// left implied. Pricing by `MediaSource` string length is what the estimator's own
+    /// doc rules out: a base64 blob over-counts by orders of magnitude and a URL's length
+    /// has no relationship to the cost at all.
+    #[test]
+    fn a_url_and_a_base64_attachment_cost_the_same() {
+        let url = Message::text(MessageRole::User, "x")
+            .with_attachment(MediaAttachment::image_url("https://ex.com/a.png"));
+        let blob = Message::text(MessageRole::User, "x").with_attachment(
+            MediaAttachment::image_base64("A".repeat(100_000), "image/png"),
+        );
+        let bare = estimate_input_tokens_pessimistic(&chat_of(vec![Message::text(
+            MessageRole::User,
+            "x",
+        )]));
+        let url_est = estimate_input_tokens_pessimistic(&chat_of(vec![url]));
+        let blob_est = estimate_input_tokens_pessimistic(&chat_of(vec![blob]));
+        assert_eq!(
+            url_est, blob_est,
+            "a 100 KB base64 payload and a short URL are the same image to a provider, \
+             and must be the same number here"
+        );
+        assert_eq!(
+            url_est,
+            bare + MAX_TOKENS_PER_ATTACHMENT,
+            "and BOTH are actually CHARGED. Asserting only that the two equal each other \
+             is satisfied by charging neither — which is precisely the pre-slice \
+             behaviour, so that assertion alone could never have gone red, and the plan's \
+             `Red:` tick against this test could not have been true"
+        );
+    }
+
+    /// **SP-7a.1 AC6 — the attachment term saturates rather than wrapping.**
+    ///
+    /// Same argument as the `div_ceil` saturation the function already carries: a wrap
+    /// turns an enormous payload into a small number and ADMITS it, which is precisely
+    /// what this estimate exists to prevent. `u32::MAX` skips every candidate instead.
+    #[test]
+    fn the_attachment_charge_saturates_rather_than_wrapping() {
+        let n = (u32::MAX / MAX_TOKENS_PER_ATTACHMENT) as usize + 2;
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&chat_of(vec![with_images("x", n)])),
+            u32::MAX,
+            "an attachment count past the u32 ceiling clamps loudly instead of wrapping \
+             into a small, admissible number"
+        );
+    }
+
+    /// **Review follow-up — the ceiling's real skip threshold, pinned.**
+    ///
+    /// The constant's doc claimed the charge was "bounded ... ten images cost ~48 k
+    /// tokens, well inside every current window, so this cannot reproduce the `Stt` arm's
+    /// failure of an estimate so large that every candidate is skipped." That is false
+    /// against the catalog this crate ships: `presets::tagged` gives every demo model an
+    /// 8192-token window, so the SECOND image already overruns it and the request becomes
+    /// a terminal `AllGated`. Written as an assertion, the claim failed — `10 *
+    /// MAX_TOKENS_PER_ATTACHMENT` is 47_840 against a smallest window of 8_192.
+    ///
+    /// There is a hard limit and it is `floor(window / MAX_TOKENS_PER_ATTACHMENT)`. It is
+    /// pinned here so any later move of the ceiling, or of the preset windows, is judged
+    /// against it rather than against prose.
+    #[test]
+    fn the_ceiling_caps_how_many_attachments_a_window_can_hold() {
+        for (window, max_admissible) in [(8_192u32, 1usize), (128_000, 26), (200_000, 41)] {
+            let fits =
+                estimate_input_tokens_pessimistic(&chat_of(vec![with_images("x", max_admissible)]));
+            let overruns = estimate_input_tokens_pessimistic(&chat_of(vec![with_images(
+                "x",
+                max_admissible + 1,
+            )]));
+            assert!(
+                fits <= window,
+                "{max_admissible} attachments must fit a {window}-token window (est {fits})"
+            );
+            assert!(
+                overruns > window,
+                "{} attachments must overrun a {window}-token window (est {overruns})",
+                max_admissible + 1
+            );
+        }
+
+        // And what that means for the catalog this crate actually ships.
+        let smallest = crate::catalog::demo_catalog()
+            .models
+            .values()
+            .map(|m| m.context_window)
+            .min()
+            .expect("demo catalog has models");
+        assert_eq!(smallest, 8_192, "presets::tagged's window");
+        assert_eq!(
+            (smallest / MAX_TOKENS_PER_ATTACHMENT) as usize,
+            1,
+            "the shipped preset window admits exactly ONE attachment — a two-image \
+             request is unroutable on it, which is the cost of a ceiling and is the \
+             thing the doc must state rather than deny"
+        );
+    }
+
+    /// **SP-7a.1 AC4 — a payload with no attachments is unchanged.**
+    ///
+    /// The no-regression guard for every existing caller: the gate, the SP-DATA-5 budget
+    /// clamp and SP-7b's `plan_budget` all consume this figure, and none of them may move
+    /// on a text-only request. Asserted as the literal pre-slice arithmetic rather than
+    /// against a helper, so a change to BOTH the code and a shared helper cannot hide.
+    #[test]
+    fn a_payload_with_no_attachments_is_unchanged() {
+        let p = chat_of(vec![Message::text(MessageRole::User, "0123456789")]);
+        assert_eq!(
+            estimate_input_tokens_pessimistic(&p),
+            4,
+            "ceil(10 / 3) — exactly what it returned before attachments were counted"
+        );
     }
 
     /// The shape the ReAct loop appends on every turn: an assistant turn whose text
