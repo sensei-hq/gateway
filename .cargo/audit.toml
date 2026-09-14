@@ -1,0 +1,43 @@
+# `cargo audit` configuration. This file is the repo-controlled record of every
+# advisory we do not fail CI on, and WHY — an undocumented `--ignore` on a CI command
+# line is indistinguishable from not auditing at all.
+#
+# Rule for adding an entry: it needs a reachability argument or an upstream-fix
+# argument, a command that reproduces it, and a condition that retires it. If you
+# cannot write the retire condition, fix the dependency instead.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 — `rsa` 0.9.10, "Marvin Attack: potential key recovery through
+  # timing sidechannels" (5.9 medium).
+  #
+  # NOT COMPILED. `rsa` reaches the lockfile only through `sqlx-mysql`, and no crate in
+  # this workspace enables sqlx's `mysql` feature — all three declarations are
+  # postgres-only (`orchestrator-store/Cargo.toml:31`, `vault/Cargo.toml:27`,
+  # `torii/Cargo.toml:30`). `cargo audit` scans the lockfile, which records the union of
+  # optional-feature resolutions, so it sees a crate the build never links.
+  #
+  # Reproduce:  cargo tree -i rsa --workspace --target all   # => "nothing to print"
+  #
+  # Upstream:   no fixed version exists ("Solution: No fixed upgrade is available!").
+  #             Even if reachability changed, there is nothing to upgrade to today.
+  #
+  # Retire when: sqlx's `mysql` feature is enabled anywhere in this workspace (at which
+  # point this becomes a live finding and needs a real answer), or `rsa` ships a fix and
+  # sqlx picks it up. Re-check by deleting this entry and running `cargo audit`.
+  "RUSTSEC-2023-0071",
+]
+
+# Unmaintained/yanked advisories are reported but do not fail the build, which is
+# cargo-audit's default. Three are currently outstanding and all three are lockfile-only
+# by the same mechanism as `rsa` above — none resolves in `cargo tree --workspace
+# --target all`:
+#
+#   RUSTSEC-2025-0119  number_prefix 0.4.0  unmaintained
+#   RUSTSEC-2024-0436  paste 1.0.15         unmaintained
+#   (yanked)           chacha20 0.10.1      yanked
+#
+# They are left visible on purpose: "unmaintained" is a trajectory, not a vulnerability,
+# and hiding it removes the signal that would tell us to move off the crate. If one of
+# them ever becomes reachable AND gains a vulnerability advisory, the section above is
+# where the decision gets recorded.
