@@ -133,6 +133,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Rustdoc warnings are invisible to `build`, `test`, `clippy` and `fmt` alike, so
+      # nothing caught 32 broken intra-doc links accumulating across 15 files. Worse than
+      # the count: SP-7a.1 silently rebound a `pub` function's entire 194-line doc to a
+      # constant in a private module — the documentation of a re-exported API rendered
+      # NOWHERE — and shipped through all four of those gates untouched.
+      #
+      # Mostly links from public docs to private items, which resolve only under
+      # `--document-private-items` and so render as bare text on the public page. The
+      # house convention is to name a private item in backticks and reserve `[...]` for
+      # something a reader can actually click.
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
   # Audits the committed Cargo.lock against the RustSec advisory database (#56). This
   # could not run at all before the lockfile was committed — `cargo audit` audits a
   # lockfile. Documented exceptions live in `.cargo/audit.toml`, which carries the

@@ -5,8 +5,8 @@
 //! `/v1/embeddings` wire format. Rather than re-declare the wire types
 //! and request/response plumbing in each adapter, this module owns the
 //! full-featured variant once (tools + multimodal + streaming-with-tools)
-//! and exposes three `pub(crate)` entry points — [`chat`], [`chat_stream`],
-//! and [`embed`] — that speak the gateway's typed
+//! and exposes three `pub(crate)` entry points — `chat`, `chat_stream`,
+//! and `embed` — that speak the gateway's typed
 //! [`io`](kernel::types::io) request/response structs and encapsulate the
 //! HTTP.
 //!
@@ -228,7 +228,7 @@ pub(crate) async fn embed(
 
 /// Generate the standard OpenAI-compatible [`ChatModel`](kernel::adapters::capability::ChatModel)
 /// impl for an adapter whose `chat`/`chat_stream` just require an API key then delegate to
-/// [`chat`]/[`chat_stream`] with a default model — the "thin delegation" contract described in
+/// `chat`/`chat_stream` with a default model — the "thin delegation" contract described in
 /// this module's header. The adapter must have a `client: reqwest::Client` field.
 ///
 /// - `$adapter` — the adapter type.

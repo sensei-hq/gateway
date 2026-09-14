@@ -12,7 +12,7 @@
 //! commands — both gates are `run gate decide` — but the events they write are NOT
 //! interchangeable, because each executor arm reads only its own and the two menus are
 //! different vocabularies: a `HumanGate`'s option carries a `GateOutcome`, a loop gate's
-//! carries `stops`. [`PublishedMenu`] is what keeps those two facts from being one fact,
+//! carries `stops`. `PublishedMenu` is what keeps those two facts from being one fact,
 //! and everything up to the append itself is factored over the option NAMES, which both
 //! kinds have. Appending the wrong event would record a decision the executor cannot
 //! interpret: durable, unread, and reported here as delivered.
@@ -213,7 +213,7 @@ pub fn decision_of(action: GateAction) -> Decision {
 /// is synthesized per iteration and exists in NO graph, so the journal is the only record
 /// that anything is waiting there or of what it may be answered with. Reading the menu
 /// from the journal is why this command works on that kind at all — it needed a
-/// [`PublishedMenu`] variant, not a new command.
+/// `PublishedMenu` variant, not a new command.
 ///
 /// **This check is advisory and the executor re-checks.** It is non-atomic — it reads the
 /// menu, then appends — and the library entry point bypasses it entirely. It exists to

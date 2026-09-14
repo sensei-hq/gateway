@@ -602,7 +602,7 @@ async fn bump_on(conn: &mut sqlx::PgConnection) -> Result<u64, OrchestratorError
 /// self-consistent read of its own thing), and callers that need the pair use `load_versioned`
 /// (`RegistryHandle::reload`/`from_source` already do). The un-coupled writers (`store`,
 /// `bump_config_version`) are gated out of production builds behind `test-support`/`test` — see
-/// [`store`](Self::store).
+/// `store`.
 #[derive(Clone)]
 pub struct PostgresConfigSource {
     pool: PgPool,
