@@ -1,5 +1,10 @@
 /target
-Cargo.lock
+# Cargo.lock is deliberately NOT ignored. This workspace's members include
+# `crates/gateway`, `crates/orchestrator`, `crates/vault`, `crates/kokoro` and the
+# `torii` binary — the library convention of omitting the lockfile applies to crates
+# whose consumers resolve their own versions, not to a workspace that ships binaries.
+# Committing it is also what makes `cargo audit` possible (it audits a lockfile) and
+# what lets CI pass `--locked` so a build pins what it resolved.
 **/*.rs.bk
 .DS_Store
 # Claude Code state/transcripts — can contain secrets. Never commit.
