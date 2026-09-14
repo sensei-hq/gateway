@@ -32,9 +32,17 @@ impl Voices {
                 bytes.len()
             )));
         }
+        // `as_chunks::<4>()` rather than `chunks_exact(4)`: the const generic gives
+        // `&[[u8; 4]]`, so `from_le_bytes` takes the array directly instead of being
+        // hand-indexed out of a slice whose length the compiler cannot see. The length
+        // is already an exact multiple of `ROW_BYTES` by the guard above, so the
+        // remainder (`.1`) is empty by construction. Required by clippy's
+        // `chunks_exact_to_as_chunks` on Rust 1.98+.
         let data = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect::<Vec<f32>>();
         let rows = data.len() / Self::DIM;
         Ok(Self { data, rows })
