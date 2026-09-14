@@ -92,13 +92,42 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
     }
 }
 
+/// What one [`MediaAttachment`] is charged against a candidate's context window.
+///
+/// A declared ceiling rather than a measurement, because the only quantity available in
+/// process is the `MediaSource` string and neither shape carries the cost: a `Base64`
+/// source over-counts by two to three orders of magnitude (a 1 MB image is ~1.4 M base64
+/// bytes), and a `Url`'s length has no relationship to the cost at all — the provider
+/// fetches it. Real dimensions would need image decoding on a pure, sync, hot-path
+/// function, and would still answer nothing for the `Url` case.
+///
+/// The value is the largest per-image figure the providers publish, because this estimate
+/// must not under-count for ANY candidate and a chain routinely mixes vision tiers:
+///
+/// | Tier | Long edge | Max tokens/image |
+/// |---|---|---|
+/// | Opus 4.6 and earlier, Sonnet 4.6 | 1568 px | ~1600 |
+/// | Opus 4.7 / 4.8 / 5, Sonnet 5 (high-res) | 2576 px | **4784** |
+///
+/// It is deliberately a CEILING and not an average. The defect this fixes is admitting a
+/// candidate whose window the images push past, and only a ceiling prevents that. The
+/// residual error is stated plainly: a small image on a low-res-tier model is over-counted
+/// by roughly 3×, which biases toward routing to a larger-window candidate — the safe
+/// direction for a gate whose job is to keep an over-window request off the wire.
+///
+/// Bounded, unlike the byte-length shapes it replaces: ten images cost ~48 k tokens, well
+/// inside every current window, so this cannot reproduce the `Stt` arm's failure of an
+/// estimate so large that every candidate is skipped.
+pub const MAX_TOKENS_PER_ATTACHMENT: u32 = 4784;
+
 /// A deliberately pessimistic input estimate, for the CONTEXT-WINDOW gate only.
 ///
 /// # What it counts that `estimate_input_tokens` does not, on a `Chat` payload
 ///
-/// (Its sibling is named in backticks rather than linked throughout this doc: this
-/// function is `pub` and that one is private to `engine`, so an intra-doc link from here
-/// to there is a rustdoc warning. The private one is in this same file.)
+/// (Its sibling and `MAX_TOKENS_PER_ATTACHMENT` are named in backticks rather than
+/// linked throughout this doc: this function is `pub` and both of those are private to
+/// `engine`, so an intra-doc link from here to there is a rustdoc warning. Both are in
+/// this same file.)
 ///
 /// The other payload kinds are answered in a different unit or not at all; see "The unit
 /// is ONE inference the model's window has to hold" below, which is where the arms that
@@ -123,7 +152,7 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 ///
 /// # Media IS counted, at a declared ceiling (SP-7c)
 ///
-/// Each `Message::attachments` entry is charged [`MAX_TOKENS_PER_ATTACHMENT`], so on a
+/// Each `Message::attachments` entry is charged `MAX_TOKENS_PER_ATTACHMENT`, so on a
 /// `Chat` payload this is an upper bound on the REQUEST, not merely on its text.
 ///
 /// **This paragraph used to say the opposite, and the superseded text is worth keeping**
@@ -150,7 +179,7 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// The `Stt` failure it warned about — an estimate so large that every candidate is
 /// skipped and a serviceable request becomes a terminal `AllGated` — is checked, not
 /// inherited: at 4784 tokens an image, ten of them cost ~48 k, inside every current
-/// window. See [`MAX_TOKENS_PER_ATTACHMENT`] for the ceiling's provenance and the
+/// window. See `MAX_TOKENS_PER_ATTACHMENT` for the ceiling's provenance and the
 /// direction of its residual error.
 ///
 /// **Still true, and still worth stating: no producer in this workspace attaches media.**
@@ -286,34 +315,6 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// `est + max_tokens <= context_window(model dispatched to)` — with `est` measured by
 /// THIS function on the request that actually went out. Both were red before the
 /// unification, in the two different ways a subset relation fails.
-/// What one [`MediaAttachment`] is charged against a candidate's context window.
-///
-/// A declared ceiling rather than a measurement, because the only quantity available in
-/// process is the `MediaSource` string and neither shape carries the cost: a `Base64`
-/// source over-counts by two to three orders of magnitude (a 1 MB image is ~1.4 M base64
-/// bytes), and a `Url`'s length has no relationship to the cost at all — the provider
-/// fetches it. Real dimensions would need image decoding on a pure, sync, hot-path
-/// function, and would still answer nothing for the `Url` case.
-///
-/// The value is the largest per-image figure the providers publish, because this estimate
-/// must not under-count for ANY candidate and a chain routinely mixes vision tiers:
-///
-/// | Tier | Long edge | Max tokens/image |
-/// |---|---|---|
-/// | Opus 4.6 and earlier, Sonnet 4.6 | 1568 px | ~1600 |
-/// | Opus 4.7 / 4.8 / 5, Sonnet 5 (high-res) | 2576 px | **4784** |
-///
-/// It is deliberately a CEILING and not an average. The defect this fixes is admitting a
-/// candidate whose window the images push past, and only a ceiling prevents that. The
-/// residual error is stated plainly: a small image on a low-res-tier model is over-counted
-/// by roughly 3×, which biases toward routing to a larger-window candidate — the safe
-/// direction for a gate whose job is to keep an over-window request off the wire.
-///
-/// Bounded, unlike the byte-length shapes it replaces: ten images cost ~48 k tokens, well
-/// inside every current window, so this cannot reproduce the `Stt` arm's failure of an
-/// estimate so large that every candidate is skipped.
-pub const MAX_TOKENS_PER_ATTACHMENT: u32 = 4784;
-
 pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
     let chars: usize = match payload {
         Payload::Chat {
