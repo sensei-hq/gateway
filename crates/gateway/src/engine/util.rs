@@ -473,10 +473,18 @@ mod tests {
         )]));
         let one = estimate_input_tokens_pessimistic(&chat_of(vec![with_images(text, 1)]));
         assert_eq!(
-            one,
-            bare + MAX_TOKENS_PER_ATTACHMENT,
-            "the image is charged the ceiling ON TOP of the text estimate — not instead \
-             of it, and not folded into the byte count"
+            one, 4_788,
+            "ceil(10/3) = 4 text tokens, plus the declared 4784 ceiling. Pinned as an \
+             ABSOLUTE figure and not as `bare + MAX_TOKENS_PER_ATTACHMENT`: stating the \
+             expectation in terms of the constant asserts it against itself, so halving \
+             the ceiling moves both sides and ships green — and the ceiling's VALUE is \
+             the whole content of spec D2, `must not under-count for ANY candidate`"
+        );
+        assert_eq!(
+            one - bare,
+            MAX_TOKENS_PER_ATTACHMENT,
+            "and the charge lands ON TOP of the text estimate — not instead of it, and \
+             not folded into the byte count"
         );
     }
 
@@ -512,11 +520,24 @@ mod tests {
         let blob = Message::text(MessageRole::User, "x").with_attachment(
             MediaAttachment::image_base64("A".repeat(100_000), "image/png"),
         );
+        let bare = estimate_input_tokens_pessimistic(&chat_of(vec![Message::text(
+            MessageRole::User,
+            "x",
+        )]));
+        let url_est = estimate_input_tokens_pessimistic(&chat_of(vec![url]));
+        let blob_est = estimate_input_tokens_pessimistic(&chat_of(vec![blob]));
         assert_eq!(
-            estimate_input_tokens_pessimistic(&chat_of(vec![url])),
-            estimate_input_tokens_pessimistic(&chat_of(vec![blob])),
+            url_est, blob_est,
             "a 100 KB base64 payload and a short URL are the same image to a provider, \
              and must be the same number here"
+        );
+        assert_eq!(
+            url_est,
+            bare + MAX_TOKENS_PER_ATTACHMENT,
+            "and BOTH are actually CHARGED. Asserting only that the two equal each other \
+             is satisfied by charging neither — which is precisely the pre-slice \
+             behaviour, so that assertion alone could never have gone red, and the plan's \
+             `Red:` tick against this test could not have been true"
         );
     }
 
