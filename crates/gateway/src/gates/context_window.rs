@@ -15,8 +15,9 @@ use crate::skip_reason::SkipReason;
 /// The estimate read is `input_tokens_pessimistic`, NOT the cost gate's `input_tokens`:
 /// the cost figure omits tool schemas and divides by 4, so judging on it would admit
 /// exactly the requests this gate exists to catch. See
-/// `engine::util::estimate_input_tokens_pessimistic` — including its statement of what
-/// it does NOT count, since the gate is exactly as complete as its input.
+/// `engine::util::estimate_input_tokens_pessimistic` — including its "Media IS counted,
+/// at a declared ceiling" section and its arm-by-arm account of what each payload kind
+/// returns, since the gate is exactly as complete as its input.
 ///
 /// **Which payload kinds this gate applies to is decided THERE, not here.** The estimator
 /// answers in the unit each kind's window actually bounds and returns 0 where a
@@ -218,19 +219,6 @@ mod tests {
         );
     }
 
-    /// A request inside the window admits; one over it is skipped with BOTH numbers; and
-    /// the SAME request gets DIFFERENT answers from two candidates.
-    ///
-    /// The third clause is the slice's whole reason to exist and was the one thing no
-    /// test pinned: replacing `c.model_config.context_window` with the literal 8_192 —
-    /// deleting every read of the candidate — left the entire gateway suite green. So
-    /// one estimate is now evaluated against a 128k candidate and an 8k one, which is
-    /// AC1's chain at unit scale and dies on any regression to a single chain-wide
-    /// number.
-    ///
-    /// `8_192` admitting and `8_193` skipping pins the boundary as `est > window`, not
-    /// `est >= window` — see the type's doc for why that is the narrow question and what
-    /// does NOT bound the output half.
     /// **SP-7c AC5 — the gate refuses a multimodal request it used to admit.**
     ///
     /// The defect this slice fixes is not in the gate's comparison, which was always
@@ -323,6 +311,19 @@ mod tests {
         }
     }
 
+    /// A request inside the window admits; one over it is skipped with BOTH numbers; and
+    /// the SAME request gets DIFFERENT answers from two candidates.
+    ///
+    /// The third clause is the slice's whole reason to exist and was the one thing no
+    /// test pinned: replacing `c.model_config.context_window` with the literal 8_192 —
+    /// deleting every read of the candidate — left the entire gateway suite green. So
+    /// one estimate is now evaluated against a 128k candidate and an 8k one, which is
+    /// AC1's chain at unit scale and dies on any regression to a single chain-wide
+    /// number.
+    ///
+    /// `8_192` admitting and `8_193` skipping pins the boundary as `est > window`, not
+    /// `est >= window` — see the type's doc for why that is the narrow question and what
+    /// does NOT bound the output half.
     #[test]
     fn over_window_skips_and_under_window_admits() {
         let mc = model_with_window(8_192);
