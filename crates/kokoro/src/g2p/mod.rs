@@ -3,7 +3,7 @@
 //!
 //! This is the **pluggable axis** of the pipeline. The phoneme *vocabulary* is
 //! shared across languages (one IPA set baked into the model), so only the G2P
-//! strategy and the voice packs vary by [`Lang`](crate::lang::Lang). Implement
+//! strategy and the voice packs vary by [`Lang`]. Implement
 //! [`G2p`] once per language — e.g. `en` (a misaki-en port, landing in follow-up
 //! work) — and inject it into the synthesizer; nothing else in the pipeline
 //! changes. See gh#23.

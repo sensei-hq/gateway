@@ -13,7 +13,7 @@
 //!   operator-supplied base URL to honour.
 //! - `headers` **are** honoured: every entry is stamped onto the
 //!   outbound request through the SDK's `customize().mutate_request`
-//!   hook (see [`apply_config`]).
+//!   hook (see `apply_config`).
 //! - `timeout_ms` **is** honoured: it maps to a per-operation SDK
 //!   timeout via `config_override`.
 //! - Per-request `model` / `max_tokens` / `temperature` are honoured as

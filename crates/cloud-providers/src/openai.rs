@@ -100,7 +100,7 @@ impl OpenAIAdapter {
 
     /// Build an OpenAI-compatible adapter registered under a custom id.
     /// The id should match the corresponding [`RouterConfig`]'s key in
-    /// [`GatewayConfig::routers`], since the gateway engine dispatches by
+    /// [`GatewayConfig::routers`](kernel::types::config::GatewayConfig::routers), since the gateway engine dispatches by
     /// router id.
     pub fn with_id(id: impl Into<String>) -> Result<Self, GatewayError> {
         Ok(Self {
