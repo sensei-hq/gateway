@@ -1,6 +1,6 @@
-# SP-7c — multimodal window correctness Implementation Plan
+# SP-7a.1 — multimodal window correctness Implementation Plan
 
-> Steps use checkbox (`- [ ]`) syntax. Task ids here are `SP-7c Task N` — not `SP-DOC-1 Task N`
+> Steps use checkbox (`- [ ]`) syntax. Task ids here are `SP-7a.1 Task N` — not `SP-DOC-1 Task N`
 > (complete) and not `SP-7b.1 Task N` (complete).
 
 **Spec:** `docs/superpowers/specs/2026-09-08-sp-7c-multimodal-window-design.md` (7 ACs).

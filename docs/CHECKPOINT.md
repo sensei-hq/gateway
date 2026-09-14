@@ -15,9 +15,11 @@ before acting. Fixes: `760b2f9` rustdoc placement — the constant was inserted 
 silently reassigning the estimator's 194-line doc to it (public page 4258 → 21509 bytes), same
 mistake orphaned a gate test's doc. `bfd5216` test strength — 4784 was asserted against itself
 (halving it left 322 tests green), AC3 was green under charge-zero so its plan `Red:` tick was
-false. This commit — doc truth on six surfaces: the false "ten images fit every window" (shipped
+false. `ad82452` doc truth on six surfaces — the false "ten images fit every window" (shipped
 preset is 8192, so the SECOND image overruns), four stale specs, the orchestrator's now-false
-`× 3` identity, miscounted citations (18 sites not 20; no `dispatch.rs` `Vec::new`).
+`× 3` identity, miscounted citations (18 sites not 20; no `dispatch.rs` `Vec::new`). This commit
+renames the slice SP-7c → SP-7a.1; `SP-7c` was already bound to semantic activation on six
+surfaces, and is released back to it.
 
 ## Verified
 
@@ -26,10 +28,8 @@ Mutations: halved ceiling → exit 101, 1 red; charge-zero → exit 101, 5 red.
 
 ## Next
 
-1. Rename slice id SP-7c → **SP-7a.1** (spec/plan filenames + in-code markers) — `SP-7c` is
-   already bound to "semantic / retrieval-ranked activation" on six surfaces. User-decided.
-2. develop→main PR.
-3. **Issue #56**, its own slice: commit `Cargo.lock` + `cargo audit`; CI clippy/fmt/audit gates;
+1. develop→main PR. `develop` is 4 ahead: three review-fix commits + the id rename.
+2. **Issue #56**, its own slice: commit `Cargo.lock` + `cargo audit`; CI clippy/fmt/audit gates;
    a `site/` job; bump undici 7.28.0 (HIGH) / dompurify / vitest / devalue.
 
 ## Open

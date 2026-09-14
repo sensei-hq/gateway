@@ -219,7 +219,7 @@ mod tests {
         );
     }
 
-    /// **SP-7c AC5 — the gate refuses a multimodal request it used to admit.**
+    /// **SP-7a.1 AC5 — the gate refuses a multimodal request it used to admit.**
     ///
     /// The defect this slice fixes is not in the gate's comparison, which was always
     /// right; it is that the number handed to it was an upper bound on the request's TEXT
@@ -305,7 +305,7 @@ mod tests {
             GateVerdict::Skip(other) => panic!("expected an OverContextWindow skip, got {other}"),
             GateVerdict::Admit => panic!(
                 "a request whose images overrun the window must not be admitted — this is \
-                 the defect SP-7c closes, and an admitted candidate here means the \
+                 the defect SP-7a.1 closes, and an admitted candidate here means the \
                  attachment term is not reaching the gate"
             ),
         }

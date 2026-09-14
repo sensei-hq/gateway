@@ -166,7 +166,7 @@ pub const MAX_TOKENS_PER_ATTACHMENT: u32 = 4784;
 ///    and therefore in the safe direction. Rounding is up (`div_ceil`) rather than
 ///    truncating, so a payload with any content at all estimates at least one token.
 ///
-/// # Media IS counted, at a declared ceiling (SP-7c)
+/// # Media IS counted, at a declared ceiling (SP-7a.1)
 ///
 /// Each `Message::attachments` entry is charged `MAX_TOKENS_PER_ATTACHMENT`, so on a
 /// `Chat` payload this is an upper bound on the REQUEST, not merely on its text.
@@ -210,7 +210,7 @@ pub const MAX_TOKENS_PER_ATTACHMENT: u32 = 4784;
 /// and counted 20 call sites rather than 18.) The adapters
 /// only translate what they are handed — so the term above changes no orchestrator run.
 /// It is not dead code: four adapters put attachments on the wire, so any consumer of this
-/// `[lib]` crate can construct one, and before SP-7c the first caller to do so inherited
+/// `[lib]` crate can construct one, and before SP-7a.1 the first caller to do so inherited
 /// a request the gate had declared to fit.
 ///
 /// # Why a third estimator rather than a call to one of the two that exist
@@ -392,7 +392,7 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
         | Payload::ImageGenerate { .. }
         | Payload::VideoGenerate { .. } => 0,
     };
-    // SP-7c: media is priced in TOKENS, so it is added AFTER the divide below — running a
+    // SP-7a.1: media is priced in TOKENS, so it is added AFTER the divide below — running a
     // published per-image token figure back through the `/3` bytes heuristic would
     // silently charge a third of the ceiling.
     //
@@ -474,7 +474,7 @@ mod tests {
         }
     }
 
-    /// SP-7c — a user message carrying `n` image attachments beside its text.
+    /// SP-7a.1 — a user message carrying `n` image attachments beside its text.
     fn with_images(text: &str, n: usize) -> Message {
         let mut m = Message::text(MessageRole::User, text);
         for _ in 0..n {
@@ -483,7 +483,7 @@ mod tests {
         m
     }
 
-    /// **SP-7c AC1 — an attachment costs the declared ceiling, on top of the text.**
+    /// **SP-7a.1 AC1 — an attachment costs the declared ceiling, on top of the text.**
     ///
     /// Before this slice `attachments` was not counted at all, so this payload and its
     /// text-only twin priced identically and the window gate judged a multimodal request
@@ -512,7 +512,7 @@ mod tests {
         );
     }
 
-    /// **SP-7c AC2 — charged per ATTACHMENT, not per message that has any.**
+    /// **SP-7a.1 AC2 — charged per ATTACHMENT, not per message that has any.**
     #[test]
     fn attachments_are_charged_per_entry_across_messages() {
         let bare = estimate_input_tokens_pessimistic(&chat_of(vec![
@@ -531,7 +531,7 @@ mod tests {
         );
     }
 
-    /// **SP-7c AC3 — the source SHAPE does not change the charge.**
+    /// **SP-7a.1 AC3 — the source SHAPE does not change the charge.**
     ///
     /// This is the failure mode the slice removes, so it is pinned directly rather than
     /// left implied. Pricing by `MediaSource` string length is what the estimator's own
@@ -565,7 +565,7 @@ mod tests {
         );
     }
 
-    /// **SP-7c AC6 — the attachment term saturates rather than wrapping.**
+    /// **SP-7a.1 AC6 — the attachment term saturates rather than wrapping.**
     ///
     /// Same argument as the `div_ceil` saturation the function already carries: a wrap
     /// turns an enormous payload into a small number and ADMITS it, which is precisely
@@ -631,7 +631,7 @@ mod tests {
         );
     }
 
-    /// **SP-7c AC4 — a payload with no attachments is unchanged.**
+    /// **SP-7a.1 AC4 — a payload with no attachments is unchanged.**
     ///
     /// The no-regression guard for every existing caller: the gate, the SP-DATA-5 budget
     /// clamp and SP-7b's `plan_budget` all consume this figure, and none of them may move
