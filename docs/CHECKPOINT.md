@@ -1,43 +1,39 @@
 # Checkpoint
 
-**Slice: SP-7c — multimodal window correctness. BUILD COMPLETE, review not yet run.**
-Spec `2026-09-08-sp-7c-multimodal-window-design.md` (7 ACs) + plan, both ticked. `3918784`.
-`main` = `c9d4b06` (PR #55: SP-7b.1, the clamp flake, SP-DOC-1).
+**Slice: SP-7a.1 — multimodal window correctness. Build DONE; whole-slice review DONE, fixes
+landed; not yet merged to main.** Spec+plan: `docs/superpowers/*/2026-09-08-sp-7a-1-*`.
+`main` = `2b6351f` (PR #57 CodeQL, #58 anchor-id). `develop` synced with main at `5c7d5d0`.
 
 ## Done
 
-The estimator did not count `Message::attachments` at all, so every per-candidate
-`ContextWindowGate` decision on a multimodal request was made on the request's TEXT alone — a
-request whose images pushed it past a window was declared to fit and the provider rejected it.
-Each attachment is now charged `MAX_TOKENS_PER_ATTACHMENT` = 4784.
+The estimator ignored `Message::attachments`, so every `ContextWindowGate` decision on a
+multimodal request was made on its TEXT alone. Each attachment now costs 4784 tokens, charged
+after the `/3` divide. Real but LATENT: all 18 `with_attachment` invocations are tests.
 
-- **A declared ceiling, not a measurement.** The doc had already ruled out both string shapes
-  (base64 over-counts by 2–3 orders of magnitude; a URL's length means nothing). 4784 = the largest
-  published per-image figure (high-res 2576px tier; ~1600 for 1568px) — the bound must not
-  under-count for ANY candidate in a mixed-tier chain. Charged in TOKENS after the `/3` divide, as
-  the superseded doc prescribed; exhaustive match so a future variant fails to compile.
-- **Premise recorded, and it scopes the slice:** the hole is REAL but LATENT — all 20
-  `with_attachment` sites are tests and the executor passes `Vec::new()` everywhere. It justifies
-  fixing the estimator+gate; it does not justify a producer, and none was built.
+Five adversarial reviewers (security + data-correctness clean); 11 findings, each hand-verified
+before acting. Fixes: `760b2f9` rustdoc placement — the constant was inserted mid-doc-block,
+silently reassigning the estimator's 194-line doc to it (public page 4258 → 21509 bytes), same
+mistake orphaned a gate test's doc. `bfd5216` test strength — 4784 was asserted against itself
+(halving it left 322 tests green), AC3 was green under charge-zero so its plan `Red:` tick was
+false. This commit — doc truth on six surfaces: the false "ten images fit every window" (shipped
+preset is 8192, so the SECOND image overruns), four stale specs, the orchestrator's now-false
+`× 3` identity, miscounted citations (18 sites not 20; no `dispatch.rs` `Vec::new`).
 
 ## Verified
 
-`cargo test --workspace` **1766 / 0 failed, real exit 0** (baseline 1760 + 6) · clippy 0 · fmt 0 ·
-diff = 2 code files. **Six mutations run:** charge-0, per-message, before-the-divide and
-`wrapping_add` each redden their own test; AC3 survived all four so it was verified separately
-against price-base64-by-length (reddens alone); AC4 against charge-every-message. AC5 asserts the
-real composition (payload → estimator → gate), text-only twin still admitted.
+`cargo test --workspace` 1767 / 0, real exit 0 · clippy -D warnings 0 · fmt 0 · rustdoc 0 warn.
+Mutations: halved ceiling → exit 101, 1 red; charge-zero → exit 101, 5 red.
 
 ## Next
 
-1. **`/sensei:review`** — the whole-slice adversarial review has NOT run. Every prior slice found
-   something; this project's record is that fixes introduce defects.
-2. Then the develop→main PR (`develop` is 3 ahead).
+1. Rename slice id SP-7c → **SP-7a.1** (spec/plan filenames + in-code markers) — `SP-7c` is
+   already bound to "semantic / retrieval-ranked activation" on six surfaces. User-decided.
+2. develop→main PR.
+3. **Issue #56**, its own slice: commit `Cargo.lock` + `cargo audit`; CI clippy/fmt/audit gates;
+   a `site/` job; bump undici 7.28.0 (HIGH) / dompurify / vitest / devalue.
 
 ## Open
 
-Deferred in spec §8, none blocking: a real per-image cost model (needs decoding or a provider count
-endpoint); tier-aware ceilings (plumbing exists, not worth a model-tracking table yet); an
-orchestrator producer (its own slice — prompt assembler, `agent_input_hash`, journal, redaction).
-
-**Sensei daemon NOT running — this file is the record.**
+Deferred, none blocking: tier-aware ceilings (would remove the 8192 over-refusal); a per-image
+cost model; an orchestrator producer. Dependabot does NOT parse `site/bun.lock` and sees only
+direct Rust crates — feeds #56. **Sensei daemon NOT running; this file is the record.**
