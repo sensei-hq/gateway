@@ -16,7 +16,7 @@
 //! Events. Each SSE `data:` payload is the same JSON shape as a non-
 //! streaming response — a list of candidates whose `parts[].text` is
 //! an incremental delta — so the chunk parser reuses
-//! [`GeminiChatResponse`] plus a per-candidate `finishReason` field.
+//! `GeminiChatResponse` plus a per-candidate `finishReason` field.
 //! The final chunk carries `usageMetadata` and `finishReason: "STOP"`.
 
 use std::collections::HashMap;

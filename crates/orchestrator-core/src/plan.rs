@@ -202,7 +202,7 @@ fn check_reserved_ids(graph: &Graph, errs: &mut Vec<PlanError>) {
 /// `Loop`'s `LoopBody::Agent` body and its `GateSpec::Agent`/`GateSpec::Human` gate,
 /// and recursively through nested `Subgraph`/`Branch` graphs plus a
 /// `LoopBody::Subgraph` body) + each `NodePlan.needs` (agents/skills/tools) +
-/// reserved-id (recursively — see [`check_reserved_ids`]) + node-count. Returns ALL
+/// reserved-id (recursively — see `check_reserved_ids`) + node-count. Returns ALL
 /// errors.
 pub fn feasible(
     plan: &PlannedGraph,
