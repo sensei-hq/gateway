@@ -1,7 +1,7 @@
-# SP-7c — multimodal window correctness
+# SP-7a.1 — multimodal window correctness
 
 **Status:** design, awaiting approval
-**Slice:** SP-7c (after SP-7a window-aware selection, SP-7b context budgeting, SP-DOC-1)
+**Slice:** SP-7a.1 (after SP-7a window-aware selection, SP-7b context budgeting, SP-DOC-1)
 **Scope chosen by the user:** the estimator and the gate only. No producer, no new feature surface.
 
 ---
