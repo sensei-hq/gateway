@@ -111,18 +111,75 @@ ranking is an optimisation over a library, and measuring whether it beats `OnKey
 library and a baseline. SP-REG-1 produces both. §3 records the determinism decision so SP-7c
 starts from it.
 
-## 6. Open — must be answered before design
+## 6. Ownership — and a premise that turned out to be already satisfied
 
-**What the library should contain** is a product decision this analysis cannot make from the code.
-The roles the code already expects are `area: "planning"` (planner selector), and
-`area: "research" / kind: "reasoning"` (used in `plan.rs:270` and `torii/diff.rs:183` fixtures).
+Raised 2026-09-14: *"this is a generic gateway utility, so the bundled agents/skills should be for
+that purpose; the registry should be handled by torii rather than gateway; gateway should not
+assume anything but receive the agents/skills/tools for execution."*
+
+**Two of those three are already how it is built**, verified rather than assumed:
+
+| Crate | Knows about agents/skills/tools? |
+|---|---|
+| `crates/gateway` | **No.** `rg 'AgentDefinition\|SkillDef\|Activation::' crates/gateway/src/` → 0; its `Cargo.toml` has no orchestrator dependency at all. It models routers, chains, selection, adapters. |
+| `orchestrator-core` | The TYPES + the `ConfigSource` **trait** (`registry.rs:277`) — a seam, not a backend. |
+| `orchestrator-store` | The backends: `FilesystemConfigSource`, `PostgresConfigSource`. |
+| `orchestrator` | `Executor::with_registry_handle` (`executor/mod.rs:837`) — injected, `Option`, default `None`. |
+| `torii` | The durable write path: validate → diff → push (`PushDecision::{NoOp, Apply, NeedsConfirmation}`). |
+
+So "gateway must receive rather than assume" already holds — gateway never sees a registry, and the
+executor takes a handle rather than constructing one. "torii should handle the registry" already
+holds for the write path. The types must stay in `orchestrator-core` because torii depends on core
+and not the reverse.
+
+**What was genuinely missing is content and a layering story**, which is this slice.
+
+### Decisions (user, 2026-09-14)
+
+**D1 — the shipped content serves the TOOLKIT's own purpose**, not a domain. At minimum an
+`area: planning` agent, because without one `PlannerRef::Select` is inoperable (§2.2). Other roles
+the code already expects: `area: "research" / kind: "reasoning"` (`plan.rs:270`,
+`torii/diff.rs:183`).
+
+**D2 — built-ins live at `crates/torii/registry/`.** torii owns the management surface and the
+write path, so the baseline content sits beside it. The orchestrator stays content-free.
+
+**D3 — layered sources, override by name.** A defaults source composed with the implementer's
+source; on a name collision the later layer wins, so an implementer gets working defaults free,
+can override any single one, and never forks the whole set.
+
+### The constraint D3 has to respect, found while checking it
+
+`Registry::from_config` (`registry.rs:428`) **rejects duplicates loudly** —
+`OrchestratorError::RegistryLoad("duplicate agent: {name}")`, pinned by
+`from_config_assembles_validates_and_rejects_duplicates` (`registry.rs:1289`).
+
+So D3 **cannot** be implemented by concatenating two `RegistryConfig`s and calling `from_config`:
+that errors on every intentional override. The merge must happen at `RegistryConfig` level
+**before** `from_config`, giving the rule:
+
+- **within one source** — a duplicate name stays a loud error (it is an accident: two files
+  defining the same agent);
+- **across layers** — the later layer wins (it is intent).
+
+That preserves the existing guard rather than weakening it. No composing `ConfigSource` exists
+today (`rg 'Chained|Layered|Composite|Overlay'` over the config sources → nothing), so it is new
+code. `RegistryConfig` is four `Vec`s (`agents`, `skills`, `tools`, `chain_bindings`), so the merge
+is per-collection by name — and `chain_bindings` is keyed by `(area, kind)`, not a name, which the
+design must handle separately.
+
+### Added to the done gate by D1–D3
+
+6. A defaults layer and an implementer layer, both present, where the implementer's definition of a
+   colliding name is the one the `Registry` resolves — and a duplicate WITHIN either layer is still
+   a loud `RegistryLoad` error.
+7. Overriding a built-in requires no fork: the implementer supplies one file, not a copy of the set.
 
 ## 7. Not yet run
 
 The Step 4 depth check (`sensei-analyst`, `sensei-plan-depth-reviewer`,
-`sensei-persona-reviewer`) has **not** been run against this analysis. It is the next step, and
-§6 should be closed first — a depth review of an analysis with an open content question would
-report that question and little else.
+`sensei-persona-reviewer`) has **not** been run against this analysis. §6 is now closed, so it is
+the immediate next step before `/sensei:design`.
 
 ## 8. Method note
 
