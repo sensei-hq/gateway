@@ -1,40 +1,39 @@
 # Checkpoint
 
-**Slice: SP-DOC-1 — doc-truth pass. COMPLETE.** Plan
-`docs/superpowers/plans/2026-09-08-sp-doc-1-doc-truth.md`, Tasks 1–6, 31 items + 2 coverage gaps, all
-closed (`d5b88cd`). After SP-7b.1 (Tasks 1–5) and SP-7b, on `main` via PR #54 — `main` = `24d1868`.
+**Slice: SP-7a.1 — multimodal window correctness. Build DONE; whole-slice review DONE, fixes
+landed; not yet merged to main.** Spec+plan: `docs/superpowers/*/2026-09-08-sp-7a-1-*`.
+`main` = `2b6351f` (PR #57 CodeQL, #58 anchor-id). `develop` synced with main at `5c7d5d0`.
 
-## Done — `SP-DOC-1 Task N`, not any implementation slice's `Task N`
+## Done
 
-A 13-agent audit swept every superpowers spec/plan for claims about EXISTING CODE that the code
-falsifies: 36 candidates → an adversarial verifier refuted 5 → **31 confirmed**, 3 re-derived by
-hand. A second 13-agent pass applied them, each diff adversarially re-reviewed. The two biggest:
+The estimator ignored `Message::attachments`, so every `ContextWindowGate` decision on a
+multimodal request was made on its TEXT alone. Each attachment now costs 4784 tokens, charged
+after the `/3` divide. Real but LATENT: all 18 `with_attachment` invocations are tests.
 
-- **The executor is not a concurrent DAG scheduler.** `drive` is `for node in ready { .await }` —
-  sequential. `Executor.concurrency` caps `Map` CHILDREN; the only `Semaphore` is in `fanout.rs`.
-- **Snapshot-seeded resume was never wired.** `start_inner` folds the WHOLE journal, `latest_snapshot`
-  has no non-test caller, and the spec's `SnapshotWritten` variant never existed in `crates/`.
-
-Security-relevant: the Linux-sandbox plan prescribed `ABI::V1` (leaves `truncate(2)` unmediated;
-shipped is V5), the subprocess spec claimed a portable mem cap macOS fails closed on, and the
-broker docs recorded redact-then-scrub when the shipped order is scrub-then-redact.
-
-**The re-review earned the pass its trust:** 13 defects caught, 11 fixed, overwhelmingly NEW
-falsehoods the corrections introduced (an invented `torii config status`; an amendment negating a
-halt that still exists as `pause_context_floor`). Without it: one set of false claims for another.
+Five adversarial reviewers (security + data-correctness clean); 11 findings, each hand-verified
+before acting. Fixes: `760b2f9` rustdoc placement — the constant was inserted mid-doc-block,
+silently reassigning the estimator's 194-line doc to it (public page 4258 → 21509 bytes), same
+mistake orphaned a gate test's doc. `bfd5216` test strength — 4784 was asserted against itself
+(halving it left 322 tests green), AC3 was green under charge-zero so its plan `Red:` tick was
+false. `ad82452` doc truth on six surfaces — the false "ten images fit every window" (shipped
+preset is 8192, so the SECOND image overruns), four stale specs, the orchestrator's now-false
+`× 3` identity, miscounted citations (18 sites not 20; no `dispatch.rs` `Vec::new`). This commit
+renames the slice SP-7c → SP-7a.1; `SP-7c` was already bound to semantic activation on six
+surfaces, and is released back to it.
 
 ## Verified
 
-`cargo test --workspace` **1760 / 0 failed, real exit 0** — UNCHANGED from baseline, the required
-property for a docs-only pass, not merely green · clippy `-D warnings` 0 · `fmt --check` 0 · **zero
-files under `crates/` in the diff** (30 files, +947/−17, all docs).
+`cargo test --workspace` 1767 / 0, real exit 0 · clippy -D warnings 0 · fmt 0 · rustdoc 0 warn.
+Mutations: halved ceiling → exit 101, 1 red; charge-zero → exit 101, 5 red.
 
 ## Next
 
-1. **Open the develop→main PR.** `develop` is 12 ahead, clean, pushed; it contains main's merge
-   commits so it will not sit BEHIND. The natural batch boundary.
-2. **SP-7c** — no spec, named nowhere; begins at `/sensei:design`. Two verified gaps for it:
-   `Message::attachments` uncounted by the estimator (so the gate can admit what a call's images
-   push over the window), and §4.5's wall-clock input drift.
+1. develop→main PR. `develop` is 4 ahead: three review-fix commits + the id rename.
+2. **Issue #56**, its own slice: commit `Cargo.lock` + `cargo audit`; CI clippy/fmt/audit gates;
+   a `site/` job; bump undici 7.28.0 (HIGH) / dompurify / vitest / devalue.
 
-**Sensei daemon NOT running — this file is the record.**
+## Open
+
+Deferred, none blocking: tier-aware ceilings (would remove the 8192 over-refusal); a per-image
+cost model; an orchestrator producer. Dependabot does NOT parse `site/bun.lock` and sees only
+direct Rust crates — feeds #56. **Sensei daemon NOT running; this file is the record.**

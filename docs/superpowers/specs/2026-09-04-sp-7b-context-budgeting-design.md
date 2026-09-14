@@ -80,7 +80,9 @@ machinery.
   asserted there rather than claimed here for every shape.
 - **Model-call summarization.** No summarizer effect, at produce time or consume time. §9 records
   both shapes and why neither is needed to deliver this slice's promise.
-- **`Message.attachments`.** Counted by neither the estimator nor any truncator. Pre-existing.
+- **`Message.attachments`.** ~~Counted by neither the estimator nor any truncator.
+  Pre-existing.~~ **⚠️ SUPERSEDED by SP-7a.1 (`3918784`):** the ESTIMATOR now charges each
+  attachment a 4784-token ceiling. Still uncounted by any truncator — that half stands.
 - **SP-7c** (semantic / retrieval-ranked activation). Unchanged.
 
 ## 3. The decisions, and why
@@ -571,7 +573,8 @@ a consumer that ignores `context_budgeted` will treat it as a full one.
 - **Blackboard design D5 is FALSE in code** — it claims each dependency contributes its `summary` if
   present. Nothing populates it (`rg 'summary: Some' crates/` → zero hits) and nothing reads it.
   Recorded here because it was found while scoping this slice.
-- **`Message.attachments`** in the estimator and the truncator.
+- **`Message.attachments`** in ~~the estimator and~~ the truncator. The estimator half was
+  delivered by SP-7a.1 (`3918784`); the truncator half remains deferred.
 - **A hook for `ContextBudgeted`.** Consistent with the standing carry-forward that no hook fires for
   the signal/gate/loop-gate events either.
 - **`Gateway`'s catalog in the version fence.** §4.2 shows `GatewayConfig` has no version field, so
