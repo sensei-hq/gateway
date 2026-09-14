@@ -643,9 +643,18 @@ pub enum BudgetRefusal {
 /// The bytes available to the whole `system` half, from the window and the transcript.
 ///
 /// `window - MIN_OUTPUT_TOKENS - transcript_tokens`, converted to bytes by `× 3`. The `× 3` is
-/// EXACT, not a fudge factor: `estimate_input_tokens_pessimistic` is `ceil(bytes / 3)`
-/// (`gateway/src/engine/util.rs`), so a token budget of `T` is precisely a byte budget of `3T`
-/// over the parts that estimator counts. `MIN_OUTPUT_TOKENS` is reserved so a degraded turn still
+/// EXACT, not a fudge factor, **over the byte-measured terms** —
+/// `estimate_input_tokens_pessimistic` is `ceil(bytes / 3)` across text, system and tool
+/// schemas (`gateway/src/engine/util.rs`), so a token budget of `T` is precisely a byte budget
+/// of `3T` over those parts, which are the only parts this budget hands out.
+///
+/// Since SP-7a.1 that estimator is `ceil(bytes / 3) + MAX_TOKENS_PER_ATTACHMENT × attachments`,
+/// and the attachment term has no byte relationship at all — it is a flat per-image token
+/// ceiling. The identity above therefore does NOT extend to it: a payload carrying attachments
+/// is not covered, and converting an attachment charge through the `× 3` would divide a
+/// published per-image token figure by three, which is the exact mistake SP-7a.1's D3 exists to
+/// prevent. No orchestrator message populates `attachments` today, so the budget is unaffected;
+/// a caller that starts attaching media owes this function an attachment term of its own. `MIN_OUTPUT_TOKENS` is reserved so a degraded turn still
 /// has room for a usable reply rather than being cut off mid-sentence.
 ///
 /// **The reserve is the ONLY headroom the growing transcript is GUARANTEED, and that is a real
