@@ -219,7 +219,7 @@ impl<K: KekProvider, S: VaultStore> Vault<K, S> {
     /// under the DEK, not the KEK. Returns the number of DEK blobs re-wrapped.
     ///
     /// This is an operational migration, not a live call: after it commits, restart the process
-    /// with a [`KekProvider`](crate::kek::KekProvider) serving `new_kek`. This `Vault` still holds
+    /// with a [`KekProvider`] serving `new_kek`. This `Vault` still holds
     /// the old KEK and can no longer resolve the re-wrapped DEKs.
     pub async fn rotate_kek(&self, new_kek: &[u8; 32]) -> Result<usize, VaultError> {
         let old_kek = self.kek.kek()?;

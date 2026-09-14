@@ -8,7 +8,7 @@
 //! ## Shape
 //! - One [`tokio::sync::watch`] channel per model — latest-value semantics, so a
 //!   late subscriber immediately sees the current phase and memory is bounded.
-//!   The [`ModelSlot`] holding that channel is the **dedup key**: exactly one
+//!   The `ModelSlot` holding that channel is the **dedup key**: exactly one
 //!   job runs per model id.
 //! - Jobs run in the background ([`tokio::spawn`]); a [`tokio::sync::Semaphore`]
 //!   caps how many provision concurrently. `ensure` is synchronous and must be
@@ -274,7 +274,7 @@ impl ProvisioningSupervisor {
     ///   subscribe.
     /// - **no plan** for this id → a handle reporting `Absent` (nothing to do).
     ///
-    /// The [`ModelSlot`] insert is guarded by the slots lock, so concurrent
+    /// The `ModelSlot` insert is guarded by the slots lock, so concurrent
     /// `ensure` calls for the same id share the one job.
     pub fn ensure(&self, model: &str, _opts: EnsureOpts) -> ProvisionHandle {
         let mut slots = self.slots.lock().expect("supervisor slots mutex poisoned");

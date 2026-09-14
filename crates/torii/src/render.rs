@@ -637,7 +637,7 @@ pub type Awaiting = Result<Vec<AwaitingNode>, String>;
 ///
 /// An [`Err`] row renders as `unknown: <error>` — never as an absent or empty awaiting set,
 /// which is the one answer that would tell an operator there is nothing to signal on a run
-/// that may be blocked on a human. The message goes through the same [`safe_reason`]
+/// that may be blocked on a human. The message goes through the same `safe_reason`
 /// transform a pause reason does (redact, then collapse control characters, then cap): a
 /// journal-backend fault is free text from the driver and can carry a connection string, a
 /// newline that would forge a row, or an ANSI escape.

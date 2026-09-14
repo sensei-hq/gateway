@@ -36,9 +36,9 @@ impl JobConfig {
     /// few minutes) without rebuilding the library.
     ///
     /// - `max_wait` follows `config.timeout_ms`, falling back to the
-    ///   [`DEFAULT_MAX_WAIT_SECS`] default when `timeout_ms` is unset.
-    /// - `poll_interval` stays at the [`DEFAULT_POLL_INTERVAL_SECS`]
-    ///   default unless the operator sets the [`POLL_INTERVAL_HEADER`]
+    ///   `DEFAULT_MAX_WAIT_SECS` default when `timeout_ms` is unset.
+    /// - `poll_interval` stays at the `DEFAULT_POLL_INTERVAL_SECS`
+    ///   default unless the operator sets the `POLL_INTERVAL_HEADER`
     ///   (`x-poll-interval-ms`) hint on the router config. Non-numeric or
     ///   zero values fall back to the default.
     pub fn from_config(config: &RouterConfig) -> Self {
