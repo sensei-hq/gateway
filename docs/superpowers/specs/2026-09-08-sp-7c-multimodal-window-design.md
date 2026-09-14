@@ -25,10 +25,22 @@ bound on the whole request rather than on its text.
 - Four adapters translate attachments to provider-native shapes and put them on the wire:
   `anthropic/convert.rs`, `openai_compat/convert.rs`, `gemini.rs`, `bedrock/convert/request.rs`.
   The capability is shipped.
-- **No production code in this workspace ever populates `attachments`.** Every one of the 20
-  `with_attachment` call sites is a test. `executor/agent.rs` and `executor/dispatch.rs` both pass
-  `Vec::new()`, and `dispatch.rs` says so outright ("attachments omitted from both because no
-  orchestrator producer populates them").
+- **No production code in this workspace ever populates `attachments`.** All **18**
+  `with_attachment` invocations sit inside `#[cfg(test)]` modules — 4 anthropic, 5 bedrock,
+  4 gemini, 3 openai_compat, 2 kernel, each well below its file's `cfg(test)` marker (525 / 255 /
+  799 / 503 / 571). `executor/agent.rs:936` passes `attachments: Vec::new()` on the assistant
+  turn, and every other orchestrator message is built by `Message::text`, `Message::tool_result`
+  or `support::build_chat_request`, all of which leave the field empty. `dispatch.rs:149` says so
+  outright ("attachments omitted from both because no orchestrator producer populates them").
+
+  > **⚠️ Corrected by the whole-slice review (2026-09-14).** This bullet said "every one of the
+  > **20** `with_attachment` call sites" and that "`executor/agent.rs` and `executor/dispatch.rs`
+  > **both** pass `Vec::new()`". Both citations were wrong: a `git grep` counts 21 matching lines,
+  > of which one is the `pub fn` definition, one a rustdoc example (`kernel/types/request.rs:179`)
+  > and one a test's NAME — leaving 18 real invocations; and `dispatch.rs` contains no
+  > `attachments` assignment at all, only the comment. **The conclusion is unaffected and was
+  > re-verified independently** — the hole is real and latent, so the scope this premise sets
+  > still stands.
 
 So no orchestrator run can reach this today. What can reach it is any consumer of the `gateway`
 library — it is a `[lib]` crate, and the adapters' multimodal support is part of its published
@@ -108,17 +120,41 @@ three. The attachment term is added to the token total the text arithmetic produ
 compile here. Pricing a new media kind at zero by omission is precisely the defect this slice
 exists to remove; the compiler should refuse to let it recur.
 
-### D5 — The `Stt` precedent bounds the risk, and is not breached
+### D5 — The `Stt` precedent bounds the risk, and IS breached at a count
+
+> **⚠️ SUPERSEDED by the whole-slice review (2026-09-14).** As written this section said:
+> "at 4784 tokens, ten images cost ~48 k tokens — comfortably inside every current model's
+> window, and inside the 200 k of the smallest. The over-count is bounded and proportional."
+> That is false, and self-contradicting on its face — 200 k cannot be both "the smallest"
+> and a bound on "every" window. The smallest window this crate ships is **8192**
+> (`presets::tagged`, applied to every `demo_catalog()` model), against which ten images
+> cost nearly six times the window.
 
 The `Stt` arm refuses to invent a number because an estimate so large that every candidate is
-skipped turns a serviceable request into a terminal `AllGated`. That failure mode is the reason to
-check this decision, not a reason to reject it: at 4784 tokens, ten images cost ~48 k tokens —
-comfortably inside every current model's window, and inside the 200 k of the smallest. The
-over-count is bounded and proportional, unlike the base64 shape it replaces.
+skipped turns a serviceable request into a terminal `AllGated`. This decision **does** reproduce
+that failure, just at a count rather than at one image. A candidate is skipped at
+`floor(window / 4784) + 1` attachments:
 
-Direction of the residual error is stated plainly: a small image on a low-res-tier model is
-over-counted by roughly 3×. That biases toward routing to a larger-window candidate — the safe
-direction for a gate whose job is to not put an over-window request on the wire.
+| Window | Attachments admitted | First count that skips |
+|---|---|---|
+| **8 192** (`presets::tagged`, every shipped demo model) | **1** | **2** |
+| 128 000 | 26 | 27 |
+| 200 000 | 41 | 42 |
+
+Pinned by `the_ceiling_caps_how_many_attachments_a_window_can_hold`, so a later move of either
+the ceiling or the preset windows is judged against the table rather than against prose.
+
+Direction of the residual error, with the precondition the original omitted: a small image on a
+low-res-tier model is over-counted by roughly 3×, which biases toward routing to a larger-window
+candidate — the safe direction **only while a larger-window candidate exists**. A 2576px-tier
+image on a real 8192-window vision model costs ~1600 and would genuinely have fitted; the ceiling
+refuses it, and when every candidate is 8192 there is nothing left to bias toward, so a request
+that would have succeeded becomes terminal.
+
+That price is accepted rather than hidden: under-counting admits a request the provider then
+rejects, which is worse than refusing it here. It is also why tier-aware ceilings lead §8's
+deferred list — they are what removes this, and only a ceiling closes the admit bug in the
+meantime.
 
 ---
 

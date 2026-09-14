@@ -75,6 +75,13 @@ problems for this use:
 For the cost `BudgetGate` an under-count is merely optimistic pricing. For a window gate it is the
 defect: it admits a candidate the prompt does not fit, and the provider answers 400.
 
+> **⚠️ SUPERSEDED by SP-7a.1 — multimodal window correctness (`3918784`).** The estimator now
+> charges every attachment a declared ceiling of 4784 tokens, so it is an upper bound on a
+> `Chat` REQUEST and no longer on its text alone. The paragraph below describes the pre-SP-7a.1
+> state and is kept because its reasoning — why neither `MediaSource` string shape can be
+> measured — is what picked the shape of the fix. Its conclusion, that a multimodal call "can
+> still be admitted to a model its images push over", is no longer true.
+
 **What the pessimistic estimate does NOT count, stated so "pessimistic" is not read as
 "complete":** `Message::attachments`. There is no honest token model for media in this crate — the
 only measurable quantity is the `MediaSource` string, and for a `Base64` source that over-counts by
@@ -361,9 +368,10 @@ journaled into `RunPaused` and read back by `torii status`.
   > remove or replace the entry it names, says outright that adding a larger model alongside cannot
   > help, and qualifies "send less input" as conditional on that same entry staying the smallest
   > one that can hold the prompt.
-- **A per-attachment token term for the pessimistic estimate** (§4). Owed by the first caller that
-  attaches media; the term belongs in tokens, added after the divide, and must not be derived from
-  the base64 length.
+- ~~**A per-attachment token term for the pessimistic estimate** (§4). Owed by the first caller
+  that attaches media; the term belongs in tokens, added after the divide, and must not be derived
+  from the base64 length.~~ **DONE — delivered by SP-7a.1 (`3918784`)**, in exactly that shape: a
+  declared 4784-token ceiling per attachment, charged after the divide, never from string length.
 - **A real input bound for the non-chat capabilities** (AC10). `Tts` / `ImageGenerate` /
   `VideoGenerate` DO have provider-published input maxima — a prompt character limit — but it is
   not `context_window` and `ModelConfig` has no field for it. Until one exists those payload kinds

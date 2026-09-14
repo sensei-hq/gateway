@@ -115,9 +115,25 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
 /// by roughly 3×, which biases toward routing to a larger-window candidate — the safe
 /// direction for a gate whose job is to keep an over-window request off the wire.
 ///
-/// Bounded, unlike the byte-length shapes it replaces: ten images cost ~48 k tokens, well
-/// inside every current window, so this cannot reproduce the `Stt` arm's failure of an
-/// estimate so large that every candidate is skipped.
+/// Bounded per image, unlike the byte-length shapes it replaces — but bounded is not
+/// free, and the limit is sharper than it looks. A candidate is skipped at
+/// `floor(window / MAX_TOKENS_PER_ATTACHMENT) + 1` attachments: **2 against the 8192-token
+/// window `presets::tagged` gives every shipped demo model**, 27 against 128 k, 42 against
+/// 200 k. `the_ceiling_caps_how_many_attachments_a_window_can_hold` pins all three.
+///
+/// So this CAN reproduce the `Stt` arm's failure — an estimate so large that every
+/// candidate is skipped and a serviceable request becomes a terminal `AllGated` — just at
+/// a count rather than at one image. An earlier version of this paragraph claimed the
+/// opposite ("ten images cost ~48 k tokens, well inside every current window"); against an
+/// 8192-token window ten images cost nearly six times it.
+///
+/// The "over-counting is the safe direction" argument above has an unstated precondition
+/// that belongs here: it is safe only while a LARGER-window candidate exists to route to.
+/// A 2576px-tier image on a real 8192-window vision model costs ~1600 and would genuinely
+/// have fitted; the ceiling refuses it anyway, and when every candidate is 8192 there is
+/// nothing left to bias toward. That is the price of a ceiling and it is accepted here —
+/// under-counting admits a request the provider then rejects, which is worse — but it is
+/// the reason the tier-aware charge is the first item in the spec's deferred list.
 pub const MAX_TOKENS_PER_ATTACHMENT: u32 = 4784;
 
 /// A deliberately pessimistic input estimate, for the CONTEXT-WINDOW gate only.
@@ -177,13 +193,21 @@ pub const MAX_TOKENS_PER_ATTACHMENT: u32 = 4784;
 /// closed instead of documented.
 ///
 /// The `Stt` failure it warned about — an estimate so large that every candidate is
-/// skipped and a serviceable request becomes a terminal `AllGated` — is checked, not
-/// inherited: at 4784 tokens an image, ten of them cost ~48 k, inside every current
-/// window. See `MAX_TOKENS_PER_ATTACHMENT` for the ceiling's provenance and the
-/// direction of its residual error.
+/// skipped and a serviceable request becomes a terminal `AllGated` — is INHERITED at a
+/// count, not escaped. A candidate is skipped at `floor(window / 4784) + 1` attachments,
+/// which is **2** against the 8192-token window every shipped demo model carries. An
+/// earlier version of this paragraph claimed ten images were "inside every current
+/// window"; they are nearly six times the smallest one. See
+/// `MAX_TOKENS_PER_ATTACHMENT` for the ceiling's provenance, the full threshold table and
+/// the precondition its residual-error argument depends on.
 ///
 /// **Still true, and still worth stating: no producer in this workspace attaches media.**
-/// `executor/agent.rs` and `executor/dispatch.rs` both pass `Vec::new()`, and the adapters
+/// All 18 `with_attachment` invocations are inside `#[cfg(test)]` modules;
+/// `executor/agent.rs:936` passes `attachments: Vec::new()` and every other orchestrator
+/// message is built by `Message::text`, `Message::tool_result` or `build_chat_request`,
+/// which leave the field empty. (`dispatch.rs` carries only a comment saying so — an
+/// earlier version of this paragraph credited it with a `Vec::new()` it does not have,
+/// and counted 20 call sites rather than 18.) The adapters
 /// only translate what they are handed — so the term above changes no orchestrator run.
 /// It is not dead code: four adapters put attachments on the wire, so any consumer of this
 /// `[lib]` crate can construct one, and before SP-7c the first caller to do so inherited
@@ -554,6 +578,56 @@ mod tests {
             u32::MAX,
             "an attachment count past the u32 ceiling clamps loudly instead of wrapping \
              into a small, admissible number"
+        );
+    }
+
+    /// **Review follow-up — the ceiling's real skip threshold, pinned.**
+    ///
+    /// The constant's doc claimed the charge was "bounded ... ten images cost ~48 k
+    /// tokens, well inside every current window, so this cannot reproduce the `Stt` arm's
+    /// failure of an estimate so large that every candidate is skipped." That is false
+    /// against the catalog this crate ships: `presets::tagged` gives every demo model an
+    /// 8192-token window, so the SECOND image already overruns it and the request becomes
+    /// a terminal `AllGated`. Written as an assertion, the claim failed — `10 *
+    /// MAX_TOKENS_PER_ATTACHMENT` is 47_840 against a smallest window of 8_192.
+    ///
+    /// There is a hard limit and it is `floor(window / MAX_TOKENS_PER_ATTACHMENT)`. It is
+    /// pinned here so any later move of the ceiling, or of the preset windows, is judged
+    /// against it rather than against prose.
+    #[test]
+    fn the_ceiling_caps_how_many_attachments_a_window_can_hold() {
+        for (window, max_admissible) in [(8_192u32, 1usize), (128_000, 26), (200_000, 41)] {
+            let fits =
+                estimate_input_tokens_pessimistic(&chat_of(vec![with_images("x", max_admissible)]));
+            let overruns = estimate_input_tokens_pessimistic(&chat_of(vec![with_images(
+                "x",
+                max_admissible + 1,
+            )]));
+            assert!(
+                fits <= window,
+                "{max_admissible} attachments must fit a {window}-token window (est {fits})"
+            );
+            assert!(
+                overruns > window,
+                "{} attachments must overrun a {window}-token window (est {overruns})",
+                max_admissible + 1
+            );
+        }
+
+        // And what that means for the catalog this crate actually ships.
+        let smallest = crate::catalog::demo_catalog()
+            .models
+            .values()
+            .map(|m| m.context_window)
+            .min()
+            .expect("demo catalog has models");
+        assert_eq!(smallest, 8_192, "presets::tagged's window");
+        assert_eq!(
+            (smallest / MAX_TOKENS_PER_ATTACHMENT) as usize,
+            1,
+            "the shipped preset window admits exactly ONE attachment — a two-image \
+             request is unroutable on it, which is the cost of a ceiling and is the \
+             thing the doc must state rather than deny"
         );
     }
 
