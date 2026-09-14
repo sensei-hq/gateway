@@ -195,6 +195,15 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # `bun run test` is vitest in BROWSER mode — `vite.config.ts` configures
+      # `@vitest/browser-playwright` with a headless chromium instance — so the runner
+      # needs a real browser binary. Without this the suite fails at launch with
+      # "Executable doesn't exist at .../chrome-headless-shell". Only chromium is
+      # installed because that is the single configured instance; `--with-deps` pulls
+      # the shared libraries the headless shell links against on a bare runner.
+      - name: Install Playwright chromium
+        run: bunx playwright install --with-deps chromium
+
       - name: Type-check
         run: bun run check
 
