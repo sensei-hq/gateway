@@ -400,7 +400,7 @@ impl SignalState {
     /// A bare adjective, carrying no "already"/"still" of its own, because the callers
     /// supply their own tense — "is `<state>`" and "was already `<state>` before the write
     /// landed" cannot both be built from one word that already says "already". The
-    /// pre-check's Completed refusal has its own dedicated sentence in [`not_delivered`]
+    /// pre-check's Completed refusal has its own dedicated sentence in `not_delivered`
     /// and does not go through here.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -788,8 +788,8 @@ fn awaiting_nodes(events: &[(Seq, JournalEvent)]) -> Vec<render::AwaitingNode> {
 /// executor itself writes inline. **That claim holds only because of the two corrections
 /// below, each of which falsified it once — and each was found only by measuring the row
 /// rather than the argument.** The cap is checked on the REDACTED value — the one actually
-/// written, see [`Measured`] — and on a size measured the way the DURABLE backend stores
-/// it rather than the way `serde_json` writes it, see [`jsonb_number_expansion`]. It is
+/// written, see `Measured` — and on a size measured the way the DURABLE backend stores
+/// it rather than the way `serde_json` writes it, see `jsonb_number_expansion`. It is
 /// also far beyond any real use: both are a human DECISION
 /// (`{"decision":"approved","note":"…"}`), not a data channel, and 4 KiB is roughly 600
 /// words of prose.
@@ -936,8 +936,8 @@ pub(crate) fn check_payload_size(
 /// input bytes. The `invalid type: string "sk-live-…"` shape that leaks in `boot` comes
 /// from deserializing into a TYPED struct, which this does not do.
 ///
-/// This checks the payload [`AsGiven`](Measured::AsGiven) only. The check that bounds the
-/// durable row — [`AfterRedaction`](Measured::AfterRedaction) — needs the redactor and
+/// This checks the payload `Measured::AsGiven` only. The check that bounds the
+/// durable row — `Measured::AfterRedaction` — needs the redactor and
 /// lives in [`signal`]; it can refuse a payload this one accepted, after a connection has
 /// been opened. That is the right split: this one exists to fail fast and to keep an
 /// unbounded blob away from the redactor, not to be the authority on the row size.
@@ -989,7 +989,7 @@ pub fn parse_payload(s: &str) -> Result<serde_json::Value, String> {
 /// the terminal marker's `Seq` decides — see [`SignalStateAt`].
 ///
 /// **The payload is redacted before it is size-checked and journaled** (§6.4/§6.5) — see
-/// [`render::redact_payload`] and [`Measured`]. **A signal is not a credential channel;
+/// `render::redact_payload` and `Measured`. **A signal is not a credential channel;
 /// the credential broker is.**
 pub async fn signal(
     store: &dyn SchedulerStore,

@@ -434,7 +434,7 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
 /// below is normally reached THROUGH. The n shares sum to at most `budget - CONTEXT_HEAD.len()`,
 /// so (for any budget big enough to hold the heading at all) overrunning takes some entry
 /// exceeding its OWN share, and for an entry with a
-/// non-empty body the only way to do that is [`truncate_with_marker`] running out of room for
+/// non-empty body the only way to do that is `truncate_with_marker` running out of room for
 /// its marker — the escape hatch documented below — which is to say emitting one. So the tail
 /// is typically appended to a body already carrying markers. On this module's own fixture of
 /// 200 × 500-byte dependencies into a 1 024-byte budget the render carries 19 markers AND a
@@ -447,7 +447,7 @@ pub fn render_context_section_bounded(entries: &[(String, String)], budget: usiz
 /// data and are free to contain the very `### ` headings and truncation markers a parser would key
 /// on, so measuring afterwards would mean re-parsing text a dependency controls. So they are
 /// accumulated as the section is written — `retained` from the same per-entry `room` the loop
-/// already computes, via what [`truncate_with_marker`] reports it emitted.
+/// already computes, via what `truncate_with_marker` reports it emitted.
 ///
 /// The budget is split EVENLY across dependencies rather than first-come-first-served, so
 /// one verbose upstream cannot crowd the others out of the question entirely — the human is
@@ -776,7 +776,7 @@ fn context_section_overhead(entries: &[(String, String)]) -> usize {
 /// Takes the context ENTRIES rather than a byte total because both of the figures it needs come
 /// from them and must agree: the floor is a fraction of the entry bodies, and the room those
 /// bodies will actually get is the budget minus the section structure the keys and bodies imply
-/// (see [`context_section_overhead`]). A caller passing the two separately could pass a pair that
+/// (see `context_section_overhead`). A caller passing the two separately could pass a pair that
 /// does not describe the same section.
 ///
 /// **The fit check is an APPROXIMATION, in both directions, and [`retained_meets_floor`] over
@@ -809,8 +809,8 @@ fn context_section_overhead(entries: &[(String, String)]) -> usize {
 /// fit.
 ///
 /// **This is the FIRST drive's planner only.** A later drive must not re-run it: its answer folds
-/// in [`orchestrator_core::CONTEXT_FLOOR_FRACTION`], [`context_section_overhead`]'s reservation
-/// and [`tool_bytes`], so an edit to any of them would change `dropped_tools` — and therefore
+/// in [`orchestrator_core::CONTEXT_FLOOR_FRACTION`], `context_section_overhead`'s reservation
+/// and `tool_bytes`, so an edit to any of them would change `dropped_tools` — and therefore
 /// `system` and `tools`, and therefore `agent_input_hash` — under a run whose turn is already
 /// memoized against the old answer. [`replayed_plan`] reproduces the shipped plan from the
 /// journal instead, which keeps a constant the spec intends to re-tune out of the replay path.
@@ -871,8 +871,8 @@ pub fn plan_budget(
 /// This is what makes the cut a function of journaled state in the strong sense the spec's §4.1
 /// asks for. [`plan_budget`] answers "which schemas SHOULD go", and that answer depends on
 /// [`orchestrator_core::CONTEXT_FLOOR_FRACTION`] — a constant whose own doc says it exists to be
-/// replaced by a measurement once AC10's warn supplies one — plus [`context_section_overhead`]'s
-/// reservation and [`tool_bytes`]. Re-running it on a resume therefore made every in-flight
+/// replaced by a measurement once AC10's warn supplies one — plus `context_section_overhead`'s
+/// reservation and `tool_bytes`. Re-running it on a resume therefore made every in-flight
 /// budgeted run's prompt a function of the binary's arithmetic: re-tune the fraction and
 /// `dropped_tools` moves, `system` and `tools` move with it, `agent_input_hash` stops matching
 /// the memo, and the resume dies `DeterminismViolation` — terminal, and unrevivable because

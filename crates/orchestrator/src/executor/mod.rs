@@ -808,7 +808,8 @@ impl Executor {
 
     /// Override the CAS split threshold (default 4 KiB): an effect output whose
     /// serialized size exceeds this is stored in the `ContentStore` and the
-    /// journal carries a [`ContentRef`]; smaller outputs stay inline.
+    /// journal carries a [`ContentRef`](orchestrator_core::ContentRef); smaller outputs
+    /// stay inline.
     pub fn with_cas_threshold(mut self, bytes: usize) -> Self {
         self.cas_threshold = bytes;
         self
@@ -1014,7 +1015,7 @@ impl Executor {
     /// - **already terminal** (a `RunCompleted` is present) ⇒ return the folded
     ///   outcome WITHOUT re-driving, so no second `RunCompleted` is appended;
     /// - **partial** ⇒ fold every `EffectRecorded` into the memo and hand off to
-    ///   [`drive`](Self::drive), which replays the completed prefix (no gateway
+    ///   `drive`, which replays the completed prefix (no gateway
     ///   call, no duplicate journal events), runs the tail, and appends
     ///   `RunCompleted` once.
     ///
