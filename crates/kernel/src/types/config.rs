@@ -245,7 +245,7 @@ pub struct PanelConfig {
     /// **dropped** (its result becomes an error) rather than returned, so no two
     /// returned slots share a family even when per-slot fallback converges.
     /// Default `false` — non-strict: keep both and only record the overlap in
-    /// [`PanelResponse::collisions`]. No effect when `distinct_by` is `None`.
+    /// `PanelResponse::collisions`. No effect when `distinct_by` is `None`.
     #[serde(default)]
     pub strict: bool,
 }

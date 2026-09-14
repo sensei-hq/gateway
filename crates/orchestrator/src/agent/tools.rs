@@ -28,7 +28,7 @@ pub struct ToolContext {
     pub credentials: std::sync::Arc<std::collections::HashMap<String, orchestrator_core::Secret>>,
     /// The CANONICAL per-run workspace root the executor resolved (SP-4 s3), or `None`
     /// when no workspace is wired. A confined fs tool resolves its target via
-    /// [`workspace::confine`](crate::agent::workspace::confine) against this root.
+    /// `workspace::confine` against this root.
     pub workspace_root: Option<std::sync::Arc<std::path::PathBuf>>,
     /// The per-call sandbox handle (SP-4 s4), policy-fixed by the executor from the grant, or
     /// `None` when no sandbox is wired (⇒ the `shell` tool refuses loud). Ephemeral.

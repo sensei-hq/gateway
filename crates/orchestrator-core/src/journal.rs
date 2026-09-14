@@ -145,7 +145,7 @@ pub enum JournalEvent {
         input_hash: String,
         seq: Seq,
         /// The effect's output, carried **inline** for small payloads or as a
-        /// content-addressed [`ContentRef`](crate::content::ContentRef) for
+        /// content-addressed [`ContentRef`] for
         /// over-threshold ones (§7.4). The fold reads this without loading blobs.
         output: EffectOutput,
         /// Set only for `Observation` effects (§7.1): freshness + provenance so a
@@ -789,7 +789,7 @@ pub trait ExecutionJournal: Send + Sync {
 
     /// Persist the latest round-boundary [`Snapshot`] for `run` (latest wins).
     /// The default is a no-op — a backend without snapshot support simply folds
-    /// from the start (the slice-1/2 path); [`InMemoryJournal`] overrides it.
+    /// from the start (the slice-1/2 path); `InMemoryJournal` overrides it.
     async fn snapshot(&self, _run: RunId, _snap: Snapshot) -> Result<(), JournalError> {
         Ok(())
     }
@@ -805,7 +805,7 @@ pub trait ExecutionJournal: Send + Sync {
     /// Map's per-child `EffectRecorded`) and `add` (a `MapCompacted` manifest);
     /// the journal stays oblivious to Map semantics. The default is a graceful
     /// no-removal append (a backend without compaction keeps the child records but
-    /// still records the manifest); [`InMemoryJournal`] overrides it to remove.
+    /// still records the manifest); `InMemoryJournal` overrides it to remove.
     async fn compact(
         &self,
         run: RunId,

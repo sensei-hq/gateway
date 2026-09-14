@@ -139,7 +139,7 @@ pub struct ResourceCaps {
 impl Permissions {
     /// Does `self` (an agent's grant) cover `need` (a tool's declared needs)?
     /// paths: each need is prefixed by some grant path. commands: needed ⊆ granted.
-    /// network/caps: see [`NetworkPolicy::covers`]/[`ResourceCaps::covers`].
+    /// network/caps: see `NetworkPolicy::covers`/`ResourceCaps::covers`.
     pub fn covers(&self, need: &Permissions) -> bool {
         need.paths
             .iter()
