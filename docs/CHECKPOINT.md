@@ -1,7 +1,7 @@
 # Checkpoint
 
-**No slice in flight. No open tasks. `main` = `cece751`, CI green 5/5.**
-Merged 2026-09-14: #59, #60, #61, #62. Issue #56 CLOSED.
+**In flight: SP-REG-1 analysis done, BLOCKED on one product question (§6).** `main` = `cece751`,
+CI green 5/5. Merged 2026-09-14: #59, #60, #61, #62. Issue #56 CLOSED.
 
 ## Done
 
@@ -13,13 +13,12 @@ on TEXT alone; each now costs 4784 tokens after the `/3` divide. LATENT — all 
 **#60 — issue #56, and #61 behind it.** `Cargo.lock` committed (560 crates auditable vs 47);
 `h2` → 0.4.19; `rsa` documented as uncompiled in `.cargo/audit.toml`; `undici` → 7.29.1 (HIGH
 TLS bypass) plus dompurify/devalue/vitest; new `lint`, `cargo audit`, `site` CI jobs. #61 then
-took `rustls` → 0.23.45 (RUSTSEC-2026-0285), published hours after #60's audit ran green.
+took `rustls` → 0.23.45 (RUSTSEC-2026-0285) hours after #60's audit ran green.
 
 **#62 — 32 broken intra-doc links + the missing gate.** Rustdoc warnings are invisible to
 build/test/clippy/fmt, which is how SP-7a.1 rebound a public API's 194-line doc onto a private
-constant and shipped. `RUSTDOCFLAGS="-D warnings" cargo doc` now runs in `lint`,
-mutation-verified to exit 101 on one reintroduced link. Also dropped `stash@{0}` (`c76a3fe`),
-the `loop_gate_settled_with` ordering mutation a named test already guards.
+constant and shipped. `RUSTDOCFLAGS="-D warnings" cargo doc` now runs in `lint`, mutation-verified
+to exit 101. Also dropped `stash@{0}` (`c76a3fe`), a guarded ordering mutation.
 
 ## Verified
 
@@ -29,11 +28,12 @@ Homebrew 1.97 and SHADOWS rustup's 1.98 — verify via `~/.rustup/toolchains/*/b
 
 ## Next
 
-Nothing committed. Candidates: **SP-7c semantic activation** (id released by #59, unspecced —
-starts at `/sensei:design`) · tier-aware ceilings, removing the 8192 over-refusal (SP-7a.1 §8).
+**SP-REG-1** (`docs/analysis/2026-09-14-sp-reg-1-registry-content.md`). Answer §6 — what the
+skill library contains — then Step 4 depth check, then `/sensei:design`. SP-7c deferred again:
+ranking is an optimisation over a library that does not exist; §3 records its determinism call.
 
 ## Open
 
-`cargo audit` reads a run-time database, so it can redden an unchanged `main` — it did (#61); if
-disruptive, make it a scheduled workflow that files an issue. Dependabot does NOT parse
-`site/bun.lock`; the `site` job watches it. `cookie` un-overridden. **Daemon NOT running.**
+`cargo audit` reads a run-time DB so it can redden an unchanged `main` (#61). Dependabot does NOT
+parse `site/bun.lock`; the `site` job watches it. **Daemon down ⇒ SP-REG-1's absolutes are
+ripgrep-derived; re-check with the code graph.**
