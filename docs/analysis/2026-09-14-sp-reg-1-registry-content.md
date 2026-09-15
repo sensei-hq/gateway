@@ -85,8 +85,18 @@ The on-disk contract already exists and is the target
 
 ### Done gate (observable)
 
-1. At least one agent with `area: planning` exists, so `planner_candidates()` is non-empty and
-   `PlannerRef::Select` reaches a planner instead of `expand_failed`.
+1. `PlannerRef::Select` **actually reaches a planner** in the binary `boot::heavy` builds —
+   asserted end-to-end, not by proving `planner_candidates()` non-empty.
+
+   > **⚠️ Corrected by depth round 3.** This item read: "at least one agent with `area: planning`
+   > exists, **so** `planner_candidates()` is non-empty and `PlannerRef::Select` reaches a planner
+   > instead of `expand_failed`." **The "so" is false.** `expand.rs` has a SECOND refusal
+   > immediately after the empty-candidates one — `"Select planner but no selector wired"` — and
+   > `boot::heavy` never calls `with_planner_selector`. All 20 invocations are in `tests.rs`; the
+   > only non-test occurrence is the method definition (`executor/mod.rs:867`), and
+   > `Executor.selector` defaults to `None`. So a non-empty candidate set is **necessary but not
+   > sufficient**, and the slice could have shipped with this item green and the feature still
+   > dead. See D8.
 2. At least one skill declares `activate_on`, and a test drives `assemble_prompt` proving the body
    is composed in for a matching input and absent for a non-matching one — i.e. `OnKeywords` is
    exercised by something that is not a unit-test literal.
@@ -192,9 +202,22 @@ one directory, replace-all, and `Registry::from_config`'s loud duplicate rejecti
 the guard it has always been rather than something the merge has to work around.
 
 The cost, stated plainly: an implementer does not get upstream improvements to the defaults for
-free. They re-run `init` into a scratch directory and diff. That is the trade for owning their own
-registry outright, and it is the right way round — the alternative made their durable config a
-function of which binary happened to run the push.
+free.
+
+> **⚠️ Round 3 sharpened this, and an earlier draft understated it.** The draft said the workflow
+> is "re-run `init` into a scratch directory and diff." That is not usable as described: a raw
+> two-way diff between fresh defaults and a directory the implementer has *already edited* conflates
+> "what upstream changed" with "what I changed", and there is no recorded seed version to build a
+> three-way diff from. Worse, the real cost is not "no free upgrade" but **no discovery channel** —
+> nothing tells them an upstream change exists at all (the repo has no CHANGELOG, and nothing stamps
+> a version into what `init` writes).
+>
+> The supported upgrade path should instead be the one D7's choice already makes available for
+> free: the defaults live at a checked-in git path, so
+> `git diff <old-tag> <new-tag> -- crates/torii/registry/` shows exactly what upstream changed,
+> uncontaminated by the implementer's own edits. Design should name that (or build a thin
+> `config diff-defaults` that does it), and consider stamping a defaults version into seeded
+> content so a stale directory is self-diagnosing.
 
 **D7 — the defaults are compiled into the `torii` binary** (`include_dir!` / `rust-embed`). D2
 puts them at `crates/torii/registry/`, which is a SOURCE-tree path: a `cargo install`ed or
@@ -235,6 +258,32 @@ asserted: only **5 of 57** `AgentDefinition` literal constructions in `crates/` 
 `from_config_assembles_validates_and_rejects_duplicates` (`registry.rs:1289`) assembles a registry
 whose only agent is `area: research` and asserts it validates.
 
+**D8 — wire a default `PlannerSelector` in `boot::heavy`.** Absorbed into this slice rather than
+deferred, because without it the slice's own purpose is unmet: registry content fixes only the
+first of TWO independent reasons `PlannerRef::Select` fails, and fixing one of two leaves the
+feature exactly as broken.
+
+`RulePlannerSelector::new(None)` is the right default — pure, deterministic, no model call. Its
+`select` prefers a configured default when it is among the candidates and otherwise takes
+`candidates.first()` (`planner.rs:91-107`), which is a defensible policy for a toolkit default and
+does not spend a token. `LlmPlannerSelector` is NOT the default: it costs a model call per expand
+and picking it for an implementer is a policy decision the toolkit should not make silently.
+
+**D9 — `config init`'s contract, including what it must NOT require.**
+
+- **It must not require `DATABASE_URL`.** `Command::Config { action }` calls `boot::light(&env)`
+  **before** matching the action (`main.rs:630-631`), and `boot::light` opens a Postgres pool. But
+  `init` is a pure local filesystem operation over compiled-in defaults with no durable-store
+  dependency. Added naively as a third arm it would inherit a database requirement for no reason
+  connected to what it does. The dispatch has to be restructured so `init` is reachable without
+  booting the light tier.
+- **Target-directory states must be specified, all four:** missing (create it? refuse?), empty
+  (seed), non-empty-but-unseeded (refuse? merge? `--force`?), already-seeded-and-since-edited
+  (**this is the dangerous one**). A second `init` that silently overwrites an implementer's edits
+  back to defaults would be the same hazard class D3/D4 were rejected for — silently mutating the
+  implementer's content — merely relocated from `push` to `init`. Default should be refuse-unless-
+  empty, with any overwrite behind an explicit flag.
+
 **Two things D5 does NOT close, recorded for the design:**
 
 - **Edge vs level.** As worded the rule is level-triggered: once a registry is legitimately
@@ -242,7 +291,24 @@ whose only agent is `area: research` and asserts it validates.
   case was argued. Design should decide.
 - **"Add, don't override."** An implementer who *adds* a planner rather than editing the seeded one
   gets a silent competitor: `RulePlannerSelector::select` falls back to `candidates.first()` sorted
-  by name, and `LlmPlannerSelector` puts every `area == planning` candidate in one menu.
+  by name, and `LlmPlannerSelector` puts every `area == planning` candidate in one menu. **D6 makes
+  this MORE likely, not less** — "extend the seed with your own content" nudges an implementer
+  toward authoring a second `area: planning` agent beside the seeded one.
+- **`--yes` silences it, on exactly the path that matters most.** `plan_push` gates on
+  `(d.requires_confirmation() || paused_runs > 0) && !confirmed` (`cmd/config.rs:52`), and the
+  file's own comment records the intent: "`--yes` bypasses the paused-run gate exactly as it
+  bypasses the removal gate — one consistent escape hatch, not two rules." Any CI push passes
+  `--yes` (it must — `interactive_confirm` refuses on EOF), so the zero-planner warning is invisible
+  precisely in automated deployments. Combined with the level-trigger above, an implementer who
+  legitimately never ships a planner is pushed toward permanent `--yes`, which trains blind consent
+  — the failure this file's own doc comments warn about elsewhere. Design should decide whether
+  this disclosure is `--yes`-suppressible at all, or belongs at a log level CI surfaces.
+
+**A boot-time gap D8 does not close, recorded:** `require_agents` (`boot.rs:269-283`) refuses to
+start on zero AGENTS with an actionable message, but counts agents in total — a registry with
+agents and no `area: planning` boots fine and fails mid-run at `expand.rs:169` with a message that
+names no remedy. Extending that check (or adding a sibling) is cheap and turns a runtime surprise
+into a startup one.
 
 ### What D6 deletes — a merge constraint that no longer applies
 
@@ -264,16 +330,30 @@ opt-out flag, provenance record) that seed-once does not need at all.
 
 6. `torii config init <dir>` writes the built-in defaults into an empty directory, and
    `FilesystemConfigSource::load` + `Registry::from_config` over that directory then assemble
-   without error — i.e. what it seeds is immediately valid, not a template needing repair.
-7. The seeded content is **owned**: deleting a file from `<dir>` and pushing removes that entity
-   from the durable config, and a later `config init` into a *different* directory is the only way
-   defaults reappear. No push re-introduces them.
-8. `config init` works from a binary with no source tree beside it (D7) — asserted against the
-   installed/compiled artifact, not against `crates/torii/registry/` on disk.
+   without error — i.e. what it seeds is immediately valid, not a template needing repair. Each of
+   D9's four target-directory states has its own assertion, **including that `init` succeeds with
+   no `DATABASE_URL` set**.
+7. The seeded content is **owned**: deleting a file from `<dir>` and pushing **with `--yes`**
+   removes that entity from the durable config, and no later push re-introduces it. The `--yes` is
+   load-bearing in the assertion, not incidental: `requires_confirmation()` fires on ANY removal
+   (`diff.rs:42-44`) and the real `interactive_confirm` blocks on a live stdin, so a check written
+   without it can hang instead of observing the removal.
+8. `config init` works from a binary with no source tree beside it (D7) — asserted by spawning
+   `env!("CARGO_BIN_EXE_torii")` with `.current_dir()` set to a temp directory containing no
+   `crates/torii/registry/`. The cwd isolation is what makes this prove embedding; without it the
+   test passes while the defaults still resolve through a relative or `CARGO_MANIFEST_DIR`-derived
+   path. The harness already exists and is proven — `crates/torii/tests/cli.rs` spawns the compiled
+   binary across 26+ tests — but no existing test sets `current_dir`.
 9. A push whose incoming config contains zero `area: planning` agents returns
    `PushDecision::NeedsConfirmation`, and the rendered text names the consequence. Asserted
    through `plan_push` for the decision and `describe_diff` for the text — **not** by adding a
-   check to `describe_diff` alone, which renders after the write on the `Apply` path.
+   check to `describe_diff` alone, which renders after the write on the `Apply` path. Concretely:
+   `plan_push` gains a third OR-condition counting `incoming.agents` with `area == PLANNER_AREA`;
+   `describe_diff` gains a `planner_agents: usize` parameter warning when `== 0`, mirroring
+   `paused_runs: usize` which warns when `> 0`.
+10. **`PlannerRef::Select` reaches a planner in the binary `boot::heavy` builds** (D8) — the
+    end-to-end form of item 1, and the only item that proves the slice's stated purpose rather
+    than that its tooling exists.
 
 ## 6.1 Still open — the minimum content list
 
@@ -353,9 +433,36 @@ Findings 3, 4 and 5 shared one root cause — merging defaults on *every* push �
 property with D6 closed all three at once, while also making 8 and 10 moot and removing five
 mechanisms the design would otherwise have owed.
 
-**A third round is required**, by the same rule that forced this one: D6 and D7 assert new things
-about existing code (that `torii config push` needs no change under seed-once; that no embedding
-dependency exists today), and the done gate has been rewritten around them.
+### Round 3 — re-run 2026-09-15, all three, blind
+
+Round 3 found the largest defect of the whole analysis, in a premise that had survived two rounds
+because nobody had asked the end-to-end question.
+
+| # | Finding | Found by | Outcome |
+|---|---|---|---|
+| X1 | **`boot::heavy` wires no `PlannerSelector`.** `expand.rs` has a SECOND refusal after the empty-candidates one — "Select planner but no selector wired" — and all 20 `with_planner_selector` calls are in `tests.rs`. `PlannerRef::Select` is broken in production for TWO independent reasons; this slice addressed one. **Gate item 1's "so" was false.** | persona | **D8** + item 1 rewritten + new item 10 |
+| A1 | D6 makes a fix *available*, not applied; the gate certified tooling, §4's heading says "ship content" | analyst | item 10 is the end-to-end assertion |
+| P1 | `config init` would inherit a spurious `DATABASE_URL` requirement — `Command::Config` calls `boot::light` **before** matching the action | depth | **D9** |
+| P2 | Item 7 omitted `--yes`; `requires_confirmation` fires on any removal and `interactive_confirm` blocks on live stdin, so the check could hang | depth | item 7 |
+| A2 | `init` against a non-empty/already-seeded directory unspecified — **the hazard D3/D4 died for, relocated to `init`** | analyst | **D9** |
+| X2 | `--yes` silences D5 on exactly the CI path where it matters most; with the level-trigger it trains blind consent | persona | recorded under D5 |
+| X3 | No discovery channel for upstream defaults; the "scratch-dir diff" was unusable as written; `git diff <tag> -- crates/torii/registry/` is strictly better | persona | D6 cost paragraph rewritten |
+| X4 | `require_agents` guards zero-agents, not zero-planners; the runtime message names no remedy | persona | recorded under D5 |
+| P3 | Item 8 could pass vacuously without `current_dir` isolation | depth | item 8 |
+| X5 | The first push of seeded content is a pure addition, so it applies unconfirmed — the least-guarded moment | persona | honestly-scoped tradeoff, noted |
+| P4 | `describe_diff`'s new parameter unnamed | depth | item 9 names `planner_agents: usize` |
+| §6.1 | Minimum content list still open, still blocks gate item 2 | depth | open |
+
+Also re-confirmed independently this round: delete-then-push really does remove an entity (named
+test `an_empty_incoming_config_reports_everything_removed`, `diff.rs:323`); D7's premise; D5's
+signature citations; and the hard-invariant-breaks-a-test claim.
+
+**A fourth round is required** by the rule that forced rounds 2 and 3: D8 and D9 assert new things
+about existing code (`boot::heavy`'s executor construction, `Command::Config`'s dispatch order),
+and two gate items were added or rewritten around them. The convergence trend is real — round 1
+produced three decisions of which two were wrong, round 2 produced two of which none were wrong
+but both were incomplete, round 3 found one CRITICAL — but "fewer findings each round" is not
+"zero", and X1 survived two rounds precisely because it was never asked about directly.
 
 ## 8. Method note
 
