@@ -27,6 +27,15 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// The executor this scheduler drives. A test seam, not public API — gated so it
+    /// cannot become one by accident. `Scheduler` takes the `Executor` by value, so a
+    /// caller that built one (`torii::boot::heavy`) has no other way to assert what it
+    /// wired.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn executor(&self) -> &Executor {
+        &self.executor
+    }
+
     /// A scheduler over `store`, driving `executor`, reading pause deadlines from `journal` (the SAME
     /// journal the executor holds), timed by `clock`. Default lease 60s (stale-`waking` reclaim window).
     pub fn new(
