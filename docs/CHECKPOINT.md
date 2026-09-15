@@ -1,39 +1,39 @@
 # Checkpoint
 
-**In flight: SP-REG-1 analysis done, BLOCKED on one product question (§6).** `main` = `cece751`,
-CI green 5/5. Merged 2026-09-14: #59, #60, #61, #62. Issue #56 CLOSED.
+**No slice in flight. `main` = `e952f3e`. SP-REG-0 shipped; SP-REG-1 split into a programme.**
+Merged 2026-09-14/15: #59, #60, #61, #62, #63. Issue #56 CLOSED.
 
 ## Done
 
-**#59 — SP-7a.1 multimodal window correctness + whole-slice review.** The estimator ignored
-`Message::attachments`, so every `ContextWindowGate` decision on a multimodal request was made
-on TEXT alone; each now costs 4784 tokens after the `/3` divide. LATENT — all 18
-`with_attachment` sites are tests. Five reviewers, 11 findings, all fixed and hand-verified.
+**#59 SP-7a.1** multimodal window correctness + its whole-slice review (11 findings, all fixed).
+**#60 issue #56** — `Cargo.lock` committed (560 crates auditable vs 47), `h2` → 0.4.19, `undici`
+→ 7.29.1 (HIGH TLS bypass), new `lint`/`cargo audit`/`site` CI jobs. **#61** `rustls` → 0.23.45.
+**#62** 32 broken intra-doc links + a `RUSTDOCFLAGS=-D warnings` gate, mutation-verified.
 
-**#60 — issue #56, and #61 behind it.** `Cargo.lock` committed (560 crates auditable vs 47);
-`h2` → 0.4.19; `rsa` documented as uncompiled in `.cargo/audit.toml`; `undici` → 7.29.1 (HIGH
-TLS bypass) plus dompurify/devalue/vitest; new `lint`, `cargo audit`, `site` CI jobs. #61 then
-took `rustls` → 0.23.45 (RUSTSEC-2026-0285) hours after #60's audit ran green.
+**#63 SP-REG-0 — `PlannerRef::Select` was dead in every shipped `torii`.** `expand.rs` refuses
+twice and `boot::heavy` wired eight builders but not the selector; all `with_planner_selector`
+calls were in tests, so a whole SP-3 slice-4B feature could not run while the suite stayed green.
+Now wires `RulePlannerSelector::new(None)`. Two `#[cfg(test-support)]` seams were needed because
+the defect is unobservable without a model backend CI lacks — which is how it shipped.
 
-**#62 — 32 broken intra-doc links + the missing gate.** Rustdoc warnings are invisible to
-build/test/clippy/fmt, which is how SP-7a.1 rebound a public API's 194-line doc onto a private
-constant and shipped. `RUSTDOCFLAGS="-D warnings" cargo doc` now runs in `lint`, mutation-verified
-to exit 101. Also dropped `stash@{0}` (`c76a3fe`), a guarded ordering mutation.
+## SP-REG-1 — split, NOT done
+
+Four rounds produced **10 → 12 → 12** findings (not converging); round 4 falsified two §2
+foundation claims, one of them citing a `#[cfg(test)]` fixture as production capability — the
+trap that document's own earlier correction disqualifies. It had accreted into ~8 workstreams.
+
+**Remaining (table in §7.1 of `docs/analysis/2026-09-14-sp-reg-1-registry-content.md`):** content
+list · `config init` · embedded defaults · gateway chain alignment · tool specs + five unwired
+discovery tools · default-planner designation · entry-point docs · distribution.
 
 ## Verified
 
-`cargo test --workspace --locked` 1767 / 0 real exit 0 · clippy **0.1.98** `-D warnings` 0 · fmt
-0 · rustdoc `-D warnings` 0 · `cargo audit` 0 · site 657 files, 46 tests. Local `rustc` is
-Homebrew 1.97 and SHADOWS rustup's 1.98 — verify via `~/.rustup/toolchains/*/bin`.
+`cargo test --workspace --locked` **1817 / 0** with a live Postgres (1767 without) · clippy
+**0.1.98** `-D warnings` 0 · fmt 0 · rustdoc `-D warnings` 0 · `cargo audit` 0 · both PG suites 0.
+Local `rustc` is Homebrew 1.97 and SHADOWS rustup's 1.98 — verify via `~/.rustup/toolchains/*/bin`.
+Postgres is live on 5432 with `database/_apply_all.sql` applied.
 
 ## Next
 
-**SP-REG-1** (`docs/analysis/2026-09-14-sp-reg-1-registry-content.md`). Answer §6 — what the
-skill library contains — then Step 4 depth check, then `/sensei:design`. SP-7c deferred again:
-ranking is an optimisation over a library that does not exist; §3 records its determinism call.
-
-## Open
-
-`cargo audit` reads a run-time DB so it can redden an unchanged `main` (#61). Dependabot does NOT
-parse `site/bun.lock`; the `site` job watches it. **Daemon down ⇒ SP-REG-1's absolutes are
-ripgrep-derived; re-check with the code graph.**
+Re-scope SP-REG-1 from §7.1's table, not §4's framing; §2's claims are verified only as of round 4.
+**Daemon down ⇒ those absolutes are ripgrep-derived; re-check with the code graph.**

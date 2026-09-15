@@ -294,10 +294,22 @@ asserted: only **5 of 57** `AgentDefinition` literal constructions in `crates/` 
 `from_config_assembles_validates_and_rejects_duplicates` (`registry.rs:1289`) assembles a registry
 whose only agent is `area: research` and asserts it validates.
 
-**D8 — wire a default `PlannerSelector` in `boot::heavy`.** Absorbed into this slice rather than
-deferred, because without it the slice's own purpose is unmet: registry content fixes only the
-first of TWO independent reasons `PlannerRef::Select` fails, and fixing one of two leaves the
-feature exactly as broken.
+**D8 — wire a default `PlannerSelector` in `boot::heavy`. ✅ SHIPPED as SP-REG-0, PR #63
+(`e952f3e`) — extracted out of this slice and merged on its own.**
+
+Round 4's claims verifier showed why it could go alone: `require_agents` refuses to boot on zero
+agents, so **every running worker has already pushed agents** and could have pushed an
+`area: planning` one. For those deployments the missing selector was the SOLE blocker — a ~1-line
+production change with immediate value and no dependency on content, `config init`, embedding or
+distribution.
+
+Shipped with `RulePlannerSelector::new(None)` (pure, no model call), two
+`#[cfg(test/test-support)]` seams (`Executor::has_planner_selector`, `Scheduler::executor`)
+because the defect was otherwise unobservable without a model backend CI does not have, and a
+mutation-verified guard. Suite 1817/0 with a live Postgres.
+
+**Still open from D8, deliberately:** nothing can supply `Some(default)`, so two `area: planning`
+agents resolve by name order (round-4 finding F1). Designating a default is its own change.
 
 `RulePlannerSelector::new(None)` is the right default — pure, deterministic, no model call. Its
 `select` prefers a configured default when it is among the candidates and otherwise takes
@@ -514,9 +526,36 @@ FALSE claims in §2, the foundation, which no earlier round had re-checked.**
 | Z5 | D7 leaves `include_dir` vs `rust-embed` an unresolved either/or with different APIs. | depth | **open** |
 | C3 | §2.2's "empty **by construction**" is MISLEADING — `require_agents` refuses boot on zero agents, so **every running worker has already pushed agents and could have pushed a planner**. The set is empty because this repo ships no content. | claims | see below |
 
-C3 is the most useful finding in the round, because it decomposes the problem: **for any existing
-deployment, the missing selector (D8) is the SOLE blocker** — a ~3-line change, independently
-shippable, with no dependency on content, `config init`, embedding or distribution.
+C3 is the most useful finding in the round, because it decomposed the problem: **for any existing
+deployment, the missing selector (D8) was the SOLE blocker** — independently shippable, with no
+dependency on content, `config init`, embedding or distribution. **That became SP-REG-0 and is
+merged (PR #63, `e952f3e`).**
+
+## 7.1 The split, and what SP-REG-1 is now
+
+Four rounds produced **10 → 12 → 12** findings — not converging — and falsified two §2 foundation
+claims in round 4 that three earlier rounds had read past. Meanwhile the slice had accreted from
+"ship registry content" into roughly eight independent workstreams. Continuing to patch one
+document was chasing a moving target, so the work was split.
+
+**Shipped:** SP-REG-0 — wire the planner selector (PR #63).
+
+**SP-REG-1 remains open**, and is now honestly a *programme* rather than a slice. Its parts, each
+of which the review rounds showed is independently substantial:
+
+| part | state | blocking evidence |
+|---|---|---|
+| The minimum content list — which skills, what `activate_on` sets, any `tools/*.json` | open | §6.1; blocks gate item 2 |
+| `config init` (D6/D9) — CLI shape, four directory states, no-`DATABASE_URL` dispatch restructure | open | D9; `env_config()` at `main.rs:418` is the real gate |
+| Defaults embedded in the binary (D7) — and `include_dir` vs `rust-embed` | open | Z5 |
+| Gateway chain alignment — a shipped agent's chain-id must exist in a `GatewayConfig` that `config push` never sees | open | round-4 Y1 |
+| Tool specs + the five unwired SP-3 discovery tools | open | round-4 Y2 |
+| Designating a default planner | open | round-4 F1 |
+| Entry-point docs — zero `.md` files under `crates/torii` | open | round-4 F2 |
+| Distribution + build provenance — no Dockerfile, no release workflow, no `--version` | open | round-4 F3 |
+
+Anyone picking this up should re-scope from that table rather than from §4's original framing,
+and should treat §2's claims as re-verified only as of round 4.
 
 **The analysis is not converging.** Rounds produced 10 → 12 → 12 findings; round 4 falsified two
 foundation claims that three prior rounds had read past. And the slice has accreted well beyond
