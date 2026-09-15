@@ -161,92 +161,119 @@ and not the reverse.
 **D2 — built-ins live at `crates/torii/registry/`.** torii owns the management surface and the
 write path, so the baseline content sits beside it. The orchestrator stays content-free.
 
-**D3 — layered sources, override by name.** A defaults source composed with the implementer's
-source; on a name collision the later layer wins, so an implementer gets working defaults free,
-can override any single one, and never forks the whole set.
+> **⚠️ D3 and D4 are SUPERSEDED by D6, after the second depth check.** They said: layered sources
+> with the later layer winning on a name collision (D3), merged before the durable write by
+> `torii config push` (D4). The reviewers showed that merging defaults in on **every push** —
+> which D4 required — produces three separate defects with one root cause:
+>
+> 1. **No deletion.** "Later layer wins" has no tombstone, so an implementer can never remove a
+>    built-in they do not want — only override its name with inert content that still validates.
+>    D3 was chosen to avoid forking the set, and this forced exactly that.
+> 2. **A torii upgrade silently mutates the implementer's durable config.** If a release changed
+>    `crates/torii/registry/`, the next routine CI push of an *unedited* directory becomes a
+>    non-noop, bumps the generation, and applies without confirmation (`plan_push` gates only on
+>    `!removed.is_empty() || paused_runs > 0`). `torii config version` reports a bare `u64` with no
+>    record that the cause was a binary upgrade rather than an edit — and **any successful push
+>    terminally kills every already-journaled paused run** (`cmd/config.rs:30-39`).
+> 3. **No opt-out.** The merge was unconditional, so a deployer whose requirement is "the durable
+>    registry contains only what I reviewed" could not meet it. Before this slice there was no
+>    shipped content at all, so D4 would have left that persona **worse off than the status quo** —
+>    in a repo whose whole SP-4 model is an auditable ceiling of trust.
 
-**D4 — the merge happens BEFORE the durable write.** `torii config push` composes the built-in
-defaults root with the implementer's root, merges, validates, and writes the MERGED result. The
-depth check found D3 had no route to production otherwise: `ConfigAction::Push { dir: PathBuf }`
-(`main.rs:308`) takes ONE directory and is **replace-all**, and the executor boots from a single
-`PostgresConfigSource` (`torii/boot.rs:371`). So an implementer pushing only their override
-directory would **wipe the defaults** — precisely the "fork the whole set" outcome D3 exists to
-prevent. The rejected alternative was composing at executor boot: that leaves the fs defaults and
-the Postgres tables free to disagree, which is the "second source of truth" failure §4's Wrong
-Gate already names, and it would hollow out SP-DATA-2's config-generation fence. Merging before
-the write keeps exactly one durable source of truth.
+**D6 — seed-once, not merge-always.** A new `torii config init <dir>` writes the built-in defaults
+into the implementer's OWN directory, once. From then on those files are theirs: edit them, delete
+them, review them in their own VCS, push them with the `torii config push` that already exists.
 
-**D5 — a push that would leave zero planners warns and requires confirmation.** The depth check
-found override-by-name is otherwise a **trap that re-opens the very bug this slice closes**: an
-override keeping the built-in planner's NAME but changing `area` passes silently, because
-`Registry::validate` has no planner invariant (`rg 'PLANNER_AREA|"planning"' registry.rs` → 0),
-`diff::compare` keys agents by name so an `area` edit is classified `changed` not `removed`, and
+This is a large simplification, not merely a different choice. It deletes the need for:
+a composing `ConfigSource` (none exists — would have been new code), the per-collection merge-key
+table, the per-layer-vs-cross-layer dedup ordering, a tombstone syntax, a `--no-defaults` flag,
+and a generation-bump provenance record. `torii config push` needs **no change at all**: it stays
+one directory, replace-all, and `Registry::from_config`'s loud duplicate rejection stays exactly
+the guard it has always been rather than something the merge has to work around.
+
+The cost, stated plainly: an implementer does not get upstream improvements to the defaults for
+free. They re-run `init` into a scratch directory and diff. That is the trade for owning their own
+registry outright, and it is the right way round — the alternative made their durable config a
+function of which binary happened to run the push.
+
+**D7 — the defaults are compiled into the `torii` binary** (`include_dir!` / `rust-embed`). D2
+puts them at `crates/torii/registry/`, which is a SOURCE-tree path: a `cargo install`ed or
+containerised `torii` has no such directory, so `config init` could not find them. Embedding works
+identically from a checkout, an install, or a container, with nothing to ship alongside and
+nothing to misconfigure. Neither dependency is present today (`crates/torii/Cargo.toml` has no
+`rust-embed`/`include_dir`, and `torii/build.rs` is about `DATABASE_URL` cfg, unrelated), so this
+is a new dependency. Refreshing the defaults requires a rebuild, which is correct: they are part
+of the binary's contract.
+
+**D5 (revised) — the zero-planner gate lives in `plan_push`, NOT `describe_diff`.** Still needed
+under D6, because an implementer can still edit the seeded planner agent's `area` and silently
+disable planner selection: `Registry::validate` has no planner invariant, `diff::compare` keys
+agents by name so an `area` edit classifies as `changed` not `removed`, and
 `ConfigDiff::requires_confirmation` is `!self.removed.is_empty()` (`diff.rs:42-44`) — so it
-applies **unprompted**. The failure then surfaces much later as `expand_failed("no planner agents
-(area==planning)")`, disconnected from the push that caused it.
+applies unprompted and fails much later as `expand_failed("no planner agents (area==planning)")`.
 
-So `describe_diff` gains a check: if the push would leave zero `area: planning` agents, force
-confirmation and name the consequence. A hard invariant in `Registry::validate` was rejected — a
-registry with no planner is legitimately legal (you simply cannot use `PlannerRef::Select`), and
-making it illegal would redden the many existing test registries that have none. Reserving
-built-in names as non-overridable was rejected as removing the flexibility D3 was chosen for.
+> **⚠️ An earlier draft put this check in `describe_diff`, and that was wrong.** `describe_diff` is
+> a pure renderer with no return path into the decision, and on the `Apply` arm
+> (`cmd/config.rs:243-248`) its text is passed to `write_and_report`, which calls
+> `store_and_bump_if` and returns the text as a **prefix on the success message of an
+> already-committed write** — `confirm` is never called on that path. A check there would have
+> printed a warning about a push that had already happened: the very silent-application bug D5
+> exists to close, wearing a fix.
 
-**Also unguarded, and NOT closed by D5 — record it for the design:** an implementer who *adds* a
-planner rather than overriding one gets a silent competitor. `RulePlannerSelector::select` falls
-back to `candidates.first()` sorted by name, so the built-in can win alphabetically; and
-`LlmPlannerSelector` puts every `area == planning` candidate in one menu, so the built-in competes
-for every plan. Neither is covered by the done gate.
+So: the **decision** half goes in `plan_push`, which already receives `incoming: &RegistryConfig`
+(`cmd/config.rs:40-45`) and so can count `area == PLANNER_AREA` agents — a third OR-condition
+beside `d.requires_confirmation() || paused_runs > 0`, forcing `NeedsConfirmation`. The
+**disclosure** half needs a channel into `describe_diff`, which today receives only
+`(&ConfigDiff, u64, &str, usize)` and whose `ConfigDiff`/`DiffEntry` carry no `area`. The
+established pattern in that same file is `paused_runs: usize`, added for exactly this reason —
+warning about something the diff cannot express — and tested at `cmd/config.rs:399` and `:419`.
+D5 follows it with an analogous parameter.
 
-### The constraint D3 has to respect, found while checking it
+A hard invariant in `Registry::validate` was rejected and the reason is now measured, not
+asserted: only **5 of 57** `AgentDefinition` literal constructions in `crates/` declare
+`area: "planning"`, and a named currently-green test would flip red —
+`from_config_assembles_validates_and_rejects_duplicates` (`registry.rs:1289`) assembles a registry
+whose only agent is `area: research` and asserts it validates.
 
-`Registry::from_config` (`registry.rs:428`) **rejects duplicates loudly** —
-`OrchestratorError::RegistryLoad("duplicate agent: {name}")`, pinned by
-`from_config_assembles_validates_and_rejects_duplicates` (`registry.rs:1289`).
+**Two things D5 does NOT close, recorded for the design:**
 
-So D3 **cannot** be implemented by concatenating two `RegistryConfig`s and calling `from_config`:
-that errors on every intentional override. The merge must happen at `RegistryConfig` level
-**before** `from_config`, giving the rule:
+- **Edge vs level.** As worded the rule is level-triggered: once a registry is legitimately
+  planner-less it re-warns on *every* future push, including unrelated edits. Only the transition
+  case was argued. Design should decide.
+- **"Add, don't override."** An implementer who *adds* a planner rather than editing the seeded one
+  gets a silent competitor: `RulePlannerSelector::select` falls back to `candidates.first()` sorted
+  by name, and `LlmPlannerSelector` puts every `area == planning` candidate in one menu.
 
-- **within one source** — a duplicate name stays a loud error (it is an accident: two files
-  defining the same agent);
-- **across layers** — the later layer wins (it is intent).
+### What D6 deletes — a merge constraint that no longer applies
 
-That preserves the existing guard rather than weakening it. No composing `ConfigSource` exists
-today (`rg 'Chained|Layered|Composite|Overlay'` over the config sources → nothing), so it is new
-code.
+An earlier draft spent a section on the merge semantics D3/D4 required: that
+`Registry::from_config` (`registry.rs:428`) rejects duplicates loudly, so a merge could not be
+concatenate-then-build; that it therefore had to happen at `RegistryConfig` level with a
+per-collection key table (`name` for agents/skills/tools, `(area, kind)` for `chain_bindings`);
+and that intra-layer dedup needed its own new pass because `FilesystemConfigSource::load` does
+none.
 
-**The merge key, per collection — stated, because an earlier draft only flagged it.**
-`RegistryConfig` is four `Vec`s:
+**All of that is moot under D6.** There is one layer at push time — the implementer's directory —
+so `from_config`'s duplicate rejection is simply the guard it always was, `chain_bindings` needs
+no special key, and no per-layer dedup pass exists to write. The finding that produced the
+constraint was correct and is retained here only as the reason D6 is cheaper than it looks: the
+merge design was accumulating mechanisms (composing source, key table, dedup pass, tombstone,
+opt-out flag, provenance record) that seed-once does not need at all.
 
-| collection | merge key | override rule |
-|---|---|---|
-| `agents`, `skills`, `tools` | `name` | later layer replaces the earlier entry with the same `name` |
-| `chain_bindings` | **`(area, kind)`** | later layer replaces the earlier entry with the same `(area, kind)` tuple |
+### Added to the done gate by D1, D5–D7
 
-`chain_bindings` has no `name` field, so it is the collection a name-keyed merge would silently
-*concatenate* — and `Registry::from_config` rejects a duplicate `(area, kind)` just as loudly as a
-duplicate name (`"duplicate chain binding: {area}/{kind}"`, `registry.rs:457-465`, pinned by
-`duplicate_area_kind_in_chains_json_is_rejected_by_from_config`). So the natural oversight —
-merge by name, concatenate the rest — would pass every other gate item while reintroducing
-"every intentional override is a loud error" for bindings specifically.
-
-**Where intra-layer dedup lives.** Today duplicate detection exists *only* in
-`Registry::from_config`; `FilesystemConfigSource::load` does none. Since D4 merges before
-`from_config` runs, the "within a layer this is a loud error" half needs its own per-layer pass in
-the merge code — it cannot be inherited from `from_config`, which by then sees one merged config
-in which the collisions have already been resolved.
-
-### Added to the done gate by D1–D5
-
-6. A defaults layer and an implementer layer, both present, where the implementer's definition of a
-   colliding **name** is the one the `Registry` resolves — and a duplicate WITHIN either layer is
-   still a loud `RegistryLoad` error, raised by the merge's own per-layer pass.
-7. The same, keyed on **`(area, kind)`**, for `chain_bindings` — asserted separately, because this
-   is the collection a name-keyed merge silently concatenates.
-8. Overriding a built-in requires no fork: the implementer supplies one file, pushes, and the
-   merged durable config contains their version plus every un-overridden default.
-9. A push whose merged result would contain zero `area: planning` agents requires confirmation and
-   says why (D5). Asserted through `plan_push`/`describe_diff`, not by inspecting the diff struct.
+6. `torii config init <dir>` writes the built-in defaults into an empty directory, and
+   `FilesystemConfigSource::load` + `Registry::from_config` over that directory then assemble
+   without error — i.e. what it seeds is immediately valid, not a template needing repair.
+7. The seeded content is **owned**: deleting a file from `<dir>` and pushing removes that entity
+   from the durable config, and a later `config init` into a *different* directory is the only way
+   defaults reappear. No push re-introduces them.
+8. `config init` works from a binary with no source tree beside it (D7) — asserted against the
+   installed/compiled artifact, not against `crates/torii/registry/` on disk.
+9. A push whose incoming config contains zero `area: planning` agents returns
+   `PushDecision::NeedsConfirmation`, and the rendered text names the consequence. Asserted
+   through `plan_push` for the decision and `describe_diff` for the text — **not** by adding a
+   check to `describe_diff` alone, which renders after the write on the `Apply` path.
 
 ## 6.1 Still open — the minimum content list
 
@@ -296,9 +323,39 @@ section added last and never checked until now. All were verified by hand before
 | G | README documents no orchestrator/torii crate — persona undocumented | persona | §6.2 |
 | H | Gate item 3 read stronger than it was (`load` ≠ assemble) | depth | §4 item 3 |
 
-**Re-run required.** Per the design stage's own rule, a rewrite that asserts something new about
-existing code goes back through verification — and D4, D5 and the §6 merge-key table all do. The
-depth check should be re-run against this revised document before `/sensei:design`.
+### Round 2 — re-run 2026-09-14 against the revised document
+
+All three again, blind, and deliberately NOT told what round 1 found. **Round 2 invalidated two of
+the three decisions round 1 produced**, which is the case for re-running rather than assuming a
+rewrite closes what it claims to.
+
+**Every one of round 1's five re-checked assertions was independently CONFIRMED** — D4's premises,
+D5's premises, the merge-key table, §6.1's tool-executable hazard, §6.2's README count. Including
+the one flagged as the author's own unverified weak point (that a hard `validate` invariant would
+break existing tests), which the analyst proved with a named green test rather than a ratio.
+
+What round 2 found anyway:
+
+| # | Finding | Found by | Outcome |
+|---|---|---|---|
+| 1 | **D5 was specified in the wrong function.** `describe_diff` is a pure renderer; on the `Apply` arm its text prefixes an already-committed write and `confirm` is never called. The check would have warned about a push that already happened. | persona + depth | **D5 revised** — decision in `plan_push`, disclosure via a `paused_runs`-style parameter |
+| 2 | **Defaults-root discovery undecided** — `crates/torii/registry/` is a source path an installed binary cannot see; no embedding mechanism exists. | analyst + depth | **D7** |
+| 3 | No deletion: "later layer wins" has no tombstone. | persona | **D3/D4 superseded by D6** |
+| 4 | A torii upgrade silently bumps the durable generation on an unedited push — and any push kills paused runs. | persona | **D3/D4 superseded by D6** |
+| 5 | No opt-out; the minimal-trust deployer ends up worse off than the pre-slice status quo. | persona | **D3/D4 superseded by D6** |
+| 6 | Gate item 2 remains unbuildable — no committed skill/keyword content. | depth | open, §6.1 |
+| 7 | D5 is level-triggered, re-warning forever once legitimately planner-less. | depth | recorded for design |
+| 8 | `ConfigAction::Push`'s doc comment would have gone stale under D4. | persona | moot under D6 — push is unchanged |
+| 9 | `describe_diff` renders no field-level values, so an `area` reassignment looks like any `~ agent`. | persona | recorded for design |
+| 10 | Per-layer vs cross-layer dedup ordering underspecified. | depth | moot under D6 |
+
+Findings 3, 4 and 5 shared one root cause — merging defaults on *every* push — and killing that
+property with D6 closed all three at once, while also making 8 and 10 moot and removing five
+mechanisms the design would otherwise have owed.
+
+**A third round is required**, by the same rule that forced this one: D6 and D7 assert new things
+about existing code (that `torii config push` needs no change under seed-once; that no embedding
+dependency exists today), and the done gate has been rewritten around them.
 
 ## 8. Method note
 
