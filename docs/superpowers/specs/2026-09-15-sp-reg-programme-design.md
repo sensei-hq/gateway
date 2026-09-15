@@ -27,7 +27,7 @@ is recorded so it can be re-opened deliberately rather than by accident.
 |---|---|---|
 | **SP-REG-2** | Discovery tools, composed per-run from the pinned registry | code: nothing. **Done gate: the tool SPECS** — see §3 |
 | **SP-REG-3** | Designating which planner wins | nothing |
-| **SP-REG-4** | `config init` + embedded defaults + the shipped content | **the content list (§6)** |
+| **SP-REG-4** | `config init` + embedded defaults + the shipped content | **TWO: the content list, AND the un-designed `dispatch()` restructure (§6)** |
 | **SP-REG-5** | Cross-check agent chain ids against the gateway config at push | nothing |
 
 Distribution (a published artifact, build provenance, `--version`) is **out of scope**. It is a
@@ -95,9 +95,15 @@ after a `RegistryHandle::reload`, every subsequent run would still see the boot-
    against the core `Registry`. The executor's `ToolRegistry` never reaches it.
 2. **It widens nothing.** The SP-4 s1 gate requires a called tool to be LISTED on the agent
    (`ar.agent_tools.iter().any(...)`), so registering an executable an agent has not declared is
-   inert. The one read that happens BEFORE that gate is `spec_of` → `class`, which defaults to
-   `Pure` for an unregistered name — and all five discovery tools declare `EffectClass::Pure`, so
-   registering them changes no class and no memo behaviour.
+   inert. **TWO** reads happen before that gate — `spec_of` → `class` and `required_of` → `need` —
+   and both are harmless. `class` defaults to `Pure` for an unregistered name, and all five
+   discovery tools declare `EffectClass::Pure`, so registering them changes no class and no memo
+   behaviour. `required_of` on an unregistered name returns empty `Permissions`, and the
+   `!(listed && grant.covers(&need))` test short-circuits on `listed` regardless.
+
+   > An earlier draft said "the one read". Two drafts in a row have now miscounted reads of
+   > `self.tools` in this file — once as four instead of five, once as one instead of two. The
+   > cause both times was a single-line regex over code that wraps.
 
    > **⚠️ Corrected.** An earlier draft cited `boot.rs` as recording "the same argument". It does
    > not: `boot.rs`'s argument for `fs_read`/`fs_write`/`shell` is that those tools **fail closed**
@@ -106,31 +112,51 @@ after a `RegistryHandle::reload`, every subsequent run would still see the boot-
    > the full list unconditionally. The s1 listing check is the whole defence, so it is stated
    > directly rather than leaning on a false analogy.
 
-3. **Replay-safety holds only on the fenced path, and that scopes the slice.** The tools read the
-   pinned registry, and the run's fence is `{version}#cfg{generation}`.
+3. **Already-recorded calls are safe everywhere; only FRESH calls need the `#cfg` term.** This is
+   the precise statement, and two earlier drafts got it wrong in opposite directions.
 
-   > **⚠️ An earlier draft claimed "there is no third outcome". That is FALSE — there are at least
-   > three.** `format!("{}#cfg{}", …)` is the only writer of the suffix and lives inside `pinned`.
-   > So: **(a)** an executor built with `with_registry` (no handle) never gets a `#cfg` term at all,
-   > so two processes with *different* fixed registries carry the *same* fence and compare equal;
-   > **(b)** a handle over an unversioned source pins generation `0` — `ConfigSource::version()`
-   > defaults to `None` and `from_source` does `unwrap_or(0)` — so a `FilesystemConfigSource` yields
-   > `v1#cfg0` whatever its content, which the repo states itself in `e2e_pg.rs` ("a worker that
-   > never pins a generation can never observe a fence drift"); **(c)** `run_inner` never loads the
-   > journal and never checks the fence at all.
+   A discovery tool is `EffectClass::Pure`, so a recorded call **replays from the journal memo and
+   is never re-executed** — `execute_tool_effect`'s memo hit returns the recorded output, with the
+   `stale` re-run reserved for `Observation`. That holds on *any* executor, handle or not, and the
+   repo already proves it on the no-handle path: `agent_resume_halts_when_a_skill_changed_under_a_
+   completed_turn` builds two `with_registry` executors over *different* registries and gets a loud
+   `DeterminismViolation` with zero gateway calls.
 
-**This inverts the earlier draft's "wrinkle".** That draft said composing on the no-handle path was
-a completeness requirement and the likeliest way to ship half-working. The opposite is true:
-**compose ONLY on the pinned path.** A fixed-registry executor has no generation, therefore no
-fence, therefore nothing making discovery output replay-safe — registering the tools there would
-manufacture exactly the divergence this design avoids. That is a deliberate boundary with a reason,
-and the doc comment must say so. Production is unaffected: `boot::heavy` uses
-`with_registry_handle`, and `with_registry` appears only in tests.
+   What the `#cfg` term buys is narrower and real: **fresh-call config consistency.** A call made
+   for the first time on drive N+1 reads the live pinned registry. Only a generation term in the
+   fence makes a drifted config refuse the resume instead of silently answering differently — and
+   the tool's own input hash cannot catch it, because `list_agents`'s arguments are `{}` whatever
+   the registry holds.
+
+   > **⚠️ Two corrections, both of them mine.** The first draft claimed "there is no third outcome"
+   > for the fence — FALSE, there are three: `with_registry` yields no `#cfg` term at all; a handle
+   > over an unversioned source pins `0` regardless of content (`ConfigSource::version()` defaults
+   > to `None`, `from_source` does `unwrap_or(0)`); and `run_inner` never checks the fence.
+   >
+   > The *second* draft then over-corrected into "a fixed-registry executor has no fence, therefore
+   > nothing making discovery output replay-safe" — **also FALSE, on both links.** `start_inner`
+   > fences unconditionally on `RunStarted.version`; a no-handle executor HAS a fence, it just has
+   > no `#cfg` term in it. And replay safety comes from the Pure memo, not from the fence at all.
+
+**The conclusion survives the correction, on the narrower ground: compose ONLY on the pinned path.**
+Not because the other path is replay-unsafe — it isn't, for recorded calls — but because only the
+pinned path can detect config drift for a *fresh* call, and a discovery tool whose answer silently
+depends on which registry a process happens to hold is worth refusing rather than shipping.
+Production is unaffected either way: `boot::heavy` uses `with_registry_handle`, and
+`Executor::with_registry` appears only in tests.
+
+**What the no-handle path gets instead, stated so it is not a surprise:** an agent that declares
+`list_agents` there passes `assemble_prompt_parts` and the s1 gate, then hard-fails `UnknownTool`
+out of `execute_ctx` — a burned turn, not a graceful refusal. That is the exact failure `boot.rs`
+records as its reason for registering `fs_read`/`fs_write`/`shell`. Accepting it here is a
+deliberate trade, and the doc comment must say so.
 
 ### Done gate
 
 1. A planner agent declaring `list_agents` gets the pinned registry's agents, not a boot snapshot.
-2. The no-handle construction path registers them too.
+2. The no-handle path does NOT register them — asserted explicitly, because an earlier draft's
+   gate demanded the opposite and a builder working the checklist would have implemented the
+   rejected design.
 3. `agent_input_hash` is byte-identical for a run whose agent declares none of them.
 4. An agent that does NOT declare a discovery tool still cannot call it (s1 gate unchanged).
 
@@ -146,10 +172,27 @@ Add an optional marker to `AgentDefinition` (frontmatter `default_planner: true`
 `Executor::planner_candidates` — which already reads `self.registry` and sorts by name — order the
 marked agent **first**, then the rest by name.
 
-That is the whole change. `RulePlannerSelector::new(None)` already takes `candidates.first()`, so
-it picks the marked one with no new plumbing; and `LlmPlannerSelector` sees it first in the
-capability menu. No trait change, no new constructor argument, and the value is read from the
-**pinned** registry at selection time rather than from a process-scoped snapshot.
+`RulePlannerSelector::new(None)` already takes `candidates.first()`, so it picks the marked one
+with no new plumbing, and the value is read from the **pinned** registry at selection time rather
+than from a process-scoped snapshot. No trait change, no new constructor argument.
+
+> **⚠️ "That is the whole change" was wrong twice, and a later review caught both.**
+>
+> **Ordering binds only ONE of the two selectors.** `LlmPlannerSelector` does preserve candidate
+> order — its menu is a plain `candidates.iter().map(…).join("\n")`, no sort, no dedup — but
+> position is not designation. It asks a model to "choose the single best planner agent" and
+> returns whatever name comes back; the only executor-side guard is a `candidates.contains(&a)`
+> membership check. So the marker is **binding** for `RulePlannerSelector` and merely **advisory**
+> for `LlmPlannerSelector`. Production wires the former, which is why this is acceptable — but the
+> done gate must say so rather than claim the marker is honoured unconditionally.
+>
+> **The field is not free.** `AgentDefinition` derives no `Default`, and **42 of its 58
+> construction sites are exhaustive literals with no `..` rest-pattern**, so a new field is a
+> compile error at every one (41 are in `#[cfg(test)]`, so it is mechanical churn rather than
+> risk). And `FmValue` has exactly two variants — `Scalar(String)` and `List(Vec<String>)` — with
+> **no `Bool` and no `optional_bool` helper**, so the frontmatter parser needs a new path, plus a
+> policy for malformed input (`yes`, `TRUE`, `1`). This repo's precedent is loud rejection: see
+> `agent_from_frontmatter_rejects_an_unknown_backed_by`. Follow it.
 
 > **⚠️ Both halves of this section were wrong in an earlier draft, and the review caught both.**
 >
@@ -177,16 +220,21 @@ name-order behaviour, so this is additive.
 
 ### Done gate
 
-1. Two planners, one marked ⇒ the marked one is selected regardless of name order.
+1. Two planners, one marked ⇒ the marked one is selected regardless of name order, **asserted
+   against `RulePlannerSelector`** — the production selector. A test wiring `LlmPlannerSelector`
+   must NOT assert this: the marker is advisory there and such a test would be nondeterministic.
 2. Two marked ⇒ loud refusal at config load, naming both.
 3. Zero marked ⇒ byte-identical to today.
+4. A malformed `default_planner` value is a loud `FrontmatterParse` error, not a silent `false`.
 
 ## 5. SP-REG-5 — cross-check chain ids at push
 
 An agent's `chain` is a string. `Registry::validate` checks only that it is *present*; the id is
 resolved later in the gateway against `GatewayConfig.chains`, a file `torii config push` never
 reads. Disagreement yields empty candidates → `NoCandidates` → terminal `NodeFailed`, with a
-message the code itself says names "neither cause nor remedy".
+message that names neither cause nor remedy. (That phrasing is this repo's — it is in
+`crates/torii/README.md` and a `skip_reason.rs` test doc comment, not in production code. The
+substance is what matters: `NoCandidates` falls into `classify_gateway_error`'s catch-all `Fail`.)
 
 ### Resolved design
 
@@ -202,7 +250,9 @@ refusal naming both sides.
 ### Done gate
 
 1. A registry referencing an unknown chain id, pushed with `--gateway-config`, is refused naming
-   the agent and the id.
+   the agent and the id — as `CliError::error` ⇒ **exit 1**, matching `push`'s existing pre-write
+   validation refusals ("refusing to push: … does not assemble into a valid registry"), NOT the
+   exit-2 `Outcome::precondition` shape reserved for "ran fine, nothing to do".
 2. The same push without the flag behaves exactly as today.
 3. A registry whose ids all resolve pushes unchanged.
 
@@ -229,18 +279,18 @@ citations had already gone stale by the time it was reviewed. Re-run this table 
 
 | claim | check | expect | verdict |
 |---|---|---|---|
-| The five discovery tools are wired nowhere in production | `rg --no-ignore 'ListAgents\|ListSkills\|ListTools\|ListChains\|ValidatePlan' crates/torii/` | 0 | CONFIRMED |
-| …but a live test proves the composition shape | `rg -n 'ListAgents\|ValidatePlan' crates/orchestrator/src/executor/tests.rs` | non-empty | CONFIRMED |
-| All five hold an `Arc<Registry>` snapshot, and all are `EffectClass::Pure` | `rg -n 'pub struct (List\|ValidatePlan)' -A 12 crates/orchestrator/src/agent/tools.rs` | snapshot + Pure | CONFIRMED |
+| The five discovery tools are wired nowhere in production | `rg --no-ignore -e ListAgents -e ListSkills -e ListTools -e ListChains -e ValidatePlan crates/torii/` | 0 | CONFIRMED |
+| …but a live test proves the composition shape | `rg -n -e ListAgents -e ValidatePlan crates/orchestrator/src/executor/tests.rs` | non-empty | CONFIRMED |
+| All five hold an `Arc<Registry>` snapshot, and all are `EffectClass::Pure` | `rg -n -e 'pub struct List' -e 'pub struct ValidatePlan' -A 12 crates/orchestrator/src/agent/tools.rs` | snapshot + Pure | CONFIRMED |
 | `pinned` re-pins the registry, clears the handle, and does NOT touch `selector` or `tools` | `rg -n 'fn pinned' -A 7 crates/orchestrator/src/executor/mod.rs` | 3 assignments only | CONFIRMED |
-| `ToolRegistry` derives `Clone` | `rg -n 'derive.*Clone' -A 3 crates/orchestrator/src/agent/tools.rs \| head` | derives | CONFIRMED |
+| `ToolRegistry` derives `Clone` | `rg -n 'derive.*Clone' -A 3 crates/orchestrator/src/agent/tools.rs` | derives | CONFIRMED |
 | `agent_input_hash` hashes the AGENT's declared tools, not the executor registry | `rg -n 'fn agent_input_hash' -A 12 crates/orchestrator/src/executor/support.rs` | `chain\|system\|messages\|tools` from `AgentRun` | CONFIRMED |
 | **The executor's `ToolRegistry` has FIVE read sites, and one feeds the journal** | `rg -U -n 'self\s*\n?\s*\.tools' crates/orchestrator/src/executor/agent.rs` | **6 matches, 5 real reads** — the 6th is a comment | **CONFIRMED — an earlier draft listed four.** A single-line `rg 'self\.tools'` misses the chain split across lines at the `idempotency_key_of` call, whose result is journaled into `EffectIntent`. Headline survives: that value never enters `agent_input_hash`, and all five discovery tools are `Pure` so they emit no `EffectIntent` at all |
 | The s1 gate requires a called tool to be LISTED on the agent | `rg -n 'agent_tools.iter' crates/orchestrator/src/executor/agent.rs` | present | CONFIRMED |
 | `pinned` is reached only when a handle is set | `rg -n -B 4 '\.pinned\(' crates/orchestrator/src/executor/mod.rs` | both under `if let Some(h)` | CONFIRMED |
 | **`#cfg` is written in exactly one place, inside `pinned`** | `rg --no-ignore -n 'format!\("\{\}#cfg' crates/` | **exactly 1**, in `executor/mod.rs` | CONFIRMED — this is why the fence is absent on the no-handle path. (A bare `rg '#cfg\{'` returns 13 hits over 6 files; 12 are doc comments and tests. The pattern must target the `format!` writer or it reports a number that means nothing.) |
 | An unversioned `ConfigSource` pins generation 0 | `rg -n 'fn version' -A 4 crates/orchestrator-core/src/registry.rs; rg -n 'unwrap_or\(0\)' crates/orchestrator-core/src/registry.rs` | default `None` → 0 | CONFIRMED |
-| `run_inner` never checks the fence | `rg -n 'fn run_inner' -A 30 crates/orchestrator/src/executor/mod.rs \| rg -c 'fence\|VersionFence'` | 0 | CONFIRMED |
+| `run_inner` never checks the fence | `rg -n 'fn run_inner' -A 30 crates/orchestrator/src/executor/mod.rs` then eyeball for a fence check | 0 | CONFIRMED |
 | `PlannerRef::Select` reuses a journaled pick on resume | `rg -n 'PlannerRef::Select' -A 6 crates/orchestrator/src/executor/expand.rs` | "selector is NOT re-invoked" | CONFIRMED |
 | `planner_candidates` reads `self.registry` and sorts by name | `rg -n 'fn planner_candidates' -A 12 crates/orchestrator/src/executor/mod.rs` | reads + sorts | CONFIRMED |
 | `RulePlannerSelector`'s `default` slot has no supplier | `rg --no-ignore -n 'RulePlannerSelector::new' crates/` | only `new(None)` in prod | CONFIRMED |
@@ -272,12 +322,33 @@ command, and two of those commands were themselves imprecise on first write (`rg
 doc comments; `rg 'self\.tools'` counts a comment line) and were tightened until they return what
 the table claims.
 
-**A second verification round is owed** before build: §3 and §4 were substantially rewritten, and
-both now assert new things about existing code.
+## 7.2 Verification round 2 — claims verifier + depth reviewer, 2026-09-15
+
+**Seven more findings, several inside round 1's own corrections.**
+
+| finding | outcome |
+|---|---|
+| §3.3's justification for "compose ONLY on the pinned path" — **FALSE on both links.** `start_inner` fences unconditionally, so a no-handle executor HAS a fence (just no `#cfg` term); and replay safety comes from the **Pure memo**, not the fence — a recorded call is never re-executed on any path | §3.3 item 3 rewritten. The conclusion survives on the narrower ground: only the pinned path detects drift for a FRESH call |
+| **The ledger's commands did not run.** `\|` inside a markdown table is escaped for markdown and becomes a LITERAL pipe in `rg`. 5 of 20 rows were broken — and row 1, the premise of the whole slice, returned its expected `0` *regardless of the truth* | every alternation rewritten as `-e` flags; all verified to return what the table claims |
+| Done gate item 2 and §8 bullet 1 asserted the **rejected** design — stale from before round 1's inversion | both inverted |
+| §4's "ordering suffices for both selectors" — order IS preserved in the LLM menu, but position is not designation: the model answers freely and the only guard is a membership check | marker is **binding** for `RulePlannerSelector`, **advisory** for the LLM one; done gate 1 qualified |
+| §4's "that is the whole change" — `AgentDefinition` derives no `Default` and **42 of 58** literals are exhaustive; `FmValue` has **no `Bool`** and no `optional_bool` | scope stated; malformed-input policy set to loud, per the `backed_by` precedent |
+| §3.3 "the one read before the gate" — there are **two** (`spec_of` and `required_of`) | corrected; this is the second miscount of `self.tools` reads, both from single-line regexes over wrapping code |
+| §5's "the code itself says neither cause nor remedy" — that phrase is in `torii/README.md` (which this session wrote) and a test doc comment, not production code | attribution corrected; exit-code contract pinned to exit 1 |
+
+**Honest assessment: the spec is behaving like the analysis did.** Two rounds, seven findings each,
+and round 2's largest finding was *inside round 1's correction* — I over-corrected "no third
+outcome" into "no fence at all", which was equally false. The recurring defect is stable and
+specific: **a true premise with a false THEREFORE**, plus regex-derived counts that are wrong
+because the code wraps.
+
+Before building any of these slices, re-run §7's ledger — it is now composed of commands that
+actually execute — rather than trusting the CONFIRMED column.
 
 ## 8. Wrong gate
 
-- **SP-REG-2 ships half-working** because only the handle path composes the tools. §3's wrinkle.
+- **SP-REG-2 registers the tools on the no-handle path**, because that reads like completeness.
+  §3 rejects it deliberately: only the pinned path can detect config drift for a fresh call.
 - **SP-REG-3's marker is read at boot but not fenced**, if it is sourced from anywhere but the
   pinned registry — which would recreate the per-process divergence it exists to avoid.
 - **SP-REG-5's check passes vacuously** if it validates only explicit `agent.chain` and skips
