@@ -12,6 +12,17 @@ Shared **LLM inference routing engine** — fallback chains, circuit breaker, bu
 | [`local-providers`](crates/local-providers) (`sensei-local-providers`) | In-process inference adapters (`llama.cpp`, ONNX Runtime, FastEmbed). Implement the same `kernel` capability traits as the cloud adapters, so local and cloud models compose in one routing config. Engines are feature-gated. |
 | [`local-engine`](crates/local-engine) (`sensei-local-engine`) | The local model engine: resolvers that map a stable model id to on-disk bytes (managed / Ollama / external, composed via `ChainedResolver`), plus optional Hugging Face pull (`hf-download`). |
 
+The orchestrator stack builds **on top of** the routing engine above. `gateway` knows nothing about
+it — no dependency, and no notion of agents, skills or tools — so the five crates above are usable
+entirely on their own.
+
+| Crate | What it is |
+|---|---|
+| [`orchestrator-core`](crates/orchestrator-core) (`sensei-orchestrator-core`) | The domain types and the seams: `Graph`/`NodeKind`, the registry vocabulary (`AgentDefinition`, `SkillDef`, `ToolSpec`, `Activation`), and the traits a backend implements — `ExecutionJournal`, `ContentStore`, `ContextStore`, `ConfigSource`, `SchedulerStore`. No I/O. |
+| [`orchestrator`](crates/orchestrator) (`sensei-orchestrator`) | The durable, resumable executor: journal-and-fold replay, effect classes (Pure / Observation / Mutation with two-phase in-doubt reconcile), hierarchical nodes (`Subgraph`, `Branch`, `Expand`, `Loop`), permission enforcement, secret redaction, workspace and subprocess isolation, human-in-the-loop gates, and context budgeting. |
+| [`orchestrator-store`](crates/orchestrator-store) (`sensei-orchestrator-store`) | Postgres backends for those seams (`postgres` feature), plus in-memory ones for tests. A run journaled in one process resumes in another with no token re-spend. |
+| [`torii`](crates/torii) (`sensei-torii`) | **The operator CLI** — submit and observe runs, intervene on human-gated ones, drive due wakes, manage durable config. See [its README](crates/torii/README.md) for a quickstart, including what you must set up by hand and the gaps it does not yet cover. |
+
 `local-providers` features (all off by default — each pulls heavyweight native deps):
 
 ```
