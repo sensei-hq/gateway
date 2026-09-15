@@ -869,6 +869,21 @@ impl Executor {
         self
     }
 
+    /// Is a `PlannerSelector` wired? A test seam, not public API — gated so it cannot
+    /// become one by accident.
+    ///
+    /// It exists because a selector's absence is otherwise only observable by DRIVING a
+    /// `PlannerRef::Select` node to its second refusal (`expand.rs`, "Select planner but
+    /// no selector wired"), which needs a real model completion and so cannot run in CI.
+    /// That unobservability is exactly how `boot::heavy` came to build a production
+    /// executor with no selector at all — every `with_planner_selector` call in the
+    /// workspace was in a test — leaving `PlannerRef::Select` dead in the shipped binary
+    /// for a reason no test could see.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_planner_selector(&self) -> bool {
+        self.selector.is_some()
+    }
+
     /// Set the max runtime expansions (`PlanDelta`s) per run (self-DoS cap; default 32).
     pub fn with_max_expansions(mut self, n: usize) -> Self {
         self.max_expansions = n;
