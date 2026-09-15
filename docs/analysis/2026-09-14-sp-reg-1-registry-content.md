@@ -21,10 +21,27 @@ premise underneath SP-7c is not what the deferrals describe.
 
 **2.1 SP-2's activation policy has no production user, and there is no library to activate.**
 
-`Activation` (`orchestrator-core/src/registry.rs:228`) is `Always | OnKeywords(Vec<String>)`.
-`OnKeywords` is constructed in exactly three places, all inside `#[cfg(test)]`
-(`agent/prompt.rs:1063`, `:1095`, `:1123`). The only non-test construction is the frontmatter
-parser at `registry.rs:957` — the mechanism, with nothing feeding it.
+`Activation` (`orchestrator-core/src/registry.rs:228`) is `Always | OnKeywords(Vec<String>)`, and
+**nothing ships content that feeds it** — the mechanism exists with no input.
+
+> **⚠️ The census here was FALSE as first written** (round-4 claims verifier; the conclusion above
+> survives, the enumeration did not). It said "constructed in exactly three places, all inside
+> `#[cfg(test)]` … the only non-test construction is the frontmatter parser at `registry.rs:957`."
+> Actually: **≥12 test constructions across three files**, and **three** non-test construction
+> paths, not one —
+>
+> | path | site |
+> |---|---|
+> | skill frontmatter `activate_on` | `registry.rs:957` (the one cited) |
+> | `serde_json::from_str::<ToolSpec>` over `<root>/tools/*.json` | `orchestrator-store/config_source.rs:119` |
+> | `from_value::<SkillDef>`/`<ToolSpec>` over jsonb | `orchestrator-store/postgres.rs:482-495` |
+>
+> Two consequences that matter. **`ToolSpec` carries `#[serde(default)] activation: Activation`**
+> (`registry.rs:93`), so a `tools/*.json` can declare `OnKeywords` exactly as a skill can — gate
+> item 2 is not the only route to exercising activation, and §6.1's still-open "do any tools ship"
+> question is therefore coupled to it. And the path `boot::heavy` actually uses to bring shipped
+> activation into a running executor is **`PostgresConfigSource::read_all`**, not the frontmatter
+> parser — that one runs only on `torii config push`'s read side.
 
 And there is nothing to feed it: no `import/` seed tree under `database/` (so `config_skills`
 ships empty), and no on-disk registry root anywhere in the repo (`.claude/skills` is Claude
@@ -46,14 +63,33 @@ capability menu and the anti-hallucination `∉candidates` check. **None of it c
 the set it selects from is empty by construction. This is not a latent hole like SP-7a.1's; it is
 a feature with no inputs.
 
-**2.3 "SP-7c needs embedding infrastructure" is mostly false; what is missing is storage.**
+**2.3 The GATEWAY can embed. The ORCHESTRATOR cannot ask it to.**
 
-`Capability::TextEmbed` exists (`kernel/src/types/capability.rs:9`), adapters implement `embed`,
-and the orchestrator already dispatches `Payload::Embed` (`orchestrator/src/test_support.rs:259`,
-the payload the SP-DATA-5 clamp deliberately skips). Embedding is reachable today.
+> **⚠️ FALSE as first written, corrected by the round-4 claims verifier.** This section said
+> *"the orchestrator already dispatches `Payload::Embed` (`orchestrator/src/test_support.rs:259`)
+> … Embedding is reachable today."* **`test_support` is `#[cfg(any(test, feature =
+> "test-support"))]`** (`orchestrator/src/lib.rs:17-18`), the cited line is a *comment* above a
+> `ModelConfig` fixture, and the only `Payload::Embed` in the whole orchestrator crate is in
+> `executor/tests.rs`. This is the same trap §6/D1's own correction disqualifies — a `#[cfg(test)]`
+> fixture cited as production capability — committed a second time, in the one section rounds 1–3
+> never revisited.
 
-What is genuinely absent is **vector storage** — no pgvector, no vector column anywhere in
-`database/`.
+What is true: `Capability::TextEmbed` exists (`kernel/types/capability.rs:9`) and **seven** adapters
+implement `EmbedModel` (OpenAI, HuggingFace, Ollama, Gemini, Bedrock, FastEmbed, EmbeddedLlama), so
+the gateway can serve an embedding.
+
+What is false: that the orchestrator can request one. All three production `InferenceRequest`
+builders hardcode chat — `build_request` (`executor/support.rs:535-558`,
+`capability: Capability::TextChat`, `Payload::Chat`, and it mines a `ModelCall`'s JSON only for
+`payload["prompt"]`), `build_chat_request` (`support.rs:578`) and the selector's own dispatch
+(`dispatch.rs:1290`). **A graph author cannot express an embed call.**
+
+And **vector storage is absent** — no pgvector, no vector column anywhere in `database/`.
+
+**What this costs §5's deferral argument:** SP-7c was deferred as "an optimisation over a library."
+That still holds, but its cost was understated — it needs a new non-`Chat` dispatch arm, with the
+determinism and metering handling that implies, *plus* storage. Not "mostly infrastructure that
+already exists."
 
 ## 3. The determinism constraint, recorded for whenever SP-7c runs
 
@@ -457,9 +493,38 @@ Also re-confirmed independently this round: delete-then-push really does remove 
 test `an_empty_incoming_config_reports_everything_removed`, `diff.rs:323`); D7's premise; D5's
 signature citations; and the hard-invariant-breaks-a-test claim.
 
-**A fourth round is required** by the rule that forced rounds 2 and 3: D8 and D9 assert new things
-about existing code (`boot::heavy`'s executor construction, `Command::Config`'s dispatch order),
-and two gate items were added or rewritten around them. The convergence trend is real — round 1
+### Round 4 — re-run 2026-09-15; three depth reviewers plus `sensei-claims-verifier`
+
+Escalated with the claims verifier because the recurring failure was false assertions about
+existing code. **Round 4 produced MORE findings than round 3, not fewer — and two of them are
+FALSE claims in §2, the foundation, which no earlier round had re-checked.**
+
+| # | Finding | Found by | Outcome |
+|---|---|---|---|
+| C1 | **§2.3 FALSE — the orchestrator cannot dispatch `Payload::Embed`.** `test_support` is `#[cfg(test)]`-gated, the citation was a comment above a fixture, and all three production request builders hardcode `TextChat`/`Chat`. The `#[cfg(test)]`-as-production trap, committed a second time. | claims | §2.3 rewritten |
+| C2 | **§2.1 FALSE — the `OnKeywords` census.** ≥12 test sites, not 3; three non-test construction paths, not one. Conclusion survives; enumeration did not. `ToolSpec` also carries `activation`, coupling §6.1 to gate item 2. | claims | §2.1 rewritten |
+| Y1 | **`resolve_chain` succeeding proves a STRING EXISTS, not that it routes.** The id is resolved in a different crate against `GatewayConfig.chains` — a file `config push`/`init` never see. Unknown id → empty candidates → `NoCandidates` → terminal `NodeFailed`, naming "neither cause nor remedy". §4's Wrong Gate asserts the converse. | analyst | **open** |
+| Y2 | **The tool-spec rule is one-directional in §6.1.** `validate` rejects an agent declaring a tool with no `ToolSpec`, so shipping zero `tools/*.json` leaves the three wired built-ins permanently unreachable. And the five SP-3 discovery tools (`ListAgents`…`ValidatePlan`) are `pub` production types wired **nowhere** in torii. | analyst | **open** |
+| Z2 | **Gate items 1 and 10 are the same assertion twice, and neither is checkable.** End-to-end `Select` needs a real model completion; every e2e test bypasses `boot::heavy` with a fake gateway; CI has Postgres and no model backend. | depth | **open** |
+| Z3/F2 | **D9's `DATABASE_URL` diagnosis names the wrong call site.** `dispatch()` calls `boot::env_config()?` at `main.rs:418`, before the match. Proven empirically by building and running the binary. | depth + persona | **open** |
+| F1 | **D8's "configured default" is dead code.** No CLI flag, env var or registry field can ever supply `Some(default)`, so two planners resolve by *alphabetical name order*; item 9 fires only on `== 0`. Contradicts SP-6 s4's own principle that silent role substitution must fail loudly. | persona | **open** |
+| F3 | **D7's persona and D6's upgrade path are mutually exclusive.** No Dockerfile, no release workflow, torii absent from the README's five published crates — so the no-source-tree user doesn't exist yet; when they do, they cannot `git diff` and cannot tell which tag their binary came from (no `version` in the clap command, no build provenance). | persona | **open** |
+| Z4 | D9's four target-directory states silently drop "missing". | depth | **open** |
+| F4 | "Empty" is undefined and collides with D6's own `git init` advice; no exit-code/idempotency contract for `init`'s refusal, unlike `push`'s. | persona | **open** |
+| Z5 | D7 leaves `include_dir` vs `rust-embed` an unresolved either/or with different APIs. | depth | **open** |
+| C3 | §2.2's "empty **by construction**" is MISLEADING — `require_agents` refuses boot on zero agents, so **every running worker has already pushed agents and could have pushed a planner**. The set is empty because this repo ships no content. | claims | see below |
+
+C3 is the most useful finding in the round, because it decomposes the problem: **for any existing
+deployment, the missing selector (D8) is the SOLE blocker** — a ~3-line change, independently
+shippable, with no dependency on content, `config init`, embedding or distribution.
+
+**The analysis is not converging.** Rounds produced 10 → 12 → 12 findings; round 4 falsified two
+foundation claims that three prior rounds had read past. And the slice has accreted well beyond
+"ship registry content": it now implies wiring a selector, restructuring CLI dispatch twice over,
+aligning a separate gateway config surface, wiring five discovery tools, shipping tool specs,
+adding a default-planner designation, writing entry-point docs, and a distribution story. That is a
+programme, not a slice. **Scope decision required before any further rounds** — patching this
+document further is chasing a moving target. The convergence trend is real — round 1
 produced three decisions of which two were wrong, round 2 produced two of which none were wrong
 but both were incomplete, round 3 found one CRITICAL — but "fewer findings each round" is not
 "zero", and X1 survived two rounds precisely because it was never asked about directly.
