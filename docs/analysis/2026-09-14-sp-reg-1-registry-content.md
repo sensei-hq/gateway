@@ -549,13 +549,44 @@ of which the review rounds showed is independently substantial:
 | `config init` (D6/D9) — CLI shape, four directory states, no-`DATABASE_URL` dispatch restructure | open | D9; `env_config()` at `main.rs:418` is the real gate |
 | Defaults embedded in the binary (D7) — and `include_dir` vs `rust-embed` | open | Z5 |
 | Gateway chain alignment — a shipped agent's chain-id must exist in a `GatewayConfig` that `config push` never sees | open | round-4 Y1 |
-| Tool specs + the five unwired SP-3 discovery tools | open | round-4 Y2 |
+| Tool specs + the five unwired SP-3 discovery tools | open — **and NOT a boot-wiring job, see §7.2** | round-4 Y2 |
 | Designating a default planner | open | round-4 F1 |
 | Entry-point docs — zero `.md` files under `crates/torii` | open | round-4 F2 |
 | Distribution + build provenance — no Dockerfile, no release workflow, no `--version` | open | round-4 F3 |
 
 Anyone picking this up should re-scope from that table rather than from §4's original framing,
 and should treat §2's claims as re-verified only as of round 4.
+
+## 7.2 The discovery tools are NOT a second SP-REG-0 — checked before building
+
+The obvious next slice looked like Y2's other half: the five SP-3 discovery tools (`ListAgents`,
+`ListSkills`, `ListTools`, `ListChains`, `ValidatePlan`) are `pub` production types wired nowhere,
+exactly the shape SP-REG-0 fixed for the selector. `boot::heavy` already wires three tools into a
+`ToolRegistry`, so adding five more looks like a one-line change.
+
+**It is not, and doing it that way would be wrong.** All five hold an `Arc<Registry>` — a
+SNAPSHOT, not the hot-reloadable `RegistryHandle` `boot::heavy` has. But `Executor::pinned`
+(`executor/mod.rs:935`) sets `self.registry` from `handle.snapshot()` at the start of every run and
+clears the handle, while `with_tools` is set **once** at construction and `pinned` does not touch
+it. So a boot-wired discovery tool would carry a boot-time snapshot shared across every run:
+
+- **Wrong answer.** A planner would introspect a different registry than the one its own run is
+  pinned to — `ValidatePlan` most sharply, validating a draft plan against a registry that is not
+  the one the plan will be executed under.
+- **A determinism hazard, and the serious half.** Discovery output feeds the planner's reasoning
+  and is journaled. A process that booted BEFORE a `torii config push` and one that booted after
+  would hand the same run different agent lists, so a resume in the second process could produce a
+  different plan. That is the SP-DATA-2 fence class of failure, reached through a tool instead of
+  through config.
+
+The correct construction site is **per-run, from the pinned registry** — which means the executor
+must compose these tools when it assembles an agent's tool set, not receive them once at boot.
+That machinery does not exist (`with_tools` takes one `Arc<ToolRegistry>` for the executor's whole
+life), so this is a real slice with a determinism argument to discharge, not a wiring fix.
+
+Recorded here because the boot-wiring version is the natural thing to reach for, it would compile,
+its tests would pass, and the failure would only appear as a replay divergence in a deployment that
+had been reconfigured between two process starts.
 
 **The analysis is not converging.** Rounds produced 10 → 12 → 12 findings; round 4 falsified two
 foundation claims that three prior rounds had read past. And the slice has accreted well beyond
