@@ -8,7 +8,7 @@
 use crate::errors::{CliError, redact_url};
 use orchestrator::agent::tools::{FsReadTool, FsWriteTool, ShellTool, ToolRegistry};
 use orchestrator::{Executor, Scheduler};
-use orchestrator_core::{Clock, PatternRedactor, RegistryHandle, SystemClock};
+use orchestrator_core::{Clock, PatternRedactor, RegistryHandle, RulePlannerSelector, SystemClock};
 use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
     PostgresSchedulerStore, connect_with_max,
@@ -436,7 +436,25 @@ pub async fn heavy(
                 .with_tool(Arc::new(FsReadTool))
                 .with_tool(Arc::new(FsWriteTool))
                 .with_tool(Arc::new(ShellTool)),
-        ));
+        ))
+        // SP-REG-0. Without this, `PlannerRef::Select` is DEAD in the shipped binary:
+        // `expand.rs` refuses a second time on `self.selector == None`, immediately
+        // after the empty-candidates refusal, so no amount of registry content can
+        // make a `Select` node work. Every `with_planner_selector` call in the
+        // workspace was in `executor/tests.rs` — the suite was entirely green while
+        // the feature could not run.
+        //
+        // `RulePlannerSelector::new(None)` and not `LlmPlannerSelector`: it is pure and
+        // spends no tokens (it prefers a configured default when that default is among
+        // the candidates, else takes `candidates.first()` over the name-sorted set),
+        // whereas the LLM selector costs a model call per expand. Choosing to spend
+        // tokens on planner selection is the implementer's call, not a default.
+        //
+        // KNOWN, and deliberately not fixed here: nothing can supply that `Some(default)`
+        // yet — no CLI flag, env var or registry field — so with two `area: planning`
+        // agents the winner is decided by name order. Designating a default is its own
+        // change; this one makes `Select` work at all.
+        .with_planner_selector(Arc::new(RulePlannerSelector::new(None)));
 
     if let Some(root) = workspace_root {
         executor = executor.with_workspace_root(root);
@@ -823,6 +841,94 @@ mod tests {
     /// seed away between the write and `heavy()`'s read. `config_guard` now
     /// serializes every durable-config writer in this crate, which closes that
     /// race at the source; the retry below is kept as the backstop for any
+    /// **SP-REG-0 — the production executor must have a planner selector wired.**
+    ///
+    /// `PlannerRef::Select` fails for TWO independent reasons, and only the first is
+    /// about config: `expand.rs` refuses once when `planner_candidates()` is empty, and
+    /// again immediately after when `self.selector` is `None`. Before this slice every
+    /// `with_planner_selector` call in the workspace was inside `executor/tests.rs`, so
+    /// the shipped binary always took the second refusal — a whole SP-3 slice-4B feature
+    /// dead in production, invisible to a suite that was entirely green.
+    ///
+    /// Asserted on the built executor rather than by driving a `Select` node, because
+    /// driving one requires a real model completion (`drive_planner_agent` → `drive_agent`)
+    /// and CI has Postgres but no model backend. This test is the honest, checkable
+    /// property: whatever `heavy()` hands the scheduler has a selector.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn heavy_wires_a_planner_selector_so_select_is_not_dead_in_the_binary() {
+        let Some(url) = crate::test_guard::db_url() else {
+            return;
+        };
+        let _guard = crate::test_guard::config_guard().await;
+
+        let probe_pool = connect(&url).await.expect("connect");
+        let config_source = PostgresConfigSource::new(probe_pool.clone());
+        let seed = orchestrator_core::RegistryConfig {
+            agents: vec![orchestrator_core::AgentDefinition {
+                name: "torii-selector-probe-agent".to_string(),
+                area: "test".to_string(),
+                kind: "test".to_string(),
+                chain: Some("torii-selector-probe-chain".to_string()),
+                chains: Default::default(),
+                grants: Default::default(),
+                tools: vec![],
+                skills: vec![],
+                system_prompt: "probe".to_string(),
+                backed_by: Default::default(),
+            }],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
+
+        let gw_dir = std::env::temp_dir().join(format!("torii-sel-gw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&gw_dir).expect("tmp dir");
+        let gw_path = gw_dir.join("gateway.json");
+        std::fs::write(
+            &gw_path,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+        )
+        .expect("write gateway config");
+
+        let env = EnvConfig {
+            database_url: url.clone(),
+            fence_version: Some("torii-selector-probe-fence".to_string()),
+            pool_size: DEFAULT_POOL_SIZE,
+        };
+
+        // Same seed-race tolerance as the pool test below: a concurrent config test can
+        // replace-all our probe agent between the store and the boot.
+        let mut deps = None;
+        for _ in 0..5 {
+            config_source
+                .store_and_bump(&seed)
+                .await
+                .expect("seed the probe agent");
+            match heavy(&env, &gw_path, None).await {
+                Ok(d) => {
+                    deps = Some(d);
+                    break;
+                }
+                Err(e) if e.message.contains("zero agents") => continue,
+                Err(e) => panic!("heavy() failed for a reason other than the seed race: {e:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&gw_dir);
+        let deps = deps.expect("heavy() never won the probe-agent seed race after 5 attempts");
+
+        assert!(
+            deps.scheduler.executor().has_planner_selector(),
+            "heavy() built an executor with NO planner selector — every \
+             `PlannerRef::Select` node in this binary takes expand.rs's \
+             \"Select planner but no selector wired\" refusal, whatever the registry \
+             contains",
+        );
+    }
+
     /// future writer that forgets the guard, and any OTHER failure is a real bug
     /// and is not retried.
     #[cfg_attr(
