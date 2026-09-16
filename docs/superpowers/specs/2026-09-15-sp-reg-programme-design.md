@@ -28,7 +28,7 @@ is recorded so it can be re-opened deliberately rather than by accident.
 | **SP-REG-2** | Discovery tools, composed per-run from the pinned registry | code: nothing. **Done gate: the tool SPECS** — see §3 |
 | **SP-REG-3** | Designating which planner wins | nothing |
 | **SP-REG-4** | `config init` + embedded defaults + the shipped content | **TWO: the content list, AND the un-designed `dispatch()` restructure (§6)** |
-| **SP-REG-5** | Cross-check agent chain ids against the gateway config at push | nothing |
+| **SP-REG-5** | Cross-check agent chain ids against the gateway config at push | ✅ **SHIPPED** — PR #65 (`15688a5`) |
 
 Distribution (a published artifact, build provenance, `--version`) is **out of scope**. It is a
 release-engineering concern with no dependency on any of the above, and folding it in is what made
@@ -227,7 +227,7 @@ name-order behaviour, so this is additive.
 3. Zero marked ⇒ byte-identical to today.
 4. A malformed `default_planner` value is a loud `FrontmatterParse` error, not a silent `false`.
 
-## 5. SP-REG-5 — cross-check chain ids at push
+## 5. SP-REG-5 — cross-check chain ids at push ✅ SHIPPED (PR #65)
 
 An agent's `chain` is a string. `Registry::validate` checks only that it is *present*; the id is
 resolved later in the gateway against `GatewayConfig.chains`, a file `torii config push` never
