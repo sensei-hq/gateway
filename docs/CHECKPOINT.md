@@ -1,39 +1,39 @@
 # Checkpoint
 
-**No slice in flight. `main` = `15688a5`. SP-REG-0, torii docs and SP-REG-5 shipped.**
-Merged: #59–#65. Issue #56 CLOSED. SP-REG-1 is a programme; its spec is `2026-09-15-sp-reg-programme-design.md`.
+**`main` = `15688a5`. `develop` = `570dc7b`. PR #66 OPEN (SP-REG-3, 5 commits, awaiting review).**
+Merged: #59–#65. Issue #56 CLOSED. SP-REG-1 is a programme — spec
+`docs/superpowers/specs/2026-09-15-sp-reg-programme-design.md`.
 
 ## Done
 
-**#59** SP-7a.1 multimodal window + its whole-slice review (11 findings). **#60** issue #56 —
-`Cargo.lock` (560 crates auditable vs 47), `h2` → 0.4.19, `undici` → 7.29.1 (HIGH TLS bypass),
-`lint`/`audit`/`site` CI jobs. **#61** `rustls` → 0.23.45. **#62** 32 intra-doc links + a rustdoc
-gate. **#64** torii's first README (the crate had ZERO `.md`) + the four orchestrator crates in the
-root README; every claim verified against the built binary.
+**#63 SP-REG-0** — `PlannerRef::Select` was dead in every shipped binary: `expand.rs` refuses
+twice and `boot::heavy` wired eight builders but not the selector. **#64** — torii's first README
+(the crate had zero `.md`) plus the four orchestrator crates in the root README. **#65 SP-REG-5** —
+`config push --gateway-config` refuses a registry whose chain ids the gateway catalog does not
+define, across all three reference surfaces.
 
-**#63 SP-REG-0 — `PlannerRef::Select` was dead in every shipped `torii`.** `expand.rs` refuses
-twice and `boot::heavy` wired eight builders but not the selector; all `with_planner_selector`
-calls were in tests, so a whole SP-3 slice-4B feature could not run while the suite stayed green.
-Now wires `RulePlannerSelector::new(None)`. Two `#[cfg(test-support)]` seams were needed because
-the defect is unobservable without a model backend CI lacks — which is how it shipped.
+**PR #66 SP-REG-3** — a `default_planner` marker; `planner_candidates` orders it first, read from
+the PINNED registry, not a boot snapshot (an earlier design was rejected for exactly that). Built
+by a 9-agent workflow; 6 findings, all verified, none refuted; 3 MEDIUM fixed, **3 LOW open**.
 
-## SP-REG-1 — split, NOT done
+**Docs** — `crates/torii/docs/features/agentic-execution-surface.md`: the seiki (administer) and
+torii (operate) surface. 12 screens with goals + props, the goal→planner→plan→execute journey, the
+invariants a naive UI gets wrong, §7's honest gaps. `docs/mockups/` is the MARKETING site and
+covers none of it.
 
-Four rounds produced **10 → 12 → 12** findings (not converging); round 4 falsified two §2
-foundation claims, one citing a `#[cfg(test)]` fixture as production capability — the trap that
-document's own earlier correction disqualifies. It had accreted into ~8 workstreams.
+## Next
 
-**Remaining (table in §7.1 of `docs/analysis/2026-09-14-sp-reg-1-registry-content.md`):** content
-list · `config init` · embedded defaults · gateway chain alignment · tool specs + discovery tools
-(**§7.2 — NOT boot-wiring: a boot snapshot goes stale per-run and is a replay hazard**) ·
-default-planner designation · distribution.
+**The capability survey** — what an embedder can do today vs what production agentic execution
+needs. NOT yet run; it is the real answer to "what will it take to build on top".
 
-Re-scope from §7.1, not §4's framing; §2 is verified only as of round 4, and the daemon was down so
-those absolutes are ripgrep-derived — re-check with the code graph.
+Then by value: **wire the five discovery tools** (a planner currently plans blind; spec §3 —
+compose in `pinned` ONLY, never the no-handle path) · **default registry content** (product call;
+without it a fresh install cannot plan) · **`config pull`** (small — `load_versioned()` exists and
+`push` already calls it).
 
 ## Verified
 
-`cargo test --workspace --locked` **1817 / 0** with a live Postgres (1767 without) · clippy
-**0.1.98** `-D warnings` 0 · fmt 0 · rustdoc `-D warnings` 0 · `cargo audit` 0 · both PG suites 0.
-Local `rustc` is Homebrew 1.97 and SHADOWS rustup's 1.98 — verify via `~/.rustup/toolchains/*/bin`.
-Postgres is live on 5432 with `database/_apply_all.sql` applied.
+`cargo test --workspace --locked` **1831 / 0** real exit 0 with a live Postgres · clippy **0.1.98**
+`-D warnings` 0 · fmt 0 · rustdoc `-D warnings` 0 · `cargo audit` 0.
+Homebrew `rustc` 1.97 SHADOWS rustup's 1.98 — use `~/.rustup/toolchains/*/bin`. Postgres on 5432,
+schema applied. **Ripgrep counts here have been wrong 4/4** — see the memory notes.
