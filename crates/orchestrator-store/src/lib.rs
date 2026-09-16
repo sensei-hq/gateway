@@ -293,4 +293,63 @@ mod tests {
         let a = journal.load(run_a).await.unwrap();
         assert_eq!(a.len(), 1, "run A keeps its own event");
     }
+
+    /// **SP-OPS-1: `_apply_all.sql` must mirror every `ddl/` table, verbatim.**
+    ///
+    /// Two surfaces define this schema and nothing checked they agreed. `dbd reconcile` applies
+    /// `ddl/` to a live database; CI provisions a FRESH Postgres by piping `_apply_all.sql`,
+    /// which is a HAND-MAINTAINED mirror ("mirrors the dbd-authored per-type table DDL
+    /// verbatim"), not a generated artifact. So a DDL change plus a local reconcile passes every
+    /// test on the author's machine and fails only in CI, against a database built the other way.
+    ///
+    /// That is not hypothetical: SP-OPS-1.1 added `run_id` to `context_refs`, reconciled locally,
+    /// and CI failed three Postgres tests because the mirror still declared the old primary key.
+    /// A one-surface edit is invisible to every local signal, which is exactly the class a
+    /// conformance check exists for.
+    #[test]
+    fn apply_all_sql_mirrors_every_ddl_table() {
+        fn normalize(s: &str) -> String {
+            s.lines()
+                .map(|l| l.split("--").next().unwrap_or("")) // drop trailing comments
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../database");
+        let apply = normalize(
+            &std::fs::read_to_string(format!("{root}/_apply_all.sql"))
+                .expect("database/_apply_all.sql"),
+        );
+
+        let dir = format!("{root}/ddl/table/orchestrator");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("ddl/table/orchestrator") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            let ddl = std::fs::read_to_string(&path).unwrap();
+            // The statement only — the per-file comment header is NOT mirrored, by design.
+            let start = ddl.find("create table").unwrap_or_else(|| {
+                panic!("{path:?} has no `create table` statement");
+            });
+            let end = ddl[start..].find(");").expect("unterminated create table") + start + 2;
+            let stmt = normalize(&ddl[start..end]);
+            assert!(
+                apply.contains(&stmt),
+                "database/_apply_all.sql has drifted from {path:?}.\n\nCI builds its database \
+                 from _apply_all.sql, so this table would be created with the WRONG shape there \
+                 while passing locally against a `dbd reconcile`d database. Mirror it:\n\n{stmt}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 10,
+            "expected every orchestrator table to be checked, saw {checked} — did the ddl \
+             directory move? A silently-empty sweep would make this guard vacuous"
+        );
+    }
 }
