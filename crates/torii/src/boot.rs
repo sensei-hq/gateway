@@ -6,7 +6,9 @@
 //! unit-testable against in-memory doubles.
 
 use crate::errors::{CliError, redact_url};
-use orchestrator::agent::tools::{FsReadTool, FsWriteTool, ShellTool, ToolRegistry};
+use orchestrator::agent::tools::{
+    FsReadTool, FsWriteReconciler, FsWriteTool, ReconcileRegistry, ShellTool, ToolRegistry,
+};
 use orchestrator::{Executor, Scheduler};
 use orchestrator_core::{Clock, PatternRedactor, RegistryHandle, RulePlannerSelector, SystemClock};
 use orchestrator_store::postgres::{
@@ -436,6 +438,19 @@ pub async fn heavy(
                 .with_tool(Arc::new(FsReadTool))
                 .with_tool(Arc::new(FsWriteTool))
                 .with_tool(Arc::new(ShellTool)),
+        ))
+        // SP-OPS-1.5. Without this the binary shipped two Mutation tools and ZERO
+        // reconcilers, so a crash between an `fs_write`'s intent and its record left the
+        // run in doubt forever: `reconcile_in_doubt` fell to `Indeterminate`, the pause
+        // carried a NULL `next_wake` so no timer woke it, and `force_wake` only
+        // re-reconciled to `Indeterminate` again. `fs_write` is idempotent (truncate-and-
+        // replace), so the correct verdict is simply to let it re-run.
+        //
+        // `shell` is deliberately absent: an arbitrary command is not idempotent and
+        // nothing generic can decide whether it applied, so it still parks for a human.
+        // That is a real remaining gap, not an oversight.
+        .with_reconcilers(Arc::new(
+            ReconcileRegistry::default().with_provider("fs_write", Arc::new(FsWriteReconciler)),
         ))
         // SP-REG-0. Without this, `PlannerRef::Select` is DEAD in the shipped binary:
         // `expand.rs` refuses a second time on `self.selector == None`, immediately
@@ -926,6 +941,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&gw_dir);
         let deps = deps.expect("heavy() never won the probe-agent seed race after 5 attempts");
 
+        // SP-OPS-1.5: the same class of bug as the selector below — a Mutation tool with no
+        // reconciler parks an interrupted run forever, and nothing short of crashing a real
+        // run mid-mutation would reveal it.
+        assert!(
+            deps.scheduler.executor().has_reconciler_for("fs_write"),
+            "heavy() registered fs_write (a Mutation tool) with NO reconciler — a crash \
+             between its EffectIntent and EffectRecorded parks the run on Indeterminate \
+             with a NULL next_wake, which no timer wakes and force_wake cannot resolve",
+        );
         assert!(
             deps.scheduler.executor().has_planner_selector(),
             "heavy() built an executor with NO planner selector — every \

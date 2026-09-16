@@ -86,8 +86,21 @@ impl Scheduler {
                 return outcome;
             }
         };
+        // SP-OPS-1.4: `submit` drives inline and holds the row `waking` for the whole drive, so
+        // it is a driver like any other and must exclude concurrent ones. A fresh run id is
+        // rarely contended — `enqueue` already rejects a duplicate — but taking the lock here is
+        // what makes "exactly one driver per run" a property of the scheduler rather than of
+        // which entry point happened to be used.
+        let Some(lock) = self.store.try_lock_run(run).await? else {
+            return Err(OrchestratorError::Store(format!(
+                "run {} is already being driven",
+                run.0
+            )));
+        };
         let outcome = self.executor.run_budgeted(run, &graph, budget).await;
-        self.record(run, since, &outcome).await?;
+        let recorded = self.record(run, since, &outcome).await;
+        lock.release().await?;
+        recorded?;
         outcome
     }
 
@@ -98,8 +111,16 @@ impl Scheduler {
             .store
             .claim_due(self.clock.now(), self.lease, CLAIM_BATCH)
             .await?;
-        let n = due.len();
+        let mut driven = 0usize;
         for (run, graph) in due {
+            // SP-OPS-1.4: the exclusive hold, taken BEFORE any drive work. `None` ⇒ another
+            // worker is mid-drive on this run, so skip it entirely — do NOT record anything,
+            // because that drive owns the outcome and `record_*` is conditional on `waking`.
+            // The row keeps its fresh `claimed_at`, which is now inert: the lock, not the
+            // lease, is what excludes.
+            let Some(lock) = self.store.try_lock_run(run).await? else {
+                continue;
+            };
             // A journal that will not load is a DRIVE failure, not a store failure, and the
             // distinction is the whole contract above. `?`-ing it here aborted the entire
             // CLAIMED batch on one bad run: the run was never recorded terminal, so
@@ -117,14 +138,22 @@ impl Scheduler {
             let since = match self.watermark(run).await {
                 Ok(s) => s,
                 Err(e) => {
-                    self.record(run, 0, &Err(e)).await?;
+                    let recorded = self.record(run, 0, &Err(e)).await;
+                    lock.release().await?;
+                    recorded?;
+                    driven += 1;
                     continue;
                 }
             };
             let outcome = self.executor.start(run, &graph).await;
-            self.record(run, since, &outcome).await?;
+            let recorded = self.record(run, since, &outcome).await;
+            // Release before propagating: a store fault must not also strand the run behind a
+            // lock that outlives this tick.
+            lock.release().await?;
+            recorded?;
+            driven += 1;
         }
-        Ok(n)
+        Ok(driven)
     }
 
     pub async fn status(&self, run: RunId) -> Result<Option<ScheduledRun>, OrchestratorError> {

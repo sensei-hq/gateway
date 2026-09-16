@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use orchestrator_core::{
     ContentRef, ContentStore, ContextKey, ContextRef, ContextStore, Digest, OrchestratorError,
-    Scope, digest_of,
+    RunId, Scope, digest_of,
 };
 
 /// In-memory content-addressed store: a shared `Digest → bytes` map. `put`
@@ -47,13 +47,21 @@ impl ContentStore for InMemoryContentStore {
 }
 
 /// In-memory scoped blackboard, backed by a [`ContentStore`] (values are stored
-/// as content-addressed refs, never inline). Writes to an existing `(scope, key)`
-/// are rejected; reads resolve `Node` → `Run`.
+/// as content-addressed refs, never inline). Writes to an existing `(run, scope, key)`
+/// are rejected; reads resolve `Node` → `Run` **within one run**.
+///
+/// The [`RunId`] in the key is load-bearing (SP-OPS-1.1): one `Scheduler` drives up to
+/// `CLAIM_BATCH` runs through a single `Executor`, so this map is shared across runs in
+/// process just as the Postgres table is across processes.
 #[derive(Clone)]
 pub struct InMemoryContextStore {
     content: Arc<dyn ContentStore>,
-    entries: Arc<Mutex<HashMap<(Scope, ContextKey), ContextRef>>>,
+    entries: Arc<Mutex<HashMap<ContextEntryKey, ContextRef>>>,
 }
+
+/// The blackboard's composite key. Mirrors the `context_refs` primary key
+/// `(run_id, scope_kind, scope_id, ctx_key)` — [`Scope`] supplies the two scope columns.
+type ContextEntryKey = (RunId, Scope, ContextKey);
 
 impl InMemoryContextStore {
     pub fn new(content: Arc<dyn ContentStore>) -> Self {
@@ -75,6 +83,7 @@ impl InMemoryContextStore {
 impl ContextStore for InMemoryContextStore {
     async fn put(
         &self,
+        run: RunId,
         scope: Scope,
         key: ContextKey,
         value: serde_json::Value,
@@ -96,28 +105,29 @@ impl ContextStore for InMemoryContextStore {
         };
 
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if entries.contains_key(&(scope.clone(), key.clone())) {
+        if entries.contains_key(&(run, scope.clone(), key.clone())) {
             return Err(OrchestratorError::ContextKeyCollision {
                 scope: Self::scope_label(&scope),
                 key: key.0,
             });
         }
-        entries.insert((scope, key), context_ref.clone());
+        entries.insert((run, scope, key), context_ref.clone());
         Ok(context_ref)
     }
 
     async fn get(
         &self,
+        run: RunId,
         scope: Scope,
         key: ContextKey,
     ) -> Result<Option<ContextRef>, OrchestratorError> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(found) = entries.get(&(scope.clone(), key.clone())) {
+        if let Some(found) = entries.get(&(run, scope.clone(), key.clone())) {
             return Ok(Some(found.clone()));
         }
-        // Resolve up the scope chain: a Node read falls back to Run.
+        // Resolve up the scope chain: a Node read falls back to Run — in the SAME run.
         if let Scope::Node(_) = scope
-            && let Some(found) = entries.get(&(Scope::Run, key))
+            && let Some(found) = entries.get(&(run, Scope::Run, key))
         {
             return Ok(Some(found.clone()));
         }
@@ -129,12 +139,12 @@ impl ContextStore for InMemoryContextStore {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    async fn insert_ref(&self, r: ContextRef) -> Result<(), OrchestratorError> {
+    async fn insert_ref(&self, run: RunId, r: ContextRef) -> Result<(), OrchestratorError> {
         // Rehydration from a journaled write: plain insert (last wins on an
         // identical fold replay), no collision check — the journal is the source
         // of truth. No CAS touch; the blob already lives there.
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.insert((r.scope.clone(), r.key.clone()), r);
+        entries.insert((run, r.scope.clone(), r.key.clone()), r);
         Ok(())
     }
 }
@@ -173,12 +183,13 @@ mod tests {
     #[tokio::test]
     async fn context_store_collides_resolves_node_to_run_and_misses_to_none() {
         let store = InMemoryContextStore::new(Arc::new(InMemoryContentStore::new()));
+        let run = RunId(uuid::Uuid::new_v4());
         let k1 = || ContextKey("k1".into());
         let node = || Scope::Node(NodeId("n".into()));
 
         // Run-scoped write round-trips through the CAS.
         let r1 = store
-            .put(Scope::Run, k1(), serde_json::json!({ "v": 1 }))
+            .put(run, Scope::Run, k1(), serde_json::json!({ "v": 1 }))
             .await
             .unwrap();
         assert_eq!(
@@ -189,7 +200,7 @@ mod tests {
 
         // Re-writing the same (scope,key) is a loud collision.
         let err = store
-            .put(Scope::Run, k1(), serde_json::json!({ "v": 2 }))
+            .put(run, Scope::Run, k1(), serde_json::json!({ "v": 2 }))
             .await
             .expect_err("same (scope,key) collides");
         assert!(
@@ -198,13 +209,13 @@ mod tests {
         );
 
         // A Node-scoped read resolves up to the Run-scoped entry.
-        let got = store.get(node(), k1()).await.unwrap();
+        let got = store.get(run, node(), k1()).await.unwrap();
         assert!(got.is_some(), "Node read resolves up to Run");
 
         // A read miss is an explicit Ok(None).
         assert!(
             store
-                .get(Scope::Run, ContextKey("absent".into()))
+                .get(run, Scope::Run, ContextKey("absent".into()))
                 .await
                 .unwrap()
                 .is_none(),
@@ -214,13 +225,17 @@ mod tests {
         // A Node-scoped write is private to that node — not visible at Run.
         store
             .put(
+                run,
                 node(),
                 ContextKey("k2".into()),
                 serde_json::json!({ "n": true }),
             )
             .await
             .unwrap();
-        let node_entry = store.get(node(), ContextKey("k2".into())).await.unwrap();
+        let node_entry = store
+            .get(run, node(), ContextKey("k2".into()))
+            .await
+            .unwrap();
         assert_eq!(
             node_entry.unwrap().scope,
             node(),
@@ -228,12 +243,84 @@ mod tests {
         );
         assert!(
             store
-                .get(Scope::Run, ContextKey("k2".into()))
+                .get(run, Scope::Run, ContextKey("k2".into()))
                 .await
                 .unwrap()
                 .is_none(),
             "a Node-scoped write does not leak to Run"
         );
+    }
+
+    /// **SP-OPS-1.1 (analysis §2.3) — two runs may publish the same key.**
+    ///
+    /// The blackboard was keyed `(scope, key)` with no run dimension, so a `Scope::Run`
+    /// entry was global to the deployment forever. Because node ids are author-chosen and
+    /// stable, `publish_context` keyed on the bare node id meant **re-running the same
+    /// graph collided on its first completed node** — and the collision propagates with
+    /// `?` out of `apply_node_result`, aborting the whole drive after the model call was
+    /// already paid for. It was also a permanent poison pill: the failed `put` journals no
+    /// `ContextWrite`, so the fold guard never engages and every resume re-collides.
+    ///
+    /// Asserts both halves, because fixing only the first would be a silent regression of
+    /// the second: distinct runs are INDEPENDENT, and a repeat within ONE run still
+    /// collides loudly.
+    #[tokio::test]
+    async fn two_runs_publish_the_same_key_independently_but_one_run_still_collides() {
+        let store = InMemoryContextStore::new(Arc::new(InMemoryContentStore::new()));
+        let (a, b) = (RunId(uuid::Uuid::new_v4()), RunId(uuid::Uuid::new_v4()));
+        let key = || ContextKey("n1".into());
+
+        let ra = store
+            .put(a, Scope::Run, key(), serde_json::json!({ "run": "a" }))
+            .await
+            .expect("run A publishes n1");
+        let rb = store
+            .put(b, Scope::Run, key(), serde_json::json!({ "run": "b" }))
+            .await
+            .expect("run B publishes the SAME node id — the whole point of the fix");
+
+        // Not merely both-Ok: each run must read back its OWN value. A shared row that
+        // happened not to error would pass an is_ok() check and still be the bug.
+        assert_eq!(
+            store.load(&ra).await.unwrap(),
+            serde_json::json!({ "run": "a" })
+        );
+        assert_eq!(
+            store.load(&rb).await.unwrap(),
+            serde_json::json!({ "run": "b" })
+        );
+        assert_eq!(
+            store
+                .get(a, Scope::Run, key())
+                .await
+                .unwrap()
+                .map(|r| store_digest(&r)),
+            Some(store_digest(&ra)),
+            "run A reads back A's entry, not B's"
+        );
+        assert_eq!(
+            store
+                .get(b, Scope::Run, key())
+                .await
+                .unwrap()
+                .map(|r| store_digest(&r)),
+            Some(store_digest(&rb)),
+            "run B reads back B's entry, not A's"
+        );
+
+        // The within-run guard is NOT relaxed by the fix.
+        let err = store
+            .put(a, Scope::Run, key(), serde_json::json!({ "run": "a2" }))
+            .await
+            .expect_err("a repeat within ONE run still collides loudly");
+        assert!(
+            matches!(err, OrchestratorError::ContextKeyCollision { .. }),
+            "{err:?}"
+        );
+    }
+
+    fn store_digest(r: &ContextRef) -> String {
+        r.content.digest.0.clone()
     }
 
     /// `insert_ref` rehydrates an entry from an already-journaled ref (resume
@@ -256,14 +343,15 @@ mod tests {
             summary: None,
         };
         let store = InMemoryContextStore::new(content);
-        store.insert_ref(r.clone()).await.unwrap();
+        let run = RunId(uuid::Uuid::new_v4());
+        store.insert_ref(run, r.clone()).await.unwrap();
         let got = store
-            .get(Scope::Run, ContextKey("k".into()))
+            .get(run, Scope::Run, ContextKey("k".into()))
             .await
             .unwrap()
             .expect("present after insert_ref");
         assert_eq!(store.load(&got).await.unwrap(), serde_json::json!({"v":1}));
         // Idempotent — re-inserting the same (scope,key) does not collide.
-        store.insert_ref(r).await.unwrap();
+        store.insert_ref(run, r).await.unwrap();
     }
 }

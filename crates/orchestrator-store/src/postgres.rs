@@ -297,7 +297,10 @@ impl ContentStore for PostgresContentStore {
 }
 
 /// A durable [`ContextStore`] backed by the `orchestrator.context_refs` table (keyed by
-/// `(scope_kind, scope_id, ctx_key)`), storing each value's bytes once in the shared CAS.
+/// `(run_id, scope_kind, scope_id, ctx_key)`), storing each value's bytes once in the shared CAS.
+///
+/// `run_id` is load-bearing (SP-OPS-1.1): without it a `Scope::Run` row was global to the
+/// deployment forever, so re-running the same graph collided on its first completed node.
 ///
 /// Parity with [`InMemoryContextStore`](crate::InMemoryContextStore): `put` writes the value to
 /// the CAS then inserts the ref, rejecting a re-write of an existing `(scope, key)` LOUDLY with
@@ -316,8 +319,9 @@ impl PostgresContextStore {
         Self { pool }
     }
 
-    /// Decompose a [`Scope`] into the `(scope_kind, scope_id)` primary-key columns. `Run` carries
-    /// an empty id; `Node(id)` carries the node path.
+    /// Decompose a [`Scope`] into the `(scope_kind, scope_id)` key columns. `Run` carries an
+    /// empty id; `Node(id)` carries the node path. The run dimension is NOT here — it is a
+    /// separate `run_id` column, because [`Scope`] is journaled and must keep its encoding.
     fn scope_cols(scope: &Scope) -> (&'static str, String) {
         match scope {
             Scope::Run => ("run", String::new()),
@@ -330,17 +334,19 @@ impl PostgresContextStore {
         PostgresContentStore::new(self.pool.clone())
     }
 
-    /// Fetch the single ref at the exact `(scope_kind, scope_id, ctx_key)` row, if present.
+    /// Fetch the single ref at the exact `(run_id, scope_kind, scope_id, ctx_key)` row.
     async fn fetch(
         &self,
+        run: RunId,
         kind: &str,
         id: &str,
         key: &str,
     ) -> Result<Option<ContextRef>, OrchestratorError> {
         let row: Option<(serde_json::Value,)> = sqlx::query_as(
             "select ctx_ref from orchestrator.context_refs \
-             where scope_kind = $1 and scope_id = $2 and ctx_key = $3",
+             where run_id = $1 and scope_kind = $2 and scope_id = $3 and ctx_key = $4",
         )
+        .bind(run.0)
         .bind(kind)
         .bind(id)
         .bind(key)
@@ -356,6 +362,7 @@ impl PostgresContextStore {
 impl ContextStore for PostgresContextStore {
     async fn put(
         &self,
+        run: RunId,
         scope: Scope,
         key: ContextKey,
         value: serde_json::Value,
@@ -376,12 +383,14 @@ impl ContextStore for PostgresContextStore {
         let (kind, id) = Self::scope_cols(&scope);
         let ref_json = serde_json::to_value(&context_ref)?;
         // LOUD collision: a plain insert (never `on conflict do nothing`). A PK unique-violation
-        // means this `(scope, key)` already exists → map it to `ContextKeyCollision`, not a
-        // silent overwrite.
+        // means this `(run, scope, key)` already exists → map it to `ContextKeyCollision`, not a
+        // silent overwrite. Scoped by run since SP-OPS-1.1, so this fires only on a genuine
+        // duplicate WITHIN one run — never because another run used the same node id.
         let res = sqlx::query(
-            "insert into orchestrator.context_refs (scope_kind, scope_id, ctx_key, ctx_ref) \
-             values ($1, $2, $3, $4)",
+            "insert into orchestrator.context_refs (run_id, scope_kind, scope_id, ctx_key, ctx_ref) \
+             values ($1, $2, $3, $4, $5)",
         )
+        .bind(run.0)
         .bind(kind)
         .bind(&id)
         .bind(&key.0)
@@ -400,17 +409,19 @@ impl ContextStore for PostgresContextStore {
 
     async fn get(
         &self,
+        run: RunId,
         scope: Scope,
         key: ContextKey,
     ) -> Result<Option<ContextRef>, OrchestratorError> {
         let (kind, id) = Self::scope_cols(&scope);
-        if let Some(found) = self.fetch(kind, &id, &key.0).await? {
+        if let Some(found) = self.fetch(run, kind, &id, &key.0).await? {
             return Ok(Some(found));
         }
-        // Resolve up the scope chain: a Node read falls back to the Run-scoped entry.
+        // Resolve up the scope chain: a Node read falls back to the Run-scoped entry
+        // OF THE SAME RUN.
         if let Scope::Node(_) = scope {
             let (rk, rid) = Self::scope_cols(&Scope::Run);
-            if let Some(found) = self.fetch(rk, &rid, &key.0).await? {
+            if let Some(found) = self.fetch(run, rk, &rid, &key.0).await? {
                 return Ok(Some(found));
             }
         }
@@ -422,18 +433,20 @@ impl ContextStore for PostgresContextStore {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    async fn insert_ref(&self, r: ContextRef) -> Result<(), OrchestratorError> {
+    async fn insert_ref(&self, run: RunId, r: ContextRef) -> Result<(), OrchestratorError> {
         // Rehydration from a journaled write: idempotent upsert (a fold replays every write), no
         // collision check — the journal is the source of truth. No CAS touch; the blob already
         // lives there. `do nothing` is first-write-wins (vs InMemory's last-write-wins overwrite);
         // immaterial, since `put` enforces collisions at journal-write time so a fold only ever
-        // replays an identical ref for a given `(scope, key)`.
+        // replays an identical ref for a given `(run, scope, key)`.
         let (kind, id) = Self::scope_cols(&r.scope);
         let ref_json = serde_json::to_value(&r)?;
         sqlx::query(
-            "insert into orchestrator.context_refs (scope_kind, scope_id, ctx_key, ctx_ref) \
-             values ($1, $2, $3, $4) on conflict (scope_kind, scope_id, ctx_key) do nothing",
+            "insert into orchestrator.context_refs (run_id, scope_kind, scope_id, ctx_key, ctx_ref) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict (run_id, scope_kind, scope_id, ctx_key) do nothing",
         )
+        .bind(run.0)
         .bind(kind)
         .bind(&id)
         .bind(&r.key.0)
@@ -870,8 +883,73 @@ impl PostgresSchedulerStore {
     }
 }
 
+/// Fold a [`RunId`] into the single `bigint` a Postgres advisory lock is keyed by.
+///
+/// A UUID is 128 bits and the key is 64, so this is lossy BY CONSTRUCTION and a collision is
+/// possible. It is safe in the direction that matters: a collision makes two *different* runs
+/// mutually exclusive, which costs a drive its turn until the next tick — a liveness cost, never a
+/// double-drive. The inverse (two identical runs hashing apart) cannot happen.
+fn advisory_key(run: RunId) -> i64 {
+    let bits = run.0.as_u128();
+    ((bits >> 64) as u64 ^ (bits as u64)) as i64
+}
+
+/// A held Postgres session advisory lock.
+///
+/// Owns a **detached** connection rather than a pooled one, and that is the correctness crux: an
+/// advisory lock is scoped to its SESSION, and a `PoolConnection` returned to the pool keeps its
+/// session open — so the lock would survive, invisibly, and be handed to an unrelated query. A
+/// detached connection is closed when dropped, which ends the session and releases the lock.
+///
+/// That makes both exits safe: `release` unlocks explicitly, and a panic that skips `release`
+/// still drops the connection. It is also why a killed worker self-heals — Postgres reaps the
+/// session with the TCP connection, needing no lease and no timing assumption.
+struct PgRunLock {
+    conn: Option<sqlx::PgConnection>,
+    key: i64,
+}
+
+#[async_trait::async_trait]
+impl orchestrator_core::RunLock for PgRunLock {
+    async fn release(mut self: Box<Self>) -> Result<(), OrchestratorError> {
+        if let Some(mut conn) = self.conn.take() {
+            sqlx::query("select pg_advisory_unlock($1)")
+                .bind(self.key)
+                .execute(&mut conn)
+                .await
+                .map_err(store_err)?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl SchedulerStore for PostgresSchedulerStore {
+    /// SP-OPS-1.4: `pg_try_advisory_lock` on a detached session — non-blocking, so a contended
+    /// run is SKIPPED rather than queued behind a drive that may run for minutes.
+    async fn try_lock_run(
+        &self,
+        run: RunId,
+    ) -> Result<Option<Box<dyn orchestrator_core::RunLock>>, OrchestratorError> {
+        // Detached, not pooled: see `PgRunLock`. Acquired BEFORE the lock query so a failure to
+        // get a connection is a store error rather than a silent "someone else holds it".
+        let mut conn = self.pool.acquire().await.map_err(store_err)?.detach();
+        let key = advisory_key(run);
+        let (got,): (bool,) = sqlx::query_as("select pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(store_err)?;
+        // Not taken ⇒ drop the connection here, closing the session. Holding it would leak one
+        // connection per contended tick against a pool of 8.
+        Ok(got.then(|| {
+            Box::new(PgRunLock {
+                conn: Some(conn),
+                key,
+            }) as Box<dyn orchestrator_core::RunLock>
+        }))
+    }
+
     async fn enqueue(
         &self,
         run: RunId,
@@ -1430,12 +1508,13 @@ mod tests {
         let Some(url) = db_url() else { return };
         let store = PostgresContextStore::new(connect(&url).await.unwrap());
         let tag = uuid::Uuid::new_v4().simple().to_string();
+        let run = RunId(uuid::Uuid::new_v4());
         let k1 = || ContextKey(format!("k1-{tag}"));
         let node = || Scope::Node(NodeId(format!("n-{tag}")));
 
         // Run-scoped write round-trips through the CAS.
         let r1 = store
-            .put(Scope::Run, k1(), serde_json::json!({ "v": 1 }))
+            .put(run, Scope::Run, k1(), serde_json::json!({ "v": 1 }))
             .await
             .unwrap();
         assert_eq!(
@@ -1446,7 +1525,7 @@ mod tests {
 
         // Re-writing the same (scope,key) is a loud collision (never last-write-wins).
         let err = store
-            .put(Scope::Run, k1(), serde_json::json!({ "v": 2 }))
+            .put(run, Scope::Run, k1(), serde_json::json!({ "v": 2 }))
             .await
             .expect_err("same (scope,key) collides");
         assert!(
@@ -1456,14 +1535,14 @@ mod tests {
 
         // A Node-scoped read resolves up to the Run-scoped entry.
         assert!(
-            store.get(node(), k1()).await.unwrap().is_some(),
+            store.get(run, node(), k1()).await.unwrap().is_some(),
             "Node read resolves up to Run"
         );
 
         // A read miss is an explicit Ok(None).
         assert!(
             store
-                .get(Scope::Run, ContextKey(format!("absent-{tag}")))
+                .get(run, Scope::Run, ContextKey(format!("absent-{tag}")))
                 .await
                 .unwrap()
                 .is_none(),
@@ -1473,18 +1552,168 @@ mod tests {
         // A Node-scoped write is private to that node — not visible at Run.
         let k2 = || ContextKey(format!("k2-{tag}"));
         store
-            .put(node(), k2(), serde_json::json!({ "n": true }))
+            .put(run, node(), k2(), serde_json::json!({ "n": true }))
             .await
             .unwrap();
-        let node_entry = store.get(node(), k2()).await.unwrap();
+        let node_entry = store.get(run, node(), k2()).await.unwrap();
         assert_eq!(
             node_entry.unwrap().scope,
             node(),
             "the Node entry is returned"
         );
         assert!(
-            store.get(Scope::Run, k2()).await.unwrap().is_none(),
+            store.get(run, Scope::Run, k2()).await.unwrap().is_none(),
             "a Node-scoped write does not leak to Run"
+        );
+    }
+
+    /// **SP-OPS-1.4 (analysis §2.5) — the drive lock excludes across SESSIONS.**
+    ///
+    /// The property the lease could not provide. Two stores over the same pool take two distinct
+    /// detached connections, so this is genuine cross-session exclusion — the same mechanism that
+    /// separates two worker processes, not an in-process flag.
+    ///
+    /// Also pins that the lock is RE-TAKEABLE after release.
+    ///
+    /// It does NOT prove the connection must be detached — `release` unlocks explicitly, so a
+    /// pooled connection passes this test. That property is the DROP path, and it has its own
+    /// test below; the claim was checked by mutation rather than assumed.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn pg_a_run_drive_lock_excludes_another_session_and_is_retakeable() {
+        let Some(url) = db_url() else { return };
+        let a = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let b = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let run = RunId(uuid::Uuid::new_v4());
+
+        let held = a
+            .try_lock_run(run)
+            .await
+            .unwrap()
+            .expect("uncontended run locks");
+        assert!(
+            b.try_lock_run(run).await.unwrap().is_none(),
+            "a second session must NOT get the same run's drive lock"
+        );
+
+        // A DIFFERENT run is unaffected — the lock is per-run, not a global mutex over driving.
+        let other = RunId(uuid::Uuid::new_v4());
+        assert!(
+            b.try_lock_run(other).await.unwrap().is_some(),
+            "locks are per-run"
+        );
+
+        held.release().await.unwrap();
+        assert!(
+            b.try_lock_run(run).await.unwrap().is_some(),
+            "released ⇒ re-takeable; a pooled (non-detached) connection would leak it here"
+        );
+    }
+
+    /// **SP-OPS-1.4 — a lock DROPPED without `release` still frees the run.**
+    ///
+    /// The property that forces a detached connection, and the one the sibling test above does
+    /// not cover: `release` unlocks explicitly, so it passes either way. Only this path
+    /// distinguishes them. A panicking drive skips `release`, and a `PoolConnection` returned to
+    /// the pool keeps its session — and therefore its advisory lock — alive, so the run would be
+    /// stranded until the process exits AND an unrelated later query would silently inherit the
+    /// lock. Detaching makes the drop close the session, which is what frees it.
+    ///
+    /// Mutating `.detach()` away makes this test fail; without it that mutation survives — which
+    /// was measured, not assumed: the sibling test's original comment claimed to cover this and
+    /// did not.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn pg_a_dropped_run_lock_is_released_without_an_explicit_release() {
+        let Some(url) = db_url() else { return };
+        let a = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let b = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let run = RunId(uuid::Uuid::new_v4());
+
+        // Dropped, never released — the panicking-drive path.
+        drop(a.try_lock_run(run).await.unwrap().expect("locks"));
+
+        // The session close is asynchronous on the server, so give it a bounded chance rather
+        // than asserting on a single immediate probe (which would be flaky in either direction).
+        let mut freed = false;
+        for _ in 0..50 {
+            if b.try_lock_run(run).await.unwrap().is_some() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            freed,
+            "a dropped lock must free the run; a pooled (non-detached) connection strands it"
+        );
+    }
+
+    /// **SP-OPS-1.1 (analysis §2.3), durable parity with
+    /// `two_runs_publish_the_same_key_independently_but_one_run_still_collides`.**
+    ///
+    /// The in-memory mirror proves the keying; this proves the TABLE — the PK is really
+    /// `(run_id, scope_kind, scope_id, ctx_key)` and the insert really binds the run. It is
+    /// the durable path that carried the bug: `context_refs` outlives the process, so the
+    /// old global key burned every node id in the deployment permanently.
+    ///
+    /// Deliberately uses a BARE key (`n1`), not the `-{tag}` marker the other Postgres
+    /// tests use. Those markers exist to dodge exactly this bug (see `e2e_pg.rs`'s
+    /// `signal_graph` note); a tagged key here would make the test pass without the fix.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn pg_two_runs_publish_the_same_key_independently_but_one_run_still_collides() {
+        let Some(url) = db_url() else { return };
+        let store = PostgresContextStore::new(connect(&url).await.unwrap());
+        let (a, b) = (RunId(uuid::Uuid::new_v4()), RunId(uuid::Uuid::new_v4()));
+        let key = || ContextKey("n1".into());
+
+        let ra = store
+            .put(a, Scope::Run, key(), serde_json::json!({ "run": "a" }))
+            .await
+            .expect("run A publishes n1");
+        let rb = store
+            .put(b, Scope::Run, key(), serde_json::json!({ "run": "b" }))
+            .await
+            .expect("run B publishes the SAME node id against the SAME durable table");
+
+        assert_eq!(
+            store.load(&ra).await.unwrap(),
+            serde_json::json!({ "run": "a" })
+        );
+        assert_eq!(
+            store.load(&rb).await.unwrap(),
+            serde_json::json!({ "run": "b" })
+        );
+        // Each run reads back its own row, not the other's.
+        let got_a = store.get(a, Scope::Run, key()).await.unwrap().unwrap();
+        let got_b = store.get(b, Scope::Run, key()).await.unwrap().unwrap();
+        assert_eq!(
+            store.load(&got_a).await.unwrap(),
+            serde_json::json!({ "run": "a" })
+        );
+        assert_eq!(
+            store.load(&got_b).await.unwrap(),
+            serde_json::json!({ "run": "b" })
+        );
+
+        // The within-run guard survives the fix.
+        let err = store
+            .put(a, Scope::Run, key(), serde_json::json!({ "run": "a2" }))
+            .await
+            .expect_err("a repeat within ONE run still collides loudly");
+        assert!(
+            matches!(err, OrchestratorError::ContextKeyCollision { .. }),
+            "{err:?}"
         );
     }
 
@@ -1515,9 +1744,10 @@ mod tests {
         };
 
         let store = PostgresContextStore::new(pool.clone());
-        store.insert_ref(r.clone()).await.unwrap();
+        let run = RunId(uuid::Uuid::new_v4());
+        store.insert_ref(run, r.clone()).await.unwrap();
         let got = store
-            .get(Scope::Run, ContextKey(format!("k-{tag}")))
+            .get(run, Scope::Run, ContextKey(format!("k-{tag}")))
             .await
             .unwrap()
             .expect("present after insert_ref");
@@ -1527,7 +1757,7 @@ mod tests {
         );
 
         // Idempotent — re-inserting the same (scope,key) does not collide (unlike `put`).
-        store.insert_ref(r).await.unwrap();
+        store.insert_ref(run, r).await.unwrap();
     }
 
     // ---- PostgresConfigSource (SP-DATA-2 Task 3) ------------------------------------------

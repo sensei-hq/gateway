@@ -36,12 +36,13 @@ create table if not exists orchestrator.cas_blobs (
 
 -- ddl/table/orchestrator/context_refs.sql
 create table if not exists orchestrator.context_refs (
+    run_id     uuid        not null,
     scope_kind text        not null,   -- 'run' | 'node'
-    scope_id   text        not null,   -- run id or node path
+    scope_id   text        not null,   -- '' for run scope; the node path for node scope
     ctx_key    text        not null,
     ctx_ref    jsonb       not null,   -- serialized ContextRef (references a cas digest)
     created_at timestamptz not null default now(),
-    primary key (scope_kind, scope_id, ctx_key)
+    primary key (run_id, scope_kind, scope_id, ctx_key)
 );
 
 -- ddl/table/orchestrator/run_snapshots.sql

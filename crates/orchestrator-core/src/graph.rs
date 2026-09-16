@@ -77,7 +77,12 @@ pub enum NodeKind {
     /// `other => other.clone()` arm and `validate_dag` need no `Expand` case.
     Expand {
         input: serde_json::Value,
-        #[serde(default)]
+        /// REQUIRED (SP-OPS-1.2, analysis §2.4). Deliberately NOT `#[serde(default)]`:
+        /// the `Default` is [`PlannerRef::Injected`], which is the *test* variant, and
+        /// `with_planner` has no production caller — so a defaulted `planner` parsed
+        /// cleanly and then failed mid-run with "no planner wired", after the run had
+        /// begun. `Select` is no better a default (no planning-area registry content
+        /// ships). An author must choose, and the failure belongs at parse time.
         planner: PlannerRef,
     },
     /// SP-6 s1: pause until an external signal arrives for this node (HITL).
@@ -2234,17 +2239,68 @@ mod tests {
         );
     }
 
+    /// **SP-OPS-1.2 (analysis §2.4) — `Expand.planner` is REQUIRED in JSON.**
+    ///
+    /// This replaces `expand_deserializes_without_planner_as_injected`, which pinned the
+    /// opposite and encoded the bug. `#[serde(default)]` resolved a missing `planner` to
+    /// `PlannerRef::Injected` — but `Injected` is the *test* variant (its own doc says
+    /// "deterministic/test") and `with_planner` has zero production callers, so every
+    /// hand-written `Expand` graph died mid-run with "no planner wired", AFTER the run had
+    /// started. Making the field required moves that failure to parse time.
+    ///
+    /// `Select` is deliberately NOT the default either: no planning-area registry content
+    /// ships, so defaulting to it would only swap the message for "no planning candidates".
+    /// A kind with no usable default must not have one.
     #[test]
-    fn expand_deserializes_without_planner_as_injected() {
-        let j = r#"{"Expand":{"input":{}}}"#;
-        let k: NodeKind = serde_json::from_str(j).unwrap();
-        assert!(matches!(
-            k,
-            NodeKind::Expand {
-                planner: PlannerRef::Injected,
-                ..
-            }
-        ));
+    fn expand_without_planner_is_a_parse_error_naming_the_field() {
+        let err = serde_json::from_str::<NodeKind>(r#"{"Expand":{"input":{}}}"#)
+            .expect_err("a missing `planner` must not silently resolve to the test variant");
+        assert!(
+            err.to_string().contains("planner"),
+            "the parse error must name the missing field so an author can fix it: {err}"
+        );
+    }
+
+    /// The companion to the above: specifying `planner` explicitly still works, for every
+    /// variant. Without this, making the field required could pass its own test while
+    /// breaking the graphs that DO declare a planner.
+    #[test]
+    fn expand_with_an_explicit_planner_still_parses() {
+        for (j, want) in [
+            (
+                r#"{"Expand":{"input":{},"planner":"Injected"}}"#,
+                PlannerRef::Injected,
+            ),
+            (
+                r#"{"Expand":{"input":{},"planner":"Select"}}"#,
+                PlannerRef::Select,
+            ),
+        ] {
+            let k: NodeKind = serde_json::from_str(j).expect(j);
+            let NodeKind::Expand { planner, .. } = k else {
+                panic!("expected Expand from {j}")
+            };
+            assert_eq!(planner, want, "{j}");
+        }
+    }
+
+    /// **The durable-graph safety check for SP-OPS-1.2.** `scheduled_runs.graph` holds
+    /// serde-serialized graphs, so requiring `planner` on the way IN would strand every
+    /// stored graph if serialization could ever omit it. It cannot — there is no
+    /// `skip_serializing_if` on the field — and this pins that: a round-trip through
+    /// `to_string` must always carry `planner`, so an already-enqueued run still wakes.
+    #[test]
+    fn a_serialized_expand_always_carries_planner_so_stored_graphs_still_load() {
+        let k = NodeKind::Expand {
+            input: serde_json::json!({}),
+            planner: PlannerRef::Injected,
+        };
+        let s = serde_json::to_string(&k).unwrap();
+        assert!(
+            s.contains("\"planner\""),
+            "serialization must emit `planner` or enqueued graphs would fail to reload: {s}"
+        );
+        serde_json::from_str::<NodeKind>(&s).expect("a serialized Expand must round-trip");
     }
 
     #[test]

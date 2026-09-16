@@ -41,6 +41,21 @@ pub struct Executor {
     registry: Arc<Registry>,
     tools: Arc<ToolRegistry>,
     max_steps: usize,
+    /// SP-OPS-1.3: total attempts a node gets before a retryable gateway failure becomes
+    /// terminal. **Default 1 — retry OFF, behaviour byte-identical.**
+    ///
+    /// Opt-in because the blast radius is wider than "retry a transient 500". The
+    /// gateway marks an exhaustion retryable when ANY candidate hit a non-limit fault,
+    /// and an unclassified provider error is a non-limit fault — while the genuinely
+    /// terminal cases (auth, credits) exhaust as `AllGated` and pause for a human rather
+    /// than reaching this path at all. So enabling it retries essentially every provider
+    /// failure, which costs latency and possibly spend against a permanently broken
+    /// setup. That is the right default for many deployments and the wrong one to impose.
+    ///
+    /// With the default, a transient failure still terminates the run — the condition
+    /// analysis §2.2 describes. The mechanism is here and tested; the default is a
+    /// deployment decision.
+    max_transient_attempts: u32,
     /// Max nesting depth (Subgraph levels; SP-3 self-DoS backstop). Default 8.
     max_depth: usize,
     concurrency: usize,
@@ -327,6 +342,15 @@ struct Fold {
     /// whether a row is written. That is why it is not a loosening of [`Fold::failed`]'s
     /// fence, which is about which kinds may treat a recorded failure as FINAL.
     failure_messages: HashMap<NodeId, std::collections::HashSet<String>>,
+    /// SP-OPS-1.3: how many `NodeFailed` ROWS a node has journaled — the attempt count
+    /// that bounds the transient-retry loop.
+    ///
+    /// A third failure map, and the third question. [`Fold::failed`] is first-wins (ONE
+    /// verdict); [`Fold::failure_messages`] is a SET of distinct messages ("is this exact
+    /// row already written"). Neither can bound a retry: a provider returning the
+    /// identical 500 forever collapses to one entry in both, so a bound read from either
+    /// would never be reached and the run would wake forever.
+    attempts: HashMap<NodeId, u32>,
     /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
     /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
     /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
@@ -528,6 +552,12 @@ impl Fold {
         self.failure_messages
             .get(node)
             .is_some_and(|seen| seen.contains(message))
+    }
+
+    /// SP-OPS-1.3: prior failed attempts for `node`. See [`Fold::attempts`] for why
+    /// neither sibling map can answer this.
+    fn attempts_for(&self, node: &NodeId) -> u32 {
+        self.attempts.get(node).copied().unwrap_or(0)
     }
 
     /// SP-6 s2: the decision folded for this `HumanGate`, if a human has answered.
@@ -741,6 +771,7 @@ impl Executor {
             registry: Arc::new(Registry::default()),
             tools: Arc::new(ToolRegistry::default()),
             max_steps: 8,
+            max_transient_attempts: 1,
             max_depth: 8,
             concurrency: 8,
             content: None,
@@ -851,6 +882,17 @@ impl Executor {
         self
     }
 
+    /// Total attempts a node gets before a retryable gateway failure becomes terminal
+    /// (default 1 = no retry). `n <= 1` disables retry. See
+    /// the `max_transient_attempts` field's own docs for why it is opt-in.
+    ///
+    /// Retries pause on an exponential backoff (2s, 4s, capped 60s) and re-attempt on
+    /// the scheduler's wake, so a retry costs a journal round trip, not a held thread.
+    pub fn with_max_transient_attempts(mut self, n: u32) -> Self {
+        self.max_transient_attempts = n;
+        self
+    }
+
     /// Set the max nesting depth (Subgraph self-DoS cap; default 8).
     pub fn with_max_depth(mut self, n: usize) -> Self {
         self.max_depth = n;
@@ -882,6 +924,17 @@ impl Executor {
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_planner_selector(&self) -> bool {
         self.selector.is_some()
+    }
+
+    /// SP-OPS-1.5: is a reconciler registered for `tool`? The same test seam as
+    /// [`has_planner_selector`](Self::has_planner_selector), for the same reason and the same
+    /// class of bug — a missing reconciler is otherwise observable only by CRASHING a run
+    /// between a Mutation's intent and its record, which no CI test can stage against the real
+    /// binary. That unobservability is how the shipped executable came to register two Mutation
+    /// tools and zero reconcilers, parking any interrupted `fs_write` forever.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_reconciler_for(&self, tool: &str) -> bool {
+        self.reconcilers.get(tool).is_some()
     }
 
     /// Set the max runtime expansions (`PlanDelta`s) per run (self-DoS cap; default 32).
@@ -1127,7 +1180,7 @@ impl Executor {
         let this = self
             .clone()
             .with_expansion_seed(fold.expansions.len(), seed_nodes);
-        this.rehydrate_context(&fold).await?;
+        this.rehydrate_context(run, &fold).await?;
         // The RUN's own graph: a human-backed `Agent` node here is at the one
         // position §5.5 permits.
         let outcome = this.drive(run, graph, &fold, false).await?;
@@ -1515,7 +1568,40 @@ impl Executor {
                             output: None,
                         }),
                     },
-                    Err(error) => match classify_gateway_error(&error) {
+                    Err(error) => match classify_gateway_error(
+                        &error,
+                        fold.attempts_for(&node.id),
+                        self.max_transient_attempts,
+                        self.clock.now(),
+                    ) {
+                        // SP-OPS-1.3: a transient fault with budget left. Appends BOTH
+                        // the `NodeFailed` (this attempt's record, and what the bound is
+                        // counted from — a pause alone would leave the loop unbounded)
+                        // and the `RunPaused` the scheduler wakes on. The node re-attempts
+                        // on that wake: it journaled no `EffectRecorded`, so it carries no
+                        // memo.
+                        GatewayDisposition::Retry {
+                            resume_after,
+                            reason,
+                        } => {
+                            self.append(
+                                run,
+                                JournalEvent::NodeFailed {
+                                    node: node.id.clone(),
+                                    error: reason.clone(),
+                                },
+                            )
+                            .await?;
+                            self.append(
+                                run,
+                                JournalEvent::RunPaused {
+                                    reason: reason.clone(),
+                                    resume_after: Some(resume_after),
+                                },
+                            )
+                            .await?;
+                            Ok(NodeExec::Paused { reason })
+                        }
                         // A fully-gated chain that something can still clear (§11.2):
                         // durable pause (resumable), never a bare fail. On resume
                         // the node re-attempts (no `EffectRecorded` was journaled).
@@ -1559,7 +1645,7 @@ impl Executor {
                 input,
                 phase,
             } => {
-                let context = self.resolve_context(node).await?;
+                let context = self.resolve_context(run, node).await?;
                 match self
                     .drive_agent(
                         run,
@@ -1678,7 +1764,7 @@ impl Executor {
         if fold.context.contains_key(&(Scope::Run, key.clone())) {
             return Ok(());
         }
-        let r = ctx.put(Scope::Run, key, output.clone()).await?;
+        let r = ctx.put(run, Scope::Run, key, output.clone()).await?;
         self.append(
             run,
             JournalEvent::ContextWrite {
@@ -1696,12 +1782,12 @@ impl Executor {
     /// Rehydrate the injected blackboard from folded `ContextWrite`s on resume —
     /// `insert_ref` only, no blob load; the CAS persists across the crash seam, so
     /// a later `load` reads the value back. No context store wired ⇒ a no-op.
-    async fn rehydrate_context(&self, fold: &Fold) -> Result<(), OrchestratorError> {
+    async fn rehydrate_context(&self, run: RunId, fold: &Fold) -> Result<(), OrchestratorError> {
         let Some(ctx) = &self.context else {
             return Ok(());
         };
         for r in fold.context.values() {
-            ctx.insert_ref(r.clone()).await?;
+            ctx.insert_ref(run, r.clone()).await?;
         }
         Ok(())
     }
@@ -1723,6 +1809,7 @@ impl Executor {
     /// No store ⇒ empty.
     async fn resolve_context(
         &self,
+        run: RunId,
         node: &orchestrator_core::Node,
     ) -> Result<Vec<(ContextKey, serde_json::Value)>, OrchestratorError> {
         let Some(ctx) = &self.context else {
@@ -1734,7 +1821,7 @@ impl Executor {
                 continue;
             }
             let key = ContextKey(dep.on.0.clone());
-            if let Some(r) = ctx.get(Scope::Run, key.clone()).await? {
+            if let Some(r) = ctx.get(run, Scope::Run, key.clone()).await? {
                 out.push((key, ctx.load(&r).await?));
             }
         }

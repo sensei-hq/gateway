@@ -1698,6 +1698,47 @@ async fn in_doubt_not_applied_runs_the_effect_once_under_the_standing_intent() {
     );
 }
 
+/// **SP-OPS-1.5 (analysis §2.6) — the SHIPPED `fs_write` reconciler un-parks an in-doubt
+/// mutation.**
+///
+/// Paired deliberately with `in_doubt_indeterminate_pauses_without_applying` directly below,
+/// which is what `fs_write` did until now: the binary registered two Mutation tools and zero
+/// reconcilers, so a crash between intent and record fell to `Indeterminate` and paused with a
+/// NULL `next_wake` — no timer wakes it and `force_wake` only re-reconciles to `Indeterminate`
+/// again. Stuck forever, behind a reason naming only a hash.
+///
+/// Driven through the shared in-doubt harness rather than a real filesystem: the claim under test
+/// is that `FsWriteReconciler`'s verdict makes the executor RE-RUN instead of parking, which is a
+/// property of the verdict, not of any file. The idempotence that justifies the verdict is
+/// argued at the type and is a property of `std::fs::write` truncating.
+#[tokio::test]
+async fn the_shipped_fs_write_reconciler_reruns_an_in_doubt_mutation_instead_of_parking() {
+    use crate::agent::tools::FsWriteReconciler;
+    let (journal, run) = seed_in_doubt_note().await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(FsWriteReconciler));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
+
+    assert!(
+        out.paused.is_none(),
+        "the whole point: it must NOT park. {:?}",
+        out.paused
+    );
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "the effect re-runs exactly once — safe precisely because fs_write is idempotent"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes rather than waiting for a human"
+    );
+}
+
 /// Acceptance §8.6 — in-doubt Mutation, `Indeterminate` (an `AlwaysIndeterminate`
 /// provider that cannot decide): the executor pauses loud — journals `RunPaused`,
 /// sets `outcome.paused`, applies NOTHING, and does not complete.
@@ -4628,6 +4669,7 @@ async fn completed_node_publishes_a_context_ref_to_the_blackboard() {
     );
     let got = ctx
         .get(
+            run,
             orchestrator_core::Scope::Run,
             orchestrator_core::ContextKey(n1.0.clone()),
         )
@@ -4660,15 +4702,154 @@ async fn no_context_store_journals_no_context_writes() {
     );
 }
 
+/// **SP-OPS-1.3 (analysis §2.2) — the retry bound TERMINATES.** The safety-critical half.
+///
+/// A permanently-failing provider must not wake forever. `RunPaused` has no fold guard,
+/// so an unbounded retry grows the journal on every wake — the poison-run shape this
+/// increment exists to avoid, which its own fix would otherwise reintroduce.
+///
+/// Drives repeatedly, as the scheduler would. With `max_transient_attempts = 3` the first
+/// two drives pause on a backoff deadline and the third fails TERMINALLY.
+///
+/// The bound is counted from journaled `NodeFailed` rows, which is why the retry path
+/// appends one beside the `RunPaused`: a pause alone appends none, and this test would
+/// then never terminate.
+#[tokio::test]
+async fn a_permanently_failing_provider_exhausts_the_retry_bound_and_fails_terminally() {
+    let (gw, calls) = failing_after_gateway(0).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, n1, _n2) = two_node_graph("a", "b");
+    let exec =
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_max_transient_attempts(3);
+
+    // Attempts 1 and 2: a retryable failure with budget left ⇒ a timed pause.
+    for attempt in 1..=2 {
+        let out = exec.start(run, &graph).await.expect("drive");
+        let paused = out
+            .paused
+            .unwrap_or_else(|| panic!("attempt {attempt} must pause, not fail"));
+        assert!(
+            paused.reason.contains(&format!("attempt {attempt} of 3")),
+            "attempt {attempt}: {}",
+            paused.reason
+        );
+        assert!(
+            out.failed.is_none(),
+            "attempt {attempt} is not terminal yet"
+        );
+    }
+
+    // Attempt 3 is the last: no budget left, so it fails terminally rather than pausing
+    // again. This is the assertion that proves the loop is bounded.
+    let out = exec.start(run, &graph).await.expect("drive");
+    assert!(
+        out.paused.is_none(),
+        "the bound must stop the wake loop: {:?}",
+        out.paused
+    );
+    let (failed_node, _) = out.failed.expect("the third attempt is terminal");
+    assert_eq!(failed_node, n1);
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "exactly max_transient_attempts provider calls — no more, no fewer"
+    );
+}
+
+/// The other half: retry is **OFF by default**, so the same provider fails on the first
+/// drive. Pins the byte-identical default rather than leaving it to inspection — without
+/// this, flipping the default would silently change every deployment.
+#[tokio::test]
+async fn retry_is_off_by_default_so_one_failure_is_terminal() {
+    let (gw, calls) = failing_after_gateway(0).await;
+    let (graph, n1, _n2) = two_node_graph("a", "b");
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("drive");
+    assert!(out.paused.is_none(), "no retry pause by default");
+    assert_eq!(out.failed.expect("terminal by default").0, n1);
+    assert_eq!(calls.lock().unwrap().len(), 1, "exactly one provider call");
+}
+
+/// **SP-OPS-1.1 (analysis §2.3) — the same graph runs TWICE. The user-visible symptom.**
+///
+/// The store-level tests prove the keying; this proves the thing an operator actually
+/// hit. Before the fix, `publish_context` wrote every completed node's output under a
+/// `Scope::Run` entry keyed by the BARE node id, and `Scope::Run` carried no run
+/// dimension — so the second run of any graph collided on its first completed node. The
+/// collision propagates with `?` out of `apply_node_result`, so it aborted the entire
+/// drive, not just the node, AFTER the model call had been paid for.
+///
+/// Both runs share ONE executor and ONE context store on purpose: that is the real
+/// topology (a `Scheduler` drives up to `CLAIM_BATCH` runs through a single `Executor`),
+/// and a per-run store would hide the bug. The node ids are the bare ones from
+/// `two_node_graph` — the graph is byte-identical across both runs, as a re-submitted
+/// graph is.
+#[tokio::test]
+async fn the_same_graph_runs_twice_against_one_shared_blackboard() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gw, _c) = recording_gateway().await;
+    let (graph, n1, _n2) = two_node_graph("a", "b");
+    let exec = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_content_store(content)
+        .with_context_store(ctx.clone());
+
+    let first = RunId(uuid::Uuid::new_v4());
+    let out1 = exec.run(first, &graph).await.expect("first run");
+    assert!(out1.failed.is_none(), "first run: {:?}", out1.failed);
+
+    // The SAME graph again, new run id — this is what used to abort mid-drive.
+    let second = RunId(uuid::Uuid::new_v4());
+    let out2 = exec
+        .run(second, &graph)
+        .await
+        .expect("second run of the same graph");
+    assert!(
+        out2.failed.is_none(),
+        "re-running an identical graph must not collide: {:?}",
+        out2.failed
+    );
+    assert_eq!(
+        out2.completed.len(),
+        graph.nodes.len(),
+        "every node of the second run completed"
+    );
+
+    // And the two runs' blackboards are genuinely separate, not one shared row that
+    // happened not to error.
+    let key = || orchestrator_core::ContextKey(n1.0.clone());
+    for run in [first, second] {
+        assert!(
+            ctx.get(run, orchestrator_core::Scope::Run, key())
+                .await
+                .unwrap()
+                .is_some(),
+            "each run has its own entry for the shared node id"
+        );
+    }
+}
+
 /// Acceptance §8.4 — a duplicate (Run, key) publish surfaces ContextKeyCollision
 /// loudly (never a silent overwrite). Pre-seed Run/"n1" WITHOUT a ContextWrite so
 /// the fold-guard does not skip, then run — n1's publish collides.
+///
+/// SP-OPS-1.1: the seed and the drive must share ONE `run`. Run-scoping the blackboard
+/// removed the CROSS-run collision (the bug); this collision is WITHIN a run and must
+/// stay loud. Seeding under a different run id would make this test pass vacuously — it
+/// would stop colliding for the new reason rather than the asserted one.
 #[tokio::test]
 async fn duplicate_context_key_publish_is_a_loud_collision() {
     use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
     let content = Arc::new(InMemoryContentStore::new());
     let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let run = RunId(uuid::Uuid::new_v4());
     ctx.put(
+        run,
         orchestrator_core::Scope::Run,
         orchestrator_core::ContextKey("n1".into()),
         serde_json::json!({ "pre": "seeded" }),
@@ -4680,7 +4861,7 @@ async fn duplicate_context_key_publish_is_a_loud_collision() {
     let err = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
         .with_content_store(content)
         .with_context_store(ctx)
-        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .run(run, &graph)
         .await
         .expect_err("duplicate publish collides");
     assert!(
@@ -16779,6 +16960,76 @@ mod scheduler_driver {
         );
     }
 
+    /// **SP-OPS-1.4 (analysis §2.5) — a run already being driven is NOT driven again.**
+    ///
+    /// The lease could not guarantee this. `claimed_at` is stamped once and never renewed, and
+    /// `tick` stamps a whole batch at one instant then drives it serially, so the tail of a slow
+    /// batch is past its 60s lease before it starts and a second worker reclaims it *while the
+    /// first is still running*. Both drives then fold the journal before either writes, the memo
+    /// has nothing to fence with, and the model call is paid for twice.
+    ///
+    /// Holding the lock for the whole test simulates the first worker mid-drive; `tick` is the
+    /// second worker arriving. It must claim nothing it can drive and spend nothing.
+    #[tokio::test]
+    async fn a_run_held_by_another_worker_is_not_driven() {
+        let journal = InMemoryJournal::new();
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap());
+        store
+            .enqueue(run, &one_node_graph(), clock.now())
+            .await
+            .unwrap();
+        store
+            .record_paused(run, Some(clock.now() - Duration::seconds(1)), "due")
+            .await
+            .unwrap();
+
+        // The other worker's hold, kept alive across the tick.
+        let held = store
+            .try_lock_run(run)
+            .await
+            .unwrap()
+            .expect("uncontended at first");
+
+        let (gw, calls) = recording_gateway().await;
+        let sched = Scheduler::new(
+            store.clone(),
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone()),
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+        sched.tick().await.unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "a held run must not be driven — this is the double-spend"
+        );
+
+        // The skip CONSUMED the claim: `claim_due` already flipped the row to `waking` with a
+        // fresh `claimed_at`, so releasing alone does not make it due again. That is correct in
+        // production — the worker actually holding the lock is mid-drive and will `record_*` the
+        // outcome itself. Here nothing is behind the lock, which is the genuinely-abandoned case,
+        // and the recovery path is the stale-`waking` reclaim: the lock excludes a LIVE driver,
+        // the lease still recovers a DEAD one. They compose; neither replaces the other.
+        held.release().await.unwrap();
+        sched.tick().await.unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "still `waking` from the consumed claim — not yet stale"
+        );
+
+        // Past DEFAULT_LEASE_SECS (60), so the abandoned `waking` row is stale.
+        clock.set(clock.now() + Duration::seconds(61));
+        sched.tick().await.unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the stale-waking reclaim drives it exactly once, and only once"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_prevents_a_wake() {
         let journal = InMemoryJournal::new();
@@ -17873,7 +18124,11 @@ mod await_signal {
             "the completed gate published to the blackboard"
         );
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("gate".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("gate".into()),
+            )
             .await
             .unwrap()
             .expect("the gate's output is on the blackboard");
@@ -19105,7 +19360,11 @@ mod human_gate {
 
         // (b) THE DURABLE WRITE — the same single redacted value, not a second scrub.
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("release".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("release".into()),
+            )
             .await
             .unwrap()
             .expect("the completed gate published its decision to the blackboard");
@@ -21166,7 +21425,11 @@ mod human_agent {
         );
 
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("review".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("review".into()),
+            )
             .await
             .unwrap()
             .expect("the durable blackboard is unaffected — that is the doc's other half");
@@ -21689,7 +21952,11 @@ mod human_agent {
 
         // (b) THE DURABLE WRITE — the same single redacted value, not a second scrub.
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("review".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("review".into()),
+            )
             .await
             .unwrap()
             .expect("the completed node published its answer to the blackboard");
