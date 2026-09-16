@@ -59,6 +59,38 @@ pub struct ScheduledRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// An exclusive hold on one run's drive (SP-OPS-1.4).
+///
+/// The lease alone could not provide this. `claimed_at` is stamped once at claim and never
+/// renewed, and `tick` claims a batch — stamping every row at ONE instant — then drives them
+/// serially, so the tail of a slow batch is past its 60s lease before it is even started and a
+/// second worker reclaims and drives it CONCURRENTLY. The scheduler's own header called a
+/// double-drive harmless, which is true of a *sequential* re-drive (the first drive's effects are
+/// journaled, so the memo fences them) and false of a concurrent one: both drives load the journal
+/// before either writes, so the memo has nothing to fence with and a plain `ModelCall` is
+/// double-spent.
+///
+/// A lock makes that impossible rather than unlikely, and unlike a lease it needs no timing
+/// assumption at all: the Postgres implementation is a SESSION-scoped advisory lock, so a worker
+/// that is killed mid-drive has its lock released by Postgres when the connection dies — the
+/// self-healing property the lease was approximating.
+#[async_trait::async_trait]
+pub trait RunLock: Send + Sync {
+    /// Release the hold. Dropping without calling this MUST also release — a lock that leaks on a
+    /// panic would strand the run until the process exits.
+    async fn release(self: Box<Self>) -> Result<(), OrchestratorError>;
+}
+
+/// The lock a backend with exactly one driver hands out: nothing to exclude, nothing to release.
+pub struct UncontendedRunLock;
+
+#[async_trait::async_trait]
+impl RunLock for UncontendedRunLock {
+    async fn release(self: Box<Self>) -> Result<(), OrchestratorError> {
+        Ok(())
+    }
+}
+
 /// A durable store of the scheduler's wake set — one row per submitted run holding its ORIGINAL graph
 /// (so any process can re-drive `Executor::start(run, graph)` at the deadline) + its schedule/status.
 ///
@@ -68,6 +100,20 @@ pub struct ScheduledRun {
 /// cancelled row is never resurrected.
 #[async_trait::async_trait]
 pub trait SchedulerStore: Send + Sync {
+    /// Take the exclusive drive lock for `run` (SP-OPS-1.4). `Ok(None)` ⇒ another worker holds it
+    /// and this one must NOT drive.
+    ///
+    /// Defaulted to "always granted" so a third-party backend keeps compiling and a
+    /// single-process deployment needs no lock. Both shipped stores override it — the default is
+    /// safe only where there is exactly one driver, which a backend author must decide, not
+    /// inherit silently. Both overrides are exercised by tests.
+    async fn try_lock_run(
+        &self,
+        _run: RunId,
+    ) -> Result<Option<Box<dyn RunLock>>, OrchestratorError> {
+        Ok(Some(Box::new(UncontendedRunLock)))
+    }
+
     /// Insert a NEW run as in-flight (`waking`), storing its graph + stamping `claimed_at=now`. A
     /// duplicate `run` id is a loud error (submit is once per run).
     async fn enqueue(

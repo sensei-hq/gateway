@@ -16919,6 +16919,76 @@ mod scheduler_driver {
         );
     }
 
+    /// **SP-OPS-1.4 (analysis §2.5) — a run already being driven is NOT driven again.**
+    ///
+    /// The lease could not guarantee this. `claimed_at` is stamped once and never renewed, and
+    /// `tick` stamps a whole batch at one instant then drives it serially, so the tail of a slow
+    /// batch is past its 60s lease before it starts and a second worker reclaims it *while the
+    /// first is still running*. Both drives then fold the journal before either writes, the memo
+    /// has nothing to fence with, and the model call is paid for twice.
+    ///
+    /// Holding the lock for the whole test simulates the first worker mid-drive; `tick` is the
+    /// second worker arriving. It must claim nothing it can drive and spend nothing.
+    #[tokio::test]
+    async fn a_run_held_by_another_worker_is_not_driven() {
+        let journal = InMemoryJournal::new();
+        let store = Arc::new(InMemorySchedulerStore::new());
+        let run = RunId(uuid::Uuid::new_v4());
+        let clock = FakeClock::new(DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap());
+        store
+            .enqueue(run, &one_node_graph(), clock.now())
+            .await
+            .unwrap();
+        store
+            .record_paused(run, Some(clock.now() - Duration::seconds(1)), "due")
+            .await
+            .unwrap();
+
+        // The other worker's hold, kept alive across the tick.
+        let held = store
+            .try_lock_run(run)
+            .await
+            .unwrap()
+            .expect("uncontended at first");
+
+        let (gw, calls) = recording_gateway().await;
+        let sched = Scheduler::new(
+            store.clone(),
+            Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_clock(clock.clone()),
+            Arc::new(journal.clone()),
+            clock.clone(),
+        );
+        sched.tick().await.unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "a held run must not be driven — this is the double-spend"
+        );
+
+        // The skip CONSUMED the claim: `claim_due` already flipped the row to `waking` with a
+        // fresh `claimed_at`, so releasing alone does not make it due again. That is correct in
+        // production — the worker actually holding the lock is mid-drive and will `record_*` the
+        // outcome itself. Here nothing is behind the lock, which is the genuinely-abandoned case,
+        // and the recovery path is the stale-`waking` reclaim: the lock excludes a LIVE driver,
+        // the lease still recovers a DEAD one. They compose; neither replaces the other.
+        held.release().await.unwrap();
+        sched.tick().await.unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "still `waking` from the consumed claim — not yet stale"
+        );
+
+        // Past DEFAULT_LEASE_SECS (60), so the abandoned `waking` row is stale.
+        clock.set(clock.now() + Duration::seconds(61));
+        sched.tick().await.unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the stale-waking reclaim drives it exactly once, and only once"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_prevents_a_wake() {
         let journal = InMemoryJournal::new();
