@@ -386,6 +386,129 @@ mod tests {
         }
     }
 
+    /// The README's agent-frontmatter key list is part of THIS command's contract: it
+    /// is the only place torii tells an operator which keys an `agents/*.md` may carry,
+    /// and `push` is what reads them.
+    ///
+    /// Derived from `AgentDefinition`'s serde field names rather than a hand-kept copy,
+    /// on the precedent of the `execution-graph.md` guard in `orchestrator_core::graph`
+    /// and for the same reason: a list maintained by hand beside the thing it describes
+    /// is exactly what drifts. SP-REG-3 shipped `default_planner` — a key whose
+    /// malformed value is a hard `FrontmatterParse` error — and named it in no markdown
+    /// anywhere in the repository, so an operator could neither discover the feature nor
+    /// guess that `default_planner: yes` is refused while `true` is accepted.
+    ///
+    /// The rule runs BOTH ways, because a list can lie by commission as well as by
+    /// omission: `grants` was named here for a key `from_frontmatter` never reads (it
+    /// hardcodes an empty map; grants are authored in the registry root's
+    /// `grants.json`), so an operator authoring `grants:` in an agent md got silence.
+    ///
+    /// `NOT_A_FRONTMATTER_KEY` is FROZEN and every entry is re-checked against the
+    /// scrape, so a renamed field cannot leave a dead exemption behind. Adding a name to
+    /// it to make this test pass is the move the test exists to catch.
+    #[test]
+    fn the_readme_names_every_agent_frontmatter_key_push_reads() {
+        use orchestrator_core::{AgentBacking, AgentDefinition};
+
+        let readme = include_str!("../../README.md");
+        // Bounded to the key enumeration itself: the `agents/*.md` line plus any `#`
+        // continuation lines, stopping at the `body =` line. Deliberately NOT the whole
+        // section — the prose below names several keys again while documenting none, and
+        // reading it would let a passing mention count as documentation (the failure
+        // mode the `execution-graph.md` guard was rewritten to close).
+        let mut rest = readme.lines().skip_while(|l| !l.contains("agents/*.md"));
+        let first = rest
+            .next()
+            .expect("the README still enumerates the agent frontmatter keys");
+        let line: String = std::iter::once(first)
+            .chain(rest.take_while(|l| l.trim_start().starts_with('#') && !l.contains("body =")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let probe = AgentDefinition::from_frontmatter("---\nname: n\narea: a\nkind: k\n---\nb\n")
+            .expect("the probe agent parses");
+        let fields: Vec<String> = match serde_json::to_value(&probe).expect("serializes") {
+            serde_json::Value::Object(m) => m.keys().cloned().collect(),
+            other => panic!("AgentDefinition is no longer a JSON object: {other}"),
+        };
+        assert!(
+            fields.len() >= 11,
+            "the field scrape broke — found {fields:?}"
+        );
+
+        /// `system_prompt` is the md BODY, documented on the following line; `grants`
+        /// is not readable from an agent md at all.
+        const NOT_A_FRONTMATTER_KEY: [&str; 2] = ["system_prompt", "grants"];
+        for exempt in NOT_A_FRONTMATTER_KEY {
+            assert!(
+                fields.iter().any(|f| f == exempt),
+                "`{exempt}` is exempted from the key list but is no longer a field of \
+                 AgentDefinition — drop the exemption rather than leave a free pass"
+            );
+            assert!(
+                !line.contains(exempt),
+                "`{exempt}` is NOT parsed out of agent frontmatter, so naming it here \
+                 tells an operator to author a key the loader silently ignores: {line}"
+            );
+        }
+        for f in &fields {
+            if NOT_A_FRONTMATTER_KEY.contains(&f.as_str()) {
+                continue;
+            }
+            assert!(
+                line.contains(f.as_str()),
+                "`{f}` is parsed out of agent frontmatter but the README's key list does \
+                 not name it, so it is undiscoverable: {line}"
+            );
+        }
+
+        // `timeout` is the one authored key that is not a field of its own:
+        // `parse_backing` reads it beside `backed_by` and folds the pair into
+        // `AgentBacking::Human`, so the scrape above cannot see it.
+        assert!(
+            matches!(
+                AgentDefinition::from_frontmatter(
+                    "---\nname: n\narea: a\nkind: k\nbacked_by: human\ntimeout: 48h\n---\nb\n"
+                )
+                .expect("a human-backed agent parses")
+                .backed_by,
+                AgentBacking::Human { timeout: Some(_) }
+            ),
+            "the `timeout` probe stopped exercising the key it documents"
+        );
+        assert!(
+            line.contains("timeout"),
+            "`timeout` is authored in agent frontmatter but the README's key list does \
+             not name it: {line}"
+        );
+    }
+
+    /// The README's "Known gaps" section exists so an operator does not have to find a
+    /// limitation by experiment — which makes a gap that is no longer a gap strictly
+    /// worse than no entry at all: it is a shipped feature the shipped documentation
+    /// denies. SP-REG-3 made "nothing can yet designate a default" false while leaving
+    /// the sentence in place, so an operator with two `area: planning` agents would
+    /// read it, believe the alphabetical pick is unavoidable, and work around it by
+    /// renaming agents — the exact failure the slice removed.
+    ///
+    /// A staleness pin, stated plainly: it asserts the section does not deny the
+    /// capability the sibling test above proves is documented. It cannot generalise to
+    /// gaps whose code is not in this workspace.
+    #[test]
+    fn the_readme_known_gaps_do_not_deny_the_planner_designation() {
+        let readme = include_str!("../../README.md");
+        let gaps = readme
+            .split_once("## Known gaps")
+            .expect("the README still has a Known gaps section")
+            .1;
+        assert!(
+            !gaps.contains("nothing can yet designate a default"),
+            "`default_planner` designates one — `Registry::validate` enforces at most \
+             one marked agent and `Executor::planner_candidates` orders it first — so \
+             the gap entry denying it is false: {gaps}"
+        );
+    }
+
     /// **SP-REG-5 — all three chain-reference surfaces are checked, with attribution.**
     ///
     /// `Registry::chain_names` covers the same three surfaces but returns a deduplicated SET,
@@ -399,6 +522,7 @@ mod tests {
         phases.insert("review".to_string(), "missing-phase-chain".to_string());
         let incoming = RegistryConfig {
             agents: vec![AgentDefinition {
+                default_planner: false,
                 name: "planner".into(),
                 area: "planning".into(),
                 kind: "reasoning".into(),

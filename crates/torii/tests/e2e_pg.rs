@@ -255,6 +255,7 @@ const REVIEWER_TASK: &str = "the Acme MSA, clause 7";
 
 fn reviewer(timeout: Option<Duration>) -> orchestrator_core::AgentDefinition {
     orchestrator_core::AgentDefinition {
+        default_planner: false,
         name: "reviewer".into(),
         area: "review".into(),
         kind: "human".into(),

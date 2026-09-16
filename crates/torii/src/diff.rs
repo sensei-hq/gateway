@@ -179,6 +179,7 @@ mod tests {
 
     fn agent(name: &str) -> AgentDefinition {
         AgentDefinition {
+            default_planner: false,
             name: name.into(),
             area: "research".into(),
             kind: "reasoning".into(),
