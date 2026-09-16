@@ -186,10 +186,54 @@ async fn write_and_report(
 /// `scheduler` is read (never written) purely to count the in-flight work this push would
 /// strand — see [`plan_push`]. `LightDeps` already carries the scheduler store over the
 /// same pool, so this costs no new connection.
+/// Every chain id the incoming registry references that the gateway's catalog does not
+/// define, as `(what referenced it, the id)` pairs, sorted and deduplicated.
+///
+/// **Why this check exists at all.** An agent's chain is a STRING, and `Registry::validate`
+/// only checks that it is PRESENT — the id is resolved much later, in the gateway, against
+/// `GatewayConfig.chains`, a file `torii config push` otherwise never reads. When the two
+/// disagree the failure surfaces at run time as an empty candidate set →
+/// `GatewayError::NoCandidates` → a terminal `NodeFailed`, naming neither the cause nor the
+/// remedy. This turns that into a push-time refusal naming both sides.
+///
+/// Attribution is why this does not simply use `Registry::chain_names`, which returns a
+/// deduplicated SET and so cannot say WHICH agent referenced a missing id.
+fn unresolved_chain_refs(
+    incoming: &RegistryConfig,
+    chains: &std::collections::HashMap<String, kernel::types::config::FallbackChainConfig>,
+) -> Vec<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    for a in &incoming.agents {
+        if let Some(c) = &a.chain
+            && !chains.contains_key(c)
+        {
+            out.insert((format!("agent {:?}", a.name), c.clone()));
+        }
+        // Per-phase overrides are checked too. A name-keyed check that walks only
+        // `agent.chain` passes every obvious test while missing the two collections a
+        // real config is most likely to drift in.
+        for (phase, c) in &a.chains {
+            if !chains.contains_key(c) {
+                out.insert((format!("agent {:?} phase {:?}", a.name, phase), c.clone()));
+            }
+        }
+    }
+    for b in &incoming.chain_bindings {
+        if !chains.contains_key(&b.chain) {
+            out.insert((
+                format!("chain binding {:?}/{:?}", b.area, b.kind),
+                b.chain.clone(),
+            ));
+        }
+    }
+    out.into_iter().collect()
+}
+
 pub async fn push(
     src: &PostgresConfigSource,
     scheduler: &dyn SchedulerStore,
     dir: &Path,
+    gateway_config: Option<&Path>,
     yes: bool,
     confirm: &mut dyn FnMut(&str) -> bool,
 ) -> Result<Outcome, CliError> {
@@ -206,6 +250,37 @@ pub async fn push(
             dir.display()
         ))
     })?;
+
+    // 1b. SP-REG-5, OPTIONAL. `Registry::validate` above proves every chain id is PRESENT;
+    // it cannot prove any of them RESOLVES, because the gateway's catalog is not
+    // registry-visible. Given the catalog, refuse here rather than let the mismatch surface
+    // mid-run as an empty candidate set -> `NoCandidates` -> a terminal `NodeFailed` naming
+    // neither cause nor remedy. Optional so every existing invocation is unchanged.
+    if let Some(gw_path) = gateway_config {
+        let raw = std::fs::read_to_string(gw_path).map_err(|e| {
+            CliError::error(format!(
+                "refusing to push: cannot read {}: {e}",
+                gw_path.display()
+            ))
+        })?;
+        let gw: kernel::types::config::GatewayConfig = serde_json::from_str(&raw)
+            .map_err(|e| crate::boot::gateway_config_parse_error(gw_path, &e))?;
+        let missing = unresolved_chain_refs(&incoming, &gw.chains);
+        if !missing.is_empty() {
+            let detail = missing
+                .iter()
+                .map(|(what, chain)| format!("  {what} -> chain {chain:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(CliError::error(format!(
+                "refusing to push: {} references {} chain id(s) that {} does not define:\n{}",
+                dir.display(),
+                missing.len(),
+                gw_path.display(),
+                detail
+            )));
+        }
+    }
 
     // 2. One atomic read of the durable (content, generation) pair.
     let (current, current_v) = src.load_versioned().await?;
@@ -309,6 +384,86 @@ mod tests {
             tools: vec![],
             chain_bindings: vec![],
         }
+    }
+
+    /// **SP-REG-5 — all three chain-reference surfaces are checked, with attribution.**
+    ///
+    /// `Registry::chain_names` covers the same three surfaces but returns a deduplicated SET,
+    /// so it cannot name WHICH agent referenced a missing id. This asserts the attribution,
+    /// not just the detection — a check that reported only "chain `x` is missing" would pass a
+    /// weaker version of this test while leaving an operator to grep for the culprit.
+    #[test]
+    fn every_chain_reference_surface_is_checked_and_attributed() {
+        use orchestrator_core::{AgentDefinition, ChainBinding};
+        let mut phases = std::collections::HashMap::new();
+        phases.insert("review".to_string(), "missing-phase-chain".to_string());
+        let incoming = RegistryConfig {
+            agents: vec![AgentDefinition {
+                name: "planner".into(),
+                area: "planning".into(),
+                kind: "reasoning".into(),
+                chain: Some("missing-direct-chain".into()),
+                chains: phases,
+                grants: Default::default(),
+                tools: vec![],
+                skills: vec![],
+                system_prompt: "p".into(),
+                backed_by: Default::default(),
+            }],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![ChainBinding {
+                area: "research".into(),
+                kind: "reasoning".into(),
+                chain: "missing-binding-chain".into(),
+            }],
+        };
+        let empty = std::collections::HashMap::new();
+        let found = unresolved_chain_refs(&incoming, &empty);
+
+        let ids: Vec<&str> = found.iter().map(|(_, c)| c.as_str()).collect();
+        assert!(
+            ids.contains(&"missing-direct-chain")
+                && ids.contains(&"missing-phase-chain")
+                && ids.contains(&"missing-binding-chain"),
+            "all THREE surfaces must be checked — a name-keyed check that skips per-phase \
+             `chains` or `ChainBinding.chain` passes every other assertion while leaving the \
+             collection a real config is most likely to drift in: {found:?}"
+        );
+        let attributions = found.iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>();
+        assert!(
+            attributions.iter().any(|w| w.contains("planner"))
+                && attributions.iter().any(|w| w.contains("research")),
+            "each miss must name WHAT referenced it, or the operator gets an id and no culprit: \
+             {attributions:?}"
+        );
+    }
+
+    /// A registry whose ids all resolve is silent — the check must not refuse a good push.
+    #[test]
+    fn a_registry_whose_chains_all_resolve_reports_nothing() {
+        use orchestrator_core::ChainBinding;
+        let incoming = RegistryConfig {
+            agents: vec![],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![ChainBinding {
+                area: "research".into(),
+                kind: "reasoning".into(),
+                chain: "known".into(),
+            }],
+        };
+        let mut chains = std::collections::HashMap::new();
+        chains.insert(
+            "known".to_string(),
+            kernel::types::config::FallbackChainConfig {
+                id: "known".into(),
+                capability: kernel::types::capability::Capability::TextChat,
+                models: vec![],
+                fallback_triggers: vec![],
+            },
+        );
+        assert!(unresolved_chain_refs(&incoming, &chains).is_empty());
     }
 
     #[test]
@@ -688,7 +843,7 @@ mod tests {
             true
         };
 
-        let out = push(&src, &no_paused_runs(), &dir, false, &mut confirm)
+        let out = push(&src, &no_paused_runs(), &dir, None, false, &mut confirm)
             .await
             .expect("no hard error");
         std::fs::remove_dir_all(&dir).ok();
@@ -738,7 +893,7 @@ mod tests {
 
         let dir = empty_config_dir(); // removes everything -> requires confirmation
         let mut confirm = |_text: &str| false; // the operator declines
-        let out = push(&src, &no_paused_runs(), &dir, false, &mut confirm)
+        let out = push(&src, &no_paused_runs(), &dir, None, false, &mut confirm)
             .await
             .expect("no hard error");
         std::fs::remove_dir_all(&dir).ok();
@@ -847,7 +1002,7 @@ mod tests {
         .unwrap();
 
         let mut always_yes = |_: &str| true;
-        let out = push(&src, &no_paused_runs(), &dir, true, &mut always_yes)
+        let out = push(&src, &no_paused_runs(), &dir, None, true, &mut always_yes)
             .await
             .expect("no hard error");
         std::fs::remove_dir_all(&dir).ok();
@@ -907,7 +1062,7 @@ mod tests {
         )
         .unwrap();
         let mut always_yes = |_: &str| true;
-        let err = push(&src, &no_paused_runs(), &bad, true, &mut always_yes)
+        let err = push(&src, &no_paused_runs(), &bad, None, true, &mut always_yes)
             .await
             .expect_err("a config that does not assemble must be refused");
         std::fs::remove_dir_all(&bad).ok();
@@ -922,7 +1077,7 @@ mod tests {
         // 2. AN UNCONFIRMED REMOVAL WRITES NOTHING — neither content nor generation.
         let empty = empty_config_dir();
         let mut always_no = |_: &str| false;
-        let refused = push(&src, &no_paused_runs(), &empty, false, &mut always_no)
+        let refused = push(&src, &no_paused_runs(), &empty, None, false, &mut always_no)
             .await
             .expect("a declined push is not a hard error");
         assert_eq!(
@@ -944,9 +1099,16 @@ mod tests {
         );
 
         // 3. THE SAME REMOVAL, CONFIRMED, LANDS AND BUMPS EXACTLY ONCE.
-        let applied = push(&src, &no_paused_runs(), &empty, false, &mut always_yes)
-            .await
-            .expect("a confirmed push is not a hard error");
+        let applied = push(
+            &src,
+            &no_paused_runs(),
+            &empty,
+            None,
+            false,
+            &mut always_yes,
+        )
+        .await
+        .expect("a confirmed push is not a hard error");
         std::fs::remove_dir_all(&empty).ok();
         assert_eq!(applied.code, crate::errors::EXIT_OK, "{}", applied.text);
         assert!(
@@ -1019,7 +1181,7 @@ mod tests {
             shown = Some(text.to_string());
             false
         };
-        let out = push(&src, &store, &dir, false, &mut decline)
+        let out = push(&src, &store, &dir, None, false, &mut decline)
             .await
             .expect("no hard error");
         std::fs::remove_dir_all(&dir).ok();
