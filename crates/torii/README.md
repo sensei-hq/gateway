@@ -40,7 +40,8 @@ deployment adds `models` and named `chains`.
 `torii config push <dir>` reads exactly three subdirectories:
 
 ```
-<dir>/agents/*.md     # frontmatter: name, area, kind, chain | chains, tools, skills, grants
+<dir>/agents/*.md     # frontmatter: name, area, kind, chain | chains, tools, skills,
+                      #              backed_by, timeout, default_planner
                       # body = the agent's system_prompt
 <dir>/skills/*.md     # frontmatter: name, description, activate_on: [kw, ...]
                       # body = the skill text composed into the prompt
@@ -52,6 +53,18 @@ Flat globs — a `skills/foo/SKILL.md` one level deeper is **not** read.
 `activate_on` as a list makes a skill conditional (`OnKeywords`); absent means always. A *scalar*
 `activate_on` is a loud parse error rather than a silent "always", so a forgotten pair of brackets
 cannot quietly disable the gate.
+
+`backed_by: human` makes the agent a human role rather than a model one, with an optional
+`timeout: 48h` SLA; a `timeout` without it is a loud parse error, because a model-backed agent has
+no SLA to wait on. `default_planner: true` designates **the** `area: planning` agent that a
+`PlannerRef::Select` node picks, instead of letting the alphabetically-first name win — at most one
+agent may carry it, a second is refused at load, and it is refused outside `area: planning`, where
+it would designate nothing. Both keys are read literally: `default_planner: yes` is a loud parse
+error, never a silent "unmarked".
+
+Per-tool `grants` are **not** agent frontmatter. They live in the registry root as
+`<dir>/grants.json` (`{"<agent>": {"<tool>": <permissions>}}`), beside the optional
+`<dir>/chains.json` of `(area, kind) → chain` bindings.
 
 A shipped `tools/*.json` declares a schema the model may call. The executable side must exist too —
 `torii` wires `fs_read`, `fs_write` and `shell`. A schema with no executable counterpart is a tool
@@ -110,8 +123,9 @@ Stated because finding them by experiment is worse.
   them. `torii worker serve` refuses to boot against a registry with zero agents.
 - **No `config init`, `config pull` or `config diff`.** `version` and `push` are the whole config
   surface today.
-- **Two planner agents resolve by name order.** With more than one `area: planning` agent, the
-  selector takes the first by name; nothing can yet designate a default.
+- **With nobody marked, two planner agents resolve by name order.** Mark one `area: planning`
+  agent `default_planner: true` and it is chosen; leave every agent unmarked and the selector
+  still takes the first by name.
 - **No release artifact.** There is no published crate or container, so `torii` is built from a
   checkout.
 
