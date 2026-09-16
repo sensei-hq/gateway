@@ -277,6 +277,20 @@ Every check is a **command**, not a line reference. An earlier draft used `read 
 which is not re-runnable and drifts the moment a line is inserted above it — one of its own
 citations had already gone stale by the time it was reviewed. Re-run this table at build start.
 
+> **Re-run 2026-09-16, after SP-REG-5 shipped. 19 of 20 rows hold; one is now FALSE.**
+>
+> The false one is the gateway-config row, invalidated by **PR #65 — this spec's own §5**, about an
+> hour after the ledger was written. That is the case for re-running rather than trusting the
+> verdict column: the repo moves, and it moves fastest in exactly the area a spec is being built
+> from.
+>
+> Two checks were also imprecise without their claims being wrong — `planner_candidates` (defeated
+> by line-wrapping, the third such miss here) and `RulePlannerSelector::new` (a `grep -v tests`
+> filter that cannot see a `#[cfg(test)]` module in a file not named `tests.rs`). Both rows now
+> carry the trap.
+>
+> **Still unverified-by-re-run:** nothing. Every row was executed.
+
 | claim | check | expect | verdict |
 |---|---|---|---|
 | The five discovery tools are wired nowhere in production | `rg --no-ignore -e ListAgents -e ListSkills -e ListTools -e ListChains -e ValidatePlan crates/torii/` | 0 | CONFIRMED |
@@ -292,12 +306,12 @@ citations had already gone stale by the time it was reviewed. Re-run this table 
 | An unversioned `ConfigSource` pins generation 0 | `rg -n 'fn version' -A 4 crates/orchestrator-core/src/registry.rs; rg -n 'unwrap_or\(0\)' crates/orchestrator-core/src/registry.rs` | default `None` → 0 | CONFIRMED |
 | `run_inner` never checks the fence | `rg -n 'fn run_inner' -A 30 crates/orchestrator/src/executor/mod.rs` then eyeball for a fence check | 0 | CONFIRMED |
 | `PlannerRef::Select` reuses a journaled pick on resume | `rg -n 'PlannerRef::Select' -A 6 crates/orchestrator/src/executor/expand.rs` | "selector is NOT re-invoked" | CONFIRMED |
-| `planner_candidates` reads `self.registry` and sorts by name | `rg -n 'fn planner_candidates' -A 12 crates/orchestrator/src/executor/mod.rs` | reads + sorts | CONFIRMED |
-| `RulePlannerSelector`'s `default` slot has no supplier | `rg --no-ignore -n 'RulePlannerSelector::new' crates/` | only `new(None)` in prod | CONFIRMED |
+| `planner_candidates` reads `self.registry` and sorts by name | `rg -n 'fn planner_candidates' -A 12 crates/orchestrator/src/executor/mod.rs` — **read the output, do not grep it** | reads + sorts | CONFIRMED. **The obvious grep fails**: `self` and `.registry` sit on separate lines, so a single-line `-e 'self\.registry'` matches nothing and the row looks half-false. THIRD time line-wrapping has defeated a check here (`self.tools` miscounted twice). Any pattern touching a method chain in this codebase needs `-U`, or an eyeball |
+| `RulePlannerSelector`'s `default` slot has no supplier | `rg --no-ignore -n 'RulePlannerSelector::new' crates/` | prod = `boot.rs` `new(None)` only | CONFIRMED — but note the `Some(..)` hits in `orchestrator-core/src/planner.rs` are inside `#[cfg(test)] mod selector_tests`, which a `grep -v tests` filter does NOT exclude because the file is not named `tests.rs`. Filter on the module, not the filename |
 | `Registry::validate` rejects an agent listing an unregistered tool | `rg -n 'UnknownToolRef' crates/orchestrator-core/src/registry.rs crates/orchestrator/src/agent/prompt.rs` | both sites | CONFIRMED |
 | `Registry::validate` checks chain PRESENCE, not resolvability | `rg -n 'UnknownChainRef' -B 6 crates/orchestrator-core/src/registry.rs` | no catalog consulted | CONFIRMED |
 | An unknown chain id yields empty candidates → terminal `NodeFailed` | `rg -n 'fn resolve_candidates' -A 16 crates/gateway/src/selection.rs` | `all_candidates: vec![]` | CONFIRMED |
-| `torii config push` never reads the gateway config | `rg -n 'enum ConfigAction' -A 14 crates/torii/src/main.rs` | no gateway-config arg | CONFIRMED |
+| ~~`torii config push` never reads the gateway config~~ | `rg -n 'enum ConfigAction' -A 18 crates/torii/src/main.rs` | ~~no gateway-config arg~~ | **FALSE as of PR #65 — superseded by SP-REG-5 itself.** `Push` now carries `gateway_config: Option<PathBuf>`. The row is kept struck rather than deleted: it was the premise §5 was written on, and a reader needs to see that the premise was true when written and is now closed by the slice it justified |
 | `dispatch()` requires `DATABASE_URL` before matching the command | `rg -n 'fn dispatch' -A 4 crates/torii/src/main.rs` | `env_config()?` first | CONFIRMED |
 
 ## 7.1 Verification round 1 — `sensei-claims-verifier`, 2026-09-15
