@@ -884,7 +884,7 @@ impl Executor {
 
     /// Total attempts a node gets before a retryable gateway failure becomes terminal
     /// (default 1 = no retry). `n <= 1` disables retry. See
-    /// [`max_transient_attempts`](Self::max_transient_attempts) for why it is opt-in.
+    /// the `max_transient_attempts` field's own docs for why it is opt-in.
     ///
     /// Retries pause on an exponential backoff (2s, 4s, capped 60s) and re-attempt on
     /// the scheduler's wake, so a retry costs a journal round trip, not a held thread.
