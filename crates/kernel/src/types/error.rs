@@ -104,6 +104,22 @@ pub enum GatewayError {
         /// flattened `errors` string so callers can inspect the full
         /// [`Attempt`](crate::types::trace::Attempt) records on total failure.
         attempts_detail: Vec<crate::types::trace::Attempt>,
+        /// Whether trying again later could plausibly succeed (SP-OPS-1.3).
+        ///
+        /// `true` iff at least one candidate failed with a **non-limit fault** — a 5xx,
+        /// a network error, or an unclassified fault — which may clear on its own.
+        /// `false` when exhaustion was reached without any such fault: the other route
+        /// here is a terminal limit (401 / credits) that `Stop`ped the walk early and
+        /// left later candidates un-attempted, and no amount of waiting fixes that.
+        ///
+        /// Exists because the distinction was previously **computed and discarded**.
+        /// `exhaustion::contribution_for` already classifies every attempt as
+        /// `Timed` / `Terminal` / `HardFailure`, but `all_gated_error` consumed that and
+        /// returned only `Option<AllGated>`, so a caller holding `AllAttemptsFailed`
+        /// could recover the cause only by string-matching provider prose in `errors` —
+        /// which mis-retries a permanent auth failure and mis-fails a transient 5xx.
+        /// The orchestrator keys its bounded retry on this field.
+        retryable: bool,
     },
 
     /// Every candidate was gated (health-locked / cooling / breaker-open / over
@@ -182,15 +198,26 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
+    /// Could trying again later plausibly succeed?
+    ///
+    /// The single-candidate variants answer from their own shape. `AllAttemptsFailed` is
+    /// an AGGREGATE and cannot: it is raised both when a 5xx exhausted the chain (worth
+    /// retrying) and when a terminal limit stopped the walk (never worth retrying). It
+    /// used to answer `false` for both — safe, but it is why a transient provider fault
+    /// killed an orchestrator run permanently. It now defers to the `retryable` flag the
+    /// gateway populates from its own per-attempt classification (SP-OPS-1.3).
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            GatewayError::RateLimit { .. }
-                | GatewayError::Timeout { .. }
-                | GatewayError::ProviderError { .. }
-                | GatewayError::ModelUnavailable { .. }
-                | GatewayError::Network(_)
-        )
+        match self {
+            GatewayError::AllAttemptsFailed { retryable, .. } => *retryable,
+            other => matches!(
+                other,
+                GatewayError::RateLimit { .. }
+                    | GatewayError::Timeout { .. }
+                    | GatewayError::ProviderError { .. }
+                    | GatewayError::ModelUnavailable { .. }
+                    | GatewayError::Network(_)
+            ),
+        }
     }
 
     pub fn should_trigger_fallback(&self, triggers: &[FallbackTrigger]) -> bool {
@@ -373,6 +400,7 @@ mod tests {
             attempts: 3,
             errors: "x".into(),
             attempts_detail: Vec::new(),
+            retryable: false,
         };
         assert_eq!(err.to_string(), "all 3 attempts failed: x");
 
@@ -441,8 +469,22 @@ mod tests {
                 attempts: 3,
                 errors: String::new(),
                 attempts_detail: Vec::new(),
+                retryable: false,
             }
-            .is_retryable()
+            .is_retryable(),
+            "an aggregate with no hard fault is not retryable"
+        );
+        // SP-OPS-1.3: and the same variant IS retryable when the gateway saw a hard
+        // fault. Without this half the assertion above passes on a hardcoded `false`.
+        assert!(
+            GatewayError::AllAttemptsFailed {
+                attempts: 3,
+                errors: String::new(),
+                attempts_detail: Vec::new(),
+                retryable: true,
+            }
+            .is_retryable(),
+            "a 5xx-driven exhaustion must be retryable"
         );
     }
 
@@ -523,6 +565,7 @@ mod tests {
                 attempts: 5,
                 errors: String::new(),
                 attempts_detail: Vec::new(),
+                retryable: true,
             }
             .should_trigger_fallback(&all_triggers)
         );
