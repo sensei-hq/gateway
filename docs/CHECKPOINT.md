@@ -1,40 +1,40 @@
 # Checkpoint
 
-**`main` = `e6658d6`. SP-REG-0/3/5 + torii docs merged (#59–#66). Issue #56 CLOSED.**
+**Slice: SP-OPS-1 consolidation**, on `develop` ahead of `main`. Plan
+`docs/superpowers/plans/2026-09-16-sp-ops-1-consolidation.md`; grounding
+`docs/analysis/2026-09-16-agentic-execution-capability-survey.md`.
 
 ## Done
 
-**The capability survey — RUN.** `docs/analysis/2026-09-16-agentic-execution-capability-survey.md`.
-Six blind lenses. Every §2 finding re-verified by hand; §3 is reported-not-re-derived. The embedder
-lens compiled and ran a real external consumer, so its findings are empirical.
+**The capability survey** (`555d383`) — six blind lenses: the durable core is strong, the
+composition root is empty (12 seams wired to nothing), plus 3 live bugs.
+**SP-OPS-1.2 — `Expand.planner` is now REQUIRED in JSON** (`c3f200a`). `#[serde(default)]` resolved
+a missing field to `PlannerRef::Injected`, the *test* variant, so every hand-written `Expand` graph
+parsed fine then died mid-run with "no planner wired". `Select` is no better a default — no
+planning-area content ships. Replaced the test pinning the old behaviour (it encoded the bug).
+Durable graphs unaffected: no `skip_serializing_if`, pinned by a round-trip test.
+**1833 / 0** with live Postgres; both green-on-arrival guards mutation-verified (`#[serde(skip)]`
+→ 3 `panicked at`, 0 compile errors).
 
-**Verdict: the durable core is strong; the composition root is empty. 12 seams are built, tested
-and wired to nothing** (§2.1 enumerates them; `with_concurrency` is never called even in tests).
-`boot.rs` is the highest-leverage file in the repo.
+## Next — SP-OPS-1.1, then 1.3
 
-## Open — 3 verified BUGS, by reachability
+**1.1 run-scope the blackboard** (§2.3, the severe one: re-running the same graph aborts the second
+mid-drive, after paying). Shape chosen to avoid a journal-format bump — do NOT make
+`Scope::Run(RunId)` (`Scope` is serialized inside `JournalEvent::ContextWrite`). Instead add a
+`run: RunId` **param** to `ContextStore::{put,get,insert_ref}` + a `run_id` **column**, PK
+`(run_id, scope_kind, scope_id, ctx_key)`. Red test goes against `InMemoryContextStore` first —
+same defect (`stores.rs:55`), no DB needed. dbd is **pre-release** (no migrations dir) ⇒ edit DDL +
+`dbd reconcile`, never hand-write a migration.
 
-1. **A transient provider 500 permanently kills a run.** Executor documents retry-on-resume
-   (`mod.rs:303`); `Scheduler::record` terminalizes `failed`, `claim_due` never re-selects it.
-   Fix in `record`, not the classifier.
-2. **The blackboard is not run-scoped.** `Scope::Run => ("run", String::new())`
-   (`postgres.rs:323`); the DDL comment says "run id". **Re-running the same graph aborts the
-   second mid-drive, after paying.** Known + dodged at `e2e_pg.rs:141`.
-3. **`Expand` via JSON is dead by default** (SP-REG-0's sibling). `PlannerRef::Injected` is
-   `#[default]` + `#[serde(default)]` but is the *test* variant; `with_planner` has 0 production
-   callers. **Fix the default, not the wiring.**
+**1.3 bounded transient retry** (§2.2). Fix is in `classify_gateway_error`, NOT `Scheduler::record`
+— `RunOutcome.failed` is a bare `(NodeId, String)`, so `record` has no signal. Needs an attempt
+bound or it becomes the poison-run loop.
 
-Plus: concurrent double-drive (60s lease never renewed; 64 runs stamped at one instant, driven
-serially; 2 lenses found it independently, the header calls it safe) · no reconciler ships while 2
-Mutation tools do ⇒ crash-mid-mutation parks forever · 3 LOW open on main.
-
-## Next
-
-Consolidation slice before any new feature: bugs 1–3 are small, independent, each with an obvious
-red test; 4–5 need a design call. With an empty composition root, new features become dead seams.
+**1.4 lease / 1.5 reconciler** — design calls, not started blind.
 
 ## Verified
 
-`cargo test --workspace --locked` **1831 / 0** real exit 0 · clippy **0.1.98** `-D warnings` 0 ·
-fmt 0 · rustdoc 0 · `cargo audit` 0. Homebrew `rustc` 1.97 SHADOWS rustup's 1.98. **Ripgrep counts
-here: wrong 4/4 — read matches, never count.**
+`DATABASE_URL="postgres://Jerry@localhost:5432/postgres"` (the `orchestrator` schema is in the
+`postgres` db, not `sensei`). `cargo test --workspace --locked` **1833 / 0** real exit 0 · clippy
+**0.1.98** `-D warnings` 0 · fmt 0. Homebrew `rustc` 1.97 SHADOWS rustup's 1.98. **Ripgrep counts
+here: wrong 4/4.** sensei daemon DOWN ⇒ this file is the record.
