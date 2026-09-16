@@ -1573,10 +1573,11 @@ mod tests {
     /// detached connections, so this is genuine cross-session exclusion — the same mechanism that
     /// separates two worker processes, not an in-process flag.
     ///
-    /// Also pins that the lock is RE-TAKEABLE after release. A session advisory lock survives its
-    /// connection returning to a pool, so an implementation holding a pooled connection instead of
-    /// a detached one would leak the lock and strand the run forever; that failure shows up here
-    /// as the re-acquire returning `None`.
+    /// Also pins that the lock is RE-TAKEABLE after release.
+    ///
+    /// It does NOT prove the connection must be detached — `release` unlocks explicitly, so a
+    /// pooled connection passes this test. That property is the DROP path, and it has its own
+    /// test below; the claim was checked by mutation rather than assumed.
     #[cfg_attr(
         not(have_database_url),
         ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
@@ -1609,6 +1610,48 @@ mod tests {
         assert!(
             b.try_lock_run(run).await.unwrap().is_some(),
             "released ⇒ re-takeable; a pooled (non-detached) connection would leak it here"
+        );
+    }
+
+    /// **SP-OPS-1.4 — a lock DROPPED without `release` still frees the run.**
+    ///
+    /// The property that forces a detached connection, and the one the sibling test above does
+    /// not cover: `release` unlocks explicitly, so it passes either way. Only this path
+    /// distinguishes them. A panicking drive skips `release`, and a `PoolConnection` returned to
+    /// the pool keeps its session — and therefore its advisory lock — alive, so the run would be
+    /// stranded until the process exits AND an unrelated later query would silently inherit the
+    /// lock. Detaching makes the drop close the session, which is what frees it.
+    ///
+    /// Mutating `.detach()` away makes this test fail; without it that mutation survives — which
+    /// was measured, not assumed: the sibling test's original comment claimed to cover this and
+    /// did not.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn pg_a_dropped_run_lock_is_released_without_an_explicit_release() {
+        let Some(url) = db_url() else { return };
+        let a = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let b = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let run = RunId(uuid::Uuid::new_v4());
+
+        // Dropped, never released — the panicking-drive path.
+        drop(a.try_lock_run(run).await.unwrap().expect("locks"));
+
+        // The session close is asynchronous on the server, so give it a bounded chance rather
+        // than asserting on a single immediate probe (which would be flaky in either direction).
+        let mut freed = false;
+        for _ in 0..50 {
+            if b.try_lock_run(run).await.unwrap().is_some() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            freed,
+            "a dropped lock must free the run; a pooled (non-detached) connection strands it"
         );
     }
 
