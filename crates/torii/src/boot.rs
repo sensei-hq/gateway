@@ -185,7 +185,7 @@ fn connect_failure(database_url: &str, err: &str) -> String {
 /// would put a live credential in a worker's stderr and thus in journald/CI logs.
 /// `RouterConfig` already has a redacting `Debug` for exactly this reason; the serde error
 /// is the hole that bypasses it. Line/column/category is enough to find the problem.
-fn gateway_config_parse_error(path: &Path, e: &serde_json::Error) -> CliError {
+pub(crate) fn gateway_config_parse_error(path: &Path, e: &serde_json::Error) -> CliError {
     CliError::error(format!(
         "{} is not a valid gateway config: {:?} error at line {} column {}. \
          The offending value is deliberately not echoed — this file holds provider API keys.",
