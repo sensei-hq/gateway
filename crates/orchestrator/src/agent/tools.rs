@@ -543,6 +543,42 @@ impl Tool for FsWriteTool {
     }
 }
 
+/// SP-OPS-1.5 (analysis §2.6): the reconciler for [`FsWriteTool`].
+///
+/// Without one, a crash between an `fs_write`'s `EffectIntent` and its `EffectRecorded` leaves
+/// the mutation in doubt, `reconcile_in_doubt` falls to `Indeterminate`, and the run pauses with
+/// a NULL `next_wake` — so the timer never wakes it, `force_wake` re-reconciles to
+/// `Indeterminate` again, and the run is stuck **forever** behind a pause reason naming only a
+/// sha256 hash. The shipped binary registers two Mutation tools and, until now, zero reconcilers.
+///
+/// The verdict is always [`NotApplied`](orchestrator_core::ReconcileOutcome::NotApplied), and
+/// that is a positive claim rather
+/// than a cop-out: `fs_write` is **idempotent**. It is `std::fs::write`, which truncates and
+/// replaces — not an append and not a create-exclusive — so running it a second time with the
+/// same args yields the identical end state whether or not the first attempt landed. The
+/// two-phase machinery exists to stop a DOUBLE-APPLY, and for an idempotent overwrite there is
+/// no such thing.
+///
+/// Deliberately does NOT read the file back to look for the content. That check needs the run's
+/// workspace root, which a `ReconcileProvider` is not given; worse, it would be WRONG — a later
+/// legitimate edit would read as "not applied" and a coincidentally-equal file as "applied",
+/// turning a safe re-run into a guess. Re-running is both cheaper and more correct.
+///
+/// `shell` gets no reconciler for the opposite reason: an arbitrary command is not idempotent and
+/// nothing generic can decide whether it ran. It still parks, by design.
+pub struct FsWriteReconciler;
+
+#[async_trait::async_trait]
+impl orchestrator_core::ReconcileProvider for FsWriteReconciler {
+    async fn reconcile(
+        &self,
+        _idempotency_key: &str,
+        _args: &serde_json::Value,
+    ) -> Result<orchestrator_core::ReconcileOutcome, OrchestratorError> {
+        Ok(orchestrator_core::ReconcileOutcome::NotApplied)
+    }
+}
+
 /// SP-4 s3: a REAL filesystem read, confined to the per-run workspace jail. Observation
 /// (`ttl_secs: 0` ⇒ always re-read; a resume re-reads the persisted file, no token cost).
 pub struct FsReadTool;

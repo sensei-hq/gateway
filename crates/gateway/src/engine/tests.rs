@@ -1354,6 +1354,70 @@ async fn terminal_credits_403_stops_even_with_trigger() {
     }
 }
 
+/// **SP-OPS-1.3 — `AllAttemptsFailed.retryable` discriminates the two ways exhaustion
+/// is reached.** The gateway already classifies every attempt
+/// (`exhaustion::contribution_for` → `Timed` / `Terminal` / `HardFailure`) and used to
+/// discard that, leaving a caller to string-match provider prose in `errors`. These pin
+/// the typed answer instead.
+///
+/// Both cases raise the SAME variant with the SAME attempt count, which is exactly why
+/// the flag is needed — nothing else in the error tells them apart.
+///
+/// Terminal credits: a 403-credits `Stop`s the walk with no hard fault, so exhaustion is
+/// reached via `attempted_all == false`. Waiting cannot fix it.
+#[tokio::test]
+async fn a_terminal_credits_exhaustion_is_not_retryable() {
+    let gw = gateway_with_triggers(vec![FallbackTrigger::ProviderError]);
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "insufficient credits".into(),
+            status: Some(403),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    match gw.execute(&chat_request()).await.unwrap_err() {
+        GatewayError::AllAttemptsFailed { retryable, .. } => assert!(
+            !retryable,
+            "a terminal credits limit never clears on its own — retrying only burns money"
+        ),
+        other => panic!("expected AllAttemptsFailed, got: {other}"),
+    }
+}
+
+/// The other half: a 500 is a `HardFailure`, which may clear on its own. With fallback
+/// disabled the single candidate exhausts, so this reaches `AllAttemptsFailed` by the
+/// hard-fault route rather than the early-`Stop` one.
+#[tokio::test]
+async fn a_hard_fault_exhaustion_is_retryable() {
+    let gw = gateway_with_triggers(vec![FallbackTrigger::ProviderError]);
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "boom".into(),
+            status: Some(500),
+        },
+    )
+    .await;
+    register_noop(&gw).await;
+
+    let req = InferenceRequest {
+        allow_fallback: false,
+        ..chat_request()
+    };
+    match gw.execute(&req).await.unwrap_err() {
+        GatewayError::AllAttemptsFailed { retryable, .. } => assert!(
+            retryable,
+            "a 5xx is a non-limit fault that may clear — the orchestrator must be able to retry it"
+        ),
+        other => panic!("expected AllAttemptsFailed, got: {other}"),
+    }
+}
+
 /// An unclassified 500 keeps the configured trigger semantics: WITH a
 /// `ProviderError` trigger it falls over (the `classify()==None` branch defers
 /// to `should_trigger_fallback`).

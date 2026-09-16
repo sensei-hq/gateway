@@ -843,8 +843,18 @@ impl Executor {
         // It must be the LIVE view and not a pair of scalars: a ReAct node dispatches
         // once PER TURN inside a single drive, so a frozen `spent` would let an agent
         // burn all `max_steps` turns against the ledger as it stood before turn 0.
-        self.dispatch_model_turn(ar.run, ar.node_id, eid, ih, request, &ar.fold.meter())
-            .await
+        // SP-OPS-1.3: the retry bound rides as a SCALAR for the same reason the ledger
+        // rides as a `Meter` — `dispatch_model_turn` stays independent of the fold's shape.
+        self.dispatch_model_turn(
+            ar.run,
+            ar.node_id,
+            eid,
+            ih,
+            request,
+            &ar.fold.meter(),
+            ar.fold.attempts_for(ar.node_id),
+        )
+        .await
     }
 
     /// Finalize a completed agent node: journal `NodeCompleted` once (guarded on
@@ -1475,6 +1485,7 @@ impl Executor {
         ih: String,
         request: InferenceRequest,
         meter: &super::dispatch::Meter<'_>,
+        attempts_so_far: u32,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         match self.dispatch_metered(&request, meter).await {
             Ok(Ok(response)) => {
@@ -1516,7 +1527,37 @@ impl Executor {
             // the turn re-attempts (no `EffectRecorded` was journaled). `resume_after`
             // passes through unwrapped: `None` is the HOTL class, not a missing value.
             // Every other gateway error fails the node.
-            Err(error) => match classify_gateway_error(&error) {
+            Err(error) => match classify_gateway_error(
+                &error,
+                attempts_so_far,
+                self.max_transient_attempts,
+                self.clock.now(),
+            ) {
+                // SP-OPS-1.3: transient, with budget left. Appends BOTH the `NodeFailed`
+                // (the attempt record the bound counts) and the `RunPaused` the scheduler
+                // wakes on; a pause alone would never advance the count.
+                GatewayDisposition::Retry {
+                    resume_after,
+                    reason,
+                } => {
+                    self.append(
+                        run,
+                        JournalEvent::NodeFailed {
+                            node: node_id.clone(),
+                            error: reason.clone(),
+                        },
+                    )
+                    .await?;
+                    self.append(
+                        run,
+                        JournalEvent::RunPaused {
+                            reason: reason.clone(),
+                            resume_after: Some(resume_after),
+                        },
+                    )
+                    .await?;
+                    Ok(ToolOutcome::Paused(reason))
+                }
                 GatewayDisposition::Pause {
                     resume_after,
                     reason,

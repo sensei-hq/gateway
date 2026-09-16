@@ -218,10 +218,22 @@ impl super::Gateway {
             .await;
         }
 
+        // SP-OPS-1.3: carry the retryability the walk already classified, instead of
+        // discarding it. `HardFailure` is the non-limit class (5xx / network /
+        // unclassified) — the one that may clear on its own. Without any, exhaustion was
+        // reached the OTHER way: a terminal limit `Stop`ped the walk early (so
+        // `attempted_all` is false and `gated` is None even though nothing hard-failed),
+        // and waiting cannot fix that. Computed from `contributions` rather than sniffed
+        // from `errors`, so a provider rewording a message cannot change the verdict.
+        let retryable = contributions
+            .iter()
+            .any(|c| matches!(c, super::exhaustion::GateContribution::HardFailure));
+
         Err(gated.unwrap_or_else(|| GatewayError::AllAttemptsFailed {
             attempts: attempts.len(),
             errors,
             attempts_detail: attempts,
+            retryable,
         }))
     }
 

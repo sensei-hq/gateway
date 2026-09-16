@@ -23,6 +23,34 @@ struct Row {
 #[derive(Clone, Default)]
 pub struct InMemorySchedulerStore {
     rows: Arc<Mutex<HashMap<RunId, Row>>>,
+    /// SP-OPS-1.4: runs currently being driven. In-process, but NOT vacuous — one
+    /// `Scheduler` drives up to `CLAIM_BATCH` runs through one `Executor`, and a caller may
+    /// clone this store across tasks, so two concurrent drives of one run are reachable
+    /// here exactly as they are across processes.
+    driving: Arc<Mutex<std::collections::HashSet<RunId>>>,
+}
+
+/// The in-memory hold: removes its run from `driving` on release, and on drop, so a panicking
+/// drive cannot strand a run for the life of the process.
+struct MemRunLock {
+    run: RunId,
+    driving: Arc<Mutex<std::collections::HashSet<RunId>>>,
+}
+
+#[async_trait::async_trait]
+impl orchestrator_core::RunLock for MemRunLock {
+    async fn release(self: Box<Self>) -> Result<(), OrchestratorError> {
+        Ok(()) // `Drop` does the work, so an un-released lock behaves identically.
+    }
+}
+
+impl Drop for MemRunLock {
+    fn drop(&mut self) {
+        self.driving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.run);
+    }
 }
 
 impl InMemorySchedulerStore {
@@ -45,6 +73,25 @@ impl InMemorySchedulerStore {
 
 #[async_trait::async_trait]
 impl SchedulerStore for InMemorySchedulerStore {
+    /// SP-OPS-1.4: non-blocking in-process exclusion, matching the Postgres semantics — a
+    /// contended run is SKIPPED, never queued behind a drive that may run for minutes.
+    async fn try_lock_run(
+        &self,
+        run: RunId,
+    ) -> Result<Option<Box<dyn orchestrator_core::RunLock>>, OrchestratorError> {
+        let taken = self
+            .driving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run);
+        Ok(taken.then(|| {
+            Box::new(MemRunLock {
+                run,
+                driving: self.driving.clone(),
+            }) as Box<dyn orchestrator_core::RunLock>
+        }))
+    }
+
     async fn enqueue(
         &self,
         run: RunId,
