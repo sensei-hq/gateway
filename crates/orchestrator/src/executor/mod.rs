@@ -1354,16 +1354,42 @@ impl Executor {
     }
 
     /// The sorted planner library: registry agents whose `area == PLANNER_AREA`, as
-    /// `AgentRef`s (sorted by name for deterministic selection).
+    /// `AgentRef`s — an agent marked `default_planner` first, then the rest by name.
+    ///
+    /// **SP-REG-3.** `RulePlannerSelector::new(None)` — what `torii boot` wires — takes
+    /// `candidates.first()`, so ordering the marked agent first IS the designation: no
+    /// trait change, no new constructor argument. Doing it here rather than at boot is
+    /// deliberate. `with_planner_selector` is set-once and `pinned` never touches
+    /// `self.selector`, so reading the marker into a `RulePlannerSelector` at boot
+    /// would freeze a process-scoped snapshot OUTSIDE the config fence; reading it from
+    /// `self.registry` — the pinned registry — puts it inside, where a `config push`
+    /// reaches it. (Replay is not the argument for either: `PlannerRef::Select` journals
+    /// its pick and `expand.rs` reuses `fold.selections` without re-invoking the
+    /// selector. The argument is fleet consistency — one pushed config gives every
+    /// worker the same first selection, where a flag would have to be set identically
+    /// on every process.)
+    ///
+    /// **Binding for `RulePlannerSelector`, ADVISORY for `LlmPlannerSelector`.** The
+    /// latter preserves this order when rendering its candidate menu, but then asks a
+    /// model to choose and returns whatever name comes back — the only guard being
+    /// `expand.rs`'s `candidates.contains(&a)` membership check. Production wires the
+    /// former, which is what makes that acceptable.
+    ///
+    /// `!default_planner` leads the sort key because `false < true`, so a marked agent
+    /// sorts before an unmarked one. The name stays as the tie-break, which keeps the
+    /// order TOTAL: `Registry::validate` refuses two marked agents at load, but a
+    /// hand-built `Registry` can still hold two, and this must not degrade to
+    /// `HashMap` order if it does.
     fn planner_candidates(&self) -> Vec<AgentRef> {
-        let mut c: Vec<AgentRef> = self
+        let mut c: Vec<_> = self
             .registry
             .agents()
             .filter(|a| a.area == PLANNER_AREA)
-            .map(|a| AgentRef(a.name.clone()))
             .collect();
-        c.sort_by(|x, y| x.0.cmp(&y.0));
-        c
+        c.sort_by(|x, y| {
+            (!x.default_planner, x.name.as_str()).cmp(&(!y.default_planner, y.name.as_str()))
+        });
+        c.into_iter().map(|a| AgentRef(a.name.clone())).collect()
     }
 
     /// Enforce the expansion caps (§4.5) against the run-scoped counters, then tally

@@ -1689,6 +1689,7 @@ mod tests {
             },
         );
         let agent = AgentDefinition {
+            default_planner: false,
             name: agent_name.clone(),
             area: "research".into(),
             kind: "reasoning".into(),
