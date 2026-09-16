@@ -115,6 +115,31 @@ plus the gateway construction sites, plus the orchestrator arm. Scope is three c
 *any* non-gated failure with a small bound, accepting that permanent failures burn N attempts
 before dying. Cheaper and orchestrator-local; wrong-but-bounded rather than right.
 
+### Part 1 — DONE (`741a93e`)
+
+`AllAttemptsFailed.retryable`, computed from the contributions, wired into the **existing**
+`is_retryable()` rather than added beside it — that method excluded the aggregate because
+pre-aggregation it could not know, and it has zero production callers, so this connects a dead
+seam instead of duplicating it. Both tests mutation-verified.
+
+### Part 2 — the retry loop. One trap, recorded before it is rediscovered
+
+**A `Pause` disposition appends no `NodeFailed`.** In both dispatch arms, `Fail` appends
+`NodeFailed` and `Pause` appends only `RunPaused`. So turning a transient failure into a pause —
+the obvious implementation — means the attempt counter (folded from `NodeFailed` occurrences)
+**never increments, and the run retries forever.** That is the poison-run shape this increment
+exists to avoid, reintroduced by its own fix.
+
+Therefore the retry arm must append **both**: `NodeFailed` (the honest record of this attempt, and
+the thing that counts) *and* `RunPaused` (the deadline the scheduler wakes on). Appending
+`NodeFailed` for a `ModelCall` is already the normal path and is safe — `Fold::failed` is read as
+a verdict only by waiting kinds via `gate_precheck`, and `ready_nodes` works off the per-drive
+`DriveState`, which never consults it.
+
+Counting: `attempts_so_far` = prior `NodeFailed` rows for the node (this attempt's row is appended
+after the decision). Retry while `attempts_so_far < MAX_ATTEMPTS - 1`, so attempts 1 and 2 pause
+and attempt 3 fails terminally.
+
 ### Once the signal exists
 
 - Transient ⇒ `Pause { resume_after: Some(now + backoff) }` instead of `Fail`.
