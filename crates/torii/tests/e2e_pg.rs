@@ -1421,7 +1421,7 @@ async fn a_signalled_gate_is_answered_by_an_operator_and_completes_in_a_fresh_pr
     // test's doc comment for why that would be empty here.
     let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
     let published = ctx
-        .get(Scope::Run, ContextKey(gate.0.clone()))
+        .get(run, Scope::Run, ContextKey(gate.0.clone()))
         .await
         .unwrap()
         .expect("the completed gate published its output to the durable blackboard");
@@ -1716,7 +1716,7 @@ async fn a_human_gate_decided_in_another_process_completes_the_run() {
     // `Branch` matches on, which is why the whole object is asserted rather than the name.
     let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
     let published = ctx
-        .get(Scope::Run, ContextKey(release.0.clone()))
+        .get(run, Scope::Run, ContextKey(release.0.clone()))
         .await
         .unwrap()
         .expect("the completed gate published its decision to the durable blackboard");
@@ -2074,7 +2074,7 @@ async fn a_human_backed_agent_answered_in_another_process_completes_the_run() {
     // the run auditable after the fact.
     let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
     let published = ctx
-        .get(Scope::Run, ContextKey(review.0.clone()))
+        .get(run, Scope::Run, ContextKey(review.0.clone()))
         .await
         .unwrap()
         .expect("the completed role published its answer to the durable blackboard");
@@ -2453,7 +2453,7 @@ async fn a_loop_gate_decided_in_another_process_resumes_and_converges() {
     // boundary: process B resolved `ship` against A's journaled `stops: true`.
     let ctx = PostgresContextStore::new(connect(&url).await.unwrap());
     let published = ctx
-        .get(Scope::Run, ContextKey(lp.0.clone()))
+        .get(run, Scope::Run, ContextKey(lp.0.clone()))
         .await
         .unwrap()
         .expect("the completed Loop published its output to the durable blackboard");

@@ -1127,7 +1127,7 @@ impl Executor {
         let this = self
             .clone()
             .with_expansion_seed(fold.expansions.len(), seed_nodes);
-        this.rehydrate_context(&fold).await?;
+        this.rehydrate_context(run, &fold).await?;
         // The RUN's own graph: a human-backed `Agent` node here is at the one
         // position §5.5 permits.
         let outcome = this.drive(run, graph, &fold, false).await?;
@@ -1559,7 +1559,7 @@ impl Executor {
                 input,
                 phase,
             } => {
-                let context = self.resolve_context(node).await?;
+                let context = self.resolve_context(run, node).await?;
                 match self
                     .drive_agent(
                         run,
@@ -1678,7 +1678,7 @@ impl Executor {
         if fold.context.contains_key(&(Scope::Run, key.clone())) {
             return Ok(());
         }
-        let r = ctx.put(Scope::Run, key, output.clone()).await?;
+        let r = ctx.put(run, Scope::Run, key, output.clone()).await?;
         self.append(
             run,
             JournalEvent::ContextWrite {
@@ -1696,12 +1696,12 @@ impl Executor {
     /// Rehydrate the injected blackboard from folded `ContextWrite`s on resume —
     /// `insert_ref` only, no blob load; the CAS persists across the crash seam, so
     /// a later `load` reads the value back. No context store wired ⇒ a no-op.
-    async fn rehydrate_context(&self, fold: &Fold) -> Result<(), OrchestratorError> {
+    async fn rehydrate_context(&self, run: RunId, fold: &Fold) -> Result<(), OrchestratorError> {
         let Some(ctx) = &self.context else {
             return Ok(());
         };
         for r in fold.context.values() {
-            ctx.insert_ref(r.clone()).await?;
+            ctx.insert_ref(run, r.clone()).await?;
         }
         Ok(())
     }
@@ -1723,6 +1723,7 @@ impl Executor {
     /// No store ⇒ empty.
     async fn resolve_context(
         &self,
+        run: RunId,
         node: &orchestrator_core::Node,
     ) -> Result<Vec<(ContextKey, serde_json::Value)>, OrchestratorError> {
         let Some(ctx) = &self.context else {
@@ -1734,7 +1735,7 @@ impl Executor {
                 continue;
             }
             let key = ContextKey(dep.on.0.clone());
-            if let Some(r) = ctx.get(Scope::Run, key.clone()).await? {
+            if let Some(r) = ctx.get(run, Scope::Run, key.clone()).await? {
                 out.push((key, ctx.load(&r).await?));
             }
         }
