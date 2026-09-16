@@ -985,6 +985,7 @@ mod tests {
 
     fn registry() -> (Registry, AgentDefinition) {
         let agent = AgentDefinition {
+            default_planner: false,
             name: "r".into(),
             area: "research".into(),
             kind: "reasoning".into(),

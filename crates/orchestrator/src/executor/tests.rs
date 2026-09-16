@@ -96,6 +96,7 @@ fn intent_key(events: &[(Seq, JournalEvent)], eid: &EffectId) -> Option<String> 
 
 fn agent_def(chain: &str) -> AgentDefinition {
     AgentDefinition {
+        default_planner: false,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -338,6 +339,7 @@ async fn agent_routes_via_area_kind_binding_end_to_end() {
     use orchestrator_core::{ChainBinding, RegistryConfig};
     // Agent omits chain; the (research,reasoning) binding maps it to "c".
     let agent = AgentDefinition {
+        default_planner: false,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -392,6 +394,7 @@ async fn phase_override_wins_over_base_route_through_from_config() {
     let mut chains = std::collections::HashMap::new();
     chains.insert("plan".to_string(), "c".to_string());
     let agent = AgentDefinition {
+        default_planner: false,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -3580,6 +3583,7 @@ async fn agent_node_drives_real_reference_chain_to_local_fallover() {
     let (gateway, calls) = demo_reference_gateway().await;
     let journal = InMemoryJournal::new();
     let registry = Arc::new(Registry::default().with_agent(AgentDefinition {
+        default_planner: false,
         name: "researcher".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4162,6 +4166,7 @@ async fn map_of_agents_then_consolidate_drives_the_real_reference_chain_to_local
     let (gateway, calls) = demo_reference_gateway().await;
     let journal = InMemoryJournal::new();
     let mk_agent = |name: &str| AgentDefinition {
+        default_planner: false,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4281,6 +4286,7 @@ async fn e2e_map_observation_agents_plus_mutation_agent_through_the_real_gateway
     let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
     let mk_agent = |name: &str, tools: Vec<String>| AgentDefinition {
+        default_planner: false,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4439,6 +4445,7 @@ async fn in_doubt_mutation_in_a_map_child_pauses_the_whole_run() {
     let run = RunId(uuid::Uuid::new_v4());
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
+            default_planner: false,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -4707,6 +4714,7 @@ async fn agent_prompt_includes_its_dependency_output_from_the_blackboard() {
     let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
     let (gw, _c) = echo_system_gateway().await;
     let mk = |name: &str, sys: &str| AgentDefinition {
+        default_planner: false,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -5480,6 +5488,7 @@ async fn loop_subgraph_body_pause_pauses_the_loop() {
     let run = RunId(uuid::Uuid::new_v4());
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
+            default_planner: false,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -5945,6 +5954,7 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
     let reg = Arc::new(
         Registry::default()
             .with_agent(AgentDefinition {
+                default_planner: false,
                 name: "planner".into(),
                 area: "planning".into(),
                 kind: "reasoning".into(),
@@ -5957,6 +5967,7 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
                 backed_by: AgentBacking::Model,
             })
             .with_agent(AgentDefinition {
+                default_planner: false,
                 name: "gate".into(),
                 area: "gating".into(),
                 kind: "reasoning".into(),
@@ -7468,6 +7479,7 @@ async fn an_in_doubt_mutation_in_a_subgraph_pauses_the_run() {
     let run = RunId(uuid::Uuid::new_v4());
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
+            default_planner: false,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -7983,6 +7995,7 @@ async fn an_in_doubt_mutation_in_a_branch_arm_pauses_the_run() {
     let run = RunId(uuid::Uuid::new_v4());
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
+            default_planner: false,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -8751,6 +8764,7 @@ async fn an_in_doubt_mutation_in_an_expand_plan_pauses_the_run() {
     let run = RunId(uuid::Uuid::new_v4());
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
+            default_planner: false,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -8922,6 +8936,7 @@ async fn on_plan_expanded_fires_with_the_plan() {
 /// comes from the scripted gateway, so this helper takes no plan argument.
 fn planner_registry() -> Arc<Registry> {
     Arc::new(Registry::default().with_agent(AgentDefinition {
+        default_planner: false,
         name: "planner".into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -9288,6 +9303,7 @@ async fn planner_agent_determinism_violation_in_the_plan_sub_run_halts() {
     // The planner agent, parameterized by its `system_prompt` (the input-hash input).
     let planner_reg = |sys: &str| {
         Arc::new(Registry::default().with_agent(AgentDefinition {
+            default_planner: false,
             name: "planner".into(),
             area: "planning".into(),
             kind: "reasoning".into(),
@@ -9358,6 +9374,7 @@ async fn planner_agent_determinism_violation_in_the_plan_sub_run_halts() {
 async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
     // Registry: a `planner` agent granted validate_plan + list_agents, and a `worker` agent.
     let worker = AgentDefinition {
+        default_planner: false,
         name: "worker".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -9370,6 +9387,7 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
         backed_by: AgentBacking::Model,
     };
     let planner = AgentDefinition {
+        default_planner: false,
         name: "planner".into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -9538,7 +9556,15 @@ impl orchestrator_core::ModelDispatch for FixedDispatch {
 
 /// A registry with two `planning`-area planner agents (both emit a plan via the gateway).
 fn two_planner_registry() -> Arc<Registry> {
+    two_planner_registry_marking(None)
+}
+
+/// [`two_planner_registry`], with `marked` (if any) carrying SP-REG-3's
+/// `default_planner`. `None` reproduces the pre-slice registry exactly, which is what
+/// keeps every other caller byte-identical.
+fn two_planner_registry_marking(marked: Option<&str>) -> Arc<Registry> {
     let mk = |name: &str| AgentDefinition {
+        default_planner: marked == Some(name),
         name: name.into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -9566,6 +9592,117 @@ fn expand_select_node(id: &str, deps: Vec<Dep>) -> Node {
         },
         deps,
     }
+}
+
+// ---- SP-REG-3: designating the planner ----
+
+/// The ordering rule itself: `default_planner` leads, the rest keep name order.
+///
+/// Three planners, and the marked one is `zeta` — the name that sorts LAST — so a
+/// name-only sort cannot produce this answer by accident. The tail `[alpha, beta]`
+/// pins the tie-break: marking an agent must reorder exactly one position, not
+/// discard the sort. That total order is why two marked agents (which `validate`
+/// refuses at load, but a hand-built `Registry` can still hold) is still
+/// deterministic here rather than HashMap-order.
+#[tokio::test]
+async fn planner_candidates_orders_the_marked_agent_first() {
+    let mk = |name: &str, marked: bool| AgentDefinition {
+        default_planner: marked,
+        name: name.into(),
+        area: "planning".into(),
+        kind: "reasoning".into(),
+        chain: Some("c".into()),
+        chains: std::collections::HashMap::new(),
+        grants: std::collections::HashMap::new(),
+        tools: vec![],
+        skills: vec![],
+        system_prompt: format!("planner {name}"),
+        backed_by: AgentBacking::Model,
+    };
+    let reg = Arc::new(
+        Registry::default()
+            .with_agent(mk("alpha", false))
+            .with_agent(mk("beta", false))
+            .with_agent(mk("zeta", true)),
+    );
+    let (gateway, _c) = recording_gateway().await;
+    let exec =
+        Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1").with_registry(reg);
+    assert_eq!(
+        exec.planner_candidates(),
+        vec![
+            AgentRef("zeta".into()),
+            AgentRef("alpha".into()),
+            AgentRef("beta".into())
+        ],
+        "the marked agent leads; the rest keep name order"
+    );
+}
+
+/// SP-REG-3 done gate 1, end to end.
+///
+/// Asserted against `RulePlannerSelector` — the selector `torii boot` actually wires,
+/// and the one for which the marker is BINDING (`candidates.first()` over the order
+/// `planner_candidates` produced). A sibling test must NOT make this assertion against
+/// `LlmPlannerSelector`: that selector preserves candidate order when rendering its
+/// menu, but then asks a model to choose and returns whatever name comes back, so
+/// position there is advisory and such a test would be nondeterministic.
+///
+/// `beta` is marked and `alpha` sorts first, so the pre-slice executor picks `alpha`.
+#[tokio::test]
+async fn select_prefers_the_marked_default_planner_over_name_order() {
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    let (gateway, _c) =
+        scripted_gateway(vec![final_response(plan_json), final_response("n1 out")]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(two_planner_registry_marking(Some("beta")))
+        .with_planner_selector(Arc::new(orchestrator_core::RulePlannerSelector::new(None)));
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    let evs = journal.load(run).await.unwrap();
+    assert!(
+        evs.iter().any(|(_, ev)| matches!(
+            ev,
+            JournalEvent::PlannerSelected { node, agent } if node.0 == "e" && agent.0 == "beta"
+        )),
+        "the marked planner was selected despite sorting after `alpha`: {evs:?}"
+    );
+}
+
+/// SP-REG-3 done gate 3: zero marked ⇒ byte-identical to today.
+///
+/// The same wiring as the test above with the marker removed, so the two differ in
+/// exactly one bit. This is the non-regression half: the ordering change must not
+/// disturb a registry that marks nobody, which is every registry authored before this
+/// slice.
+#[tokio::test]
+async fn select_with_no_marked_planner_keeps_name_order() {
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    let (gateway, _c) =
+        scripted_gateway(vec![final_response(plan_json), final_response("n1 out")]).await;
+    let journal = InMemoryJournal::new();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(orchestrator_core::RulePlannerSelector::new(None)));
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    let out = exec.run(run, &graph).await.expect("run");
+    assert!(out.failed.is_none(), "{out:?}");
+    let evs = journal.load(run).await.unwrap();
+    assert!(
+        evs.iter().any(|(_, ev)| matches!(
+            ev,
+            JournalEvent::PlannerSelected { node, agent } if node.0 == "e" && agent.0 == "alpha"
+        )),
+        "nobody marked ⇒ the name sort still decides: {evs:?}"
+    );
 }
 
 #[tokio::test]
@@ -9604,6 +9741,7 @@ async fn select_with_no_candidates_fails_the_node() {
     let (gateway, _c) = recording_gateway().await;
     // registry has an agent but NOT area=="planning".
     let reg = Arc::new(Registry::default().with_agent(AgentDefinition {
+        default_planner: false,
         name: "coder".into(),
         area: "coding".into(),
         kind: "exec".into(),
@@ -19685,6 +19823,7 @@ mod human_agent {
     /// structural half of every zero-spend claim in this file.
     pub(super) fn reviewer(timeout: Option<Duration>, skills: Vec<String>) -> AgentDefinition {
         AgentDefinition {
+            default_planner: false,
             name: "reviewer".into(),
             area: "review".into(),
             kind: "human".into(),

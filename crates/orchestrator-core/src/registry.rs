@@ -57,6 +57,23 @@ pub struct AgentDefinition {
     /// existing config changes.
     #[serde(default)]
     pub backed_by: AgentBacking,
+    /// SP-REG-3: designate THE planner for [`PlannerRef::Select`](crate::graph::PlannerRef).
+    /// `Executor::planner_candidates` orders a marked agent FIRST, so
+    /// `RulePlannerSelector`'s `candidates.first()` picks it instead of whichever name
+    /// sorts lowest. Two marked agents is a loud `RegistryLoad` at load; zero marked
+    /// keeps today's name order.
+    ///
+    /// **Binding for `RulePlannerSelector` (the one production wires), ADVISORY for
+    /// `LlmPlannerSelector`** — the latter preserves candidate order when building its
+    /// menu, but then asks a model to choose and returns whatever name comes back, so
+    /// position is a nudge, not a designation.
+    ///
+    /// `#[serde(default)]` ⇒ absent means unmarked, so every `config_agents` row
+    /// written before this slice still deserializes. Without it ONE pre-slice row
+    /// fails `read_all`'s `collect::<Result<_,_>>()` and bricks the whole registry
+    /// load.
+    #[serde(default)]
+    pub default_planner: bool,
 }
 
 /// A skill: an injectable instruction module composed into a prompt by name.
@@ -492,6 +509,22 @@ impl Registry {
     /// human-backed agent can have no tool for them to apply to.
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         for agent in self.agents.values() {
+            // SP-REG-3: the marker only designates among `PLANNER_AREA` agents —
+            // `Executor::planner_candidates` filters on the area BEFORE it reads the
+            // marker — so marking an agent outside that area designates nothing and
+            // leaves selection on the name-order accident this slice removes. Same
+            // class as the human-backing rules below: a config that states something
+            // untrue about the agent, silently.
+            if agent.default_planner && agent.area != crate::planner::PLANNER_AREA {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "agent {:?} is marked default_planner but its area is {:?}, not {:?}; \
+                     only a planner-area agent is ever a candidate, so the marker \
+                     designates nothing here",
+                    agent.name,
+                    agent.area,
+                    crate::planner::PLANNER_AREA
+                )));
+            }
             for skill in &agent.skills {
                 if !self.skills.contains_key(skill) {
                     return Err(OrchestratorError::UnknownSkillRef {
@@ -618,6 +651,36 @@ impl Registry {
                 }
             }
         }
+
+        // SP-REG-3: at most one agent may be THE default planner.
+        //
+        // This is a CROSS-agent rule, which is why it sits in `validate` rather than in
+        // `from_config` beside the duplicate-name checks. Those have to be there: two
+        // agents with the same name collapse to one `HashMap` key under `with_agent`,
+        // so `validate` cannot see them. Two DIFFERENT agents both marked are two
+        // distinct keys and are plainly visible here — and putting the rule here also
+        // covers the `Registry::default().with_agent(…)` builder path, which bypasses
+        // `from_config` entirely. `from_config` ends in `validate`, so config load still
+        // refuses it exactly as it refuses a duplicate name.
+        //
+        // Silently keeping one would be the worst outcome available: the survivor is
+        // picked by the alphabetical accident this slice exists to remove, while the
+        // config asserts that two different agents are the designated planner.
+        let mut marked: Vec<&str> = self
+            .agents
+            .values()
+            .filter(|a| a.default_planner)
+            .map(|a| a.name.as_str())
+            .collect();
+        if marked.len() > 1 {
+            marked.sort_unstable(); // HashMap order varies; the message must not.
+            return Err(OrchestratorError::RegistryLoad(format!(
+                "agents {} are all marked default_planner; at most one agent may be the \
+                 default planner, or the designation is decided by name order anyway",
+                marked.join(", ")
+            )));
+        }
+
         Ok(())
     }
 }
@@ -912,6 +975,38 @@ fn parse_backing(map: &HashMap<String, FmValue>) -> Result<AgentBacking, Orchest
     }
 }
 
+/// Parse the `default_planner` marker (SP-REG-3): which `area: planning` agent
+/// `PlannerRef::Select` prefers over the name sort.
+///
+/// Absent ⇒ `false`, so every agent md written before this slice parses
+/// byte-identically and zero marked agents keeps today's alphabetical behaviour.
+/// Absent is the ONLY silent path: a present-but-unrecognised value is loud, exactly
+/// as `parse_backing` is loud about `backed_by: huamn`. Reading `default_planner: yes`
+/// as unmarked would leave a config that looks like it designates a planner while
+/// selection quietly falls back to the alphabetical accident this slice exists to
+/// remove — and nothing would ever say so, because the wrong planner still plans.
+///
+/// `FmValue` has no `Bool` variant and there is no `optional_bool` helper, so this is
+/// a new path rather than a reused one. It matches the RAW map entry for the same
+/// reason `parse_backing` does: `optional_scalar` maps BOTH `default_planner:` and
+/// `default_planner: [true]` to `None`, which would silently drop a marker the author
+/// believes they set. A list gets its own arm so the two spellings are not blurred by
+/// one catch-all.
+fn parse_default_planner(map: &HashMap<String, FmValue>) -> Result<bool, OrchestratorError> {
+    match map.get("default_planner") {
+        None => Ok(false),
+        Some(FmValue::Scalar(v)) if v == "true" => Ok(true),
+        Some(FmValue::Scalar(v)) if v == "false" => Ok(false),
+        Some(FmValue::Scalar(v)) => Err(OrchestratorError::FrontmatterParse(format!(
+            "default_planner must be `true` or `false`, got {v:?}; omit the key to \
+             leave the agent unmarked"
+        ))),
+        Some(FmValue::List(_)) => Err(OrchestratorError::FrontmatterParse(
+            "default_planner must be a scalar `true` or `false`, not a list".into(),
+        )),
+    }
+}
+
 impl AgentDefinition {
     /// Parse an agent from the md+frontmatter subset.
     ///
@@ -935,6 +1030,7 @@ impl AgentDefinition {
             skills: optional_list(&f, "skills"),
             system_prompt: body.to_string(),
             backed_by: parse_backing(&f)?,
+            default_planner: parse_default_planner(&f)?,
         })
     }
 }
@@ -1052,6 +1148,66 @@ mod tests {
                 .expect_err(&format!("backed_by: {bad:?} must be loud"));
             let m = format!("{e}");
             assert!(m.contains("backed_by"), "must name the key: {m}");
+        }
+    }
+
+    /// SP-REG-3: `default_planner` designates which `area: planning` agent
+    /// `PlannerRef::Select` prefers, instead of letting an alphabetical accident
+    /// decide. Absent ⇒ `false`, so every agent md written before this slice parses
+    /// byte-identically.
+    #[test]
+    fn agent_from_frontmatter_parses_default_planner() {
+        let md = "---\nname: n\narea: planning\nkind: k\nchain: c\ndefault_planner: true\n---\nb\n";
+        assert!(
+            AgentDefinition::from_frontmatter(md)
+                .expect("parses")
+                .default_planner,
+            "`default_planner: true` must mark the agent"
+        );
+        let md =
+            "---\nname: n\narea: planning\nkind: k\nchain: c\ndefault_planner: false\n---\nb\n";
+        assert!(
+            !AgentDefinition::from_frontmatter(md)
+                .expect("parses")
+                .default_planner,
+            "`default_planner: false` must not mark the agent"
+        );
+        assert!(
+            !AgentDefinition::from_frontmatter(AGENT_MD)
+                .expect("parses")
+                .default_planner,
+            "absent ⇒ false; a pre-slice agent md is unchanged through this loader"
+        );
+    }
+
+    /// SP-REG-3, the `backed_by` precedent applied: a value the author believes marks
+    /// the agent must NOT silently mean `false`. `default_planner: yes` collapsing to
+    /// unmarked yields a config that reads as if a planner is designated while
+    /// selection quietly falls back to alphabetical accident — the very failure this
+    /// slice exists to remove, and invisible because it produces no error and the
+    /// wrong planner still plans.
+    ///
+    /// The table carries a truthy synonym, two case variants, a numeric spelling, a
+    /// plain typo, AND the two present-but-unusable shapes. The last two are the
+    /// reason this parser matches the RAW `FmValue` entry: `optional_scalar` maps both
+    /// `default_planner:` and `default_planner: [true]` to `None`, so a parser built
+    /// on it would drop them on the floor.
+    #[test]
+    fn agent_from_frontmatter_rejects_a_malformed_default_planner() {
+        for bad in [
+            "yes", "TRUE", "True", "1", "", "maybe", "no", "0", "[true]", "[]",
+        ] {
+            let md = format!(
+                "---\nname: n\narea: planning\nkind: k\nchain: c\ndefault_planner: {bad}\n---\nb\n"
+            );
+            let e = AgentDefinition::from_frontmatter(&md)
+                .expect_err(&format!("default_planner: {bad:?} must be loud"));
+            let m = format!("{e}");
+            assert!(m.contains("default_planner"), "must name the key: {m}");
+            assert!(
+                matches!(e, OrchestratorError::FrontmatterParse(_)),
+                "must be a FrontmatterParse, not a silent false: {e:?}"
+            );
         }
     }
 
@@ -1183,6 +1339,148 @@ mod tests {
             let back: AgentBacking = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(backing, back, "round trip via {json}");
         }
+    }
+
+    /// SP-REG-3 done gate 2: two designated planners is not a designation.
+    ///
+    /// Loud at load, in the same place and with the same error shape as the duplicate
+    /// agent/skill/tool name and duplicate `(area, kind)` binding rules. Silently
+    /// keeping one would pick it by the very name-order accident this slice removes,
+    /// while the config claims two agents are THE planner.
+    ///
+    /// `validate` walks `self.agents` — a `HashMap` — so the message is asserted to be
+    /// byte-identical across repeats AND sorted. Each `from_config` builds a fresh
+    /// `HashMap` with a fresh `RandomState`, so the repeats really do vary the
+    /// iteration order; a message built from "whichever came second" would differ
+    /// between them.
+    #[test]
+    fn two_default_planners_is_a_loud_registry_load_naming_both() {
+        let mk = |name: &str| AgentDefinition {
+            name: name.into(),
+            default_planner: true,
+            ..role_agent(crate::planner::PLANNER_AREA, "reasoning", Some("c"))
+        };
+        let mut seen: Option<String> = None;
+        for _ in 0..32 {
+            let cfg = RegistryConfig {
+                agents: vec![mk("zeta"), mk("alpha"), mk("beta")],
+                skills: vec![],
+                tools: vec![],
+                chain_bindings: vec![],
+            };
+            let e = Registry::from_config(cfg).expect_err("two marked planners must be loud");
+            assert!(
+                matches!(e, OrchestratorError::RegistryLoad(_)),
+                "same shape as the duplicate-name rules: {e:?}"
+            );
+            let m = format!("{e}");
+            assert!(m.contains("default_planner"), "names the key: {m}");
+            let (a, b, z) = (
+                m.find("alpha").expect("names alpha"),
+                m.find("beta").expect("names beta"),
+                m.find("zeta").expect("names zeta"),
+            );
+            assert!(a < b && b < z, "every offender, in sorted order: {m}");
+            match &seen {
+                None => seen = Some(m),
+                Some(first) => assert_eq!(first, &m, "HashMap order varies; the message must not"),
+            }
+        }
+    }
+
+    /// The mirror of the malformed-value rule, one level up: a RIGHT value on the
+    /// WRONG agent.
+    ///
+    /// `planner_candidates` filters on `area == PLANNER_AREA` BEFORE it looks at the
+    /// marker, so `default_planner: true` on a `research` agent designates nothing and
+    /// selection falls straight back to the name-order accident — with no error, and
+    /// with a plausible planner still planning, so nothing ever says so. That is the
+    /// identical failure shape `agent_from_frontmatter_rejects_a_malformed_default_planner`
+    /// refuses, and the same class `validate` already refuses for human-backed agents
+    /// that declare tools: a config that states something untrue about the agent.
+    ///
+    /// Beyond the four done-gate items, and safe to add precisely because the field is
+    /// new: no config in existence sets it, so nothing that loads today stops loading.
+    #[test]
+    fn a_default_planner_outside_the_planning_area_is_loud() {
+        let cfg = RegistryConfig {
+            agents: vec![AgentDefinition {
+                name: "researcher".into(),
+                default_planner: true,
+                ..role_agent("research", "reasoning", Some("c"))
+            }],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
+        let e = Registry::from_config(cfg).expect_err("an inert marker must be loud");
+        assert!(
+            matches!(e, OrchestratorError::RegistryLoad(_)),
+            "same shape as the other semantic rules: {e:?}"
+        );
+        let m = format!("{e}");
+        assert!(m.contains("default_planner"), "names the key: {m}");
+        assert!(m.contains("researcher"), "names the agent: {m}");
+        assert!(
+            m.contains(crate::planner::PLANNER_AREA),
+            "names the fix — the area it must be in: {m}"
+        );
+    }
+
+    /// The companion: exactly one marked planner is the whole point, and must load.
+    #[test]
+    fn one_default_planner_loads() {
+        let cfg = RegistryConfig {
+            agents: vec![
+                AgentDefinition {
+                    name: "alpha".into(),
+                    ..role_agent(crate::planner::PLANNER_AREA, "reasoning", Some("c"))
+                },
+                AgentDefinition {
+                    name: "beta".into(),
+                    default_planner: true,
+                    ..role_agent(crate::planner::PLANNER_AREA, "reasoning", Some("c"))
+                },
+            ],
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        };
+        let reg = Registry::from_config(cfg).expect("one marked planner is valid");
+        assert!(reg.agent("beta").expect("present").default_planner);
+    }
+
+    /// SP-REG-3's serde fence, and the reason the field carries `#[serde(default)]`.
+    ///
+    /// `PostgresConfigSource::read_all` deserializes every `config_agents` row and
+    /// `collect::<Result<_,_>>()?`s them, so ONE un-deserializable row returns `Err`
+    /// for the WHOLE `RegistryConfig` — bricking torii boot and every scheduler wake
+    /// that re-resolves config. The row below is the exact key set of a live
+    /// pre-SP-REG-3 row (10 keys, no `default_planner`).
+    #[test]
+    fn a_pre_sp_reg_3_agent_row_without_default_planner_still_deserializes() {
+        let row = serde_json::json!({
+            "area": "test", "kind": "test", "name": "torii-boot-probe-agent",
+            "chain": "torii-boot-probe-chain", "tools": [], "chains": {},
+            "grants": {}, "skills": [], "backed_by": "Model", "system_prompt": "probe"
+        });
+        let a: AgentDefinition =
+            serde_json::from_value(row).expect("a pre-SP-REG-3 config_agents row still loads");
+        assert!(!a.default_planner, "absent ⇒ unmarked");
+        // And the marker is DURABLE: `torii config push` stores what it loaded, so a
+        // marker that did not survive serde would be silently dropped on the round
+        // trip exactly as a missing frontmatter key would drop it.
+        let marked = AgentDefinition {
+            default_planner: true,
+            ..serde_json::from_value::<AgentDefinition>(serde_json::to_value(&a).unwrap()).unwrap()
+        };
+        let back: AgentDefinition =
+            serde_json::from_str(&serde_json::to_string(&marked).expect("serializes"))
+                .expect("deserializes");
+        assert!(
+            back.default_planner,
+            "the marker survives a jsonb round trip"
+        );
     }
 
     /// The loader and `validate` compose: an authored human agent assembles into a
@@ -1397,6 +1695,7 @@ mod tests {
 
     fn role_agent(area: &str, kind: &str, chain: Option<&str>) -> AgentDefinition {
         AgentDefinition {
+            default_planner: false,
             name: "role".into(),
             area: area.into(),
             kind: kind.into(),
@@ -1966,6 +2265,7 @@ mod tests {
         // A config whose agent references a missing tool → from_config validate fails.
         let bad = RegistryConfig {
             agents: vec![AgentDefinition {
+                default_planner: false,
                 name: "a".into(),
                 area: "x".into(),
                 kind: "y".into(),
@@ -2152,6 +2452,7 @@ mod tests {
 
     fn human_agent(name: &str) -> AgentDefinition {
         AgentDefinition {
+            default_planner: false,
             name: name.to_string(),
             area: "review".into(),
             kind: "human".into(),

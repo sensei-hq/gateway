@@ -399,6 +399,7 @@ mod tests {
         phases.insert("review".to_string(), "missing-phase-chain".to_string());
         let incoming = RegistryConfig {
             agents: vec![AgentDefinition {
+                default_planner: false,
                 name: "planner".into(),
                 area: "planning".into(),
                 kind: "reasoning".into(),
