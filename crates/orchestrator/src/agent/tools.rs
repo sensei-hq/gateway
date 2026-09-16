@@ -1427,6 +1427,7 @@ mod planner_tool_tests {
 
     fn agent_def(name: &str) -> AgentDefinition {
         AgentDefinition {
+            default_planner: false,
             name: name.into(),
             area: "research".into(),
             kind: "reasoning".into(),

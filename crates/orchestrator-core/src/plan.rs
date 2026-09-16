@@ -266,6 +266,7 @@ mod tests {
 
     fn agent_reg() -> Registry {
         Registry::default().with_agent(AgentDefinition {
+            default_planner: false,
             name: "researcher".into(),
             area: "research".into(),
             kind: "reasoning".into(),

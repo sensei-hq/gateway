@@ -446,14 +446,19 @@ pub async fn heavy(
         //
         // `RulePlannerSelector::new(None)` and not `LlmPlannerSelector`: it is pure and
         // spends no tokens (it prefers a configured default when that default is among
-        // the candidates, else takes `candidates.first()` over the name-sorted set),
+        // the candidates, else takes `candidates.first()` over the order
+        // `Executor::planner_candidates` produced — marked first, then by name),
         // whereas the LLM selector costs a model call per expand. Choosing to spend
         // tokens on planner selection is the implementer's call, not a default.
         //
-        // KNOWN, and deliberately not fixed here: nothing can supply that `Some(default)`
-        // yet — no CLI flag, env var or registry field — so with two `area: planning`
-        // agents the winner is decided by name order. Designating a default is its own
-        // change; this one makes `Select` work at all.
+        // `None` here is now deliberate rather than a gap. SP-REG-3 supplies the
+        // designation from the REGISTRY instead: an agent authored `default_planner:
+        // true` is ordered FIRST by `Executor::planner_candidates`, so this selector's
+        // `candidates.first()` picks it without a constructor argument. Reading it there
+        // rather than here is the point — `with_planner_selector` is set-once and
+        // `pinned` never touches `self.selector`, so a marker resolved at boot would be
+        // a process-scoped snapshot OUTSIDE the config fence, and a `config push` could
+        // never move it.
         .with_planner_selector(Arc::new(RulePlannerSelector::new(None)));
 
     if let Some(root) = workspace_root {
@@ -869,6 +874,7 @@ mod tests {
         let config_source = PostgresConfigSource::new(probe_pool.clone());
         let seed = orchestrator_core::RegistryConfig {
             agents: vec![orchestrator_core::AgentDefinition {
+                default_planner: false,
                 name: "torii-selector-probe-agent".to_string(),
                 area: "test".to_string(),
                 kind: "test".to_string(),
@@ -945,6 +951,7 @@ mod tests {
         let probe_pool = connect(&url).await.expect("connect");
         let config_source = PostgresConfigSource::new(probe_pool.clone());
         let agent = orchestrator_core::AgentDefinition {
+            default_planner: false,
             name: "torii-boot-probe-agent".to_string(),
             area: "test".to_string(),
             kind: "test".to_string(),
