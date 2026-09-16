@@ -1,7 +1,7 @@
 # Checkpoint
 
-**No slice in flight. `main` = `52c8a02`. SP-REG-0 + torii docs shipped; SP-REG-1 is a programme.**
-Merged 2026-09-14/15: #59, #60, #61, #62, #63, #64. Issue #56 CLOSED.
+**No slice in flight. `main` = `15688a5`. SP-REG-0, torii docs and SP-REG-5 shipped.**
+Merged: #59–#65. Issue #56 CLOSED. SP-REG-1 is a programme; its spec is `2026-09-15-sp-reg-programme-design.md`.
 
 ## Done
 
