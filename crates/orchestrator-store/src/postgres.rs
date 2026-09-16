@@ -883,8 +883,73 @@ impl PostgresSchedulerStore {
     }
 }
 
+/// Fold a [`RunId`] into the single `bigint` a Postgres advisory lock is keyed by.
+///
+/// A UUID is 128 bits and the key is 64, so this is lossy BY CONSTRUCTION and a collision is
+/// possible. It is safe in the direction that matters: a collision makes two *different* runs
+/// mutually exclusive, which costs a drive its turn until the next tick — a liveness cost, never a
+/// double-drive. The inverse (two identical runs hashing apart) cannot happen.
+fn advisory_key(run: RunId) -> i64 {
+    let bits = run.0.as_u128();
+    ((bits >> 64) as u64 ^ (bits as u64)) as i64
+}
+
+/// A held Postgres session advisory lock.
+///
+/// Owns a **detached** connection rather than a pooled one, and that is the correctness crux: an
+/// advisory lock is scoped to its SESSION, and a `PoolConnection` returned to the pool keeps its
+/// session open — so the lock would survive, invisibly, and be handed to an unrelated query. A
+/// detached connection is closed when dropped, which ends the session and releases the lock.
+///
+/// That makes both exits safe: `release` unlocks explicitly, and a panic that skips `release`
+/// still drops the connection. It is also why a killed worker self-heals — Postgres reaps the
+/// session with the TCP connection, needing no lease and no timing assumption.
+struct PgRunLock {
+    conn: Option<sqlx::PgConnection>,
+    key: i64,
+}
+
+#[async_trait::async_trait]
+impl orchestrator_core::RunLock for PgRunLock {
+    async fn release(mut self: Box<Self>) -> Result<(), OrchestratorError> {
+        if let Some(mut conn) = self.conn.take() {
+            sqlx::query("select pg_advisory_unlock($1)")
+                .bind(self.key)
+                .execute(&mut conn)
+                .await
+                .map_err(store_err)?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl SchedulerStore for PostgresSchedulerStore {
+    /// SP-OPS-1.4: `pg_try_advisory_lock` on a detached session — non-blocking, so a contended
+    /// run is SKIPPED rather than queued behind a drive that may run for minutes.
+    async fn try_lock_run(
+        &self,
+        run: RunId,
+    ) -> Result<Option<Box<dyn orchestrator_core::RunLock>>, OrchestratorError> {
+        // Detached, not pooled: see `PgRunLock`. Acquired BEFORE the lock query so a failure to
+        // get a connection is a store error rather than a silent "someone else holds it".
+        let mut conn = self.pool.acquire().await.map_err(store_err)?.detach();
+        let key = advisory_key(run);
+        let (got,): (bool,) = sqlx::query_as("select pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(store_err)?;
+        // Not taken ⇒ drop the connection here, closing the session. Holding it would leak one
+        // connection per contended tick against a pool of 8.
+        Ok(got.then(|| {
+            Box::new(PgRunLock {
+                conn: Some(conn),
+                key,
+            }) as Box<dyn orchestrator_core::RunLock>
+        }))
+    }
+
     async fn enqueue(
         &self,
         run: RunId,
@@ -1499,6 +1564,51 @@ mod tests {
         assert!(
             store.get(run, Scope::Run, k2()).await.unwrap().is_none(),
             "a Node-scoped write does not leak to Run"
+        );
+    }
+
+    /// **SP-OPS-1.4 (analysis §2.5) — the drive lock excludes across SESSIONS.**
+    ///
+    /// The property the lease could not provide. Two stores over the same pool take two distinct
+    /// detached connections, so this is genuine cross-session exclusion — the same mechanism that
+    /// separates two worker processes, not an in-process flag.
+    ///
+    /// Also pins that the lock is RE-TAKEABLE after release. A session advisory lock survives its
+    /// connection returning to a pool, so an implementation holding a pooled connection instead of
+    /// a detached one would leak the lock and strand the run forever; that failure shows up here
+    /// as the re-acquire returning `None`.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn pg_a_run_drive_lock_excludes_another_session_and_is_retakeable() {
+        let Some(url) = db_url() else { return };
+        let a = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let b = PostgresSchedulerStore::new(connect(&url).await.unwrap());
+        let run = RunId(uuid::Uuid::new_v4());
+
+        let held = a
+            .try_lock_run(run)
+            .await
+            .unwrap()
+            .expect("uncontended run locks");
+        assert!(
+            b.try_lock_run(run).await.unwrap().is_none(),
+            "a second session must NOT get the same run's drive lock"
+        );
+
+        // A DIFFERENT run is unaffected — the lock is per-run, not a global mutex over driving.
+        let other = RunId(uuid::Uuid::new_v4());
+        assert!(
+            b.try_lock_run(other).await.unwrap().is_some(),
+            "locks are per-run"
+        );
+
+        held.release().await.unwrap();
+        assert!(
+            b.try_lock_run(run).await.unwrap().is_some(),
+            "released ⇒ re-takeable; a pooled (non-detached) connection would leak it here"
         );
     }
 
