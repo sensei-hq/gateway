@@ -4661,6 +4661,78 @@ async fn no_context_store_journals_no_context_writes() {
     );
 }
 
+/// **SP-OPS-1.3 (analysis §2.2) — the retry bound TERMINATES.** The safety-critical half.
+///
+/// A permanently-failing provider must not wake forever. `RunPaused` has no fold guard,
+/// so an unbounded retry grows the journal on every wake — the poison-run shape this
+/// increment exists to avoid, which its own fix would otherwise reintroduce.
+///
+/// Drives repeatedly, as the scheduler would. With `max_transient_attempts = 3` the first
+/// two drives pause on a backoff deadline and the third fails TERMINALLY.
+///
+/// The bound is counted from journaled `NodeFailed` rows, which is why the retry path
+/// appends one beside the `RunPaused`: a pause alone appends none, and this test would
+/// then never terminate.
+#[tokio::test]
+async fn a_permanently_failing_provider_exhausts_the_retry_bound_and_fails_terminally() {
+    let (gw, calls) = failing_after_gateway(0).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let (graph, n1, _n2) = two_node_graph("a", "b");
+    let exec =
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1").with_max_transient_attempts(3);
+
+    // Attempts 1 and 2: a retryable failure with budget left ⇒ a timed pause.
+    for attempt in 1..=2 {
+        let out = exec.start(run, &graph).await.expect("drive");
+        let paused = out
+            .paused
+            .unwrap_or_else(|| panic!("attempt {attempt} must pause, not fail"));
+        assert!(
+            paused.reason.contains(&format!("attempt {attempt} of 3")),
+            "attempt {attempt}: {}",
+            paused.reason
+        );
+        assert!(
+            out.failed.is_none(),
+            "attempt {attempt} is not terminal yet"
+        );
+    }
+
+    // Attempt 3 is the last: no budget left, so it fails terminally rather than pausing
+    // again. This is the assertion that proves the loop is bounded.
+    let out = exec.start(run, &graph).await.expect("drive");
+    assert!(
+        out.paused.is_none(),
+        "the bound must stop the wake loop: {:?}",
+        out.paused
+    );
+    let (failed_node, _) = out.failed.expect("the third attempt is terminal");
+    assert_eq!(failed_node, n1);
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        3,
+        "exactly max_transient_attempts provider calls — no more, no fewer"
+    );
+}
+
+/// The other half: retry is **OFF by default**, so the same provider fails on the first
+/// drive. Pins the byte-identical default rather than leaving it to inspection — without
+/// this, flipping the default would silently change every deployment.
+#[tokio::test]
+async fn retry_is_off_by_default_so_one_failure_is_terminal() {
+    let (gw, calls) = failing_after_gateway(0).await;
+    let (graph, n1, _n2) = two_node_graph("a", "b");
+    let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("drive");
+    assert!(out.paused.is_none(), "no retry pause by default");
+    assert_eq!(out.failed.expect("terminal by default").0, n1);
+    assert_eq!(calls.lock().unwrap().len(), 1, "exactly one provider call");
+}
+
 /// **SP-OPS-1.1 (analysis §2.3) — the same graph runs TWICE. The user-visible symptom.**
 ///
 /// The store-level tests prove the keying; this proves the thing an operator actually

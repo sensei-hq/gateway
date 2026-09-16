@@ -122,6 +122,10 @@ pub(crate) fn fold_journal(
                     .entry(node.clone())
                     .or_default()
                     .insert(error.clone());
+                // SP-OPS-1.3: count ROWS, not distinct messages. The bound on the
+                // transient-retry loop is read from here precisely because the two maps
+                // above both collapse a provider that fails identically every time.
+                *fold.attempts.entry(node.clone()).or_insert(0) += 1;
             }
             // The cascade-skip record, folded so `cascade_skip_from` appends each node's
             // `NodeSkipped` at most once ACROSS drives. It was a `_` catch-all until the
@@ -633,6 +637,15 @@ pub(crate) enum GatewayDisposition {
         resume_after: Option<chrono::DateTime<chrono::Utc>>,
         reason: String,
     },
+    /// SP-OPS-1.3: a transient fault with retry budget left. Distinct from `Pause`
+    /// because the caller must ALSO append a `NodeFailed` — that row is the attempt
+    /// record the bound is counted from, and a `Pause` appends none, so folding the two
+    /// together would make the retry loop unbounded. A separate variant rather than a
+    /// flag so a call site cannot forget by defaulting.
+    Retry {
+        resume_after: chrono::DateTime<chrono::Utc>,
+        reason: String,
+    },
     Fail(String),
 }
 
@@ -664,8 +677,25 @@ pub(crate) enum GatewayDisposition {
 ///
 /// What this does NOT do is make waiting the remedy. The pause carries no deadline
 /// precisely so nothing wakes it on a timer into the identical refusal forever.
+///
+/// # Bounded transient retry (SP-OPS-1.3)
+///
+/// A transient provider fault used to fall through to `Fail`, and `Scheduler::record`
+/// files a failed run terminal while `claim_due` never re-selects it — so a single 5xx
+/// killed a run permanently, even though the executor documents re-attempt-on-resume for
+/// exactly this case. A retryable error now pauses on a backoff deadline instead, which
+/// reuses the wake machinery rather than inventing a retry path.
+///
+/// `attempts_so_far` is the node's prior `NodeFailed` row count and BOUNDS the loop:
+/// unbounded retry is the poison-run shape, and `RunPaused` has no fold guard, so every
+/// wake grows the journal. The caller must append a `NodeFailed` on this path too — a
+/// `Pause` alone appends none, the count would never advance, and the bound would never
+/// be reached.
 pub(crate) fn classify_gateway_error(
     err: &kernel::types::error::GatewayError,
+    attempts_so_far: u32,
+    max_attempts: u32,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> GatewayDisposition {
     match err {
         kernel::types::error::GatewayError::AllGated {
@@ -701,8 +731,32 @@ pub(crate) fn classify_gateway_error(
             resume_after: None,
             reason: err.to_string(),
         },
+        // A fault that may clear on its own, and budget left to wait for it. Keyed on
+        // the gateway's own typed verdict (`is_retryable`, fed by the contributions it
+        // classified) rather than on message text, so a provider rewording an error
+        // cannot turn a permanent failure into an infinite retry.
+        other if other.is_retryable() && attempts_so_far + 1 < max_attempts => {
+            GatewayDisposition::Retry {
+                resume_after: now + retry_backoff(attempts_so_far),
+                reason: format!(
+                    "transient failure, retrying (attempt {} of {max_attempts}): {other}",
+                    attempts_so_far + 1
+                ),
+            }
+        }
         other => GatewayDisposition::Fail(other.to_string()),
     }
+}
+
+/// Exponential backoff for retry `n` (0-based): 2s, 4s, 8s … capped at 60s.
+///
+/// Deterministic on purpose — no jitter. The deadline is journaled into `RunPaused` and
+/// read back by the scheduler, so it is computed once and never recomputed; jitter would
+/// buy thundering-herd protection the `claim_due` batch already bounds, at the cost of a
+/// value a reader cannot reproduce from the journal.
+pub(crate) fn retry_backoff(attempts_so_far: u32) -> chrono::Duration {
+    let secs = 2i64.saturating_pow(attempts_so_far.min(16) + 1);
+    chrono::Duration::seconds(secs.min(60))
 }
 
 // `est_prompt_tokens` lived here: it computed the `est` figure the deleted
@@ -1192,6 +1246,37 @@ mod tests {
             "the ORIGINAL verdict survives a later one"
         );
         assert_eq!(fold.failure_for(&NodeId("other".into())), None);
+
+        // SP-OPS-1.3: the same rows also yield an ATTEMPT COUNT, which is what bounds
+        // the transient-retry loop. Distinct from both siblings: `failed` is first-wins
+        // (one verdict) and `failure_messages` is a SET of distinct messages, so a
+        // provider returning the identical 500 forever collapses to 1 there and would
+        // never reach the bound. This counts ROWS.
+        assert_eq!(fold.attempts_for(&NodeId("gate".into())), 2);
+        assert_eq!(fold.attempts_for(&NodeId("other".into())), 0);
+    }
+
+    /// **SP-OPS-1.3 — the counter must count repeats of the SAME message.** The bound
+    /// exists for exactly the case a provider fails identically every time; counting
+    /// distinct messages (as `failure_messages` does, correctly, for its own question)
+    /// would leave that case unbounded.
+    #[test]
+    fn the_attempt_counter_counts_identical_failures() {
+        let fail = |seq: Seq| {
+            (
+                seq,
+                JournalEvent::NodeFailed {
+                    node: NodeId("n1".into()),
+                    error: "provider error (status 500)".into(),
+                },
+            )
+        };
+        let (fold, _, _) = fold_journal(&[fail(0), fail(1), fail(2)]);
+        assert_eq!(
+            fold.attempts_for(&NodeId("n1".into())),
+            3,
+            "three identical failures are three attempts, not one"
+        );
     }
 
     fn at(unix_secs: i64) -> chrono::DateTime<chrono::Utc> {
@@ -1647,11 +1732,16 @@ mod tests {
         use kernel::types::error::{GatewayError, HumanAction};
         let t = chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap();
         // Timed AllGated → Pause (reason names the instant).
-        match classify_gateway_error(&GatewayError::AllGated {
-            resume_after: Some(t),
-            skipped: vec![],
-            human_action: None,
-        }) {
+        match classify_gateway_error(
+            &GatewayError::AllGated {
+                resume_after: Some(t),
+                skipped: vec![],
+                human_action: None,
+            },
+            0,
+            1,
+            chrono::Utc::now(),
+        ) {
             GatewayDisposition::Pause {
                 resume_after,
                 reason,
@@ -1666,15 +1756,20 @@ mod tests {
         // is the M1 reversal (see the function's doc): it used to fail, and a failed run
         // is unreachable by every supported command — `force_wake` matches only
         // `status = 'paused'`.
-        match classify_gateway_error(&GatewayError::AllGated {
-            resume_after: None,
-            skipped: vec![
-                "r:m — estimated 20000 input tokens exceeds the model's 8192-token \
+        match classify_gateway_error(
+            &GatewayError::AllGated {
+                resume_after: None,
+                skipped: vec![
+                    "r:m — estimated 20000 input tokens exceeds the model's 8192-token \
                  context window"
-                    .to_string(),
-            ],
-            human_action: Some(HumanAction::UseLargerContextWindow),
-        }) {
+                        .to_string(),
+                ],
+                human_action: Some(HumanAction::UseLargerContextWindow),
+            },
+            0,
+            1,
+            chrono::Utc::now(),
+        ) {
             GatewayDisposition::Pause {
                 resume_after,
                 reason,
@@ -1704,7 +1799,7 @@ mod tests {
         };
         let blind_msg = blind.to_string();
         assert!(
-            matches!(classify_gateway_error(&blind), GatewayDisposition::Fail(m) if m == blind_msg),
+            matches!(classify_gateway_error(&blind, 0, 1, chrono::Utc::now()), GatewayDisposition::Fail(m) if m == blind_msg),
             "an AllGated naming no remedy at all must fail"
         );
         // A PAUSE carries the per-candidate diagnostics and the remedy too, and this is
@@ -1716,16 +1811,21 @@ mod tests {
         // the last step. The FAIL arm below has always used `err.to_string()`; the pause
         // arm did not, which meant the recoverable case told the operator strictly less
         // than the terminal one.
-        match classify_gateway_error(&GatewayError::AllGated {
-            resume_after: Some(t),
-            skipped: vec![
-                "noop:small — circuit breaker open".to_string(),
-                "noop:big — estimated 200000 input tokens exceeds the model's \
+        match classify_gateway_error(
+            &GatewayError::AllGated {
+                resume_after: Some(t),
+                skipped: vec![
+                    "noop:small — circuit breaker open".to_string(),
+                    "noop:big — estimated 200000 input tokens exceeds the model's \
                  128000-token context window"
-                    .to_string(),
-            ],
-            human_action: Some(HumanAction::UseLargerContextWindow),
-        }) {
+                        .to_string(),
+                ],
+                human_action: Some(HumanAction::UseLargerContextWindow),
+            },
+            0,
+            1,
+            chrono::Utc::now(),
+        ) {
             GatewayDisposition::Pause { reason, .. } => {
                 assert!(
                     reason.contains("128000-token context window"),
@@ -1748,7 +1848,7 @@ mod tests {
             human_action: Some(HumanAction::TopUpCredits),
         };
         let credits_msg = credits.to_string();
-        match classify_gateway_error(&credits) {
+        match classify_gateway_error(&credits, 0, 1, chrono::Utc::now()) {
             GatewayDisposition::Pause {
                 resume_after,
                 reason,
@@ -1767,7 +1867,7 @@ mod tests {
             remaining: 0.0,
         };
         assert!(matches!(
-            classify_gateway_error(&budget),
+            classify_gateway_error(&budget, 0, 1, chrono::Utc::now()),
             GatewayDisposition::Fail(_)
         ));
     }

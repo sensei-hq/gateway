@@ -41,6 +41,21 @@ pub struct Executor {
     registry: Arc<Registry>,
     tools: Arc<ToolRegistry>,
     max_steps: usize,
+    /// SP-OPS-1.3: total attempts a node gets before a retryable gateway failure becomes
+    /// terminal. **Default 1 — retry OFF, behaviour byte-identical.**
+    ///
+    /// Opt-in because the blast radius is wider than "retry a transient 500". The
+    /// gateway marks an exhaustion retryable when ANY candidate hit a non-limit fault,
+    /// and an unclassified provider error is a non-limit fault — while the genuinely
+    /// terminal cases (auth, credits) exhaust as `AllGated` and pause for a human rather
+    /// than reaching this path at all. So enabling it retries essentially every provider
+    /// failure, which costs latency and possibly spend against a permanently broken
+    /// setup. That is the right default for many deployments and the wrong one to impose.
+    ///
+    /// With the default, a transient failure still terminates the run — the condition
+    /// analysis §2.2 describes. The mechanism is here and tested; the default is a
+    /// deployment decision.
+    max_transient_attempts: u32,
     /// Max nesting depth (Subgraph levels; SP-3 self-DoS backstop). Default 8.
     max_depth: usize,
     concurrency: usize,
@@ -327,6 +342,15 @@ struct Fold {
     /// whether a row is written. That is why it is not a loosening of [`Fold::failed`]'s
     /// fence, which is about which kinds may treat a recorded failure as FINAL.
     failure_messages: HashMap<NodeId, std::collections::HashSet<String>>,
+    /// SP-OPS-1.3: how many `NodeFailed` ROWS a node has journaled — the attempt count
+    /// that bounds the transient-retry loop.
+    ///
+    /// A third failure map, and the third question. [`Fold::failed`] is first-wins (ONE
+    /// verdict); [`Fold::failure_messages`] is a SET of distinct messages ("is this exact
+    /// row already written"). Neither can bound a retry: a provider returning the
+    /// identical 500 forever collapses to one entry in both, so a bound read from either
+    /// would never be reached and the run would wake forever.
+    attempts: HashMap<NodeId, u32>,
     /// SP-DATA-5 spend ledger, keyed by effect id — NOT a running total over events.
     /// The two-phase Mutation path can append a second `EffectRecorded` for one id (an
     /// in-doubt `Confirmed` reconcile); keying absorbs that, a sum would double-count
@@ -528,6 +552,12 @@ impl Fold {
         self.failure_messages
             .get(node)
             .is_some_and(|seen| seen.contains(message))
+    }
+
+    /// SP-OPS-1.3: prior failed attempts for `node`. See [`Fold::attempts`] for why
+    /// neither sibling map can answer this.
+    fn attempts_for(&self, node: &NodeId) -> u32 {
+        self.attempts.get(node).copied().unwrap_or(0)
     }
 
     /// SP-6 s2: the decision folded for this `HumanGate`, if a human has answered.
@@ -741,6 +771,7 @@ impl Executor {
             registry: Arc::new(Registry::default()),
             tools: Arc::new(ToolRegistry::default()),
             max_steps: 8,
+            max_transient_attempts: 1,
             max_depth: 8,
             concurrency: 8,
             content: None,
@@ -848,6 +879,17 @@ impl Executor {
     /// Override the ReAct loop's max turns (default 8).
     pub fn with_max_steps(mut self, n: usize) -> Self {
         self.max_steps = n;
+        self
+    }
+
+    /// Total attempts a node gets before a retryable gateway failure becomes terminal
+    /// (default 1 = no retry). `n <= 1` disables retry. See
+    /// [`max_transient_attempts`](Self::max_transient_attempts) for why it is opt-in.
+    ///
+    /// Retries pause on an exponential backoff (2s, 4s, capped 60s) and re-attempt on
+    /// the scheduler's wake, so a retry costs a journal round trip, not a held thread.
+    pub fn with_max_transient_attempts(mut self, n: u32) -> Self {
+        self.max_transient_attempts = n;
         self
     }
 
@@ -1515,7 +1557,40 @@ impl Executor {
                             output: None,
                         }),
                     },
-                    Err(error) => match classify_gateway_error(&error) {
+                    Err(error) => match classify_gateway_error(
+                        &error,
+                        fold.attempts_for(&node.id),
+                        self.max_transient_attempts,
+                        self.clock.now(),
+                    ) {
+                        // SP-OPS-1.3: a transient fault with budget left. Appends BOTH
+                        // the `NodeFailed` (this attempt's record, and what the bound is
+                        // counted from — a pause alone would leave the loop unbounded)
+                        // and the `RunPaused` the scheduler wakes on. The node re-attempts
+                        // on that wake: it journaled no `EffectRecorded`, so it carries no
+                        // memo.
+                        GatewayDisposition::Retry {
+                            resume_after,
+                            reason,
+                        } => {
+                            self.append(
+                                run,
+                                JournalEvent::NodeFailed {
+                                    node: node.id.clone(),
+                                    error: reason.clone(),
+                                },
+                            )
+                            .await?;
+                            self.append(
+                                run,
+                                JournalEvent::RunPaused {
+                                    reason: reason.clone(),
+                                    resume_after: Some(resume_after),
+                                },
+                            )
+                            .await?;
+                            Ok(NodeExec::Paused { reason })
+                        }
                         // A fully-gated chain that something can still clear (§11.2):
                         // durable pause (resumable), never a bare fail. On resume
                         // the node re-attempts (no `EffectRecorded` was journaled).
