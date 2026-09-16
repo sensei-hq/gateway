@@ -138,12 +138,17 @@ fn two_node_graph(marker: &str) -> Graph {
 /// assertion can say "`n1` was replayed, `n2` was driven" rather than merely "one call
 /// happened".
 ///
-/// The ids must be run-unique for a second, durable reason: this test wires a
-/// `PostgresContextStore` (as `boot::heavy` does in production), and `context_refs`' primary
-/// key is `(scope_kind, scope_id, ctx_key)` — a `Scope::Run` write carries an EMPTY scope
-/// id, so two runs publishing the same node id collide LOUDLY
-/// (`ContextKeyCollision`). Sharing the bare `n1` of the tests above would make this suite
-/// fail on its second run against a persistent database.
+/// The markers are now an attribution device ONLY. They used to be load-bearing for a
+/// second, durable reason, and that reason was a bug: `context_refs`' primary key was
+/// `(scope_kind, scope_id, ctx_key)` and a `Scope::Run` write carried an EMPTY scope id,
+/// so two runs publishing the same node id collided LOUDLY and this suite failed on its
+/// second run against a persistent database. SP-OPS-1.1 added `run_id` to the key
+/// (analysis §2.3), so bare ids would no longer collide.
+///
+/// They are kept because the attribution reason above still stands on its own — and
+/// because a test that stops needing a workaround is not the place to prove the
+/// workaround is gone. That is asserted directly, with deliberately bare keys, by
+/// `pg_two_runs_publish_the_same_key_independently_but_one_run_still_collides`.
 fn signal_graph(marker: &str, timeout: Option<Duration>) -> Graph {
     let (n1, gate, n2) = signal_graph_ids(marker);
     let model = |id: &NodeId, deps: Vec<orchestrator_core::Dep>| Node {
