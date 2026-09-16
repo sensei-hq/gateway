@@ -307,6 +307,11 @@ enum ConfigAction {
     /// Replace the durable config from a directory and advance the generation
     Push {
         dir: PathBuf,
+        /// Cross-check every chain id the registry references against this gateway
+        /// config, and refuse the push if any does not resolve. Optional: without it
+        /// a mismatch is only discovered mid-run, as a terminal node failure.
+        #[arg(long)]
+        gateway_config: Option<PathBuf>,
         /// Apply without confirmation even when entities are removed
         #[arg(long)]
         yes: bool,
@@ -633,7 +638,11 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 ConfigAction::Version { json } => {
                     cmd::config::version(&d.config_source, json).await
                 }
-                ConfigAction::Push { dir, yes } => {
+                ConfigAction::Push {
+                    dir,
+                    gateway_config,
+                    yes,
+                } => {
                     let mut confirm = |text: &str| {
                         cmd::config::interactive_confirm(
                             text,
@@ -648,6 +657,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                         &d.config_source,
                         d.scheduler_store.as_ref(),
                         &dir,
+                        gateway_config.as_deref(),
                         yes,
                         &mut confirm,
                     )
