@@ -1698,6 +1698,47 @@ async fn in_doubt_not_applied_runs_the_effect_once_under_the_standing_intent() {
     );
 }
 
+/// **SP-OPS-1.5 (analysis §2.6) — the SHIPPED `fs_write` reconciler un-parks an in-doubt
+/// mutation.**
+///
+/// Paired deliberately with `in_doubt_indeterminate_pauses_without_applying` directly below,
+/// which is what `fs_write` did until now: the binary registered two Mutation tools and zero
+/// reconcilers, so a crash between intent and record fell to `Indeterminate` and paused with a
+/// NULL `next_wake` — no timer wakes it and `force_wake` only re-reconciles to `Indeterminate`
+/// again. Stuck forever, behind a reason naming only a hash.
+///
+/// Driven through the shared in-doubt harness rather than a real filesystem: the claim under test
+/// is that `FsWriteReconciler`'s verdict makes the executor RE-RUN instead of parking, which is a
+/// property of the verdict, not of any file. The idempotence that justifies the verdict is
+/// argued at the type and is a property of `std::fs::write` truncating.
+#[tokio::test]
+async fn the_shipped_fs_write_reconciler_reruns_an_in_doubt_mutation_instead_of_parking() {
+    use crate::agent::tools::FsWriteReconciler;
+    let (journal, run) = seed_in_doubt_note().await;
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reconcilers =
+        ReconcileRegistry::default().with_provider("record_note", Arc::new(FsWriteReconciler));
+    let (out, events) = resume_in_doubt(journal, run, sink.clone(), reconcilers).await;
+
+    assert!(
+        out.paused.is_none(),
+        "the whole point: it must NOT park. {:?}",
+        out.paused
+    );
+    assert!(out.failed.is_none(), "{:?}", out.failed);
+    assert_eq!(
+        &*sink.lock().unwrap(),
+        &["hello".to_string()],
+        "the effect re-runs exactly once — safe precisely because fs_write is idempotent"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, JournalEvent::RunCompleted)),
+        "the run completes rather than waiting for a human"
+    );
+}
+
 /// Acceptance §8.6 — in-doubt Mutation, `Indeterminate` (an `AlwaysIndeterminate`
 /// provider that cannot decide): the executor pauses loud — journals `RunPaused`,
 /// sets `outcome.paused`, applies NOTHING, and does not complete.

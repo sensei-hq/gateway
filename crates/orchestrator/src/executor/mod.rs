@@ -926,6 +926,17 @@ impl Executor {
         self.selector.is_some()
     }
 
+    /// SP-OPS-1.5: is a reconciler registered for `tool`? The same test seam as
+    /// [`has_planner_selector`](Self::has_planner_selector), for the same reason and the same
+    /// class of bug — a missing reconciler is otherwise observable only by CRASHING a run
+    /// between a Mutation's intent and its record, which no CI test can stage against the real
+    /// binary. That unobservability is how the shipped executable came to register two Mutation
+    /// tools and zero reconcilers, parking any interrupted `fs_write` forever.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_reconciler_for(&self, tool: &str) -> bool {
+        self.reconcilers.get(tool).is_some()
+    }
+
     /// Set the max runtime expansions (`PlanDelta`s) per run (self-DoS cap; default 32).
     pub fn with_max_expansions(mut self, n: usize) -> Self {
         self.max_expansions = n;
