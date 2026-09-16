@@ -551,7 +551,8 @@ impl Tool for FsWriteTool {
 /// `Indeterminate` again, and the run is stuck **forever** behind a pause reason naming only a
 /// sha256 hash. The shipped binary registers two Mutation tools and, until now, zero reconcilers.
 ///
-/// The verdict is always [`ReconcileOutcome::NotApplied`], and that is a positive claim rather
+/// The verdict is always [`NotApplied`](orchestrator_core::ReconcileOutcome::NotApplied), and
+/// that is a positive claim rather
 /// than a cop-out: `fs_write` is **idempotent**. It is `std::fs::write`, which truncates and
 /// replaces — not an append and not a create-exclusive — so running it a second time with the
 /// same args yields the identical end state whether or not the first attempt landed. The

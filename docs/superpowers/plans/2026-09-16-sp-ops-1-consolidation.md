@@ -157,14 +157,38 @@ and attempt 3 fails terminally.
   ×2, capped at 60s; bound is **per-node** (the fold already keys per node, and one flaky node
   should not consume a sibling's budget).
 
-## SP-OPS-1.4 / 1.5 — the two design calls
+## SP-OPS-1.4 — per-run drive lock — DONE (`4d4d02b`, `a70d55c`)
 
-**1.4 lease (§2.5):** renew mid-drive · shrink `CLAIM_BATCH` to what fits one lease · per-run
-advisory lock on the journal. Not started until chosen.
+Chosen: the advisory lock. `SchedulerStore::try_lock_run`, non-blocking, taken on both driving
+paths (`tick` and `submit`). Postgres uses a SESSION-scoped `pg_try_advisory_lock` on a
+**detached** connection — the crux, since an advisory lock outlives a `PoolConnection`'s return
+to the pool, so a pooled one would leak the lock onto an unrelated query.
 
-**1.5 reconciler (§2.6):** ship a reconciler for `fs_write` (feasible — the file is evidence) ·
-refuse to register a Mutation tool with no reconciler · document and leave. Not started until
-chosen.
+The lock and the lease **compose**: the lock excludes a LIVE driver, the lease still recovers a
+DEAD one. A skip consumes the claim, so an abandoned `waking` row recovers via the stale-lease
+path — pinned by the scheduler test.
+
+Correction worth keeping: the cross-session test's first comment claimed it would catch a pooled
+connection. **It does not** — `release` unlocks explicitly, so the pooled variant passes it. Found
+by applying the mutation and watching it survive. The drop-path test (`a70d55c`) is what actually
+pins `.detach()`, and it does catch it.
+
+## SP-OPS-1.5 — `fs_write` reconciler — DONE (`1383def`)
+
+Chosen: ship one. The verdict is always `NotApplied`, which is a positive claim: `fs_write` is
+`std::fs::write` — truncate-and-replace — so a re-run reaches the identical end state whether or
+not the first attempt landed, and the two-phase machinery exists to prevent a double-APPLY that
+an idempotent overwrite cannot have.
+
+Deliberately does **not** read the file back: that needs the run's workspace root (which a
+`ReconcileProvider` is not given) and would be wrong anyway — a later legitimate edit reads as
+"not applied", a coincidentally-equal file as "applied". `shell` gets none, by design: an
+arbitrary command is not idempotent and nothing generic can decide whether it ran, so it still
+parks for a human. **That is a real remaining gap.**
+
+Added `Executor::has_reconciler_for`, the twin of `has_planner_selector` — a missing reconciler is
+otherwise observable only by crashing a real run mid-mutation, which is exactly how the binary
+came to ship without one.
 
 ---
 
