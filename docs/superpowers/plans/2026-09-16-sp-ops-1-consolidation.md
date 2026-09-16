@@ -86,15 +86,51 @@ The executor already re-attempts a failed `ModelCall`/`Agent` on the next drive
 (`executor/mod.rs:303-310`); nothing reaches it because the scheduler terminalizes. Reuse the
 existing pause machinery rather than inventing a retry path.
 
-- Classify transient `GatewayError`s (timeout, 5xx, network) as
-  `Pause { resume_after: Some(now + backoff) }` instead of `Fail`.
+### Third correction: the transient signal does not survive the gateway boundary
+
+Grounding for this increment found the planned shape ("classify transient `GatewayError`s in
+`classify_gateway_error`") **unbuildable as written**, for a reason worth recording.
+
+The gateway *does* classify. `exhaustion.rs` computes a `GateContribution` per candidate —
+`Timed(Instant)` / `Terminal(HumanAction)` / **`HardFailure`**, the last documented as
+"non-limit fault (500 / network / unclassified)", i.e. exactly the retryable class. But
+`all_gated_error` returns `None` as soon as any `HardFailure` is present
+(`exhaustion.rs:52-57`), and the caller then raises `AllAttemptsFailed { attempts, errors,
+attempts_detail }` — where `errors` is a flattened **string** and `attempts_detail`'s
+`AttemptStatus` is only `Success | Failed`, with the cause in a free-text `error: Option<String>`.
+
+**So the distinction is computed and then thrown away**, and by the time the orchestrator sees the
+error the only way to recover it is to string-match provider prose. That is how a permanent auth
+failure gets retried forever, or a transient one gets failed — a wrong retry decision that spends
+money either way. This is the same "built, then not connected" shape as §2.1; the classification
+is not missing, it is discarded one layer above the consumer.
+
+**Replacement approach:** preserve it. Give `AllAttemptsFailed` a typed retryability signal
+(`retryable: bool`, or a `FailureKind`) populated from the `GateContribution`s the gateway has
+already computed, then `classify_gateway_error` reads a type instead of a message. Cost: a public
+field on a `kernel` error variant (breaking for embedders — pre-1.0, but it is an API change),
+plus the gateway construction sites, plus the orchestrator arm. Scope is three crates, not one.
+
+**This is a decision, not a detail** — an alternative is to leave the gateway alone and retry on
+*any* non-gated failure with a small bound, accepting that permanent failures burn N attempts
+before dying. Cheaper and orchestrator-local; wrong-but-bounded rather than right.
+
+### Once the signal exists
+
+- Transient ⇒ `Pause { resume_after: Some(now + backoff) }` instead of `Fail`.
 - **A bound is mandatory** — unbounded retry is the poison-run shape the survey also found, and
-  `RunPaused` has no fold guard, so each wake grows the journal. Needs an attempt count; the
-  cheapest durable source is folding `NodeFailed` occurrences for the node, avoiding a schema
-  change.
-- **Red:** a run whose provider returns 500 once completes on the next drive; a run whose provider
-  returns 500 forever stops after N attempts and is recorded terminal.
-- **Open:** N, the backoff curve, and whether the bound is per-node or per-run.
+  `RunPaused` has no fold guard, so each wake grows the journal.
+- Attempt count: fold `NodeFailed` occurrences per node. Verified available — the `ModelCall`
+  `Fail` arm appends `NodeFailed` **unconditionally** every drive (`mod.rs:1541`), and the
+  `failure_messages` dedup set is read only by `fail_loop`, so repeated identical failures each
+  leave a row. No schema or journal-format change needed.
+- Two dispatch sites, not one: `executor/mod.rs:1518` (ModelCall) and `executor/agent.rs:1519`
+  (Agent).
+- **Red:** a provider failing transiently once ⇒ the run completes on the next drive; failing
+  forever ⇒ terminal after N attempts, not an infinite wake loop.
+- **Defaults (my call unless overridden):** N = 3 total attempts; exponential backoff from 2s,
+  ×2, capped at 60s; bound is **per-node** (the fold already keys per node, and one flaky node
+  should not consume a sibling's budget).
 
 ## SP-OPS-1.4 / 1.5 — the two design calls
 
