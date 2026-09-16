@@ -1353,6 +1353,18 @@ mod tests {
     /// `HashMap` with a fresh `RandomState`, so the repeats really do vary the
     /// iteration order; a message built from "whichever came second" would differ
     /// between them.
+    ///
+    /// **EXACTLY TWO is the first case, and it is the point.** The rule is
+    /// `marked.len() > 1`, so two is where it starts firing — and a three-marked
+    /// fixture says nothing about where the threshold sits, because a predicate that
+    /// only fired at three or more would refuse it just the same. The first version of
+    /// this test built three agents and called itself `two_default_planners_…`:
+    /// mutating the guard to `marked.len() > 2` kept the ENTIRE workspace suite green
+    /// (1828 passed, 0 failed), while an operator config with exactly two agents
+    /// marked `default_planner: true` loaded silently and the alphabetical accident
+    /// this slice removes decided which of the two "designated" planners won. Three is
+    /// kept alongside it so the message is still proven to name EVERY offender rather
+    /// than just the pair.
     #[test]
     fn two_default_planners_is_a_loud_registry_load_naming_both() {
         let mk = |name: &str| AgentDefinition {
@@ -1360,30 +1372,45 @@ mod tests {
             default_planner: true,
             ..role_agent(crate::planner::PLANNER_AREA, "reasoning", Some("c"))
         };
-        let mut seen: Option<String> = None;
-        for _ in 0..32 {
-            let cfg = RegistryConfig {
-                agents: vec![mk("zeta"), mk("alpha"), mk("beta")],
-                skills: vec![],
-                tools: vec![],
-                chain_bindings: vec![],
-            };
-            let e = Registry::from_config(cfg).expect_err("two marked planners must be loud");
-            assert!(
-                matches!(e, OrchestratorError::RegistryLoad(_)),
-                "same shape as the duplicate-name rules: {e:?}"
-            );
-            let m = format!("{e}");
-            assert!(m.contains("default_planner"), "names the key: {m}");
-            let (a, b, z) = (
-                m.find("alpha").expect("names alpha"),
-                m.find("beta").expect("names beta"),
-                m.find("zeta").expect("names zeta"),
-            );
-            assert!(a < b && b < z, "every offender, in sorted order: {m}");
-            match &seen {
-                None => seen = Some(m),
-                Some(first) => assert_eq!(first, &m, "HashMap order varies; the message must not"),
+        for names in [vec!["beta", "alpha"], vec!["zeta", "alpha", "beta"]] {
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            let mut seen: Option<String> = None;
+            for _ in 0..32 {
+                let cfg = RegistryConfig {
+                    agents: names.iter().map(|n| mk(n)).collect(),
+                    skills: vec![],
+                    tools: vec![],
+                    chain_bindings: vec![],
+                };
+                let e = match Registry::from_config(cfg) {
+                    Err(e) => e,
+                    Ok(_) => panic!(
+                        "{} agents marked default_planner LOADED; the guard fires at \
+                         `marked.len() > 1`, so two is where it must start",
+                        names.len()
+                    ),
+                };
+                assert!(
+                    matches!(e, OrchestratorError::RegistryLoad(_)),
+                    "same shape as the duplicate-name rules: {e:?}"
+                );
+                let m = format!("{e}");
+                assert!(m.contains("default_planner"), "names the key: {m}");
+                let at: Vec<usize> = sorted
+                    .iter()
+                    .map(|n| m.find(n).unwrap_or_else(|| panic!("names {n}: {m}")))
+                    .collect();
+                assert!(
+                    at.windows(2).all(|w| w[0] < w[1]),
+                    "every offender, in sorted order: {m}"
+                );
+                match &seen {
+                    None => seen = Some(m),
+                    Some(first) => {
+                        assert_eq!(first, &m, "HashMap order varies; the message must not")
+                    }
+                }
             }
         }
     }

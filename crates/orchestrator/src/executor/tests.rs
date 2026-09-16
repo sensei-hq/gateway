@@ -9563,24 +9563,34 @@ fn two_planner_registry() -> Arc<Registry> {
 /// `default_planner`. `None` reproduces the pre-slice registry exactly, which is what
 /// keeps every other caller byte-identical.
 fn two_planner_registry_marking(marked: Option<&str>) -> Arc<Registry> {
-    let mk = |name: &str| AgentDefinition {
-        default_planner: marked == Some(name),
-        name: name.into(),
-        area: "planning".into(),
-        kind: "reasoning".into(),
-        chain: Some("c".into()),
-        chains: std::collections::HashMap::new(),
-        grants: std::collections::HashMap::new(),
-        tools: vec![],
-        skills: vec![],
-        system_prompt: format!("planner {name}"),
-        backed_by: AgentBacking::Model,
-    };
     Arc::new(
-        Registry::default()
-            .with_agent(mk("alpha"))
-            .with_agent(mk("beta")),
+        two_planner_agents_marking(marked)
+            .into_iter()
+            .fold(Registry::default(), Registry::with_agent),
     )
+}
+
+/// The agents behind [`two_planner_registry_marking`], as the `Vec` a `RegistryConfig`
+/// wants. Split out so the hot-reload test can push the SAME fixture through
+/// `RegistryHandle::reload` with only the marker moved — one definition of "two
+/// planners", so a reload cannot differ from the wired registry by accident.
+fn two_planner_agents_marking(marked: Option<&str>) -> Vec<AgentDefinition> {
+    ["alpha", "beta"]
+        .into_iter()
+        .map(|name| AgentDefinition {
+            default_planner: marked == Some(name),
+            name: name.into(),
+            area: "planning".into(),
+            kind: "reasoning".into(),
+            chain: Some("c".into()),
+            chains: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            tools: vec![],
+            skills: vec![],
+            system_prompt: format!("planner {name}"),
+            backed_by: AgentBacking::Model,
+        })
+        .collect()
 }
 
 fn expand_select_node(id: &str, deps: Vec<Dep>) -> Node {
@@ -9703,6 +9713,103 @@ async fn select_with_no_marked_planner_keeps_name_order() {
         )),
         "nobody marked ⇒ the name sort still decides: {evs:?}"
     );
+}
+
+/// SP-REG-3's determinism claim, and the reason `planner_candidates` reads the marker
+/// instead of `boot::heavy` resolving it into `RulePlannerSelector::new(Some(..))`:
+/// **the designation is read from the PINNED registry at selection time, so a
+/// `config push` moves it on a LIVE executor.**
+///
+/// The three sibling tests above cannot see this property. Every one of them wires
+/// `with_registry` — a fixed `Arc<Registry>` that never changes — which a
+/// resolve-once-at-boot implementation satisfies identically. This is the only test in
+/// the workspace that combines a marked agent with `with_registry_handle`, which is
+/// what `boot::heavy` actually wires (boot.rs), and it is the only one where the two
+/// designs disagree.
+///
+/// Proven by mutation rather than asserted: caching the sorted candidates on the
+/// `Executor` at `with_registry_handle` time and returning that cache from
+/// `planner_candidates` — the exact refactor the rustdoc on `planner_candidates` says
+/// it rejected — keeps all 466 other tests in this crate green and reddens only this
+/// one, on the second assertion (`left: "beta", right: "alpha"`).
+///
+/// The failure it fences: a worker boots with `beta` marked, an operator pushes a
+/// config moving the marker to `alpha`, the handle reloads — and every subsequent run
+/// still plans with `beta` from the frozen snapshot while `torii config version`
+/// reports the new generation and the durable config says `alpha`.
+#[tokio::test]
+async fn a_reloaded_config_moves_the_designation_on_a_live_executor() {
+    use orchestrator_core::{RegistryConfig, RegistryHandle};
+    use orchestrator_store::InMemoryConfigSource;
+
+    let plan_json = r#"{"graph":{"nodes":[{"id":"n1","kind":{"ModelCall":{"chain":"c","payload":{"prompt":"n1"}}},"deps":[]}]}}"#;
+    // Two runs × (one plan call + one plan-node call).
+    let (gateway, _c) = scripted_gateway(vec![
+        final_response(plan_json),
+        final_response("n1 out"),
+        final_response(plan_json),
+        final_response("n1 out"),
+    ])
+    .await;
+    let journal = InMemoryJournal::new();
+    let handle = RegistryHandle::new(
+        two_planner_agents_marking(Some("beta"))
+            .into_iter()
+            .fold(Registry::default(), Registry::with_agent),
+    );
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry_handle(handle.clone())
+        .with_planner_selector(Arc::new(orchestrator_core::RulePlannerSelector::new(None)));
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    // Generation 0: `beta` is marked, so `beta` plans — despite `alpha` sorting first.
+    let run_a = RunId(uuid::Uuid::new_v4());
+    let out = exec.run(run_a, &graph).await.expect("run A");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert_eq!(
+        selected_planner(&journal, run_a).await,
+        "beta",
+        "generation 0 marks `beta`"
+    );
+
+    // `torii config push` moves the designation to `alpha`. Same executor, same handle.
+    handle
+        .reload(&InMemoryConfigSource(RegistryConfig {
+            agents: two_planner_agents_marking(Some("alpha")),
+            skills: vec![],
+            tools: vec![],
+            chain_bindings: vec![],
+        }))
+        .await
+        .expect("reload");
+
+    let run_b = RunId(uuid::Uuid::new_v4());
+    let out = exec.run(run_b, &graph).await.expect("run B");
+    assert!(out.failed.is_none(), "{out:?}");
+    assert_eq!(
+        selected_planner(&journal, run_b).await,
+        "alpha",
+        "the marker is read from the registry PINNED for this run, not from a snapshot \
+         taken when the executor was wired — a `config push` must move the designation"
+    );
+}
+
+/// Which planner the Expand node `"e"` journaled for `run`. `PlannerSelected` is the
+/// durable record of the pick (it is what a resume replays), so asserting on it rather
+/// than on the prompt text asserts the decision, not a side effect of it.
+async fn selected_planner(journal: &InMemoryJournal, run: RunId) -> String {
+    journal
+        .load(run)
+        .await
+        .expect("journal loads")
+        .into_iter()
+        .find_map(|(_, ev)| match ev {
+            JournalEvent::PlannerSelected { node, agent } if node.0 == "e" => Some(agent.0),
+            _ => None,
+        })
+        .expect("the Select node journaled a PlannerSelected")
 }
 
 #[tokio::test]
