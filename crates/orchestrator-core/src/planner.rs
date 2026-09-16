@@ -78,7 +78,16 @@ pub trait PlannerSelector: Send + Sync {
 }
 
 /// A pure, deterministic selector: the configured `default` when it is a candidate,
-/// else the first candidate (candidates arrive sorted by name). Goal-independent.
+/// else the FIRST candidate — so the caller's ordering IS the policy. Goal-independent.
+///
+/// **What "first" means (SP-REG-3).** `Executor::planner_candidates` is the only
+/// producer of that slice, and it orders an agent marked `default_planner` ahead of the
+/// rest, which keep name order. So the first candidate is the DESIGNATED planner when a
+/// registry designates one, and the alphabetically-first planner only when none does.
+/// This said "candidates arrive sorted by name" until the marker shipped; a maintainer
+/// answering "which planner runs with no `default` configured?" from that sentence
+/// would have got the wrong answer, and re-derived a name-only sort on the next
+/// refactor — silently un-shipping the designation.
 pub struct RulePlannerSelector {
     default: Option<AgentRef>,
 }

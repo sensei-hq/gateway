@@ -446,7 +446,8 @@ pub async fn heavy(
         //
         // `RulePlannerSelector::new(None)` and not `LlmPlannerSelector`: it is pure and
         // spends no tokens (it prefers a configured default when that default is among
-        // the candidates, else takes `candidates.first()` over the name-sorted set),
+        // the candidates, else takes `candidates.first()` over the order
+        // `Executor::planner_candidates` produced — marked first, then by name),
         // whereas the LLM selector costs a model call per expand. Choosing to spend
         // tokens on planner selection is the implementer's call, not a default.
         //
