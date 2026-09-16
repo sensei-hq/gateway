@@ -186,10 +186,12 @@ than from a process-scoped snapshot. No trait change, no new constructor argumen
 > for `LlmPlannerSelector`. Production wires the former, which is why this is acceptable — but the
 > done gate must say so rather than claim the marker is honoured unconditionally.
 >
-> **The field is not free.** `AgentDefinition` derives no `Default`, and **42 of its 58
-> construction sites are exhaustive literals with no `..` rest-pattern**, so a new field is a
-> compile error at every one (41 are in `#[cfg(test)]`, so it is mechanical churn rather than
-> risk). And `FmValue` has exactly two variants — `Scalar(String)` and `List(Vec<String>)` — with
+> **The field is not free.** `AgentDefinition` derives no `Default`, so a new field is a compile
+> error at every exhaustive literal. **The count in an earlier draft — "42 of 58" — was wrong.**
+> `rg 'AgentDefinition \{'` also matches `-> AgentDefinition {`, where the brace opens a FUNCTION
+> BODY, and `pub struct AgentDefinition {`. The implementation patched **34** real literals and
+> the build is green, which is the ground truth. Fourth regex-derived miscount in this codebase,
+> same root cause every time: matching text rather than the construct. And `FmValue` has exactly two variants — `Scalar(String)` and `List(Vec<String>)` — with
 > **no `Bool` and no `optional_bool` helper**, so the frontmatter parser needs a new path, plus a
 > policy for malformed input (`yes`, `TRUE`, `1`). This repo's precedent is loud rejection: see
 > `agent_from_frontmatter_rejects_an_unknown_backed_by`. Follow it.
