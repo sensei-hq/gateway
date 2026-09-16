@@ -297,7 +297,10 @@ impl ContentStore for PostgresContentStore {
 }
 
 /// A durable [`ContextStore`] backed by the `orchestrator.context_refs` table (keyed by
-/// `(scope_kind, scope_id, ctx_key)`), storing each value's bytes once in the shared CAS.
+/// `(run_id, scope_kind, scope_id, ctx_key)`), storing each value's bytes once in the shared CAS.
+///
+/// `run_id` is load-bearing (SP-OPS-1.1): without it a `Scope::Run` row was global to the
+/// deployment forever, so re-running the same graph collided on its first completed node.
 ///
 /// Parity with [`InMemoryContextStore`](crate::InMemoryContextStore): `put` writes the value to
 /// the CAS then inserts the ref, rejecting a re-write of an existing `(scope, key)` LOUDLY with
@@ -316,8 +319,9 @@ impl PostgresContextStore {
         Self { pool }
     }
 
-    /// Decompose a [`Scope`] into the `(scope_kind, scope_id)` primary-key columns. `Run` carries
-    /// an empty id; `Node(id)` carries the node path.
+    /// Decompose a [`Scope`] into the `(scope_kind, scope_id)` key columns. `Run` carries an
+    /// empty id; `Node(id)` carries the node path. The run dimension is NOT here — it is a
+    /// separate `run_id` column, because [`Scope`] is journaled and must keep its encoding.
     fn scope_cols(scope: &Scope) -> (&'static str, String) {
         match scope {
             Scope::Run => ("run", String::new()),
@@ -330,17 +334,19 @@ impl PostgresContextStore {
         PostgresContentStore::new(self.pool.clone())
     }
 
-    /// Fetch the single ref at the exact `(scope_kind, scope_id, ctx_key)` row, if present.
+    /// Fetch the single ref at the exact `(run_id, scope_kind, scope_id, ctx_key)` row.
     async fn fetch(
         &self,
+        run: RunId,
         kind: &str,
         id: &str,
         key: &str,
     ) -> Result<Option<ContextRef>, OrchestratorError> {
         let row: Option<(serde_json::Value,)> = sqlx::query_as(
             "select ctx_ref from orchestrator.context_refs \
-             where scope_kind = $1 and scope_id = $2 and ctx_key = $3",
+             where run_id = $1 and scope_kind = $2 and scope_id = $3 and ctx_key = $4",
         )
+        .bind(run.0)
         .bind(kind)
         .bind(id)
         .bind(key)
@@ -356,6 +362,7 @@ impl PostgresContextStore {
 impl ContextStore for PostgresContextStore {
     async fn put(
         &self,
+        run: RunId,
         scope: Scope,
         key: ContextKey,
         value: serde_json::Value,
@@ -376,12 +383,14 @@ impl ContextStore for PostgresContextStore {
         let (kind, id) = Self::scope_cols(&scope);
         let ref_json = serde_json::to_value(&context_ref)?;
         // LOUD collision: a plain insert (never `on conflict do nothing`). A PK unique-violation
-        // means this `(scope, key)` already exists → map it to `ContextKeyCollision`, not a
-        // silent overwrite.
+        // means this `(run, scope, key)` already exists → map it to `ContextKeyCollision`, not a
+        // silent overwrite. Scoped by run since SP-OPS-1.1, so this fires only on a genuine
+        // duplicate WITHIN one run — never because another run used the same node id.
         let res = sqlx::query(
-            "insert into orchestrator.context_refs (scope_kind, scope_id, ctx_key, ctx_ref) \
-             values ($1, $2, $3, $4)",
+            "insert into orchestrator.context_refs (run_id, scope_kind, scope_id, ctx_key, ctx_ref) \
+             values ($1, $2, $3, $4, $5)",
         )
+        .bind(run.0)
         .bind(kind)
         .bind(&id)
         .bind(&key.0)
@@ -400,17 +409,19 @@ impl ContextStore for PostgresContextStore {
 
     async fn get(
         &self,
+        run: RunId,
         scope: Scope,
         key: ContextKey,
     ) -> Result<Option<ContextRef>, OrchestratorError> {
         let (kind, id) = Self::scope_cols(&scope);
-        if let Some(found) = self.fetch(kind, &id, &key.0).await? {
+        if let Some(found) = self.fetch(run, kind, &id, &key.0).await? {
             return Ok(Some(found));
         }
-        // Resolve up the scope chain: a Node read falls back to the Run-scoped entry.
+        // Resolve up the scope chain: a Node read falls back to the Run-scoped entry
+        // OF THE SAME RUN.
         if let Scope::Node(_) = scope {
             let (rk, rid) = Self::scope_cols(&Scope::Run);
-            if let Some(found) = self.fetch(rk, &rid, &key.0).await? {
+            if let Some(found) = self.fetch(run, rk, &rid, &key.0).await? {
                 return Ok(Some(found));
             }
         }
@@ -422,18 +433,20 @@ impl ContextStore for PostgresContextStore {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    async fn insert_ref(&self, r: ContextRef) -> Result<(), OrchestratorError> {
+    async fn insert_ref(&self, run: RunId, r: ContextRef) -> Result<(), OrchestratorError> {
         // Rehydration from a journaled write: idempotent upsert (a fold replays every write), no
         // collision check — the journal is the source of truth. No CAS touch; the blob already
         // lives there. `do nothing` is first-write-wins (vs InMemory's last-write-wins overwrite);
         // immaterial, since `put` enforces collisions at journal-write time so a fold only ever
-        // replays an identical ref for a given `(scope, key)`.
+        // replays an identical ref for a given `(run, scope, key)`.
         let (kind, id) = Self::scope_cols(&r.scope);
         let ref_json = serde_json::to_value(&r)?;
         sqlx::query(
-            "insert into orchestrator.context_refs (scope_kind, scope_id, ctx_key, ctx_ref) \
-             values ($1, $2, $3, $4) on conflict (scope_kind, scope_id, ctx_key) do nothing",
+            "insert into orchestrator.context_refs (run_id, scope_kind, scope_id, ctx_key, ctx_ref) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict (run_id, scope_kind, scope_id, ctx_key) do nothing",
         )
+        .bind(run.0)
         .bind(kind)
         .bind(&id)
         .bind(&r.key.0)
@@ -1430,12 +1443,13 @@ mod tests {
         let Some(url) = db_url() else { return };
         let store = PostgresContextStore::new(connect(&url).await.unwrap());
         let tag = uuid::Uuid::new_v4().simple().to_string();
+        let run = RunId(uuid::Uuid::new_v4());
         let k1 = || ContextKey(format!("k1-{tag}"));
         let node = || Scope::Node(NodeId(format!("n-{tag}")));
 
         // Run-scoped write round-trips through the CAS.
         let r1 = store
-            .put(Scope::Run, k1(), serde_json::json!({ "v": 1 }))
+            .put(run, Scope::Run, k1(), serde_json::json!({ "v": 1 }))
             .await
             .unwrap();
         assert_eq!(
@@ -1446,7 +1460,7 @@ mod tests {
 
         // Re-writing the same (scope,key) is a loud collision (never last-write-wins).
         let err = store
-            .put(Scope::Run, k1(), serde_json::json!({ "v": 2 }))
+            .put(run, Scope::Run, k1(), serde_json::json!({ "v": 2 }))
             .await
             .expect_err("same (scope,key) collides");
         assert!(
@@ -1456,14 +1470,14 @@ mod tests {
 
         // A Node-scoped read resolves up to the Run-scoped entry.
         assert!(
-            store.get(node(), k1()).await.unwrap().is_some(),
+            store.get(run, node(), k1()).await.unwrap().is_some(),
             "Node read resolves up to Run"
         );
 
         // A read miss is an explicit Ok(None).
         assert!(
             store
-                .get(Scope::Run, ContextKey(format!("absent-{tag}")))
+                .get(run, Scope::Run, ContextKey(format!("absent-{tag}")))
                 .await
                 .unwrap()
                 .is_none(),
@@ -1473,18 +1487,80 @@ mod tests {
         // A Node-scoped write is private to that node — not visible at Run.
         let k2 = || ContextKey(format!("k2-{tag}"));
         store
-            .put(node(), k2(), serde_json::json!({ "n": true }))
+            .put(run, node(), k2(), serde_json::json!({ "n": true }))
             .await
             .unwrap();
-        let node_entry = store.get(node(), k2()).await.unwrap();
+        let node_entry = store.get(run, node(), k2()).await.unwrap();
         assert_eq!(
             node_entry.unwrap().scope,
             node(),
             "the Node entry is returned"
         );
         assert!(
-            store.get(Scope::Run, k2()).await.unwrap().is_none(),
+            store.get(run, Scope::Run, k2()).await.unwrap().is_none(),
             "a Node-scoped write does not leak to Run"
+        );
+    }
+
+    /// **SP-OPS-1.1 (analysis §2.3), durable parity with
+    /// `two_runs_publish_the_same_key_independently_but_one_run_still_collides`.**
+    ///
+    /// The in-memory mirror proves the keying; this proves the TABLE — the PK is really
+    /// `(run_id, scope_kind, scope_id, ctx_key)` and the insert really binds the run. It is
+    /// the durable path that carried the bug: `context_refs` outlives the process, so the
+    /// old global key burned every node id in the deployment permanently.
+    ///
+    /// Deliberately uses a BARE key (`n1`), not the `-{tag}` marker the other Postgres
+    /// tests use. Those markers exist to dodge exactly this bug (see `e2e_pg.rs`'s
+    /// `signal_graph` note); a tagged key here would make the test pass without the fix.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn pg_two_runs_publish_the_same_key_independently_but_one_run_still_collides() {
+        let Some(url) = db_url() else { return };
+        let store = PostgresContextStore::new(connect(&url).await.unwrap());
+        let (a, b) = (RunId(uuid::Uuid::new_v4()), RunId(uuid::Uuid::new_v4()));
+        let key = || ContextKey("n1".into());
+
+        let ra = store
+            .put(a, Scope::Run, key(), serde_json::json!({ "run": "a" }))
+            .await
+            .expect("run A publishes n1");
+        let rb = store
+            .put(b, Scope::Run, key(), serde_json::json!({ "run": "b" }))
+            .await
+            .expect("run B publishes the SAME node id against the SAME durable table");
+
+        assert_eq!(
+            store.load(&ra).await.unwrap(),
+            serde_json::json!({ "run": "a" })
+        );
+        assert_eq!(
+            store.load(&rb).await.unwrap(),
+            serde_json::json!({ "run": "b" })
+        );
+        // Each run reads back its own row, not the other's.
+        let got_a = store.get(a, Scope::Run, key()).await.unwrap().unwrap();
+        let got_b = store.get(b, Scope::Run, key()).await.unwrap().unwrap();
+        assert_eq!(
+            store.load(&got_a).await.unwrap(),
+            serde_json::json!({ "run": "a" })
+        );
+        assert_eq!(
+            store.load(&got_b).await.unwrap(),
+            serde_json::json!({ "run": "b" })
+        );
+
+        // The within-run guard survives the fix.
+        let err = store
+            .put(a, Scope::Run, key(), serde_json::json!({ "run": "a2" }))
+            .await
+            .expect_err("a repeat within ONE run still collides loudly");
+        assert!(
+            matches!(err, OrchestratorError::ContextKeyCollision { .. }),
+            "{err:?}"
         );
     }
 
@@ -1515,9 +1591,10 @@ mod tests {
         };
 
         let store = PostgresContextStore::new(pool.clone());
-        store.insert_ref(r.clone()).await.unwrap();
+        let run = RunId(uuid::Uuid::new_v4());
+        store.insert_ref(run, r.clone()).await.unwrap();
         let got = store
-            .get(Scope::Run, ContextKey(format!("k-{tag}")))
+            .get(run, Scope::Run, ContextKey(format!("k-{tag}")))
             .await
             .unwrap()
             .expect("present after insert_ref");
@@ -1527,7 +1604,7 @@ mod tests {
         );
 
         // Idempotent — re-inserting the same (scope,key) does not collide (unlike `put`).
-        store.insert_ref(r).await.unwrap();
+        store.insert_ref(run, r).await.unwrap();
     }
 
     // ---- PostgresConfigSource (SP-DATA-2 Task 3) ------------------------------------------

@@ -4628,6 +4628,7 @@ async fn completed_node_publishes_a_context_ref_to_the_blackboard() {
     );
     let got = ctx
         .get(
+            run,
             orchestrator_core::Scope::Run,
             orchestrator_core::ContextKey(n1.0.clone()),
         )
@@ -4660,15 +4661,82 @@ async fn no_context_store_journals_no_context_writes() {
     );
 }
 
+/// **SP-OPS-1.1 (analysis §2.3) — the same graph runs TWICE. The user-visible symptom.**
+///
+/// The store-level tests prove the keying; this proves the thing an operator actually
+/// hit. Before the fix, `publish_context` wrote every completed node's output under a
+/// `Scope::Run` entry keyed by the BARE node id, and `Scope::Run` carried no run
+/// dimension — so the second run of any graph collided on its first completed node. The
+/// collision propagates with `?` out of `apply_node_result`, so it aborted the entire
+/// drive, not just the node, AFTER the model call had been paid for.
+///
+/// Both runs share ONE executor and ONE context store on purpose: that is the real
+/// topology (a `Scheduler` drives up to `CLAIM_BATCH` runs through a single `Executor`),
+/// and a per-run store would hide the bug. The node ids are the bare ones from
+/// `two_node_graph` — the graph is byte-identical across both runs, as a re-submitted
+/// graph is.
+#[tokio::test]
+async fn the_same_graph_runs_twice_against_one_shared_blackboard() {
+    use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
+    let content = Arc::new(InMemoryContentStore::new());
+    let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let (gw, _c) = recording_gateway().await;
+    let (graph, n1, _n2) = two_node_graph("a", "b");
+    let exec = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+        .with_content_store(content)
+        .with_context_store(ctx.clone());
+
+    let first = RunId(uuid::Uuid::new_v4());
+    let out1 = exec.run(first, &graph).await.expect("first run");
+    assert!(out1.failed.is_none(), "first run: {:?}", out1.failed);
+
+    // The SAME graph again, new run id — this is what used to abort mid-drive.
+    let second = RunId(uuid::Uuid::new_v4());
+    let out2 = exec
+        .run(second, &graph)
+        .await
+        .expect("second run of the same graph");
+    assert!(
+        out2.failed.is_none(),
+        "re-running an identical graph must not collide: {:?}",
+        out2.failed
+    );
+    assert_eq!(
+        out2.completed.len(),
+        graph.nodes.len(),
+        "every node of the second run completed"
+    );
+
+    // And the two runs' blackboards are genuinely separate, not one shared row that
+    // happened not to error.
+    let key = || orchestrator_core::ContextKey(n1.0.clone());
+    for run in [first, second] {
+        assert!(
+            ctx.get(run, orchestrator_core::Scope::Run, key())
+                .await
+                .unwrap()
+                .is_some(),
+            "each run has its own entry for the shared node id"
+        );
+    }
+}
+
 /// Acceptance §8.4 — a duplicate (Run, key) publish surfaces ContextKeyCollision
 /// loudly (never a silent overwrite). Pre-seed Run/"n1" WITHOUT a ContextWrite so
 /// the fold-guard does not skip, then run — n1's publish collides.
+///
+/// SP-OPS-1.1: the seed and the drive must share ONE `run`. Run-scoping the blackboard
+/// removed the CROSS-run collision (the bug); this collision is WITHIN a run and must
+/// stay loud. Seeding under a different run id would make this test pass vacuously — it
+/// would stop colliding for the new reason rather than the asserted one.
 #[tokio::test]
 async fn duplicate_context_key_publish_is_a_loud_collision() {
     use orchestrator_store::{InMemoryContentStore, InMemoryContextStore};
     let content = Arc::new(InMemoryContentStore::new());
     let ctx = Arc::new(InMemoryContextStore::new(content.clone()));
+    let run = RunId(uuid::Uuid::new_v4());
     ctx.put(
+        run,
         orchestrator_core::Scope::Run,
         orchestrator_core::ContextKey("n1".into()),
         serde_json::json!({ "pre": "seeded" }),
@@ -4680,7 +4748,7 @@ async fn duplicate_context_key_publish_is_a_loud_collision() {
     let err = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
         .with_content_store(content)
         .with_context_store(ctx)
-        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .run(run, &graph)
         .await
         .expect_err("duplicate publish collides");
     assert!(
@@ -17873,7 +17941,11 @@ mod await_signal {
             "the completed gate published to the blackboard"
         );
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("gate".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("gate".into()),
+            )
             .await
             .unwrap()
             .expect("the gate's output is on the blackboard");
@@ -19105,7 +19177,11 @@ mod human_gate {
 
         // (b) THE DURABLE WRITE — the same single redacted value, not a second scrub.
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("release".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("release".into()),
+            )
             .await
             .unwrap()
             .expect("the completed gate published its decision to the blackboard");
@@ -21166,7 +21242,11 @@ mod human_agent {
         );
 
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("review".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("review".into()),
+            )
             .await
             .unwrap()
             .expect("the durable blackboard is unaffected — that is the doc's other half");
@@ -21689,7 +21769,11 @@ mod human_agent {
 
         // (b) THE DURABLE WRITE — the same single redacted value, not a second scrub.
         let r = ctx
-            .get(orchestrator_core::Scope::Run, ContextKey("review".into()))
+            .get(
+                run,
+                orchestrator_core::Scope::Run,
+                ContextKey("review".into()),
+            )
             .await
             .unwrap()
             .expect("the completed node published its answer to the blackboard");
