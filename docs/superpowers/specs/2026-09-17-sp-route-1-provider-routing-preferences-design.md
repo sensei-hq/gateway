@@ -291,7 +291,33 @@ end and today go only into the `InferenceCall` store record. This needs a **seco
 dispatch**.
 
 The streaming `duration_ms` starts *after* the stream is obtained, so it is not the same quantity
-as the non-streaming one. They are never pooled into a single mean.
+as the non-streaming one. They must never be pooled into a single mean.
+
+**How that is actually enforced — and an error this spec made.** The sentence above originally
+read "They are never pooled", stated as though the design already had the property. It did not.
+`Sample` carried no discriminator, so `stats()` averaged every `latency_ms` together, and both
+producers key the identical `"{router}:{model}"` string. The Task 4 review caught it, and Task 5
+would have made it materially worse by adding a third span to the same ring.
+
+The enforcement is an `AttemptPhase` on `AttemptOutcome`, read only by `PerformanceRecorder` —
+the health recorders (breaker, cooldown, lockout) ignore it and still see `success` unchanged:
+
+| phase | `duration_ms` is | contributes latency | contributes a verdict | contributes throughput |
+|---|---|---|---|---|
+| `Complete` | time-to-response | yes | yes | if tokens present |
+| `StreamAcquired` | time-to-first-response | yes | **no** | no |
+| `StreamCompleted` | generation time | **no** | yes | if tokens present |
+
+`Sample.latency_ms` and `Sample.success` are therefore both `Option`. Two properties fall out, and
+both matter downstream:
+
+1. `mean_latency_ms` only ever averages time-until-the-endpoint-started-producing, which *is*
+   comparable across streaming and non-streaming. Without this, §5.3's `sort: latency` would rank
+   a fast-TTFB streaming endpoint below a slow non-streaming one purely because it streams.
+2. **One attempt casts exactly one reliability vote.** Without this, an endpoint failing every
+   stream mid-way converges on `success_rate == 0.5` and never lower — because its acquisition
+   success is counted beside its completion failure — and §5.1's reliability multiplier could
+   never de-weight a totally broken endpoint.
 
 ### 6.4 The plumbing change
 
