@@ -12,6 +12,45 @@
 
 ---
 
+## Progress
+
+| Task | Commits | State |
+|---|---|---|
+| 1 | `83a5371` · `ba5e93f` · `cd1fcc7` | ✅ done, two review rounds |
+| 2 | `cf19179` | ✅ done, reviewed jointly with Task 3 |
+| 3 | `da0dfb5` · `6e5cfa5` | ✅ done, 2 Critical + 3 Important fixed |
+| 4–12 | — | pending |
+
+Off-slice, landed alongside: `5208952` — revived `facade.rs`'s test module (uncompilable since
+2026-07-23) and added a `cargo check -p sensei-gateway --features local --all-targets` CI step,
+because no CI job had ever enabled a non-default feature.
+
+## The review lesson — apply it to every remaining task
+
+Every Critical and Important finding in Tasks 1–3 was the same shape: **a test that cannot fail on
+the thing its name claims.** Three of the four were the negative half asserted without the positive
+half.
+
+- Task 1: deleting a field from the hand-written `Debug` left the whole workspace green.
+- Task 1: the serde test pinned 2 of 8 `skip_serializing_if` attributes.
+- Task 3: both service tests asserted the named candidate was *excluded*, never that an unnamed one
+  *survived* — so a gate that excluded everything passed 332/332.
+- Task 3: `only`'s empty-`routers` axis was unpinned while the mirror `models` case was covered.
+
+So, for every task below:
+
+1. **Assert the positive half.** A filtering or ordering test that only checks what was removed or
+   demoted will pass against an implementation that removes or demotes everything. Name the
+   candidate that must SURVIVE, and where it must land.
+2. **Name the mutation up front.** Any claim of the form "guarded by X" gets the one-line source
+   change that should break it, and that mutation is actually run — a real `panicked at`, not a
+   compile error (`cargo test` exits 101 for both).
+3. **Check the mirror case.** If a rule has two symmetric axes or branches, test both. The Task 3
+   asymmetry — `models` covered, `routers` not — is exactly how half a rule ships unpinned.
+
+This bites hardest in Tasks 7–10: a weighted strategy that returns the right *set* in the wrong
+*order* will pass any test that only checks membership.
+
 ## Orientation — read before Task 1
 
 **The two-dimensional candidate space.** A candidate is a `(router, model)` pair. `router` is the provider backend (`anthropic`, `ollama`); `model` is the model id (`claude-haiku`, `gemma3:27b`). The endpoint key is `format!("{router}:{model}")` and **cannot be parsed back** — model ids contain colons. Always carry the two parts separately.
@@ -56,7 +95,7 @@
 - Modify: `crates/kernel/src/types/request.rs`
 - Test: `crates/kernel/src/types/request.rs` (inline `mod tests`)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `mod tests` block at the bottom of `crates/kernel/src/types/request.rs`:
 
@@ -117,12 +156,12 @@ fn a_request_without_preferences_emits_no_routing_key() {
 
 `Payload::Chat` takes `messages, system, max_tokens, temperature, tools` — `tools` is a `Vec`, not an `Option`. Import `Message`, `MessageRole` and `Payload` from this module if the test block does not already have them.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p sensei-kernel routing_preferences_round_trip -- --nocapture`
 Expected: FAIL — `cannot find type 'RoutingPreferences' in this scope`.
 
-- [ ] **Step 3: Add the preference types**
+- [x] **Step 3: Add the preference types**
 
 In `crates/kernel/src/types/request.rs`, above `pub struct InferenceRequest`:
 
@@ -180,7 +219,7 @@ pub struct CandidateRef {
 }
 ```
 
-- [ ] **Step 4: Add the field to `InferenceRequest`**
+- [x] **Step 4: Add the field to `InferenceRequest`**
 
 After the `credentials` field:
 
@@ -197,7 +236,7 @@ And in the hand-written `impl std::fmt::Debug for InferenceRequest`, after the `
             .field("routing", &self.routing)
 ```
 
-- [ ] **Step 5: Sweep the 55 struct literals**
+- [x] **Step 5: Sweep the 55 struct literals**
 
 Adding a field breaks every `InferenceRequest { .. }` literal (there is no `Default` impl). Find them:
 
@@ -208,7 +247,7 @@ Add `routing: None,` to each. To enumerate the files first:
 Run: `rg --no-ignore -g '!target' -c 'InferenceRequest \{' --type rust`
 Expected: 55 occurrences across ~12 files, the largest being `crates/gateway/src/engine/tests.rs` (18).
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-kernel routing_preferences_round_trip a_request_without_preferences -- --nocapture`
 Expected: PASS, 2 tests.
@@ -216,7 +255,7 @@ Expected: PASS, 2 tests.
 Run: `cargo build --workspace`
 Expected: success, no E0063.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/kernel/src/types/request.rs crates/gateway crates/orchestrator
@@ -231,7 +270,7 @@ git commit -m "feat(kernel): RoutingPreferences on InferenceRequest (SP-ROUTE-1 
 - Modify: `crates/gateway/src/skip_reason.rs`
 - Test: `crates/gateway/src/skip_reason.rs` (inline `mod tests`)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 /// A policy exclusion is STRUCTURAL, and that is a behaviour rather than a label.
@@ -254,12 +293,12 @@ fn a_policy_exclusion_is_structural_and_never_pauses_a_run() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p sensei-gateway a_policy_exclusion_is_structural -- --nocapture`
 Expected: FAIL — `no variant named 'ExcludedByPolicy'`.
 
-- [ ] **Step 3: Add the variant**
+- [x] **Step 3: Add the variant**
 
 In `crates/gateway/src/skip_reason.rs`, add to `enum SkipReason` after `UnsupportedCapability`:
 
@@ -288,12 +327,12 @@ In `gate_status`, add `ExcludedByPolicy` to the existing `Structural` arm:
             | SkipReason::UnsupportedCapability(_) => GateStatus::Structural,
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p sensei-gateway a_policy_exclusion_is_structural -- --nocapture`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/gateway/src/skip_reason.rs
@@ -309,7 +348,7 @@ git commit -m "feat(gateway): SkipReason::ExcludedByPolicy, structural (SP-ROUTE
 - Modify: `crates/gateway/src/gates/mod.rs`, `crates/gateway/src/selection.rs`
 - Test: `crates/gateway/src/gates/routing_policy.rs`, `crates/gateway/src/selection.rs`
 
-- [ ] **Step 1: Write the failing matching tests**
+- [x] **Step 1: Write the failing matching tests**
 
 Create `crates/gateway/src/gates/routing_policy.rs` with only the test module for now:
 
@@ -389,12 +428,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p sensei-gateway routing_policy -- --nocapture`
 Expected: FAIL — `file not found for module 'routing_policy'` until Step 3 registers it, then `cannot find function 'admitted_by_policy'`.
 
-- [ ] **Step 3: Write the gate and the matching rules**
+- [x] **Step 3: Write the gate and the matching rules**
 
 At the top of `crates/gateway/src/gates/routing_policy.rs`, above the test module:
 
@@ -464,7 +503,7 @@ fn matches_any_axis(s: &CandidateSet, router: &str, model: &str) -> bool {
 }
 ```
 
-- [ ] **Step 4: Register the module and thread preferences through**
+- [x] **Step 4: Register the module and thread preferences through**
 
 In `crates/gateway/src/gates/mod.rs`, add to the module list:
 
@@ -508,7 +547,7 @@ Then fix every `SelectionCriteria { .. }` literal by adding `preferences: None,`
 
 Run: `cargo build --workspace 2>&1 | grep -c "E0063"`
 
-- [ ] **Step 5: Write the whole-service ordering test**
+- [x] **Step 5: Write the whole-service ordering test**
 
 In `crates/gateway/src/selection.rs`'s `mod tests`:
 
@@ -605,12 +644,12 @@ fn excluding_every_candidate_is_terminal_not_pausable() {
 
 If `engine::exhaustion` is not visible from `selection.rs`'s tests, widen it to `pub(crate)` for the test only — it is already `pub(super)` inside `engine`.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-gateway routing_policy a_policy_exclusion_is_reported excluding_every_candidate -- --nocapture`
 Expected: PASS, 6 tests.
 
-- [ ] **Step 7: Mutation-check the gate position**
+- [x] **Step 7: Mutation-check the gate position**
 
 Temporarily move `Box::new(RoutingPolicyGate)` to the END of the gates vector in `selection.rs`.
 
@@ -619,7 +658,7 @@ Expected: a panic line mentioning "policy must win over the open breaker".
 
 If NO panic appears, the test is not pinning the position and must be fixed before proceeding. Restore the original order and re-run to green.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/gateway/src crates/kernel/src

@@ -121,11 +121,20 @@ way to actually restrict.
 
 ### 4.2 Precedence
 
-`only` → `ignore` → `order` → `sort` → default weighting.
+Filtering happens first, then ordering: `{only, ignore}` → `order` → `sort` → default weighting.
 
-`only` and `ignore` are filters (§5.0). `order` and `sort` are both orderings: `order` wins for
-the candidates it names, and `sort` (or the default) orders the unnamed tail, which follows them.
-Combining them is legal and composable rather than an error.
+**`only` and `ignore` do NOT have a precedence relative to each other, and an earlier draft of
+this section was wrong to imply one.** Both are pure predicates over a single candidate, so
+admission is the conjunction `only_ok && !ignore_match` — which commutes. No input distinguishes
+the two evaluation orders, and the Task 3 review proved it: swapping the two blocks in
+`admitted_by_policy` left the entire suite green. What *is* true, and what the tests pin, is that
+satisfying `only` does not exempt a candidate from `ignore`. Write that, not a sequence.
+
+The distinction is load-bearing rather than pedantic, because `order` and `sort` genuinely **are**
+sequence-dependent (§5.0, §5.1): `order` wins for the candidates it names, and `sort` — or the
+default weighting — orders the unnamed tail, which then follows them. A reader who has learnt from
+this section that "→" means observable sequencing will mis-model the half where it does.
+Combining `order` and `sort` is legal and composable rather than an error.
 
 ## 5. Selection
 
