@@ -111,6 +111,14 @@ impl ConnectionCooldownSink {
 
 impl HealthRecorder for ConnectionCooldownSink {
     fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<Instant> {
+        // A `StreamAcquired` outcome is a latency observation, not a verdict.
+        // This sink keys on `o.error`, which is always `None` at acquisition,
+        // so it was already inert to the phase-blindness bug the other two
+        // sinks had — this guard makes that explicit rather than incidental
+        // (SP-ROUTE-1 Task 5 review, Critical 3).
+        if !o.phase.is_verdict() {
+            return None;
+        }
         // Transport-level fault → cool the whole router (Network = connection failure;
         // Timeout = endpoint unreachable/too slow). Other errors do NOT cool.
         if matches!(

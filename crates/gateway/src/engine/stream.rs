@@ -288,7 +288,15 @@ impl super::Gateway {
                                         success: false,
                                         error: Some(&e),
                                         duration_ms: stream_start.elapsed().as_millis() as u64,
-                                        output_tokens: usage_acc.map(|u| u.output_tokens),
+                                        // Deliberately `None`, even if an earlier chunk
+                                        // carried `usage` (some providers report tokens on
+                                        // their last good chunk before dying). The attempt
+                                        // FAILED — a rate derived from a broken, partial
+                                        // attempt is not a throughput observation, and
+                                        // contributing one would let a later ranking
+                                        // average a dead attempt's output into a live rate
+                                        // (SP-ROUTE-1 Task 5 review, Minor 3).
+                                        output_tokens: None,
                                         // The stream ENDED, badly. This is the attempt's
                                         // one and only verdict — the acquisition dispatch
                                         // deliberately cast none — and its duration is
@@ -315,6 +323,13 @@ impl super::Gateway {
                     // producing); this second dispatch records the generation rate and
                     // this attempt's one verdict. The two durations measure different
                     // spans, and `AttemptPhase` is what keeps them out of one mean.
+                    //
+                    // MUST run before `yield StreamEvent::Done` below, not after: in an
+                    // `async_stream` generator, code placed after a `yield` runs only on
+                    // the NEXT poll, and a real consumer that stops polling once it sees
+                    // the terminal `Done` (as any sane one does) would never resume this
+                    // generator far enough to run a dispatch placed after it — the
+                    // verdict would silently vanish (SP-ROUTE-1 Task 5 review, Minor 2).
                     let _ = super::dispatch_outcome(
                         &recorders,
                         &crate::gates::AttemptOutcome {

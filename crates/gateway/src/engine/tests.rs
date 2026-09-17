@@ -762,6 +762,29 @@ impl crate::gates::HealthRecorder for PhaseRecorder {
     }
 }
 
+/// A `HealthRecorder` that records `(phase, success, output_tokens)` for
+/// every dispatch. SP-ROUTE-1 Task 5 review (Important 1): the throughput
+/// test originally asserted `mean_tokens_per_sec > 0.0`, which cannot fail —
+/// `throughput_samples == 1`, checked two lines earlier, already forces
+/// `ms > 0 && t > 0` (see `PerformanceRecorder::on_outcome`), so ANY positive
+/// token count derives a positive rate. Swapping `output_tokens.output_tokens`
+/// for `.input_tokens` at the dispatch site (500 → 1000) survived the whole
+/// suite. This recorder captures the dispatched count directly and
+/// deterministically, independent of wall-clock arithmetic.
+type RecordedOutcomes = Arc<std::sync::Mutex<Vec<(crate::gates::AttemptPhase, bool, Option<u32>)>>>;
+
+struct OutcomeRecorder(RecordedOutcomes);
+
+impl crate::gates::HealthRecorder for OutcomeRecorder {
+    fn on_outcome(&self, outcome: &crate::gates::AttemptOutcome<'_>) -> Option<std::time::Instant> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((outcome.phase, outcome.success, outcome.output_tokens));
+        None
+    }
+}
+
 #[tokio::test]
 async fn execute_fans_outcome_out_to_registered_recorders() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -833,17 +856,39 @@ async fn execute_tags_a_failed_attempt_complete() {
 /// once the stream is polled; awaiting the setup alone records zero outcomes
 /// and the test would pass vacuously.
 ///
-/// SP-ROUTE-1 Task 5 note: this now asserts TWO phases, not one.
-/// `collect_stream` drives the fixture's stream to completion, and Task 5
-/// added the end-of-stream completion dispatch — every successfully-drained
-/// stream now casts a trailing `StreamCompleted` outcome (its one verdict) in
-/// addition to the leading `StreamAcquired` (latency-only, no verdict) this
-/// test originally pinned alone, before that completion dispatch existed.
-/// The property this test's name claims — acquisition is tagged
-/// `StreamAcquired`, never `Complete` — is unchanged and still the first
-/// element asserted here.
+/// SP-ROUTE-1 Task 5 review (Minor 1): this asserts ONLY `phases[0]` — the
+/// acquisition tag — even though a full successful drive now also casts a
+/// trailing `StreamCompleted` (see `completed_stream_is_tagged_stream_completed_not_complete`).
+/// Splitting the two catchers matters: a single test asserting the whole
+/// two-element vec invites a later "simplification" to `phases[0]` that
+/// would silently delete the completion-tag guard along with it.
 #[tokio::test]
 async fn stream_acquisition_is_tagged_stream_acquired_not_complete() {
+    let mut gw = test_gateway();
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "noop".to_string(),
+        }))
+        .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    let recorded = phases.lock().unwrap();
+    assert_eq!(
+        recorded.first().copied(),
+        Some(crate::gates::AttemptPhase::StreamAcquired),
+        "a stream acquisition must be tagged StreamAcquired, not Complete: {recorded:?}"
+    );
+}
+
+/// SP-ROUTE-1 Task 5 review (Minor 1) — the sibling catcher this split
+/// preserves: a successfully-drained stream's completion outcome must be
+/// tagged `StreamCompleted`, never `Complete` (which would inject generation
+/// time into `mean_latency_ms` — exactly the span-pooling Task 4 fixed).
+#[tokio::test]
+async fn completed_stream_is_tagged_stream_completed_not_complete() {
     let mut gw = test_gateway();
     gw.adapters
         .register_chat(Arc::new(FakeStreamer {
@@ -861,8 +906,7 @@ async fn stream_acquisition_is_tagged_stream_acquired_not_complete() {
             crate::gates::AttemptPhase::StreamAcquired,
             crate::gates::AttemptPhase::StreamCompleted
         ],
-        "a stream acquisition must be tagged StreamAcquired, not Complete — and Task 5's \
-         completion dispatch must follow it as StreamCompleted"
+        "a successfully-drained stream must cast a trailing StreamCompleted outcome, not Complete"
     );
 }
 
@@ -888,6 +932,35 @@ async fn stream_setup_failure_is_tagged_complete() {
         *phases.lock().unwrap(),
         vec![crate::gates::AttemptPhase::Complete],
         "a stream setup failure is final and must be tagged Complete"
+    );
+}
+
+/// SP-ROUTE-1 Task 5 review (Critical 1) — the mid-stream failure terminus
+/// has no phase-tag test at all: `AttemptPhase::StreamCompleted` → `Complete`
+/// on that dispatch survived the whole suite. `Complete` contributes a
+/// LATENCY of generation time, so a stream dying after 9s would inject
+/// 9000ms into `mean_latency_ms` — precisely the span-pooling Task 4 fixed,
+/// and what Task 9 sorts on.
+#[tokio::test]
+async fn stream_mid_failure_is_tagged_stream_completed_not_complete() {
+    let mut gw = test_gateway();
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailer {
+            id: "noop".to_string(),
+        }))
+        .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![
+            crate::gates::AttemptPhase::StreamAcquired,
+            crate::gates::AttemptPhase::StreamCompleted
+        ],
+        "a stream dying mid-way must tag its completion StreamCompleted, not Complete"
     );
 }
 
@@ -2533,6 +2606,137 @@ impl crate::adapters::capability::ChatModel for FakeStreamerWithRealDelay {
     }
 }
 
+/// Like `FakeStreamMidFailer`, but the mid-stream error is caller-supplied.
+/// `FakeStreamMidFailer` hardcodes a `ProviderError`; the SP-ROUTE-1 Task 5
+/// review's cooldown/lockout/escalation tests need OTHER error kinds
+/// (`Timeout` to cool the router, `RateLimit` to lock the endpoint) — the
+/// same closure convention `FakeStreamErrAdapter` already uses for setup
+/// failures, applied to the mid-stream terminus instead.
+struct FakeStreamMidFailerWith {
+    id: String,
+    err: Arc<dyn Fn() -> GatewayError + Send + Sync>,
+}
+
+impl crate::adapters::capability::Model for FakeStreamMidFailerWith {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamMidFailerWith {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::request::StreamChunk;
+        let chunks: Vec<Result<StreamChunk, GatewayError>> = vec![
+            Ok(StreamChunk {
+                content: "partial".to_string(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            }),
+            Err((self.err)()),
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+}
+
+async fn register_stream_mid_err(
+    gw: &Gateway,
+    id: &str,
+    err: impl Fn() -> GatewayError + Send + Sync + 'static,
+) {
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailerWith {
+            id: id.to_string(),
+            err: Arc::new(err),
+        }))
+        .await;
+}
+
+/// A mid-stream failer whose one good chunk carries `usage` — a provider that
+/// reports token counts and then dies. Real (tiny) delay before the error, for
+/// the same reason `FakeStreamerWithRealDelay` needs one: without it,
+/// `duration_ms` truncates to 0 and the M3 mutation (restoring a throughput
+/// sample to the failure dispatch) would be masked by the `ms > 0` guard
+/// rather than caught by the assertion.
+struct FakeStreamMidFailerWithUsage {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for FakeStreamMidFailerWithUsage {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamMidFailerWithUsage {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::cost::TokenUsage;
+        use crate::types::request::StreamChunk;
+        let id = self.id.clone();
+        let stream = async_stream::stream! {
+            yield Ok(StreamChunk {
+                content: "partial".to_string(),
+                finish_reason: None,
+                usage: Some(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    total_tokens: 150,
+                }),
+                tool_calls: Vec::new(),
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            yield Err(GatewayError::ProviderError {
+                adapter: id.clone(),
+                message: "connection reset mid-stream".to_string(),
+                status: Some(500),
+            });
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
 async fn collect_stream(gw: &Gateway, request: &InferenceRequest) -> Vec<StreamEvent> {
     use futures::StreamExt;
     let mut stream = gw
@@ -2544,6 +2748,18 @@ async fn collect_stream(gw: &Gateway, request: &InferenceRequest) -> Vec<StreamE
         events.push(ev);
     }
     events
+}
+
+/// Drive one streaming attempt if the endpoint currently admits one, silently
+/// doing nothing if selection is gated (e.g. the breaker is already Open) —
+/// unlike `collect_stream`, which `.expect()`s a stream and panics on `Err`.
+/// Needed to drive an endpoint PAST the point its breaker opens without the
+/// test panicking on the very call that (correctly) starts failing selection.
+async fn try_drain_stream(gw: &Gateway, request: &InferenceRequest) {
+    use futures::StreamExt;
+    if let Ok(mut stream) = gw.execute_stream(request).await {
+        while stream.next().await.is_some() {}
+    }
 }
 
 #[tokio::test]
@@ -5296,12 +5512,15 @@ async fn a_completed_stream_is_recorded_as_a_success_with_its_throughput() {
         consensus: Default::default(),
     };
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
-    let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+    let mut gw = Gateway::new(config, AdapterRegistry::new(), cb);
     gw.adapters
         .register_chat(Arc::new(FakeStreamerWithRealDelay {
             id: "priced".to_string(),
         }))
         .await;
+    let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders
+        .push(Arc::new(OutcomeRecorder(outcomes.clone())));
 
     let request = InferenceRequest {
         capability: Capability::TextChat,
@@ -5335,10 +5554,455 @@ async fn a_completed_stream_is_recorded_as_a_success_with_its_throughput() {
     );
     assert_eq!(
         stats.throughput_samples, 1,
-        "completion carries the token count"
+        "completion carries the token count — proves the wiring"
     );
+
+    // Deterministic, wall-clock-independent pin on the exact count dispatched
+    // (Important 1): `mean_tokens_per_sec > 0.0` cannot fail once
+    // `throughput_samples == 1` already forces a positive rate, so a scrambled
+    // (but still positive) token count would ship silently. 500 is FakeStreamer's
+    // `output_tokens`; 1000 is its `input_tokens` — a wrong-field swap at the
+    // dispatch site must be visible here.
+    let recorded = outcomes.lock().unwrap();
+    let completion = recorded
+        .iter()
+        .find(|(phase, ..)| *phase == crate::gates::AttemptPhase::StreamCompleted)
+        .expect("a StreamCompleted outcome must have been dispatched");
+    assert_eq!(
+        completion.2,
+        Some(500),
+        "the completion dispatch must carry OUTPUT tokens (500), not input tokens (1000): {recorded:?}"
+    );
+}
+
+// --- SP-ROUTE-1 Task 5 review fixes: one attempt casts one verdict to every
+// health recorder, not just `PerformanceRecorder` ---
+//
+// The review found that `AttemptPhase::StreamAcquired` — deliberately a
+// latency-only observation, per Task 4 — was read ONLY by
+// `PerformanceRecorder`. Every other recorder (`CircuitBreakerSink`,
+// `ModelLockoutSink`, `ConnectionCooldownSink`) treated it as a full
+// observation, so the acquisition dispatch's `success: true` reached
+// `record_success` / `store.clear()` on EVERY streaming attempt — a real
+// production defect (Critical 3 below). The tests in this section drove the
+// mutation that proved it, then pin the `AttemptPhase::is_verdict()` fix.
+
+/// A single-router/single-model ("mid"/"mid") config with NO fallback
+/// candidate — used below so the point of each test is watching ONE
+/// endpoint's health state evolve across repeated attempts, not fallback.
+fn mid_gateway_config() -> GatewayConfig {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "mid".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        "mid".to_string(),
+        ModelConfig {
+            id: "mid".to_string(),
+            api_model_id: None,
+            provider: "mid".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: None,
+            catalog: None,
+        },
+    );
+    GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
+}
+
+/// A chat request pinned directly at the "mid" router/model (no chain).
+fn mid_chat_request() -> InferenceRequest {
+    InferenceRequest {
+        capability: Capability::TextChat,
+        model: Some("mid".to_string()),
+        router: Some("mid".to_string()),
+        chain: None,
+        payload: Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, "hi")],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+        routing: None,
+    }
+}
+
+/// Critical 3, primary symptom. Before the `is_verdict()` fix, the
+/// acquisition dispatch (`success: true`, phase `StreamAcquired`) reached
+/// `CircuitBreakerSink` and called `record_success`, which RESETS
+/// `Closed { failure_count }` to 0. The mid-stream failure then
+/// re-incremented it to 1. Every attempt: 0 → 1 → 0 → 1 — the breaker could
+/// never reach `threshold` no matter how many streams failed halfway.
+#[tokio::test]
+async fn repeated_mid_stream_failures_open_the_breaker() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+        threshold: 5,
+        ..Default::default()
+    });
+    let gw = Gateway::new(mid_gateway_config(), AdapterRegistry::new(), cb.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailer {
+            id: "mid".to_string(),
+        }))
+        .await;
+    let request = mid_chat_request();
+
+    // try_drain_stream tolerates the breaker opening partway through: once
+    // Open, selection gates the candidate and `execute_stream` returns Err
+    // before any stream — a no-op for the loop, not a panic.
+    for _ in 0..10 {
+        try_drain_stream(&gw, &request).await;
+    }
+
+    assert_eq!(
+        cb.get_state("mid:mid").name(),
+        "open",
+        "an endpoint failing every stream halfway must eventually be skipped"
+    );
+}
+
+/// Critical 3, second symptom. A successful stream dispatches TWO
+/// `success: true` outcomes (acquisition, then completion); in `HalfOpen`,
+/// `record_success` increments `success_count` on each — so
+/// `half_open_max_requests: 3` would close the breaker after two streaming
+/// attempts, not three.
+#[tokio::test]
+async fn a_streaming_success_casts_one_breaker_vote_not_two() {
+    use crate::circuit_breaker::BreakerState;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+        threshold: 1,
+        timeout: std::time::Duration::from_millis(0),
+        half_open_max_requests: 3,
+    });
+    // Drive "mid:mid" into HalfOpen directly: one failure to Open, then one
+    // `can_execute` (timeout already expired) for the Open -> HalfOpen
+    // transition — mirrors `circuit_breaker.rs`'s own tests.
+    cb.can_execute("mid:mid");
+    cb.record_failure("mid:mid");
+    assert!(cb.can_execute("mid:mid"), "expired Open must admit");
+    match cb.get_state("mid:mid") {
+        BreakerState::HalfOpen { success_count } => assert_eq!(success_count, 0),
+        other => panic!(
+            "expected HalfOpen{{success_count:0}} before the attempt, got {}",
+            other.name()
+        ),
+    }
+
+    let gw = Gateway::new(mid_gateway_config(), AdapterRegistry::new(), cb.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await;
+
+    match cb.get_state("mid:mid") {
+        BreakerState::HalfOpen { success_count } => assert_eq!(
+            success_count, 1,
+            "one successful streaming attempt must cast exactly one breaker vote"
+        ),
+        other => panic!(
+            "expected still HalfOpen{{success_count:1}}, got {}",
+            other.name()
+        ),
+    }
+}
+
+/// Critical 3, third symptom. A consumer that drops a stream after one chunk
+/// (a normal SSE client disconnect) leaves only the acquisition dispatch on
+/// the wire. That dispatch must NOT hand the breaker a free `record_success`
+/// for an attempt whose outcome nobody knows — proven by pre-seeding a
+/// NONZERO failure count and confirming an abandoned stream does not reset
+/// it. A latency sample IS still legitimately recorded (`PerformanceRecorder`
+/// treats `StreamAcquired` as a latency-only observation, unaffected by this
+/// fix).
+#[tokio::test]
+async fn an_abandoned_stream_casts_no_verdict_at_all() {
+    use crate::circuit_breaker::BreakerState;
+    use futures::StreamExt;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default()); // threshold 5
+    cb.can_execute("mid:mid");
+    cb.record_failure("mid:mid");
+    cb.record_failure("mid:mid");
+    match cb.get_state("mid:mid") {
+        BreakerState::Closed { failure_count } => assert_eq!(failure_count, 2),
+        other => panic!(
+            "expected Closed{{failure_count:2}} before the attempt, got {}",
+            other.name()
+        ),
+    }
+
+    let gw = Gateway::new(mid_gateway_config(), AdapterRegistry::new(), cb.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let mut stream = gw
+        .execute_stream(&mid_chat_request())
+        .await
+        .expect("stream should start");
+    let first = stream.next().await;
     assert!(
-        stats.mean_tokens_per_sec > 0.0,
-        "a real rate was derived: {stats:?}"
+        matches!(first, Some(StreamEvent::Chunk { .. })),
+        "expected the first chunk, got {first:?}"
+    );
+    drop(stream); // abandon mid-stream — never polled again
+
+    match cb.get_state("mid:mid") {
+        BreakerState::Closed { failure_count } => assert_eq!(
+            failure_count, 2,
+            "an abandoned stream must not reset the failure count via a phantom record_success"
+        ),
+        other => panic!("the breaker must stay Closed{{2}}, got {}", other.name()),
+    }
+
+    let stats = gw
+        .performance_stats("mid:mid")
+        .expect("the acquisition latency observation IS legitimately recorded");
+    assert_eq!(
+        stats.verdict_samples, 0,
+        "nobody knows whether the abandoned stream succeeded or failed"
+    );
+    assert_eq!(
+        stats.samples, 1,
+        "the acquisition dispatch still contributes a latency sample"
+    );
+}
+
+/// Critical 2 — half of AC9 had no test at all: mutating the mid-stream
+/// dispatch's `error: Some(&e)` to `error: None` survived the whole suite
+/// (358/358). `ConnectionCooldownSink` matches on `o.error`, so a mid-stream
+/// transport fault must reach it exactly as a setup-time one already does.
+#[tokio::test]
+async fn a_mid_stream_timeout_cools_the_router() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::Timeout {
+        adapter: "mid".to_string(),
+        model: "mid".to_string(),
+        duration_ms: 1,
+    })
+    .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await;
+
+    assert!(
+        gw.cooldown.cooling_until("mid").is_some(),
+        "a mid-stream Timeout must cool the router exactly like a setup-time one"
+    );
+}
+
+/// Critical 2, second half — the same gap on the lockout sink: a mid-stream
+/// 429 must lock the endpoint exactly like a setup-time one.
+#[tokio::test]
+async fn a_mid_stream_rate_limit_locks_the_endpoint() {
+    use crate::gates::lockout::{LockReason, ModelLockoutRead};
+
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::RateLimit {
+        adapter: "mid".to_string(),
+        retry_after_ms: Some(2000),
+    })
+    .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await;
+
+    let locked = gw
+        .model_lockout
+        .locked("mid:mid")
+        .expect("a mid-stream 429 must lock the endpoint exactly like a setup-time one");
+    assert_eq!(locked.reason, LockReason::RateLimit);
+}
+
+/// Important 3 — a single mid-stream 429 now locks the endpoint, so on a
+/// single-candidate config the NEXT `execute_stream` is gated before any
+/// stream starts: `Err(AllGated { resume_after: Some(_) })`, which the
+/// orchestrator turns into a durable pause. A defensible policy, but a new
+/// user-visible escalation with no test before this — pinned here.
+#[tokio::test]
+async fn a_mid_stream_rate_limit_pauses_the_next_stream_request() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::RateLimit {
+        adapter: "mid".to_string(),
+        retry_after_ms: Some(2000),
+    })
+    .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await; // locks "mid:mid"
+
+    match gw.execute_stream(&mid_chat_request()).await {
+        Err(GatewayError::AllGated { resume_after, .. }) => {
+            assert!(
+                resume_after.is_some(),
+                "a timed 429 lock must carry a resume instant, not fail outright"
+            );
+        }
+        Err(other) => panic!("expected AllGated, got: {other}"),
+        Ok(_) => {
+            panic!("expected the SECOND stream request to be paused as AllGated, not admitted")
+        }
+    }
+}
+
+/// Important 3, secondary — the OTHER practical effect of the C3 fix. Before
+/// it, the acquisition dispatch's `store.clear(o.endpoint)` in
+/// `ModelLockoutSink` (its `success: true` branch) ran on EVERY streaming
+/// attempt, wiping the escalation counter immediately before the mid-stream
+/// failure dispatch that followed in the SAME attempt — so a relock after a
+/// prior lock expired always looked like a fresh lock (escalation reset to
+/// 0) and could never escalate past the base backoff.
+#[tokio::test]
+async fn a_second_mid_stream_rate_limit_escalates_past_the_first() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::RateLimit {
+        adapter: "mid".to_string(),
+        retry_after_ms: None, // synthetic backoff, so escalation shows up in `until`
+    })
+    .await;
+    let now = Instant::now();
+
+    // Pre-seed as though a first lock -> release cycle already happened: an
+    // EXPIRED rate-limit lock at escalation 0 — exactly what a real first
+    // mid-stream 429 leaves behind once its base cooldown elapses.
+    gw.apply_lockout(
+        "mid:mid",
+        crate::gates::lockout::LockReason::RateLimit,
+        Some(now - std::time::Duration::from_secs(1)),
+    );
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await; // a genuine relock
+
+    use crate::gates::lockout::ModelLockoutRead;
+    let until = gw
+        .model_lockout
+        .locked("mid:mid")
+        .expect("relocked")
+        .until
+        .expect("timed lock");
+    let base = crate::gates::lockout::ModelLockoutPolicy::default().rate_limit_base;
+    assert!(
+        until > now + base + std::time::Duration::from_secs(30),
+        "a genuine relock must escalate strictly past the base backoff (~60s): \
+         until={until:?} now+base={:?}",
+        now + base
+    );
+}
+
+/// Minor 2 — the completion dispatch sits BEFORE `yield StreamEvent::Done` in
+/// `stream.rs`, and that ordering is load-bearing: in an `async_stream`
+/// generator, code after a `yield` runs only on the NEXT poll. A real SSE
+/// handler that stops polling once it observes the terminal `Done` event (as
+/// any sane consumer does) would never resume the generator far enough to
+/// run a dispatch placed AFTER that yield — the verdict would silently
+/// vanish. `collect_stream` drains to `None` and would not catch a
+/// regression here; this test stops exactly where a real consumer stops.
+#[tokio::test]
+async fn a_consumer_that_stops_at_done_still_sees_its_verdict_recorded() {
+    use futures::StreamExt;
+
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let mut stream = gw
+        .execute_stream(&mid_chat_request())
+        .await
+        .expect("stream should start");
+    loop {
+        match stream.next().await {
+            Some(StreamEvent::Done { .. }) => break,
+            Some(_) => continue,
+            None => panic!("stream ended without a terminal Done event"),
+        }
+    }
+    drop(stream); // stop exactly where a real consumer stops — no further polling
+
+    let stats = gw
+        .performance_stats("mid:mid")
+        .expect("recorded by the time Done was observed");
+    assert_eq!(
+        stats.verdict_samples, 1,
+        "the verdict must already be recorded once Done is observed, not only after the \
+         stream is fully drained to None"
+    );
+}
+
+/// Minor 3 — a mid-stream failure's dispatch must carry `output_tokens:
+/// None`, even when the provider's last good chunk reported usage. A failed
+/// attempt has no meaningful rate; contributing a throughput sample for it
+/// would let Task 9 average in a broken attempt's partial output.
+#[tokio::test]
+async fn a_mid_stream_failure_with_usage_contributes_no_throughput() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailerWithUsage {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
+
+    let stats = gw.performance_stats("mid:mid").expect("recorded");
+    assert_eq!(
+        stats.throughput_samples, 0,
+        "a failed attempt must not contribute a throughput sample, even though its last \
+         chunk carried usage: {stats:?}"
     );
 }

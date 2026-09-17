@@ -35,6 +35,17 @@ impl CircuitBreakerSink {
 
 impl HealthRecorder for CircuitBreakerSink {
     fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<std::time::Instant> {
+        // A `StreamAcquired` outcome is a latency observation, not a verdict —
+        // the completion dispatch for this same attempt (or nothing, if the
+        // consumer abandoned the stream) is the one that gets a vote. Without
+        // this guard, `success: true` at acquisition reached `record_success`
+        // on EVERY streaming attempt, resetting `Closed { failure_count }` to
+        // 0 right before the completion dispatch could increment it — the
+        // breaker could never reach `threshold` no matter how many streams
+        // failed mid-way (SP-ROUTE-1 Task 5 review, Critical 3).
+        if !o.phase.is_verdict() {
+            return None;
+        }
         if o.success {
             self.breaker.record_success(o.endpoint);
             None

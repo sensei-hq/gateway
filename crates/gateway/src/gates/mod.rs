@@ -68,9 +68,7 @@ pub trait AdmissionGate: Send + Sync {
     fn evaluate(&self, cand: &CandidateView<'_>, ctx: &SelectionCtx<'_>) -> GateVerdict;
 }
 
-/// What an `AttemptOutcome` is an observation OF. Read only by
-/// `PerformanceRecorder`; the health recorders (breaker/cooldown/lockout)
-/// ignore it — `success`/`error` mean exactly what they always have to them.
+/// What an `AttemptOutcome` is an observation OF.
 ///
 /// This exists because one streaming attempt produces TWO `AttemptOutcome`
 /// dispatches (acquisition, then completion), and naively treating both as
@@ -80,6 +78,18 @@ pub trait AdmissionGate: Send + Sync {
 /// because the acquisition success is counted alongside the mid-stream
 /// failure. `AttemptPhase` is how `PerformanceRecorder` tells which of the
 /// two spans `duration_ms` is, and which outcome (if either) is the verdict.
+///
+/// EVERY `HealthRecorder` honours [`is_verdict`](AttemptPhase::is_verdict), not
+/// only `PerformanceRecorder` — a SP-ROUTE-1 Task 5 review finding. Letting
+/// `StreamAcquired`'s `success: true` reach `CircuitBreakerSink` /
+/// `ModelLockoutSink` made the circuit breaker structurally unable to trip on
+/// a mid-stream failure (its `record_success` reset the failure count that the
+/// failure dispatch then re-incremented, every attempt: 0 → 1 → 0 → 1) and
+/// silently halved the half-open probe budget for streaming (two
+/// `success: true` votes per attempt instead of one). `PerformanceRecorder`
+/// still needs the full three-way match (latency vs. verdict vs. neither), so
+/// it does not use this method — the other three recorders only ever need the
+/// verdict/non-verdict binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptPhase {
     /// A complete request/response. `duration_ms` is time-to-response and the
@@ -95,6 +105,22 @@ pub enum AttemptPhase {
     /// comparable to the other two phases' `duration_ms`, so it contributes no
     /// latency observation. The verdict is final.
     StreamCompleted,
+}
+
+impl AttemptPhase {
+    /// Whether this outcome is a VERDICT on the attempt, as opposed to a
+    /// latency observation made while it is still in flight.
+    ///
+    /// `StreamAcquired` is the only phase that is not. A completion outcome
+    /// for the same attempt always follows it — or the consumer abandoned the
+    /// stream, in which case nobody knows whether it succeeded and no
+    /// recorder should guess. Every health recorder honours this, not just
+    /// `PerformanceRecorder`: letting acquisition vote made the circuit
+    /// breaker structurally unable to trip on mid-stream failure, and
+    /// silently halved the half-open probe budget for streaming.
+    pub fn is_verdict(self) -> bool {
+        !matches!(self, AttemptPhase::StreamAcquired)
+    }
 }
 
 /// A single attempt's outcome, fed to the write-side recorders. `endpoint` is the
@@ -119,8 +145,9 @@ pub struct AttemptOutcome<'a> {
     /// Output tokens, when the attempt produced a countable response. `None`
     /// for a setup failure or a stream-acquisition dispatch.
     pub output_tokens: Option<u32>,
-    /// What this outcome observes — see [`AttemptPhase`]. Read only by
-    /// `PerformanceRecorder`.
+    /// What this outcome observes — see [`AttemptPhase`]. Read by every
+    /// `HealthRecorder` via [`AttemptPhase::is_verdict`], and additionally by
+    /// `PerformanceRecorder` for the latency/verdict/neither three-way split.
     pub phase: AttemptPhase,
 }
 
