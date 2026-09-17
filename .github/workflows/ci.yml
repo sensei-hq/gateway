@@ -80,6 +80,15 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
+      # `local` is not a default feature, so nothing else in CI ever compiles
+      # the code behind it — `facade.rs`'s test module silently stopped
+      # compiling on 2026-07-23 and no gate noticed. This is cheap: gateway's
+      # `local` feature pulls only `dep:local-engine`, whose own default
+      # feature set is empty, so no native engine (llama-cpp / ort / kokoro)
+      # is built.
+      - name: Check non-default features compile
+        run: cargo check -p sensei-gateway --features local --all-targets --locked
+
       # The schema the DB tests expect. dbd owns `database/`; `_apply_all.sql` is
       # its generated all-in-one apply, and every statement is `create ... if not
       # exists`, so this is idempotent. ON_ERROR_STOP makes a bad statement fail the
