@@ -19,7 +19,7 @@
 | 1 | `83a5371` · `ba5e93f` · `cd1fcc7` | ✅ done, two review rounds |
 | 2 | `cf19179` | ✅ done, reviewed jointly with Task 3 |
 | 3 | `da0dfb5` · `6e5cfa5` | ✅ done, 2 Critical + 3 Important fixed |
-| 4 | `edab9c4` · `1b75dae` | ✅ done; review forced an `AttemptPhase` design fix — see below |
+| 4 | `edab9c4` · `1b75dae` · `1ac3597` | ✅ done after 3 review rounds; forced an `AttemptPhase` design fix and a new `verdict_samples` field — see below |
 | 5–12 | — | pending |
 
 **Task 4 changed the design, and Tasks 5 / 7 / 9 inherit it.** The review found that
@@ -36,6 +36,13 @@ verdict and a throughput but no latency. One attempt, one vote.
 
 `dispatch_outcome` now takes `&AttemptOutcome` rather than seven positional arguments. Task 5's
 snippets below are already updated for both changes.
+
+**`EndpointStats` also gained `verdict_samples`, and Tasks 7 and 9 MUST read it.** The third
+review round found that `success_rate: 0.0` is byte-identical whether every attempt failed or no
+attempt has voted yet. Reading the rate without checking the count gives an unmeasured endpoint
+weight zero — and on a cold process that is every candidate, so a healthy fleet would route as
+though every provider were dead. The same hazard applies to `throughput_samples` in Task 9. Both
+tasks' code and fixtures below are already updated; do not "simplify" the `.filter(|s| s.verdict_samples > 0)` away.
 
 Off-slice, landed alongside: `5208952` — revived `facade.rs`'s test module (uncompilable since
 2026-07-23) and added a `cargo check -p sensei-gateway --features local --all-targets` CI step,
@@ -1661,6 +1668,11 @@ In `crates/gateway/src/strategy.rs`'s `mod tests`. Extend the `sm` helper to tak
                 endpoint.ends_with(":dead").then_some(EndpointStats {
                     samples: 10,
                     throughput_samples: 0,
+                    // Task 4 added `verdict_samples`. It must be NON-ZERO here or
+                    // this fixture means "no verdicts yet", not "every attempt
+                    // failed" — and `reliability` below must treat those two
+                    // differently, which is the whole point of the field.
+                    verdict_samples: 10,
                     mean_latency_ms: 100.0,
                     mean_tokens_per_sec: 0.0,
                     success_rate: 0.0,
@@ -1673,6 +1685,50 @@ In `crates/gateway/src/strategy.rs`'s `mod tests`. Extend the `sm` helper to tak
             GroupedWeightedStrategy.order(&mut v, &test_ctx(&DeadEndpoint, &rng));
             assert_eq!(names(&v), vec!["live", "dead"], "seed {seed}");
         }
+    }
+
+    /// The other side of `verdict_samples`, and the one that would take down a
+    /// healthy fleet rather than one endpoint.
+    ///
+    /// An endpoint with live samples but NO verdict yet reports
+    /// `success_rate: 0.0` — byte-identical to one whose every attempt failed.
+    /// Reading that number without checking `verdict_samples` gives it weight
+    /// zero, which drops it into the never-drawn bucket. On a cold process that
+    /// is EVERY candidate, so a perfectly healthy fleet would route as though
+    /// every provider were dead. Unmeasured must weigh 1.0.
+    #[test]
+    fn an_endpoint_with_no_verdict_yet_is_weighted_as_healthy() {
+        struct AcquiredOnly;
+        impl EndpointPerformanceRead for AcquiredOnly {
+            fn stats(&self, _endpoint: &str) -> Option<EndpointStats> {
+                Some(EndpointStats {
+                    samples: 5,
+                    throughput_samples: 0,
+                    verdict_samples: 0, // no verdict has been cast
+                    mean_latency_ms: 100.0,
+                    mean_tokens_per_sec: 0.0,
+                    success_rate: 0.0, // the fallback, NOT "everything failed"
+                })
+            }
+        }
+        // Prices 1 and 3, so with reliability 1.0 the cheap one leads ~9/10.
+        // If the unmeasured endpoints were weighed 0.0 instead, BOTH would be
+        // zero-weight and the ratio would collapse to the stable input order.
+        let rng = SplitMix64::seeded(0xFEED);
+        let mut cheap_first = 0;
+        const N: usize = 2000;
+        for _ in 0..N {
+            let mut v = vec![sm_cost("dear", 1, Some(3.0)), sm_cost("cheap", 1, Some(1.0))];
+            GroupedWeightedStrategy.order(&mut v, &test_ctx(&AcquiredOnly, &rng));
+            if v[0].model == "cheap" {
+                cheap_first += 1;
+            }
+        }
+        let share = cheap_first as f64 / N as f64;
+        assert!(
+            (share - 0.9).abs() < 0.04,
+            "unmeasured must weigh 1.0, so price weighting still applies; got {share}"
+        );
     }
 
     /// Groups never interleave: a priority-2 candidate cannot precede a
@@ -1761,9 +1817,17 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
     for m in group {
         let cost = m.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
         let endpoint = format!("{}:{}", m.router, m.model);
+        // `success_rate` reads 0.0 BOTH when every attempt failed and when no
+        // attempt has cast a verdict yet. `verdict_samples` (Task 4) is the only
+        // way to tell those apart, and the difference is not cosmetic: without
+        // the filter, a cold process — or any endpoint whose ring holds only
+        // `StreamAcquired` samples — weighs 0.0 and lands in the never-drawn
+        // bucket, so a healthy fleet would route as though every provider were
+        // dead. Unmeasured must weigh 1.0.
         let reliability = ctx
             .perf
             .stats(&endpoint)
+            .filter(|s| s.verdict_samples > 0)
             .map(|s| s.success_rate)
             .unwrap_or(1.0);
         match classify(cost, reliability) {
@@ -1925,6 +1989,7 @@ git commit -m "feat(gateway): PriceStrategy for sort=price (SP-ROUTE-1 Task 8, A
                 .map(|(_, samples, latency, tps)| EndpointStats {
                     samples: *samples,
                     throughput_samples: *samples,
+                    verdict_samples: *samples,
                     mean_latency_ms: *latency,
                     mean_tokens_per_sec: *tps,
                     success_rate: 1.0,
