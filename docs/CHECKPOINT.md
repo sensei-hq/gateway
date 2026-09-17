@@ -1,46 +1,51 @@
 # Checkpoint
 
-**SP-ROUTE-1 brainstorm COMPLETE — design spec committed, awaiting review.** On `develop`
-(`2d18fb3`, docs-only). Spec:
-`docs/superpowers/specs/2026-09-17-sp-route-1-provider-routing-preferences-design.md`.
+**SP-ROUTE-1 — Tasks 1–3 of 12 done, reviewed, pushed** (`51e73b9` on `develop`).
+Spec: `docs/superpowers/specs/2026-09-17-sp-route-1-provider-routing-preferences-design.md`
+Plan: `docs/superpowers/plans/2026-09-17-sp-route-1-provider-routing-preferences.md`
+(carries a Progress table and a "review lesson" section).
 
-## The slice
+## Done
 
-An OpenRouter-shaped provider-routing surface on `InferenceRequest`: `sort`
-(price/latency/throughput), `only`/`ignore` filters, explicit `order`, and price-weighted
-uptime-aware selection as the **default**. Lands on `RoutingStrategy` (`strategy.rs:5`) — the
-seam SP-0 reserved for exactly this.
+**T1** request types (`83a5371`, `ba5e93f`, `cd1fcc7`) — `RoutingPreferences` on `InferenceRequest`.
+**T2** `SkipReason::ExcludedByPolicy`, Structural (`cf19179`).
+**T3** `RoutingPolicyGate` for `only`/`ignore`, registered **first** (`da0dfb5`, `6e5cfa5`).
 
-## Decisions (§3, D1–D8)
+Suite: 334 gateway / 1803 workspace passed, 0 failed.
 
-Per-request not per-chain · all four knobs · separate `routers`/`models` lists · weighted-random
-IS the default **but scoped to equal-priority groups** · in-memory rolling window for metrics ·
-mid-stream failure fix folded in · preferences deliberately do **not** reach orchestrator nodes
-(they would have to join `input_hash` or a resume replays a memo from the old policy).
+**Next:** Task 4 — `gates/performance.rs` (`EndpointPerformanceRead` + bounded-ring
+`PerformanceStore` + `PerformanceRecorder`; extend `AttemptOutcome` with `duration_ms` +
+`output_tokens`; wire the store into `Gateway` before `recorders`). **Blocks T5 and T7.**
 
-## Three facts that stopped it being a literal transplant
+## The review lesson — now a plan requirement for T4–12
 
-1. Chain entries are different **models**, not interchangeable providers of one model — so
-   whole-chain inverse-square weighting inverts authored intent. Hence equal-priority grouping;
-   and since `assemble()` reassigns strictly distinct priorities (`assemble.rs:145-154`), the new
-   default is **byte-identical on every chain that exists today**.
-2. `estimate_cost` returns `None` for unpriced models (`selection.rs:169`) and the repo is full of
-   free local ones ⇒ `1/cost²` undefined. Free-first is that formula's limit taken honestly.
-3. `format!("{router}:{model}")` **cannot be parsed back** (model ids contain colons), ruling out
-   a flat selector namespace.
+Every Critical/Important finding so far was a test that cannot fail on the thing its name claims,
+usually the negative half asserted without the positive half. T3's gate could have excluded
+**every** candidate and passed 332/332. So: assert the positive half, name the mutation up front
+and actually run it, and test the mirror case of any two-axis rule.
 
-## Defect found + folded in (D7/§7, AC9)
+## Corrected spec claim
 
-Streaming `dispatch_outcome(success=true)` fires the instant a stream is **obtained**
-(`stream.rs:230`), and the mid-stream error path (`stream.rs:250-259`) returns **without
-dispatching** — so a stream that dies halfway is recorded to every health recorder as a *success*.
-Fixed here because §5.1 weights on reliability. Accepted change: mid-stream failures now count
-toward the breaker for the first time.
+§4.2 said `only` → `ignore` as if observable. **False** — both are pure predicates, so admission is
+the commutative conjunction `only_ok && !ignore_match`; swapping the blocks left the suite green.
+Fixed. `order`/`sort` *are* genuinely sequence-dependent (T10), which is why it mattered.
 
-**Next:** `superpowers:writing-plans` over the spec, once the user approves it.
+## Off-slice, landed
 
-## State
+`5208952` — revived `crates/gateway/src/facade.rs`'s test module (uncompilable since 2026-07-23)
+and added `cargo check -p sensei-gateway --features local --all-targets` to `ci.yml`. **No CI job
+had ever enabled a non-default feature.** The revived test passes.
 
-Open questions: none blocking. Known-broken: nothing — docs-only, suite untouched, pre-commit
-fmt + clippy green. Prior checkpoint pointed at SP-7b/`build`; that is **complete and on `main`**
-(PR #54/#59) — stale state, not abandoned work.
+## Carry-forwards
+
+1. `CandidateSet` derives `Eq`/`Hash`, but they are order/duplicate-sensitive over `Vec<String>`
+   while its doc calls the axes sets — do NOT key a `HashMap` on it without normalizing. T3 uses
+   linear scans and is immune.
+2. `engine::exhaustion` + `all_gated_error` + `GateContribution` widened `pub(super)`→`pub(crate)`
+   for one test; proven minimal (reverting `GateContribution` gives 2 hard errors).
+3. New kernel types are not re-exported from `kernel/src/lib.rs`; `tests/reexport_paths.rs` not
+   extended. Decide at T10.
+4. `#[ignore]`d `a_requests_routing_preferences_reach_selection` in `engine/tests.rs` — T10 Step 4
+   un-ignores it. **It is the only thing that would catch the whole feature being inert.**
+
+Open questions: none. Known-broken: nothing.
