@@ -267,6 +267,35 @@ impl super::Gateway {
                                 }
                             }
                             Err(e) => {
+                                // A stream that dies after first byte is a FAILURE, and
+                                // the recorders have to hear about it. Before SP-ROUTE-1
+                                // this path returned silently while the acquisition
+                                // dispatch had already fired, so an endpoint failing
+                                // every stream halfway looked perfectly healthy — which
+                                // the default strategy's reliability multiplier would
+                                // then have weighted traffic toward.
+                                //
+                                // The returned deadline is discarded: the caller has
+                                // already committed to this stream and there is no
+                                // fallback left to schedule. Surfacing it on the yielded
+                                // `StreamEvent::Error` would change that event's payload
+                                // and is deliberately out of scope (spec §12).
+                                let _ = super::dispatch_outcome(
+                                    &recorders,
+                                    &crate::gates::AttemptOutcome {
+                                        endpoint: &endpoint,
+                                        router: &candidate.router,
+                                        success: false,
+                                        error: Some(&e),
+                                        duration_ms: stream_start.elapsed().as_millis() as u64,
+                                        output_tokens: usage_acc.map(|u| u.output_tokens),
+                                        // The stream ENDED, badly. This is the attempt's
+                                        // one and only verdict — the acquisition dispatch
+                                        // deliberately cast none — and its duration is
+                                        // generation time, so it contributes no latency.
+                                        phase: crate::gates::AttemptPhase::StreamCompleted,
+                                    },
+                                );
                                 // Mid-stream failure: bytes already sent, so no
                                 // fallback — surface and stop.
                                 yield StreamEvent::Error {
@@ -280,6 +309,25 @@ impl super::Gateway {
                     }
 
                     let tokens = usage_acc.unwrap_or_default();
+
+                    // Throughput is only knowable here. The acquisition dispatch at the
+                    // top of this block recorded LATENCY (time until the stream started
+                    // producing); this second dispatch records the generation rate and
+                    // this attempt's one verdict. The two durations measure different
+                    // spans, and `AttemptPhase` is what keeps them out of one mean.
+                    let _ = super::dispatch_outcome(
+                        &recorders,
+                        &crate::gates::AttemptOutcome {
+                            endpoint: &endpoint,
+                            router: &candidate.router,
+                            success: true,
+                            error: None,
+                            duration_ms: stream_start.elapsed().as_millis() as u64,
+                            output_tokens: Some(tokens.output_tokens),
+                            phase: crate::gates::AttemptPhase::StreamCompleted,
+                        },
+                    );
+
                     let cost = candidate
                         .model_config
                         .pricing

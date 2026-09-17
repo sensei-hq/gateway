@@ -832,6 +832,16 @@ async fn execute_tags_a_failed_attempt_complete() {
 /// dispatch happens inside the `async_stream` generator body, which only runs
 /// once the stream is polled; awaiting the setup alone records zero outcomes
 /// and the test would pass vacuously.
+///
+/// SP-ROUTE-1 Task 5 note: this now asserts TWO phases, not one.
+/// `collect_stream` drives the fixture's stream to completion, and Task 5
+/// added the end-of-stream completion dispatch — every successfully-drained
+/// stream now casts a trailing `StreamCompleted` outcome (its one verdict) in
+/// addition to the leading `StreamAcquired` (latency-only, no verdict) this
+/// test originally pinned alone, before that completion dispatch existed.
+/// The property this test's name claims — acquisition is tagged
+/// `StreamAcquired`, never `Complete` — is unchanged and still the first
+/// element asserted here.
 #[tokio::test]
 async fn stream_acquisition_is_tagged_stream_acquired_not_complete() {
     let mut gw = test_gateway();
@@ -847,8 +857,12 @@ async fn stream_acquisition_is_tagged_stream_acquired_not_complete() {
 
     assert_eq!(
         *phases.lock().unwrap(),
-        vec![crate::gates::AttemptPhase::StreamAcquired],
-        "a stream acquisition must be tagged StreamAcquired, not Complete"
+        vec![
+            crate::gates::AttemptPhase::StreamAcquired,
+            crate::gates::AttemptPhase::StreamCompleted
+        ],
+        "a stream acquisition must be tagged StreamAcquired, not Complete — and Task 5's \
+         completion dispatch must follow it as StreamCompleted"
     );
 }
 
@@ -2383,6 +2397,139 @@ impl crate::adapters::capability::ChatModel for FakeStreamFailer {
             message: "stream setup failed".to_string(),
             status: Some(self.status),
         })
+    }
+}
+
+/// Chat adapter whose `chat_stream` yields one good chunk then an error — a
+/// stream that dies AFTER the caller has committed to it. Distinct from
+/// `FakeStreamFailer`, which fails at setup and is already covered.
+struct FakeStreamMidFailer {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for FakeStreamMidFailer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamMidFailer {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::request::StreamChunk;
+        let chunks: Vec<Result<StreamChunk, GatewayError>> = vec![
+            Ok(StreamChunk {
+                content: "partial".to_string(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            }),
+            Err(GatewayError::ProviderError {
+                adapter: self.id.clone(),
+                message: "connection reset mid-stream".to_string(),
+                status: Some(500),
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+}
+
+/// Same chunk shape as `FakeStreamer` (two content chunks then a terminal
+/// chunk carrying `TokenUsage { output_tokens: 500 }`), but with a real
+/// (tiny) delay before the terminal chunk.
+///
+/// Why this exists rather than reusing `FakeStreamer` directly: the
+/// `StreamCompleted` dispatch times generation with `std::time::Instant`,
+/// a real wall clock that tokio's mock-time (`test-util`) cannot advance.
+/// `FakeStreamer`'s chunks come from a synchronous `futures::stream::iter`,
+/// so a whole attempt completes in low-microseconds — `duration_ms` always
+/// truncates to 0, and `PerformanceRecorder::on_outcome`'s `ms > 0` guard
+/// then (correctly) declines to invent a throughput sample. That guard is
+/// exactly right in production (no rate should ever be reported over an
+/// unmeasurable span); it just means a throughput assertion needs a fixture
+/// where measurable time genuinely elapses.
+struct FakeStreamerWithRealDelay {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for FakeStreamerWithRealDelay {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamerWithRealDelay {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::cost::TokenUsage;
+        use crate::types::request::StreamChunk;
+        let stream = async_stream::stream! {
+            yield Ok(StreamChunk {
+                content: "Hello, ".to_string(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            });
+            yield Ok(StreamChunk {
+                content: "world!".to_string(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            });
+            // The real, unmocked delay this fixture exists for.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            yield Ok(StreamChunk {
+                content: String::new(),
+                finish_reason: Some("stop".to_string()),
+                usage: Some(TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 500,
+                    total_tokens: 1500,
+                }),
+                tool_calls: Vec::new(),
+            });
+        };
+        Ok(Box::pin(stream))
     }
 }
 
@@ -5004,4 +5151,194 @@ async fn execute_stream_gates_on_the_context_window_like_execute() {
              provider would answer 400 mid-stream, after the caller has committed"
         ),
     }
+}
+
+/// AC9 — a stream that fails after its first chunk must reach the health
+/// recorders as a FAILURE.
+///
+/// Before this fix the mid-stream error path returned without dispatching at
+/// all, while the acquisition dispatch had already fired — so an endpoint
+/// failing every stream halfway looked perfectly healthy.
+///
+/// `success_rate` must be 0.0, NOT 0.5. Task 4's `StreamAcquired` phase casts
+/// no verdict precisely so that one attempt yields one vote; 0.5 was the floor
+/// that made it impossible for Task 7's reliability multiplier to de-weight a
+/// totally broken endpoint.
+#[tokio::test]
+async fn a_mid_stream_failure_is_recorded_as_a_failure() {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "mid".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        "mid".to_string(),
+        ModelConfig {
+            id: "mid".to_string(),
+            api_model_id: None,
+            provider: "mid".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: None,
+            catalog: None,
+        },
+    );
+    let config = GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    };
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let request = InferenceRequest {
+        capability: Capability::TextChat,
+        model: Some("mid".to_string()),
+        router: Some("mid".to_string()),
+        chain: None,
+        payload: Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, "hi")],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+        routing: None,
+    };
+
+    let events = collect_stream(&gw, &request).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "the fixture must actually fail mid-stream: {events:?}"
+    );
+
+    let stats = gw
+        .performance_stats("mid:mid")
+        .expect("the attempt must be recorded");
+    assert_eq!(
+        stats.verdict_samples, 1,
+        "one attempt casts exactly one verdict"
+    );
+    assert!(
+        (stats.success_rate - 0.0).abs() < 1e-9,
+        "the single verdict is a failure: {stats:?}"
+    );
+}
+
+/// The positive mirror, and the reason it exists: a test that only checks a
+/// failed stream records a failure also passes against an implementation that
+/// records EVERY stream as a failure.
+#[tokio::test]
+async fn a_completed_stream_is_recorded_as_a_success_with_its_throughput() {
+    use crate::types::config::ModelPricing;
+
+    let mut routers = HashMap::new();
+    routers.insert(
+        "priced".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        "priced".to_string(),
+        ModelConfig {
+            id: "priced".to_string(),
+            api_model_id: None,
+            provider: "priced".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: Some(ModelPricing {
+                input_per_1k: 0.0008,
+                output_per_1k: 0.004,
+                per_request: None,
+            }),
+            catalog: None,
+        },
+    );
+    let config = GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    };
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamerWithRealDelay {
+            id: "priced".to_string(),
+        }))
+        .await;
+
+    let request = InferenceRequest {
+        capability: Capability::TextChat,
+        model: Some("priced".to_string()),
+        router: Some("priced".to_string()),
+        chain: None,
+        payload: Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, "hi")],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+        routing: None,
+    };
+
+    let events = collect_stream(&gw, &request).await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+
+    let stats = gw.performance_stats("priced:priced").expect("recorded");
+    assert_eq!(stats.verdict_samples, 1, "one attempt, one verdict");
+    assert!(
+        (stats.success_rate - 1.0).abs() < 1e-9,
+        "and it succeeded: {stats:?}"
+    );
+    assert_eq!(
+        stats.throughput_samples, 1,
+        "completion carries the token count"
+    );
+    assert!(
+        stats.mean_tokens_per_sec > 0.0,
+        "a real rate was derived: {stats:?}"
+    );
 }
