@@ -125,6 +125,7 @@ mod tests {
             config: &gateway_config,
             router_health: &NeverCooling,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);
@@ -160,6 +161,7 @@ mod tests {
             config: &gateway_config,
             router_health: &NeverCooling,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);

@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use std::time::Instant;
 
 /// One attempted candidate's contribution to exhaustion aggregation.
-pub(super) enum GateContribution {
+pub(crate) enum GateContribution {
     /// Attempted, failed with a recoverable limit that locked it until `Instant`.
     Timed(Instant),
     /// Attempted, failed with a terminal limit needing caller action.
@@ -45,7 +45,7 @@ pub(super) fn contribution_for(
 /// Build the terminal error at chain exhaustion. `Some(AllGated)` iff every
 /// candidate was gated (health-skip or classified limit) and none hard-failed;
 /// `None` ⇒ "not all-gated — use the existing terminal error".
-pub(super) fn all_gated_error(
+pub(crate) fn all_gated_error(
     skipped: &[SkippedCandidate],
     contributions: &[GateContribution],
 ) -> Option<GatewayError> {

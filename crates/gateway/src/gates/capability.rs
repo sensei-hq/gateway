@@ -94,6 +94,7 @@ mod tests {
             config: &gateway_config,
             router_health: &NeverCooling,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         let verdict = CapabilityGate.evaluate(&cand, &ctx);
@@ -129,6 +130,7 @@ mod tests {
             config: &gateway_config,
             router_health: &NeverCooling,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         let verdict = CapabilityGate.evaluate(&cand, &ctx);

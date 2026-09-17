@@ -2,6 +2,7 @@ use crate::skip_reason::SkipReason;
 use crate::types::capability::Capability;
 use crate::types::config::{GatewayConfig, ModelConfig, RouterConfig};
 use crate::types::error::GatewayError;
+use crate::types::request::RoutingPreferences;
 use std::time::Instant;
 
 pub mod budget;
@@ -10,6 +11,7 @@ pub mod circuit_breaker_gate;
 pub mod context_window;
 pub mod cooldown;
 pub mod lockout;
+pub mod routing_policy;
 
 /// Read port for endpoint health (the circuit breaker implements it in Task 4;
 /// cooldown/lockout ports arrive in later SP-0 plans).
@@ -50,6 +52,9 @@ pub struct SelectionCtx<'a> {
     pub config: &'a GatewayConfig,
     pub router_health: &'a dyn RouterHealthRead,
     pub model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
+    /// The request's routing preferences, read by [`routing_policy::RoutingPolicyGate`].
+    /// `None` ⇒ no filtering.
+    pub preferences: Option<&'a RoutingPreferences>,
 }
 
 pub enum GateVerdict {
