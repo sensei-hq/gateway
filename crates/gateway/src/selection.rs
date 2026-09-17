@@ -71,14 +71,14 @@ pub struct SelectionResult {
 /// Resolves which model(s) to use for a given request via 3-tier resolution
 /// (direct, named chain, capability). Structural resolution (router/model
 /// lookup) happens per path; the shared admission pipeline then runs the
-/// ordered [`AdmissionGate`]s (capability, connection cooldown, circuit breaker,
-/// model lockout, budget, context window) and the [`RoutingStrategy`] orders the
-/// admitted candidates. The list below is the one place these are registered — keep
-/// every enumeration in this file in step with it.
+/// ordered [`AdmissionGate`]s (routing policy, capability, connection cooldown,
+/// circuit breaker, model lockout, budget, context window) and the
+/// [`RoutingStrategy`] orders the admitted candidates. The list below is the one
+/// place these are registered — keep every enumeration in this file in step with it.
 pub struct ModelSelectionService<'a> {
     config: &'a GatewayConfig,
-    /// Ordered admission gates: capability, connection cooldown, circuit breaker,
-    /// model lockout, budget, context window.
+    /// Ordered admission gates: routing policy, capability, connection cooldown,
+    /// circuit breaker, model lockout, budget, context window.
     gates: Vec<Box<dyn AdmissionGate>>,
     /// Endpoint health read port (the circuit breaker implements it).
     health: &'a dyn EndpointHealthRead,
@@ -284,8 +284,8 @@ impl<'a> ModelSelectionService<'a> {
     /// `RouterDisabled`), then the model (missing → `ModelNotFound`). No
     /// provider fallback. `priority = 1`; `api_model_id` is 2-level
     /// (model_config override else model id). The shared gate pipeline
-    /// (capability, connection cooldown, circuit breaker, model lockout, budget,
-    /// context window) runs in [`Self::admit`].
+    /// (routing policy, capability, connection cooldown, circuit breaker, model
+    /// lockout, budget, context window) runs in [`Self::admit`].
     fn validate_direct(
         &self,
         router_name: &str,
@@ -358,8 +358,9 @@ impl<'a> ModelSelectionService<'a> {
     /// (falling back to the model's provider), then validate it (missing →
     /// `RouterNotFound`, disabled → `RouterDisabled`). `priority = entry.priority`;
     /// `api_model_id` is 3-level (entry override → model_config → model id). The
-    /// shared gate pipeline (capability, connection cooldown, circuit breaker, model
-    /// lockout, budget, context window) runs in [`Self::admit`].
+    /// shared gate pipeline (routing policy, capability, connection cooldown,
+    /// circuit breaker, model lockout, budget, context window) runs in
+    /// [`Self::admit`].
     fn validate_chain_entry(
         &self,
         entry: &ChainEntry,
@@ -1639,6 +1640,16 @@ mod tests {
             ),
             "and it must contribute nothing to resume_after"
         );
+        assert_eq!(
+            result.selected.as_ref().map(|s| s.model.as_str()),
+            Some("claude-haiku"),
+            "the candidate the filter did NOT name must still be selected"
+        );
+        assert_eq!(
+            result.all_candidates.len(),
+            1,
+            "exactly one candidate survives the ignore"
+        );
     }
 
     /// AC5, other half — excluding EVERY candidate is terminal, not a pause.
@@ -1668,6 +1679,17 @@ mod tests {
         });
 
         assert!(result.all_candidates.is_empty());
+        assert_eq!(
+            result.skipped.len(),
+            2,
+            "both chain candidates must be recorded as skipped"
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .all(|s| matches!(s.reason, SkipReason::ExcludedByPolicy))
+        );
         assert!(
             crate::engine::exhaustion::all_gated_error(&result.skipped, &[]).is_none(),
             "an all-structural exhaustion must NOT become AllGated — no deadline \

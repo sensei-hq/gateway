@@ -143,15 +143,17 @@ impl SkipReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// A policy exclusion is STRUCTURAL, and that is a behaviour rather than a label.
+    /// A policy exclusion is classified STRUCTURAL, and its rendered reason is
+    /// pinned exactly because that string reaches operators verbatim through
+    /// `all_gated_error`'s diagnostics.
     ///
-    /// `all_gated_error` counts only `Timed`/`Terminal` toward `any_gate`
-    /// (`exhaustion.rs`), so a selection excluded entirely by the caller's own
-    /// filters returns `None` from it and surfaces as a terminal `NoCandidates`
-    /// rather than a pause. That is correct: no deadline and no human remedy makes
-    /// a candidate the caller excluded eligible again.
+    /// The consequence of the Structural classification — that a selection
+    /// excluded entirely by the caller's own filters surfaces as a terminal
+    /// `NoCandidates` rather than a pause — is pinned at the whole-service level
+    /// in `selection.rs`'s `excluding_every_candidate_is_terminal_not_pausable`,
+    /// not here.
     #[test]
-    fn a_policy_exclusion_is_structural_and_never_pauses_a_run() {
+    fn a_policy_exclusion_is_classified_structural_and_renders_its_reason() {
         assert!(matches!(
             SkipReason::ExcludedByPolicy.gate_status(),
             GateStatus::Structural
