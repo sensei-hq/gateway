@@ -656,6 +656,38 @@ async fn execute_no_candidates_errors() {
     }
 }
 
+/// A caller's `routing` preferences must actually REACH selection. The two
+/// production `SelectionCriteria` sites (`execute.rs`, `stream.rs`) are the only
+/// path, and until SP-ROUTE-1 Task 10 wires them they hardcode `preferences: None`
+/// — so the whole feature can be built and stay inert with a green suite.
+/// Un-ignore at Task 10 Step 4.
+#[tokio::test]
+#[ignore = "green at SP-ROUTE-1 Task 10 Step 4, which wires request.routing into SelectionCriteria"]
+async fn a_requests_routing_preferences_reach_selection() {
+    let gw = test_gateway();
+    register_noop(&gw).await;
+
+    // `test_config_with_noop`'s only chain has exactly one candidate: router
+    // "noop", model "noop". An `only` naming a router that does not exist
+    // excludes it — and once excluded, nothing is left to try.
+    let mut request = chat_request();
+    request.routing = Some(crate::types::request::RoutingPreferences {
+        only: Some(crate::types::request::CandidateSet {
+            routers: vec!["nonexistent".to_string()],
+            models: vec![],
+        }),
+        ..Default::default()
+    });
+
+    let result = gw.execute(&request).await;
+    assert!(
+        result.is_err(),
+        "the only-router filter names a router absent from the chain, so the sole \
+         candidate must be excluded and the call must fail rather than succeed \
+         (degraded or not) against the noop adapter: {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn execute_with_direct_model() {
     let gw = test_gateway();

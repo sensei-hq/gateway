@@ -30,12 +30,8 @@ impl AdmissionGate for RoutingPolicyGate {
     }
 }
 
-/// `only` then `ignore`, in that order.
-pub(crate) fn admitted_by_policy(
-    prefs: Option<&RoutingPreferences>,
-    router: &str,
-    model: &str,
-) -> bool {
+/// A candidate is admitted iff it satisfies `only` AND is not named by `ignore`.
+fn admitted_by_policy(prefs: Option<&RoutingPreferences>, router: &str, model: &str) -> bool {
     let Some(p) = prefs else { return true };
     if let Some(only) = &p.only
         && !matches_all_axes(only, router, model)
@@ -104,6 +100,31 @@ mod tests {
             admits(&routers_only, "anthropic", "anything"),
             "an EMPTY axis is don't-care, not 'match nothing'"
         );
+
+        let models_only = RoutingPreferences {
+            only: Some(set(&[], &["claude-haiku"])),
+            ..Default::default()
+        };
+        assert!(
+            admits(&models_only, "bedrock", "claude-haiku"),
+            "an EMPTY ROUTERS axis is don't-care too"
+        );
+        assert!(
+            !admits(&models_only, "bedrock", "claude-opus"),
+            "and the non-empty models axis still binds"
+        );
+    }
+
+    /// Degenerate case: BOTH axes of `only` empty admits everything, same as
+    /// `only` being entirely absent. Reachable from the wire as
+    /// `{"routing":{"only":{}}}`.
+    #[test]
+    fn only_with_both_axes_empty_admits_everything() {
+        let p = RoutingPreferences {
+            only: Some(CandidateSet::default()),
+            ..Default::default()
+        };
+        assert!(admits(&p, "any", "thing"));
     }
 
     /// `ignore` is OR across non-empty axes. AND would exclude only the single
@@ -125,10 +146,26 @@ mod tests {
         );
     }
 
-    /// `ignore` is applied AFTER `only`, so it can subtract from an allowlist.
-    /// Reversing the order would let `only` re-admit an ignored candidate.
+    /// A model id containing a colon (`"gemma3:27b"`) must still match via the
+    /// MODELS axis — the two axes are separate fields precisely because the
+    /// `"{router}:{model}"` endpoint key can't be parsed back apart, so this
+    /// checks the model string is compared whole, not split on `:`.
     #[test]
-    fn ignore_subtracts_from_only() {
+    fn ignore_matches_a_colon_bearing_model_id_via_the_models_axis() {
+        let p = RoutingPreferences {
+            ignore: Some(set(&[], &["gemma3:27b"])),
+            ..Default::default()
+        };
+        assert!(!admits(&p, "ollama", "gemma3:27b"));
+        assert!(admits(&p, "ollama", "claude-haiku"));
+    }
+
+    /// `only` and `ignore` compose as a conjunction — passing the allowlist does
+    /// not exempt a candidate from the denylist. The two are order-independent by
+    /// construction (both are pure predicates with an early `return false`); the
+    /// spec's `only → ignore` names pipeline stages, not an observable sequence.
+    #[test]
+    fn ignore_excludes_even_when_only_admits() {
         let p = RoutingPreferences {
             only: Some(set(&["anthropic"], &[])),
             ignore: Some(set(&[], &["claude-opus"])),
