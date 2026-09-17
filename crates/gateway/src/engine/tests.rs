@@ -762,6 +762,43 @@ async fn execute_fans_outcome_out_to_registered_recorders() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
+/// Task 4 review (Important 2): deleting `PerformanceRecorder` from
+/// `build_recorders` passed 342/342 — nothing exercised the wiring between
+/// `Gateway::record_outcome` and `Gateway::performance_stats`. This proves the
+/// whole path end-to-end on a real `Gateway`: a real outcome in, the exact
+/// units out (50 tokens / 1000ms == 50 tok/s) at the boundary a caller sees.
+#[test]
+fn record_outcome_feeds_performance_stats_through_the_real_gateway() {
+    let gw = test_gateway();
+
+    // Asserted BEFORE any outcome is recorded, so the later `expect` cannot be
+    // satisfied by some fallback/default — only a real write makes this `Some`.
+    assert!(
+        gw.performance_stats("r:m").is_none(),
+        "no attempt has been recorded yet"
+    );
+
+    gw.record_outcome(&crate::gates::AttemptOutcome {
+        endpoint: "r:m",
+        router: "r",
+        success: true,
+        error: None,
+        duration_ms: 1000,
+        output_tokens: Some(50),
+        phase: crate::gates::AttemptPhase::Complete,
+    });
+
+    let stats = gw
+        .performance_stats("r:m")
+        .expect("the recorder just wrote a live sample");
+    assert_eq!(stats.samples, 1);
+    assert!(
+        (stats.mean_tokens_per_sec - 50.0).abs() < 1e-9,
+        "50 tokens in 1000ms is 50 tok/s at the Gateway boundary, got {}",
+        stats.mean_tokens_per_sec
+    );
+}
+
 #[tokio::test]
 async fn execute_update_config_takes_effect() {
     let gw = test_gateway();

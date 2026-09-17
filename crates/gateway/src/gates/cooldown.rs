@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::AttemptPhase;
 use super::{
     AdmissionGate, AttemptOutcome, CandidateView, GateVerdict, HealthRecorder, RouterHealthRead,
     SelectionCtx,
@@ -264,6 +266,7 @@ mod tests {
             error: Some(&timeout_err),
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         // The sink returns the `until` it just wrote — a future instant equal to
         // what the store now reports.
@@ -283,6 +286,7 @@ mod tests {
             error: Some(&provider_err),
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert!(returned.is_none(), "non-transport error does not cool");
         assert!(store.cooling_until("B").is_none());
@@ -294,6 +298,7 @@ mod tests {
             error: None,
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert!(returned.is_none(), "success does not cool");
         assert!(store.cooling_until("C").is_none());
@@ -356,6 +361,7 @@ mod tests {
             error: Some(&timeout_err),
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
 
         // Expired pruned; the active cooldown and just-written one survive.
@@ -401,6 +407,7 @@ mod tests {
                 error: Some(&err),
                 duration_ms: 1,
                 output_tokens: None,
+                phase: AttemptPhase::Complete,
             })
             .expect("transport fault cools");
         assert!(until >= now + base, "at least the full base cooldown");
@@ -428,6 +435,7 @@ mod tests {
                 error: Some(&err),
                 duration_ms: 1,
                 output_tokens: None,
+                phase: AttemptPhase::Complete,
             })
             .expect("transport fault cools");
         let jitter = crate::resilience::deterministic_jitter("R", base, 0.5);

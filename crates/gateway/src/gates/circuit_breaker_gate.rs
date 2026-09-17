@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::AttemptPhase;
 use super::{
     AdmissionGate, AttemptOutcome, CandidateView, GateVerdict, HealthRecorder, SelectionCtx,
 };
@@ -186,6 +188,7 @@ mod tests {
             error: None,
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(cb.get_state("r:m").name(), "open"); // threshold 1 → opens on one failure
         let next_retry = match cb.get_state("r:m") {
@@ -202,6 +205,7 @@ mod tests {
             error: None,
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(returned, None, "success returns no wake-up instant");
         assert_eq!(cb.get_state("r:n").name(), "closed");
@@ -220,6 +224,7 @@ mod tests {
             error: None,
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(cb2.get_state("r:o").name(), "closed");
         assert_eq!(

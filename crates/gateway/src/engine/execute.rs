@@ -332,14 +332,15 @@ impl super::Gateway {
             Ok(mut response) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let output_tokens = response.usage.as_ref().map(|u| u.output_tokens);
-                let _ = self.record_outcome(
-                    &endpoint,
-                    &candidate.router,
-                    true,
-                    None,
+                let _ = self.record_outcome(&crate::gates::AttemptOutcome {
+                    endpoint: &endpoint,
+                    router: &candidate.router,
+                    success: true,
+                    error: None,
                     duration_ms,
                     output_tokens,
-                );
+                    phase: crate::gates::AttemptPhase::Complete,
+                });
 
                 // Fill cost: the pre-call estimate from selection, and the
                 // actual dollar cost from the returned token usage × the
@@ -415,14 +416,15 @@ impl super::Gateway {
                 // Capture the instant the recorder pipeline just wrote (for a
                 // recoverable limit that locked this endpoint) so the exhaustion
                 // aggregation can attribute a timed resume to this attempt.
-                let written_until = self.record_outcome(
-                    &endpoint,
-                    &candidate.router,
-                    false,
-                    Some(&err),
+                let written_until = self.record_outcome(&crate::gates::AttemptOutcome {
+                    endpoint: &endpoint,
+                    router: &candidate.router,
+                    success: false,
+                    error: Some(&err),
                     duration_ms,
-                    None,
-                );
+                    output_tokens: None,
+                    phase: crate::gates::AttemptPhase::Complete,
+                });
 
                 // Classify drives the in-flight fallover so the walk and the next-request
                 // lockout agree (design §3.1): a recoverable provider limit (429 / 403-quota)

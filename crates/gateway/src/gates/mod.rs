@@ -68,6 +68,35 @@ pub trait AdmissionGate: Send + Sync {
     fn evaluate(&self, cand: &CandidateView<'_>, ctx: &SelectionCtx<'_>) -> GateVerdict;
 }
 
+/// What an `AttemptOutcome` is an observation OF. Read only by
+/// `PerformanceRecorder`; the health recorders (breaker/cooldown/lockout)
+/// ignore it — `success`/`error` mean exactly what they always have to them.
+///
+/// This exists because one streaming attempt produces TWO `AttemptOutcome`
+/// dispatches (acquisition, then completion), and naively treating both as
+/// full observations pools two unrelated time spans into one latency mean and
+/// lets a single attempt cast two reliability votes — an endpoint that fails
+/// every stream mid-way would converge on `success_rate == 0.5` forever,
+/// because the acquisition success is counted alongside the mid-stream
+/// failure. `AttemptPhase` is how `PerformanceRecorder` tells which of the
+/// two spans `duration_ms` is, and which outcome (if either) is the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptPhase {
+    /// A complete request/response. `duration_ms` is time-to-response and the
+    /// verdict is final. Every non-streaming attempt, and every setup failure
+    /// (streaming or not — no completion dispatch follows a setup failure).
+    Complete,
+    /// A stream was obtained. `duration_ms` is time-to-first-response — the
+    /// same quantity as `Complete`'s, hence comparable — but the verdict is
+    /// NOT final, because a completion outcome for this same attempt always
+    /// follows.
+    StreamAcquired,
+    /// A stream ended. `duration_ms` is GENERATION time, which is not
+    /// comparable to the other two phases' `duration_ms`, so it contributes no
+    /// latency observation. The verdict is final.
+    StreamCompleted,
+}
+
 /// A single attempt's outcome, fed to the write-side recorders. `endpoint` is the
 /// opaque "router:model" key (matches the read-side breaker keying). `router` is
 /// carried separately since `endpoint` can't be split reliably back into
@@ -79,14 +108,20 @@ pub struct AttemptOutcome<'a> {
     pub router: &'a str,
     pub success: bool,
     pub error: Option<&'a GatewayError>,
-    /// Wall time for this attempt, in ms. For a STREAM this is the time until
-    /// the stream was obtained, not the time to complete it — Task 5 adds the
-    /// second, end-of-stream dispatch that carries the generation rate, and the
-    /// two spans are never pooled into one mean.
+    /// Wall time for this attempt/phase, in ms. Its meaning depends on
+    /// `phase` and the three meanings are NOT interchangeable: time-to-response
+    /// for `Complete`, time-to-first-response for `StreamAcquired` (the same
+    /// quantity as `Complete`'s), or generation time for `StreamCompleted`
+    /// (a different quantity, comparable to neither). `PerformanceRecorder`
+    /// reads `phase` to decide whether this value is a latency observation at
+    /// all, rather than pooling unlike spans into one mean.
     pub duration_ms: u64,
     /// Output tokens, when the attempt produced a countable response. `None`
     /// for a setup failure or a stream-acquisition dispatch.
     pub output_tokens: Option<u32>,
+    /// What this outcome observes — see [`AttemptPhase`]. Read only by
+    /// `PerformanceRecorder`.
+    pub phase: AttemptPhase,
 }
 
 /// Reliable write-side reducer: updates authoritative health state from an attempt
