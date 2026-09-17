@@ -19,6 +19,12 @@ pub enum SkipReason {
     RouterNotFound,
     RouterDisabled,
     UnsupportedCapability(Capability),
+    /// The request's own `only`/`ignore` preferences excluded this candidate.
+    ///
+    /// Deliberately carries NO detail. The caller already knows what it asked
+    /// for, and echoing the matched rule back would only widen the diagnostic
+    /// surface for no gain.
+    ExcludedByPolicy,
     OverBudget {
         estimated: f64,
         budget: f64,
@@ -59,6 +65,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::RouterNotFound => write!(f, "router not found"),
             SkipReason::RouterDisabled => write!(f, "router disabled"),
             SkipReason::UnsupportedCapability(c) => write!(f, "does not support {c:?}"),
+            SkipReason::ExcludedByPolicy => write!(f, "excluded by request routing preferences"),
             SkipReason::OverBudget { estimated, budget } => {
                 write!(
                     f,
@@ -127,6 +134,7 @@ impl SkipReason {
             SkipReason::ModelNotFound
             | SkipReason::RouterNotFound
             | SkipReason::RouterDisabled
+            | SkipReason::ExcludedByPolicy
             | SkipReason::UnsupportedCapability(_) => GateStatus::Structural,
         }
     }
@@ -135,6 +143,25 @@ impl SkipReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A policy exclusion is STRUCTURAL, and that is a behaviour rather than a label.
+    ///
+    /// `all_gated_error` counts only `Timed`/`Terminal` toward `any_gate`
+    /// (`exhaustion.rs`), so a selection excluded entirely by the caller's own
+    /// filters returns `None` from it and surfaces as a terminal `NoCandidates`
+    /// rather than a pause. That is correct: no deadline and no human remedy makes
+    /// a candidate the caller excluded eligible again.
+    #[test]
+    fn a_policy_exclusion_is_structural_and_never_pauses_a_run() {
+        assert!(matches!(
+            SkipReason::ExcludedByPolicy.gate_status(),
+            GateStatus::Structural
+        ));
+        assert_eq!(
+            SkipReason::ExcludedByPolicy.to_string(),
+            "excluded by request routing preferences"
+        );
+    }
+
     #[test]
     fn skip_reason_renders_and_classifies() {
         assert_eq!(SkipReason::RouterDisabled.to_string(), "router disabled");
