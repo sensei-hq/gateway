@@ -371,6 +371,58 @@ fn default_true() -> bool {
     true
 }
 
+/// Per-request provider-routing preferences (SP-ROUTE-1).
+///
+/// Every knob is optional; an entirely absent `RoutingPreferences` means "use
+/// the default" — price-weighted, uptime-aware selection within equal-priority
+/// groups, which is a no-op on any chain whose priorities are distinct.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoutingPreferences {
+    /// Replace the default ordering with a deterministic sort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<SortKey>,
+    /// Allowlist. AND across non-empty axes (see `CandidateSet`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<CandidateSet>,
+    /// Denylist. OR across non-empty axes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<CandidateSet>,
+    /// Explicit try-order. Candidates matching no entry follow as fallbacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<CandidateRef>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortKey {
+    Price,
+    Latency,
+    Throughput,
+}
+
+/// A set of candidates named on either axis. The two axes are SEPARATE because
+/// the endpoint key `"{router}:{model}"` cannot be parsed back — model ids
+/// contain colons (`"ollama:gemma3:27b"`).
+///
+/// An EMPTY list is "don't care" on that axis.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CandidateSet {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
+/// One position in an explicit sequence. An ABSENT field is a wildcard, so
+/// `{router: "anthropic"}` means "every anthropic candidate, here".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CandidateRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub capability: Capability,
@@ -410,6 +462,10 @@ pub struct InferenceRequest {
     /// request, so the engine stays tenant-agnostic. Redacted in `Debug`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub credentials: HashMap<String, String>,
+    /// Per-request provider-routing preferences (SP-ROUTE-1). `None` ⇒ the
+    /// default strategy; the wire format is byte-identical to before this slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingPreferences>,
 }
 
 /// Custom `Debug` that never prints credential secret values — `credentials`
@@ -427,6 +483,7 @@ impl std::fmt::Debug for InferenceRequest {
             .field("auth", &self.auth)
             .field("panel", &self.panel)
             .field("consensus", &self.consensus)
+            .field("routing", &self.routing)
             .field("allow_fallback", &self.allow_fallback)
             .field(
                 "credentials",
@@ -592,6 +649,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: HashMap::new(),
+            routing: None,
         };
         req.credentials
             .insert("openai".to_string(), "sk-super-secret-value".to_string());
@@ -626,6 +684,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -662,6 +721,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -918,6 +978,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -957,6 +1018,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1072,6 +1134,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1196,6 +1259,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1547,10 +1611,70 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"auth\""));
         let back: InferenceRequest = serde_json::from_str(&json).unwrap();
         assert!(back.auth.is_none());
+    }
+
+    #[test]
+    fn routing_preferences_round_trip_and_stay_absent_by_default() {
+        let prefs = RoutingPreferences {
+            sort: Some(SortKey::Price),
+            only: Some(CandidateSet {
+                routers: vec!["anthropic".into()],
+                models: vec![],
+            }),
+            ignore: None,
+            order: Some(vec![CandidateRef {
+                router: Some("ollama".into()),
+                model: None,
+            }]),
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RoutingPreferences>(&json).unwrap(),
+            prefs
+        );
+        // Empty axes and absent knobs must not be emitted — a caller sending
+        // `only: {routers: [...]}` should not get `models: []` back.
+        assert!(
+            !json.contains("models"),
+            "empty axis must be skipped: {json}"
+        );
+        assert!(
+            !json.contains("ignore"),
+            "absent knob must be skipped: {json}"
+        );
+    }
+
+    /// A request with no routing preferences must serialize byte-identically to
+    /// one from before this slice — the additive guarantee.
+    #[test]
+    fn a_request_without_preferences_emits_no_routing_key() {
+        let req = InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+            routing: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("routing"), "absent ⇒ no key: {json}");
     }
 }

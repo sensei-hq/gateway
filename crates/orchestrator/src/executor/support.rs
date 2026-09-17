@@ -559,6 +559,7 @@ pub(crate) fn build_request(chain: &str, payload: &serde_json::Value) -> Inferen
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 
@@ -598,6 +599,7 @@ pub(crate) fn build_chat_request(
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 

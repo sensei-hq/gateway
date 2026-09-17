@@ -92,6 +92,7 @@ fn chat_request() -> InferenceRequest {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 
@@ -160,6 +161,7 @@ fn priced_chat_request() -> InferenceRequest {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 
@@ -306,6 +308,7 @@ async fn chain_selection_injects_resolved_api_model_id() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
     gw.execute(&request).await.unwrap();
 
@@ -574,6 +577,7 @@ async fn reserved_capability_returns_unsupported_not_no_adapter() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
     let msg = gw.execute(&request).await.unwrap_err().to_string();
     assert!(
@@ -639,6 +643,7 @@ async fn execute_no_candidates_errors() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     let result = gw.execute(&request).await;
@@ -674,6 +679,7 @@ async fn execute_with_direct_model() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     let response = gw.execute(&request).await.unwrap();
@@ -1253,6 +1259,7 @@ async fn no_fallback_when_disabled_stops_at_primary() {
     let req = InferenceRequest {
         allow_fallback: false,
         credentials: Default::default(),
+        routing: None,
         ..chat_request()
     };
     match gw.execute(&req).await.unwrap_err() {
@@ -2233,6 +2240,7 @@ async fn execute_stream_yields_chunks_then_done_with_cost() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     let events = collect_stream(&gw, &request).await;
@@ -2413,6 +2421,7 @@ async fn execute_stream_non_chat_capability_errors_up_front() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     match gw.execute_stream(&request).await {

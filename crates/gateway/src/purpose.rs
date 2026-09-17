@@ -289,6 +289,7 @@ fn build_step_request(step: &PurposeStep, input_text: &str) -> InferenceRequest 
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 

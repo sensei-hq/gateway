@@ -686,6 +686,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let response = gw.execute(&request).await.expect("executes");
