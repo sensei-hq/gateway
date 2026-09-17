@@ -146,6 +146,10 @@ impl super::Gateway {
             for (idx, candidate) in candidates.iter().enumerate() {
                 let has_more = idx + 1 < total;
                 let endpoint = format!("{}:{}", candidate.router, candidate.model);
+                // Wall time for THIS candidate's setup/acquisition attempt — not
+                // the time to stream to completion (Task 5's job). No tokens
+                // exist yet at either dispatch point below, pre- or post-first-byte.
+                let attempt_start = Instant::now();
 
                 // Resolve the outbound model exactly like `execute`:
                 // caller-pinned wins, else the candidate's resolved api_model_id.
@@ -227,8 +231,15 @@ impl super::Gateway {
 
                 if let Some(mut inner) = got_stream {
                     // A candidate produced a stream: commit to it.
-                    let _ =
-                        super::dispatch_outcome(&recorders, &endpoint, &candidate.router, true, None);
+                    let _ = super::dispatch_outcome(
+                        &recorders,
+                        &endpoint,
+                        &candidate.router,
+                        true,
+                        None,
+                        attempt_start.elapsed().as_millis() as u64,
+                        None,
+                    );
                     let stream_start = Instant::now();
                     tracing::debug!(adapter = %candidate.router, model = %candidate.model, "streaming candidate");
                     for ev in pending_switches.drain(..) {
@@ -324,6 +335,8 @@ impl super::Gateway {
                             &candidate.router,
                             false,
                             Some(err),
+                            attempt_start.elapsed().as_millis() as u64,
+                            None,
                         );
                         contributions
                             .push(super::exhaustion::contribution_for(err, written_until));

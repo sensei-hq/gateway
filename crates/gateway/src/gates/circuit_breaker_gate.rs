@@ -184,6 +184,8 @@ mod tests {
             router: "r",
             success: false,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
         });
         assert_eq!(cb.get_state("r:m").name(), "open"); // threshold 1 → opens on one failure
         let next_retry = match cb.get_state("r:m") {
@@ -198,6 +200,8 @@ mod tests {
             router: "r",
             success: true,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
         });
         assert_eq!(returned, None, "success returns no wake-up instant");
         assert_eq!(cb.get_state("r:n").name(), "closed");
@@ -214,6 +218,8 @@ mod tests {
             router: "r",
             success: false,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
         });
         assert_eq!(cb2.get_state("r:o").name(), "closed");
         assert_eq!(
