@@ -81,8 +81,11 @@ mod tests {
         assert_eq!(r.lockout.max_cooldown, Duration::from_secs(6 * 3600));
         assert_eq!(r.jitter_fraction, 0.0); // off ⇒ behavior-preserving
         assert!(r.eviction_cap >= 1024); // bounded but generous
-        assert_eq!(r.perf_samples, DEFAULT_PERF_SAMPLES);
-        assert_eq!(r.perf_window, DEFAULT_PERF_WINDOW);
+        // Pinned to literals, like the neighbouring assertions — comparing
+        // to the constants themselves would pass even if the constant (and
+        // this default) silently drifted together.
+        assert_eq!(r.perf_samples, 64);
+        assert_eq!(r.perf_window, Duration::from_secs(300));
     }
 
     #[test]

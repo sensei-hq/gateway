@@ -745,6 +745,23 @@ impl crate::gates::HealthRecorder for CountingRecorder {
     }
 }
 
+/// A `HealthRecorder` that records every `AttemptPhase` it observed, in
+/// order. Wired in the same way as `CountingRecorder`. Exists because every
+/// `performance.rs` test hand-constructs an `AttemptOutcome` and calls
+/// `PerformanceRecorder` directly — nothing drove a REAL request or stream
+/// through the engine and asserted which phase it actually dispatched, so a
+/// call site tagging the wrong phase (e.g. `stream.rs`'s acquisition dispatch
+/// reverted to `Complete`, reinstating the very bug the phase split fixes)
+/// had nothing pinning it.
+struct PhaseRecorder(Arc<std::sync::Mutex<Vec<crate::gates::AttemptPhase>>>);
+
+impl crate::gates::HealthRecorder for PhaseRecorder {
+    fn on_outcome(&self, outcome: &crate::gates::AttemptOutcome<'_>) -> Option<std::time::Instant> {
+        self.0.lock().unwrap().push(outcome.phase);
+        None
+    }
+}
+
 #[tokio::test]
 async fn execute_fans_outcome_out_to_registered_recorders() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -760,6 +777,104 @@ async fn execute_fans_outcome_out_to_registered_recorders() {
     // One successful attempt ⇒ every registered recorder sees exactly one
     // outcome (the pre-existing breaker sink plus this counting recorder).
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+/// Kills the `execute.rs` success-branch phase flip: a successful
+/// non-streaming attempt must dispatch exactly one `Complete` outcome.
+#[tokio::test]
+async fn execute_tags_its_outcome_complete() {
+    let mut gw = test_gateway();
+    register_noop(&gw).await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    gw.execute(&chat_request()).await.unwrap();
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![crate::gates::AttemptPhase::Complete],
+        "a successful non-streaming attempt must dispatch exactly one Complete outcome"
+    );
+}
+
+/// Kills the `execute.rs` error-branch phase flip: a failed non-streaming
+/// attempt must ALSO dispatch `Complete` — a setup/response failure is final,
+/// not a mid-stream observation. "noop" has no adapter registered, so the
+/// chain exhausts after this one real attempt; the overall `Err` is expected
+/// and irrelevant here — the failed attempt's tag is what's pinned.
+#[tokio::test]
+async fn execute_tags_a_failed_attempt_complete() {
+    let mut gw = test_gateway_with_chain();
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "boom".into(),
+            status: Some(500),
+        },
+    )
+    .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = gw.execute(&chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![crate::gates::AttemptPhase::Complete],
+        "a failed non-streaming attempt must dispatch Complete, not some other phase"
+    );
+}
+
+/// Kills the `stream.rs` acquisition-dispatch phase flip back to `Complete`
+/// (literally reinstating the C2 bug this slice fixed). Must DRIVE the
+/// stream with `collect_stream`, not merely await `execute_stream` — the
+/// dispatch happens inside the `async_stream` generator body, which only runs
+/// once the stream is polled; awaiting the setup alone records zero outcomes
+/// and the test would pass vacuously.
+#[tokio::test]
+async fn stream_acquisition_is_tagged_stream_acquired_not_complete() {
+    let mut gw = test_gateway();
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "noop".to_string(),
+        }))
+        .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![crate::gates::AttemptPhase::StreamAcquired],
+        "a stream acquisition must be tagged StreamAcquired, not Complete"
+    );
+}
+
+/// Kills the `stream.rs` setup-failure phase flip. Same driving requirement
+/// as above: `collect_stream` actually polls the generator body where the
+/// setup-failure dispatch lives. "B" has no adapter registered, so the walk
+/// exhausts (a terminal Error event) after "A"'s one real setup failure.
+#[tokio::test]
+async fn stream_setup_failure_is_tagged_complete() {
+    let mut gw = ab_gateway(ab_chain_config(vec![]));
+    register_stream_err(&gw, "A", || GatewayError::ProviderError {
+        adapter: "A".into(),
+        message: "boom".into(),
+        status: Some(500),
+    })
+    .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![crate::gates::AttemptPhase::Complete],
+        "a stream setup failure is final and must be tagged Complete"
+    );
 }
 
 /// Task 4 review (Important 2): deleting `PerformanceRecorder` from
@@ -1191,6 +1306,52 @@ async fn with_resilience_overrides_cooldown_base() {
     assert!(
         until <= now + std::time::Duration::from_millis(500),
         "custom 50ms base, not 30s"
+    );
+}
+
+/// `with_resilience` rebuilds the `PerformanceStore` (M3), unlike
+/// cooldown/lockout which it reuses in place — and nothing exercised that
+/// rebuild path. Two mutations survive without this test: (a) swapping the
+/// store-rebuild above `build_recorders` so the recorders write to an
+/// ORPHANED store — `performance_stats` then returns `None` forever on any
+/// `.with_resilience(...)` gateway; (b) using the `DEFAULT_PERF_*` constants
+/// instead of the config's fields, silently ignoring operator tuning.
+#[test]
+fn with_resilience_rewires_and_applies_the_performance_store() {
+    let gw = test_gateway_with_chain().with_resilience(crate::resilience::ResilienceConfig {
+        perf_samples: 1,
+        ..Default::default()
+    });
+
+    gw.record_outcome(&crate::gates::AttemptOutcome {
+        endpoint: "r:m",
+        router: "r",
+        success: true,
+        error: None,
+        duration_ms: 100,
+        output_tokens: None,
+        phase: crate::gates::AttemptPhase::Complete,
+    });
+    let s = gw
+        .performance_stats("r:m")
+        .expect("the rebuilt recorder must write to the store the Gateway reads");
+    assert_eq!(s.samples, 1);
+
+    gw.record_outcome(&crate::gates::AttemptOutcome {
+        endpoint: "r:m",
+        router: "r",
+        success: true,
+        error: None,
+        duration_ms: 900,
+        output_tokens: None,
+        phase: crate::gates::AttemptPhase::Complete,
+    });
+    let s = gw.performance_stats("r:m").expect("still live");
+    assert_eq!(s.samples, 1, "the configured perf_samples=1 caps the ring");
+    assert!(
+        (s.mean_latency_ms - 900.0).abs() < 1e-9,
+        "the ring kept only the newest sample, got {}",
+        s.mean_latency_ms
     );
 }
 
