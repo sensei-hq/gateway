@@ -341,13 +341,35 @@ mid-stream error path (`stream.rs:250-259`) yields `StreamEvent::Error` and retu
 dispatching anything**. A stream that dies halfway is therefore recorded to every health recorder
 as a success.
 
-**The fix.** Dispatch a failure outcome on the mid-stream error path before returning.
+**The fix, first attempt — and why it was not enough.** Dispatching a failure outcome on the
+mid-stream error path is necessary but insufficient, and this section originally claimed more than
+it delivered. It said mid-stream failures "now count toward the circuit breaker". They did not,
+and structurally could not: the acquisition dispatch carries `success: true`, which reaches
+`CircuitBreakerSink::record_success` and **resets** `Closed { failure_count }` to zero — right
+before the mid-stream failure re-increments it to one. Every attempt cycled 0 → 1 → 0 → 1, so ten
+consecutive mid-stream failures against a threshold of five left the breaker `Closed`. The Task 5
+review proved it by driving exactly that.
 
-**The accepted behavior change.** Mid-stream failures now count toward the circuit breaker,
-connection cooldown, and model lockout, which they never have. This is beyond the ordinary remit
-of a routing slice and is taken deliberately: §5.1 weights on `reliability`, and weighting on a
-signal known to be wrong is worse than not weighting at all. It gets its own acceptance criterion
-(AC9) so it is reviewed on its merits rather than arriving as a side effect.
+Two further symptoms of the same cause: a *successful* stream cast two `success` votes, silently
+halving the half-open probe budget for streaming; and a consumer that drops a stream part-way —
+routine for SSE disconnects — handed the breaker a free `record_success` for an attempt whose
+outcome nobody knows.
+
+**The actual fix: one attempt casts one verdict, to every recorder.** §6.3's `AttemptPhase` was
+introduced for `PerformanceRecorder` alone. That was the error. `AttemptPhase::is_verdict()` is
+false only for `StreamAcquired`, and **every** `HealthRecorder` now honours it — breaker, cooldown
+and lockout early-return on a non-verdict phase. A `StreamAcquired` outcome is a latency
+observation about an attempt still in flight, not a judgement on it.
+
+**The accepted behavior change.** Mid-stream failures now genuinely count toward the circuit
+breaker, connection cooldown and model lockout. This is beyond the ordinary remit of a routing
+slice and is taken deliberately: §5.1 weights on `reliability`, and weighting on a signal known to
+be wrong is worse than not weighting at all. AC9 covers it.
+
+One consequence worth stating because it is user-visible: a single mid-stream 429 now locks the
+endpoint for the rate-limit base duration, so on a single-candidate chain the *next* request
+returns `AllGated { resume_after: Some(t) }` rather than a stream — which the orchestrator turns
+into a durable pause. Previously it retried immediately.
 
 ## 8. The orchestrator boundary (D8)
 
