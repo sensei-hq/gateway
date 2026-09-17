@@ -77,6 +77,7 @@ impl super::Gateway {
             budget: request.budget,
             input_tokens: Some(input_tokens),
             input_tokens_pessimistic: Some(estimate_input_tokens_pessimistic(&request.payload)),
+            preferences: None,
         };
 
         // 4. Select all candidates.

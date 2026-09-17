@@ -26,7 +26,7 @@ use crate::types::trace::{Attempt, AttemptStatus};
 mod consensus;
 mod dispatch;
 mod execute;
-mod exhaustion;
+pub(crate) mod exhaustion;
 mod panel;
 mod stream;
 mod util;

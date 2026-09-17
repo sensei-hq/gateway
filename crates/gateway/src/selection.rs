@@ -13,6 +13,7 @@ use crate::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
 };
 use crate::types::cost::CostEstimate;
+use crate::types::request::RoutingPreferences;
 use std::time::Instant;
 
 /// Criteria used to resolve which model(s) to try.
@@ -34,6 +35,8 @@ pub struct SelectionCriteria {
     /// candidate — a caller that reaches selection without an estimate is not making a
     /// claim about size, and refusing it would be a filter on missing data.
     pub input_tokens_pessimistic: Option<u32>,
+    /// Per-request routing preferences (SP-ROUTE-1). `None` ⇒ default routing.
+    pub preferences: Option<RoutingPreferences>,
 }
 
 /// A model that passed all validation checks and is ready for execution.
@@ -97,6 +100,8 @@ impl<'a> ModelSelectionService<'a> {
         Self {
             config,
             gates: vec![
+                // FIRST, deliberately — see `RoutingPolicyGate`'s doc comment.
+                Box::new(crate::gates::routing_policy::RoutingPolicyGate),
                 Box::new(CapabilityGate),
                 Box::new(ConnectionCooldownGate),
                 Box::new(CircuitBreakerGate),
@@ -204,6 +209,7 @@ impl<'a> ModelSelectionService<'a> {
             config: self.config,
             router_health: self.router_health,
             model_lockout: self.model_lockout,
+            preferences: criteria.preferences.as_ref(),
         };
         for gate in &self.gates {
             if let GateVerdict::Skip(reason) = gate.evaluate(&cand, &ctx) {
@@ -604,6 +610,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_some());
@@ -628,6 +635,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -654,6 +662,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert_eq!(result.all_candidates.len(), 2);
@@ -680,6 +689,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_some());
@@ -721,6 +731,7 @@ mod tests {
                 budget: None,
                 input_tokens: None,
                 input_tokens_pessimistic: None,
+                preferences: None,
             });
             assert_eq!(result.chain.as_ref().unwrap().id, "aaa_chain");
         }
@@ -743,6 +754,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_some());
@@ -772,6 +784,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -807,6 +820,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_some());
@@ -837,6 +851,7 @@ mod tests {
             budget: Some(0.001),
             input_tokens: Some(1000),
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         // gemma3:27b has no pricing -> passes budget (free)
@@ -869,6 +884,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_some());
@@ -892,6 +908,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -914,6 +931,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -937,6 +955,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -964,6 +983,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -999,6 +1019,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -1026,6 +1047,7 @@ mod tests {
             budget: Some(0.0001),
             input_tokens: Some(1000),
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -1053,6 +1075,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert!(result.selected.is_none());
@@ -1081,6 +1104,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         assert_eq!(result.all_candidates.len(), 1);
@@ -1127,6 +1151,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         // ghost_model should be skipped, gemma3:27b should be selected
@@ -1178,6 +1203,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
 
         // gemma3:27b with nonexistent router should be skipped
@@ -1207,6 +1233,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
         // Current behavior: direct validates the router first.
         assert!(matches!(
@@ -1230,6 +1257,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: None,
+            preferences: None,
         });
         // Direct does NOT provider-fallback today → empty router → "router not found".
         assert!(result.selected.is_none());
@@ -1338,6 +1366,7 @@ mod tests {
             budget: None,
             input_tokens: None,
             input_tokens_pessimistic: est,
+            preferences: None,
         }
     }
 
@@ -1548,6 +1577,101 @@ mod tests {
         assert!(
             with.skipped.is_empty() && without.skipped.is_empty(),
             "an in-window request records no skips at all"
+        );
+    }
+
+    /// AC5 — a candidate that is BOTH excluded by policy and circuit-open reports
+    /// the POLICY, and the selection does not become pausable.
+    ///
+    /// This is the test the gate's position exists for. Moving `RoutingPolicyGate`
+    /// from first to last flips the reported reason to `CircuitOpen`, whose
+    /// `gate_status()` is `Timed` — which would make `all_gated_error` return
+    /// `AllGated { resume_after: Some(..) }` and park a run waiting on a breaker for
+    /// a candidate the caller had already excluded.
+    #[test]
+    fn a_policy_exclusion_is_reported_ahead_of_an_open_breaker() {
+        let config = test_config();
+        let cb = test_cb();
+        cb.can_execute("ollama:gemma3:27b");
+        for _ in 0..5 {
+            cb.record_failure("ollama:gemma3:27b");
+        }
+        assert!(
+            !cb.can_execute("ollama:gemma3:27b"),
+            "fixture needs it open"
+        );
+
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("chat_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: Some(crate::types::request::RoutingPreferences {
+                ignore: Some(crate::types::request::CandidateSet {
+                    routers: vec!["ollama".to_string()],
+                    models: vec![],
+                }),
+                ..Default::default()
+            }),
+        });
+
+        let skipped = result
+            .skipped
+            .iter()
+            .find(|s| s.model == "gemma3:27b")
+            .expect("the excluded candidate must be recorded");
+        assert!(
+            matches!(skipped.reason, SkipReason::ExcludedByPolicy),
+            "policy must win over the open breaker: {:?}",
+            skipped.reason
+        );
+        assert!(
+            matches!(
+                skipped.reason.gate_status(),
+                crate::skip_reason::GateStatus::Structural
+            ),
+            "and it must contribute nothing to resume_after"
+        );
+    }
+
+    /// AC5, other half — excluding EVERY candidate is terminal, not a pause.
+    #[test]
+    fn excluding_every_candidate_is_terminal_not_pausable() {
+        let config = test_config();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let result = svc.select_all(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("chat_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: Some(crate::types::request::RoutingPreferences {
+                only: Some(crate::types::request::CandidateSet {
+                    routers: vec!["nonexistent".to_string()],
+                    models: vec![],
+                }),
+                ..Default::default()
+            }),
+        });
+
+        assert!(result.all_candidates.is_empty());
+        assert!(
+            crate::engine::exhaustion::all_gated_error(&result.skipped, &[]).is_none(),
+            "an all-structural exhaustion must NOT become AllGated — no deadline \
+             and no human remedy makes an excluded candidate eligible"
         );
     }
 }

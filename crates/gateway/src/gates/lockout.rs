@@ -577,6 +577,7 @@ mod tests {
             config: &gateway_config,
             router_health: &router_health,
             model_lockout: &store,
+            preferences: None,
         };
 
         // Unknown endpoint → Admit.

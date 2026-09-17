@@ -132,6 +132,7 @@ mod tests {
             config: gateway_config,
             router_health: &NeverCooling,
             model_lockout: &NeverLocked,
+            preferences: None,
         }
     }
 

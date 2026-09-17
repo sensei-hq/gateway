@@ -220,6 +220,7 @@ mod tests {
             config: &gateway_config,
             router_health: &store,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         // Not cooling yet → Admit.
