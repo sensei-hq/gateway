@@ -355,6 +355,7 @@ mod tests {
                 consensus: None,
                 allow_fallback: true,
                 credentials: Default::default(),
+                routing: None,
             }
         }
         fn system_of(req: &InferenceRequest) -> Option<String> {

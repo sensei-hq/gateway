@@ -1483,6 +1483,7 @@ pub async fn gated_gateway() -> Gateway {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         })
         .await;
     gw
@@ -1531,6 +1532,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         }
     }
 
