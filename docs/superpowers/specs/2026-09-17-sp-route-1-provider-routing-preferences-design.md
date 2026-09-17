@@ -186,6 +186,13 @@ a $1/M model still leads a $3/M model nine times in ten.
 `reliability` is the windowed success rate from §6, or `1.0` when unmeasured — this is the
 uptime-awareness half (§6.3).
 
+**"Unmeasured" has to be detected, not inferred from the rate.** `success_rate` reads `0.0` both
+when every attempt failed and when no attempt has cast a verdict yet, so `EndpointStats` carries
+`verdict_samples` and reliability is read only when it is non-zero. Skipping that check is not a
+cosmetic slip: an endpoint with no verdict would weigh `0.0`, land in the never-drawn bucket, and
+on a cold process that is *every* candidate — a perfectly healthy fleet routing as though every
+provider were dead. The same applies to `throughput_samples` for §5.3's throughput sort.
+
 **Why free-first rather than an infinite weight.** There is no finite multiple of "more likely"
 that expresses "costs nothing"; the limit of `1/c²` as `c → 0` *is* "always first". Folding the
 non-finite case into the same rule means there is one rule, not a rule plus an overflow guard.
