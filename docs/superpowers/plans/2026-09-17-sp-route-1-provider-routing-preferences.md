@@ -20,7 +20,24 @@
 | 2 | `cf19179` | ✅ done, reviewed jointly with Task 3 |
 | 3 | `da0dfb5` · `6e5cfa5` | ✅ done, 2 Critical + 3 Important fixed |
 | 4 | `edab9c4` · `1b75dae` · `1ac3597` | ✅ done after 3 review rounds; forced an `AttemptPhase` design fix and a new `verdict_samples` field — see below |
-| 5–12 | — | pending |
+| 5 | `c21b0e0` · `b1ad6ba` | ✅ done; review found a **production defect** — the breaker could not trip mid-stream |
+| 6–12 | — | pending |
+
+**Task 5 found that the breaker was structurally unable to trip on mid-stream failure.** The
+acquisition dispatch's `success: true` reached `record_success`, which reset `failure_count` to
+zero right before the mid-stream failure re-incremented it — 0 → 1 → 0 → 1 forever. Ten
+consecutive mid-stream 500s against a threshold of five left it `Closed`. Same cause: a successful
+stream cast two breaker votes (halving the half-open probe budget), and an abandoned stream handed
+the breaker a free success for an unknown outcome.
+
+Fix: `AttemptPhase::is_verdict()` — false only for `StreamAcquired` — is now honoured by **every**
+`HealthRecorder`, not just `PerformanceRecorder`. Task 4 applied "one attempt, one verdict" too
+narrowly.
+
+**Carry-forward, deliberately NOT fixed here:** the pre-existing `InferenceCall` store write in
+`stream.rs` sits *after* `yield StreamEvent::Done`, so a real SSE consumer that breaks on `Done`
+never polls again and the metering row is never written. Same exposure the completion dispatch
+avoids by sitting before the yield. That is metering, not routing, and belongs to its own slice.
 
 **Task 4 changed the design, and Tasks 5 / 7 / 9 inherit it.** The review found that
 `mean_latency_ms` pooled two unrelated time spans (full request wall time from `execute`, stream
@@ -1229,12 +1246,12 @@ Add the read-back accessor to `crates/gateway/src/engine/mod.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p sensei-gateway a_mid_stream_failure_is_recorded -- --nocapture 2>&1 | grep -E "panicked at|test result"`
 Expected: a panic mentioning "must not be recorded as a success" — `success_rate` is `1.0`.
 
-- [ ] **Step 3: Dispatch the failure**
+- [x] **Step 3: Dispatch the failure**
 
 In `crates/gateway/src/engine/stream.rs`, in the mid-stream error arm (currently lines 250-259), before the `return`:
 
@@ -1280,7 +1297,7 @@ In `crates/gateway/src/engine/stream.rs`, in the mid-stream error arm (currently
                             }
 ```
 
-- [ ] **Step 4: Add the end-of-stream throughput dispatch**
+- [x] **Step 4: Add the end-of-stream throughput dispatch**
 
 Throughput only exists at completion. After `let tokens = usage_acc.unwrap_or_default();` (currently line 263), before the `InferenceCall` is built:
 
@@ -1304,7 +1321,7 @@ Throughput only exists at completion. After `let tokens = usage_acc.unwrap_or_de
                     );
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p sensei-gateway a_mid_stream_failure_is_recorded -- --nocapture`
 Expected: PASS.
@@ -1312,7 +1329,7 @@ Expected: PASS.
 Run: `cargo test -p sensei-gateway --lib 2>&1 | tail -5`
 Expected: all green. If a breaker/cooldown test now fails because a mid-stream failure trips it, that is the intended behaviour change — update the test's expectation and note it in the commit message.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/gateway/src/engine
@@ -1336,7 +1353,7 @@ point at which throughput is knowable."
 - Modify: `crates/gateway/src/lib.rs`, `crates/gateway/src/strategy.rs`, `crates/gateway/src/selection.rs`
 - Test: `crates/gateway/src/random.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/gateway/src/random.rs` with the test module:
 
