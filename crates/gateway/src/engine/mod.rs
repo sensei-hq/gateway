@@ -97,12 +97,16 @@ impl Gateway {
         // the SAME registry — so a registered observer sees every lock the
         // sink writes (§5c: the gateway announces, the caller persists).
         let lockout_observers = crate::gates::lockout::LockoutBroadcaster::new();
+        let resilience = crate::resilience::ResilienceConfig::default();
         // Built here so the sink's write handle (in `recorders`) and this
         // read-side field share the SAME Arc-backed store, mirroring
-        // `cooldown`/`model_lockout` above.
+        // `cooldown`/`model_lockout` above. Unlike those two, the store's OWN
+        // capacity/window is baked in at construction (no setter), so
+        // `with_resilience` must rebuild rather than reuse this store when an
+        // operator tunes `perf_samples`/`perf_window`.
         let performance = crate::gates::performance::PerformanceStore::new(
-            crate::resilience::DEFAULT_PERF_SAMPLES,
-            crate::resilience::DEFAULT_PERF_WINDOW,
+            resilience.perf_samples,
+            resilience.perf_window,
         );
         // Built AFTER `model_lockout` so the sink's write handle and the gate's
         // read-side field share the SAME Arc-backed store (the gate skips what
@@ -115,7 +119,7 @@ impl Gateway {
             &model_lockout,
             &lockout_observers,
             &performance,
-            &crate::resilience::ResilienceConfig::default(),
+            &resilience,
         );
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -151,16 +155,27 @@ impl Gateway {
         self
     }
 
-    /// Tune the health gates (cooldown/lockout durations, eviction cap, and
-    /// deterministic per-endpoint jitter). Builder-style; rebuilds the recorder pipeline from
-    /// `resilience` while preserving the SAME Arc-backed stores/observers/breaker,
-    /// so the read-side gates keep reading what the sinks write. Absent ⇒
+    /// Tune the health gates (cooldown/lockout durations, eviction cap,
+    /// deterministic per-endpoint jitter, and the performance window).
+    /// Builder-style; rebuilds the recorder pipeline from `resilience` while
+    /// preserving the SAME Arc-backed cooldown/lockout stores/observers/breaker,
+    /// so THEIR read-side gates keep reading what their sinks write. Absent ⇒
     /// [`ResilienceConfig::default`] (today's behavior). Construction-time only —
     /// NOT hot-swappable via `update_config` (which carries routing config, not
     /// resilience policy).
     ///
+    /// `performance` is the one store this REBUILDS rather than reuses: its
+    /// capacity/window are fixed at construction (no setter), so a tuned
+    /// `perf_samples`/`perf_window` requires a fresh, empty
+    /// `PerformanceStore` — this call therefore discards any samples recorded
+    /// before it, unlike the cooldown/lockout stores it leaves untouched.
+    ///
     /// [`ResilienceConfig::default`]: crate::resilience::ResilienceConfig::default
     pub fn with_resilience(mut self, resilience: crate::resilience::ResilienceConfig) -> Self {
+        self.performance = crate::gates::performance::PerformanceStore::new(
+            resilience.perf_samples,
+            resilience.perf_window,
+        );
         self.recorders = build_recorders(
             &self.circuit_breaker,
             &self.cooldown,
@@ -659,26 +674,16 @@ impl Gateway {
 
     /// Dispatch one attempt's outcome to every registered recorder (reliable
     /// write-side) and return the earliest `Instant` any recorder just wrote as
-    /// this endpoint's unavailability deadline, or `None` if none did.
-    #[allow(clippy::too_many_arguments)]
+    /// this endpoint's unavailability deadline, or `None` if none did. Takes
+    /// the whole [`crate::gates::AttemptOutcome`] rather than its fields
+    /// spread across separate parameters — the outcome IS the "timing/outcome
+    /// struct" a longer parameter list would otherwise need, and every field
+    /// call sites need (`phase` included) already lives there.
     pub(super) fn record_outcome(
         &self,
-        endpoint: &str,
-        router: &str,
-        success: bool,
-        error: Option<&GatewayError>,
-        duration_ms: u64,
-        output_tokens: Option<u32>,
+        outcome: &crate::gates::AttemptOutcome<'_>,
     ) -> Option<std::time::Instant> {
-        dispatch_outcome(
-            &self.recorders,
-            endpoint,
-            router,
-            success,
-            error,
-            duration_ms,
-            output_tokens,
-        )
+        dispatch_outcome(&self.recorders, outcome)
     }
 
     /// Observed performance for an endpoint (`"{router}:{model}"`). `None` until
@@ -737,25 +742,11 @@ fn build_recorders(
 /// Dispatch an attempt outcome to every recorder. Free fn so the `'static`
 /// stream closure can own a cloned recorder set (where `&self` is unavailable).
 /// Returns the earliest deadline any recorder just wrote (min-fanned), or `None`.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_outcome(
     recorders: &[std::sync::Arc<dyn crate::gates::HealthRecorder>],
-    endpoint: &str,
-    router: &str,
-    success: bool,
-    error: Option<&crate::types::error::GatewayError>,
-    duration_ms: u64,
-    output_tokens: Option<u32>,
+    outcome: &crate::gates::AttemptOutcome<'_>,
 ) -> Option<std::time::Instant> {
-    let o = crate::gates::AttemptOutcome {
-        endpoint,
-        router,
-        success,
-        error,
-        duration_ms,
-        output_tokens,
-    };
-    recorders.iter().filter_map(|r| r.on_outcome(&o)).min()
+    recorders.iter().filter_map(|r| r.on_outcome(outcome)).min()
 }
 
 #[cfg(test)]

@@ -230,15 +230,22 @@ impl super::Gateway {
                 }
 
                 if let Some(mut inner) = got_stream {
-                    // A candidate produced a stream: commit to it.
+                    // A candidate produced a stream: commit to it. Phase
+                    // `StreamAcquired` — this is a latency-only observation
+                    // (time-to-first-response), NOT the verdict: the completion
+                    // outcome for this same attempt always follows, and Task 5
+                    // is what dispatches it.
                     let _ = super::dispatch_outcome(
                         &recorders,
-                        &endpoint,
-                        &candidate.router,
-                        true,
-                        None,
-                        attempt_start.elapsed().as_millis() as u64,
-                        None,
+                        &crate::gates::AttemptOutcome {
+                            endpoint: &endpoint,
+                            router: &candidate.router,
+                            success: true,
+                            error: None,
+                            duration_ms: attempt_start.elapsed().as_millis() as u64,
+                            output_tokens: None,
+                            phase: crate::gates::AttemptPhase::StreamAcquired,
+                        },
                     );
                     let stream_start = Instant::now();
                     tracing::debug!(adapter = %candidate.router, model = %candidate.model, "streaming candidate");
@@ -329,14 +336,19 @@ impl super::Gateway {
                 // can attribute a timed resume to this attempt.
                 match &fail_error {
                     Some(err) => {
+                        // Phase `Complete`: a setup failure is final — no
+                        // completion dispatch follows it, streaming or not.
                         let written_until = super::dispatch_outcome(
                             &recorders,
-                            &endpoint,
-                            &candidate.router,
-                            false,
-                            Some(err),
-                            attempt_start.elapsed().as_millis() as u64,
-                            None,
+                            &crate::gates::AttemptOutcome {
+                                endpoint: &endpoint,
+                                router: &candidate.router,
+                                success: false,
+                                error: Some(err),
+                                duration_ms: attempt_start.elapsed().as_millis() as u64,
+                                output_tokens: None,
+                                phase: crate::gates::AttemptPhase::Complete,
+                            },
                         );
                         contributions
                             .push(super::exhaustion::contribution_for(err, written_until));

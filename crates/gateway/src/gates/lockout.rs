@@ -189,6 +189,8 @@ impl ModelLockoutRead for ModelLockoutStore {
     }
 }
 
+#[cfg(test)]
+use super::AttemptPhase;
 use super::{AttemptOutcome, HealthRecorder};
 
 /// Best-effort, isolated observer of gateway health decisions. The gateway
@@ -642,6 +644,7 @@ mod tests {
             error: Some(err),
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         }
     }
 
@@ -776,6 +779,7 @@ mod tests {
             error: None,
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(returned, None, "success returns no wake-up instant");
         assert!(
@@ -916,6 +920,7 @@ mod tests {
             error: Some(&err),
             duration_ms: 1,
             output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
 
         assert!(

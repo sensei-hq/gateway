@@ -27,6 +27,14 @@ pub struct ResilienceConfig {
     /// deadlines to spread retries across endpoints (Task 4). `0.0` ⇒ off
     /// (today's behavior). A real upstream `Retry-After` is never jittered.
     pub jitter_fraction: f64,
+    /// Samples retained per endpoint in the rolling performance window (Task 4).
+    /// Applying a change requires `Gateway::with_resilience` to rebuild the
+    /// `PerformanceStore` (its capacity is fixed at construction), discarding
+    /// any samples recorded before the rebuild.
+    pub perf_samples: usize,
+    /// How long a performance sample stays live (Task 4). Same rebuild caveat
+    /// as `perf_samples`.
+    pub perf_window: Duration,
 }
 
 impl Default for ResilienceConfig {
@@ -36,6 +44,8 @@ impl Default for ResilienceConfig {
             lockout: ModelLockoutPolicy::default(),
             eviction_cap: DEFAULT_EVICTION_CAP,
             jitter_fraction: 0.0,
+            perf_samples: DEFAULT_PERF_SAMPLES,
+            perf_window: DEFAULT_PERF_WINDOW,
         }
     }
 }
@@ -71,6 +81,8 @@ mod tests {
         assert_eq!(r.lockout.max_cooldown, Duration::from_secs(6 * 3600));
         assert_eq!(r.jitter_fraction, 0.0); // off ⇒ behavior-preserving
         assert!(r.eviction_cap >= 1024); // bounded but generous
+        assert_eq!(r.perf_samples, DEFAULT_PERF_SAMPLES);
+        assert_eq!(r.perf_window, DEFAULT_PERF_WINDOW);
     }
 
     #[test]
