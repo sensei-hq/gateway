@@ -640,6 +640,8 @@ mod tests {
             router: "r",
             success: false,
             error: Some(err),
+            duration_ms: 1,
+            output_tokens: None,
         }
     }
 
@@ -772,6 +774,8 @@ mod tests {
             router: "r",
             success: true,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
         });
         assert_eq!(returned, None, "success returns no wake-up instant");
         assert!(
@@ -910,6 +914,8 @@ mod tests {
             router: "new",
             success: false,
             error: Some(&err),
+            duration_ms: 1,
+            output_tokens: None,
         });
 
         assert!(

@@ -262,6 +262,8 @@ mod tests {
             router: "A",
             success: false,
             error: Some(&timeout_err),
+            duration_ms: 1,
+            output_tokens: None,
         });
         // The sink returns the `until` it just wrote — a future instant equal to
         // what the store now reports.
@@ -279,6 +281,8 @@ mod tests {
             router: "B",
             success: false,
             error: Some(&provider_err),
+            duration_ms: 1,
+            output_tokens: None,
         });
         assert!(returned.is_none(), "non-transport error does not cool");
         assert!(store.cooling_until("B").is_none());
@@ -288,6 +292,8 @@ mod tests {
             router: "C",
             success: true,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
         });
         assert!(returned.is_none(), "success does not cool");
         assert!(store.cooling_until("C").is_none());
@@ -348,6 +354,8 @@ mod tests {
             router: "new",
             success: false,
             error: Some(&timeout_err),
+            duration_ms: 1,
+            output_tokens: None,
         });
 
         // Expired pruned; the active cooldown and just-written one survive.
@@ -391,6 +399,8 @@ mod tests {
                 router: "R",
                 success: false,
                 error: Some(&err),
+                duration_ms: 1,
+                output_tokens: None,
             })
             .expect("transport fault cools");
         assert!(until >= now + base, "at least the full base cooldown");
@@ -416,6 +426,8 @@ mod tests {
                 router: "R",
                 success: false,
                 error: Some(&err),
+                duration_ms: 1,
+                output_tokens: None,
             })
             .expect("transport fault cools");
         let jitter = crate::resilience::deterministic_jitter("R", base, 0.5);

@@ -11,6 +11,7 @@ pub mod circuit_breaker_gate;
 pub mod context_window;
 pub mod cooldown;
 pub mod lockout;
+pub mod performance;
 pub mod routing_policy;
 
 /// Read port for endpoint health (the circuit breaker implements it in Task 4;
@@ -78,6 +79,14 @@ pub struct AttemptOutcome<'a> {
     pub router: &'a str,
     pub success: bool,
     pub error: Option<&'a GatewayError>,
+    /// Wall time for this attempt, in ms. For a STREAM this is the time until
+    /// the stream was obtained, not the time to complete it — Task 5 adds the
+    /// second, end-of-stream dispatch that carries the generation rate, and the
+    /// two spans are never pooled into one mean.
+    pub duration_ms: u64,
+    /// Output tokens, when the attempt produced a countable response. `None`
+    /// for a setup failure or a stream-acquisition dispatch.
+    pub output_tokens: Option<u32>,
 }
 
 /// Reliable write-side reducer: updates authoritative health state from an attempt

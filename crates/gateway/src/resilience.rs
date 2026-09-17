@@ -7,6 +7,11 @@ use std::time::Duration;
 /// Active/terminal gates are never dropped.
 pub const DEFAULT_EVICTION_CAP: usize = 4096;
 
+/// Samples retained per endpoint in the rolling performance window.
+pub const DEFAULT_PERF_SAMPLES: usize = 64;
+/// How long a performance sample stays live.
+pub const DEFAULT_PERF_WINDOW: Duration = Duration::from_secs(300);
+
 /// Operator-tunable resilience policy applied at construction via
 /// `Gateway::with_resilience` (Task 2). `Default` reproduces the pre-(f)
 /// hardcoded behavior exactly, so an absent config changes nothing.

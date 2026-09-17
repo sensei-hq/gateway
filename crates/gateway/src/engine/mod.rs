@@ -74,6 +74,10 @@ pub struct Gateway {
     /// [`crate::gates::lockout::ModelLockoutSink`] in `recorders` (see
     /// [`Gateway::new`]) so a registered observer sees every lock the sink writes.
     lockout_observers: crate::gates::lockout::LockoutBroadcaster,
+    /// Rolling per-endpoint performance window: read side wired into selection
+    /// from Task 7, write side is the `PerformanceRecorder` in `recorders` —
+    /// both share this one store, exactly as `cooldown` and `model_lockout` do.
+    performance: crate::gates::performance::PerformanceStore,
 }
 
 impl Gateway {
@@ -93,6 +97,13 @@ impl Gateway {
         // the SAME registry — so a registered observer sees every lock the
         // sink writes (§5c: the gateway announces, the caller persists).
         let lockout_observers = crate::gates::lockout::LockoutBroadcaster::new();
+        // Built here so the sink's write handle (in `recorders`) and this
+        // read-side field share the SAME Arc-backed store, mirroring
+        // `cooldown`/`model_lockout` above.
+        let performance = crate::gates::performance::PerformanceStore::new(
+            crate::resilience::DEFAULT_PERF_SAMPLES,
+            crate::resilience::DEFAULT_PERF_WINDOW,
+        );
         // Built AFTER `model_lockout` so the sink's write handle and the gate's
         // read-side field share the SAME Arc-backed store (the gate skips what
         // the sink locked). The default config reproduces today's constants
@@ -103,6 +114,7 @@ impl Gateway {
             &cooldown,
             &model_lockout,
             &lockout_observers,
+            &performance,
             &crate::resilience::ResilienceConfig::default(),
         );
         Self {
@@ -115,6 +127,7 @@ impl Gateway {
             cooldown,
             model_lockout,
             lockout_observers,
+            performance,
         }
     }
 
@@ -153,6 +166,7 @@ impl Gateway {
             &self.cooldown,
             &self.model_lockout,
             &self.lockout_observers,
+            &self.performance,
             &resilience,
         );
         self
@@ -646,14 +660,35 @@ impl Gateway {
     /// Dispatch one attempt's outcome to every registered recorder (reliable
     /// write-side) and return the earliest `Instant` any recorder just wrote as
     /// this endpoint's unavailability deadline, or `None` if none did.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn record_outcome(
         &self,
         endpoint: &str,
         router: &str,
         success: bool,
         error: Option<&GatewayError>,
+        duration_ms: u64,
+        output_tokens: Option<u32>,
     ) -> Option<std::time::Instant> {
-        dispatch_outcome(&self.recorders, endpoint, router, success, error)
+        dispatch_outcome(
+            &self.recorders,
+            endpoint,
+            router,
+            success,
+            error,
+            duration_ms,
+            output_tokens,
+        )
+    }
+
+    /// Observed performance for an endpoint (`"{router}:{model}"`). `None` until
+    /// the endpoint has a live sample.
+    pub fn performance_stats(
+        &self,
+        endpoint: &str,
+    ) -> Option<crate::gates::performance::EndpointStats> {
+        use crate::gates::performance::EndpointPerformanceRead;
+        self.performance.stats(endpoint)
     }
 }
 
@@ -672,6 +707,7 @@ fn build_recorders(
     cooldown: &crate::gates::cooldown::ConnectionCooldownStore,
     model_lockout: &crate::gates::lockout::ModelLockoutStore,
     observers: &crate::gates::lockout::LockoutBroadcaster,
+    performance: &crate::gates::performance::PerformanceStore,
     resilience: &crate::resilience::ResilienceConfig,
 ) -> Vec<Arc<dyn crate::gates::HealthRecorder>> {
     vec![
@@ -691,24 +727,33 @@ fn build_recorders(
             resilience.eviction_cap,
             resilience.jitter_fraction,
         )),
+        Arc::new(crate::gates::performance::PerformanceRecorder::new(
+            performance.clone(),
+            resilience.eviction_cap,
+        )),
     ]
 }
 
 /// Dispatch an attempt outcome to every recorder. Free fn so the `'static`
 /// stream closure can own a cloned recorder set (where `&self` is unavailable).
 /// Returns the earliest deadline any recorder just wrote (min-fanned), or `None`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_outcome(
     recorders: &[std::sync::Arc<dyn crate::gates::HealthRecorder>],
     endpoint: &str,
     router: &str,
     success: bool,
     error: Option<&crate::types::error::GatewayError>,
+    duration_ms: u64,
+    output_tokens: Option<u32>,
 ) -> Option<std::time::Instant> {
     let o = crate::gates::AttemptOutcome {
         endpoint,
         router,
         success,
         error,
+        duration_ms,
+        output_tokens,
     };
     recorders.iter().filter_map(|r| r.on_outcome(&o)).min()
 }
