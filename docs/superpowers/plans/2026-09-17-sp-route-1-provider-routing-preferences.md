@@ -19,7 +19,23 @@
 | 1 | `83a5371` · `ba5e93f` · `cd1fcc7` | ✅ done, two review rounds |
 | 2 | `cf19179` | ✅ done, reviewed jointly with Task 3 |
 | 3 | `da0dfb5` · `6e5cfa5` | ✅ done, 2 Critical + 3 Important fixed |
-| 4–12 | — | pending |
+| 4 | `edab9c4` · `1b75dae` | ✅ done; review forced an `AttemptPhase` design fix — see below |
+| 5–12 | — | pending |
+
+**Task 4 changed the design, and Tasks 5 / 7 / 9 inherit it.** The review found that
+`mean_latency_ms` pooled two unrelated time spans (full request wall time from `execute`, stream
+acquisition from `stream`) because `Sample` had no discriminator — and that Task 5 would have
+added a third. It also found the consequence that actually bites: an endpoint failing every
+stream mid-way converged on `success_rate == 0.5` forever, because its acquisition success was
+counted beside its completion failure, so Task 7's reliability multiplier could never de-weight it.
+
+The fix is `AttemptPhase { Complete, StreamAcquired, StreamCompleted }` on `AttemptOutcome`, read
+**only** by `PerformanceRecorder` — the breaker, cooldown and lockout still see `success`
+unchanged. `StreamAcquired` contributes a latency and no verdict; `StreamCompleted` contributes a
+verdict and a throughput but no latency. One attempt, one vote.
+
+`dispatch_outcome` now takes `&AttemptOutcome` rather than seven positional arguments. Task 5's
+snippets below are already updated for both changes.
 
 Off-slice, landed alongside: `5208952` — revived `facade.rs`'s test module (uncompilable since
 2026-07-23) and added a `cargo check -p sensei-gateway --features local --all-targets` CI step,
@@ -674,7 +690,7 @@ git commit -m "feat(gateway): RoutingPolicyGate for only/ignore, registered firs
 - Modify: `crates/gateway/src/gates/mod.rs`
 - Test: `crates/gateway/src/gates/performance.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[cfg(test)]
@@ -743,12 +759,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p sensei-gateway performance -- --nocapture`
 Expected: FAIL — `file not found for module 'performance'`, then unresolved names.
 
-- [ ] **Step 3: Write the store**
+- [x] **Step 3: Write the store**
 
 At the top of `crates/gateway/src/gates/performance.rs`:
 
@@ -915,7 +931,7 @@ impl HealthRecorder for PerformanceRecorder {
 }
 ```
 
-- [ ] **Step 4: Extend `AttemptOutcome` and `dispatch_outcome`**
+- [x] **Step 4: Extend `AttemptOutcome` and `dispatch_outcome`**
 
 In `crates/gateway/src/gates/mod.rs`, add `pub mod performance;` and two fields to `AttemptOutcome`:
 
@@ -959,7 +975,7 @@ Run: `cargo build --workspace 2>&1 | grep -E "^error" | head -20`
 
 For each call site, pass the duration already in scope (`start.elapsed().as_millis() as u64` at `engine/execute.rs:332`) and `response.usage.map(|u| u.output_tokens)` where a response exists, `None` otherwise. On the stream-acquisition dispatch at `engine/stream.rs:230`, pass the elapsed time since the attempt began and `None` for tokens.
 
-- [ ] **Step 5: Wire the store into `Gateway`**
+- [x] **Step 5: Wire the store into `Gateway`**
 
 In `crates/gateway/src/engine/mod.rs`, add a field beside `cooldown` / `model_lockout`:
 
@@ -1000,7 +1016,7 @@ pub const DEFAULT_PERF_SAMPLES: usize = 64;
 pub const DEFAULT_PERF_WINDOW: Duration = Duration::from_secs(300);
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-gateway performance -- --nocapture`
 Expected: PASS, 5 tests.
@@ -1008,7 +1024,7 @@ Expected: PASS, 5 tests.
 Run: `cargo test --workspace 2>&1 | tail -20`
 Expected: all green — the new fields are ignored by every existing recorder.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/gateway/src
@@ -1099,9 +1115,16 @@ Then the test:
 /// looked perfectly healthy — and the default strategy's reliability multiplier
 /// would then have weighted traffic toward it.
 ///
-/// Two samples are expected after the fix: the acquisition dispatch (a genuine
-/// success — the stream WAS obtained, and that sample is what carries latency)
-/// and the mid-stream failure. So `success_rate` is 0.5, not 0.0.
+/// Two samples are recorded, but only ONE carries a verdict. Task 4's
+/// `AttemptPhase` split means the acquisition dispatch (`StreamAcquired`)
+/// contributes a latency and no verdict, because a completion outcome for the
+/// same attempt always follows. So `success_rate` is **0.0**, not 0.5 — one
+/// attempt, one vote, and it failed.
+///
+/// (An earlier draft of this plan said 0.5 here. That was written before the
+/// phase split and is exactly the floor the split exists to remove: an endpoint
+/// failing every stream mid-way must be able to reach 0.0, or Task 7's
+/// reliability multiplier can never de-weight it.)
 #[tokio::test]
 async fn a_mid_stream_failure_is_recorded_as_a_failure() {
     let mut routers = HashMap::new();
@@ -1225,12 +1248,19 @@ In `crates/gateway/src/engine/stream.rs`, in the mid-stream error arm (currently
                                 // and is deliberately out of scope (spec §12).
                                 let _ = super::dispatch_outcome(
                                     &recorders,
-                                    &endpoint,
-                                    &candidate.router,
-                                    false,
-                                    Some(&e),
-                                    stream_start.elapsed().as_millis() as u64,
-                                    usage_acc.map(|u| u.output_tokens),
+                                    &crate::gates::AttemptOutcome {
+                                        endpoint: &endpoint,
+                                        router: &candidate.router,
+                                        success: false,
+                                        error: Some(&e),
+                                        duration_ms: stream_start.elapsed().as_millis() as u64,
+                                        output_tokens: usage_acc.map(|u| u.output_tokens),
+                                        // The stream ENDED, badly. This is the attempt's one
+                                        // and only verdict — the acquisition dispatch above
+                                        // deliberately cast none — and its duration is
+                                        // generation time, so it contributes no latency.
+                                        phase: crate::gates::AttemptPhase::StreamCompleted,
+                                    },
                                 );
                                 // Mid-stream failure: bytes already sent, so no
                                 // fallback — surface and stop.
@@ -1251,16 +1281,19 @@ Throughput only exists at completion. After `let tokens = usage_acc.unwrap_or_de
                     // Throughput is only knowable here. The acquisition dispatch at the
                     // top of this block recorded LATENCY (time until the stream started
                     // producing); this second dispatch records the generation rate. The
-                    // two durations measure different spans and are never pooled into one
-                    // mean — see `EndpointStats`.
+                    // two durations measure different spans, and `AttemptPhase` is what
+                    // keeps them out of one mean — see `EndpointStats`.
                     let _ = super::dispatch_outcome(
                         &recorders,
-                        &endpoint,
-                        &candidate.router,
-                        true,
-                        None,
-                        stream_start.elapsed().as_millis() as u64,
-                        Some(tokens.output_tokens),
+                        &crate::gates::AttemptOutcome {
+                            endpoint: &endpoint,
+                            router: &candidate.router,
+                            success: true,
+                            error: None,
+                            duration_ms: stream_start.elapsed().as_millis() as u64,
+                            output_tokens: Some(tokens.output_tokens),
+                            phase: crate::gates::AttemptPhase::StreamCompleted,
+                        },
                     );
 ```
 
