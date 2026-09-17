@@ -713,8 +713,14 @@ mod tests {
             "allow_fallback",
             "credentials",
         ] {
+            // Match on the `debug_struct` separator (`"field: "`), not the bare
+            // name — a bare-name match is satisfied by an unrelated field whose
+            // own name contains this one as a substring (`"route"` inside
+            // `"router: None"`; `"router"`/`"model"` inside `"routers: [...]"` /
+            // `"models: [...]"`), so it would pass even with the `.field(...)`
+            // call for THIS field deleted.
             assert!(
-                dbg.contains(field),
+                dbg.contains(&format!("{field}: ")),
                 "hand-written Debug dropped `{field}`: {dbg}"
             );
         }
