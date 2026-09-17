@@ -270,6 +270,8 @@ mod tests {
             models,
             chains,
             constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
         }
     }
 
@@ -288,6 +290,11 @@ mod tests {
             },
             budget: None,
             auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+            routing: None,
         }
     }
 
