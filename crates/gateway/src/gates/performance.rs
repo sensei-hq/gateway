@@ -18,11 +18,20 @@ pub struct EndpointStats {
     pub mean_latency_ms: f64,
     /// Mean over `throughput_samples`; `0.0` when there are none.
     pub mean_tokens_per_sec: f64,
-    /// Fraction of VERDICT-bearing live samples (`Complete` and
+    /// Of the live samples, how many carried a VERDICT (`Complete` and
     /// `StreamCompleted`; NOT `StreamAcquired`, which is a latency observation
-    /// with no final verdict) that succeeded. `0.0` when there are none. Feeds
-    /// the default strategy's reliability multiplier — one attempt casts
-    /// exactly one verdict here, however many phases it dispatched.
+    /// with no final verdict). Counted SEPARATELY from `samples` — it is
+    /// neither a superset nor a subset of it — for exactly the reason
+    /// `throughput_samples` exists: without it, `success_rate: 0.0` cannot be
+    /// told apart from "never measured" (a healthy `StreamAcquired`-only
+    /// endpoint and an outright failed `Complete` endpoint would otherwise
+    /// report the identical `EndpointStats`).
+    pub verdict_samples: u32,
+    /// Fraction of `verdict_samples` that succeeded. `0.0` when there are
+    /// none — check `verdict_samples` to tell that apart from "measured and
+    /// 0% succeeded". Feeds the default strategy's reliability multiplier —
+    /// one attempt casts exactly one verdict here, however many phases it
+    /// dispatched.
     pub success_rate: f64,
 }
 
@@ -170,6 +179,7 @@ impl EndpointPerformanceRead for PerformanceStore {
             throughput_samples: tps.len() as u32,
             mean_latency_ms,
             mean_tokens_per_sec,
+            verdict_samples: verdicts.len() as u32,
             success_rate,
         })
     }
@@ -426,6 +436,89 @@ mod tests {
         );
     }
 
+    /// The failure assertion above is not enough on its own: `0.0` is ALSO
+    /// what the empty-verdicts fallback produces, so a `Complete` phase that
+    /// silently stopped contributing a verdict at all would pass it too. This
+    /// pins the SUCCESS case, where `1.0` is unreachable from that fallback —
+    /// the only way to get `1.0` is a real verdict actually being counted.
+    #[test]
+    fn a_complete_attempt_contributes_its_verdict() {
+        let store = PerformanceStore::new(8, Duration::from_secs(60));
+        let rec = PerformanceRecorder::new(store.clone(), 4096);
+        rec.on_outcome(&outcome("r:m", true, 100, None, AttemptPhase::Complete));
+        let s = store.stats("r:m").unwrap();
+        assert_eq!(
+            s.verdict_samples, 1,
+            "a Complete phase always carries a verdict"
+        );
+        assert!(
+            (s.success_rate - 1.0).abs() < 1e-9,
+            "a successful Complete must move success_rate OFF the 0.0 no-verdict fallback"
+        );
+    }
+
+    /// A `StreamCompleted`-only ring carries a verdict but NO latency
+    /// observation at all (its `duration_ms` is generation time). The
+    /// `latencies.is_empty()` guard must still report `0.0`, not divide `0.0`
+    /// by a `latencies.len()` of `0` and produce `NaN` — a `NaN` mean's
+    /// `partial_cmp` returns `None`, which would silently corrupt Task 9's
+    /// `sort_by(partial_cmp)`: the endpoint neither sorts nor errors, it lands
+    /// wherever the comparator gives up.
+    #[test]
+    fn a_ring_with_no_latency_observation_reports_zero_not_nan() {
+        let store = PerformanceStore::new(8, Duration::from_secs(60));
+        let rec = PerformanceRecorder::new(store.clone(), 4096);
+        rec.on_outcome(&outcome(
+            "r:m",
+            true,
+            5_000,
+            Some(100),
+            AttemptPhase::StreamCompleted,
+        ));
+
+        let s = store.stats("r:m").expect("a live sample still reports");
+        assert_eq!(
+            s.samples, 0,
+            "StreamCompleted contributes no latency sample"
+        );
+        assert!(
+            !s.mean_latency_ms.is_nan(),
+            "a NaN mean poisons partial_cmp in the latency sort"
+        );
+        assert_eq!(
+            s.mean_latency_ms.partial_cmp(&10.0),
+            Some(std::cmp::Ordering::Less),
+            "the 0.0 fallback must total-order against a real value, not collapse the comparator"
+        );
+    }
+
+    /// A `StreamAcquired`-only ring carries a latency observation but NO
+    /// verdict and NO token count — both the `verdicts.is_empty()` and
+    /// `tps.is_empty()` guards must hold here simultaneously.
+    #[test]
+    fn a_ring_with_no_verdict_reports_zero_not_nan() {
+        let store = PerformanceStore::new(8, Duration::from_secs(60));
+        let rec = PerformanceRecorder::new(store.clone(), 4096);
+        rec.on_outcome(&outcome(
+            "r:m",
+            true,
+            200,
+            None,
+            AttemptPhase::StreamAcquired,
+        ));
+
+        let s = store.stats("r:m").expect("a live sample still reports");
+        assert_eq!(
+            s.verdict_samples, 0,
+            "StreamAcquired contributes no verdict"
+        );
+        assert!(
+            !s.success_rate.is_nan(),
+            "a NaN success_rate poisons any sort/filter on it"
+        );
+        assert!(!s.mean_tokens_per_sec.is_nan());
+    }
+
     /// One streaming attempt must contribute ONE latency observation and ONE
     /// verdict, not two of each. Before the phase split, a stream that died
     /// mid-way scored 0.5 forever because its acquisition success was counted
@@ -510,7 +603,10 @@ mod tests {
     }
 
     /// At/below the cap, nothing is evicted — even an all-stale endpoint is
-    /// kept (until the cap is actually exceeded on some later write).
+    /// kept (until the cap is actually exceeded on some later write). `cap`
+    /// is set to the EXACT current length (1), not some generous headroom —
+    /// a `<=` weakened to `<` would still pass a cap of 4096 against a len of
+    /// 1, since 1 < 4096 either way.
     #[test]
     fn evict_stale_over_cap_no_op_when_at_or_below_cap() {
         let store = PerformanceStore::new(8, Duration::from_secs(60));
@@ -518,11 +614,48 @@ mod tests {
             "stale",
             aged_sample(Duration::from_secs(120), 100, None, true),
         );
-        store.evict_stale_over_cap(4096);
+        store.evict_stale_over_cap(1);
         assert_eq!(
             store.len(),
             1,
-            "at/below cap, even an all-stale endpoint is kept"
+            "at (not merely below) cap, even an all-stale endpoint is kept"
+        );
+    }
+
+    /// Before `verdict_samples` existed, a healthy stream acquisition (a
+    /// latency observation with no verdict yet) read IDENTICALLY to an
+    /// outright failure: both produced `samples: 1, throughput_samples: 0,
+    /// mean_latency_ms: 200.0, mean_tokens_per_sec: 0.0, success_rate: 0.0`.
+    /// `EndpointStats` derives `PartialEq`, so the two are equal until a
+    /// discriminator distinguishes "never measured" from "measured and
+    /// failed" — exactly the hazard `throughput_samples` already solved for
+    /// tokens. Red against the pre-`verdict_samples` source (the two ARE
+    /// equal there); green once `verdict_samples` differs (1 vs 0).
+    #[test]
+    fn no_verdict_is_distinguishable_from_total_failure() {
+        let store = PerformanceStore::new(8, Duration::from_secs(60));
+        let rec = PerformanceRecorder::new(store.clone(), 4096);
+
+        rec.on_outcome(&outcome(
+            "healthy:stream",
+            true,
+            200,
+            None,
+            AttemptPhase::StreamAcquired,
+        ));
+        rec.on_outcome(&outcome(
+            "broken:complete",
+            false,
+            200,
+            None,
+            AttemptPhase::Complete,
+        ));
+
+        let a = store.stats("healthy:stream").unwrap();
+        let b = store.stats("broken:complete").unwrap();
+        assert_ne!(
+            a, b,
+            "a healthy stream acquisition must not read identically to a failure"
         );
     }
 }

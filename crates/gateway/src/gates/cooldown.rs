@@ -326,12 +326,14 @@ mod tests {
     }
 
     /// At/below the cap, nothing is evicted — even an expired entry is kept.
+    /// `cap` is the EXACT current length (1), not generous headroom — a `<=`
+    /// weakened to `<` would still pass a cap of 4096 against a len of 1.
     #[test]
     fn evict_no_op_when_at_or_below_cap() {
         let s = ConnectionCooldownStore::new();
         let now = Instant::now();
         s.start("a", now - Duration::from_secs(1)); // expired but under cap → kept
-        s.evict_expired_over_cap(4096);
+        s.evict_expired_over_cap(1);
         assert!(s.cooling_until("a").is_some());
     }
 
