@@ -1258,8 +1258,6 @@ async fn no_fallback_when_disabled_stops_at_primary() {
 
     let req = InferenceRequest {
         allow_fallback: false,
-        credentials: Default::default(),
-        routing: None,
         ..chat_request()
     };
     match gw.execute(&req).await.unwrap_err() {
