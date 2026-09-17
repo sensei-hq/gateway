@@ -374,9 +374,11 @@ fn default_true() -> bool {
 /// Per-request provider-routing preferences (SP-ROUTE-1).
 ///
 /// Every knob is optional; an entirely absent `RoutingPreferences` means "use
-/// the default" — price-weighted, uptime-aware selection within equal-priority
-/// groups, which is a no-op on any chain whose priorities are distinct.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+/// the default". From SP-ROUTE-1 Task 7 that default is price-weighted,
+/// uptime-aware selection within equal-priority groups (a no-op on any chain
+/// whose priorities are distinct); until then it is strict `priority` order
+/// (see `gateway::strategy::PriorityStrategy`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RoutingPreferences {
     /// Replace the default ordering with a deterministic sort.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,11 +394,14 @@ pub struct RoutingPreferences {
     pub order: Option<Vec<CandidateRef>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortKey {
+    /// Ascending — cheapest candidate first.
     Price,
+    /// Ascending — fastest (lowest-latency) candidate first.
     Latency,
+    /// Descending — highest-throughput candidate first.
     Throughput,
 }
 
@@ -405,7 +410,7 @@ pub enum SortKey {
 /// contain colons (`"ollama:gemma3:27b"`).
 ///
 /// An EMPTY list is "don't care" on that axis.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CandidateSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routers: Vec<String>,
@@ -415,7 +420,7 @@ pub struct CandidateSet {
 
 /// One position in an explicit sequence. An ABSENT field is a wildcard, so
 /// `{router: "anthropic"}` means "every anthropic candidate, here".
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CandidateRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<String>,
@@ -661,6 +666,61 @@ mod tests {
         assert!(
             dbg.contains("openai"),
             "router name should appear so the override is debuggable: {dbg}"
+        );
+    }
+
+    /// The hand-written `Debug` impl claims (in its doc comment) that every
+    /// field but `credentials` prints verbatim. Enumerate the field names so a
+    /// dropped `.field(...)` call — including on the NEXT field someone adds —
+    /// fails this test rather than silently shrinking the impl.
+    #[test]
+    fn debug_prints_every_field() {
+        let req = InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::Chat {
+                messages: Vec::new(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: HashMap::new(),
+            routing: Some(RoutingPreferences {
+                sort: Some(SortKey::Latency),
+                ..Default::default()
+            }),
+        };
+        let dbg = format!("{req:?}");
+        for field in [
+            "capability",
+            "model",
+            "router",
+            "chain",
+            "payload",
+            "budget",
+            "auth",
+            "panel",
+            "consensus",
+            "routing",
+            "allow_fallback",
+            "credentials",
+        ] {
+            assert!(
+                dbg.contains(field),
+                "hand-written Debug dropped `{field}`: {dbg}"
+            );
+        }
+        assert!(
+            dbg.contains("Latency"),
+            "routing value must be visible: {dbg}"
         );
     }
 
@@ -1638,15 +1698,25 @@ mod tests {
             serde_json::from_str::<RoutingPreferences>(&json).unwrap(),
             prefs
         );
-        // Empty axes and absent knobs must not be emitted — a caller sending
-        // `only: {routers: [...]}` should not get `models: []` back.
-        assert!(
-            !json.contains("models"),
-            "empty axis must be skipped: {json}"
+        // Exact wire shape: pins every skip that fires here, the field names,
+        // and the snake_case SortKey rename.
+        assert_eq!(
+            json,
+            r#"{"sort":"price","only":{"routers":["anthropic"]},"order":[{"router":"ollama"}]}"#
         );
-        assert!(
-            !json.contains("ignore"),
-            "absent knob must be skipped: {json}"
+        // Every knob absent / every axis empty ⇒ the empty object, on all three types.
+        // This is what pins the remaining five `skip_serializing_if`s.
+        assert_eq!(
+            serde_json::to_string(&RoutingPreferences::default()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::to_string(&CandidateSet::default()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::to_string(&CandidateRef::default()).unwrap(),
+            "{}"
         );
     }
 
