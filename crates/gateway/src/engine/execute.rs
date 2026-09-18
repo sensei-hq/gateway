@@ -60,12 +60,7 @@ impl super::Gateway {
         };
 
         // 3. Select all candidates
-        let svc = ModelSelectionService::new(
-            &config,
-            &self.circuit_breaker,
-            &self.cooldown,
-            &self.model_lockout,
-        );
+        let svc = self.selection_service(&config);
         let result = svc.select_all(&criteria);
 
         // 4. No candidates? Selection admitted nothing. If every skip was a gate
@@ -273,7 +268,7 @@ impl super::Gateway {
         } else {
             Some(candidate.api_model_id.clone())
         };
-        let endpoint = format!("{}:{}", candidate.router, candidate.model);
+        let endpoint = candidate.endpoint_key();
         // Per-call credential override: a tenant-aware consumer resolves the
         // caller's key and injects it here, so the engine stays tenant-agnostic.
         // Preferred over the router's configured api_key/env for this dispatch.

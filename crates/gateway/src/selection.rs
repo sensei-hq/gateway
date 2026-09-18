@@ -39,6 +39,16 @@ pub struct SelectionCriteria {
     pub preferences: Option<RoutingPreferences>,
 }
 
+/// The `"{router}:{model}"` key every read/write performance, health, cooldown,
+/// and lockout port is keyed by. ONE function, so a separator change (or a
+/// Task 9 lookup that needs a fourth call site) touches one place instead of
+/// silently drifting between the two `CandidateView` construction sites below
+/// and the two engine call sites (`engine::execute`, `engine::stream`) that
+/// used to each spell `format!("{}:{}", ...)` out by hand.
+pub(crate) fn endpoint_key(router: &str, model: &str) -> String {
+    format!("{router}:{model}")
+}
+
 /// A model that passed all validation checks and is ready for execution.
 #[derive(Debug, Clone)]
 pub struct SelectedModel {
@@ -49,6 +59,14 @@ pub struct SelectedModel {
     pub api_model_id: String,
     pub priority: u8,
     pub cost_estimate: Option<CostEstimate>,
+}
+
+impl SelectedModel {
+    /// The same `"{router}:{model}"` key `admit` built while gating this
+    /// candidate — see [`endpoint_key`].
+    pub(crate) fn endpoint_key(&self) -> String {
+        endpoint_key(&self.router, &self.model)
+    }
 }
 
 /// A candidate that was considered but rejected during validation.
@@ -97,10 +115,16 @@ pub struct ModelSelectionService<'a> {
 }
 
 static NO_PERF: crate::gates::performance::NoPerformance = crate::gates::performance::NoPerformance;
-/// A FIXED seed, deliberately. This default is reached only by callers that
-/// construct the service directly — unit tests — where reproducibility is what
-/// you want. Both production paths (`engine::execute`, `engine::stream`) pass
-/// the gateway's entropy-seeded source via `with_random` from Task 10.
+/// A FIXED seed, reached only by callers that construct the service directly.
+///
+/// This does NOT give a test a reproducible draw: the static is process-wide and
+/// cargo runs tests in parallel, so the sequence is fixed but which test receives
+/// which value is not. A test that depends on specific draws MUST pass its own
+/// `SplitMix64::seeded(n)` via `with_random`. Both production paths
+/// (`engine::execute`, `engine::stream`) pass the gateway's entropy-seeded source
+/// via `with_random` from Task 10 — see
+/// `engine::tests::production_selection_never_uses_the_fixed_seed_default`, the
+/// tripwire that catches a caller that forgets to.
 static DEFAULT_RNG: crate::random::SplitMix64 = crate::random::SplitMix64::seeded(0x5EED_5EED);
 
 impl<'a> ModelSelectionService<'a> {
@@ -183,6 +207,21 @@ impl<'a> ModelSelectionService<'a> {
     pub fn with_random(mut self, rng: &'a dyn crate::random::RandomSource) -> Self {
         self.rng = rng;
         self
+    }
+
+    /// Whether this service still holds the fixed-seed `DEFAULT_RNG` — i.e.
+    /// `with_random` was never called (or silently discarded its argument).
+    /// Pointer identity against the process-wide static, not a value
+    /// comparison: two *different* `SplitMix64::seeded(0x5EED_5EED)` instances
+    /// would compare unequal here, which is exactly what this needs to detect
+    /// — "is this THE default" rather than "is this seeded the same as it".
+    /// Test-only; see `engine::tests::production_selection_never_uses_the_fixed_seed_default`.
+    #[cfg(test)]
+    pub(crate) fn uses_default_rng(&self) -> bool {
+        std::ptr::eq(
+            self.rng as *const _ as *const (),
+            &DEFAULT_RNG as *const _ as *const (),
+        )
     }
 
     /// Select the first valid candidate.
@@ -351,7 +390,7 @@ impl<'a> ModelSelectionService<'a> {
         let cand = CandidateView {
             model: model_name,
             router: router_name,
-            endpoint: format!("{router_name}:{model_name}"),
+            endpoint: endpoint_key(router_name, model_name),
             model_config,
             router_config,
         };
@@ -455,7 +494,7 @@ impl<'a> ModelSelectionService<'a> {
         let cand = CandidateView {
             model: model_name,
             router: &router_name,
-            endpoint: format!("{router_name}:{model_name}"),
+            endpoint: endpoint_key(&router_name, model_name),
             model_config,
             router_config,
         };
@@ -500,6 +539,7 @@ impl<'a> ModelSelectionService<'a> {
 mod tests {
     use super::*;
     use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
+    use crate::random::RandomSource;
     use crate::types::config::{
         ChainEntry, FallbackChainConfig, FallbackTrigger, ModelConfig, ModelPricing, RouterConfig,
     };
@@ -1747,8 +1787,15 @@ mod tests {
     /// lists its entries in priority order, so a `PriorityStrategy` reduced to a
     /// no-op would still satisfy an assertion built on it: the input order and the
     /// sorted order coincide. Reversing them here means only an actual sort
-    /// produces `["gemma3:27b", "claude-haiku"]`; a no-op or mis-wired ctx would
-    /// yield `["claude-haiku", "gemma3:27b"]` instead.
+    /// produces `["gemma3:27b", "claude-haiku"]`; a no-op strategy would yield
+    /// `["claude-haiku", "gemma3:27b"]` instead.
+    ///
+    /// This test does NOT prove the ctx's individual ports (`rng`/`perf`/
+    /// `min_samples`) actually reach the strategy — `PriorityStrategy` ignores
+    /// `ctx` entirely, so a ctx built wholly from wrong defaults changes nothing
+    /// here. That claim belongs to
+    /// [`the_builders_install_the_ports_the_strategy_sees`], which uses a probe
+    /// strategy that reads the ctx back out.
     #[test]
     fn widening_the_strategy_seam_leaves_selection_unchanged() {
         let mut config = test_config();
@@ -1819,6 +1866,99 @@ mod tests {
         assert_eq!(
             got_bare, got_wired,
             "wiring the new ports must not perturb a PriorityStrategy selection"
+        );
+    }
+
+    /// Records what the `StrategyCtx` it was handed actually carried, so a test
+    /// can read the ports back out rather than infer them from `PriorityStrategy`'s
+    /// output — which ignores `ctx` entirely and therefore cannot tell "wired
+    /// correctly" from "silently discarded".
+    #[derive(Default)]
+    struct ProbeStrategy {
+        draw: std::sync::Mutex<Option<u64>>,
+        min_samples: std::sync::Mutex<Option<u32>>,
+        perf_samples: std::sync::Mutex<Option<u32>>,
+    }
+    impl crate::strategy::RoutingStrategy for std::sync::Arc<ProbeStrategy> {
+        fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &crate::strategy::StrategyCtx<'_>) {
+            *self.draw.lock().unwrap() = Some(ctx.rng.next_u64());
+            *self.min_samples.lock().unwrap() = Some(ctx.min_samples);
+            *self.perf_samples.lock().unwrap() =
+                ctx.perf.stats("probe-endpoint").map(|s| s.samples);
+            admitted.sort_by_key(|m| m.priority);
+        }
+    }
+
+    /// The Critical fix: `widening_the_strategy_seam_leaves_selection_unchanged`
+    /// is green in exactly the world where `with_random`/`with_performance`
+    /// silently discard their arguments, because it only ever exercises
+    /// `PriorityStrategy`, which never reads `ctx`. This test installs a probe
+    /// strategy (via the crate-private `strategy` field — `mod tests` is a child
+    /// of `selection`) that reads the ctx back out, so a builder that drops its
+    /// argument is directly observable.
+    ///
+    /// `min_samples: 11` deliberately differs from the default (`3`), and
+    /// `perf_samples: Some(1)` deliberately differs from the null port's
+    /// (`None`) — each assertion must be unreachable from what `new()` already
+    /// installs, or a builder that does nothing would still pass it.
+    #[test]
+    fn the_builders_install_the_ports_the_strategy_sees() {
+        let config = test_config();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+
+        let store =
+            crate::gates::performance::PerformanceStore::new(8, std::time::Duration::from_secs(60));
+        store.record(
+            "probe-endpoint",
+            crate::gates::performance::Sample {
+                at: std::time::Instant::now(),
+                latency_ms: Some(10),
+                tokens_per_sec: None,
+                success: Some(true),
+            },
+        );
+        let rng = crate::random::SplitMix64::seeded(1234);
+        // Computed from a SEPARATE, freshly-seeded instance — not `rng` itself —
+        // so this is a real prediction of `rng`'s first draw, not a tautology.
+        let expected_first_draw = crate::random::SplitMix64::seeded(1234).next_u64();
+
+        let probe = std::sync::Arc::new(ProbeStrategy::default());
+        let mut svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout)
+            .with_performance(&store, 11)
+            .with_random(&rng);
+        svc.strategy = Box::new(std::sync::Arc::clone(&probe));
+
+        let criteria = SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("chat_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: None,
+        };
+        let _ = svc.select_all(&criteria);
+
+        assert_eq!(
+            *probe.draw.lock().unwrap(),
+            Some(expected_first_draw),
+            "resolve_chain's ctx must carry the `rng` passed to `with_random`, not \
+             `DEFAULT_RNG` or anything else"
+        );
+        assert_eq!(
+            *probe.min_samples.lock().unwrap(),
+            Some(11),
+            "resolve_chain's ctx must carry the `min_samples` passed to \
+             `with_performance`, not the default `3`"
+        );
+        assert_eq!(
+            *probe.perf_samples.lock().unwrap(),
+            Some(1),
+            "resolve_chain's ctx must carry the `perf` passed to `with_performance`, \
+             not the null port (which would report `None`)"
         );
     }
 }

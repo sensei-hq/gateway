@@ -6,7 +6,17 @@ use crate::selection::SelectedModel;
 pub struct StrategyCtx<'a> {
     pub perf: &'a dyn EndpointPerformanceRead,
     pub rng: &'a dyn RandomSource,
-    /// Minimum live samples before a metric sort considers a candidate measured.
+    /// The minimum count of the counter appropriate to the metric being sorted
+    /// on, before a metric sort trusts it as "measured" rather than falling
+    /// back: `EndpointStats::verdict_samples` for `success_rate`,
+    /// `EndpointStats::samples` for latency, `EndpointStats::throughput_samples`
+    /// for throughput. These three counters are independent (see their doc on
+    /// `EndpointStats`) — comparing this threshold against the wrong one is a
+    /// live hazard, not a cosmetic mismatch: a gate written as
+    /// `stats.samples >= min_samples` before trusting `success_rate` would
+    /// treat a `StreamAcquired`-only endpoint (`verdict_samples == 0`,
+    /// `success_rate == 0.0`) as measured-and-totally-unreliable, zeroing out
+    /// a healthy endpoint that has simply never completed a request.
     pub min_samples: u32,
 }
 
