@@ -169,7 +169,8 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
 }
 
 /// `sort: price` — ascending estimated cost across every candidate, free first,
-/// ties broken by authored priority so the order is total.
+/// ties broken by authored priority so no pair is left to price alone; equal
+/// price and equal priority keep chain order.
 ///
 /// This deliberately overrides `priority` entirely, unlike
 /// [`GroupedWeightedStrategy`], which only ever reorders WITHIN a priority
@@ -180,12 +181,29 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
 /// that an unpriced model costs nothing.
 pub struct PriceStrategy;
 
+/// The sort key for one candidate.
+///
+/// A NON-FINITE price is fenced to `+inf` so it sorts LAST. This is not
+/// hypothetical: `estimate_cost` sums `input_cost + output_cost` over three
+/// unvalidated `f64`s from config, so `1e308` against `-1e308` produces `NaN`.
+/// A `NaN` compares `None` against everything, `unwrap_or(Equal)` turns that
+/// into "equal to all", and an intransitive comparator makes `sort_by` PANIC —
+/// which the `.then(priority)` tiebreak does NOT rescue, since equal priorities
+/// are exactly the load-balancing case an explicit `sort` permits.
+///
+/// `+inf` rather than `0.0` deliberately: `None` is free, but an unusable price
+/// is not a price at all, and treating it as free would let a broken price win
+/// the CHEAPEST slot — a budget hazard rather than a neutral default.
+fn price_key(m: &SelectedModel) -> f64 {
+    let c = m.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
+    if c.is_finite() { c } else { f64::INFINITY }
+}
+
 impl RoutingStrategy for PriceStrategy {
     fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) {
         admitted.sort_by(|a, b| {
-            let ca = a.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
-            let cb = b.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
-            ca.partial_cmp(&cb)
+            price_key(a)
+                .partial_cmp(&price_key(b))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.priority.cmp(&b.priority))
         });
@@ -227,18 +245,30 @@ impl MetricStrategy {
 
     /// `None` ⇒ not measured for THIS metric.
     ///
-    /// Throughput reads `throughput_samples`, NOT `samples`: an endpoint with
-    /// plenty of latency observations but no token counts would otherwise sort
-    /// on a mean over nothing. The two counters are independent by design.
+    /// Each arm reads the counter that belongs to ITS metric, and no other.
+    /// Latency reads `samples`; throughput reads `throughput_samples`. The
+    /// three counters on `EndpointStats` are independent — neither a superset
+    /// nor a subset of one another — so an endpoint can carry plenty of
+    /// observations of one kind and none of another, and each mean is `0.0`
+    /// when its own counter is zero. Read the wrong one and that `0.0`
+    /// fallback is mistaken for a measurement, which sorts the endpoint that
+    /// was NEVER observed straight to the front.
+    ///
+    /// A non-finite reading is fenced to `None` — not a measurement, so it
+    /// takes the unmeasured hold-its-index path. Without this, a `NaN` compares
+    /// `None` against every other candidate, `unwrap_or(Equal)` turns that into
+    /// "equal to all", and the resulting intransitive comparator makes
+    /// `sort_by` panic.
     fn value(&self, m: &SelectedModel, ctx: &StrategyCtx<'_>) -> Option<f64> {
         let s = ctx.perf.stats(&m.endpoint_key())?;
-        match self.metric {
+        let v = match self.metric {
             Metric::Latency => (s.samples >= ctx.min_samples).then_some(s.mean_latency_ms),
             // Negated so an ASCENDING sort puts the highest rate first.
             Metric::Throughput => {
                 (s.throughput_samples >= ctx.min_samples).then_some(-s.mean_tokens_per_sec)
             }
-        }
+        }?;
+        v.is_finite().then_some(v)
     }
 }
 
@@ -247,19 +277,37 @@ impl RoutingStrategy for MetricStrategy {
         // The baseline every unmeasured candidate keeps.
         admitted.sort_by_key(|m| m.priority);
 
-        let slots: Vec<usize> = admitted
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| self.value(m, ctx).is_some())
-            .map(|(i, _)| i)
-            .collect();
-
-        let mut subset: Vec<SelectedModel> = slots.iter().map(|&i| admitted[i].clone()).collect();
-        subset.sort_by(|a, b| {
-            let (va, vb) = (self.value(a, ctx), self.value(b, ctx));
-            va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for (&slot, m) in slots.iter().zip(subset) {
+        // ONE read per candidate, taken BEFORE any comparison, then sort the
+        // SNAPSHOT. `ctx.perf` is a LIVE rolling window that
+        // `PerformanceRecorder::on_outcome` mutates from every concurrently
+        // completing attempt, and `stats()` recomputes its means from
+        // `Instant::now()` on every call. Calling `value()` from INSIDE the
+        // comparator lets a candidate's key change between two comparisons,
+        // which makes the comparator intransitive — and `sort_by` detects that
+        // and PANICS, inside model selection. Measured against the real
+        // `PerformanceStore` with four writer threads: 89 panics in 719
+        // selections at n=40, and none at n=12, because the total-order check
+        // only runs once the input outgrows insertion sort.
+        //
+        // Snapshotting also drops the cost from O(n log n) mutex acquisitions,
+        // full-window rescans and `endpoint_key()` allocations per selection to
+        // O(n) — 12 reads for a 12-candidate chain rather than 144.
+        let mut subset: Vec<(f64, SelectedModel)> = Vec::new();
+        let mut slots: Vec<usize> = Vec::new();
+        for (i, m) in admitted.iter().enumerate() {
+            if let Some(v) = self.value(m, ctx) {
+                slots.push(i);
+                subset.push((v, m.clone()));
+            }
+        }
+        // STABLE, and that is load-bearing: candidates whose readings are equal
+        // fall back to the authored priority order established above, which is
+        // what makes a partial set of observations a monotone interpolation
+        // between priority order and metric order rather than an arbitrary
+        // shuffle of the ties.
+        subset.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        debug_assert_eq!(slots.len(), subset.len());
+        for (&slot, (_, m)) in slots.iter().zip(subset) {
             admitted[slot] = m;
         }
     }
@@ -1072,5 +1120,358 @@ mod tests {
              move — and it is already in the one measured slot. Reading `samples` \
              instead would make `latency_only` measured at 0.0 tok/s and demote it."
         );
+    }
+
+    // --- Task 8/9 review fixes -------------------------------------------
+
+    /// `sm_cost` builds `router: "test"`, so a candidate `mNN` keys as
+    /// `test:mNN`. Recovers the index a fixture varies its reading by.
+    fn endpoint_idx(endpoint: &str) -> usize {
+        endpoint
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .trim_start_matches('m')
+            .parse()
+            .unwrap()
+    }
+
+    /// A reading computed per endpoint by a closure. `FixedStats` takes a
+    /// `'static` slice, which cannot express a fixture whose SIZE varies — and
+    /// the drift, non-finite and stability tests below all sweep `n`.
+    struct FnStats<F>(F);
+    impl<F: Fn(&str) -> Option<EndpointStats> + Send + Sync> EndpointPerformanceRead for FnStats<F> {
+        fn stats(&self, endpoint: &str) -> Option<EndpointStats> {
+            (self.0)(endpoint)
+        }
+    }
+
+    /// Counts `stats()` calls. The readings are real and distinct, so the sort
+    /// does genuine work — a fixture reporting "unmeasured" would keep the
+    /// count low by doing nothing, and prove nothing.
+    #[derive(Default)]
+    struct CountingStats {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl EndpointPerformanceRead for CountingStats {
+        fn stats(&self, endpoint: &str) -> Option<EndpointStats> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(EndpointStats {
+                samples: 9,
+                throughput_samples: 9,
+                verdict_samples: 9,
+                mean_latency_ms: (100 - endpoint_idx(endpoint)) as f64,
+                mean_tokens_per_sec: 1.0,
+                success_rate: 1.0,
+            })
+        }
+    }
+
+    /// All THREE counters and BOTH means set independently. `FixedStats` ties
+    /// `verdict_samples` to `samples` and every fixture using it sets
+    /// `samples == throughput_samples`, so it structurally cannot pin WHICH
+    /// counter an arm reads. This can.
+    ///
+    /// (suffix, samples, throughput_samples, verdict_samples, latency, tok/s)
+    struct IndependentStats(&'static [(&'static str, u32, u32, u32, f64, f64)]);
+    impl EndpointPerformanceRead for IndependentStats {
+        fn stats(&self, endpoint: &str) -> Option<EndpointStats> {
+            self.0.iter().find(|(e, ..)| endpoint.ends_with(e)).map(
+                |(_, samples, tput, verdicts, latency, tps)| EndpointStats {
+                    samples: *samples,
+                    throughput_samples: *tput,
+                    verdict_samples: *verdicts,
+                    mean_latency_ms: *latency,
+                    mean_tokens_per_sec: *tps,
+                    success_rate: 1.0,
+                },
+            )
+        }
+    }
+
+    /// C1 — the store is read ONCE per candidate, before any comparison.
+    ///
+    /// Reading from inside the comparator is not merely slow, it is the
+    /// Critical below: `stats()` on the real `PerformanceStore` takes a mutex,
+    /// rescans the whole window and allocates, and a comparison-driven read
+    /// count is `O(n log n)` of that on every single selection.
+    #[test]
+    fn a_metric_sort_reads_each_endpoint_at_most_once() {
+        const N: usize = 12;
+        let perf = CountingStats::default();
+        let rng = SplitMix64::seeded(1);
+        let mut v: Vec<SelectedModel> = (0..N)
+            .map(|i| sm_cost(&format!("m{i:02}"), (i + 1) as u8, None))
+            .collect();
+        MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+
+        // Latency is `100 - i`, so ascending latency is DESCENDING index — the
+        // sort really did reorder, and the count below is not the count of a
+        // no-op.
+        let expected: Vec<String> = (0..N).rev().map(|i| format!("m{i:02}")).collect();
+        assert_eq!(
+            names(&v),
+            expected,
+            "the readings must actually drive a sort"
+        );
+
+        let calls = perf.calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            calls <= N,
+            "each candidate's reading must be taken ONCE, before sorting; got \
+             {calls} reads for {N} candidates"
+        );
+    }
+
+    /// C1, the defect itself — a reading that CHANGES between comparisons makes
+    /// the comparator intransitive, and `sort_by` PANICS on that.
+    ///
+    /// This is not hypothetical. `ctx.perf` in production is the shared
+    /// `PerformanceStore`; `stats()` recomputes its means from `Instant::now()`
+    /// over a ring that `PerformanceRecorder::on_outcome` mutates from every
+    /// concurrently completing attempt. Measured against the REAL store with
+    /// four writer threads, the pre-fix code panicked model selection in 89 of
+    /// 719 selections at n=40 ("user-provided comparison function does not
+    /// correctly implement a total order"). At n=12 it never panicked — the
+    /// cliff is n≈20, where the sort stops using insertion sort and starts
+    /// running its total-order check, so a small fixture cannot see this.
+    ///
+    /// The fixture drifts deterministically rather than racing, so the test is
+    /// reproducible; the sweep crosses the cliff in both directions because the
+    /// panic is non-monotone in `n`.
+    #[test]
+    fn a_drifting_reading_never_panics_the_sort() {
+        for n in [3usize, 25, 40, 60] {
+            let seq = std::sync::atomic::AtomicU64::new(0);
+            let perf = FnStats(move |_endpoint: &str| {
+                let k = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(EndpointStats {
+                    samples: 9,
+                    throughput_samples: 9,
+                    verdict_samples: 9,
+                    // A different answer every time the SAME endpoint is asked.
+                    mean_latency_ms: (k.wrapping_mul(2_654_435_761) % 1_000) as f64,
+                    mean_tokens_per_sec: (k.wrapping_mul(40_503) % 1_000) as f64,
+                    success_rate: 1.0,
+                })
+            });
+            let rng = SplitMix64::seeded(1);
+            let mut v: Vec<SelectedModel> = (0..n)
+                .map(|i| sm_cost(&format!("m{i:02}"), (i + 1) as u8, None))
+                .collect();
+
+            // Panics here if the reading is taken from inside the comparator.
+            MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+
+            let mut got = names(&v);
+            got.sort();
+            let mut expected: Vec<String> = (0..n).map(|i| format!("m{i:02}")).collect();
+            expected.sort();
+            assert_eq!(
+                got, expected,
+                "n={n}: every candidate must survive the sort exactly once"
+            );
+        }
+    }
+
+    /// I1 — the latency arm reads `samples`, and NEITHER of the other two
+    /// counters.
+    ///
+    /// The Task 9 fixtures all set `samples == throughput_samples` and derived
+    /// `verdict_samples` from `samples`, so `Metric::Latency` reading either of
+    /// the other counters passed every one of them. The failure that ships
+    /// green: `tput_only` has NO latency observation, so its `mean_latency_ms`
+    /// is `0.0` — the never-measured fallback, not a measurement. Read the
+    /// wrong counter and it is "measured at 0.0ms", which sorts FIRST, so
+    /// `sort: latency` routes all traffic to the one endpoint whose latency was
+    /// never observed. That is the Task 4 bug in the untested direction.
+    #[test]
+    fn a_latency_sort_uses_the_latency_counter_only() {
+        let perf = IndependentStats(&[
+            // No latency samples at all ⇒ 0.0 is the FALLBACK, not a reading.
+            // Ample throughput AND verdict samples, so either wrong counter
+            // promotes it.
+            (":tput_only", 0, 9, 9, 0.0, 50.0),
+            // The mirror: latency observed, no token counts, NO verdict cast.
+            // The zero `verdict_samples` is what kills the verdict mutation.
+            (":lat_only", 9, 0, 0, 100.0, 0.0),
+            (":slow", 9, 9, 9, 900.0, 1.0),
+        ]);
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![
+            sm_cost("slow", 1, None),
+            sm_cost("tput_only", 2, None),
+            sm_cost("lat_only", 3, None),
+        ];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["lat_only", "tput_only", "slow"],
+            "`tput_only` is unmeasured FOR LATENCY and must hold slot 1 rather \
+             than lead on a 0.0 fallback; `lat_only` is measured at 100ms and \
+             must beat `slow` at 900ms despite having no token counts and no \
+             verdict"
+        );
+    }
+
+    /// I2 — a non-finite reading is not a measurement.
+    ///
+    /// A `NaN` compares `None` against everything, so `unwrap_or(Equal)` makes
+    /// it EQUAL to every other candidate — an intransitive comparator, which
+    /// `sort_by` panics on. Fencing it at the source reclassifies it as
+    /// unmeasured, which routes it down the already-tested hold-its-index path.
+    ///
+    /// MIXED `NaN`/finite, deliberately: an all-`NaN` fixture measures nothing,
+    /// because everything comparing Equal to everything IS a consistent order
+    /// and does not panic. Swept across `n` because the panic is non-monotone
+    /// in it.
+    #[test]
+    fn a_non_finite_reading_is_not_a_measurement() {
+        for n in [3usize, 25, 30, 60] {
+            let nan_at = n / 2;
+            let perf = FnStats(move |endpoint: &str| {
+                let i = endpoint_idx(endpoint);
+                Some(EndpointStats {
+                    samples: 9,
+                    throughput_samples: 9,
+                    verdict_samples: 9,
+                    mean_latency_ms: if i == nan_at {
+                        f64::NAN
+                    } else {
+                        (n - i) as f64
+                    },
+                    mean_tokens_per_sec: 1.0,
+                    success_rate: 1.0,
+                })
+            });
+            let rng = SplitMix64::seeded(1);
+            let mut v: Vec<SelectedModel> = (0..n)
+                .map(|i| sm_cost(&format!("m{i:02}"), (i + 1) as u8, None))
+                .collect();
+            MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+
+            // Latency is `n - i`, so ascending latency is descending index. The
+            // NaN candidate is not a measurement, so it holds its INDEX and the
+            // finite ones sort among the remaining slots.
+            let mut expected: Vec<String> = (0..n)
+                .rev()
+                .filter(|&i| i != nan_at)
+                .map(|i| format!("m{i:02}"))
+                .collect();
+            expected.insert(nan_at, format!("m{nan_at:02}"));
+            assert_eq!(names(&v), expected, "n={n}");
+        }
+    }
+
+    /// I2, the `PriceStrategy` half — and it needs no exotic fixture to reach.
+    /// `estimate_cost` is `input_cost + output_cost` over three unvalidated
+    /// `f64`s, so `input_per_1k: 1e308` with `output_per_1k: -1e308` yields
+    /// `inf + -inf` = `NaN` straight from config.
+    ///
+    /// ALL-EQUAL priorities, which is the point: `.then(a.priority.cmp(&b))`
+    /// does NOT rescue an intransitive comparator, and equal priority is
+    /// exactly the load-balancing case an explicit `sort` is allowed to have.
+    ///
+    /// The fence maps non-finite to `+inf` so an unusable price sorts LAST.
+    /// `None` means free, but a NON-FINITE price is not a price at all, and
+    /// treating it as free would let a broken price win the CHEAPEST slot — a
+    /// budget hazard, not a neutral default.
+    #[test]
+    fn a_non_finite_price_sorts_last_and_never_panics() {
+        for n in [3usize, 25, 30, 60] {
+            let nan_at = n / 2;
+            let rng = SplitMix64::seeded(1);
+            let mut v: Vec<SelectedModel> = (0..n)
+                .map(|i| {
+                    let cost = if i == nan_at {
+                        f64::NAN
+                    } else {
+                        (n - i) as f64
+                    };
+                    sm_cost(&format!("m{i:02}"), 1, Some(cost))
+                })
+                .collect();
+            PriceStrategy.order(&mut v, &test_ctx(&NoPerformance, &rng));
+
+            let mut expected: Vec<String> = (0..n)
+                .rev()
+                .filter(|&i| i != nan_at)
+                .map(|i| format!("m{i:02}"))
+                .collect();
+            expected.push(format!("m{nan_at:02}"));
+            assert_eq!(names(&v), expected, "n={n}: an unusable price sorts last");
+        }
+    }
+
+    /// I3 — candidates with EQUAL readings fall back to authored priority.
+    ///
+    /// That fallback is the whole "partial ⇒ a monotone interpolation between
+    /// priority order and metric order" story, and nothing pinned it: adding a
+    /// REVERSED priority tiebreak to the subset comparator passed all 27 Task 9
+    /// tests. Eight buckets of eight share an identical reading, so within a
+    /// bucket only the tiebreak can decide.
+    #[test]
+    fn equal_metric_values_keep_authored_priority_order() {
+        const N: usize = 64;
+        let perf = FnStats(|endpoint: &str| {
+            Some(EndpointStats {
+                samples: 9,
+                throughput_samples: 9,
+                verdict_samples: 9,
+                // Eight buckets of eight, each bucket wholly tied.
+                mean_latency_ms: ((endpoint_idx(endpoint) / 8) * 100) as f64,
+                mean_tokens_per_sec: 1.0,
+                success_rate: 1.0,
+            })
+        });
+        let rng = SplitMix64::seeded(1);
+        // Authored in REVERSE, so input order cannot be mistaken for the answer.
+        let mut v: Vec<SelectedModel> = (0..N)
+            .rev()
+            .map(|i| sm_cost(&format!("m{i:02}"), (i + 1) as u8, None))
+            .collect();
+        MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+        let expected: Vec<String> = (0..N).map(|i| format!("m{i:02}")).collect();
+        assert_eq!(
+            names(&v),
+            expected,
+            "within a tied bucket the authored priority decides, so the full \
+             ascending order must be recovered from a reversed input"
+        );
+    }
+
+    /// Mi1 — `None` means free, i.e. EQUAL to an explicit `Some(0.0)` with
+    /// priority deciding between them. Every earlier fixture pitted `None`
+    /// against a POSITIVE price, so `unwrap_or(-1.0)` — "unpriced beats even
+    /// free" — passed them all.
+    ///
+    /// Two unpriced candidates, so their relative order is pinned too.
+    #[test]
+    fn unpriced_ties_with_an_explicit_zero_price() {
+        for unpriced_first in [true, false] {
+            let rng = SplitMix64::seeded(7);
+            let mut v = if unpriced_first {
+                vec![
+                    sm_cost("unpriced_late", 9, None),
+                    sm_cost("unpriced_mid", 5, None),
+                    sm_cost("explicit_zero_early", 1, Some(0.0)),
+                ]
+            } else {
+                vec![
+                    sm_cost("explicit_zero_early", 1, Some(0.0)),
+                    sm_cost("unpriced_mid", 5, None),
+                    sm_cost("unpriced_late", 9, None),
+                ]
+            };
+            PriceStrategy.order(&mut v, &test_ctx(&NoPerformance, &rng));
+            assert_eq!(
+                names(&v),
+                vec!["explicit_zero_early", "unpriced_mid", "unpriced_late"],
+                "unpriced_first {unpriced_first}: unpriced is free, so it TIES \
+                 an explicit 0.0 and authored priority decides — it does not \
+                 outrank it"
+            );
+        }
     }
 }

@@ -39,8 +39,24 @@ non-total comparator. `PriceStrategy`'s `unwrap_or(Ordering::Equal)` swallows th
 `GroupedWeightedStrategy::classify` incidentally treats it as `Free` via the `!base.is_finite()`
 guard, which is aimed at overflow rather than being a deliberate `NaN` policy.
 
-The right fix is **config validation rejecting non-finite and negative prices**, which is a
-different layer and a different slice. Recorded here so it is a decision rather than an oversight.
+**Upgraded by the Task 8/9 review — this was worse than "silent mis-ordering".** A `NaN` key makes
+the comparator intransitive, and Rust's `sort_by` **panics** on that: measured at n=25/30/60 for
+`PriceStrategy`, with `.then(priority)` NOT rescuing it (the demonstration used all-equal
+priorities, which is exactly the load-balancing case an explicit `sort` permits). Two further
+corrections to the first analysis: *all*-NaN does not panic — only MIXED NaN/finite does, so a
+fixture setting every value to NaN measures nothing — and the panic is **non-monotone in n**
+(25 panics, 200 does not), so no amount of "we measured no panic at N" bounds the risk.
+
+Both strategies now **fence non-finite keys**, with deliberately opposite defaults:
+`MetricStrategy` maps one to `None` (not a measurement ⇒ unmeasured ⇒ hold its index, an
+already-tested path); `PriceStrategy` maps one to `+inf` so an unusable price sorts **last** —
+treating it as free would let a broken price win the *cheapest* slot, a budget hazard rather than
+a neutral default.
+
+So the carry-forward is now **contained, not open**: the routing layer can no longer be panicked or
+mis-ordered by a bad price. Config validation rejecting non-finite and negative prices is still the
+right fix at the right layer, and still belongs to its own slice — it would turn a silently ignored
+misconfiguration into a loud one at load time, which is where an operator can act on it.
 
 **Task 7's Critical is the one to remember.** Reverting `strategy: Box::new(GroupedWeightedStrategy)`
 to `PriorityStrategy` — the single highest-risk line in the feature — passed 381/381. The reason is
