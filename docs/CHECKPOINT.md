@@ -1,51 +1,58 @@
 # Checkpoint
 
-**SP-ROUTE-1 — Tasks 1–3 of 12 done, reviewed, pushed** (`51e73b9` on `develop`).
+**SP-ROUTE-1 — Tasks 1–10 of 12 done, each reviewed, pushed** (`d6576b8` on `develop`).
+Suite **1888 passed / 0 failed / 60 ignored**, real exit 0.
 Spec: `docs/superpowers/specs/2026-09-17-sp-route-1-provider-routing-preferences-design.md`
 Plan: `docs/superpowers/plans/2026-09-17-sp-route-1-provider-routing-preferences.md`
-(carries a Progress table and a "review lesson" section).
+(carries a Progress table, a "review lesson" and a "three traps" section — **read those first**).
 
 ## Done
 
-**T1** request types (`83a5371`, `ba5e93f`, `cd1fcc7`) — `RoutingPreferences` on `InferenceRequest`.
-**T2** `SkipReason::ExcludedByPolicy`, Structural (`cf19179`).
-**T3** `RoutingPolicyGate` for `only`/`ignore`, registered **first** (`da0dfb5`, `6e5cfa5`).
+T1 request types · T2 `ExcludedByPolicy` · T3 `RoutingPolicyGate` (`only`/`ignore`) ·
+T4 performance store + `AttemptPhase` · T5 stream completion/failure recording ·
+T6 `RandomSource` + `StrategyCtx` · T7 `GroupedWeightedStrategy` (the default) ·
+T8 `PriceStrategy` · T9 `MetricStrategy` · **T10 per-request resolution + engine wiring.**
 
-Suite: 334 gateway / 1803 workspace passed, 0 failed.
+**The feature is live as of T10.** Both planted tripwires were confirmed RED before it and green
+after — `request.routing` had never reached selection, and production ran on the fixed-seed
+`DEFAULT_RNG`.
 
-**Next:** Task 4 — `gates/performance.rs` (`EndpointPerformanceRead` + bounded-ring
-`PerformanceStore` + `PerformanceRecorder`; extend `AttemptOutcome` with `duration_ms` +
-`output_tokens`; wire the store into `Gateway` before `recorders`). **Blocks T5 and T7.**
+**Next:** Task 11 (observability — `RoutingDecision` on the trace, AC10), then Task 12
+(docs + final verification + whole-slice review).
 
-## The review lesson — now a plan requirement for T4–12
+## Three production defects found by review, all fixed
 
-Every Critical/Important finding so far was a test that cannot fail on the thing its name claims,
-usually the negative half asserted without the positive half. T3's gate could have excluded
-**every** candidate and passed 332/332. So: assert the positive half, name the mutation up front
-and actually run it, and test the mirror case of any two-axis rule.
+1. **T9:** `MetricStrategy` read the live `PerformanceStore` from *inside* `sort_by`'s comparator.
+   The key could change between comparisons → intransitive → **`sort_by` panics inside model
+   selection.** 89 panics in 719 selections at 40 candidates, zero at 12 (the check only runs above
+   insertion-sort size). No fixture could see it — all three returned a constant. Fixed by
+   snapshotting; also 144 → 12 `stats()` calls per selection, 7.5× throughput.
+2. **T5:** the circuit breaker was structurally **unable** to trip on mid-stream failure — the
+   acquisition dispatch's `success: true` reset `failure_count` right before the failure
+   re-incremented it. Fixed by `AttemptPhase::is_verdict()`, now honoured by *every* recorder.
+3. **T4:** `mean_latency_ms` pooled full-request wall time with stream-acquisition time.
 
-## Corrected spec claim
+## Rules earned, now in the plan
 
-§4.2 said `only` → `ignore` as if observable. **False** — both are pure predicates, so admission is
-the commutative conjunction `only_ok && !ignore_match`; swapping the blocks left the suite green.
-Fixed. `order`/`sort` *are* genuinely sequence-dependent (T10), which is why it mattered.
+- Never call a port from inside a comparator — read once into a snapshot, then sort.
+- A fixture returning a constant cannot test a live source.
+- Never read a mean without its count (`samples` / `throughput_samples` / `verdict_samples`).
+- A test asserting two things are EQUAL is green when neither works.
+- A test proving two strategies *agree* cannot catch a swap between them.
+
+## Carry-forwards — deliberate, not forgotten
+
+1. `InferenceCall` store write in `stream.rs` sits **after** `yield Done`, so a real SSE consumer
+   that breaks on `Done` is never metered. Metering, not routing — own slice.
+2. Nothing validates `ModelPricing` for finiteness or sign. Now **contained** (both strategies
+   fence non-finite keys) but the loud load-time rejection belongs at the config layer.
+3. New kernel types not re-exported from `kernel/src/lib.rs`; `tests/reexport_paths.rs` not
+   extended. Decide in T11/T12.
 
 ## Off-slice, landed
 
-`5208952` — revived `crates/gateway/src/facade.rs`'s test module (uncompilable since 2026-07-23)
-and added `cargo check -p sensei-gateway --features local --all-targets` to `ci.yml`. **No CI job
-had ever enabled a non-default feature.** The revived test passes.
-
-## Carry-forwards
-
-1. `CandidateSet` derives `Eq`/`Hash`, but they are order/duplicate-sensitive over `Vec<String>`
-   while its doc calls the axes sets — do NOT key a `HashMap` on it without normalizing. T3 uses
-   linear scans and is immune.
-2. `engine::exhaustion` + `all_gated_error` + `GateContribution` widened `pub(super)`→`pub(crate)`
-   for one test; proven minimal (reverting `GateContribution` gives 2 hard errors).
-3. New kernel types are not re-exported from `kernel/src/lib.rs`; `tests/reexport_paths.rs` not
-   extended. Decide at T10.
-4. `#[ignore]`d `a_requests_routing_preferences_reach_selection` in `engine/tests.rs` — T10 Step 4
-   un-ignores it. **It is the only thing that would catch the whole feature being inert.**
+`5208952` — revived `facade.rs`'s test module (uncompilable since 2026-07-23) and added
+`cargo check -p sensei-gateway --features local --all-targets` to `ci.yml`. **No CI job had ever
+enabled a non-default feature.**
 
 Open questions: none. Known-broken: nothing.
