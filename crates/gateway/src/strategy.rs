@@ -23,6 +23,20 @@ pub struct StrategyCtx<'a> {
 /// Orders admitted candidates. The single ordering seam.
 pub trait RoutingStrategy: Send + Sync {
     fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>);
+
+    /// A stable identifier for the strategy that actually ran, for the trace.
+    ///
+    /// Deliberately NOT defaulted. The alternative to asking the strategy is a
+    /// second `match` on `SortKey` at the trace site, which agrees with
+    /// `ModelSelectionService::strategy_for` on the day it is written and is
+    /// free to drift from it afterwards; this way there is exactly one `match`
+    /// in the crate and the name is read off the object that did the work.
+    /// A default would reintroduce the same failure one step along — a new
+    /// strategy would silently trace as whatever the default said.
+    ///
+    /// The two metric sorts share one type, so this is a property of the VALUE
+    /// rather than of the type: `MetricStrategy` reports its own metric.
+    fn name(&self) -> &'static str;
 }
 
 /// A reference to a strategy is a strategy.
@@ -34,10 +48,22 @@ pub trait RoutingStrategy: Send + Sync {
 /// `strategy_for` return a BORROW of the override instead, keeping the probe
 /// mechanism (`selection::tests::the_builders_install_the_ports_the_strategy_sees`)
 /// working without widening the production surface.
+///
+/// **It makes the test build's trait-resolution universe differ from
+/// production's**: under `cfg(test)` `&T` satisfies `RoutingStrategy`, so a
+/// call that only compiles through this blanket impl would compile in tests and
+/// fail the release build. Nothing in `src/` relies on it today (production
+/// `strategy_for` returns owned strategies), and that is the property to
+/// preserve if this impl is ever widened.
 #[cfg(test)]
 impl<T: RoutingStrategy + ?Sized> RoutingStrategy for &T {
     fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) {
         (**self).order(admitted, ctx)
+    }
+    /// Forwarded, NOT reported as a wrapper name — an override must announce
+    /// the strategy it wraps or the probe becomes invisible in the trace.
+    fn name(&self) -> &'static str {
+        (**self).name()
     }
 }
 
@@ -47,6 +73,9 @@ pub struct PriorityStrategy;
 impl RoutingStrategy for PriorityStrategy {
     fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) {
         admitted.sort_by_key(|m| m.priority); // stable; identical to resolve_chain's sort today
+    }
+    fn name(&self) -> &'static str {
+        "priority"
     }
 }
 
@@ -104,6 +133,9 @@ impl RoutingStrategy for GroupedWeightedStrategy {
             out.extend(order_group(group, ctx));
         }
         *admitted = out;
+    }
+    fn name(&self) -> &'static str {
+        "grouped_weighted"
     }
 }
 
@@ -224,6 +256,9 @@ impl RoutingStrategy for PriceStrategy {
                 .then(a.priority.cmp(&b.priority))
         });
     }
+    fn name(&self) -> &'static str {
+        "price"
+    }
 }
 
 /// Which observed quantity a [`MetricStrategy`] sorts on.
@@ -325,6 +360,15 @@ impl RoutingStrategy for MetricStrategy {
         debug_assert_eq!(slots.len(), subset.len());
         for (&slot, (_, m)) in slots.iter().zip(subset) {
             admitted[slot] = m;
+        }
+    }
+    /// A property of the VALUE, not the type — the two metric sorts share
+    /// `MetricStrategy`, so reporting a single type-wide name would make
+    /// `sort: latency` and `sort: throughput` indistinguishable in the trace.
+    fn name(&self) -> &'static str {
+        match self.metric {
+            Metric::Latency => "latency",
+            Metric::Throughput => "throughput",
         }
     }
 }

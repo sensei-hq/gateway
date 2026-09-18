@@ -197,7 +197,12 @@ impl<'a> ModelSelectionService<'a> {
             strategy_override: None,
             perf: &NO_PERF,
             rng: &DEFAULT_RNG,
-            min_samples: 3,
+            // The SAME constant `ResilienceConfig::default` uses, not a second
+            // literal `3` that happens to agree with it. Two copies of a default
+            // are a drift hazard with no upside: a tuned default would move one
+            // and silently leave a caller who never calls `with_performance`
+            // (every unit test in this file) judging on the old threshold.
+            min_samples: crate::resilience::DEFAULT_MIN_SAMPLES,
         }
     }
 
@@ -464,29 +469,55 @@ impl<'a> ModelSelectionService<'a> {
         };
         self.strategy_for(criteria).order(&mut all_candidates, &ctx);
 
-        // `order` is layered ON TOP of whichever strategy ran. A STABLE sort by
-        // matched-ref index gives exactly the specified semantics: named
-        // candidates lead in ref order, candidates sharing a ref keep the
-        // strategy's relative order, and unmatched candidates (rank usize::MAX)
-        // follow as fallbacks in the strategy's order. `order` therefore never
-        // FILTERS — `only`/`ignore` (the `RoutingPolicyGate`) are the knobs that
-        // restrict, and they have already run by here.
+        // `order` is layered ON TOP of whichever strategy ran, and gives exactly
+        // the specified semantics: named candidates lead in ref order,
+        // candidates sharing a ref keep the strategy's relative order, and
+        // unmatched candidates (rank `usize::MAX`) follow as fallbacks in the
+        // strategy's order. `order` therefore never FILTERS — `only`/`ignore`
+        // (the `RoutingPolicyGate`) are the knobs that restrict, and they have
+        // already run by here.
         //
-        // The rank is computed per candidate from `refs` alone — a pure, cheap
-        // function of data already in hand. Do NOT be tempted to consult a port
-        // here: Task 9 shipped a panic by reading a live store from inside a
-        // comparator (`stats()` recomputes from `Instant::now()`, so a key could
-        // change between two comparisons, and `sort_by` detects the resulting
-        // intransitivity and panics inside model selection).
+        // **The key is `(rank, position-in-the-strategy's-output)`, and the
+        // second component is what makes this correct rather than merely
+        // correct-today.** Keyed on `rank` alone the specified answer holds only
+        // because the sort is STABLE, which made `sort_by_key` →
+        // `sort_unstable_by_key` a live defect that the whole suite missed: an
+        // operator's authored sequence was silently scrambled for exactly the
+        // long chains where writing one out is worth the trouble. Carrying the
+        // index makes every key DISTINCT, so the tie-break is in the data and
+        // any correct sort — stable or not — produces the specified order.
+        //
+        // The rank is computed ONCE PER CANDIDATE, before sorting, not inside
+        // the comparator: `sort_by_key` invokes its key function once per
+        // COMPARISON, so the scan over `refs` would run `O(n log n · |refs|)`
+        // times per selection instead of `O(n · |refs|)`. (`sort_by_cached_key`
+        // fixes that much on its own but cannot express this key, which needs
+        // each element's index.) Do NOT be tempted to consult a port here
+        // either: Task 9 shipped a panic by reading a live store from inside a
+        // comparator — `stats()` recomputes from `Instant::now()`, so a key
+        // could change between two comparisons, and `sort_by` detects the
+        // resulting intransitivity and panics inside model selection.
         if let Some(refs) = criteria.preferences.as_ref().and_then(|p| p.order.as_ref()) {
-            all_candidates.sort_by_key(|m| {
+            // FIRST match wins: `[{model: charlie}, {router: north}]` reads
+            // "charlie, then the rest of north", so a candidate matching both
+            // takes the earlier rank. `rposition` would give charlie the LATER
+            // one, tying it with the rest of north and losing its lead.
+            let rank_of = |m: &SelectedModel| {
                 refs.iter()
                     .position(|r| {
                         r.router.as_deref().is_none_or(|x| x == m.router)
                             && r.model.as_deref().is_none_or(|x| x == m.model)
                     })
                     .unwrap_or(usize::MAX)
-            });
+            };
+            let mut ranked: Vec<(usize, usize, SelectedModel)> =
+                std::mem::take(&mut all_candidates)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, m)| (rank_of(&m), i, m))
+                    .collect();
+            ranked.sort_by_key(|(rank, i, _)| (*rank, *i));
+            all_candidates = ranked.into_iter().map(|(_, _, m)| m).collect();
         }
 
         SelectionResult {
@@ -2040,6 +2071,11 @@ mod tests {
                 ctx.perf.stats("probe-endpoint").map(|s| s.samples);
             admitted.sort_by_key(|m| m.priority);
         }
+        /// Self-announcing, so a trace taken while an override is installed
+        /// says so instead of impersonating the strategy it displaced.
+        fn name(&self) -> &'static str {
+            "probe"
+        }
     }
 
     /// The Critical fix: `widening_the_strategy_seam_leaves_selection_unchanged`
@@ -2112,6 +2148,31 @@ mod tests {
             Some(1),
             "resolve_chain's ctx must carry the `perf` passed to `with_performance`, \
              not the null port (which would report `None`)"
+        );
+
+        // The override must beat an EXPLICIT `sort` too, not just an absent one.
+        //
+        // `strategy_for` consults the override ahead of the `sort` match, and
+        // that placement was unpinned. Moving it after the match genuinely does
+        // not matter (the match is side-effect-free), but narrowing it — e.g.
+        // gating on `sort.is_none()` — compiles, survives every other test, and
+        // makes the probe silently stop observing any request carrying a `sort`.
+        // Every future test built on this probe would then be quietly blind on
+        // exactly the requests SP-ROUTE-1 exists to serve.
+        *probe.min_samples.lock().unwrap() = None;
+        let _ = svc.select_all(&SelectionCriteria {
+            preferences: Some(crate::types::request::RoutingPreferences {
+                sort: Some(crate::types::request::SortKey::Price),
+                ..Default::default()
+            }),
+            ..criteria
+        });
+        assert_eq!(
+            *probe.min_samples.lock().unwrap(),
+            Some(11),
+            "the override must run for a request carrying `sort: price` as well — \
+             a probe that only sees unsorted requests observes nothing this slice \
+             is about"
         );
     }
 
@@ -2373,6 +2434,51 @@ mod tests {
         }
     }
 
+    /// The resolved strategy must NAME itself.
+    ///
+    /// Task 11 needs the applied strategy's name for the trace. The obvious way
+    /// to get it — a second `match` on `SortKey` at the trace site — is a drift
+    /// hazard precisely because it compiles and agrees on the day it is written;
+    /// reading the name off the strategy that actually ran cannot drift, because
+    /// there is only one `match`.
+    ///
+    /// Behaviour is pinned by `each_sort_value_resolves_to_its_own_strategy`;
+    /// this pins the LABEL, which a behaviour test cannot see. Both are needed —
+    /// a strategy can be correctly named and wrongly ordered, or the reverse.
+    #[test]
+    fn the_resolved_strategy_names_itself() {
+        use crate::types::request::SortKey;
+        let config = sort_chain();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+
+        let name_for = |sort: Option<SortKey>| {
+            svc.strategy_for(&sort_criteria(Some(RoutingPreferences {
+                sort,
+                ..Default::default()
+            })))
+            .name()
+        };
+
+        assert_eq!(name_for(None), "grouped_weighted");
+        assert_eq!(name_for(Some(SortKey::Price)), "price");
+        assert_eq!(name_for(Some(SortKey::Latency)), "latency");
+        assert_eq!(
+            name_for(Some(SortKey::Throughput)),
+            "throughput",
+            "the two metric sorts share a type, so each must report its OWN \
+             metric rather than the type's name"
+        );
+        assert_eq!(
+            svc.strategy_for(&sort_criteria(None)).name(),
+            "grouped_weighted",
+            "absent PREFERENCES resolve the same as an absent `sort` — the two \
+             are different `None`s and both must reach the default"
+        );
+    }
+
     /// AC6 — `order` sequences the candidates it names; unmatched candidates
     /// follow as FALLBACKS rather than being dropped. `only` is the knob that
     /// restricts.
@@ -2416,6 +2522,69 @@ mod tests {
             "an `order` naming a candidate that is not in the chain must leave \
              the selection exactly as the strategy left it — and must not drop \
              the candidates it failed to name"
+        );
+    }
+
+    /// A candidate matching MORE THAN ONE `order` ref takes its rank from the
+    /// FIRST match.
+    ///
+    /// Nothing pinned this: every other `order` test uses refs that partition
+    /// the chain, so only "matched" and "not matched" were ever exercised and
+    /// `.position(…)` → `.rposition(…)` survived the whole suite. The overlap is
+    /// not exotic — it is the most natural way to combine the two ref forms:
+    /// `[{model: charlie}, {router: north}]` means "charlie first, then the rest
+    /// of north", and charlie is on north, so it matches both.
+    ///
+    /// Under `rposition` charlie takes its LAST match (rank 1), ties with alpha,
+    /// and the sort leaves alpha in front — silently inverting the one
+    /// instruction the caller was most explicit about.
+    #[test]
+    fn the_first_matching_order_ref_sets_a_candidates_rank() {
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![model_ref("charlie"), router_ref("north")]),
+                ..Default::default()
+            })),
+            vec!["charlie", "alpha", "bravo"],
+            "charlie matches ref 0 AND ref 1; the FIRST match wins, so it leads \
+             alpha — which matches only ref 1. Under `rposition` both rank 1 and \
+             charlie loses the lead the caller named it for"
+        );
+    }
+
+    /// A ref naming BOTH axes is an AND, so it matches a specific endpoint and
+    /// not merely either half of it.
+    ///
+    /// No other test sets both fields, so a ref that ignored one axis — or
+    /// treated the pair as an OR — would be invisible. `bravo` lives on `south`,
+    /// so `{router: north, model: bravo}` names an endpoint that does not exist
+    /// and must match NOTHING, leaving the strategy's order untouched.
+    #[test]
+    fn an_order_ref_naming_both_axes_matches_only_that_endpoint() {
+        let both = |router: &str, model: &str| crate::types::request::CandidateRef {
+            router: Some(router.to_string()),
+            model: Some(model.to_string()),
+        };
+
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![both("north", "bravo")]),
+                ..Default::default()
+            })),
+            vec!["alpha", "bravo", "charlie"],
+            "bravo is on `south`, so this pair names no real endpoint and must \
+             match nothing — an OR, or a ref that ignored the router axis, would \
+             promote bravo here"
+        );
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![both("north", "charlie")]),
+                ..Default::default()
+            })),
+            vec!["charlie", "alpha", "bravo"],
+            "and the pair that DOES name a real endpoint matches it — without \
+             this half the assertion above would also pass against a ref that \
+             matched nothing at all"
         );
     }
 

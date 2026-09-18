@@ -679,13 +679,34 @@ async fn a_requests_routing_preferences_reach_selection() {
         ..Default::default()
     });
 
-    let result = gw.execute(&request).await;
+    // The BEFORE state, so the failure below is attributable. `is_err()` alone
+    // cannot tell "the `only` filter excluded the sole candidate" from any other
+    // failure on this path — including a fixture that was never able to succeed.
+    let unfiltered = gw.execute(&chat_request()).await;
     assert!(
-        result.is_err(),
-        "the only-router filter names a router absent from the chain, so the sole \
-         candidate must be excluded and the call must fail rather than succeed \
-         (degraded or not) against the noop adapter: {result:?}"
+        unfiltered.is_ok(),
+        "the same request without preferences must succeed, or the assertion \
+         below proves nothing about the filter: {unfiltered:?}"
     );
+
+    match gw.execute(&request).await {
+        // Every candidate is `ExcludedByPolicy`, which is Structural — so this
+        // is terminal `NoCandidates`, NOT `AllGated`. The distinction is the
+        // point: an excluded candidate has no deadline and no human remedy, so
+        // turning this into a pausable error would park the run forever.
+        Err(GatewayError::NoCandidates { capability }) => {
+            assert_eq!(capability, Capability::TextChat);
+        }
+        Err(other) => panic!(
+            "the only-router filter excludes every candidate structurally, so this \
+             must be NoCandidates rather than a gated/pausable error: {other}"
+        ),
+        Ok(response) => panic!(
+            "the only-router filter names a router absent from the chain, so the \
+             sole candidate must be excluded and the call must fail rather than \
+             succeed (degraded or not) against the noop adapter: {response:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -6088,6 +6109,99 @@ fn production_selection_never_uses_the_fixed_seed_default() {
         "production must pass an entropy-seeded source via with_random; the fixed-seed \
          DEFAULT_RNG makes every process draw the identical sequence, so weighted routing \
          synchronises across the fleet instead of spreading"
+    );
+}
+
+/// `chat_chain`'s two endpoints, observed TWICE each: `noop` fast, `fail-model`
+/// slow. Two is deliberately one BELOW the default `min_samples` of 3, so the
+/// same fixture reads as "not measured" under the default and as "measured"
+/// under a threshold of 2 — which is the only way to observe the threshold
+/// itself rather than the observations.
+fn observe_twice(gw: &Gateway) {
+    for _ in 0..2 {
+        for (endpoint, router, duration_ms) in [
+            ("failing:fail-model", "failing", 500),
+            ("noop:noop", "noop", 10),
+        ] {
+            gw.record_outcome(&crate::gates::AttemptOutcome {
+                endpoint,
+                router,
+                success: true,
+                error: None,
+                duration_ms,
+                output_tokens: Some(10),
+                phase: crate::gates::AttemptPhase::Complete,
+            });
+        }
+    }
+}
+
+/// A `sort: latency` selection over `chat_chain`, through the real production
+/// construction path.
+fn latency_route(gw: &Gateway, config: &GatewayConfig) -> Vec<String> {
+    gw.selection_service(config)
+        .select_all(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("chat_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: Some(crate::types::request::RoutingPreferences {
+                sort: Some(crate::types::request::SortKey::Latency),
+                ..Default::default()
+            }),
+        })
+        .all_candidates
+        .iter()
+        .map(|c| c.model.clone())
+        .collect()
+}
+
+/// `ResilienceConfig::min_samples` must REACH the metric sort.
+///
+/// Every step of that wiring was independently deletable with a green suite —
+/// `.with_performance(…, 0)`, dropping the `with_resilience` assignment,
+/// `DEFAULT_MIN_SAMPLES = 1` — because nothing observed the THRESHOLD, only the
+/// observations. The `→ 0` direction is the live hazard, and it is what
+/// `StrategyCtx::min_samples`'s own doc warns about: at zero, `s.samples >= 0`
+/// always holds, so an endpoint with ZERO latency observations reports
+/// `mean_latency_ms == 0.0` and sorts FIRST; and `verdict_samples >= 0` always
+/// holds, so a never-verdicted endpoint's `success_rate == 0.0` becomes a
+/// TRUSTED reliability of zero. "A cold process weighs every candidate 0.0 and a
+/// healthy fleet routes as though every provider were dead" stops being a
+/// comment about a bug that was fixed and becomes an operator-reachable config.
+///
+/// The fixture holds the OBSERVATIONS fixed at two and varies only the
+/// threshold, so the two halves differ in exactly the quantity under test.
+#[test]
+fn resilience_min_samples_reaches_the_metric_sort() {
+    let config = test_config_with_failing_and_noop();
+
+    let strict = test_gateway_with_chain();
+    observe_twice(&strict);
+    assert_eq!(
+        latency_route(&strict, &config),
+        vec!["fail-model", "noop"],
+        "2 observations is BELOW the default min_samples of 3, so neither \
+         candidate counts as measured and the latency sort must leave priority \
+         order alone"
+    );
+
+    let lenient = test_gateway_with_chain().with_resilience(crate::resilience::ResilienceConfig {
+        min_samples: 2,
+        ..Default::default()
+    });
+    // AFTER `with_resilience`, which REBUILDS the performance store — observing
+    // first would hand the samples to the store this call then discards.
+    observe_twice(&lenient);
+    assert_eq!(
+        latency_route(&lenient, &config),
+        vec!["noop", "fail-model"],
+        "min_samples: 2 must reach `StrategyCtx`, so the SAME two observations \
+         now count and noop's 10ms beats fail-model's 500ms despite its worse \
+         priority"
     );
 }
 

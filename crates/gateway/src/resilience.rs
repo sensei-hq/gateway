@@ -19,7 +19,15 @@ pub const DEFAULT_MIN_SAMPLES: u32 = 3;
 /// Operator-tunable resilience policy applied at construction via
 /// `Gateway::with_resilience` (Task 2). `Default` reproduces the pre-(f)
 /// hardcoded behavior exactly, so an absent config changes nothing.
+///
+/// `#[non_exhaustive]` because this is a published crate's public surface and
+/// this struct grows a field per slice (`min_samples` arrived with SP-ROUTE-1).
+/// Without it, every added field is a breaking change for any downstream struct
+/// literal; with it, downstream must build from `..Default::default()` and
+/// keeps compiling. Applied the same slice the field landed in — it is breaking
+/// exactly once, and doing it later only makes the break bigger.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResilienceConfig {
     /// Base router cooldown after a transport fault (`Network`/`Timeout`).
     pub cooldown_base: Duration,
