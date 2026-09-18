@@ -22,7 +22,22 @@
 | 4 | `edab9c4` · `1b75dae` · `1ac3597` | ✅ done after 3 review rounds; forced an `AttemptPhase` design fix and a new `verdict_samples` field — see below |
 | 5 | `c21b0e0` · `b1ad6ba` | ✅ done; review found a **production defect** — the breaker could not trip mid-stream |
 | 6 | `5fedd29` · `a252457` | ✅ done; review found all four seam wiring points were deletable with a green suite |
-| 7–12 | — | pending |
+| 7 | `c7ad5aa` · `4ed2247` · `cf02fba` | ✅ done; review found the **registered default itself** was untested |
+| 8–12 | — | pending |
+
+**Task 7's Critical is the one to remember.** Reverting `strategy: Box::new(GroupedWeightedStrategy)`
+to `PriorityStrategy` — the single highest-risk line in the feature — passed 381/381. The reason is
+structural: AC1's whole job is to prove the two strategies are *indistinguishable* on
+distinct-priority chains, so AC1 **cannot** catch a revert. Only a tied chain can, and nothing had
+one. Now pinned by `the_registered_default_weights_a_tied_group`.
+
+**Two decisions Task 8 inherits:**
+- `cost_estimate: None` is treated as **free** (`unwrap_or(0.0)`), matching `BudgetGate`'s existing
+  reading that an unpriced model costs nothing. `PriceStrategy` keeps the same rule — deliberately,
+  not by copy-paste.
+- The draw loop guards `!total.is_finite()` and falls back to **chain order**. `classify` guards
+  `base`; their SUM is a different claim, and two candidates at ~1e-154 each pass every `classify`
+  guard and only overflow when added.
 
 **Task 6 left two things Tasks 7–10 depend on.** `SelectedModel::endpoint_key()` is the single
 source of the `"{router}:{model}"` performance-store key — use it, never re-inline the `format!`.
@@ -1608,7 +1623,7 @@ git commit -m "feat(gateway): RandomSource + StrategyCtx, widening the ordering 
 - Modify: `crates/gateway/src/strategy.rs`, `crates/gateway/src/selection.rs`
 - Test: `crates/gateway/src/strategy.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/gateway/src/strategy.rs`'s `mod tests`. Extend the `sm` helper to take a cost:
 
@@ -1787,12 +1802,12 @@ In `crates/gateway/src/strategy.rs`'s `mod tests`. Extend the `sm` helper to tak
 
 Add `use crate::gates::performance::{EndpointPerformanceRead, EndpointStats, NoPerformance}; use crate::random::SplitMix64;` to the test module.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p sensei-gateway grouped weighted free_candidate zero_reliability cheaper_lower -- --nocapture`
 Expected: FAIL — `cannot find value 'GroupedWeightedStrategy'`.
 
-- [ ] **Step 3: Write the strategy**
+- [x] **Step 3: Write the strategy**
 
 In `crates/gateway/src/strategy.rs`:
 
@@ -1901,7 +1916,7 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
 }
 ```
 
-- [ ] **Step 4: Make it the registered default**
+- [x] **Step 4: Make it the registered default**
 
 In `crates/gateway/src/selection.rs`, `ModelSelectionService::new`:
 
@@ -1909,12 +1924,12 @@ In `crates/gateway/src/selection.rs`, `ModelSelectionService::new`:
             strategy: Box::new(crate::strategy::GroupedWeightedStrategy),
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-gateway --lib 2>&1 | tail -5`
 Expected: all green. AC1 is why the existing chain-order tests still pass.
 
-- [ ] **Step 6: Mutation-check the two claims that matter**
+- [x] **Step 6: Mutation-check the two claims that matter**
 
 (a) Delete the `Weight::Free => free.push(m)` arm's priority by changing `if cost <= 0.0 { return Weight::Free; }` to `if cost < 0.0 { ... }`.
 
@@ -1926,7 +1941,7 @@ Expected: a panic. Restore.
 Run: `cargo test -p sensei-gateway distinct_priorities_select_identically 2>&1 | grep "panicked at"`
 Expected: a panic. Restore, and re-run the suite to green.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/gateway/src
