@@ -1,14 +1,25 @@
+use crate::gates::performance::EndpointPerformanceRead;
+use crate::random::RandomSource;
 use crate::selection::SelectedModel;
 
-/// Orders admitted candidates. SP-0 ships PriorityStrategy (the single ordering
-/// seam, replacing the hardcoded sort); tier/headroom strategies arrive in SP-CAT/SP-DATA.
-pub trait RoutingStrategy: Send + Sync {
-    fn order(&self, admitted: &mut Vec<SelectedModel>);
+/// What an ordering strategy may consult beyond the candidates themselves.
+pub struct StrategyCtx<'a> {
+    pub perf: &'a dyn EndpointPerformanceRead,
+    pub rng: &'a dyn RandomSource,
+    /// Minimum live samples before a metric sort considers a candidate measured.
+    pub min_samples: u32,
 }
 
+/// Orders admitted candidates. The single ordering seam.
+pub trait RoutingStrategy: Send + Sync {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>);
+}
+
+/// Strict ascending priority, stable. Retained as the explicit baseline every
+/// other strategy is compared against in tests.
 pub struct PriorityStrategy;
 impl RoutingStrategy for PriorityStrategy {
-    fn order(&self, admitted: &mut Vec<SelectedModel>) {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) {
         admitted.sort_by_key(|m| m.priority); // stable; identical to resolve_chain's sort today
     }
 }
@@ -52,18 +63,33 @@ mod tests {
         }
     }
 
+    fn test_ctx<'a>(
+        perf: &'a dyn EndpointPerformanceRead,
+        rng: &'a dyn RandomSource,
+    ) -> StrategyCtx<'a> {
+        StrategyCtx {
+            perf,
+            rng,
+            min_samples: 3,
+        }
+    }
+
     #[test]
     fn priority_strategy_sorts_ascending_by_priority() {
+        let perf = crate::gates::performance::NoPerformance;
+        let rng = crate::random::SplitMix64::seeded(1);
         let mut v = vec![sm("b", 2), sm("a", 1)];
-        PriorityStrategy.order(&mut v);
+        PriorityStrategy.order(&mut v, &test_ctx(&perf, &rng));
         assert_eq!(v[0].model, "a");
         assert_eq!(v[1].model, "b");
     }
 
     #[test]
     fn priority_strategy_is_stable_for_equal_priority() {
+        let perf = crate::gates::performance::NoPerformance;
+        let rng = crate::random::SplitMix64::seeded(1);
         let mut v = vec![sm("first", 1), sm("second", 1)];
-        PriorityStrategy.order(&mut v);
+        PriorityStrategy.order(&mut v, &test_ctx(&perf, &rng));
         assert_eq!(v[0].model, "first"); // stable: equal keys keep input order
         assert_eq!(v[1].model, "second");
     }

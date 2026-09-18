@@ -88,7 +88,20 @@ pub struct ModelSelectionService<'a> {
     model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
     /// Orders admitted candidates (SP-0: priority ascending, stable).
     strategy: Box<dyn RoutingStrategy>,
+    /// Performance read port. Defaults to the null port so a caller that never
+    /// wires performance behaves exactly as before this slice.
+    perf: &'a dyn crate::gates::performance::EndpointPerformanceRead,
+    /// Randomness for weighted ordering (Task 7 onward).
+    rng: &'a dyn crate::random::RandomSource,
+    min_samples: u32,
 }
+
+static NO_PERF: crate::gates::performance::NoPerformance = crate::gates::performance::NoPerformance;
+/// A FIXED seed, deliberately. This default is reached only by callers that
+/// construct the service directly — unit tests — where reproducibility is what
+/// you want. Both production paths (`engine::execute`, `engine::stream`) pass
+/// the gateway's entropy-seeded source via `with_random` from Task 10.
+static DEFAULT_RNG: crate::random::SplitMix64 = crate::random::SplitMix64::seeded(0x5EED_5EED);
 
 impl<'a> ModelSelectionService<'a> {
     pub fn new(
@@ -148,7 +161,28 @@ impl<'a> ModelSelectionService<'a> {
             router_health,
             model_lockout,
             strategy: Box::new(PriorityStrategy),
+            perf: &NO_PERF,
+            rng: &DEFAULT_RNG,
+            min_samples: 3,
         }
+    }
+
+    /// Performance read port, plus the minimum live-sample count a metric sort
+    /// requires before treating a candidate as measured (Task 8/9).
+    pub fn with_performance(
+        mut self,
+        perf: &'a dyn crate::gates::performance::EndpointPerformanceRead,
+        min_samples: u32,
+    ) -> Self {
+        self.perf = perf;
+        self.min_samples = min_samples;
+        self
+    }
+
+    /// Randomness for weighted ordering (Task 7 onward).
+    pub fn with_random(mut self, rng: &'a dyn crate::random::RandomSource) -> Self {
+        self.rng = rng;
+        self
     }
 
     /// Select the first valid candidate.
@@ -343,7 +377,12 @@ impl<'a> ModelSelectionService<'a> {
             }
         }
 
-        self.strategy.order(&mut all_candidates);
+        let ctx = crate::strategy::StrategyCtx {
+            perf: self.perf,
+            rng: self.rng,
+            min_samples: self.min_samples,
+        };
+        self.strategy.order(&mut all_candidates, &ctx);
 
         SelectionResult {
             selected: None, // filled by caller
@@ -1694,6 +1733,92 @@ mod tests {
             crate::engine::exhaustion::all_gated_error(&result.skipped, &[]).is_none(),
             "an all-structural exhaustion must NOT become AllGated — no deadline \
              and no human remedy makes an excluded candidate eligible"
+        );
+    }
+
+    /// Task 6 widens the ordering seam and changes NOTHING. `PriorityStrategy` is
+    /// still registered, so a chain must select exactly as it did before — and this
+    /// must hold whether or not the new ports are wired, since production wires them
+    /// (Task 10) and unit tests do not.
+    ///
+    /// The chain here lists its entries in REVERSE priority order (claude-haiku,
+    /// priority 2, first; gemma3:27b, priority 1, second) — deliberately, so this
+    /// test cannot pass by accident. `test_config()`'s own `chat_chain` already
+    /// lists its entries in priority order, so a `PriorityStrategy` reduced to a
+    /// no-op would still satisfy an assertion built on it: the input order and the
+    /// sorted order coincide. Reversing them here means only an actual sort
+    /// produces `["gemma3:27b", "claude-haiku"]`; a no-op or mis-wired ctx would
+    /// yield `["claude-haiku", "gemma3:27b"]` instead.
+    #[test]
+    fn widening_the_strategy_seam_leaves_selection_unchanged() {
+        let mut config = test_config();
+        config.chains.insert(
+            "seam_chain".to_string(),
+            FallbackChainConfig {
+                id: "seam_chain".to_string(),
+                capability: Capability::TextChat,
+                models: vec![
+                    ChainEntry {
+                        model: "claude-haiku".to_string(),
+                        router: None,
+                        api_model_id: None,
+                        priority: 2,
+                    },
+                    ChainEntry {
+                        model: "gemma3:27b".to_string(),
+                        router: None,
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                ],
+                fallback_triggers: vec![],
+            },
+        );
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+
+        let criteria = SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("seam_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: None,
+        };
+
+        let bare = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+        let got_bare: Vec<String> = bare
+            .select_all(&criteria)
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect();
+
+        let store =
+            crate::gates::performance::PerformanceStore::new(8, std::time::Duration::from_secs(60));
+        let rng = crate::random::SplitMix64::seeded(999);
+        let wired = ModelSelectionService::new(&config, &cb, &cooldown, &lockout)
+            .with_performance(&store, 3)
+            .with_random(&rng);
+        let got_wired: Vec<String> = wired
+            .select_all(&criteria)
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect();
+
+        assert_eq!(
+            got_bare,
+            vec!["gemma3:27b".to_string(), "claude-haiku".to_string()],
+            "priority order (ascending), NOT the chain's declared (reversed) order — \
+             proves the strategy actually sorted rather than passing the input through"
+        );
+        assert_eq!(
+            got_bare, got_wired,
+            "wiring the new ports must not perturb a PriorityStrategy selection"
         );
     }
 }
