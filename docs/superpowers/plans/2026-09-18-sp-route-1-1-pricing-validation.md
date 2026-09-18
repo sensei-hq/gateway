@@ -27,6 +27,24 @@
 `fmt --check` clean, `cargo test -p sensei-gateway --features local --locked` green,
 `cargo doc --workspace --no-deps` clean. Closes SP-ROUTE-1's pricing carry-forward.
 
+### One known gap, accepted deliberately
+
+**AC4's "and warns" half is unasserted.** `the_facade_drops_a_model_whose_pricing_cannot_be_compared`
+proves the drop and that `build` still returns a serving `Facade`, but nothing asserts the
+`tracing::warn!` actually fires — and that warn is the operator's only signal a model vanished.
+
+Not closed here because the cost is disproportionate to the risk. There is **no
+`tracing-subscriber` anywhere in the workspace** (checked: not in `crates/gateway`,
+`crates/orchestrator`, or the root manifest), so a log-capture test means either a new
+dev-dependency — which this slice's Tech Stack rules out — or porting `CapturingSubscriber` from
+`orchestrator/src/executor/tests.rs`, ~200 lines carrying a documented one-in-many-runs
+`tracing` interest-poisoning flake.
+
+The unguarded surface is narrow: deleting the `retain` fails **both** facade tests, so the only
+regression that slips through is "someone removes the `warn!` and keeps the drop" — a confusing
+silent drop, not a mis-route. If a log-capture harness ever lands in the gateway crate for another
+reason, this is a one-line test to add, red-first.
+
 ---
 
 ## Orientation — read before Task 1
