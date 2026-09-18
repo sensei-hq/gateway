@@ -1776,10 +1776,19 @@ mod tests {
         );
     }
 
-    /// Task 6 widens the ordering seam and changes NOTHING. `PriorityStrategy` is
-    /// still registered, so a chain must select exactly as it did before — and this
-    /// must hold whether or not the new ports are wired, since production wires them
-    /// (Task 10) and unit tests do not.
+    /// Wiring the ports must not perturb a selection — and this must hold
+    /// whether or not they are wired, since production wires them (Task 10) and
+    /// unit tests do not.
+    ///
+    /// Task 7 replaced the registered default with `GroupedWeightedStrategy`,
+    /// and this test survived unchanged for a REASON worth stating rather than
+    /// leaving as a coincidence: `seam_chain`'s two entries have DISTINCT
+    /// priorities, so every group is a singleton and AC1 makes the weighted
+    /// strategy indistinguishable from `PriorityStrategy` here. It therefore
+    /// says nothing about which of the two is registered — swapping the default
+    /// back leaves it green. That claim belongs to
+    /// [`the_registered_default_weights_a_tied_group`], which uses a TIED chain,
+    /// the only shape that can observe the difference.
     ///
     /// The chain here lists its entries in REVERSE priority order (claude-haiku,
     /// priority 2, first; gemma3:27b, priority 1, second) — deliberately, so this
@@ -1791,9 +1800,11 @@ mod tests {
     /// `["claude-haiku", "gemma3:27b"]` instead.
     ///
     /// This test does NOT prove the ctx's individual ports (`rng`/`perf`/
-    /// `min_samples`) actually reach the strategy — `PriorityStrategy` ignores
-    /// `ctx` entirely, so a ctx built wholly from wrong defaults changes nothing
-    /// here. That claim belongs to
+    /// `min_samples`) actually reach the strategy. `GroupedWeightedStrategy`
+    /// does read `ctx.rng` and `ctx.perf` — unlike the `PriorityStrategy` that
+    /// was registered when this test was written — but it reads them only inside
+    /// a group, and every group here is a singleton, so a ctx built wholly from
+    /// wrong defaults still changes nothing. That claim belongs to
     /// [`the_builders_install_the_ports_the_strategy_sees`], which uses a probe
     /// strategy that reads the ctx back out.
     #[test]
@@ -1865,7 +1876,83 @@ mod tests {
         );
         assert_eq!(
             got_bare, got_wired,
-            "wiring the new ports must not perturb a PriorityStrategy selection"
+            "wiring the ports must not perturb a distinct-priority selection"
+        );
+    }
+
+    /// The one test that pins WHICH strategy `new()` registers.
+    ///
+    /// Every other strategy test constructs `GroupedWeightedStrategy` directly
+    /// and calls `.order(...)` on it, which proves the strategy works and
+    /// nothing at all about whether the service installs it. And the
+    /// service-level tests cannot help: AC1 makes the two strategies
+    /// indistinguishable on distinct priorities BY DESIGN, and every chain in
+    /// this file has distinct priorities. So reverting the single highest-risk
+    /// line of the slice — `Box::new(GroupedWeightedStrategy)` back to
+    /// `Box::new(PriorityStrategy)` — passed the entire suite.
+    ///
+    /// A TIED group is the only shape that can observe the swap. This one is
+    /// deterministic rather than RNG-dependent: `gemma3:27b` has no pricing, so
+    /// its `cost_estimate` is `None` and it is classified free, which leads its
+    /// group ahead of any priced candidate on every possible draw. The chain
+    /// lists the PRICED model first, so a stable `PriorityStrategy` — equal
+    /// keys, input order preserved — would leave `claude-haiku` in front.
+    #[test]
+    fn the_registered_default_weights_a_tied_group() {
+        let mut config = test_config();
+        config.chains.insert(
+            "tied_chain".to_string(),
+            FallbackChainConfig {
+                id: "tied_chain".to_string(),
+                capability: Capability::TextChat,
+                models: vec![
+                    // Priced, and listed FIRST: PriorityStrategy would keep it here.
+                    ChainEntry {
+                        model: "claude-haiku".to_string(),
+                        router: None,
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                    // `pricing: None` ⇒ free ⇒ leads its tie group, every draw.
+                    ChainEntry {
+                        model: "gemma3:27b".to_string(),
+                        router: None,
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                ],
+                fallback_triggers: vec![],
+            },
+        );
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+
+        let criteria = SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("tied_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: None,
+        };
+
+        let rng = crate::random::SplitMix64::seeded(4242);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout).with_random(&rng);
+        let got: Vec<String> = svc
+            .select_all(&criteria)
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect();
+
+        assert_eq!(
+            got,
+            vec!["gemma3:27b".to_string(), "claude-haiku".to_string()],
+            "the free candidate leads its tie group — PriorityStrategy would \
+             keep the chain's declared order, so this fails if `new()` registers it"
         );
     }
 
