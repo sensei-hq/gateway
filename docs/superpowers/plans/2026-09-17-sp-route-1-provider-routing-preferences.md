@@ -26,7 +26,25 @@
 | 8 | `201450b` | ✅ done; surfaced a pre-existing config-validation gap — see below |
 | 9 | `662e22c` · `4f58000` | ✅ done; review found a **live-store read inside the sort comparator** that panicked selection |
 | 10 | `d6576b8` · `57b41c7` | ✅ done — **the feature is live**; both planted tripwires confirmed red-before / green-after |
-| 11–12 | — | pending |
+| 11 | `a9c8652` · `b7ff616` | ✅ done; found that **AC10 named a destination nothing fills** |
+| 12 | — | pending — docs + final verification + whole-slice review |
+
+**Task 11 found a spec defect of mine.** AC10 said the decision goes on `ExecutionTrace`. Nothing in
+the workspace builds one in production — it is constructed only in a `store.rs` test helper, and
+`insert_execution_trace` has no production caller; every field of that struct is equally unfilled.
+The reachable artifact is `InferenceResponse::routing`. Corrected in the spec.
+
+**The `OrderingReport` reasoning, carried forward because it is subtle.** `RoutingStrategy::order`
+*returns* the report rather than exposing a separate `explain(&self)`, and the review upheld that:
+`explain` would be racy by construction (nothing forbids one strategy instance serving concurrent
+selections), and recomputing at the trace site would re-read a **live** port — Task 9's hazard in a
+silent-failure shape rather than a loud panic.
+
+But "returned by `order`" guarantees only that the report was *produced inside the call that
+produced the ordering*. It does **not** make the values tamper-proof — a mutation that re-derived
+them at the attachment site survived the whole suite until `b7ff616` pinned it. The per-value
+guarantee is a local discipline in `order_group`: `Weight` is `Copy`, `classified` is bound once,
+and that one binding is both `.recorded()` into the report and `match`ed into the buckets.
 
 **Doc debt for Task 12, none of which has a doc surface today:**
 - `order`'s **first-matching-ref-wins** rule. `RoutingPreferences.order`'s doc says only
@@ -2492,7 +2510,7 @@ git commit -m "feat(gateway): explicit order + per-request strategy resolution (
 - Modify: `crates/gateway/src/selection.rs`, `crates/kernel/src/types/trace.rs`, `crates/gateway/src/engine/execute.rs`
 - Test: `crates/gateway/src/selection.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     /// AC10 — a weighted selection must be explainable. Without the applied
@@ -2558,12 +2576,12 @@ git commit -m "feat(gateway): explicit order + per-request strategy resolution (
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p sensei-gateway a_selection_records_the_strategy an_explicit_sort_is_named -- --nocapture`
 Expected: FAIL — `no field 'decision' on type 'SelectionResult'`.
 
-- [ ] **Step 3: Record the decision**
+- [x] **Step 3: Record the decision**
 
 In `crates/kernel/src/types/trace.rs`:
 
