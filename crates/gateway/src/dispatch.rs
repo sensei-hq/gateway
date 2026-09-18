@@ -35,6 +35,7 @@ fn empty_response() -> InferenceResponse {
         estimated_cost: None,
         actual_cost: None,
         attempts: Vec::new(),
+        routing: None,
     }
 }
 

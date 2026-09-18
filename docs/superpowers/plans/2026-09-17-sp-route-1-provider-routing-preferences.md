@@ -2614,6 +2614,34 @@ In `crates/gateway/src/selection.rs`, add `pub decision: Option<RoutingDecision>
 
 In `crates/gateway/src/engine/execute.rs`, attach `result.decision` to the `ExecutionTrace` built for the call.
 
+> **CORRECTED AT BUILD TIME — there is no `ExecutionTrace` built in `execute.rs`, or anywhere
+> else in production.** Verified with `rg -n 'ExecutionTrace|insert_execution_trace' --no-ignore
+> -g '!target' -g '*.rs'`: the type is constructed in exactly one place, `store.rs`'s `make_trace`
+> test helper, and `GatewayStore::insert_execution_trace` has no production caller at all. So the
+> line this step names cannot be written, and AC10's "`ExecutionTrace` records…" describes a type
+> that nothing fills.
+>
+> What was built instead, and why:
+>
+> - The two new types live in `crates/kernel/src/types/trace.rs` as specified, and
+>   `ExecutionTrace` gained `routing: Option<RoutingDecision>` — AC10's literal wording, and no
+>   more dead than the rest of that struct, every field of which is equally unfilled in
+>   production. It is pinned by two `store.rs` tests (a whole-value persistence round-trip, and a
+>   pre-SP-ROUTE-1 payload with no `routing` key, which would be a hard deserialization error
+>   without `#[serde(default)]`).
+> - The REACHABLE attachment is `InferenceResponse::routing`, set in `execute.rs` on the success
+>   return. That is the one artefact a caller asking "why did it pick the expensive one" actually
+>   holds. Pinned by `engine::tests::the_routing_decision_reaches_the_inference_response`, which
+>   goes red when that line is deleted (mutation-verified).
+> - Streaming (`engine/stream.rs`) also selects, but returns a stream rather than an
+>   `InferenceResponse`, so it carries no decision. Out of this task's scope; note it for Task 12.
+>
+> Also: `RoutingStrategy::order` now RETURNS an `OrderingReport` rather than gaining a separate
+> `explain(&self)`. Reading the weights back off the strategy afterwards would need interior
+> mutability (`order` takes `&self`) and could go stale; recomputing them at the trace site would
+> re-read a LIVE port, which is the Task 9 hazard in a silent-failure shape. A return value can
+> neither be stale nor describe an ordering that never happened.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-gateway a_selection_records_the_strategy an_explicit_sort_is_named -- --nocapture`
