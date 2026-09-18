@@ -44,6 +44,21 @@ impl std::fmt::Display for HumanAction {
     }
 }
 
+/// Render [`GatewayError::NoCandidates`]'s per-candidate diagnostics as a
+/// trailing clause, or nothing at all when there are none.
+///
+/// A free function rather than an inline expression in the `#[error]` attribute
+/// because the empty case must add NOTHING: appending an always-present
+/// "(skipped: )" would make the common nothing-configured error read as though
+/// diagnostics existed and were empty.
+fn fmt_skipped(skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        String::new()
+    } else {
+        format!(" — skipped: {}", skipped.join("; "))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error("authentication failed for adapter '{adapter}': {message}")]
@@ -90,8 +105,25 @@ pub enum GatewayError {
     #[error("adapter '{adapter}' does not support {what}")]
     Unsupported { adapter: String, what: String },
 
-    #[error("no candidates available for capability '{capability:?}'")]
-    NoCandidates { capability: Capability },
+    /// Selection admitted nothing, and every rejection was STRUCTURAL —
+    /// misconfiguration, a wrong capability, or a request-level routing filter.
+    /// Distinct from [`GatewayError::AllGated`], where the rejections were gates
+    /// with a deadline or a human remedy; nothing about waiting changes this
+    /// one.
+    ///
+    /// `skipped` carries the same per-candidate diagnostics `AllGated` does
+    /// (`"router:model — reason"`), and it is load-bearing rather than
+    /// decorative. Before it existed the caller got only the capability, so the
+    /// likeliest first-use failure of per-request routing preferences — a typo'd
+    /// `only: { routers: ["anthorpic"] }` — rendered as "no candidates available
+    /// for capability 'TextChat'" with no mention that a filter had rejected
+    /// everything. Empty when selection had nothing to reject at all (nothing
+    /// configured for the capability).
+    #[error("no candidates available for capability '{capability:?}'{}", crate::types::error::fmt_skipped(.skipped))]
+    NoCandidates {
+        capability: Capability,
+        skipped: Vec<String>,
+    },
 
     #[error("gateway not configured — no routers, models, or chains have been set")]
     NotConfigured,
@@ -691,6 +723,7 @@ mod tests {
         assert!(
             !GatewayError::NoCandidates {
                 capability: Capability::TextChat,
+                skipped: Vec::new(),
             }
             .should_trigger_fallback(&all_triggers)
         );

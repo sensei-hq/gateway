@@ -56,15 +56,16 @@ impl super::Gateway {
             budget: request.budget,
             input_tokens: Some(input_tokens),
             input_tokens_pessimistic: Some(input_tokens_pessimistic),
+            // One of the TWO sites (with `stream.rs`) where a caller's routing
+            // preferences enter selection. `None` here made the whole of
+            // SP-ROUTE-1 inert with a green suite — `only`/`ignore` never
+            // reached the `RoutingPolicyGate` and no `sort` selected anything.
+            // Pinned by `tests::a_requests_routing_preferences_reach_selection`.
+            preferences: request.routing.clone(),
         };
 
         // 3. Select all candidates
-        let svc = ModelSelectionService::new(
-            &config,
-            &self.circuit_breaker,
-            &self.cooldown,
-            &self.model_lockout,
-        );
+        let svc = self.selection_service(&config);
         let result = svc.select_all(&criteria);
 
         // 4. No candidates? Selection admitted nothing. If every skip was a gate
@@ -81,8 +82,14 @@ impl super::Gateway {
             if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {
                 return Err(gated);
             }
+            // Carry the per-candidate reasons rather than discarding them. An
+            // all-structural selection is exactly where the caller has no other
+            // channel: `AllGated` at least names a deadline or a remedy, while a
+            // bare `NoCandidates` used to name only the capability — so a typo'd
+            // `only: { routers: [...] }` was undiagnosable.
             return Err(GatewayError::NoCandidates {
                 capability: request.capability.clone(),
+                skipped: super::exhaustion::render_skipped(&result.skipped),
             });
         }
 
@@ -130,7 +137,17 @@ impl super::Gateway {
                 )
                 .await
             {
-                StepOutcome::Done(response) => return Ok(*response),
+                StepOutcome::Done(mut response) => {
+                    // AC10 — carry the routing decision out to the caller.
+                    // `attempt_candidate` sees one candidate and cannot know why
+                    // that candidate came first, so the attachment belongs here,
+                    // where `result` is still in scope. Without this line the
+                    // whole of Task 11 is a field populated in `SelectionResult`
+                    // and read by nobody. Pinned by
+                    // `tests::the_routing_decision_reaches_the_inference_response`.
+                    response.routing = result.decision.clone();
+                    return Ok(*response);
+                }
                 StepOutcome::FallBack => continue,
                 StepOutcome::Stop => break,
             }
@@ -272,7 +289,7 @@ impl super::Gateway {
         } else {
             Some(candidate.api_model_id.clone())
         };
-        let endpoint = format!("{}:{}", candidate.router, candidate.model);
+        let endpoint = candidate.endpoint_key();
         // Per-call credential override: a tenant-aware consumer resolves the
         // caller's key and injects it here, so the engine stays tenant-agnostic.
         // Preferred over the router's configured api_key/env for this dispatch.
@@ -330,7 +347,16 @@ impl super::Gateway {
         match outcome {
             Ok(mut response) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let _ = self.record_outcome(&endpoint, &candidate.router, true, None);
+                let output_tokens = response.usage.as_ref().map(|u| u.output_tokens);
+                let _ = self.record_outcome(&crate::gates::AttemptOutcome {
+                    endpoint: &endpoint,
+                    router: &candidate.router,
+                    success: true,
+                    error: None,
+                    duration_ms,
+                    output_tokens,
+                    phase: crate::gates::AttemptPhase::Complete,
+                });
 
                 // Fill cost: the pre-call estimate from selection, and the
                 // actual dollar cost from the returned token usage × the
@@ -406,8 +432,15 @@ impl super::Gateway {
                 // Capture the instant the recorder pipeline just wrote (for a
                 // recoverable limit that locked this endpoint) so the exhaustion
                 // aggregation can attribute a timed resume to this attempt.
-                let written_until =
-                    self.record_outcome(&endpoint, &candidate.router, false, Some(&err));
+                let written_until = self.record_outcome(&crate::gates::AttemptOutcome {
+                    endpoint: &endpoint,
+                    router: &candidate.router,
+                    success: false,
+                    error: Some(&err),
+                    duration_ms,
+                    output_tokens: None,
+                    phase: crate::gates::AttemptPhase::Complete,
+                });
 
                 // Classify drives the in-flight fallover so the walk and the next-request
                 // lockout agree (design §3.1): a recoverable provider limit (429 / 403-quota)

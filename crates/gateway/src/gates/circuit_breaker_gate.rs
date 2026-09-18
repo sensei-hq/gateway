@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::AttemptPhase;
 use super::{
     AdmissionGate, AttemptOutcome, CandidateView, GateVerdict, HealthRecorder, SelectionCtx,
 };
@@ -33,6 +35,17 @@ impl CircuitBreakerSink {
 
 impl HealthRecorder for CircuitBreakerSink {
     fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<std::time::Instant> {
+        // A `StreamAcquired` outcome is a latency observation, not a verdict —
+        // the completion dispatch for this same attempt (or nothing, if the
+        // consumer abandoned the stream) is the one that gets a vote. Without
+        // this guard, `success: true` at acquisition reached `record_success`
+        // on EVERY streaming attempt, resetting `Closed { failure_count }` to
+        // 0 right before the completion dispatch could increment it — the
+        // breaker could never reach `threshold` no matter how many streams
+        // failed mid-way (SP-ROUTE-1 Task 5 review, Critical 3).
+        if !o.phase.is_verdict() {
+            return None;
+        }
         if o.success {
             self.breaker.record_success(o.endpoint);
             None
@@ -125,6 +138,7 @@ mod tests {
             config: &gateway_config,
             router_health: &NeverCooling,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);
@@ -160,6 +174,7 @@ mod tests {
             config: &gateway_config,
             router_health: &NeverCooling,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         let verdict = CircuitBreakerGate.evaluate(&cand, &ctx);
@@ -182,6 +197,9 @@ mod tests {
             router: "r",
             success: false,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(cb.get_state("r:m").name(), "open"); // threshold 1 → opens on one failure
         let next_retry = match cb.get_state("r:m") {
@@ -196,6 +214,9 @@ mod tests {
             router: "r",
             success: true,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(returned, None, "success returns no wake-up instant");
         assert_eq!(cb.get_state("r:n").name(), "closed");
@@ -212,6 +233,9 @@ mod tests {
             router: "r",
             success: false,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(cb2.get_state("r:o").name(), "closed");
         assert_eq!(

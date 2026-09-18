@@ -27,6 +27,12 @@ candidates in priority order; if a candidate fails with an error that the
 chain's `fallback_triggers` name, the engine *falls through* to the next
 candidate. If it fails with any other error, the walk stops.
 
+> Since SP-ROUTE-1, priority order is the **default** order, not the only one. A
+> caller can override it per request via `InferenceRequest.routing`
+> (`sort` / `only` / `ignore` / `order`), and entries that share a `priority`
+> are load-balanced rather than kept in authoring order. See
+> [provider routing preferences](provider-preferences.md).
+
 Use a chain when you want a request to degrade gracefully across providers or
 models — e.g. try a cheap local model first, fall back to a hosted model on
 timeout or provider outage — without the caller having to retry or re-route by
@@ -80,7 +86,7 @@ pub struct ChainEntry {
 | `model`        | `String`          | Registry id of the model (key into `GatewayConfig.models`). Note: singular `model`, not `models`. |
 | `router`       | `Option<String>`  | Router to run this model on. When `None`, resolution falls back to the model's own `provider` (`selection.rs::resolve_chain`). |
 | `api_model_id` | `Option<String>`  | Override for the provider-facing model id. When `None`, resolution uses `ModelConfig.api_model_id`, and if that is also `None`, the registry `model` id itself. |
-| `priority`     | `u8`              | Sort key. Entries are sorted ascending by `priority` before the walk; lower numbers are tried first. |
+| `priority`     | `u8`              | Sort key. Entries are sorted ascending by `priority` before the walk; lower numbers are tried first. **Entries that TIE on `priority` form a load-balanced pool** whose internal order is drawn per request — see [provider routing preferences](provider-preferences.md#8-determinism). |
 
 > **Note (field ownership).** `id`, `capability`, `models`, and
 > `fallback_triggers` live on `FallbackChainConfig`; `router`, `api_model_id`,
@@ -186,11 +192,20 @@ Two guards to keep in mind:
    - **Tier 3 — capability:** nothing pinned → pick the chain whose
      `capability` matches, breaking ties by **lowest `id`** (deterministic;
      `HashMap` order is not stable — see the `#80` note in `resolve_by_capability`).
-   Within a chain, entries are `sort_by_key(|e| e.priority)` and each is
-   validated (router exists + enabled, model supports the capability, circuit
-   breaker closed, within budget). Failing candidates go to `skipped`, not to
-   `all_candidates`. So the engine only ever walks pre-validated candidates.
-3. **No candidates ⇒** `GatewayError::NoCandidates { capability }`.
+   Within a chain each entry is validated (router exists + enabled, the request's
+   own `only`/`ignore` preferences, model supports the capability, cooldown,
+   circuit breaker, model lockout, budget, context window), then the surviving
+   candidates are ordered by a `RoutingStrategy` resolved **per request**. The
+   default is ascending `priority`, load-balanced within any equal-priority
+   group; `InferenceRequest.routing` can replace that ordering (`sort`) or
+   re-rank it (`order`) — see
+   [provider routing preferences](provider-preferences.md). Failing candidates go
+   to `skipped`, not to `all_candidates`. So the engine only ever walks
+   pre-validated candidates.
+3. **No candidates ⇒** `GatewayError::NoCandidates { capability, skipped }` —
+   `skipped` being the per-candidate `"router:model — reason"` diagnostics, so a
+   filter (or a typo'd `only`) that rejected everything says so rather than
+   rendering as a bare "no candidates available".
 4. **Triggers.** `fallback_triggers` are read from the resolved chain, or an
    **empty slice** when there is no chain (tier 1 direct, or an unresolved
    chain). Direct requests therefore never fall through.

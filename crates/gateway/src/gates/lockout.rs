@@ -189,6 +189,8 @@ impl ModelLockoutRead for ModelLockoutStore {
     }
 }
 
+#[cfg(test)]
+use super::AttemptPhase;
 use super::{AttemptOutcome, HealthRecorder};
 
 /// Best-effort, isolated observer of gateway health decisions. The gateway
@@ -321,6 +323,16 @@ impl ModelLockoutSink {
 
 impl HealthRecorder for ModelLockoutSink {
     fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<Instant> {
+        // A `StreamAcquired` outcome is a latency observation, not a verdict.
+        // Without this guard, its `success: true` reached the `clear()` branch
+        // below on EVERY streaming attempt — wiping a prior lock's escalation
+        // counter immediately before the SAME attempt's mid-stream failure
+        // re-locked it, so a genuine relock after a prior lock expired always
+        // looked like a fresh lock and could never escalate past the base
+        // backoff (SP-ROUTE-1 Task 5 review, Important 3).
+        if !o.phase.is_verdict() {
+            return None;
+        }
         if o.success {
             self.store.clear(o.endpoint); // success clears lock + escalation
             return None;
@@ -577,6 +589,7 @@ mod tests {
             config: &gateway_config,
             router_health: &router_health,
             model_lockout: &store,
+            preferences: None,
         };
 
         // Unknown endpoint → Admit.
@@ -639,6 +652,9 @@ mod tests {
             router: "r",
             success: false,
             error: Some(err),
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         }
     }
 
@@ -771,6 +787,9 @@ mod tests {
             router: "r",
             success: true,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert_eq!(returned, None, "success returns no wake-up instant");
         assert!(
@@ -909,6 +928,9 @@ mod tests {
             router: "new",
             success: false,
             error: Some(&err),
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
 
         assert!(

@@ -1,40 +1,50 @@
 # Checkpoint
 
-**SP-OPS-1 consolidation COMPLETE** — all five increments, every fix mutation-verified. On
-`develop`, ahead of `main`. Plan + grounding:
-`docs/superpowers/plans/2026-09-16-sp-ops-1-consolidation.md` ·
-`docs/analysis/2026-09-16-agentic-execution-capability-survey.md`.
+**SP-ROUTE-1 — 12/12 TASKS + THE WHOLE-SLICE REVIEW DONE, on `develop`.**
+Suite **1909 passed / 0 failed / 60 ignored**, real exit 0, zero `panicked at`.
+Clippy (Homebrew 1.97.1 + rustup stable 1.98.1), `fmt --check`,
+`cargo test -p sensei-gateway --features local --locked` (439/0), and
+`cargo doc --workspace --no-deps` all clean, all real exit 0.
+Spec: `docs/superpowers/specs/2026-09-17-sp-route-1-provider-routing-preferences-design.md`
+Plan: `docs/superpowers/plans/2026-09-17-sp-route-1-provider-routing-preferences.md`
+(Progress table + "Whole-slice adversarial review" — **read those first**).
 
 ## Done
 
-**Survey** (`555d383`) — six blind lenses: durable core strong, composition root empty (12 seams
-wired to nothing), 3 live bugs.
-**1.2 `Expand.planner` REQUIRED** (`c3f200a`) — the serde default resolved to the *test* variant.
-**1.1 run-scoped blackboard** (`d28992e`, `3482d53`) — `run` param + `run_id` column. NOT
-`Scope::Run(RunId)`: `Scope` is serialized in `ContextWrite`, so that would bump `FORMAT_VERSION`.
-**1.3 bounded transient retry** (`741a93e`, `2f3fc8c`) — **OPT-IN, default off.**
-**1.4 per-run drive lock** (`4d4d02b`, `a70d55c`) — `pg_try_advisory_lock` on a **detached**
-connection; the lock excludes a LIVE driver, the lease still recovers a DEAD one.
-**1.5 `fs_write` reconciler** (`1383def`, `a941c20`) — always `NotApplied`: `std::fs::write`
-truncates, so a re-run is idempotent.
+T1–T12 (request types → `RoutingDecision` on `InferenceResponse` → docs), each
+reviewed. **Whole-slice review complete in two rounds:** `0c26c8c` behavioural
+(a failed attempt no longer casts a latency observation; throughput is now
+output tokens ÷ TOTAL attempt wall time on both paths; `NoCandidates` gained
+`skipped`; the `--features local` CI step runs `cargo test`, not `cargo check`)
+and this commit, documentation (3 Critical / 6 Important / 10 Minor).
+
+The two Criticals worth carrying: `#[non_exhaustive]` forbids
+`..Default::default()` too, so the documented way to set `min_samples` did not
+compile for any consumer — now guarded from OUTSIDE the crate by a
+`reexport_paths.rs` test and a `resilience.rs` doctest; and the `min_samples: 0`
+hazard named a mechanism the code lacks (`stats()` returns `None` first, so a
+cold process is fine — the real hazard is a live ring with a zeroed counter).
+
+## Next
+
+**Merge `origin/main` into `develop`, then open the develop→main PR.** `main`'s
+ruleset is strict — without main's merge commits the PR sits BEHIND and cannot
+land.
 
 ## Carry-forwards — deliberate, not forgotten
 
-1. **1.3's default leaves §2.2's bug live.** `retryable` is `any(HardFailure)` and an
-   unclassified provider error IS one, while auth/credits exhaust as `AllGated` → HOTL pause and
-   never reach that path — so enabling it retries *essentially every* provider failure. Flipping
-   it is one line plus re-expecting 35 tests that inject a 500 to mean "this node fails".
-2. **`shell` still has no reconciler** — not idempotent, nothing generic can decide whether it
-   ran, so a crash mid-`shell` still parks for a human.
-3. Untouched: no metrics/spans/correlation id · no network API · streaming stops at the orchestrator · `latest_snapshot` written never read · no tenant dimension · 3 LOW.
+1. **Streaming carries no `RoutingDecision`** — `execute_stream` applies every
+   preference but returns `StreamEvent`s, so there is nowhere to put it.
+2. **`ExecutionTrace::routing` is forward provision** — nothing builds an
+   `ExecutionTrace` in production; the response is the delivered surface.
+3. `InferenceCall` store write in `stream.rs` sits **after** `yield Done`, so an
+   SSE consumer that breaks on `Done` is never metered. Metering, not routing.
+4. Nothing validates `ModelPricing` for finiteness or sign. **Contained** (both
+   strategies fence non-finite keys), but a NEGATIVE price is accepted and sorts
+   FIRST under `sort: price`. The loud load-time rejection belongs at the config
+   layer — now documented as a hazard rather than left implicit.
+5. **Consensus legs drop the caller's `routing`** (`routing: None` hardcoded),
+   while a panel inherits it. Consistent with `budget`/`auth`; documented, not
+   changed.
 
-**Next:** survey §4 — wire `with_hooks` + the 5 discovery tools (cheap, high value), or
-start Bar-B (network API / streaming / metrics / tenancy).
-
-## Verified
-
-`DATABASE_URL="postgres://Jerry@localhost:5432/postgres"`. **1845 / 0** workspace · **73 / 0**
-store `--features postgres` · **8 / 0** e2e_pg · clippy **0.1.98** 0 · fmt 0 · rustdoc 0. Prepend
-`~/.rustup/toolchains/stable-aarch64-apple-darwin/bin` else `clippy-driver` resolves to 1.97.
-**Commit before mutating** (`git checkout` reverted uncommitted work 3× today) and **check the
-mutation applied** — a failed `str.replace` assert leaves a false green.
+Open questions: none. Known-broken: nothing.

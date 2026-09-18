@@ -147,6 +147,51 @@ from the richer `ExecutionTrace` type in `trace.rs` (which also holds a
 `Vec<Attempt>` plus candidates/skipped/costs) — `Gateway::execute` does not
 build an `ExecutionTrace`; it only fills `InferenceResponse.attempts`.
 
+## `RoutingDecision` — why the candidates were in that order
+
+Since SP-ROUTE-1 the default ordering strategy is a **weighted draw** within any
+equal-priority group, which makes routing unfalsifiable without a record: two
+identical requests may legitimately route differently, so there is nothing to
+re-run and compare against. `InferenceResponse::routing` carries the
+explanation.
+
+```rust
+pub struct RoutingDecision {
+    pub strategy: String,            // the strategy that ACTUALLY ran
+    pub degraded: bool,              // a metric sort had too few samples to reorder anything
+    pub order: Vec<RoutedCandidate>, // AFTER any `order` re-rank
+}
+
+pub struct RoutedCandidate {
+    pub endpoint: String,            // "{router}:{model}"
+    pub priority: u8,
+    pub cost: Option<f64>,           // None ⇒ unpriced (free)
+    pub reliability: Option<f64>,    // None ⇒ UNMEASURED, which is not Some(0.0)
+    pub weight: Option<f64>,         // None ⇒ never entered a draw; Some(0.0) ⇒ a real zero
+}
+```
+
+Read it alongside `attempts`, not instead of it: `order` is the ranking
+selection handed the walk ("would try"), while `attempts` records what was
+actually tried. The walk can end before the tail is reached —
+`allow_fallback: false` attempts only the first entry, and a terminal error stops
+it where it stands.
+
+`routing` is `None` when no strategy ran: a direct router+model request names its
+one candidate and orders nothing.
+
+Two gaps worth knowing before you go looking:
+
+- **The streaming path carries no decision.** `execute_stream` applies the full
+  preferences — filtering and ordering both work — but returns a stream of
+  `StreamEvent`s rather than an `InferenceResponse`, so it has nowhere to put the
+  explanation.
+- **`ExecutionTrace::routing` is forward provision only.** The field exists and
+  round-trips through serde, but nothing in this workspace builds an
+  `ExecutionTrace` in production (see above — every field of that struct is
+  equally unfilled), so no writer populates it today. The response is the
+  delivered surface.
+
 ## `StreamEvent` — the streaming trace surface
 
 `types/request.rs` defines the streaming-side event enum:

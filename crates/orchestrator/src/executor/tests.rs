@@ -15269,6 +15269,7 @@ fn straddling_chat_request(chain: &str) -> (kernel::types::request::InferenceReq
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
     (request, ceil_of_sum, sum_of_ceils)
 }
@@ -15846,6 +15847,7 @@ async fn dispatch_once_with(caller_max: Option<u32>, cap: u64) -> Option<u32> {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
     let _ = exec.dispatch_metered(&request, &meter).await;
 
@@ -15899,6 +15901,7 @@ fn embed_request() -> kernel::types::request::InferenceRequest {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 

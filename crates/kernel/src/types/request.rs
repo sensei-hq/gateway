@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::capability::Capability;
 use super::cost::{Cost, CostEstimate, TokenUsage};
-use super::trace::Attempt;
+use super::trace::{Attempt, RoutingDecision};
 
 // ---------------------------------------------------------------------------
 // Base64 serde helpers for audio byte fields
@@ -371,6 +371,177 @@ fn default_true() -> bool {
     true
 }
 
+/// Per-request provider-routing preferences (SP-ROUTE-1).
+///
+/// Every knob is optional; an entirely absent `RoutingPreferences` means "use
+/// the default" — price-weighted, uptime-aware selection within equal-priority
+/// groups (`gateway::strategy::GroupedWeightedStrategy`), which is a no-op on
+/// any chain whose admitted candidates have distinct priorities.
+///
+/// # Order of operations
+///
+/// Filtering first, then ordering:
+///
+/// ```text
+/// only / ignore  →  sort (or the weighted default)  →  order
+/// ```
+///
+/// [`only`](Self::only) and [`ignore`](Self::ignore) have **no precedence
+/// relative to each other** — both are pure predicates over a single candidate,
+/// so admission is the commutative conjunction `only_ok && !ignore_match`. What
+/// is true, and what the tests pin, is that satisfying `only` does not exempt a
+/// candidate from `ignore`.
+///
+/// [`order`](Self::order) and [`sort`](Self::sort) genuinely *are*
+/// sequence-dependent: `order` wins for the candidates it names, and `sort` (or
+/// the default weighting) orders the unnamed tail that follows them. Combining
+/// them is legal and composable, not an error.
+///
+/// # Determinism
+///
+/// With distinct chain priorities routing is deterministic and identical to
+/// prior releases. Give two chain entries the **same** priority and they become
+/// a load-balanced pool: two *fresh* runs may pick different models. Orchestrator
+/// resume is unaffected (a completed model call replays from its journal memo and
+/// never re-enters selection). See
+/// `docs/features/routing/provider-preferences.md` for the two ways a tie can
+/// arise unintentionally.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RoutingPreferences {
+    /// Replace the default weighted ordering with a deterministic sort.
+    /// See [`SortKey`] — `Price` overrides `priority` outright, while the two
+    /// metric sorts move only the candidates they have measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<SortKey>,
+    /// Allowlist. AND across non-empty axes (see [`CandidateSet`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<CandidateSet>,
+    /// Denylist. OR across non-empty axes (see [`CandidateSet`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<CandidateSet>,
+    /// Explicit try-order, layered on top of whichever strategy ran. A stable
+    /// re-rank by matched-ref index — it never FILTERS; `only`/`ignore` are the
+    /// knobs that restrict.
+    ///
+    /// **First matching ref wins.** A candidate takes the rank of the FIRST
+    /// [`CandidateRef`] it matches, not the last, so
+    /// `[{model: "charlie"}, {router: "north"}]` reads *"charlie, then the rest
+    /// of north"*: charlie matches both refs, takes rank 0, and keeps its lead
+    /// over the other north candidates at rank 1. Candidates matching no entry
+    /// rank last and follow as fallbacks.
+    ///
+    /// **Two inert forms**, neither an error:
+    ///
+    /// - `Some(vec![])` — no ref to match, so every candidate ranks last and the
+    ///   strategy's order survives intact.
+    /// - `Some(vec![CandidateRef::default()])` — an all-wildcard ref matches
+    ///   *every* candidate, so all of them tie at rank 0 and the strategy's
+    ///   relative order is preserved.
+    ///
+    /// The second carries a trap: **a default (all-wildcard) ref placed first
+    /// shadows every later ref**, because first-match-wins hands every candidate
+    /// rank 0 before any subsequent ref is consulted.
+    /// `[CandidateRef::default(), CandidateRef { model: Some("charlie"), .. }]`
+    /// does not promote charlie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<CandidateRef>>,
+}
+
+/// Which deterministic ordering replaces the weighted default
+/// ([`RoutingPreferences::sort`]).
+///
+/// `Price` and the two metric sorts behave differently on purpose, and the
+/// difference is worth knowing before reading a `RoutingDecision`:
+///
+/// - `Price` sorts **every** candidate and therefore **overrides the operator's
+///   authored `priority` entirely**. That is what an explicit sort means — load
+///   balancing switches off and the router tries candidates strictly in the
+///   named order.
+/// - `Latency` / `Throughput` sort only the **measured subset**, within the
+///   indices that subset already occupies. Unmeasured candidates never move, so
+///   a cold process returns exactly priority order and a partially-observed
+///   chain is a monotone interpolation between the two. "Measured" means at
+///   least `ResilienceConfig::min_samples` live observations *of that metric*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortKey {
+    /// Ascending estimated cost across the whole chain, free first, ties broken
+    /// by authored priority. Overrides `priority`. An unpriced model is free; a
+    /// non-finite estimate sorts LAST, not first — an unusable price is not a
+    /// price, and treating it as free would let a broken figure win the cheapest
+    /// slot.
+    Price,
+    /// Ascending — fastest (lowest mean latency) measured candidate first.
+    Latency,
+    /// Descending — highest mean tokens/sec measured candidate first.
+    Throughput,
+}
+
+/// A set of candidates named on either axis, used by both
+/// [`RoutingPreferences::only`] and [`RoutingPreferences::ignore`].
+///
+/// The two axes are SEPARATE because the endpoint key `"{router}:{model}"`
+/// cannot be parsed back — model ids contain colons (`"ollama:gemma3:27b"`).
+/// There is therefore no flat `provider:model` selector namespace; name the two
+/// parts separately.
+///
+/// **An EMPTY list is "don't care" on that axis — not "match nothing".**
+/// `only: {routers: ["anthropic"]}` admits every anthropic candidate whatever
+/// its model.
+///
+/// # The two knobs read this type differently
+///
+/// - **`only` is AND across non-empty axes.** A candidate is admitted iff it
+///   satisfies *every* non-empty list.
+/// - **`ignore` is OR across non-empty axes.** A candidate is excluded iff it is
+///   named on *any* axis.
+///
+/// The asymmetry is deliberate — it is how an operator says these aloud. "Only
+/// these routers and only these models" is a conjunction; "ignore this router
+/// and that model" is a disjunction. An AND-ed `ignore` would exclude only the
+/// single named *pair*, which nobody means.
+///
+/// | preference | candidate | admitted? |
+/// |---|---|---|
+/// | `only: {routers: [anthropic], models: [claude-haiku]}` | `anthropic:claude-haiku` | yes |
+/// | same | `anthropic:claude-opus` | no — the model axis binds |
+/// | same | `bedrock:claude-haiku` | no — the router axis binds |
+/// | `only: {routers: [anthropic]}` | `anthropic:anything` | yes — empty axis is don't-care |
+/// | `ignore: {routers: [ollama], models: [claude-opus]}` | `ollama:gemma3:27b` | no — router match |
+/// | same | `anthropic:claude-opus` | no — model match |
+/// | same | `anthropic:claude-haiku` | yes — neither axis matched |
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CandidateSet {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
+/// One position in an explicit sequence ([`RoutingPreferences::order`]).
+///
+/// A ref matches a candidate iff every **present** field equals the candidate's;
+/// an ABSENT field is a wildcard. So `{router: "anthropic"}` means "every
+/// anthropic candidate, here", and `CandidateRef::default()` (both fields
+/// absent) matches everything.
+///
+/// **A router-only ref lifts every model on that router across priority tiers.**
+/// `order: [{router: "anthropic"}]` puts *all* anthropic candidates ahead of
+/// everything else regardless of their authored `priority`. That is correct and
+/// caller-explicit — but it is precisely the cross-group reordering
+/// `GroupedWeightedStrategy` refuses to do on its own, which only ever reorders
+/// WITHIN a priority group. Reach for it deliberately.
+///
+/// See [`RoutingPreferences::order`] for first-match-wins and the two inert
+/// forms.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CandidateRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub capability: Capability,
@@ -410,6 +581,10 @@ pub struct InferenceRequest {
     /// request, so the engine stays tenant-agnostic. Redacted in `Debug`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub credentials: HashMap<String, String>,
+    /// Per-request provider-routing preferences (SP-ROUTE-1). `None` ⇒ the
+    /// default strategy; the wire format is byte-identical to before this slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingPreferences>,
 }
 
 /// Custom `Debug` that never prints credential secret values — `credentials`
@@ -427,6 +602,7 @@ impl std::fmt::Debug for InferenceRequest {
             .field("auth", &self.auth)
             .field("panel", &self.panel)
             .field("consensus", &self.consensus)
+            .field("routing", &self.routing)
             .field("allow_fallback", &self.allow_fallback)
             .field(
                 "credentials",
@@ -473,6 +649,29 @@ pub struct InferenceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_cost: Option<Cost>,
     pub attempts: Vec<Attempt>,
+    /// Why the candidates were tried in the order they were (SP-ROUTE-1 AC10).
+    ///
+    /// The mirror of [`InferenceRequest::routing`]: that field is what the
+    /// caller ASKED for, this one is what the router actually did with it. `None`
+    /// when no strategy ran — a direct router+model request orders nothing.
+    ///
+    /// Carried on the response rather than only on an [`ExecutionTrace`]
+    /// because nothing in this workspace builds an `ExecutionTrace` in
+    /// production today; the response is the one artefact a caller reporting
+    /// "why did it pick the expensive one" actually has in hand.
+    ///
+    /// **Not available on the streaming path.** `Gateway::execute_stream`
+    /// selects with the full preferences — `only`/`ignore` filtering and every
+    /// ordering knob apply — but returns a stream of `StreamEvent`s rather than
+    /// an `InferenceResponse`, so a streamed request has no explanation to read.
+    /// A known gap, not an oversight.
+    ///
+    /// `default` is belt-and-braces — serde already resolves a missing
+    /// `Option<T>` field to `None`.
+    ///
+    /// [`ExecutionTrace`]: super::trace::ExecutionTrace
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingDecision>,
 }
 
 #[derive(Debug, Clone)]
@@ -592,6 +791,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: HashMap::new(),
+            routing: None,
         };
         req.credentials
             .insert("openai".to_string(), "sk-super-secret-value".to_string());
@@ -603,6 +803,67 @@ mod tests {
         assert!(
             dbg.contains("openai"),
             "router name should appear so the override is debuggable: {dbg}"
+        );
+    }
+
+    /// The hand-written `Debug` impl claims (in its doc comment) that every
+    /// field but `credentials` prints verbatim. Enumerate the field names so a
+    /// dropped `.field(...)` call — including on the NEXT field someone adds —
+    /// fails this test rather than silently shrinking the impl.
+    #[test]
+    fn debug_prints_every_field() {
+        let req = InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::Chat {
+                messages: Vec::new(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: HashMap::new(),
+            routing: Some(RoutingPreferences {
+                sort: Some(SortKey::Latency),
+                ..Default::default()
+            }),
+        };
+        let dbg = format!("{req:?}");
+        for field in [
+            "capability",
+            "model",
+            "router",
+            "chain",
+            "payload",
+            "budget",
+            "auth",
+            "panel",
+            "consensus",
+            "routing",
+            "allow_fallback",
+            "credentials",
+        ] {
+            // Match on the `debug_struct` separator (`"field: "`), not the bare
+            // name — a bare-name match is satisfied by an unrelated field whose
+            // own name contains this one as a substring (`"route"` inside
+            // `"router: None"`; `"router"`/`"model"` inside `"routers: [...]"` /
+            // `"models: [...]"`), so it would pass even with the `.field(...)`
+            // call for THIS field deleted.
+            assert!(
+                dbg.contains(&format!("{field}: ")),
+                "hand-written Debug dropped `{field}`: {dbg}"
+            );
+        }
+        assert!(
+            dbg.contains("Latency"),
+            "routing value must be visible: {dbg}"
         );
     }
 
@@ -626,6 +887,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -662,6 +924,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -696,6 +959,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -704,6 +968,67 @@ mod tests {
         assert!(deserialized.success);
         assert_eq!(deserialized.content, Some("Hello!".to_string()));
         assert!(deserialized.attempts.is_empty());
+    }
+
+    /// A POPULATED routing decision survives the response's serde round-trip.
+    ///
+    /// Every other response test here sets `routing: None`, which exercises
+    /// only the `skip_serializing_if` path — so the nested `Option<f64>`s that
+    /// carry the whole explanation were never serialized at all. `reliability`
+    /// is the field that matters: `Some(0.0)` coming back as `None` (or the
+    /// reverse) inverts the measured-and-dead versus never-measured
+    /// distinction, and both directions are present below on purpose.
+    #[test]
+    fn response_round_trips_a_populated_routing_decision() {
+        use super::super::trace::RoutedCandidate;
+        let decision = RoutingDecision {
+            strategy: "grouped_weighted".to_string(),
+            degraded: false,
+            order: vec![
+                RoutedCandidate {
+                    endpoint: "anthropic:claude-haiku".to_string(),
+                    priority: 1,
+                    cost: Some(0.5),
+                    reliability: Some(0.0),
+                    weight: Some(0.0),
+                },
+                RoutedCandidate {
+                    endpoint: "ollama:gemma3:27b".to_string(),
+                    priority: 2,
+                    cost: None,
+                    reliability: None,
+                    weight: None,
+                },
+            ],
+        };
+        let response = InferenceResponse {
+            success: true,
+            content: Some("Hello!".to_string()),
+            embeddings: None,
+            transcription: None,
+            audio: None,
+            images: None,
+            videos: None,
+            model: None,
+            usage: None,
+            tool_calls: Vec::new(),
+            estimated_cost: None,
+            actual_cost: None,
+            attempts: vec![],
+            routing: Some(decision.clone()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: InferenceResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.routing,
+            Some(decision),
+            "a whole-value comparison: a per-field check would let the two \
+             `Option<f64>`s collapse into each other unnoticed"
+        );
+        // The endpoint carrying a colon in its MODEL name is not an accident —
+        // `"{router}:{model}"` is not uniquely splittable, so nothing may try.
+        assert!(json.contains("ollama:gemma3:27b"));
     }
 
     #[test]
@@ -918,6 +1243,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -957,6 +1283,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1014,6 +1341,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1041,6 +1369,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1072,6 +1401,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1139,6 +1469,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1196,6 +1527,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1261,6 +1593,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1547,10 +1880,80 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"auth\""));
         let back: InferenceRequest = serde_json::from_str(&json).unwrap();
         assert!(back.auth.is_none());
+    }
+
+    #[test]
+    fn routing_preferences_round_trip_and_stay_absent_by_default() {
+        let prefs = RoutingPreferences {
+            sort: Some(SortKey::Price),
+            only: Some(CandidateSet {
+                routers: vec!["anthropic".into()],
+                models: vec![],
+            }),
+            ignore: None,
+            order: Some(vec![CandidateRef {
+                router: Some("ollama".into()),
+                model: None,
+            }]),
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RoutingPreferences>(&json).unwrap(),
+            prefs
+        );
+        // Exact wire shape: pins every skip that fires here, the field names,
+        // and the snake_case SortKey rename.
+        assert_eq!(
+            json,
+            r#"{"sort":"price","only":{"routers":["anthropic"]},"order":[{"router":"ollama"}]}"#
+        );
+        // Every knob absent / every axis empty ⇒ the empty object, on all three types.
+        // This is what pins the remaining five `skip_serializing_if`s.
+        assert_eq!(
+            serde_json::to_string(&RoutingPreferences::default()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::to_string(&CandidateSet::default()).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            serde_json::to_string(&CandidateRef::default()).unwrap(),
+            "{}"
+        );
+    }
+
+    /// A request with no routing preferences must serialize byte-identically to
+    /// one from before this slice — the additive guarantee.
+    #[test]
+    fn a_request_without_preferences_emits_no_routing_key() {
+        let req = InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: None,
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+            routing: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("routing"), "absent ⇒ no key: {json}");
     }
 }

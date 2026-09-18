@@ -82,6 +82,7 @@ pub(crate) fn build_chat_request(
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 
@@ -106,6 +107,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: Vec::new(),
+            routing: None,
         }
     }
 

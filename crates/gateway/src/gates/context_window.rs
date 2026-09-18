@@ -187,6 +187,7 @@ mod tests {
             config: cfg,
             router_health: &NeverCooling,
             model_lockout: &NeverLocked,
+            preferences: None,
         }
     }
 

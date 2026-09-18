@@ -42,6 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             context_window: 128_000,
             max_output_tokens: 4096,
             pricing: None,                              // add ModelPricing to get cost figures
+            family: None,                               // lineage for panel distinctness
+            catalog: None,                              // free-tier terms + attribute tags
         })
         .build()
         .map_err(|errs| errs.join("; "))?;
@@ -73,6 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         budget: None,
         auth: None,
+        panel: None,            // not a fan-out panel request
+        consensus: None,        // not a consensus workflow request
+        allow_fallback: true,   // walk the fallback chain on error
+        credentials: Default::default(),
+        routing: None,          // no per-request provider routing preferences
     };
 
     let resp = gateway.execute(&req).await?;
@@ -93,6 +100,10 @@ let req = InferenceRequest {
     router: None, chain: None,
     payload: Payload::Embed { texts: vec!["hello".into(), "world".into()] },
     budget: None, auth: None,
+    panel: None, consensus: None,
+    allow_fallback: true,
+    credentials: Default::default(),
+    routing: None,
 };
 let resp = gateway.execute(&req).await?;
 let vectors: Vec<Vec<f32>> = resp.embeddings.unwrap_or_default();
