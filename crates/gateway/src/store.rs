@@ -349,20 +349,48 @@ mod tests {
     }
 
     /// An `ExecutionTrace` written before SP-ROUTE-1 has no `routing` key at
-    /// all. Without `#[serde(default)]` that is a hard deserialization error,
-    /// so every historical trace in a store would become unreadable — a silent
-    /// data-loss migration hidden inside an additive-looking field.
+    /// all, and must still read back.
+    ///
+    /// Deserialized from a LITERAL pre-SP-ROUTE-1 payload rather than from a
+    /// `routing: None` struct we serialized ourselves. Round-tripping our own
+    /// output only proves `skip_serializing_if` and `default` agree with each
+    /// other; a hand-written payload is the actual historical input, and it is
+    /// what the test's name promises.
+    ///
+    /// Note what this does NOT prove: `#[serde(default)]` is not what makes it
+    /// pass. Serde routes a missing field through `missing_field`, whose
+    /// `deserialize_option` visits `none`, so an `Option<T>` already defaults
+    /// to `None` — removing the attribute keeps the whole workspace green
+    /// (verified). The attribute is belt-and-braces, and stating a false
+    /// rationale for it would be worse than omitting one: the next reader would
+    /// "discover" that an equivalent field elsewhere is unsafe without it.
     #[test]
     fn a_trace_persisted_without_a_routing_decision_still_deserializes() {
+        let json = r#"{
+            "id": "7ec1f6be-1ba4-4f54-9f0f-18bb7bfd3d7e",
+            "inference_call_id": null,
+            "trace": {
+                "request_id": "legacy",
+                "capability": "text_chat",
+                "status": "success",
+                "duration_ms": 1500,
+                "candidates": [],
+                "skipped": [],
+                "attempts": [],
+                "created_at": "2026-01-01T00:00:00Z"
+            },
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let deserialized: StoredTrace =
+            serde_json::from_str(json).expect("a pre-SP-ROUTE-1 trace must still read back");
+        assert_eq!(deserialized.trace.routing, None);
+        assert_eq!(deserialized.trace.request_id, "legacy");
+
+        // And the write side: `None` is not emitted, so an OLD reader is
+        // equally unaffected by the new field.
         let mut trace = make_trace(Some(Uuid::new_v4()));
         trace.trace.routing = None;
-        let json = serde_json::to_string(&trace).unwrap();
-        assert!(
-            !json.contains("routing"),
-            "`None` must not be written at all, so an old reader is unaffected too"
-        );
-        let deserialized: StoredTrace = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.trace.routing, None);
+        assert!(!serde_json::to_string(&trace).unwrap().contains("routing"));
     }
 
     // 3. CallStatus serde

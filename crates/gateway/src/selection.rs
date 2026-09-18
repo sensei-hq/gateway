@@ -2909,15 +2909,226 @@ mod tests {
         perf: &dyn crate::gates::performance::EndpointPerformanceRead,
         prefs: Option<RoutingPreferences>,
     ) -> SelectionResult {
-        let config = sort_chain();
+        chain_select(&sort_chain(), perf, prefs)
+    }
+
+    /// As [`sort_chain_select`], but over a caller-supplied config — so a test
+    /// can vary the number of ADMITTED candidates, which `sort_chain` fixes at
+    /// three and which `degraded` turns out to depend on.
+    fn chain_select(
+        config: &GatewayConfig,
+        perf: &dyn crate::gates::performance::EndpointPerformanceRead,
+        prefs: Option<RoutingPreferences>,
+    ) -> SelectionResult {
         let cb = test_cb();
         let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
         let lockout = crate::gates::lockout::ModelLockoutStore::new();
         let rng = crate::random::SplitMix64::seeded(1010);
-        ModelSelectionService::new(&config, &cb, &cooldown, &lockout)
+        ModelSelectionService::new(config, &cb, &cooldown, &lockout)
             .with_performance(perf, 3)
             .with_random(&rng)
             .select_all(&sort_criteria(prefs))
+    }
+
+    /// [`sort_chain`] cut down to its single `alpha` entry.
+    ///
+    /// One admitted candidate has exactly one ordering, so no metric sort can
+    /// reorder it and no quantity of samples would change that. That makes it
+    /// the one shape in which "degraded FOR WANT OF SAMPLES" can be a false
+    /// alarm rather than a report.
+    fn single_model_chain() -> GatewayConfig {
+        let mut config = sort_chain();
+        config
+            .chains
+            .get_mut("sort_chain")
+            .expect("fixture chain")
+            .models
+            .retain(|e| e.model == "alpha");
+        config
+    }
+
+    /// The weights follow their ENDPOINT through the `order` re-rank — the one
+    /// claim that justifies keying the report by endpoint rather than by
+    /// position.
+    ///
+    /// `OrderingReport::weights` comes out of the strategy in the strategy's
+    /// order; `all_candidates` is then re-ranked by the `order` preference.
+    /// Every other weight assertion in this file uses a fixture whose three
+    /// candidates sit in three DISTINCT priority groups, so push order and
+    /// output order coincide and the join key is never exercised — a positional
+    /// join passes all of them.
+    ///
+    /// Here the two orders deliberately disagree. `charlie` moves from last to
+    /// first, so a positional join hands it `alpha`'s record: a never-measured
+    /// endpoint would be reported `reliability: Some(0.0)` — the
+    /// measured-and-dead versus never-measured conflation `RoutedCandidate`
+    /// calls load-bearing — and the weight shown for the winning candidate
+    /// would belong to a different provider entirely.
+    #[test]
+    fn the_recorded_weight_follows_its_endpoint_through_the_order_re_rank() {
+        // Only `alpha` is measured, and it failed every verdict.
+        let perf = ChainReadings(&[("north:alpha", 9, 0.0, 0.0)]);
+        let result = sort_chain_select(
+            &perf,
+            Some(RoutingPreferences {
+                order: Some(vec![model_ref("charlie")]),
+                ..Default::default()
+            }),
+        );
+        let decision = result
+            .decision
+            .expect("a chain resolution always records a decision");
+        assert_eq!(
+            decision
+                .order
+                .iter()
+                .map(|c| c.endpoint.clone())
+                .collect::<Vec<_>>(),
+            vec!["north:charlie", "north:alpha", "south:bravo"],
+            "fixture premise: the re-rank moves `charlie` from last to first, so \
+             a POSITION is not a stable join key for the weights"
+        );
+        let of = |endpoint: &str| {
+            decision
+                .order
+                .iter()
+                .find(|c| c.endpoint == endpoint)
+                .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+        };
+
+        assert_eq!(
+            of("north:charlie").reliability,
+            None,
+            "`charlie` was never measured. A positional join would hand it \
+             `alpha`'s reading and report `Some(0.0)` — a healthy endpoint \
+             described as one that has failed everything"
+        );
+        assert_eq!(
+            of("north:charlie").weight,
+            Some(0.25),
+            "`1/2² × 1.0` — charlie's OWN price, not the leading slot's"
+        );
+        assert_eq!(of("north:alpha").reliability, Some(0.0));
+        assert_eq!(
+            of("north:alpha").weight,
+            Some(0.0),
+            "and `alpha`'s own record travels with `alpha` to its new slot"
+        );
+        assert_eq!(of("south:bravo").reliability, None);
+        assert_eq!(of("south:bravo").weight, Some(1.0));
+    }
+
+    /// Every path that does NOT run a strategy records `None`, and that is a
+    /// claim worth pinning rather than an absence.
+    ///
+    /// The tempting later edit is to fill these in "for uniformity" with an
+    /// empty `RoutingDecision`. That would be strictly worse than the absence
+    /// it replaced: `{"strategy": "", "degraded": false, "order": []}` asserts
+    /// that a strategy ran and ordered nothing, on the four paths where nothing
+    /// ran at all. A reader cannot tell it from a chain whose every candidate
+    /// was gated out.
+    #[test]
+    fn the_paths_that_order_nothing_record_no_decision() {
+        let config = test_config();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout);
+        let select = |model: Option<&str>, router: Option<&str>, chain: Option<&str>, cap| {
+            svc.select(&SelectionCriteria {
+                capability: cap,
+                model: model.map(str::to_string),
+                router: router.map(str::to_string),
+                chain: chain.map(str::to_string),
+                budget: None,
+                input_tokens: None,
+                input_tokens_pessimistic: None,
+                preferences: None,
+            })
+        };
+
+        // Tier 1, admitted. The candidate is named outright, so nothing chose
+        // between alternatives.
+        let direct = select(
+            Some("gemma3:27b"),
+            Some("ollama"),
+            None,
+            Capability::TextChat,
+        );
+        assert!(
+            direct.selected.is_some(),
+            "fixture premise: the direct path resolved a candidate, so this is \
+             not `None` merely because the request failed"
+        );
+        assert_eq!(
+            direct.decision, None,
+            "no strategy ordered anything — an empty decision would claim one ran"
+        );
+
+        // Tier 1, rejected.
+        let direct_missing = select(Some("ghost"), Some("ollama"), None, Capability::TextChat);
+        assert!(direct_missing.selected.is_none());
+        assert_eq!(direct_missing.decision, None);
+
+        // Tier 2, chain not found.
+        let no_chain = select(None, None, Some("ghost_chain"), Capability::TextChat);
+        assert_eq!(no_chain.decision, None);
+
+        // Tier 3, no chain serves the capability.
+        let no_capability = select(None, None, None, Capability::AudioTranscribe);
+        assert!(no_capability.all_candidates.is_empty());
+        assert_eq!(no_capability.decision, None);
+    }
+
+    /// A one-candidate chain is never `degraded`, and that is not a corner
+    /// case — it is the shape where the flag is a FALSE ALARM.
+    ///
+    /// `degraded` claims a metric sort found too few samples to reorder
+    /// anything. With one admitted candidate there is exactly one ordering: no
+    /// quantity of samples would have produced a different answer, so nothing
+    /// was lost for want of them. A `subset.len() < 2` test alone is a
+    /// tautology here — it fires even for a candidate measured far past
+    /// `min_samples` — and it would send an operator hunting for missing
+    /// observations that were never the cause.
+    ///
+    /// Both halves asserted, because the flag must be false for a reason that
+    /// is about the CHAIN's size rather than about the reading: `alpha` is
+    /// measured at 9 samples in the first case and entirely unmeasured in the
+    /// second, and neither is degraded.
+    #[test]
+    fn a_single_candidate_chain_is_never_degraded_for_want_of_samples() {
+        use crate::types::request::SortKey;
+        let config = single_model_chain();
+        let degraded = |perf: &dyn crate::gates::performance::EndpointPerformanceRead| {
+            let result = chain_select(
+                &config,
+                perf,
+                Some(RoutingPreferences {
+                    sort: Some(SortKey::Latency),
+                    ..Default::default()
+                }),
+            );
+            assert_eq!(
+                result.all_candidates.len(),
+                1,
+                "fixture premise: exactly one candidate is admitted"
+            );
+            result
+                .decision
+                .expect("a chain resolution always records a decision")
+                .degraded
+        };
+
+        assert!(
+            !degraded(&SortChainStats),
+            "`alpha` is measured at 9 samples — three times `min_samples` — so \
+             reporting a shortage of samples is simply false"
+        );
+        assert!(
+            !degraded(&crate::gates::performance::NoPerformance),
+            "and unmeasured is no different: a second observation could not have \
+             reordered a list of one, so nothing degraded for want of it"
+        );
     }
 
     /// AC10 — the recorded strategy is the one that actually RAN.

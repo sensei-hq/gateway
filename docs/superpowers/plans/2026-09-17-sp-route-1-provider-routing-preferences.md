@@ -2627,8 +2627,14 @@ In `crates/gateway/src/engine/execute.rs`, attach `result.decision` to the `Exec
 >   `ExecutionTrace` gained `routing: Option<RoutingDecision>` — AC10's literal wording, and no
 >   more dead than the rest of that struct, every field of which is equally unfilled in
 >   production. It is pinned by two `store.rs` tests (a whole-value persistence round-trip, and a
->   pre-SP-ROUTE-1 payload with no `routing` key, which would be a hard deserialization error
->   without `#[serde(default)]`).
+>   literal pre-SP-ROUTE-1 payload with no `routing` key, which must still read back).
+>
+>   **Correction (review):** an earlier draft of this line claimed a missing `routing` key
+>   "would be a hard deserialization error without `#[serde(default)]`". That is FALSE. Serde
+>   routes a missing field through `missing_field`, whose `deserialize_option` visits `none`, so
+>   an `Option<T>` field already defaults to `None`; removing the attribute keeps the whole
+>   workspace green (verified by mutation). The attribute is belt-and-braces. Do not carry the
+>   original claim into Task 12's docs.
 > - The REACHABLE attachment is `InferenceResponse::routing`, set in `execute.rs` on the success
 >   return. That is the one artefact a caller asking "why did it pick the expensive one" actually
 >   holds. Pinned by `engine::tests::the_routing_decision_reaches_the_inference_response`, which

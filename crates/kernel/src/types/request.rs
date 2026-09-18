@@ -546,6 +546,9 @@ pub struct InferenceResponse {
     /// production today; the response is the one artefact a caller reporting
     /// "why did it pick the expensive one" actually has in hand.
     ///
+    /// `default` is belt-and-braces — serde already resolves a missing
+    /// `Option<T>` field to `None`.
+    ///
     /// [`ExecutionTrace`]: super::trace::ExecutionTrace
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingDecision>,
@@ -845,6 +848,67 @@ mod tests {
         assert!(deserialized.success);
         assert_eq!(deserialized.content, Some("Hello!".to_string()));
         assert!(deserialized.attempts.is_empty());
+    }
+
+    /// A POPULATED routing decision survives the response's serde round-trip.
+    ///
+    /// Every other response test here sets `routing: None`, which exercises
+    /// only the `skip_serializing_if` path — so the nested `Option<f64>`s that
+    /// carry the whole explanation were never serialized at all. `reliability`
+    /// is the field that matters: `Some(0.0)` coming back as `None` (or the
+    /// reverse) inverts the measured-and-dead versus never-measured
+    /// distinction, and both directions are present below on purpose.
+    #[test]
+    fn response_round_trips_a_populated_routing_decision() {
+        use super::super::trace::RoutedCandidate;
+        let decision = RoutingDecision {
+            strategy: "grouped_weighted".to_string(),
+            degraded: false,
+            order: vec![
+                RoutedCandidate {
+                    endpoint: "anthropic:claude-haiku".to_string(),
+                    priority: 1,
+                    cost: Some(0.5),
+                    reliability: Some(0.0),
+                    weight: Some(0.0),
+                },
+                RoutedCandidate {
+                    endpoint: "ollama:gemma3:27b".to_string(),
+                    priority: 2,
+                    cost: None,
+                    reliability: None,
+                    weight: None,
+                },
+            ],
+        };
+        let response = InferenceResponse {
+            success: true,
+            content: Some("Hello!".to_string()),
+            embeddings: None,
+            transcription: None,
+            audio: None,
+            images: None,
+            videos: None,
+            model: None,
+            usage: None,
+            tool_calls: Vec::new(),
+            estimated_cost: None,
+            actual_cost: None,
+            attempts: vec![],
+            routing: Some(decision.clone()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: InferenceResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.routing,
+            Some(decision),
+            "a whole-value comparison: a per-field check would let the two \
+             `Option<f64>`s collapse into each other unnoticed"
+        );
+        // The endpoint carrying a colon in its MODEL name is not an accident —
+        // `"{router}:{model}"` is not uniquely splittable, so nothing may try.
+        assert!(json.contains("ollama:gemma3:27b"));
     }
 
     #[test]
