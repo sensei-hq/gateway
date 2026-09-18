@@ -100,8 +100,43 @@ impl FacadeBuilder {
             tracing::warn!(router = %router, error = %err, "cloud adapter not registered (skipped)");
         }
 
+        // A model whose price cannot be COMPARED is not safely routable, so drop
+        // it. This is the production path — `Gateway::new` below is unchecked by
+        // documented design, and `collect_validation_errors` guards only the
+        // checked entry points — so without this a programmatically-assembled
+        // `GatewayConfig` carrying a negative or non-finite price reaches routing
+        // untouched. (A config FILE cannot: `ModelPricing`'s deserializer already
+        // refuses one.)
+        //
+        // DROP rather than null its pricing. The tempting repair is
+        // `model.pricing = None` — carry on without the bad price — and that is
+        // the hazard, not the fix: `None` means FREE, `PriceStrategy`'s
+        // `price_key` maps it to `0.0`, and free sorts FIRST, so "cleaning" a
+        // broken price hands it the cheapest slot. It is the same reasoning
+        // SP-ROUTE-1 used when it mapped a non-finite `PriceStrategy` key to
+        // `+inf` rather than to zero. A chain still referencing a dropped model
+        // reports `SkipReason::ModelNotFound`, which is `Structural` and surfaces
+        // in the selection diagnostics — traceable, and it cannot silently win
+        // anything.
+        //
+        // Matches the stance the facade already takes for a cloud router that
+        // fails to build: logged at `warn`, skipped, construction still succeeds.
+        // `build`'s signature is unchanged; it may simply build with fewer models.
+        // Pinned by `pricing_tests::a_dropped_model_never_outranks_a_priced_one`.
+        let mut config = self.config;
+        config.models.retain(
+            |id, model| match model.pricing.as_ref().map(|p| p.validate()) {
+                Some(Err(reason)) => {
+                    tracing::warn!(model = %id, error = %reason,
+                        "model dropped: its pricing cannot be compared");
+                    false
+                }
+                _ => true,
+            },
+        );
+
         let breaker = CircuitBreakerManager::new(self.breaker);
-        let gateway = Gateway::new(self.config, self.registry.clone(), breaker);
+        let gateway = Gateway::new(config, self.registry.clone(), breaker);
 
         #[cfg(feature = "local")]
         {
@@ -420,5 +455,216 @@ mod cloud_tests {
             .build()
             .await;
         assert!(!facade.gateway.is_configured().await);
+    }
+}
+
+/// SP-ROUTE-1.1 Task 4 — the production path drops a model whose price cannot be
+/// compared, and must NOT make it free.
+///
+/// Deliberately a plain `#[cfg(test)]` module rather than joining the
+/// `#[cfg(all(test, feature = "local"))]` one above: that module is not compiled
+/// by a default `cargo test`, so tests placed there would never run and would
+/// guard nothing. This module compiles under every feature combination.
+#[cfg(test)]
+mod pricing_tests {
+    use super::*;
+    use crate::types::capability::Capability;
+    use crate::types::config::{
+        ChainEntry, FallbackChainConfig, ModelConfig, ModelPricing, RouterConfig,
+    };
+    use crate::types::error::GatewayError;
+    use crate::types::request::{
+        InferenceRequest, Message, MessageRole, Payload, RoutingPreferences, SortKey,
+    };
+    use std::collections::HashMap;
+
+    /// A router whose id matches no well-known cloud provider, so
+    /// `register_cloud_from_config` registers no adapter for it under the default
+    /// `cloud` feature. Every candidate therefore fails with "no adapter
+    /// registered" — which still records an `Attempt`, in the order the strategy
+    /// produced.
+    fn bench_router() -> RouterConfig {
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn model(id: &str, pricing: Option<ModelPricing>) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            api_model_id: None,
+            provider: "bench".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing,
+            catalog: None,
+        }
+    }
+
+    /// `good` is genuinely priced (`0.5`/1k output over a 1024-token ceiling ⇒ an
+    /// estimate of ~0.512); `bad` carries a NEGATIVE price, which no config file
+    /// can express since SP-ROUTE-1.1 Task 2 but a programmatic `GatewayConfig`
+    /// still can — the exact input `Facade::build` is the last line against.
+    ///
+    /// The chain authors `good` FIRST (priority 1). That is deliberate: it means
+    /// a passing AC5 cannot be explained by chain order alone — anything that
+    /// puts `bad` in front had to be the price sort actively promoting it.
+    fn config_with_a_bad_price() -> GatewayConfig {
+        let models = HashMap::from([
+            (
+                "good".to_string(),
+                model(
+                    "good",
+                    Some(ModelPricing {
+                        input_per_1k: 0.5,
+                        output_per_1k: 0.5,
+                        per_request: None,
+                    }),
+                ),
+            ),
+            (
+                "bad".to_string(),
+                model(
+                    "bad",
+                    Some(ModelPricing {
+                        input_per_1k: -1.0,
+                        output_per_1k: -1.0,
+                        per_request: None,
+                    }),
+                ),
+            ),
+        ]);
+        let chains = HashMap::from([(
+            "chat".to_string(),
+            FallbackChainConfig {
+                id: "chat".to_string(),
+                capability: Capability::TextChat,
+                models: vec![
+                    ChainEntry {
+                        model: "good".to_string(),
+                        router: Some("bench".to_string()),
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                    ChainEntry {
+                        model: "bad".to_string(),
+                        router: Some("bench".to_string()),
+                        api_model_id: None,
+                        priority: 2,
+                    },
+                ],
+                fallback_triggers: vec![],
+            },
+        )]);
+        GatewayConfig {
+            routers: HashMap::from([("bench".to_string(), bench_router())]),
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        }
+    }
+
+    fn price_sorted_chat_request() -> InferenceRequest {
+        InferenceRequest {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("chat".to_string()),
+            payload: Payload::Chat {
+                messages: vec![Message::text(MessageRole::User, "hi")],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                tools: Vec::new(),
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+            routing: Some(RoutingPreferences {
+                sort: Some(SortKey::Price),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// AC4 — a programmatically-constructed bad price does not reach routing.
+    ///
+    /// The facade drops the model and still builds, matching how it already logs
+    /// and skips a cloud router that fails to construct. Its signature is
+    /// unchanged: `build` still returns `Facade`, not `Result`.
+    #[tokio::test]
+    async fn the_facade_drops_a_model_whose_pricing_cannot_be_compared() {
+        let facade = FacadeBuilder::new(config_with_a_bad_price()).build().await;
+
+        let models = facade
+            .gateway
+            .list_models()
+            .await
+            .expect("the facade must still build and serve");
+        let ids: Vec<String> = models
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(
+            !ids.contains(&"bad".to_string()),
+            "the unusable model must be dropped: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"good".to_string()),
+            "and the rest must survive: {ids:?}"
+        );
+    }
+
+    /// AC5 — the SHARP one. A dropped model must not come back as FREE.
+    ///
+    /// `pricing: None` means free, `price_key` maps it to `0.0`, and free sorts
+    /// FIRST — so "repairing" a bad price by nulling it would hand it the
+    /// cheapest slot. That is the exact hazard SP-ROUTE-1 avoided when it chose
+    /// `+inf` over `0.0` for a non-finite `PriceStrategy` key.
+    ///
+    /// The observable is the walk order the engine actually attempted, read off
+    /// `AllAttemptsFailed::attempts_detail` (no adapter is registered for the
+    /// `bench` router, so every candidate is attempted and recorded in strategy
+    /// order). Three outcomes are distinguishable:
+    ///
+    /// - drop (correct): `bad` is not a model at all, the chain entry skips as
+    ///   `ModelNotFound`, and the order is `["good"]`;
+    /// - `pricing = None` (the tempting repair): `bad` is free, sorts ahead of
+    ///   `good`'s 0.512, order is `["bad", "good"]`;
+    /// - no handling at all: `bad`'s negative estimate also sorts first, order is
+    ///   `["bad", "good"]`.
+    ///
+    /// Every other test in this slice fails when the feature is ABSENT. This one
+    /// fails when the feature is implemented the WRONG way, which is why it
+    /// exists.
+    #[tokio::test]
+    async fn a_dropped_model_never_outranks_a_priced_one() {
+        let facade = FacadeBuilder::new(config_with_a_bad_price()).build().await;
+
+        let order: Vec<String> = match facade.gateway.execute(&price_sorted_chat_request()).await {
+            Err(GatewayError::AllAttemptsFailed {
+                attempts_detail, ..
+            }) => attempts_detail.iter().map(|a| a.model.clone()).collect(),
+            other => panic!("expected AllAttemptsFailed carrying the walk order, got: {other:?}"),
+        };
+
+        assert_eq!(
+            order,
+            vec!["good".to_string()],
+            "the dropped model must be absent, not free-and-first"
+        );
     }
 }
