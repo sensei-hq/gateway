@@ -84,8 +84,10 @@ Triggers: `RateLimit`, `Timeout`, `ProviderError`, `ModelUnavailable`, `BudgetEx
 ```rust
 use gateway::resilience::ResilienceConfig;
 
-let gateway = Gateway::new(config, adapters, cb)
-    .with_resilience(ResilienceConfig { min_samples: 5, ..Default::default() });
+let mut resilience = ResilienceConfig::default();
+resilience.min_samples = 5;
+
+let gateway = Gateway::new(config, adapters, cb).with_resilience(resilience);
 ```
 
 `min_samples` (default `3`) is how many live observations an endpoint needs
@@ -93,12 +95,25 @@ before `sort: latency` / `sort: throughput` trusts its mean, and before the
 default strategy trusts its success rate. Below it the candidate counts as
 unmeasured: it holds its position, and weighs as healthy.
 
-**Do not set it to `0`.** The comparisons are `>=`, so at zero an endpoint with
-*no* observations reports `mean_latency_ms == 0.0` and wins every latency race it
-has never run — and `success_rate == 0.0` becomes a trusted reliability of zero,
-so a cold process routes as though every provider were dead.
+**`ResilienceConfig` is `#[non_exhaustive]`, which forbids *every* struct
+expression outside the gateway crate — functional-update syntax included.**
+`ResilienceConfig { min_samples: 5, ..Default::default() }` does not compile for
+you: it is `error[E0639]: cannot create non-exhaustive struct using struct
+expression`. Call `default()` and assign, as above. The same applies to
+`perf_samples` and `perf_window`, its two neighbouring knobs (retention capacity
+and retention age — changing either rebuilds the performance store and discards
+the samples in it, while `min_samples` is read per request).
 
-`ResilienceConfig` is `#[non_exhaustive]`: build it from `..Default::default()`.
+**Do not set `min_samples` to `0`.** Not because a cold process breaks — it does
+not: an endpoint with no live samples reads as `None` and is unmeasured at every
+threshold, zero included. The real hazard is an endpoint carrying live samples
+of one *kind* while the counter being read sits at zero next to a mean of `0.0`,
+which at zero is trusted as a measurement. A failed non-streaming attempt
+contributes a verdict and no latency (`samples: 0`, `mean_latency_ms: 0.0`), so
+under `sort: latency` it would lead a race it never ran; an obtained-but-unfinished
+stream contributes latency and no verdict (`verdict_samples: 0`,
+`success_rate: 0.0`), so under the default it would be weighed at zero and go
+last. Any value `>= 1` makes both unreachable.
 
 ## Build + validate
 

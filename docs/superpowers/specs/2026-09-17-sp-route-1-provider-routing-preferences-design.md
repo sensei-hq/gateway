@@ -121,7 +121,15 @@ way to actually restrict.
 
 ### 4.2 Precedence
 
-Filtering happens first, then ordering: `{only, ignore}` → `order` → `sort` → default weighting.
+Filtering happens first, then ordering: `{only, ignore}` → `sort` (or the default weighting) →
+`order`.
+
+**The arrow reads strategy-then-`order`, and an earlier draft had it backwards.** A strategy —
+`sort`'s, or `GroupedWeightedStrategy` when no `sort` is given — orders the admitted candidates,
+and the `order` re-rank is layered on top of whatever it produced. The prose beneath this line
+already described that outcome ("`order` wins for the candidates it names, and `sort` … orders the
+unnamed tail"); only the arrow disagreed, and every other surface — §5.0, `selection.rs`,
+`docs/features/routing/provider-preferences.md` §2 — had it right.
 
 **`only` and `ignore` do NOT have a precedence relative to each other, and an earlier draft of
 this section was wrong to imply one.** Both are pure predicates over a single candidate, so
@@ -188,10 +196,20 @@ uptime-awareness half (§6.3).
 
 **"Unmeasured" has to be detected, not inferred from the rate.** `success_rate` reads `0.0` both
 when every attempt failed and when no attempt has cast a verdict yet, so `EndpointStats` carries
-`verdict_samples` and reliability is read only when it is non-zero. Skipping that check is not a
-cosmetic slip: an endpoint with no verdict would weigh `0.0`, land in the never-drawn bucket, and
-on a cold process that is *every* candidate — a perfectly healthy fleet routing as though every
-provider were dead. The same applies to `throughput_samples` for §5.3's throughput sort.
+`verdict_samples`. Skipping that check is not a cosmetic slip: an endpoint with live samples but no
+verdict would weigh `0.0` and land in the never-drawn bucket — a perfectly healthy endpoint buried
+for not having finished a request. The same applies to `throughput_samples` for §5.3's throughput
+sort.
+
+**The gate is `verdict_samples >= ctx.min_samples`, not "non-zero" — this section originally said
+non-zero and the code deliberately does not.** At `> 0`, a SINGLE failed request drives
+`success_rate` to `0.0`, which is weight zero, which is last in the group until the whole window
+rolls — one unlucky attempt banishing a healthy endpoint. So reliability uses the same threshold
+§5.3's metric sorts do, applied to its own counter; below it a candidate weighs `1.0`, which is the
+"unmeasured is healthy" rule applied consistently rather than only at exactly zero samples. Both
+sides of the boundary are pinned
+(`a_candidate_below_the_verdict_threshold_is_not_yet_judged`,
+`a_candidate_at_the_verdict_threshold_is_judged`).
 
 **Why free-first rather than an infinite weight.** There is no finite multiple of "more likely"
 that expresses "costs nothing"; the limit of `1/c²` as `c → 0` *is* "always first". Folding the
@@ -207,17 +225,19 @@ random — that is the feature.
 This section originally said "every catalog-assembled chain … by construction", full stop. The
 Task 7 review found two exceptions, and both are real:
 
-1. **Chains longer than 254 entries.** That reassignment is `u8::try_from(pos + 1).unwrap_or(u8::MAX)`,
+1. **Chains longer than 255 entries.** That reassignment is `u8::try_from(pos + 1).unwrap_or(u8::MAX)`,
    which **saturates**. Measured on a 300-entry chain: 255 distinct priorities with 46 entries all
    at 255 — a genuine tie group that this slice now randomises where `PriorityStrategy` kept chain
-   order. Reachable through a `derive` tier predicate over a large catalog.
+   order. Reachable through a `derive` tier predicate over a large catalog. The boundary is 255,
+   not the 254 an earlier draft gave: a 255-entry chain maps to `1..=255`, all distinct, and the
+   first tie appears at 256. (`catalog/assemble.rs` says ">255-entry chain" and was right.)
 2. **Hand-authored chains.** `GatewayBuilder::add_chain` and `GatewayConfig`'s `Deserialize` both
    pass `ChainEntry.priority` through verbatim, and `collect_validation_errors` has no priority
    rule at all. Nothing prevents an operator from authoring a tie — deliberately or otherwise.
 
 So the honest claim is: **byte-identical for every chain whose admitted candidates have distinct
 priorities**, which covers every chain in this repo today and every `assemble()` output of length
-≤ 254. Anything else is opting into load balancing, which is the intended way to opt in — it is
+≤ 255. Anything else is opting into load balancing, which is the intended way to opt in — it is
 just not the *only* way to reach it.
 
 ### 5.2 `sort: price`
@@ -236,10 +256,19 @@ knows about**:
 2. Sort that subset by the metric (latency ascending, throughput descending).
 3. Write it back into those same indices. Unmeasured candidates never move.
 
-`MIN_SAMPLES = 3`, a `ResilienceConfig`-style tunable rather than a bare literal. Three is the
-smallest count at which a mean is not simply the last observation, and the cost of getting it
-wrong is bounded in both directions: too low and the sort reacts to noise, too high and it
-degrades to priority order — which is the documented fallback anyway.
+`MIN_SAMPLES = 3`, a `ResilienceConfig`-style tunable rather than a bare literal (it shipped as
+`ResilienceConfig::min_samples`). Three is the smallest count at which a mean is not simply the
+last observation, and the cost of getting it wrong is bounded in both directions: too low and the
+sort reacts to noise, too high and it degrades to priority order — which is the documented
+fallback anyway.
+
+**Setting it to `0` is a hazard, but not the one several surfaces claimed.** A never-observed
+endpoint is unmeasured at every threshold: `stats()` returns `None` before any `>=` runs (§6.2), so
+a cold process at `0` routes normally. What `0` reaches is an endpoint holding live samples of one
+kind while the counter being read sits at `0` beside a mean of `0.0` — a failed `Complete`
+(`samples: 0`, `mean_latency_ms: 0.0`) leading a latency race it never ran, or a `StreamAcquired`
+with no completion yet (`verdict_samples: 0`, `success_rate: 0.0`) weighed at zero and sent last.
+Any value `>= 1` makes both unreachable.
 
 Three properties, no magic constants: zero observations ⇒ pure priority order (matching the
 existing `IntraTierStrategy::is_dynamic` convention of degrading to `Priority`); full observations
@@ -247,14 +276,47 @@ existing `IntraTierStrategy::is_dynamic` convention of degrading to `Priority`);
 
 ### 5.4 The trait
 
+*As shipped* — the block below is kept in step with `crates/gateway/src/strategy.rs`; the draft it
+replaces had `order` taking no `ctx`, returning nothing, and no `name()`:
+
 ```rust
 pub trait RoutingStrategy: Send + Sync {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>);
+    /// Order `admitted` in place, and report what was used to do it.
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> OrderingReport;
+
+    /// A stable identifier for the strategy that ACTUALLY ran, for the trace.
+    /// Deliberately not defaulted (§9).
+    fn name(&self) -> &'static str;
 }
 
 pub struct StrategyCtx<'a> {
     pub perf: &'a dyn EndpointPerformanceRead,
     pub rng:  &'a dyn RandomSource,
+    /// Compared against the counter belonging to the metric being read —
+    /// `verdict_samples` for `success_rate`, `samples` for latency,
+    /// `throughput_samples` for throughput. The three are independent.
+    pub min_samples: u32,
+}
+
+/// What one `order` call did beyond permuting — the input to `RoutingDecision` (§9).
+/// RETURNED rather than read back off the strategy afterwards, because `ctx.perf` is a
+/// live window: a second derivation at the trace site could describe an ordering that
+/// never happened.
+#[derive(Debug, Default, PartialEq)]
+pub struct OrderingReport {
+    /// A metric sort had ≥ 2 candidates to order but < 2 MEASURED ones.
+    pub degraded: bool,
+    /// One entry per candidate the strategy WEIGHED; empty for every strategy but the default.
+    pub weights: Vec<CandidateWeight>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateWeight {
+    pub endpoint: String,
+    /// `None` ⇒ fewer than `min_samples` verdicts. Emphatically not `Some(0.0)`.
+    pub reliability: Option<f64>,
+    /// `None` ⇒ never entered the draw (the free bucket). `Some(0.0)` is a real zero.
+    pub weight: Option<f64>,
 }
 
 /// Interior mutability + `&self`, matching `CircuitBreakerManager`'s `Mutex` style,
@@ -279,18 +341,47 @@ reducer fed after every attempt (`gates/mod.rs:79`), paired with synchronous in-
 
 ### 6.2 The port
 
+*As shipped.* The draft this replaces carried a single `samples` counter and a non-`Option`
+`Sample`; §6.3 explains why both had to split.
+
 ```rust
 pub trait EndpointPerformanceRead: Send + Sync {
     fn stats(&self, endpoint: &str) -> Option<EndpointStats>;
 }
 
 pub struct EndpointStats {
+    /// Live samples carrying a LATENCY observation.
     pub samples: u32,
+    /// Live samples carrying token counts. Counted separately so a throughput
+    /// sort cannot mistake a latency-only history for a measured one.
+    pub throughput_samples: u32,
     pub mean_latency_ms: f64,
     pub mean_tokens_per_sec: f64,
+    /// Live samples carrying a VERDICT. Neither a superset nor a subset of
+    /// `samples`; without it, `success_rate: 0.0` cannot be told apart from
+    /// "never judged".
+    pub verdict_samples: u32,
     pub success_rate: f64,
 }
+
+/// One observation. A single streaming attempt writes TWO of these, so
+/// `latency_ms` and `success` are independent Options and exactly one sample
+/// per attempt carries the verdict.
+pub(crate) struct Sample {
+    pub at: Instant,
+    /// `None` for `StreamCompleted` (its duration feeds throughput) and for a
+    /// FAILED `Complete` (how fast a provider rejects you is not latency).
+    pub latency_ms: Option<u64>,
+    pub tokens_per_sec: Option<f64>,
+    /// `None` for `StreamAcquired` — a latency observation, not a verdict.
+    pub success: Option<bool>,
+}
 ```
+
+**`stats()` returns `None` when the ring is absent or every sample has aged out**, and `None` is
+the unmeasured path at every threshold. That is the reason a `min_samples` of `0` does *not* break
+a cold process — a claim several surfaces got wrong; see §5.3 and
+`ResilienceConfig::min_samples`.
 
 `PerformanceRecorder` implements the existing `HealthRecorder` and returns `None` from
 `on_outcome` (it never gates, so it never writes a deadline). Storage is a bounded ring per
@@ -308,13 +399,19 @@ following `ConfigSource`/`SchedulerStore`.
 where* `dispatch_outcome` already fires (`engine/stream.rs:230`). Same quantity, so latency needs
 no new dispatch point, only an elapsed value passed into the existing call.
 
-**Throughput** = output tokens ÷ generation time, which exists only at completion. On the
-streaming path the duration (`stream.rs:289`) and usage (`stream.rs:263`) are computed at stream
-end and today go only into the `InferenceCall` store record. This needs a **second, end-of-stream
+**Throughput** = output tokens ÷ **total attempt wall time**, which is only knowable at
+completion. On the streaming path the duration and usage are computed at stream end and, before
+this slice, went only into the `InferenceCall` store record. This needs a **second, end-of-stream
 dispatch**.
 
-The streaming `duration_ms` starts *after* the stream is obtained, so it is not the same quantity
-as the non-streaming one. They must never be pooled into a single mean.
+*(This originally read "÷ generation time", and the whole-slice review corrected the
+implementation to the total span. Generation time alone starts after the stream is obtained, so it
+is not the same quantity as the non-streaming path's, and pooling the two made an identical real
+rate read higher purely because it was served streaming — an endpoint faster END TO END could lose
+to a slower one. Output tokens ÷ total attempt wall time is one well-defined quantity on both
+paths, and it includes queueing, which is what a caller choosing a provider actually pays. The
+alternative — making `Complete` contribute no throughput, mirroring the latency rule — was
+rejected: it leaves `sort: throughput` measuring nothing for a non-streaming fleet.)*
 
 **How that is actually enforced — and an error this spec made.** The sentence above originally
 read "They are never pooled", stated as though the design already had the property. It did not.
@@ -327,9 +424,24 @@ the health recorders (breaker, cooldown, lockout) ignore it and still see `succe
 
 | phase | `duration_ms` is | contributes latency | contributes a verdict | contributes throughput |
 |---|---|---|---|---|
-| `Complete` | time-to-response | yes | yes | if tokens present |
+| `Complete` | time-to-response for the whole attempt | **only when the attempt SUCCEEDED** | yes | if tokens present |
 | `StreamAcquired` | time-to-first-response | yes | **no** | no |
-| `StreamCompleted` | generation time | **no** | yes | if tokens present |
+| `StreamCompleted` | **total attempt wall time** (spans acquisition *and* generation) | **no** | yes | if tokens present |
+
+Two cells changed in the whole-slice review, and both were wrong in the original:
+
+- **A FAILED `Complete` contributes no latency.** `MetricStrategy` reads `mean_latency_ms` with no
+  reliability filter of its own — unlike §5.1's default, which multiplies by `reliability`
+  precisely to avoid this — so a rejection recorded as a latency sample made `sort: latency` prefer
+  the endpoint that fails FASTEST: a provider rejecting every request in 5 ms outranking one
+  answering every request in 500 ms. The breaker does not rescue it either, since `record_success`
+  resets the consecutive-failure count and an intermittently-failing endpoint never reaches the
+  threshold. The verdict is still cast, so reliability stays correct.
+- **`StreamCompleted`'s duration is the total span, not generation time**, so the two paths report
+  one comparable throughput quantity (above). The single exception is the MID-STREAM FAILURE
+  dispatch, which still reports generation time — it passes `output_tokens: None`, so its duration
+  reaches no mean at all, and nothing may start deriving a rate from it without first making it
+  the total span too.
 
 `Sample.latency_ms` and `Sample.success` are therefore both `Option`. Two properties fall out, and
 both matter downstream:
@@ -419,7 +531,11 @@ carries a `RoutingDecision`:
 - for the weighted default, the weight each candidate received and its `cost` / `reliability` inputs.
 
 `reliability` is `Option<f64>`: `None` when unmeasured, which is **not** the same as `Some(0.0)`.
-Flattening them is how a healthy fleet gets routed as though every provider were dead.
+Flattening them is how a healthy fleet gets REPORTED as though every provider were dead. (Reported,
+not routed — the selection itself weighs an unmeasured candidate `1.0`; it is the trace that would
+lie.) `None` also covers "the strategy that ran does not consult reliability at all", which is
+every strategy but the default — so under `sort: price` the whole fleet reports `null`, and a
+reader must check `strategy` before drawing any conclusion from that.
 
 **Where it is carried, and a correction.** This section originally said "`ExecutionTrace` stores"
 it. That was wrong, and Task 11 found it: **nothing in this workspace builds an `ExecutionTrace` in
@@ -488,6 +604,6 @@ Red-first per task. The tests that actually pin the design:
 | Risk | Mitigation |
 |---|---|
 | A nondeterministic default surprises someone | AC1 proves it is inert on every chain that exists; §8 documents the tied-chain consequence |
-| Reliability weighting on a thin sample swings routing | `reliability` is `1.0` when unmeasured; `MIN_SAMPLES` gates the metric sorts; §9 makes the inputs visible |
+| Reliability weighting on a thin sample swings routing | `reliability` is `1.0` when unmeasured; `min_samples` gates reliability **and** the metric sorts — each against its own counter, and reliability's is `verdict_samples >= min_samples`, not `> 0` (§5.1); §9 makes the inputs visible |
 | The §7 breaker change trips breakers that used not to trip | Own acceptance criterion (AC9), reviewed on its merits |
 | `IntraTierStrategy::Weighted` looks like the obvious follow-on | Deliberately not in this slice; D1 keeps the request and config axes separate until the request one is proven |

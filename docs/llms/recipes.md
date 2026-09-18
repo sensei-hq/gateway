@@ -63,10 +63,24 @@ Filtering runs first, then ordering: `only`/`ignore` → `sort` (or the default)
   placed first shadows every ref after it. A **router-only** ref lifts every
   model on that router above every other priority tier — correct, but it is the
   cross-tier reordering the default strategy will not do on its own.
+- **They filter *within* the chain that was already resolved.** A capability
+  request (no `chain`) picks one chain by **lowest chain id** before any
+  filtering runs, so `only` cannot make it go looking in a different chain — it
+  narrows the chosen one, and over-narrowing yields `NoCandidates`. Pin the
+  chain by name to combine "this chain" with "these providers".
+- **A direct `router` + `model` request is filtered too.** The gate vector runs
+  on every resolution path, so an `ignore` naming that pair excludes the one
+  candidate and the call fails with `NoCandidates`.
 
 `response.routing` explains what happened: the strategy that ran, the resulting
 order, and (for the weighted default) each candidate's cost, reliability and draw
-weight. It is `None` for a direct router+model request, which orders nothing.
+weight. Two readings to get right:
+
+- It is `None` for a direct router+model request, which orders nothing. That
+  is **not** "preferences were ignored" — they still filtered it (above).
+- `reliability` and `weight` are `null` for every candidate under `sort: price`,
+  `sort: latency` and `sort: throughput`, because only the weighted default
+  consults them. Read `strategy` before concluding anything about fleet health.
 
 > `execute_stream` applies the same preferences but returns `StreamEvent`s rather
 > than an `InferenceResponse`, so a streamed call has **no** routing explanation.

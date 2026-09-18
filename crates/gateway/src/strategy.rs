@@ -289,8 +289,17 @@ fn order_group(
         // `success_rate` reads 0.0 BOTH when every attempt failed and when no
         // attempt has cast a verdict yet. `verdict_samples` is the only way to
         // tell those apart, and the difference is not cosmetic: without the
-        // filter a cold process weighs every candidate 0.0 and a healthy fleet
-        // routes as though every provider were dead.
+        // filter, an endpoint carrying live samples but no verdict — a stream
+        // obtained and not yet completed — weighs 0.0 and drops into the
+        // never-drawn bucket, buried for having nothing to report yet.
+        //
+        // Stated narrowly on purpose. An earlier version of this comment said
+        // "a cold process weighs every candidate 0.0", and that is NOT what the
+        // code does: a never-observed endpoint never reaches this filter at all,
+        // because `stats()` returns `None` (no ring, or no live sample) and
+        // `None` is unmeasured on every path. The reachable defect is the
+        // partially-observed endpoint above, which is what
+        // `an_endpoint_with_no_verdict_yet_is_weighted_as_healthy` fixtures.
         //
         // Gated at `ctx.min_samples`, not merely at `> 0`, and against
         // `verdict_samples` specifically — the counter `StrategyCtx::min_samples`
@@ -667,10 +676,13 @@ mod tests {
     ///
     /// Scope, stated precisely: this covers every chain whose admitted
     /// candidates have DISTINCT priorities — every chain in this repo today, and
-    /// every `assemble()` output up to 254 entries. Not "every catalog chain by
+    /// every `assemble()` output up to 255 entries. Not "every catalog chain by
     /// construction": `dedup_and_prioritize` assigns position via
     /// `u8::try_from(pos + 1).unwrap_or(u8::MAX)`, which SATURATES, so a chain
-    /// longer than 254 entries ties at 255 and is genuinely randomised here. A
+    /// longer than 255 entries ties at 255 and is genuinely randomised here.
+    /// The boundary is 255 rather than 254, measured both ways: 255 entries map
+    /// to `1..=255`, which is 255 DISTINCT priorities and no tie, and the first
+    /// tie appears at 256. A
     /// hand-authored chain can tie too — `GatewayBuilder::add_chain` and the
     /// `Deserialize` impl pass `priority` through verbatim and no validation
     /// rule forbids a repeat. A tie is the opt-in to load balancing, so neither

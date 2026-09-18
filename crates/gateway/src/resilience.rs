@@ -2,14 +2,15 @@ use crate::gates::lockout::ModelLockoutPolicy;
 use std::time::Duration;
 
 /// Max entries retained per in-memory health store before EXPIRED entries are
-/// evicted (Task 3). Generous — normal operation (fewer distinct endpoints)
+/// evicted (SP-0 (f) Task 3). Generous — normal operation (fewer distinct endpoints)
 /// never trips it; it only bounds leakage from many short-lived endpoints.
 /// Active/terminal gates are never dropped.
 pub const DEFAULT_EVICTION_CAP: usize = 4096;
 
-/// Samples retained per endpoint in the rolling performance window.
+/// Samples retained per endpoint in the rolling performance window
+/// (SP-ROUTE-1 Task 4).
 pub const DEFAULT_PERF_SAMPLES: usize = 64;
-/// How long a performance sample stays live.
+/// How long a performance sample stays live (SP-ROUTE-1 Task 4).
 pub const DEFAULT_PERF_WINDOW: Duration = Duration::from_secs(300);
 /// Minimum live observations before a metric sort trusts a candidate's mean.
 /// Matches the value `ModelSelectionService::new` installs, so wiring this
@@ -17,15 +18,34 @@ pub const DEFAULT_PERF_WINDOW: Duration = Duration::from_secs(300);
 pub const DEFAULT_MIN_SAMPLES: u32 = 3;
 
 /// Operator-tunable resilience policy applied at construction via
-/// `Gateway::with_resilience` (Task 2). `Default` reproduces the pre-(f)
-/// hardcoded behavior exactly, so an absent config changes nothing.
+/// `Gateway::with_resilience` (SP-0 (f) Task 2). `Default` reproduces the
+/// pre-(f) hardcoded behavior exactly, so an absent config changes nothing.
 ///
 /// `#[non_exhaustive]` because this is a published crate's public surface and
 /// this struct grows a field per slice (`min_samples` arrived with SP-ROUTE-1).
 /// Without it, every added field is a breaking change for any downstream struct
-/// literal; with it, downstream must build from `..Default::default()` and
-/// keeps compiling. Applied the same slice the field landed in — it is breaking
-/// exactly once, and doing it later only makes the break bigger.
+/// literal. Applied the same slice the field landed in — it is breaking exactly
+/// once, and doing it later only makes the break bigger.
+///
+/// **The attribute forbids EVERY struct expression outside this crate,
+/// functional-update syntax INCLUDED.** `ResilienceConfig { min_samples: 5,
+/// ..Default::default() }` is `error[E0639]: cannot create non-exhaustive
+/// struct using struct expression` for any consumer, however few fields it
+/// names — `..Default::default()` buys nothing here, and the three docs that
+/// printed it were wrong. Only code inside `sensei-gateway` may write that
+/// form, which is exactly why a whole slice shipped without noticing. Build the
+/// value and then assign:
+///
+/// ```
+/// use gateway::resilience::ResilienceConfig;
+///
+/// let mut resilience = ResilienceConfig::default();
+/// resilience.min_samples = 5;
+/// ```
+///
+/// That doctest compiles as a downstream crate, and
+/// `tests/reexport_paths.rs::non_exhaustive_config_is_built_the_way_the_docs_say`
+/// pins the same shape from the integration-test side.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ResilienceConfig {
@@ -33,19 +53,22 @@ pub struct ResilienceConfig {
     pub cooldown_base: Duration,
     /// Per-reason model-lockout durations + escalation clamp.
     pub lockout: ModelLockoutPolicy,
-    /// Per-store retention cap; over it, expired entries are evicted (Task 3).
+    /// Per-store retention cap; over it, expired entries are evicted
+    /// (SP-0 (f) Task 3).
     pub eviction_cap: usize,
     /// Deterministic jitter fraction in `[0.0, 1.0)` added to SYNTHETIC timed
-    /// deadlines to spread retries across endpoints (Task 4). `0.0` ⇒ off
-    /// (today's behavior). A real upstream `Retry-After` is never jittered.
+    /// deadlines to spread retries across endpoints (SP-0 (f) Task 4). `0.0` ⇒
+    /// off (today's behavior). A real upstream `Retry-After` is never jittered.
     pub jitter_fraction: f64,
-    /// Samples retained per endpoint in the rolling performance window (Task 4).
-    /// Applying a change requires `Gateway::with_resilience` to rebuild the
-    /// `PerformanceStore` (its capacity is fixed at construction), discarding
-    /// any samples recorded before the rebuild.
+    /// Samples retained per endpoint in the rolling performance window
+    /// (SP-ROUTE-1 Task 4 — a DIFFERENT slice's Task 4 from `jitter_fraction`
+    /// above, which is SP-0 (f)'s). Applying a change requires
+    /// `Gateway::with_resilience` to rebuild the `PerformanceStore` (its
+    /// capacity is fixed at construction), discarding any samples recorded
+    /// before the rebuild.
     pub perf_samples: usize,
-    /// How long a performance sample stays live (Task 4). Same rebuild caveat
-    /// as `perf_samples`.
+    /// How long a performance sample stays live (SP-ROUTE-1 Task 4). Same
+    /// rebuild caveat as `perf_samples`.
     pub perf_window: Duration,
     /// The minimum count of live observations a metric sort requires before it
     /// trusts a candidate's mean as "measured" rather than leaving it in
@@ -61,15 +84,35 @@ pub struct ResilienceConfig {
     /// high and it degrades to priority order, which is the documented fallback
     /// anyway.
     ///
-    /// **Do NOT set it to `0`.** Every counter comparison is `>=`, so at zero an
-    /// endpoint with no observations at all passes: `s.samples >= 0` always
-    /// holds, so a never-measured endpoint reports `mean_latency_ms == 0.0` and
-    /// sorts FIRST — winning every latency race it has never run — and
-    /// `verdict_samples >= 0` always holds, so its `success_rate == 0.0` becomes
-    /// a TRUSTED reliability of zero. "A cold process weighs every candidate 0.0
-    /// and a healthy fleet routes as though every provider were dead" stops
-    /// being a comment about a bug that was fixed and becomes an
-    /// operator-reachable configuration. Pinned by
+    /// **Do NOT set it to `0`** — but the mechanism is narrower than "a cold
+    /// process breaks", and an earlier draft of this doc named a mechanism the
+    /// code does not have.
+    ///
+    /// A NEVER-observed endpoint is unmeasured at EVERY threshold, zero
+    /// included. `PerformanceStore::stats` returns `None` before any `>=`
+    /// comparison can run — `m.get(endpoint)?` for an endpoint with no ring at
+    /// all, then `if live.is_empty() { return None }` for one whose samples have
+    /// aged out — and `None` takes the unmeasured path regardless. So a cold
+    /// process routes normally at `min_samples: 0`; it does not weigh every
+    /// candidate at zero.
+    ///
+    /// What zero DOES reach is an endpoint whose ring holds live samples while
+    /// the counter being read sits at `0` beside a mean of `0.0`. The three
+    /// counters are independent (neither superset nor subset), so that is an
+    /// ordinary state rather than a corner:
+    ///
+    /// - **Reliability.** One `StreamAcquired` with no completion yet ⇒
+    ///   `samples: 1, verdict_samples: 0, success_rate: 0.0`. At zero the
+    ///   verdict gate passes, so `GroupedWeightedStrategy` records
+    ///   `reliability: Some(0.0)` and `weight: Some(0.0)` — dead last in its
+    ///   group, for an endpoint whose only sin is not having finished a request.
+    /// - **Latency.** A FAILED `Complete` casts a verdict but contributes no
+    ///   latency observation ⇒ `samples: 0, mean_latency_ms: 0.0`. At zero
+    ///   `sort: latency` reads that `0.0` as a measurement, and the endpoint
+    ///   wins every race it has never run.
+    ///
+    /// Any value `>= 1` makes both unreachable, and the default of 3 keeps a
+    /// margin past that. Pinned by
     /// `engine::tests::resilience_min_samples_reaches_the_metric_sort`.
     ///
     /// A COUNT, unlike `perf_samples` (a retention capacity) and `perf_window`
