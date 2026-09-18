@@ -6493,3 +6493,89 @@ async fn the_routing_decision_reaches_the_inference_response() {
         "and the per-candidate detail travels with it, not just the order"
     );
 }
+
+/// AC10 — the WEIGHTS reach the response, not merely the order.
+///
+/// `the_routing_decision_reaches_the_inference_response` drives `sort: price`,
+/// and `PriceStrategy` returns `OrderingReport::default()` by construction — no
+/// weights, no reliability. So that test asserts the production artefact only
+/// for `strategy`, `order` and `cost`, while
+/// `production_selection_records_the_weight_and_reliability_it_actually_used`
+/// asserts the weights but never calls `execute`. Each half of the feature was
+/// tested on a path where the other half is absent, which left the attachment
+/// free to be replaced by a re-derivation that drops the two fields a bare
+/// fixture cannot produce — verified surviving before this test existed.
+///
+/// So: the weighted DEFAULT, through `execute`, with the live store moved
+/// first. Nothing here is reachable without both the draw's own numbers and the
+/// wiring that carries them out.
+#[tokio::test]
+async fn the_response_carries_the_weights_the_draw_actually_used() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // Only `noop` gets an adapter. `fail-model` leads on priority and has none,
+    // so the walk falls through to `noop` and the call succeeds — the decision
+    // still describes both candidates.
+    register_noop(&gw).await;
+
+    let observe = |success: bool| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint: "failing:fail-model",
+            router: "failing",
+            success,
+            error: None,
+            duration_ms: 100,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    observe(true);
+    observe(true);
+    observe(false);
+    // `noop:noop` is deliberately never observed.
+
+    // No `sort`: the weighted default is the only strategy that weighs anything.
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        ..chat_request()
+    };
+    let response = gw
+        .execute(&request)
+        .await
+        .expect("the noop adapter answers");
+    let decision = response
+        .routing
+        .expect("execute must attach the selection's routing decision");
+
+    assert_eq!(decision.strategy, "grouped_weighted");
+    let of = |endpoint: &str| {
+        decision
+            .order
+            .iter()
+            .find(|c| c.endpoint == endpoint)
+            .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+    };
+
+    assert_eq!(
+        of("failing:fail-model").reliability,
+        Some(2.0 / 3.0),
+        "two successes and one failure through the gateway's own recorder, \
+         carried all the way out to the caller's response"
+    );
+    assert_eq!(
+        of("failing:fail-model").weight,
+        Some(0.25 * (2.0 / 3.0)),
+        "`1/2² × 2/3` — the draw weight the ordering actually used, not a \
+         number re-derived at the attachment site"
+    );
+    assert_eq!(
+        of("noop:noop").reliability,
+        None,
+        "never observed — and `None` must survive the trip out rather than \
+         being flattened on the way"
+    );
+    assert_eq!(of("noop:noop").weight, Some(1.0), "`1/1² × 1.0`");
+}

@@ -41,18 +41,44 @@ pub struct StrategyCtx<'a> {
 ///
 /// A return value has neither problem. It cannot exist without the call that
 /// produced the ordering, and it cannot outlive it.
+///
+/// **What the return shape does NOT buy, stated because the obvious reading
+/// over-claims.** "Returned by `order`" guarantees only that the report was
+/// PRODUCED INSIDE the call that produced the ordering — so it cannot be stale
+/// and cannot describe a different call. It does not make the values
+/// tamper-proof: the report is an independent channel, and a caller is free to
+/// discard it and fabricate a plausible-looking substitute. That was verified,
+/// not assumed — a re-derivation at the engine's attachment site keeping
+/// strategy/order/cost while nulling `reliability` and `weight` passed the
+/// entire suite until
+/// `engine::tests::the_response_carries_the_weights_the_draw_actually_used`
+/// was written.
+///
+/// The PER-VALUE guarantee comes from one local discipline in [`order_group`],
+/// and it is the load-bearing line for anyone editing that function: [`Weight`]
+/// is `Copy`, `classified` is bound ONCE, and that same binding is both
+/// `.recorded()` into this report and `match`ed into the free/zero/draw
+/// buckets. Classify twice — even with identical-looking arguments — and the
+/// report becomes a second derivation over a live port, which is the thing this
+/// type exists to prevent.
 #[derive(Debug, Default, PartialEq)]
 pub struct OrderingReport {
-    /// A metric sort had fewer than two MEASURED candidates, so it could not
-    /// express any ordering preference and the result is exactly priority
-    /// order.
+    /// A metric sort had two or more candidates to order but fewer than two
+    /// MEASURED ones, so it could not express any ordering preference and the
+    /// result is exactly priority order.
     ///
-    /// `< 2`, not `== 0`: with a single measured candidate the sort writes that
-    /// candidate back into the slot it already occupied and nothing moves, so
-    /// the output is priority order just as surely as with none. Conversely two
-    /// measured candidates that happen to already agree are NOT degraded — the
-    /// sort would have reordered them had they disagreed. The claim is about
-    /// the INFORMATION the sort had, not about whether the permutation changed.
+    /// `< 2` measured, not `== 0`: with a single measured candidate the sort
+    /// writes that candidate back into the slot it already occupied and nothing
+    /// moves, so the output is priority order just as surely as with none.
+    /// Conversely two measured candidates that happen to already agree are NOT
+    /// degraded — the sort would have reordered them had they disagreed. The
+    /// claim is about the INFORMATION the sort had, not about whether the
+    /// permutation changed.
+    ///
+    /// Requires two or more ADMITTED candidates for the same reason read the
+    /// other way. A one-candidate chain has exactly one ordering, so no reading
+    /// could have changed it and nothing was degraded for want of one; saying
+    /// otherwise is a false alarm, not a conservative one.
     ///
     /// Always `false` for a strategy that consults no sample counts
     /// ([`PriorityStrategy`], [`PriceStrategy`], [`GroupedWeightedStrategy`]):
@@ -487,7 +513,17 @@ impl RoutingStrategy for MetricStrategy {
         // for a metric sort and is silently receiving priority order. That is
         // the fact the trace exists to surface; see `OrderingReport::degraded`
         // for why the boundary is `< 2` rather than `== 0`.
-        let degraded = !admitted.is_empty() && subset.len() < 2;
+        //
+        // Gated on there being two candidates to ORDER in the first place, and
+        // that half is not a mere empty-guard. A one-candidate chain has
+        // exactly one ordering, so no quantity of samples would have changed
+        // the answer and nothing was lost for want of them; `subset.len() < 2`
+        // alone is a tautology there and fires even for a candidate measured
+        // far past `min_samples`. Reporting that as degraded sends a reader
+        // hunting for missing observations that were never the cause. Subsumes
+        // the empty case (`0 >= 2` is false). Pinned by
+        // `selection::tests::a_single_candidate_chain_is_never_degraded_for_want_of_samples`.
+        let degraded = admitted.len() >= 2 && subset.len() < 2;
         // STABLE, and that is load-bearing: candidates whose readings are equal
         // fall back to the authored priority order established above, which is
         // what makes a partial set of observations a monotone interpolation

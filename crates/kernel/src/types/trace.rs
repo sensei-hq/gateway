@@ -70,8 +70,14 @@ pub struct RoutingDecision {
     /// `sort: latency` that silently returns priority order looks, from the
     /// outside, exactly like a `sort: latency` that was ignored.
     pub degraded: bool,
-    /// The candidates in the order the engine will actually try them — i.e.
-    /// AFTER any `order` re-rank, not merely as the strategy left them.
+    /// The candidates in the order the engine would try them — i.e. AFTER any
+    /// `order` re-rank, not merely as the strategy left them.
+    ///
+    /// "Would", not "will": this is the order selection handed the walk, and
+    /// the walk may end before the tail is reached. `allow_fallback: false`
+    /// attempts only the first entry, and a terminal error (a 401, or exhausted
+    /// credits) stops the walk where it stands. Read it as the ranking, not as
+    /// a record of what was attempted — `attempts` is that record.
     pub order: Vec<RoutedCandidate>,
 }
 
@@ -113,6 +119,11 @@ pub struct ExecutionTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_cost: Option<Cost>,
     /// Why the candidates came out in this order (SP-ROUTE-1 AC10).
+    ///
+    /// `default` is belt-and-braces, not load-bearing: serde already resolves a
+    /// missing field for an `Option<T>` to `None` via `missing_field`. Stated
+    /// because the opposite claim is an easy one to make and would mislead the
+    /// next person to add an optional field here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingDecision>,
     pub created_at: DateTime<Utc>,
