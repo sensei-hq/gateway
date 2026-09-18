@@ -197,12 +197,28 @@ provider were dead. The same applies to `throughput_samples` for §5.3's through
 that expresses "costs nothing"; the limit of `1/c²` as `c → 0` *is* "always first". Folding the
 non-finite case into the same rule means there is one rule, not a rule plus an overflow guard.
 
-**Byte-identity, stated precisely.** When no two admitted candidates share a priority, every group
-is a singleton and the output is identical to `PriorityStrategy`. `dedup_and_prioritize` reassigns
-ascending 1-based priority by final position (`catalog/assemble.rs:145-154`), so **every
-catalog-assembled chain has strictly distinct priorities by construction** and is unaffected. A
-chain that *does* tie changes from "stable authoring order" to price-weighted random — that is the
-feature, and no chain in the repo ties today.
+**Byte-identity, stated precisely — and narrower than an earlier draft claimed.** When no two
+admitted candidates share a priority, every group is a singleton and the output is identical to
+`PriorityStrategy`. `dedup_and_prioritize` reassigns ascending 1-based priority by final position
+(`catalog/assemble.rs:145-154`), so a catalog-assembled chain has strictly distinct priorities and
+is unaffected. A chain that *does* tie changes from "stable authoring order" to price-weighted
+random — that is the feature.
+
+This section originally said "every catalog-assembled chain … by construction", full stop. The
+Task 7 review found two exceptions, and both are real:
+
+1. **Chains longer than 254 entries.** That reassignment is `u8::try_from(pos + 1).unwrap_or(u8::MAX)`,
+   which **saturates**. Measured on a 300-entry chain: 255 distinct priorities with 46 entries all
+   at 255 — a genuine tie group that this slice now randomises where `PriorityStrategy` kept chain
+   order. Reachable through a `derive` tier predicate over a large catalog.
+2. **Hand-authored chains.** `GatewayBuilder::add_chain` and `GatewayConfig`'s `Deserialize` both
+   pass `ChainEntry.priority` through verbatim, and `collect_validation_errors` has no priority
+   rule at all. Nothing prevents an operator from authoring a tie — deliberately or otherwise.
+
+So the honest claim is: **byte-identical for every chain whose admitted candidates have distinct
+priorities**, which covers every chain in this repo today and every `assemble()` output of length
+≤ 254. Anything else is opting into load balancing, which is the intended way to opt in — it is
+just not the *only* way to reach it.
 
 ### 5.2 `sort: price`
 
