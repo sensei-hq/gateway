@@ -72,6 +72,34 @@ Candidates are tried in `priority` order. A failure only advances to the next
 candidate if its error kind is in `fallback_triggers` (else the chain stops).
 Triggers: `RateLimit`, `Timeout`, `ProviderError`, `ModelUnavailable`, `BudgetExceeded`.
 
+> **Give each entry a distinct `priority` unless you mean to load balance.**
+> Entries that share a `priority` become a pool: their order is drawn per
+> request, weighted by `(1 / cost²) × reliability`, so two identical requests
+> may pick different models. Distinct priorities route deterministically, exactly
+> as before. Nothing validates `priority`, so a tie is easy to author by
+> accident — see [recipes](recipes.md#shape-routing-per-request).
+
+## Tune how much evidence a metric sort needs
+
+```rust
+use gateway::resilience::ResilienceConfig;
+
+let gateway = Gateway::new(config, adapters, cb)
+    .with_resilience(ResilienceConfig { min_samples: 5, ..Default::default() });
+```
+
+`min_samples` (default `3`) is how many live observations an endpoint needs
+before `sort: latency` / `sort: throughput` trusts its mean, and before the
+default strategy trusts its success rate. Below it the candidate counts as
+unmeasured: it holds its position, and weighs as healthy.
+
+**Do not set it to `0`.** The comparisons are `>=`, so at zero an endpoint with
+*no* observations reports `mean_latency_ms == 0.0` and wins every latency race it
+has never run — and `success_rate == 0.0` becomes a trusted reliability of zero,
+so a cold process routes as though every provider were dead.
+
+`ResilienceConfig` is `#[non_exhaustive]`: build it from `..Default::default()`.
+
 ## Build + validate
 
 ```rust

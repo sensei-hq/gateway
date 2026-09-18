@@ -6,6 +6,36 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## 0.5.1 → next (unreleased — SP-ROUTE-1)
+
+Per-request **provider routing preferences** land (`sort` / `only` / `ignore` /
+`order`, plus a price-weighted default within equal-priority groups). The call
+path is source-compatible: `routing` is `Option` and serde-defaulted, so an
+absent field routes and serializes exactly as before.
+
+| Area | Change | Action |
+|---|---|---|
+| `InferenceRequest` | new field `routing: Option<RoutingPreferences>` | **only if you build the struct literally** (no `Default`): add `routing: None` |
+| `InferenceResponse` / `ExecutionTrace` | new field `routing: Option<RoutingDecision>` | same: add `routing: None` to literals |
+| `ResilienceConfig` | now `#[non_exhaustive]`, and gains `min_samples: u32` | build it from `..Default::default()` instead of naming every field |
+| `RoutingStrategy` | `fn name(&self) -> &'static str` is now **required** (deliberately not defaulted) | implementors add one line returning a stable id |
+| Chains with **tied** `priority` | those entries are now load-balanced rather than kept in authoring order | give entries distinct priorities unless you want a pool |
+| Mid-stream failures | now count toward the circuit breaker, connection cooldown and model lockout | none, but a repeatedly-failing stream can now gate its endpoint |
+
+`RoutingStrategy::name()` is un-defaulted on purpose: the alternative is a second
+`match` on `SortKey` at the trace site, which agrees on the day it is written and
+then drifts. Both breaks are right for a pre-1.0 crate and are a one-line edit
+each.
+
+The last row is the one to read twice. A single mid-stream 429 now locks the
+endpoint for the rate-limit base duration, so on a single-candidate chain the
+*next* request returns `AllGated { resume_after: Some(t) }` rather than a
+stream — previously it retried immediately. This was a correctness fix: the
+streaming path reported a stream that died halfway as a **success** to every
+health recorder.
+
+See `docs/features/routing/provider-preferences.md` for the full surface.
+
 ## 0.4.x → 0.5.x
 
 Small breaking change to the **`sensei-vault`** OAuth API (a maintainability refactor —

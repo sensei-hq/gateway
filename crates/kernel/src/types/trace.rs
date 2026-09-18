@@ -56,6 +56,19 @@ pub struct SkippedInfo {
 /// in a bug report, and a weighted router is otherwise unfalsifiable in
 /// production — two identical requests may legitimately route differently, so
 /// there is nothing to re-run and compare against.
+///
+/// Delivered on [`InferenceResponse::routing`], which is the artefact a caller
+/// actually holds. Two gaps to know before going looking for it:
+///
+/// - **The streaming path carries none.** `Gateway::execute_stream` selects with
+///   the full preferences — filtering and ordering both apply — but returns a
+///   stream of `StreamEvent`s rather than an `InferenceResponse`, so it has
+///   nowhere to put the explanation. A streamed request routes correctly and
+///   cannot currently report why. Recorded as a known gap rather than papered
+///   over.
+/// - **[`ExecutionTrace::routing`] is forward provision.** See that field.
+///
+/// [`InferenceResponse::routing`]: super::request::InferenceResponse::routing
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoutingDecision {
     /// Read from `RoutingStrategy::name()` — the strategy that actually ran,
@@ -120,10 +133,21 @@ pub struct ExecutionTrace {
     pub actual_cost: Option<Cost>,
     /// Why the candidates came out in this order (SP-ROUTE-1 AC10).
     ///
+    /// **FORWARD PROVISION, not a delivered surface.** The field exists and is
+    /// guarded by persistence round-trip tests, but **nothing in this workspace
+    /// builds an `ExecutionTrace` in production** — the type is constructed in
+    /// exactly one test helper, and `GatewayStore::insert_execution_trace` has no
+    /// production caller at all. Every field of this struct is equally unfilled.
+    /// Do not write "the trace records the routing decision" without that
+    /// qualifier, or a reader goes hunting for a writer that does not exist.
+    /// [`InferenceResponse::routing`] is the delivered surface.
+    ///
     /// `default` is belt-and-braces, not load-bearing: serde already resolves a
     /// missing field for an `Option<T>` to `None` via `missing_field`. Stated
     /// because the opposite claim is an easy one to make and would mislead the
     /// next person to add an optional field here.
+    ///
+    /// [`InferenceResponse::routing`]: super::request::InferenceResponse::routing
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingDecision>,
     pub created_at: DateTime<Utc>,

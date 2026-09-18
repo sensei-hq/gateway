@@ -54,8 +54,8 @@ pub struct StrategyCtx<'a> {
 /// `engine::tests::the_response_carries_the_weights_the_draw_actually_used`
 /// was written.
 ///
-/// The PER-VALUE guarantee comes from one local discipline in [`order_group`],
-/// and it is the load-bearing line for anyone editing that function: [`Weight`]
+/// The PER-VALUE guarantee comes from one local discipline in `order_group`,
+/// and it is the load-bearing line for anyone editing that function: `Weight`
 /// is `Copy`, `classified` is bound ONCE, and that same binding is both
 /// `.recorded()` into this report and `match`ed into the free/zero/draw
 /// buckets. Classify twice — even with identical-looking arguments — and the
