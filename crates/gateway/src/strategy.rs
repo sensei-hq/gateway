@@ -168,6 +168,30 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
     out
 }
 
+/// `sort: price` — ascending estimated cost across every candidate, free first,
+/// ties broken by authored priority so the order is total.
+///
+/// This deliberately overrides `priority` entirely, unlike
+/// [`GroupedWeightedStrategy`], which only ever reorders WITHIN a priority
+/// group. That is the documented meaning of an explicit `sort`: load balancing
+/// switches off and the router tries candidates strictly in the named order.
+///
+/// `cost_estimate: None` is treated as free, matching `BudgetGate`'s reading
+/// that an unpriced model costs nothing.
+pub struct PriceStrategy;
+
+impl RoutingStrategy for PriceStrategy {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) {
+        admitted.sort_by(|a, b| {
+            let ca = a.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
+            let cb = b.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
+            ca.partial_cmp(&cb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.priority.cmp(&b.priority))
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +760,103 @@ mod tests {
             let rng = SplitMix64::seeded(seed);
             GroupedWeightedStrategy.order(&mut v, &test_ctx(&NoPerformance, &rng));
             assert_eq!(v[0].model, "dear_first", "seed {seed}");
+        }
+    }
+
+    /// AC8 — `sort: price` orders across the WHOLE chain and deliberately
+    /// overrides `priority`. That is what "load balancing switches off and the
+    /// router tries providers strictly in that order" means.
+    ///
+    /// Every candidate here is placed so that priority order and price order
+    /// DISAGREE — a strategy that quietly respected priority would return the
+    /// input unchanged and pass a weaker test.
+    #[test]
+    fn price_sort_overrides_priority_across_the_whole_chain() {
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![
+            sm_cost("dear_but_first", 1, Some(10.0)),
+            sm_cost("cheap_but_last", 9, Some(0.1)),
+            sm_cost("free_but_middle", 5, None),
+        ];
+        PriceStrategy.order(&mut v, &test_ctx(&NoPerformance, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["free_but_middle", "cheap_but_last", "dear_but_first"]
+        );
+    }
+
+    /// Equal prices fall back to authored priority, so the order is TOTAL —
+    /// no pair is left to input-order chance.
+    #[test]
+    fn price_sort_breaks_ties_on_priority() {
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![
+            sm_cost("second", 2, Some(1.0)),
+            sm_cost("first", 1, Some(1.0)),
+        ];
+        PriceStrategy.order(&mut v, &test_ctx(&NoPerformance, &rng));
+        assert_eq!(names(&v), vec!["first", "second"]);
+    }
+
+    /// An unpriced candidate is FREE, matching `BudgetGate`'s reading and
+    /// `GroupedWeightedStrategy`'s. Asserted in BOTH input orders so no
+    /// fixed-index or stable-sort coincidence can satisfy it — that exact
+    /// coincidence hid a broken free-first classification in Task 7.
+    #[test]
+    fn price_sort_puts_an_unpriced_candidate_first_in_both_input_orders() {
+        for unpriced_first in [true, false] {
+            let rng = SplitMix64::seeded(7);
+            let mut v = if unpriced_first {
+                vec![
+                    sm_cost("unpriced", 5, None),
+                    sm_cost("cheap", 1, Some(0.001)),
+                ]
+            } else {
+                vec![
+                    sm_cost("cheap", 1, Some(0.001)),
+                    sm_cost("unpriced", 5, None),
+                ]
+            };
+            PriceStrategy.order(&mut v, &test_ctx(&NoPerformance, &rng));
+            assert_eq!(
+                names(&v),
+                vec!["unpriced", "cheap"],
+                "unpriced_first {unpriced_first}: an unpriced candidate costs nothing and leads"
+            );
+        }
+    }
+
+    /// `PriceStrategy` is DETERMINISTIC — it must not consume the RNG at all.
+    /// Two runs with the same source must agree, and so must runs with
+    /// different seeds. A strategy that drew would pass the first check and
+    /// fail the second.
+    #[test]
+    fn price_sort_is_deterministic_and_consumes_no_randomness() {
+        let fixture = || {
+            vec![
+                sm_cost("c", 1, Some(3.0)),
+                sm_cost("a", 2, Some(1.0)),
+                sm_cost("b", 3, Some(2.0)),
+            ]
+        };
+        let expected = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        for seed in [1u64, 2, 12345, u64::MAX] {
+            let rng = SplitMix64::seeded(seed);
+            let mut v = fixture();
+            PriceStrategy.order(&mut v, &test_ctx(&NoPerformance, &rng));
+            assert_eq!(
+                names(&v),
+                expected,
+                "seed {seed}: price order is not a draw"
+            );
+            // The source must be untouched: its FIRST draw must still be the
+            // first draw of a fresh source with the same seed.
+            assert_eq!(
+                rng.next_u64(),
+                SplitMix64::seeded(seed).next_u64(),
+                "seed {seed}: PriceStrategy must not consume the RNG"
+            );
         }
     }
 }
