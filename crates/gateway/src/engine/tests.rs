@@ -649,7 +649,7 @@ async fn execute_no_candidates_errors() {
     let result = gw.execute(&request).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        GatewayError::NoCandidates { capability } => {
+        GatewayError::NoCandidates { capability, .. } => {
             assert_eq!(capability, Capability::AudioTranscribe);
         }
         other => panic!("Expected NoCandidates, got: {other}"),
@@ -694,8 +694,39 @@ async fn a_requests_routing_preferences_reach_selection() {
         // is terminal `NoCandidates`, NOT `AllGated`. The distinction is the
         // point: an excluded candidate has no deadline and no human remedy, so
         // turning this into a pausable error would park the run forever.
-        Err(GatewayError::NoCandidates { capability }) => {
-            assert_eq!(capability, Capability::TextChat);
+        Err(err @ GatewayError::NoCandidates { .. }) => {
+            let GatewayError::NoCandidates {
+                ref capability,
+                ref skipped,
+            } = err
+            else {
+                unreachable!()
+            };
+            assert_eq!(*capability, Capability::TextChat);
+            // The whole-slice review's Minor 3: `result.skipped` held the
+            // per-candidate reasons and `execute` threw them away, so a typo'd
+            // `only: {routers: ["anthorpic"]}` — the likeliest first-use failure
+            // of the whole feature — surfaced as "no candidates available for
+            // capability 'TextChat'" and was undiagnosable. The filter must be
+            // visible in the error the caller actually receives.
+            assert_eq!(
+                skipped.len(),
+                1,
+                "the one excluded candidate must be carried: {skipped:?}"
+            );
+            assert!(
+                skipped[0].contains("noop:noop")
+                    && skipped[0].contains("excluded by request routing preferences"),
+                "the diagnostic must name the candidate AND the filter that \
+                 rejected it: {skipped:?}"
+            );
+            // Asserted on the RENDERED error too: a field nothing displays is a
+            // field an operator reading a log still cannot see.
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("excluded by request routing preferences"),
+                "Display must surface the filter, not just the capability: {rendered}"
+            );
         }
         Err(other) => panic!(
             "the only-router filter excludes every candidate structurally, so this \
@@ -783,25 +814,34 @@ impl crate::gates::HealthRecorder for PhaseRecorder {
     }
 }
 
-/// A `HealthRecorder` that records `(phase, success, output_tokens)` for
-/// every dispatch. SP-ROUTE-1 Task 5 review (Important 1): the throughput
-/// test originally asserted `mean_tokens_per_sec > 0.0`, which cannot fail —
-/// `throughput_samples == 1`, checked two lines earlier, already forces
-/// `ms > 0 && t > 0` (see `PerformanceRecorder::on_outcome`), so ANY positive
-/// token count derives a positive rate. Swapping `output_tokens.output_tokens`
-/// for `.input_tokens` at the dispatch site (500 → 1000) survived the whole
-/// suite. This recorder captures the dispatched count directly and
-/// deterministically, independent of wall-clock arithmetic.
-type RecordedOutcomes = Arc<std::sync::Mutex<Vec<(crate::gates::AttemptPhase, bool, Option<u32>)>>>;
+/// A `HealthRecorder` that records `(phase, success, output_tokens,
+/// duration_ms)` for every dispatch. SP-ROUTE-1 Task 5 review (Important 1):
+/// the throughput test originally asserted `mean_tokens_per_sec > 0.0`, which
+/// cannot fail — `throughput_samples == 1`, checked two lines earlier, already
+/// forces `ms > 0 && t > 0` (see `PerformanceRecorder::on_outcome`), so ANY
+/// positive token count derives a positive rate. Swapping
+/// `output_tokens.output_tokens` for `.input_tokens` at the dispatch site
+/// (500 → 1000) survived the whole suite. This recorder captures the dispatched
+/// values directly, independent of the store's wall-clock arithmetic.
+///
+/// `duration_ms` is the fourth element for the same class of reason, found by
+/// the whole-slice review (Important 1): the value that DEFINES
+/// `mean_tokens_per_sec` was pinned nowhere, so swapping the completion
+/// dispatch's `stream_start.elapsed()` for `attempt_start.elapsed()` — the
+/// Critical 2 fix, and equally its reversal — left the entire suite green.
+type RecordedOutcomes =
+    Arc<std::sync::Mutex<Vec<(crate::gates::AttemptPhase, bool, Option<u32>, u64)>>>;
 
 struct OutcomeRecorder(RecordedOutcomes);
 
 impl crate::gates::HealthRecorder for OutcomeRecorder {
     fn on_outcome(&self, outcome: &crate::gates::AttemptOutcome<'_>) -> Option<std::time::Instant> {
-        self.0
-            .lock()
-            .unwrap()
-            .push((outcome.phase, outcome.success, outcome.output_tokens));
+        self.0.lock().unwrap().push((
+            outcome.phase,
+            outcome.success,
+            outcome.output_tokens,
+            outcome.duration_ms,
+        ));
         None
     }
 }
@@ -2548,32 +2588,102 @@ impl crate::adapters::capability::ChatModel for FakeStreamMidFailer {
     }
 }
 
-/// Same chunk shape as `FakeStreamer` (two content chunks then a terminal
-/// chunk carrying `TokenUsage { output_tokens: 500 }`), but with a real
-/// (tiny) delay before the terminal chunk.
+/// The two halves of a streaming attempt's wall time, used by the fixtures
+/// below. `SETUP_DELAY` elapses inside `chat_stream` (pre-first-byte: connect,
+/// queue, prompt processing), `GENERATION_DELAY` inside the stream before the
+/// terminal usage chunk. They are equal and each large enough that a dispatch
+/// measuring only ONE of them reports a doubled throughput — a 2x separation
+/// that no scheduler jitter closes.
 ///
-/// Why this exists rather than reusing `FakeStreamer` directly: the
-/// `StreamCompleted` dispatch times generation with `std::time::Instant`,
-/// a real wall clock that tokio's mock-time (`test-util`) cannot advance.
-/// `FakeStreamer`'s chunks come from a synchronous `futures::stream::iter`,
-/// so a whole attempt completes in low-microseconds — `duration_ms` always
-/// truncates to 0, and `PerformanceRecorder::on_outcome`'s `ms > 0` guard
-/// then (correctly) declines to invent a throughput sample. That guard is
-/// exactly right in production (no rate should ever be reported over an
-/// unmeasurable span); it just means a throughput assertion needs a fixture
-/// where measurable time genuinely elapses.
-struct FakeStreamerWithRealDelay {
+/// Both are REAL `tokio::time::sleep`s, not mock time. The recorder dispatches
+/// time their spans with `std::time::Instant`, a real wall clock that tokio's
+/// `test-util` mock time cannot advance. A fixture whose chunks come from a
+/// synchronous `futures::stream::iter` completes in low-microseconds, so
+/// `duration_ms` truncates to 0 and `PerformanceRecorder::on_outcome`'s
+/// `ms > 0` guard (correctly) declines to invent a throughput sample at all —
+/// which is right in production and useless for an assertion about the rate.
+const SETUP_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
+const GENERATION_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
+/// What both paths' fixtures report as output tokens, so the only thing that
+/// can differ between them is the DURATION the rate is divided by.
+const SPLIT_DELAY_OUTPUT_TOKENS: u32 = 500;
+
+/// Non-streaming counterpart of `SplitDelayStreamer`: one `chat` call whose
+/// total wall time is `SETUP_DELAY + GENERATION_DELAY` and which returns the
+/// same `SPLIT_DELAY_OUTPUT_TOKENS`. Serving the identical work
+/// non-streaming must report the identical throughput.
+struct WholeCallDelayAdapter {
     id: String,
 }
 
-impl crate::adapters::capability::Model for FakeStreamerWithRealDelay {
+impl crate::adapters::capability::Model for WholeCallDelayAdapter {
     fn id(&self) -> &str {
         &self.id
     }
 }
 
 #[async_trait::async_trait]
-impl crate::adapters::capability::ChatModel for FakeStreamerWithRealDelay {
+impl crate::adapters::capability::ChatModel for WholeCallDelayAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        tokio::time::sleep(SETUP_DELAY + GENERATION_DELAY).await;
+        Ok(crate::types::io::ChatResponse {
+            content: Some("ok".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(TokenUsage {
+                input_tokens: 1000,
+                output_tokens: SPLIT_DELAY_OUTPUT_TOKENS,
+                total_tokens: 1500,
+            }),
+            model: Some(self.id.clone()),
+            degraded: false,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        Err(GatewayError::Unsupported {
+            adapter: self.id.clone(),
+            what: "streaming".to_string(),
+        })
+    }
+}
+
+/// A streaming adapter that splits its wall time either side of the first
+/// byte: `SETUP_DELAY` inside `chat_stream` (so it lands in the acquisition
+/// span, BEFORE `stream_start`), then `GENERATION_DELAY` inside the stream
+/// before the terminal usage chunk.
+///
+/// The split is the whole point. A fixture that sleeps only AFTER the stream
+/// exists makes `stream_start.elapsed()` and `attempt_start.elapsed()`
+/// indistinguishable, which is why the completion dispatch's span went
+/// unpinned through an entire slice: swapping the two left the suite green.
+struct SplitDelayStreamer {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for SplitDelayStreamer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for SplitDelayStreamer {
     async fn chat(
         &self,
         _cfg: &RouterConfig,
@@ -2595,8 +2705,9 @@ impl crate::adapters::capability::ChatModel for FakeStreamerWithRealDelay {
         >,
         GatewayError,
     > {
-        use crate::types::cost::TokenUsage;
         use crate::types::request::StreamChunk;
+        // Pre-first-byte: this elapses before the engine takes `stream_start`.
+        tokio::time::sleep(SETUP_DELAY).await;
         let stream = async_stream::stream! {
             yield Ok(StreamChunk {
                 content: "Hello, ".to_string(),
@@ -2604,20 +2715,14 @@ impl crate::adapters::capability::ChatModel for FakeStreamerWithRealDelay {
                 usage: None,
                 tool_calls: Vec::new(),
             });
-            yield Ok(StreamChunk {
-                content: "world!".to_string(),
-                finish_reason: None,
-                usage: None,
-                tool_calls: Vec::new(),
-            });
-            // The real, unmocked delay this fixture exists for.
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Post-first-byte: the generation span.
+            tokio::time::sleep(GENERATION_DELAY).await;
             yield Ok(StreamChunk {
                 content: String::new(),
                 finish_reason: Some("stop".to_string()),
                 usage: Some(TokenUsage {
                     input_tokens: 1000,
-                    output_tokens: 500,
+                    output_tokens: SPLIT_DELAY_OUTPUT_TOKENS,
                     total_tokens: 1500,
                 }),
                 tool_calls: Vec::new(),
@@ -2696,7 +2801,7 @@ async fn register_stream_mid_err(
 
 /// A mid-stream failer whose one good chunk carries `usage` — a provider that
 /// reports token counts and then dies. Real (tiny) delay before the error, for
-/// the same reason `FakeStreamerWithRealDelay` needs one: without it,
+/// the same reason `SETUP_DELAY`/`GENERATION_DELAY` are real: without it,
 /// `duration_ms` truncates to 0 and the M3 mutation (restoring a throughput
 /// sample to the failure dispatch) would be masked by the `ms > 0` guard
 /// rather than caught by the assertion.
@@ -4747,7 +4852,7 @@ async fn all_structural_selection_stays_no_candidates() {
     let gw = ab_gateway(config);
 
     match gw.execute(&chat_request()).await.unwrap_err() {
-        GatewayError::NoCandidates { capability } => {
+        GatewayError::NoCandidates { capability, .. } => {
             assert_eq!(capability, Capability::TextChat);
         }
         other => panic!("expected NoCandidates (all-structural), got: {other}"),
@@ -5591,7 +5696,7 @@ async fn a_completed_stream_is_recorded_as_a_success_with_its_throughput() {
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
     let mut gw = Gateway::new(config, AdapterRegistry::new(), cb);
     gw.adapters
-        .register_chat(Arc::new(FakeStreamerWithRealDelay {
+        .register_chat(Arc::new(SplitDelayStreamer {
             id: "priced".to_string(),
         }))
         .await;
@@ -5635,9 +5740,9 @@ async fn a_completed_stream_is_recorded_as_a_success_with_its_throughput() {
     );
 
     // Deterministic, wall-clock-independent pin on the exact count dispatched
-    // (Important 1): `mean_tokens_per_sec > 0.0` cannot fail once
+    // (Task 5 review, Important 1): `mean_tokens_per_sec > 0.0` cannot fail once
     // `throughput_samples == 1` already forces a positive rate, so a scrambled
-    // (but still positive) token count would ship silently. 500 is FakeStreamer's
+    // (but still positive) token count would ship silently. 500 is the fixture's
     // `output_tokens`; 1000 is its `input_tokens` — a wrong-field swap at the
     // dispatch site must be visible here.
     let recorded = outcomes.lock().unwrap();
@@ -5649,6 +5754,188 @@ async fn a_completed_stream_is_recorded_as_a_success_with_its_throughput() {
         completion.2,
         Some(500),
         "the completion dispatch must carry OUTPUT tokens (500), not input tokens (1000): {recorded:?}"
+    );
+
+    // ...and the same treatment for the OTHER half of the rate (whole-slice
+    // review, Important 1). `throughput_samples` and `output_tokens` pin the
+    // numerator; nothing pinned the DENOMINATOR, so swapping the span this
+    // dispatch measures — the Critical 2 fix, and equally its reversal — left
+    // the whole suite green.
+    //
+    // `SplitDelayStreamer` puts `SETUP_DELAY` BEFORE the first byte, so the two
+    // candidate spans are distinguishable: measuring from `stream_start` sees
+    // only `GENERATION_DELAY`. The completion dispatch must report TOTAL attempt
+    // wall time, which is the only quantity comparable with the `Complete`
+    // dispatch that writes the same endpoint key from `execute`.
+    let total = (SETUP_DELAY + GENERATION_DELAY).as_millis() as u64;
+    assert!(
+        completion.3 >= total,
+        "the completion dispatch must measure the TOTAL attempt span \
+         (>= {total}ms = {SETUP_DELAY:?} pre-first-byte + {GENERATION_DELAY:?} \
+         generation), not generation alone; got {}ms: {recorded:?}",
+        completion.3
+    );
+
+    // The acquisition dispatch is the control: it measures the pre-first-byte
+    // span only, and must NOT have grown to the total. Without this, a dispatch
+    // site that reported the total EVERYWHERE would satisfy the assertion above
+    // while destroying the latency signal.
+    //
+    // Compared RELATIONALLY rather than against an absolute upper bound. Both
+    // spans start at the same `attempt_start`, so `completion > acquisition`
+    // holds by construction under any scheduling delay, and fails only if the
+    // two dispatches measure the same moment — which is exactly the collapse
+    // being guarded against. An absolute `acquisition < total` would instead
+    // flake on a loaded CI runner that stretched the 60ms setup sleep past
+    // 120ms, testing the machine rather than the code.
+    let acquisition = recorded
+        .iter()
+        .find(|(phase, ..)| *phase == crate::gates::AttemptPhase::StreamAcquired)
+        .expect("a StreamAcquired outcome must have been dispatched");
+    assert!(
+        acquisition.3 >= SETUP_DELAY.as_millis() as u64,
+        "acquisition must cover the pre-first-byte span (>= {SETUP_DELAY:?}); \
+         got {}ms: {recorded:?}",
+        acquisition.3
+    );
+    assert!(
+        completion.3 > acquisition.3,
+        "acquisition must still measure time-to-first-response ALONE — if it \
+         also grew to the total span the latency signal is gone; got \
+         acquisition {}ms vs completion {}ms: {recorded:?}",
+        acquisition.3,
+        completion.3
+    );
+}
+
+// --- SP-ROUTE-1 whole-slice review, Critical 2 + Important 1: the two
+// throughput spans must be the SAME quantity ---
+
+/// Build a one-router/one-model chat config keyed on `id`, so each half of the
+/// comparison below gets its own `"{id}:{id}"` endpoint.
+fn single_endpoint_config(id: &str) -> GatewayConfig {
+    let mut routers = HashMap::new();
+    routers.insert(
+        id.to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        id.to_string(),
+        ModelConfig {
+            id: id.to_string(),
+            api_model_id: None,
+            provider: id.to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: None,
+            catalog: None,
+        },
+    );
+    GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
+}
+
+/// Pin a request to `id`'s router+model.
+fn pinned_chat_request(id: &str) -> InferenceRequest {
+    let mut r = chat_request();
+    r.model = Some(id.to_string());
+    r.router = Some(id.to_string());
+    r
+}
+
+/// **`sort: throughput` must not pool two unlike spans.** `tokens_per_sec` is
+/// derived in `PerformanceRecorder::on_outcome` from `duration_ms` BEFORE and
+/// independently of the `phase` match, and the same `"{router}:{model}"` key is
+/// written from both entry points — so whatever span each dispatch chose to
+/// report lands in one mean. `execute` reports the WHOLE call; the end-of-stream
+/// dispatch used to report generation time alone, measured from `stream_start`.
+///
+/// Identical real work therefore reported two different rates purely because
+/// one was served streaming, and an endpoint that was faster end-to-end could
+/// lose to a slower one. This is the same defect spec §6.3 forbids for latency,
+/// never applied to throughput.
+///
+/// The fixtures do the IDENTICAL work — `SETUP_DELAY + GENERATION_DELAY` of
+/// wall time and `SPLIT_DELAY_OUTPUT_TOKENS` output tokens — differing only in
+/// which entry point serves them. The chosen fix is "both report output tokens
+/// ÷ TOTAL attempt wall time" (rather than making `Complete` contribute no
+/// throughput, which would leave `sort: throughput` measuring nothing at all
+/// for a non-streaming fleet), so the two rates must agree.
+///
+/// The tolerance is deliberately loose relative to the defect: the bug halves
+/// the streaming path's divisor, a 2x error, while the delays are large enough
+/// that scheduler jitter moves each rate by a few percent.
+#[tokio::test]
+async fn the_same_generation_rate_reports_the_same_throughput_streaming_or_not() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let whole = Gateway::new(single_endpoint_config("whole"), AdapterRegistry::new(), cb);
+    whole
+        .adapters
+        .register_chat(Arc::new(WholeCallDelayAdapter {
+            id: "whole".to_string(),
+        }))
+        .await;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let split = Gateway::new(single_endpoint_config("split"), AdapterRegistry::new(), cb);
+    split
+        .adapters
+        .register_chat(Arc::new(SplitDelayStreamer {
+            id: "split".to_string(),
+        }))
+        .await;
+
+    whole
+        .execute(&pinned_chat_request("whole"))
+        .await
+        .expect("the non-streaming half must succeed");
+    let events = collect_stream(&split, &pinned_chat_request("split")).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "the streaming half must run to completion: {events:?}"
+    );
+
+    let non_streaming = whole.performance_stats("whole:whole").expect("recorded");
+    let streaming = split.performance_stats("split:split").expect("recorded");
+    assert_eq!(
+        non_streaming.throughput_samples, 1,
+        "the non-streaming path must contribute a throughput sample: {non_streaming:?}"
+    );
+    assert_eq!(
+        streaming.throughput_samples, 1,
+        "the streaming path must contribute a throughput sample: {streaming:?}"
+    );
+
+    // Bounds chosen against the DEFECT, not against a notion of precision: the
+    // bug halves the streaming path's divisor, so it lands at ratio 2.0, and
+    // anything under 1.55 separates from it cleanly. Reaching either bound
+    // honestly would take a ~65ms stall on one path and not the other.
+    let ratio = streaming.mean_tokens_per_sec / non_streaming.mean_tokens_per_sec;
+    assert!(
+        (0.65..=1.55).contains(&ratio),
+        "identical work ({SETUP_DELAY:?} setup + {GENERATION_DELAY:?} generation, \
+         {SPLIT_DELAY_OUTPUT_TOKENS} output tokens) must report the same throughput \
+         whichever entry point served it, but streaming reported \
+         {} tok/s against non-streaming's {} tok/s (ratio {ratio:.3}) — the streaming \
+         dispatch is measuring a different span",
+        streaming.mean_tokens_per_sec,
+        non_streaming.mean_tokens_per_sec,
     );
 }
 

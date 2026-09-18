@@ -1361,6 +1361,85 @@ mod tests {
         );
     }
 
+    /// **A failed attempt is not a latency measurement.** Driven through the
+    /// REAL `PerformanceRecorder` + `PerformanceStore`, not a `FixedStats`
+    /// fixture, because the defect lives in what the recorder writes: it used
+    /// to record `Some(o.duration_ms)` for every `Complete` phase regardless of
+    /// `o.success`, and `MetricStrategy::value` reads `mean_latency_ms` with no
+    /// reliability filter at all (unlike `GroupedWeightedStrategy`, which
+    /// multiplies by `reliability` for exactly this reason).
+    ///
+    /// The result was that a provider rejecting every request in 5ms outranked
+    /// one answering every request in 500ms, and the circuit breaker did not
+    /// save it: `record_success` resets `Closed { failure_count }` to 0, so an
+    /// endpoint that fails intermittently never reaches the consecutive-failure
+    /// threshold and stays admitted forever while permanently winning the
+    /// latency race.
+    ///
+    /// The verdict assertions are load-bearing in the other direction: dropping
+    /// the failed attempt's `success` vote as well would also make this
+    /// ordering assertion pass, and would silently blind
+    /// `GroupedWeightedStrategy`'s reliability multiplier.
+    #[test]
+    fn a_failing_fast_endpoint_does_not_outrank_a_healthy_slow_one_under_latency_sort() {
+        use crate::gates::performance::{PerformanceRecorder, PerformanceStore};
+        use crate::gates::{AttemptOutcome, AttemptPhase, HealthRecorder};
+        use std::time::Duration;
+
+        let store = PerformanceStore::new(64, Duration::from_secs(60));
+        let rec = PerformanceRecorder::new(store.clone(), 4096);
+
+        // Well past `test_ctx`'s `min_samples` of 3, so neither endpoint can
+        // pass this test merely by being under-measured.
+        for _ in 0..5 {
+            // `fast` rejects every request in 5ms.
+            rec.on_outcome(&AttemptOutcome {
+                endpoint: "test:fast",
+                router: "test",
+                success: false,
+                error: None,
+                duration_ms: 5,
+                output_tokens: None,
+                phase: AttemptPhase::Complete,
+            });
+            // `slow` answers every request, in 500ms.
+            rec.on_outcome(&AttemptOutcome {
+                endpoint: "test:slow",
+                router: "test",
+                success: true,
+                error: None,
+                duration_ms: 500,
+                output_tokens: None,
+                phase: AttemptPhase::Complete,
+            });
+        }
+
+        let fast = store.stats("test:fast").expect("five attempts recorded");
+        assert_eq!(
+            fast.samples, 0,
+            "a 100%-failing endpoint contributes no latency observation at all, \
+             got {fast:?}"
+        );
+        assert_eq!(
+            fast.verdict_samples, 5,
+            "but it still casts every verdict — reliability must stay correct: {fast:?}"
+        );
+        assert!(
+            (fast.success_rate - 0.0).abs() < 1e-9,
+            "and every one of those verdicts failed: {fast:?}"
+        );
+
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![sm_cost("slow", 1, None), sm_cost("fast", 2, None)];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&store, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["slow", "fast"],
+            "the endpoint that FAILS in 5ms must not overtake the one that \
+             ANSWERS in 500ms under `sort: latency`"
+        );
+    }
+
     // --- Task 8/9 review fixes -------------------------------------------
 
     /// `sm_cost` builds `router: "test"`, so a candidate `mNN` keys as

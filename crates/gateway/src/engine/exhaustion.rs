@@ -42,6 +42,21 @@ pub(super) fn contribution_for(
     }
 }
 
+/// Render selection's per-candidate rejections as human-readable diagnostics.
+///
+/// The ONE rendering, shared by `AllGated::skipped` and `NoCandidates::skipped`
+/// — the two terminal errors a caller can receive from an empty selection.
+/// Extracted when `NoCandidates` grew its own `skipped` field: a second inline
+/// `format!` would be free to drift, and an operator comparing a gated failure
+/// against a filtered one would be reading two different renderings of the same
+/// data.
+pub(crate) fn render_skipped(skipped: &[SkippedCandidate]) -> Vec<String> {
+    skipped
+        .iter()
+        .map(|s| format!("{}:{} — {}", s.router, s.model, s.reason))
+        .collect()
+}
+
 /// Build the terminal error at chain exhaustion. `Some(AllGated)` iff every
 /// candidate was gated (health-skip or classified limit) and none hard-failed;
 /// `None` ⇒ "not all-gated — use the existing terminal error".
@@ -57,7 +72,7 @@ pub(crate) fn all_gated_error(
     }
     let mut timed: Vec<Instant> = Vec::new();
     let mut human: Option<HumanAction> = None;
-    let mut diagnostics: Vec<String> = Vec::new();
+    let diagnostics: Vec<String> = render_skipped(skipped);
     let mut any_gate = false;
 
     for s in skipped {
@@ -72,7 +87,6 @@ pub(crate) fn all_gated_error(
             }
             GateStatus::Structural => {}
         }
-        diagnostics.push(format!("{}:{} — {}", s.router, s.model, s.reason));
     }
     for c in contributions {
         match c {

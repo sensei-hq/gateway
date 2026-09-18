@@ -82,8 +82,14 @@ impl super::Gateway {
             if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {
                 return Err(gated);
             }
+            // Carry the per-candidate reasons rather than discarding them. An
+            // all-structural selection is exactly where the caller has no other
+            // channel: `AllGated` at least names a deadline or a remedy, while a
+            // bare `NoCandidates` used to name only the capability — so a typo'd
+            // `only: { routers: [...] }` was undiagnosable.
             return Err(GatewayError::NoCandidates {
                 capability: request.capability.clone(),
+                skipped: super::exhaustion::render_skipped(&result.skipped),
             });
         }
 
