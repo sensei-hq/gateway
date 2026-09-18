@@ -135,6 +135,22 @@ impl Gateway {
         }
     }
 
+    /// Builds the [`ModelSelectionService`] used by BOTH `execute` and
+    /// `execute_stream` — the single construction site, so Task 9/10's
+    /// performance + entropy wiring lands in exactly one place instead of two
+    /// copies drifting apart, and so a test can inspect the service this
+    /// gateway actually builds (see
+    /// `tests::production_selection_never_uses_the_fixed_seed_default`)
+    /// without hand-mirroring the construction.
+    fn selection_service<'a>(&'a self, config: &'a GatewayConfig) -> ModelSelectionService<'a> {
+        ModelSelectionService::new(
+            config,
+            &self.circuit_breaker,
+            &self.cooldown,
+            &self.model_lockout,
+        )
+    }
+
     /// Attach a [`GatewayStore`] so each terminal call is persisted (enabling
     /// burn-rate/spend queries and, on the AUTH track, quota enforcement).
     /// Builder-style; without it the gateway records nothing.

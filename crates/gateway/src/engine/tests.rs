@@ -6006,3 +6006,33 @@ async fn a_mid_stream_failure_with_usage_contributes_no_throughput() {
          chunk carried usage: {stats:?}"
     );
 }
+
+/// SP-ROUTE-1 Task 6 review — Important 1. `with_random`/`with_performance`
+/// have exactly one call site in the repo today (a unit test): production
+/// (`execute`, `execute_stream`) builds its `ModelSelectionService` via
+/// `Gateway::selection_service`, which calls `ModelSelectionService::new` and
+/// nothing else. So today every production request routes off the fixed-seed
+/// `DEFAULT_RNG`, and this asserts exactly that against the REAL production
+/// construction path — `selection_service` is the one place both `execute`
+/// and `execute_stream` build the service, extracted for this reason — not a
+/// hand-mirrored copy of it.
+///
+/// `#[ignore]`d because it is expected to fail until SP-ROUTE-1 Task 10 adds
+/// `.with_random(entropy_source)` (and, per the plan, `.with_performance`)
+/// inside `selection_service`. Un-ignoring it then turns it into the
+/// regression guard: if a future edit to `selection_service` drops the
+/// `with_random` call, this goes red again.
+#[test]
+#[ignore = "green at SP-ROUTE-1 Task 10, which wires the gateway's entropy-seeded \
+            RandomSource into `Gateway::selection_service`"]
+fn production_selection_never_uses_the_fixed_seed_default() {
+    let gw = test_gateway();
+    let config = test_config_with_noop();
+    let svc = gw.selection_service(&config);
+    assert!(
+        !svc.uses_default_rng(),
+        "production must pass an entropy-seeded source via with_random; the fixed-seed \
+         DEFAULT_RNG makes every process draw the identical sequence, so weighted routing \
+         synchronises across the fleet instead of spreading"
+    );
+}

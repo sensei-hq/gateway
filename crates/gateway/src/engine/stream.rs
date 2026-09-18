@@ -81,12 +81,7 @@ impl super::Gateway {
         };
 
         // 4. Select all candidates.
-        let svc = ModelSelectionService::new(
-            &config,
-            &self.circuit_breaker,
-            &self.cooldown,
-            &self.model_lockout,
-        );
+        let svc = self.selection_service(&config);
         let result = svc.select_all(&criteria);
 
         // No candidates? If every skip was a gate (health-lock / cooling /
@@ -145,7 +140,7 @@ impl super::Gateway {
 
             for (idx, candidate) in candidates.iter().enumerate() {
                 let has_more = idx + 1 < total;
-                let endpoint = format!("{}:{}", candidate.router, candidate.model);
+                let endpoint = candidate.endpoint_key();
                 // Wall time for THIS candidate's setup/acquisition attempt — not
                 // the time to stream to completion (Task 5's job). No tokens
                 // exist yet at either dispatch point below, pre- or post-first-byte.
