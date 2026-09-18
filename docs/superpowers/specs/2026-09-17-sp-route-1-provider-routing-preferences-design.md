@@ -410,11 +410,31 @@ different models. Resume remains exact. This must be stated loudly in the operat
 ## 9. Observability
 
 Weighted random is unexplainable in a bug report unless the decision is recorded. `SelectionResult`
-carries, and `ExecutionTrace` stores:
+carries a `RoutingDecision`:
 
-- the strategy applied (and, for `Latency`/`Throughput`, whether it degraded for want of samples),
+- the strategy applied, read from `RoutingStrategy::name()` — the strategy that actually ran, never
+  a re-derivation from the request,
+- whether a metric sort degraded for want of samples,
 - the resulting candidate order,
 - for the weighted default, the weight each candidate received and its `cost` / `reliability` inputs.
+
+`reliability` is `Option<f64>`: `None` when unmeasured, which is **not** the same as `Some(0.0)`.
+Flattening them is how a healthy fleet gets routed as though every provider were dead.
+
+**Where it is carried, and a correction.** This section originally said "`ExecutionTrace` stores"
+it. That was wrong, and Task 11 found it: **nothing in this workspace builds an `ExecutionTrace` in
+production.** The type is constructed in exactly one place — a test helper in `store.rs` — and
+`GatewayStore::insert_execution_trace` has no production caller at all. Every field of that struct
+is equally unfilled. So AC10 as first written named a destination nothing reaches.
+
+The decision is therefore carried on **`InferenceResponse::routing`**, which is the artifact a
+caller actually holds. `ExecutionTrace` also gained a `routing` field, for the day something
+produces one, guarded by persistence round-trip tests — but that is forward provision, not the
+delivery.
+
+**Not carried on the streaming path.** `execute_stream` selects candidates but returns a stream
+rather than a response, so it has nowhere to put a decision. A streaming caller cannot currently
+see why its provider was chosen. Recorded as a gap rather than papered over.
 
 Without this, "why did it pick the expensive one" has no answer.
 
@@ -431,7 +451,7 @@ Without this, "why did it pick the expensive one" has no answer.
 | AC7 | `sort: latency` with zero observations equals priority order; with partial observations, unmeasured candidates hold their index |
 | AC8 | `sort: price` orders by estimated cost across the whole chain, overriding `priority` |
 | AC9 | A mid-stream failure dispatches a failure outcome to every recorder (§7) |
-| AC10 | `ExecutionTrace` records the applied strategy and the weights behind a weighted selection |
+| AC10 | `InferenceResponse::routing` records the applied strategy and the weights behind a weighted selection, with `reliability: None` distinct from `Some(0.0)` (§9 — originally written against `ExecutionTrace`, which has no production producer) |
 | AC11 | `cargo test --workspace` green; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean |
 
 ## 11. Testing
