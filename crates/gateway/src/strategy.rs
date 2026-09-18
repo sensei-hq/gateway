@@ -278,10 +278,19 @@ mod tests {
     }
 
     /// AC1 — THE safety test for the whole feature. With distinct priorities
-    /// every group is a singleton, so the weighted default must be
-    /// indistinguishable from `PriorityStrategy` on every chain that exists
-    /// today (`assemble()` reassigns ascending 1-based priorities by position,
-    /// so it never ties).
+    /// every group is a singleton, so the weighted default is indistinguishable
+    /// from `PriorityStrategy`.
+    ///
+    /// Scope, stated precisely: this covers every chain whose admitted
+    /// candidates have DISTINCT priorities — every chain in this repo today, and
+    /// every `assemble()` output up to 254 entries. Not "every catalog chain by
+    /// construction": `dedup_and_prioritize` assigns position via
+    /// `u8::try_from(pos + 1).unwrap_or(u8::MAX)`, which SATURATES, so a chain
+    /// longer than 254 entries ties at 255 and is genuinely randomised here. A
+    /// hand-authored chain can tie too — `GatewayBuilder::add_chain` and the
+    /// `Deserialize` impl pass `priority` through verbatim and no validation
+    /// rule forbids a repeat. A tie is the opt-in to load balancing, so neither
+    /// is a defect; they are simply not covered by THIS test's claim.
     ///
     /// Across MANY seeds: a single seed would pass against a strategy that
     /// happened to shuffle the same way once.
