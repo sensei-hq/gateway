@@ -7,7 +7,7 @@ use crate::gates::{
     AdmissionGate, CandidateView, EndpointHealthRead, GateVerdict, RouterHealthRead, SelectionCtx,
 };
 use crate::skip_reason::SkipReason;
-use crate::strategy::{PriorityStrategy, RoutingStrategy};
+use crate::strategy::RoutingStrategy;
 use crate::types::capability::Capability;
 use crate::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
@@ -184,7 +184,7 @@ impl<'a> ModelSelectionService<'a> {
             health: circuit_breaker,
             router_health,
             model_lockout,
-            strategy: Box::new(PriorityStrategy),
+            strategy: Box::new(crate::strategy::GroupedWeightedStrategy),
             perf: &NO_PERF,
             rng: &DEFAULT_RNG,
             min_samples: 3,
