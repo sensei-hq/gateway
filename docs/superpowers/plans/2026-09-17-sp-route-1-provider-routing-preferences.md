@@ -21,7 +21,16 @@
 | 3 | `da0dfb5` · `6e5cfa5` | ✅ done, 2 Critical + 3 Important fixed |
 | 4 | `edab9c4` · `1b75dae` · `1ac3597` | ✅ done after 3 review rounds; forced an `AttemptPhase` design fix and a new `verdict_samples` field — see below |
 | 5 | `c21b0e0` · `b1ad6ba` | ✅ done; review found a **production defect** — the breaker could not trip mid-stream |
-| 6–12 | — | pending |
+| 6 | `5fedd29` · `a252457` | ✅ done; review found all four seam wiring points were deletable with a green suite |
+| 7–12 | — | pending |
+
+**Task 6 left two things Tasks 7–10 depend on.** `SelectedModel::endpoint_key()` is the single
+source of the `"{router}:{model}"` performance-store key — use it, never re-inline the `format!`.
+And `Gateway::selection_service()` is now the single production construction site for
+`ModelSelectionService`; **Task 10 wires `.with_random(...)` and `.with_performance(...)` there**,
+which un-ignores `production_selection_never_uses_the_fixed_seed_default`. That tripwire asserts
+pointer identity against `DEFAULT_RNG`, because the obvious "two gateways draw differently" test
+is vacuous — both borrow the same static and so differ even when the wiring is missing.
 
 **Task 5 found that the breaker was structurally unable to trip on mid-stream failure.** The
 acquisition dispatch's `success: true` reached `record_success`, which reset `failure_count` to
@@ -1412,12 +1421,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p sensei-gateway splitmix -- --nocapture`
 Expected: FAIL — module not registered, then `cannot find type 'SplitMix64'`.
 
-- [ ] **Step 3: Write the random source**
+- [x] **Step 3: Write the random source**
 
 At the top of `crates/gateway/src/random.rs`:
 
@@ -1474,7 +1483,7 @@ impl RandomSource for SplitMix64 {
 
 Register it in `crates/gateway/src/lib.rs`: `pub mod random;`
 
-- [ ] **Step 4: Widen the strategy trait, keeping `PriorityStrategy` green**
+- [x] **Step 4: Widen the strategy trait, keeping `PriorityStrategy` green**
 
 Replace the top of `crates/gateway/src/strategy.rs`:
 
@@ -1523,7 +1532,7 @@ Update the two existing tests in that file to pass a ctx. Add a shared test help
 
 and call e.g. `PriorityStrategy.order(&mut v, &test_ctx(&NoPerformance, &SplitMix64::seeded(1)));`
 
-- [ ] **Step 5: Give `ModelSelectionService` the two ports, with defaults**
+- [x] **Step 5: Give `ModelSelectionService` the two ports, with defaults**
 
 In `crates/gateway/src/selection.rs`, add fields and builders:
 
@@ -1576,7 +1585,7 @@ In `resolve_chain`, replace `self.strategy.order(&mut all_candidates);` with:
         self.strategy.order(&mut all_candidates, &ctx);
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-gateway splitmix priority_strategy -- --nocapture`
 Expected: PASS, 6 tests.
@@ -1584,7 +1593,7 @@ Expected: PASS, 6 tests.
 Run: `cargo test --workspace 2>&1 | tail -5`
 Expected: all green — `PriorityStrategy` is still the registered strategy, so nothing reorders.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/gateway/src
@@ -1852,7 +1861,7 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
         // shared with the two engine dispatch sites, and a silent divergence
         // just makes `stats()` return `None` for every candidate, which degrades
         // to "nothing measured" with a green suite.
-        let endpoint = crate::gates::performance::endpoint_key(&m.router, &m.model);
+        let endpoint = m.endpoint_key();
         // `success_rate` reads 0.0 BOTH when every attempt failed and when no
         // attempt has cast a verdict yet. `verdict_samples` (Task 4) is the only
         // way to tell those apart, and the difference is not cosmetic: without
@@ -2139,9 +2148,7 @@ impl MetricStrategy {
     /// nothing.
     fn value(&self, m: &SelectedModel, ctx: &StrategyCtx<'_>) -> Option<f64> {
         // Task 6 extracted the key helper — do NOT re-inline the `format!`.
-        let s = ctx
-            .perf
-            .stats(&crate::gates::performance::endpoint_key(&m.router, &m.model))?;
+        let s = ctx.perf.stats(&m.endpoint_key())?;
         match self.metric {
             Metric::Latency => (s.samples >= self.min_samples).then_some(s.mean_latency_ms),
             // Negated so ascending sort == descending throughput.
