@@ -52,6 +52,39 @@ pub struct ModelPricing {
     pub per_request: Option<f64>,
 }
 
+impl ModelPricing {
+    /// `Err(reason)` when this pricing cannot be used to COMPARE candidates.
+    ///
+    /// Rejects non-finite and negative values. A `NaN` makes the routing
+    /// comparator intransitive — `sort_by` panics on that — and a negative
+    /// price sorts FIRST under `sort: price`, winning the cheapest slot with a
+    /// number that is not a price.
+    ///
+    /// **Zero is valid**: `Some(0.0)` is an explicit zero, distinct from
+    /// `pricing: None`, and the two deliberately tie.
+    ///
+    /// **A large finite value is valid**: any magnitude threshold would be
+    /// invented, the routing layer already fences the overflow it can cause,
+    /// and a prohibitive price is a legitimate way to park a model last.
+    pub fn validate(&self) -> Result<(), String> {
+        let check = |name: &str, v: f64| -> Result<(), String> {
+            if !v.is_finite() {
+                return Err(format!("{name} must be a finite number, got {v}"));
+            }
+            if v < 0.0 {
+                return Err(format!("{name} must not be negative, got {v}"));
+            }
+            Ok(())
+        };
+        check("input_per_1k", self.input_per_1k)?;
+        check("output_per_1k", self.output_per_1k)?;
+        if let Some(per_request) = self.per_request {
+            check("per_request", per_request)?;
+        }
+        Ok(())
+    }
+}
+
 /// Optional catalog metadata for a model: free-tier terms plus attribute tags
 /// (auth mechanism, cost band, locality). Absent ⇒ `None` ⇒ today's behaviour
 /// (no free-tier accounting, no attribute-derived tiering). Pure config; not
@@ -717,5 +750,44 @@ mod tests {
         assert_eq!(pro.quota[0].unit, MeterUnit::Requests);
         assert_eq!(pro.quota[1].window, Window::Week);
         assert_eq!(pro.per_capability[&Capability::ImageGenerate][0].limit, 50);
+    }
+
+    fn pricing(input: f64, output: f64, per_request: Option<f64>) -> ModelPricing {
+        ModelPricing {
+            input_per_1k: input,
+            output_per_1k: output,
+            per_request,
+        }
+    }
+
+    #[test]
+    fn pricing_validate_rejects_negative_and_non_finite_but_accepts_zero() {
+        let ok = |p: ModelPricing| assert!(p.validate().is_ok(), "{p:?} must be valid");
+        let bad = |p: ModelPricing, needle: &str| {
+            let e = p.validate().expect_err("must be rejected");
+            assert!(
+                e.contains(needle),
+                "the error must name the offending field and value; got {e:?}"
+            );
+        };
+
+        // Zero is an EXPLICIT price, distinct from `pricing: None`, and SP-ROUTE-1
+        // Task 8 pinned that the two tie under `sort: price`. Rejecting it would
+        // break shipped, tested behaviour.
+        ok(pricing(0.0, 0.0, None));
+        ok(pricing(0.0008, 0.004, Some(0.0)));
+        // Deliberately accepted — see the spec. Any magnitude threshold is invented,
+        // and a prohibitive price is a legitimate way to park a model last.
+        ok(pricing(1e300, 1e300, Some(1e300)));
+
+        bad(pricing(-0.001, 0.004, None), "input_per_1k");
+        bad(pricing(0.001, -0.004, None), "output_per_1k");
+        bad(pricing(0.001, 0.004, Some(-1.0)), "per_request");
+        bad(pricing(f64::NAN, 0.004, None), "input_per_1k");
+        bad(pricing(0.001, f64::INFINITY, None), "output_per_1k");
+        bad(
+            pricing(0.001, 0.004, Some(f64::NEG_INFINITY)),
+            "per_request",
+        );
     }
 }
